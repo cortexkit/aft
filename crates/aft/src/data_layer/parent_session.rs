@@ -16,6 +16,8 @@ pub struct Discovery {
     pub skipped: Vec<PathBuf>,
     /// Top-level entries of the parent folder that hold files outside every child.
     pub outside: Vec<PathBuf>,
+    /// The walk stopped at its directory-entry budget.
+    pub entry_limit_reached: bool,
 }
 
 /// The index planes requested before configure disables the parent's own indexes.

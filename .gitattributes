@@ -87,3 +87,11 @@ crates/aft/tests/fixtures/user-commands-v1/** -text
 # Status command samples are compared byte-for-byte with the pretty JSON the
 # tests encode, so they must stay LF on Windows too.
 crates/aft/tests/fixtures/aft-user-commands-v1/** text eol=lf
+# App view templates are served as-is and their canonical bytes are pinned by
+# sha256 in tests and in Occipital's checker, so they must stay LF on every
+# platform (Windows autocrlf would otherwise serve and hash CRLF bytes).
+crates/aft/src/subc/tool_views/*.ui text eol=lf
+crates/aft/src/subc/tool_views/*.json text eol=lf
+# The settings schema is compared byte-for-byte with the generated editor
+# schema, so it must stay LF on every platform.
+assets/aft.schema.json text eol=lf

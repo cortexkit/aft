@@ -198,6 +198,12 @@ impl BgTaskRegistry {
                 Err(error) => {
                     drop(child.stdin.take());
                     if let Some(scope) = scope.as_ref() {
+                        log_bash_kill(
+                            &task.task_id,
+                            Some(child.id()),
+                            None,
+                            "fallback_memory_setup_failed",
+                        );
                         let _ = scope.stop();
                     }
                     let _ = child.wait();
@@ -208,6 +214,12 @@ impl BgTaskRegistry {
         if let Some(mut monitor) = memory_monitor.take() {
             if let Err(error) = monitor.attach(child.id()) {
                 drop(state);
+                log_bash_kill(
+                    &task.task_id,
+                    Some(child.id()),
+                    Some(child.id() as i32),
+                    "fallback_memory_attach_failed",
+                );
                 super::super::super::process::terminate_pgid_with(child.id() as i32, || {
                     matches!(child.try_wait(), Ok(Some(_)))
                 });
@@ -223,6 +235,12 @@ impl BgTaskRegistry {
             if let Err(error) = self.persist_task_locked(task, &state.metadata, &mut db) {
                 drop(child.stdin.take());
                 if let Some(scope) = scope.as_ref() {
+                    log_bash_kill(
+                        &task.task_id,
+                        Some(child.id()),
+                        None,
+                        "fallback_memory_policy_persist_failed",
+                    );
                     let _ = scope.stop();
                 }
                 let _ = child.wait();

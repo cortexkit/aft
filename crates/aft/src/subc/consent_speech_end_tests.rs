@@ -57,7 +57,8 @@ impl ScopeEndControl {
         tokio::time::timeout(Duration::from_secs(10), queued.recv())
             .await
             .unwrap()
-            .unwrap();
+            .and_then(|ready| fixture.runs.resume(ready))
+            .expect("live run must resume admission");
         assert!(run.run_scope.get().unwrap().cached_budget().is_ok());
         fixture
     }

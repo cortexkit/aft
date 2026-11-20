@@ -1386,8 +1386,11 @@ fn every_vendored_secret_approval_sample_matches_its_source_checksum_and_decodes
 struct HeldCardEndpoint {
     calls: StdMutex<Vec<super::super::consent::ConsentCall>>,
     awaits: std::sync::atomic::AtomicUsize,
+    awaited: tokio::sync::Notify,
     allow_after: usize,
     fail_withdraw: bool,
+    scope_gone_on_withdraw: bool,
+    idle_withdrawals: StdMutex<Vec<String>>,
     fail_await: bool,
     pending_early: bool,
 }
@@ -1401,8 +1404,12 @@ impl super::super::consent::ConsentTransport for HeldCardEndpoint {
             usize::from(call.method == "consent.await"),
             std::sync::atomic::Ordering::SeqCst,
         );
+        if call.method == "consent.await" {
+            self.awaited.notify_one();
+        }
         let allow = self.allow_after > 0 && attempt + 1 >= self.allow_after;
         let fail_withdraw = self.fail_withdraw;
+        let scope_gone_on_withdraw = self.scope_gone_on_withdraw;
         let fail_await = self.fail_await;
         let pending_early = self.pending_early;
         Box::pin(async move {
@@ -1429,10 +1436,18 @@ impl super::super::consent::ConsentTransport for HeldCardEndpoint {
                 "consent.withdraw" if fail_withdraw => Err(
                     super::super::consent::ConsentError::Unavailable("offline".into()),
                 ),
+                "consent.withdraw" if scope_gone_on_withdraw => Err(
+                    super::super::consent::ConsentError::ScopeGone("confirmed end".into()),
+                ),
                 "consent.withdraw" => Ok(serde_json::json!({})),
                 method => panic!("unexpected secret consent operation {method}"),
             }
         })
+    }
+
+    fn withdraw_idle(&self, id: String, _: Duration) -> super::super::consent::ConsentFuture {
+        self.idle_withdrawals.lock().unwrap().push(id);
+        Box::pin(async { Ok(serde_json::json!({})) })
     }
 }
 fn held_request(expires_at_ms: u64) -> SecretConsentRequest {
@@ -1445,6 +1460,47 @@ fn held_request(expires_at_ms: u64) -> SecretConsentRequest {
         statement_b64url: "c3RhdGVtZW50".into(),
         expires_at_ms: Some(expires_at_ms),
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_confirmed_scope_end_withdraws_the_clientless_secret_card_even_after_its_route_is_gone() {
+    use crate::secret::consent::{pending_scope_stamps, wait_consent};
+    let endpoint = Arc::new(HeldCardEndpoint {
+        scope_gone_on_withdraw: true,
+        ..Default::default()
+    });
+    let _installed = TransportGuard::install(Some(Arc::new(SubcSecretConsent {
+        transport: endpoint.clone(),
+        runtime: tokio::runtime::Handle::current(),
+        cards: Default::default(),
+    })));
+    let request = held_request(crate::secret::vault::now_ms() + 600_000);
+    let caller = tokio::spawn(wait_consent(request.clone()));
+    endpoint.awaited.notified().await;
+    caller.abort();
+    assert!(caller.await.unwrap_err().is_cancelled());
+    assert_eq!(
+        pending_scope_stamps().as_slice(),
+        &[request.scope.stamp().clone()]
+    );
+
+    let executor = crate::executor::Executor::new();
+    let metrics = super::super::DispatchPathMetrics::new();
+    let mut wrong_epoch = request.scope.stamp().clone();
+    wrong_epoch.scope_epoch += 1;
+    super::super::scope_describe::accept_confirmed_end(&executor, None, &metrics, &wrong_epoch);
+    tokio::task::yield_now().await;
+    assert!(endpoint.idle_withdrawals.lock().unwrap().is_empty());
+
+    super::super::scope_describe::accept_confirmed_end(
+        &executor,
+        None,
+        &metrics,
+        request.scope.stamp(),
+    );
+    assert_eq!(wait_consent(request).await, ConsentOutcome::Cancelled);
+    assert!(pending_scope_stamps().is_empty());
+    assert_eq!(*endpoint.idle_withdrawals.lock().unwrap(), ["el_held"]);
 }
 
 fn assert_secret_card_lifecycle_logs(reason: CancellationReason) {
@@ -1478,7 +1534,6 @@ fn assert_secret_card_lifecycle_logs(reason: CancellationReason) {
             match reason {
                 CancellationReason::Expired => request.expires_at_ms = Some(0),
                 CancellationReason::Cancelled => cancel.cancel(),
-                CancellationReason::ClientDropped => cancel.cancel_with_reason(reason),
             }
             assert_eq!(
                 transport.wait(request.clone(), cancel).await,
@@ -1525,11 +1580,6 @@ fn assert_secret_card_lifecycle_logs(reason: CancellationReason) {
             .count(),
         1
     );
-}
-
-#[test]
-fn secret_card_logs_client_dropped_withdrawal() {
-    assert_secret_card_lifecycle_logs(CancellationReason::ClientDropped);
 }
 
 #[test]

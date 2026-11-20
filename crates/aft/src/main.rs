@@ -2301,6 +2301,13 @@ fn write_response_to_writer(writer: &mut impl Write, response: &Response) -> io:
     writer.write_all(&bytes)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
+    if let Some(text) = response
+        .data
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+    {
+        response.notices.acknowledge_written_text(text);
+    }
     Ok(())
 }
 

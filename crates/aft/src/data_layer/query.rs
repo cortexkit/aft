@@ -7,7 +7,7 @@
 //! another file's data (a target's node, whether a construction targets a
 //! function), it reads that file's slice.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -83,6 +83,27 @@ mod impact_budget_tests {
                 assert_eq!(found, all);
             }
         }
+    }
+
+    #[test]
+    fn unresolved_calls_walk_the_call_edges_of_a_slice_only_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("calls.ts"),
+            "function defined() {}\nexport function entry() { defined(); missingA(); missingB(); }\n",
+        )
+        .unwrap();
+        let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+        let nodes = reader.nodes_scoped_exactly("calls.ts", "entry");
+        assert_eq!(nodes.len(), 1);
+        let slice = reader.source.slice("calls.ts").unwrap();
+        assert!(slice.edges().len() > 0);
+        super::super::slice::EDGE_WALKS.with(|walks| walks.set(0));
+        assert_eq!(reader.unresolved_calls_of(&nodes[0]).unwrap().len(), 2);
+        assert_eq!(
+            super::super::slice::EDGE_WALKS.with(std::cell::Cell::get),
+            1
+        );
     }
 }
 
@@ -706,12 +727,26 @@ impl<S: SliceSource> SliceReader<S> {
         calls
     }
 
-    /// Whether a `call` edge exists for the reference at `reference` in
-    /// `slice`.
-    fn has_call_edge(&self, slice: &FileSlice, reference: u32) -> bool {
-        slice
-            .edges()
-            .any(|edge| edge.reference_index() == Some(reference) && self.edge_kind(edge) == "call")
+    /// References already represented by a call edge. Do not read another
+    /// file to classify a construction unless the query wants its reference.
+    fn call_edge_references(&self, slice: &FileSlice, wanted: &[RefView<'_>]) -> HashSet<u32> {
+        let mut remaining = wanted.iter().map(RefView::index).collect::<HashSet<_>>();
+        let mut found = HashSet::new();
+        if !remaining.is_empty() {
+            for edge in slice.edges() {
+                let Some(reference) = edge.reference_index() else {
+                    continue;
+                };
+                if remaining.contains(&reference) && self.edge_kind(edge) == "call" {
+                    found.insert(reference);
+                    remaining.remove(&reference);
+                    if remaining.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+        found
     }
 
     /// Unresolved call or construction references of `language`, one per
@@ -1026,17 +1061,21 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         let Some(caller) = slice.handle_of(node.node_id()) else {
             return Ok(Vec::new());
         };
+        let wanted = slice
+            .references()
+            .filter(|reference| {
+                reference.caller() == Some(caller)
+                    && reference.kind() == "call"
+                    && reference.resolved()
+                    && reference
+                        .target()
+                        .is_some_and(|(file, symbol)| file == node.file && symbol == node.symbol)
+            })
+            .collect::<Vec<_>>();
+        let call_edges = self.call_edge_references(&slice, &wanted);
         let mut calls = Vec::new();
-        for reference in slice.references() {
-            // The cheap integer checks first; the target is a search.
-            if reference.caller() != Some(caller)
-                || reference.kind() != "call"
-                || !reference.resolved()
-                || !reference
-                    .target()
-                    .is_some_and(|(file, symbol)| file == node.file && symbol == node.symbol)
-                || self.has_call_edge(&slice, reference.index())
-            {
+        for reference in wanted {
+            if call_edges.contains(&reference.index()) {
                 continue;
             }
             let (_, target) = self.target_of(&node.file, &node.symbol, TargetLookup::Ordinary);
@@ -1068,14 +1107,18 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
         let Some(caller) = slice.handle_of(node.node_id()) else {
             return Ok(Vec::new());
         };
-        let mut calls = slice
+        let wanted = slice
             .references()
             .filter(|reference| {
                 reference.caller() == Some(caller)
                     && reference.kind() == "call"
                     && !reference.resolved()
-                    && !self.has_call_edge(&slice, reference.index())
             })
+            .collect::<Vec<_>>();
+        let call_edges = self.call_edge_references(&slice, &wanted);
+        let mut calls = wanted
+            .into_iter()
+            .filter(|reference| !call_edges.contains(&reference.index()))
             .map(|reference| {
                 (
                     (reference.byte_start(), reference.line(), reference.ref_id()),

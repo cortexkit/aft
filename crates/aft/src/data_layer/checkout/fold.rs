@@ -201,6 +201,7 @@ impl Checkout {
                 "the publication has no call graph".to_string(),
             ));
         }
+        let bound = self.bound_states();
         let mut session = self.writer()?;
         // With the writer held, no process publishes until this one does,
         // so this is the generation the fold changes.
@@ -218,7 +219,7 @@ impl Checkout {
             self.checkout,
             &published.state,
             self.planes,
-            &[],
+            &bound,
         )? {
             Ok(done) => done,
             Err(why) => return Ok(Folded::NeedsBuild(why)),

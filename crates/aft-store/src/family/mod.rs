@@ -40,6 +40,7 @@
 //! ends, so a lease never outlives its process, and a reused process id
 //! means nothing.
 
+mod disk;
 mod lease;
 mod manifest;
 pub(crate) mod record;
@@ -57,6 +58,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+pub use disk::{DiskUsage, DiskUsageStop, measure_disk_usage};
 pub use manifest::{Manifest, SegmentEntry, StateRef};
 pub use snapshot::Snapshot;
 pub use writer::{
@@ -442,20 +444,43 @@ impl Family {
     /// count is returned. A manifest from another format version or family
     /// fails the call instead: it is not this build's to ignore.
     fn newest_manifest(&self) -> Result<(Manifest, usize), FamilyError> {
+        for _ in 0..snapshot::MAX_TRIES {
+            if let Some(found) = self.list_newest_manifest()? {
+                return Ok(found);
+            }
+        }
+        Err(FamilyError::SnapshotRetries(snapshot::MAX_TRIES))
+    }
+
+    /// One attempt. If all listed manifests are unusable and at least one
+    /// vanished, a writer may have published a replacement and removed the
+    /// old manifest after we listed the directory.
+    fn list_newest_manifest(&self) -> Result<Option<(Manifest, usize)>, FamilyError> {
         let mut skipped = 0;
-        for (number, path) in numbered_desc(&self.layout.dir, MANIFEST_PREFIX)? {
+        let mut vanished = false;
+        let listed = numbered_desc(&self.layout.dir, MANIFEST_PREFIX)?;
+        #[cfg(test)]
+        tests::AFTER_MANIFEST_LIST.with(|slot| {
+            let callback = slot.borrow_mut().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        });
+        for (number, path) in listed {
             match record::read(&path, Kind::Manifest, self.id, number) {
                 Ok(payload) => match Manifest::decode(Generation::new(number), &payload) {
-                    Ok(manifest) => return Ok((manifest, skipped)),
+                    Ok(manifest) => return Ok(Some((manifest, skipped))),
                     Err(RecordError::Invalid(_)) => skipped += 1,
                     Err(error) => return Err(FamilyError::record(&path, error)),
                 },
                 Err(RecordError::Invalid(_)) => skipped += 1,
-                Err(RecordError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(RecordError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+                    vanished = true;
+                }
                 Err(error) => return Err(FamilyError::record(&path, error)),
             }
         }
-        Ok((Manifest::empty(), skipped))
+        Ok((!vanished).then(|| (Manifest::empty(), skipped)))
     }
 
     /// The newest valid horizon, as a generation, with its file number.

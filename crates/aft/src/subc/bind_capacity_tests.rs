@@ -85,6 +85,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
         &writer,
         &writer,
         &a0,
+        None,
         &frame,
         &app,
         &executor,

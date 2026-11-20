@@ -363,6 +363,108 @@ fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
     assert!(capture.receiver.try_recv().is_err());
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn code_search_nudge_plain_grep_on_runner_heads() {
+    use super::super::{bash_selector_tests::call_v1_bash, test_support, tool_provider, BindTrust};
+    use crate::executor::Executor;
+    use subc_protocol::scope::{ScopeKind, ScopeStamp};
+
+    install(PathBuf::from("unused-test-notice-connection"));
+    for (module, raw_harness, harness) in [
+        ("broca", "runner", "broca"),
+        ("thalamus-harness", "opencode2", "opencode2"),
+    ] {
+        let session = format!("plain-grep-head-{module}");
+        let capture = test_endpoint::capture(&session, false);
+        capture.probe_incarnation("plain-grep-head-daemon", 1);
+        capture.delivery_order(Some(true));
+        capture.reply(SendReply::new("pending"));
+        let (dir, root) = test_support::test_root("plain-grep-head");
+        let src = root.as_path().join("src");
+        std::fs::create_dir(&src).unwrap();
+        std::fs::write(src.join("fixture.txt"), "foo\n").unwrap();
+        filetime::set_file_mtime(&src, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let ctx = Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.as_path().into()),
+                storage_dir: Some(dir.path().join("storage")),
+                experimental_bash_rewrite: false,
+                bash_permissions: false,
+                ..Default::default()
+            },
+        ));
+        let executor = Arc::new(Executor::new());
+        assert!(executor.register_actor(root.clone(), ctx));
+        let mut route = test_support::route_identity_with_harness(
+            &root,
+            &session,
+            BindTrust::FirstParty,
+            raw_harness,
+        );
+        let data = Arc::get_mut(&mut route.0).unwrap();
+        data.role = tool_provider::RouteRole::ToolProviderV1;
+        data.scope = Some(ScopeStamp::new(
+            Principal::Reserved {
+                module_id: "prefrontal-core".into(),
+            },
+            session.clone(),
+            1,
+            ScopeKind::Head,
+        ));
+        let AuthenticatedPrincipal::RouteBind {
+            harness: bound_harness,
+            principal_id,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            unreachable!();
+        };
+        *bound_harness = raw_harness.into();
+        *principal_id = Some(format!("reserved:{module}"));
+
+        let done = call_v1_bash(&executor, route, "grep -rn foo src/", Some("head")).await;
+        let response = done.response_for_test();
+        assert!(response.success, "{module}: {response:?}");
+        assert_eq!(response.data["exit_code"], 0, "{module}: {response:?}");
+        let task_id = response.data["task_id"].as_str().unwrap();
+        assert_eq!(
+            response.data["output"],
+            format!("src/fixture.txt:1:foo\n[task {task_id}]")
+        );
+        for _ in 0..2 {
+            let described = capture
+                .receiver
+                .try_recv()
+                .expect("runner capability probe");
+            assert_eq!(described.request["method"], "role.describe");
+            assert_eq!(described.harness, harness);
+            assert_eq!(described.session, "aft:runner-capability-probe");
+            assert_eq!(described.scope, None);
+        }
+        let sent = capture
+            .receiver
+            .try_recv()
+            .expect("ordered code-search nudge");
+        assert_eq!(sent.harness, harness);
+        assert_eq!(sent.session, session);
+        assert_eq!(sent.scope.unwrap().scope_ref, session);
+        assert_eq!(sent.request["method"], "session.send");
+        let params = &sent.request["params"];
+        assert_eq!(
+            params["send_id"],
+            "aft:nudge:aft.bash.code_search:subc-41-7"
+        );
+        assert_eq!(params["delivery"], json!(["turn_system", "tool_result"]));
+        assert_eq!(params["template"]["id"], "aft.bash.code_search");
+        assert!(
+            capture.receiver.try_recv().is_err(),
+            "only one notice before the result"
+        );
+    }
+}
+
 #[test]
 fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
     install(PathBuf::from("unused-test-notice-connection"));
@@ -411,17 +513,19 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
         false,
         None,
     );
-    let result = super::super::bash::finalized_bash_result(
-        response,
-        &ctx,
-        session,
-        &crate::subc_format::FormatContext {
-            bash_code_search_hint: Some(context),
-            ..format_context
-        },
-        false,
-        None,
-    );
+    let (result, logs) = crate::logging::capture_log_lines(|| {
+        super::super::bash::finalized_bash_result(
+            response,
+            &ctx,
+            session,
+            &crate::subc_format::FormatContext {
+                bash_code_search_hint: Some(context),
+                ..format_context
+            },
+            false,
+            None,
+        )
+    });
     assert_eq!(
         serde_json::to_vec(&result.response).unwrap(),
         serde_json::to_vec(&expected.response).unwrap()
@@ -443,6 +547,7 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
         json!({"shell":"bash", "redirect":"Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals)."})
     );
     assert!(params.get("prompt").is_none());
+    assert_eq!(logs, ["INFO runner code-search nudge call_key=call-17 send_id=aft:nudge:aft.bash.code_search:call-17 session=code-search-nudge-runner harness=broca probe=confirmed; delivered reason=runner confirmed delivery"]);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -530,7 +635,7 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
         "no retry after timeout"
     );
     assert_eq!(capture.effects.load(Ordering::Relaxed), 0);
-    assert_eq!(logs, vec!["INFO runner code-search nudge call_key=call-deadline dropped class=Timeout code=none detail=code-search notice send exceeded 2s total deadline"]);
+    assert_eq!(logs, ["INFO runner code-search nudge call_key=call-deadline send_id=aft:nudge:aft.bash.code_search:call-deadline session=code-search-nudge-deadline harness=broca probe=confirmed; dropped class=Timeout code=none detail=code-search notice send exceeded 2s total deadline"]);
 }
 
 #[test]
@@ -539,24 +644,62 @@ fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_addr
     let root = tempfile::tempdir().unwrap();
     // `sends` is whether the runner sees a send at all. Without confirmed
     // ordered delivery a nudge would start a turn of its own, so none is sent.
-    for (case, missing, ordered, sends) in [
-        ("refused", false, Some(true), true),
-        ("not-delivered", false, Some(true), true),
-        ("older-runner", false, Some(false), false),
-        ("probe-failed", false, None, false),
-        ("no-address", true, Some(true), false),
+    for (case, missing, ordered, expected) in [
+        (
+            "pending",
+            false,
+            Some(true),
+            "probe=confirmed; sent, ordered, awaiting delivery reason=eligible code search",
+        ),
+        (
+            "refused",
+            false,
+            Some(true),
+            "probe=confirmed; refused; dropped code=delivery_unsupported",
+        ),
+        (
+            "not-delivered",
+            false,
+            Some(true),
+            "probe=confirmed; not_delivered reason=handover_failed; dropped",
+        ),
+        (
+            "expired",
+            false,
+            Some(true),
+            "probe=confirmed; dropped reason=notice expired",
+        ),
+        (
+            "older-runner",
+            false,
+            Some(false),
+            "probe=not advertised; dropped class=NoOrderedDelivery",
+        ),
+        (
+            "probe-failed",
+            false,
+            None,
+            "probe=unavailable; dropped class=NoOrderedDelivery",
+        ),
+        (
+            "no-address",
+            true,
+            Some(true),
+            "probe=not completed; dropped class=Address",
+        ),
     ] {
         let session = format!("code-search-nudge-{case}");
         let capture = test_endpoint::capture(&session, false);
         capture.delivery_order(ordered);
-        if case == "refused" {
-            capture.refuse("delivery_unsupported", None);
-        }
-        if case == "not-delivered" {
-            capture.reply(undelivered("handover_failed"));
+        match case {
+            "pending" => capture.reply(SendReply::new("pending")),
+            "refused" => capture.refuse("delivery_unsupported", None),
+            "not-delivered" => capture.reply(undelivered("handover_failed")),
+            "expired" => capture.reply(SendReply::new(states::EXPIRED)),
+            _ => {}
         }
         let context = crate::subc_format::BashCodeSearchHint {
-            command: "rg foo".into(),
+            command: "grep -rn foo src/".into(),
             workdir: None,
             search_tool: Some("aft_search".into()),
             grep_tool: Some("grep".into()),
@@ -578,16 +721,60 @@ fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_addr
             json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "hit"}),
         );
         let before = serde_json::to_vec(&response).unwrap();
-        context.deliver(&mut response, root.path());
+        let src = root.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        filetime::set_file_mtime(&src, filetime::FileTime::from_unix_time(1, 0)).unwrap();
+        let (_, logs) =
+            crate::logging::capture_log_lines(|| context.deliver(&mut response, root.path()));
         assert_eq!(serde_json::to_vec(&response).unwrap(), before, "{case}");
+        assert_eq!(logs.len(), 1, "{case}: {logs:?}");
+        assert!(logs[0].contains(expected), "{case}: {logs:?}");
+        let sends = !missing && ordered == Some(true);
         if sends {
             let got = capture.receiver.try_recv().unwrap();
             assert!(got.request["params"]["delivery"].is_array(), "{case}");
+            let send_id = got.request["params"]["send_id"].as_str().unwrap();
+            assert!(
+                logs[0].contains(&format!(
+                    "send_id={send_id} session={session} harness=broca"
+                )),
+                "{case}: {logs:?}"
+            );
         }
         assert!(
             capture.receiver.try_recv().is_err(),
             "{case} never retries, sends unordered or appends"
         );
+    }
+}
+
+#[test]
+fn code_search_nudge_runner_logs_only_search_candidates_that_are_not_eligible() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("fixture.txt"), "foo\n").unwrap();
+    let data = json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "foo"});
+    for (command, reason) in [
+        ("echo 'x | grep foo'", None),
+        (
+            "echo foo | grep foo",
+            Some("search is not the first pipeline stage"),
+        ),
+        ("grep foo fixture.txt", Some("search targets a file")),
+    ] {
+        let mut response = Response::success("notice-call", data.clone());
+        let context = crate::subc_format::BashCodeSearchHint {
+            command: command.into(),
+            workdir: None,
+            search_tool: Some("aft_search".into()),
+            grep_tool: Some("grep".into()),
+            shell_tool: "bash".into(),
+            runner_notice: Some(notice_route("ineligible-code-search")),
+        };
+        let (_, logs) =
+            crate::logging::capture_log_lines(|| context.deliver(&mut response, root.path()));
+        let expected: Vec<_> = reason.into_iter().map(|reason| format!("INFO runner code-search nudge call_key=notice-call session=ineligible-code-search harness=broca not eligible reason={reason}")).collect();
+        assert_eq!(logs, expected, "{command}");
+        assert_eq!(response.data, data, "{command}");
     }
 }
 
@@ -1310,6 +1497,172 @@ fn step(scheduler: &Scheduler, now: std::time::Instant) -> Next {
     };
     scheduler.finish(&id, work, next, now);
     result
+}
+
+fn run_stamp(worker: bool) -> ScopeStamp {
+    let owner = json!({"kind":"reserved","module_id":"prefrontal"});
+    let (scope_ref, attributes) = if worker {
+        (
+            "worker:session",
+            json!({"on_behalf_of_agent":"agent-a","run_id":"run-a"}),
+        )
+    } else {
+        (
+            "head:session",
+            json!({"agent_id":"agent-a","run_id":"run-a"}),
+        )
+    };
+    serde_json::from_value(json!({
+        "owner":owner, "ref":"run:program", "scope_epoch":1, "kind":"ephemeral",
+        "attributes":attributes, "owner_authorized":true,
+        "parent":{"owner":owner,"ref":scope_ref,"scope_epoch":7}, "parent_state":"linked",
+    }))
+    .unwrap()
+}
+
+#[test]
+fn runner_notices_run_owned_task_sends_only_to_its_parent_session_scope() {
+    use crate::bash_background::registry::with_scope_spawn;
+
+    for (worker, name, expected_ref) in [
+        (false, "bash-f58a000000000001", "head:session"),
+        (true, "bash-f58a000000000002", "worker:session"),
+    ] {
+        let stamp = run_stamp(worker);
+        let task = with_scope_spawn(Some(stamp.clone()), || Completion::new(name, 0));
+        let capture = test_endpoint::capture(name, false);
+        let scheduler = Scheduler::default();
+        let mut watch = crate::protocol::BashPatternMatchFrame::new(
+            name, name, "watch-a", "ready", 0, "", true,
+        );
+        watch.launching_identity = Some(task.route.task_identity());
+
+        for (frame, id_prefix) in [
+            (task.reminder(600_000), "aft:bash-reminder:"),
+            (PushFrame::BashPatternMatch(watch), "aft:bash-watch:"),
+            (task.frame(), "aft:bash:"),
+        ] {
+            let finished = task.finished;
+            assert!(offer(
+                &scheduler,
+                task.registry.clone(),
+                frame,
+                PathBuf::new(),
+                false,
+                move || finished,
+            ));
+            assert!(matches!(step(&scheduler, Instant::now()), Next::Done));
+            let notice = capture.receiver.try_recv().unwrap();
+            assert_eq!(notice.session, name);
+            assert_eq!(
+                notice.scope,
+                Some(ScopeSelector::new(
+                    stamp.owner.clone(),
+                    expected_ref,
+                    Some(7)
+                )),
+                "{id_prefix} must never route under the run scope"
+            );
+            assert!(notice.request["params"]["send_id"]
+                .as_str()
+                .unwrap()
+                .starts_with(id_prefix));
+            let expected_delivery = if id_prefix == "aft:bash:" && !worker {
+                json!(["tool_result", "steer", "idle_start"])
+            } else {
+                json!(["tool_result", "steer"])
+            };
+            assert_eq!(notice.request["params"]["delivery"], expected_delivery);
+        }
+        assert!(capture.receiver.try_recv().is_err());
+        assert!(task.delivered());
+        assert_eq!(
+            task.registry.notice_metadata(name).unwrap().scope,
+            Some(stamp),
+            "notice delivery must not change the recorded lifecycle scope"
+        );
+    }
+}
+
+#[test]
+fn runner_notices_run_owned_task_drops_notices_without_verified_parent() {
+    use crate::bash_background::registry::with_scope_spawn;
+
+    let linked = run_stamp(true);
+    let mut missing = linked.clone();
+    missing.parent = None;
+    let mut pending = linked;
+    pending.parent_state = Some(ParentState::Pending);
+    for (name, stamp) in [
+        ("bash-f58a000000000003", missing),
+        ("bash-f58a000000000004", pending),
+    ] {
+        let task = with_scope_spawn(Some(stamp), || Completion::new(name, 0));
+        let capture = test_endpoint::capture(name, false);
+        let scheduler = Scheduler::default();
+        for frame in [task.reminder(600_000), task.frame()] {
+            let finished = task.finished;
+            assert!(offer(
+                &scheduler,
+                task.registry.clone(),
+                frame,
+                PathBuf::new(),
+                false,
+                move || finished,
+            ));
+            assert!(matches!(step(&scheduler, Instant::now()), Next::Done));
+            assert!(capture.receiver.try_recv().is_err(), "{name} sent a notice");
+        }
+    }
+}
+
+#[test]
+fn code_search_nudge_on_a_run_uses_the_resolved_owner_scope() {
+    use super::super::test_support::route_identity;
+    use subc_protocol::call_mode::CallMode;
+
+    let (_root_dir, root) = super::super::test_support::test_root("run-code-search-nudge");
+    let session = "run-code-search-nudge";
+    let mut owner = super::super::test_support::route_identity_with_harness(
+        &root,
+        session,
+        BindTrust::FirstParty,
+        "broca",
+    );
+    let stamp = run_stamp(false);
+    let head = Arc::get_mut(&mut owner.0).unwrap();
+    let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut head.spawn_principal else {
+        panic!("head must have a runner bind");
+    };
+    *principal_id = Some("reserved:broca".into());
+    let mut head_stamp = ScopeStamp::new(stamp.owner.clone(), "head:session", 7, ScopeKind::Head);
+    head_stamp.owner_authorized = true;
+    head_stamp.attributes.agent_id = Some("agent-a".into());
+    head.scope = Some(head_stamp);
+    head.call_mode = CallMode::Classic;
+
+    let mut run = route_identity(&root, "program-session");
+    let data = Arc::get_mut(&mut run.0).unwrap();
+    data.call_mode = CallMode::Codemode;
+    data.scope = Some(stamp.clone());
+    let routes = HashMap::from([(route_key(1, 1), owner), (route_key(2, 1), run)]);
+    let codemode::Admission::Owner(effective) = codemode::admit(
+        &routes,
+        route_key(2, 1),
+        Some(&json!({"name":"bash"})),
+        |_| Some(Ok(Default::default())),
+    ) else {
+        panic!("run must act for the head");
+    };
+    let address = code_search_notice(&effective, "call-a")
+        .unwrap()
+        .address
+        .unwrap();
+    assert_eq!(address.identity.session, session);
+    assert_eq!(
+        address.scope,
+        Some(ScopeSelector::new(stamp.owner, "head:session", Some(7)))
+    );
 }
 
 fn advance_notice(

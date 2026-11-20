@@ -248,11 +248,7 @@ pub(crate) fn start(
     describe_supported: bool,
 ) -> Arc<Service> {
     let root = key(root);
-    if let Err(error) =
-        crate::db::open(&root.join("aft.db")).inspect(|connection| connection.close_in_background())
-    {
-        log::warn!("speech authority initialization unavailable: {error}");
-    }
+    let schema = crate::db::open(&root.join("aft.db"));
     let mut services = SERVICES
         .get_or_init(Default::default)
         .lock()
@@ -270,6 +266,10 @@ pub(crate) fn start(
         })
         .cloned()
         .unwrap_or_else(|| new_service(root.clone()));
+    match schema {
+        Ok(conn) => service.store.keep_schema_connection(conn),
+        Err(error) => log::warn!("speech authority initialization unavailable: {error}"),
+    }
     {
         let mut state = service
             .lifecycle

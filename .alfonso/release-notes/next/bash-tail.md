@@ -1,0 +1,1 @@
+- Finished shell commands can now show their last three output lines in CortexKit apps.

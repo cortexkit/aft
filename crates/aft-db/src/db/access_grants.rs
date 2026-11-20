@@ -399,7 +399,22 @@ pub fn insert_with_source(
     if !grant.path.is_absolute() {
         return Err(rusqlite::Error::InvalidQuery);
     }
-    let canonical = crate::policy_path::policy_path(&grant.path);
+    let mut resolved = grant.clone();
+    resolved.path = crate::policy_path::policy_path(&grant.path);
+    insert_resolved_with_source(conn, key, &resolved, card_ref, source)
+}
+
+/// Insert the already-resolved grant key without probing the filesystem.
+pub fn insert_resolved_with_source(
+    conn: &Connection,
+    key: &ScopeKey,
+    grant: &AccessGrant,
+    card_ref: Option<&str>,
+    source: Option<super::access_grant_rows::GrantSource>,
+) -> rusqlite::Result<()> {
+    if !grant.path.is_absolute() {
+        return Err(rusqlite::Error::InvalidQuery);
+    }
     conn.execute("INSERT INTO access_grants(owner,scope_ref,epoch,path,kind,mode,grant_id,granted_at_ms,card_ref,source)
         SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10 WHERE EXISTS (SELECT 1 FROM access_scopes WHERE owner=?1 AND scope_ref=?2 AND epoch=?3 AND ended=0)
         ON CONFLICT(owner,scope_ref,epoch,path,kind) DO UPDATE SET
@@ -408,7 +423,7 @@ pub fn insert_with_source(
           source=CASE WHEN excluded.mode='write' AND access_grants.mode<>'write' THEN excluded.source ELSE access_grants.source END,
          grant_id=coalesce(access_grants.grant_id,excluded.grant_id),
          mode=CASE WHEN excluded.mode='write' THEN 'write' ELSE access_grants.mode END",
-        params![key.owner,key.scope_ref,key.epoch.to_string(),canonical.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref,source.map(|source| source.as_str())])?;
+        params![key.owner,key.scope_ref,key.epoch.to_string(),grant.path.to_string_lossy(),match grant.kind {GrantKind::File=>"file",GrantKind::Subtree=>"subtree"},match grant.operation {AccessOperation::Read=>"read",AccessOperation::Write=>"write"},super::access_grant_rows::new_grant_id(),super::access_grant_rows::now_ms(),card_ref,source.map(|source| source.as_str())])?;
     aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(())
 }
@@ -423,7 +438,9 @@ pub fn revoke(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Resul
             path.to_string_lossy()
         ],
     )?;
-    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
+    if deleted > 0 {
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
+    }
     Ok(deleted)
 }
 

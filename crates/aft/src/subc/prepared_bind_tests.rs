@@ -151,6 +151,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
         &writer,
         &writer,
         &a0,
+        None,
         &frame,
         &app,
         &executor,

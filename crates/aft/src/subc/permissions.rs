@@ -18,6 +18,8 @@
 //! for a single file. `scope_label` is the sentence the page shows as given.
 use crate::access_policy::{AccessOperation, GrantKind};
 use crate::db::access_grant_rows::{GrantHolder, GrantRow};
+use crate::db::access_grants::ScopeKey;
+use crate::executor::Executor;
 use serde_json::{json, Map, Value};
 use std::path::{Path, PathBuf};
 use subc_protocol::{ErrorBody, Principal};
@@ -276,15 +278,25 @@ pub(super) fn not_found() -> Value {
 /// waits out a signal grace period, and the page's caller expects the reply
 /// sooner. A command that finishes on its own meanwhile keeps its own
 /// outcome; the page reads the final state on its next list.
-pub(super) fn stop_folder_tasks(
+pub(super) fn stop_folder_tasks(executor: &Executor, scope: &ScopeKey, path: &Path) -> usize {
+    let registries = executor
+        .actor_contexts()
+        .iter()
+        .map(|ctx| ctx.bash_background().clone())
+        .collect::<Vec<_>>();
+    stop_folder_tasks_in(&registries, scope, path)
+}
+
+pub(super) fn stop_folder_tasks_in(
     registries: &[crate::bash_background::registry::BgTaskRegistry],
-    row: &GrantRow,
+    scope: &ScopeKey,
+    path: &Path,
 ) -> usize {
     let held: Vec<_> = registries
         .iter()
         .flat_map(|registry| {
             registry
-                .folder_grant_tasks(&row.scope, &row.path)
+                .folder_grant_tasks(scope, path)
                 .into_iter()
                 .map(move |task| (registry.clone(), task))
         })

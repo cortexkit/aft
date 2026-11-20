@@ -28,6 +28,10 @@ use crate::le::{array, u16_at, u32_at, u64_at};
 const MAGIC: [u8; 8] = *b"AFTREC\0\0";
 const HEADER_LEN: usize = 48;
 
+pub(super) const fn encoded_len(payload_len: u64) -> u64 {
+    payload_len.saturating_add((HEADER_LEN + Digest128::LEN) as u64)
+}
+
 /// Records larger than this are refused before they are read whole, so a
 /// damaged length field cannot ask for an absurd allocation. The largest
 /// record is a full checkout state, well under this.
@@ -109,9 +113,7 @@ pub(crate) fn decode(
         return Err(RecordError::Invalid("no record magic"));
     }
     let payload_len = u64_at(bytes, 40);
-    if payload_len > MAX_PAYLOAD
-        || bytes.len() as u64 != HEADER_LEN as u64 + payload_len + Digest128::LEN as u64
-    {
+    if payload_len > MAX_PAYLOAD || bytes.len() as u64 != encoded_len(payload_len) {
         return Err(RecordError::Invalid("length does not match the file"));
     }
     let body_len = bytes.len() - Digest128::LEN;

@@ -14040,25 +14040,7 @@ fn runon_write_shapes_respect_snapshot_membership() {
     );
 }
 
-#[test]
-fn runon_write_return_paths_exempt_only_the_resolved_requested_file() {
-    let (_dir, mut request) = runon_cd_snapshot_fixture();
-    let root = Path::new(&request.workspace_key);
-    fs::create_dir_all(root.join("sub")).unwrap();
-    fs::write(root.join("sub/golden.rs"), "golden\n").unwrap();
-    hermetic_git(root, &["add", "sub/golden.rs"]);
-    request.cwd = root.join("sub").to_string_lossy().into_owned();
-    request.return_paths = vec!["./golden.rs".into()];
-    assert!(runon_write_refusal(
-        "python3 -c 'open(\"golden.rs\", \"w\").write(\"new\")'",
-        &request
-    )
-    .is_none());
-    request.return_paths = vec!["other.rs".into()];
-    assert!(runon_write_refusal("echo new > golden.rs", &request).is_some());
-    request.return_paths = vec!["golden.rs".into()];
-    assert!(runon_write_refusal("echo new > ../other.rs", &request).is_some());
-}
+include!("remote_write_guard_tests.rs");
 
 #[test]
 fn runon_write_formatter_workdir_accepts_one_returned_file() {

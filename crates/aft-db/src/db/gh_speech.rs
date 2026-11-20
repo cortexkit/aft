@@ -78,13 +78,20 @@ INSERT OR IGNORE INTO gh_speech_initialization(singleton,initialized) VALUES(1,0
 "#;
 
 pub fn connect(path: &Path) -> rusqlite::Result<TrackedConnection> {
+    connect_with_busy_timeout(path, BUSY_TIMEOUT)
+}
+
+pub fn connect_with_busy_timeout(
+    path: &Path,
+    timeout: Duration,
+) -> rusqlite::Result<TrackedConnection> {
     let conn = TrackedConnection::open_path_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         SqliteStore::AftDb,
     )?;
     conn.close_in_background();
-    conn.busy_timeout(BUSY_TIMEOUT)?;
+    conn.busy_timeout(timeout)?;
     conn.pragma_update(None, "synchronous", "FULL")?;
     Ok(conn)
 }

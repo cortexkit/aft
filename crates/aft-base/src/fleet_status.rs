@@ -542,11 +542,15 @@ impl From<&StatusWireRequest> for FleetRouteIdentity {
 /// Connect a management client using the daemon's authenticated subc dial path.
 /// Profile and the status publisher share this helper so there is one client
 /// implementation and one connection-file/authentication behavior.
+///
+/// `owner` is a fixed label naming the caller; it keys the live-connection
+/// gauge that AFT logs per owner.
 pub async fn connect_subc_consumer(
+    owner: &'static str,
     connection_file: &Path,
     options: ConsumerOptions,
 ) -> Result<SubcConsumer, subc_client_rs::ConsumerError> {
-    crate::registration::connect_consumer(connection_file, options).await
+    crate::registration::connect_consumer(owner, connection_file, options).await
 }
 
 pub fn spawn_fleet_status_dial(
@@ -581,7 +585,7 @@ async fn run_fleet_status_dial(
             call_timeout: STATUS_CADENCE,
             ..ConsumerOptions::default()
         };
-        match connect_subc_consumer(&connection_file, options).await {
+        match connect_subc_consumer("fleet_status", &connection_file, options).await {
             Ok(consumer) => break consumer,
             Err(error) => {
                 client.set_route_live(false);

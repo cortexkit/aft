@@ -104,7 +104,13 @@ fn fixture(tool: &str, name: &str) -> Fixture {
     call.schema_pin = Some(
         crate::subc::tool_views::SHIPPED
             .keys()
-            .find(|pin| pin.starts_with(&format!("tp1:{tool}:")))
+            .find(|pin| {
+                if tool == "bash" {
+                    crate::subc::tool_views::has_bash_tail(pin)
+                } else {
+                    pin.starts_with(&format!("tp1:{tool}:"))
+                }
+            })
             .unwrap()
             .clone(),
     );
@@ -136,12 +142,22 @@ fn task() -> PersistedTask {
         false,
     )
 }
+fn terminal_bodies(metadata: &PersistedTask, stdout: &str, stderr: &str) -> BashBodies {
+    let mut bodies = bash_bodies(
+        metadata,
+        Some((stdout.len() + stderr.len()) as u64),
+        Some((stdout.into(), stderr.into())),
+    );
+    bodies.tail = bash_tail::from_streams(metadata, stdout, stderr, |text| Some(text.into()));
+    bodies
+}
+
 fn terminal(f: &Fixture, display: &mut TaskDisplay, status: BgTaskStatus, exit: Option<i64>) {
     let mut metadata = task();
     metadata.status = status;
     metadata.exit_code = exit;
     metadata.group_kill_sent = metadata.status == BgTaskStatus::Killed;
-    let bodies = bash_bodies(&metadata, Some(3), Some(("ok\n".into(), "".into())));
+    let bodies = terminal_bodies(&metadata, "ok\n", "");
     let snapshot = display.clone();
     if display.reply_produced && display.deferred {
         display.attempted = true;
@@ -149,6 +165,77 @@ fn terminal(f: &Fixture, display: &mut TaskDisplay, status: BgTaskStatus, exit: 
     bash_terminal(&snapshot, bodies, "bash-demo1", Some(2400));
     let capture = f.capture.lock().unwrap();
     assert!(capture.terminal || capture.finished);
+}
+
+#[test]
+fn bash_tail_foreground_publishes_after_record_and_detail_only_when_nonempty() {
+    for (name, stdout, expected_tail) in [
+        ("bash-tail-finished", "ok\n", Some(json!([{"text":"ok"}]))),
+        ("bash-tail-empty", "\n\x1b[0m\t\n", None),
+    ] {
+        let f = fixture("bash", name);
+        let _active = enter(Some(&f.key));
+        let mut display = current_task().unwrap();
+        let mut metadata = task();
+        metadata.status = BgTaskStatus::Completed;
+        metadata.exit_code = Some(0);
+        bash_reply(&mut display, terminal_bodies(&metadata, stdout, ""), false);
+        reply(&f.key, false, false, None);
+        reply(&f.key, false, false, None);
+
+        let writes = publications();
+        assert_eq!(writes[0].kind, DisplayKind::Record);
+        assert!(writes[0].body.get("tail").is_none());
+        assert_eq!(writes[1].kind, DisplayKind::Detail);
+        assert_eq!(writes[1].body["stdout"], stdout);
+        if let Some(tail) = expected_tail {
+            assert_eq!(writes.len(), 3);
+            assert_eq!(writes[2].kind, DisplayKind::Completion);
+            assert_eq!(writes[2].body["phase"], "foreground_finished");
+            assert_eq!(writes[2].body["tail"], tail);
+        } else {
+            assert_eq!(writes.len(), 2);
+        }
+    }
+}
+
+#[test]
+fn bash_tail_matches_occipital_line_bytes_without_inferring_tone_from_text() {
+    let fixture = include_bytes!(
+        "../../../../tests/fixtures/tool_views/phone-reader-tool-tail-v1/03-records.json"
+    );
+    let mut expected: Value = serde_json::from_slice(fixture).unwrap();
+    let mut metadata = task();
+    metadata.status = BgTaskStatus::Completed;
+    let stdout = "discarded\nrunning 12 tests\n";
+    let stderr = "test result: ok. 12 passed; 0 failed\nwarning: 1 test took over 60 s\n";
+    metadata.exit_code = Some(0);
+    let success = terminal_bodies(&metadata, stdout, stderr).tail.unwrap();
+    assert_eq!(success[2]["tone"], "muted");
+    // The reference supplies a danger tone on an invented successful run.
+    // AFT produces that same line representation only on a failed run.
+    metadata.exit_code = Some(1);
+    expected["result"]["calls"]["ck_test"]["completion"]["tail"] =
+        terminal_bodies(&metadata, stdout, stderr).tail.unwrap();
+    assert_eq!(
+        cortexkit_role_tool_display::canonical_body(expected.as_object().unwrap()).unwrap(),
+        fixture.as_slice(),
+    );
+}
+
+#[test]
+fn bash_tail_strips_ansi_and_controls_before_counting_unicode_scalars() {
+    let mut metadata = task();
+    metadata.status = BgTaskStatus::Completed;
+    metadata.exit_code = Some(0);
+    metadata.mode = crate::bash_background::persistence::BgMode::Pty;
+    let capped = "é🦀".repeat(100);
+    let stdout =
+        format!("first\r\n\x1b]0;discard this title\x07\t\r\n\x1b[31m{capped}Z\x1b[0m\n\x00\n");
+    assert_eq!(
+        terminal_bodies(&metadata, &stdout, "duplicate PTY capture").tail,
+        Some(json!([{"text":"first"}, {"text":capped}])),
+    );
 }
 
 #[test]
@@ -225,6 +312,7 @@ fn held_bash_foreground_completes_once_after_the_reply_is_produced() {
         .collect();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].body["phase"], "foreground_finished");
+    assert_eq!(completed[0].body["tail"], json!([{"text":"ok"}]));
     assert!(completed[0].body.get("taskId").is_none());
     assert!(completed[0].body.get("heldMs").is_some());
 }
@@ -244,7 +332,7 @@ fn held_background_case(name: &str, status: BgTaskStatus, exit: Option<i64>, rea
         "releasing a hold into background work is not a completion"
     );
     terminal(&f, &mut display, status.clone(), exit);
-    terminal(&f, &mut display, status, exit);
+    terminal(&f, &mut display, status.clone(), exit);
     let writes = publications();
     let completed: Vec<_> = writes
         .iter()
@@ -252,6 +340,12 @@ fn held_background_case(name: &str, status: BgTaskStatus, exit: Option<i64>, rea
         .collect();
     assert_eq!(completed.len(), 1);
     assert_eq!(completed[0].body["phase"], "background_finished");
+    let tail = if status == BgTaskStatus::Completed && exit == Some(0) {
+        json!([{"text":"ok"}])
+    } else {
+        json!([{"text":"ok","tone":"danger"}])
+    };
+    assert_eq!(completed[0].body["tail"], tail);
     assert!(completed[0].body["heldMs"].as_u64().unwrap() >= 2000);
     assert_eq!(
         completed[0].body.get("reason").and_then(Value::as_str),
@@ -949,7 +1043,7 @@ fn a_failed_task_without_exit_proof_does_not_claim_a_process_exit() {
     let mut metadata = task();
     metadata.status = BgTaskStatus::Failed;
     metadata.exit_code = None;
-    let (record, _) = bash_bodies(&metadata, Some(0), None);
+    let record = bash_bodies(&metadata, Some(0), None).facts;
     assert_eq!(record["outcome"], "error");
     assert!(record.get("exitCode").is_none());
     assert!(record.get("endReason").is_none());

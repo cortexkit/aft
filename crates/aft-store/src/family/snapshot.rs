@@ -33,10 +33,9 @@ fn shared_segments() -> &'static Mutex<HashMap<SharedKey, Weak<Segment>>> {
 /// has doubled.
 static SWEEP_AT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
-/// How many times a reader starts again when the generation it read is
-/// reclaimed before its lease takes hold. Each retry reads a newer
-/// generation, so needing more than a few means something is wrong.
-const MAX_TRIES: u32 = 16;
+/// How many attempts a reader gets if cleanup removes a listed manifest or
+/// begins before the reader can protect its chosen generation with a lease.
+pub(super) const MAX_TRIES: u32 = 16;
 
 /// A consistent view of one generation. Everything its manifest names stays
 /// on disk until the snapshot is dropped.
@@ -52,7 +51,9 @@ pub struct Snapshot {
 
 pub(super) fn take(family: &Family) -> Result<Snapshot, FamilyError> {
     for _ in 0..MAX_TRIES {
-        let (manifest, skipped_manifests) = family.newest_manifest()?;
+        let Some((manifest, skipped_manifests)) = family.list_newest_manifest()? else {
+            continue;
+        };
         let generation = manifest.generation();
         if generation == Generation::EMPTY {
             return Ok(Snapshot {

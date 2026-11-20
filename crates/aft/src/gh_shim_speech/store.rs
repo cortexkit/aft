@@ -1,6 +1,8 @@
 //! Durable speech state. History/task JSON cannot recreate these associations.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 
@@ -10,6 +12,7 @@ use crate::gh_shim_speech::model::{
 use crate::gh_shim_speech::{Code, Refusal};
 
 use crate::db::access_grants::ScopeKey;
+use crate::db::file_identity::{self, FileIdentity};
 use crate::db::gh_speech::{self as rows, AuthorityRow, ScopeEndRow};
 use crate::db::TrackedConnection;
 use crate::gh_shim_speech::scope::ValidatedEnd;
@@ -21,7 +24,18 @@ pub(crate) use legacy_dispatch::LegacyDispatchStatus;
 #[derive(Clone, Debug)]
 pub(crate) struct Store {
     path: PathBuf,
+    anchor: Arc<OnceLock<Arc<Anchor>>>,
 }
+
+type Anchor = Mutex<TrackedConnection>;
+
+#[derive(Eq, Hash, PartialEq)]
+enum AnchorKey {
+    File(FileIdentity),
+    Path(PathBuf),
+}
+
+static ANCHORS: OnceLock<Mutex<HashMap<AnchorKey, Weak<Anchor>>>> = OnceLock::new();
 
 #[derive(Clone, Debug)]
 pub(crate) struct StoredAuthority {
@@ -181,7 +195,10 @@ fn check_scopes(conn: &rusqlite::Connection, launch: &LaunchAuthority) -> Result
 
 impl Store {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            anchor: Arc::default(),
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {
@@ -189,7 +206,62 @@ impl Store {
     }
 
     pub(crate) fn connect(&self) -> Result<TrackedConnection, Refusal> {
-        let conn = rows::connect(&self.path).map_err(db_error)?;
+        self.connect_with(|| rows::connect(&self.path))
+    }
+
+    fn connect_with(
+        &self,
+        open: impl Fn() -> rusqlite::Result<TrackedConnection>,
+    ) -> Result<TrackedConnection, Refusal> {
+        let open = || Self::checked_connection(open().map_err(db_error)?);
+        self.keep_anchor(open)?;
+        open()
+    }
+
+    pub(crate) fn keep_schema_connection(&self, conn: TrackedConnection) {
+        conn.close_in_background();
+        let Ok(()) = self.keep_anchor(|| Ok::<_, std::convert::Infallible>(conn));
+    }
+
+    fn keep_anchor<E>(&self, open: impl FnOnce() -> Result<TrackedConnection, E>) -> Result<(), E> {
+        if self.anchor.get().is_some() {
+            return Ok(());
+        }
+
+        // An idle connection keeps the database open while SQLite handles are
+        // closed in the background. Only SQLite's last close takes the exclusive
+        // lock for WAL cleanup. Queue the anchor's close behind request handles.
+        let _filesystem = file_identity::filesystem_guard();
+        let mut anchors = ANCHORS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if self.anchor.get().is_some() {
+            return Ok(());
+        }
+        let key = file_identity::identity_of(&self.path).map_or_else(
+            || {
+                AnchorKey::Path(
+                    self.path
+                        .canonicalize()
+                        .unwrap_or_else(|_| self.path.clone()),
+                )
+            },
+            AnchorKey::File,
+        );
+        anchors.retain(|_, anchor| anchor.strong_count() != 0);
+        let anchor = if let Some(anchor) = anchors.get(&key).and_then(Weak::upgrade) {
+            anchor
+        } else {
+            let anchor = Arc::new(Mutex::new(open()?));
+            anchors.insert(key, Arc::downgrade(&anchor));
+            anchor
+        };
+        self.anchor.get_or_init(|| anchor);
+        Ok(())
+    }
+
+    fn checked_connection(conn: TrackedConnection) -> Result<TrackedConnection, Refusal> {
         let mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .map_err(db_error)?;
@@ -268,7 +340,12 @@ impl Store {
                 "task_unverifiable",
             ));
         }
-        let mut conn = self.connect()?;
+        let mut conn = self.connect_with(|| {
+            rows::connect_with_busy_timeout(&self.path, crate::db::TOOL_RETRY_BUSY_WAIT)
+        })?;
+        // Reading the committed revocation does not need the write lock. Recheck
+        // inside the transaction in case a revocation committed while we waited.
+        check_not_revoked(&conn, incarnation)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;

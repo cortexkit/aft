@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use aft_store::cache::BlockCache;
 use aft_store::checkout::{CheckoutState, PathKind};
 use aft_store::family::{Family, Publication, Snapshot, WriteSession};
-use aft_store::ids::{ContentKey, Generation, SegmentId};
+use aft_store::ids::{ContentKey, Digest128, Generation, SegmentId};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::vector::{
     Chunk, ChunkDetail, ChunkMapKey, FileDetails, Member, MemberSet, ModelId, ModelIdentity,
@@ -1160,10 +1160,12 @@ pub struct VectorPlane {
     max_files: usize,
     loaded: Mutex<Arc<Loaded>>,
     members: Mutex<Option<Arc<Members>>>,
+    fill_queue: Mutex<Option<FillQueue>>,
     /// The old meaning index whose vectors fills take where they match.
     old: Option<OldIndex>,
     /// When a fill round merges the family's vector segments.
     merge: MergeLimits,
+    merge_due: Mutex<Option<(Generation, u64)>>,
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -1181,8 +1183,10 @@ impl VectorPlane {
             max_files,
             loaded: Mutex::new(Arc::new(Loaded::empty())),
             members: Mutex::new(None),
+            fill_queue: Mutex::new(None),
             old: None,
             merge: MergeLimits::default(),
+            merge_due: Mutex::default(),
         }
     }
 
@@ -1383,10 +1387,96 @@ struct RoundFile {
     chunks: Result<Vec<(TextDigest, CutChunk)>, String>,
 }
 
+/// Pending work across background jobs, each of which normally publishes
+/// one batch. Keeping just path and content keys does not keep an older
+/// checkout view or vector snapshot alive.
+struct FillQueue {
+    text: String,
+    parse_gaps: Digest128,
+    segments: Vec<SegmentId>,
+    files: usize,
+    admitted: usize,
+    embedded: usize,
+    awaiting_publication: usize,
+    /// Reverse path order, so consuming the next path does not shift the rest.
+    pending: Vec<(Vec<u8>, ContentKey)>,
+}
+
+aft_store::heap_bytes_of_fields!(FillQueue {
+    text,
+    parse_gaps,
+    segments,
+    files,
+    admitted,
+    embedded,
+    awaiting_publication,
+    pending
+});
+
+fn vector_membership(loaded: &Loaded) -> Vec<SegmentId> {
+    loaded
+        .shared
+        .iter()
+        .flat_map(|shared| shared.segments().map(|segment| segment.id()))
+        .collect()
+}
+
+impl FillQueue {
+    fn survey(view: &CheckoutView, loaded: &Loaded, max_files: usize) -> Result<Self, DataError> {
+        #[cfg(test)]
+        FILL_SURVEYS.with(|surveys| surveys.set(surveys.get() + 1));
+        let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
+        let surveyed = survey(view, loaded, index.as_ref(), max_files)?;
+        let mut queue = Self {
+            text: view.text_generation(),
+            parse_gaps: view.parse_gaps_identity(),
+            segments: vector_membership(loaded),
+            files: surveyed.len(),
+            admitted: 0,
+            embedded: 0,
+            awaiting_publication: 0,
+            pending: Vec::new(),
+        };
+        for file in surveyed {
+            if file.gap.is_some() || !file.admitted {
+                continue;
+            }
+            queue.admitted += 1;
+            if !file.kind.has_content() {
+                continue;
+            }
+            if file.done(index.as_ref()) {
+                queue.embedded += 1;
+            } else if native_path(&file.path).is_some_and(|path| is_luau(&path))
+                && view.awaits_parse_publication(&file.path)
+            {
+                queue.awaiting_publication += 1;
+            } else {
+                queue.pending.push((file.path, file.content));
+            }
+        }
+        queue.pending.reverse();
+        Ok(queue)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FILL_SURVEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn check_cancelled() -> Result<(), DataError> {
+    if crate::executor::current_job_cancelled() {
+        return Err(DataError::Cancelled);
+    }
+    Ok(())
+}
+
 /// Waits up to [`WRITER_WAIT`] for the family's writer.
 fn writer(family: &Family) -> Result<WriteSession<'_>, DataError> {
     let deadline = Instant::now() + WRITER_WAIT;
     loop {
+        check_cancelled()?;
         if let Some(session) = family.try_write().map_err(store_error)? {
             return Ok(session);
         }
@@ -1445,6 +1535,7 @@ impl VectorPlane {
         rounds: usize,
         progress: &mut dyn FnMut(FillProgress),
     ) -> Result<FillReport, DataError> {
+        check_cancelled()?;
         let mut report = FillReport::default();
         let Some(view) = self.checkout.view() else {
             return Ok(report);
@@ -1453,36 +1544,26 @@ impl VectorPlane {
         let model = &self.producer.model;
         let dimensions = model.dimensions as usize;
         let mut loaded = self.load()?;
-        let queue = {
-            let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
-            let surveyed = survey(&view, &loaded, index.as_ref(), self.max_files)?;
-            report.files = surveyed.len();
-            let mut queue = Vec::new();
-            for file in surveyed {
-                if file.gap.is_some() {
-                    continue;
-                }
-                if !file.admitted {
-                    continue;
-                }
-                report.files_admitted += 1;
-                // Too large or unreadable: nothing to embed.
-                if !file.kind.has_content() {
-                    continue;
-                }
-                if file.done(index.as_ref()) {
-                    report.files_already_embedded += 1;
-                } else if native_path(&file.path).is_some_and(|path| is_luau(&path))
-                    && view.awaits_parse_publication(&file.path)
-                {
-                    report.files_awaiting_publication += 1;
-                } else {
-                    queue.push((file.path, file.content));
-                }
+        let previous = self
+            .fill_queue
+            .lock()
+            .expect("no panics while holding it")
+            .take();
+        let mut queue = match previous {
+            Some(queue)
+                if queue.text == view.text_generation()
+                    && queue.parse_gaps == view.parse_gaps_identity()
+                    && queue.segments == vector_membership(&loaded) =>
+            {
+                queue
             }
-            queue
+            _ => FillQueue::survey(&view, &loaded, self.max_files)?,
         };
-        report.files_queued = queue.len();
+        report.files = queue.files;
+        report.files_admitted = queue.admitted;
+        report.files_already_embedded = queue.embedded;
+        report.files_awaiting_publication = queue.awaiting_publication;
+        report.files_queued = queue.pending.len();
         #[cfg(all(
             test,
             feature = "wasm-grammars",
@@ -1492,12 +1573,16 @@ impl VectorPlane {
         super::test_gates::arrive(view.root(), super::test_gates::Point::FillSurvey);
         let per_vector = VectorSectionsBuilder::bytes_per_vector(dimensions);
         let mut embed_rows = |texts: Vec<String>| embed(texts);
-        let mut queue = queue.into_iter().peekable();
         let mut files_done = 0;
         let mut rounds_run = 0;
-        while queue.peek().is_some() {
+        let mut reusable = rounds == 1;
+        if rounds > 0 && queue.pending.is_empty() {
+            self.maybe_merge(&mut loaded, None, &mut report)?;
+            reusable &= report.merges == 0;
+        }
+        while !queue.pending.is_empty() {
             if rounds_run == rounds {
-                report.files_left += queue.count();
+                report.files_left += queue.pending.len();
                 break;
             }
             rounds_run += 1;
@@ -1519,7 +1604,8 @@ impl VectorPlane {
                 while round.len() < budget.files_per_round.max(1)
                     && (wanted.len() + imported.len()).saturating_mul(per_vector) < ROUND_BYTES
                 {
-                    let Some((path, content)) = queue.next() else {
+                    check_cancelled()?;
+                    let Some((path, content)) = queue.pending.pop() else {
                         break;
                     };
                     let started = Instant::now();
@@ -1605,6 +1691,7 @@ impl VectorPlane {
                 let lock = FillLock::take(self.checkout.family_dir(), &mut || progress(waiting))?;
                 report.wait_ms += elapsed_ms(started);
                 loaded = self.load()?;
+                reusable &= queue.segments == vector_membership(&loaded);
                 progress(FillProgress {
                     waiting: false,
                     ..waiting
@@ -1651,6 +1738,7 @@ impl VectorPlane {
             let mut refused: HashMap<TextDigest, String> = HashMap::new();
             let started = Instant::now();
             for batch in wanted.chunks(budget.max_batch.max(1)) {
+                check_cancelled()?;
                 report.embed_calls += 1;
                 let texts = batch.iter().map(|(_, text)| text.clone()).collect();
                 let rows = match execute_build_embedding_batch(texts, &mut embed_rows) {
@@ -1747,37 +1835,19 @@ impl VectorPlane {
             let mut stored_at_ms = None;
             if builder.chunk_maps() > 0 || builder.vectors() > 0 {
                 let started = Instant::now();
-                report.segment_bytes += Self::publish(&parts, builder)?;
+                let (base, generation, bytes) = Self::publish(&parts, builder)?;
+                report.segment_bytes += bytes;
                 stored_at_ms = Some(unix_ms());
                 report.publish_ms += elapsed_ms(started);
                 report.segments_published += 1;
                 report.files_filled += filled;
+                // Advance over our own publication only, not a publication
+                // that might also have changed maps for other queued files.
+                reusable &= base == loaded.generation;
                 loaded = self.load()?;
-                // Each round adds a vector segment and nothing else folds
-                // them, so past `MERGE_AT` this round merges them: once at
-                // most, under the round's fill lock, or one taken now when
-                // no other fill holds it (that fill merges after its round).
-                if loaded.open.len() > self.merge.merge_at {
-                    let taken = match round_lock {
-                        Some(_) => None,
-                        None => FillLock::try_take(self.checkout.family_dir())?,
-                    };
-                    if round_lock.is_some() || taken.is_some() {
-                        match self.merge_segments() {
-                            Ok(Some(merged)) => {
-                                report.merges += 1;
-                                report.merged_segments += merged.merged;
-                                report.merge_ms += merged.ms;
-                                loaded = self.load()?;
-                            }
-                            Ok(None) => {}
-                            Err(error) => crate::slog_warn!(
-                                "data layer could not merge the vector segments of {}: {error}",
-                                parts.root.display()
-                            ),
-                        }
-                    }
-                }
+                reusable &= loaded.generation == generation;
+                self.maybe_merge(&mut loaded, round_lock.as_ref(), &mut report)?;
+                reusable &= report.merges == 0;
             }
             progress(FillProgress {
                 files_done,
@@ -1788,27 +1858,107 @@ impl VectorPlane {
                 stored_at_ms,
             });
             if report.error.is_some() {
-                report.files_left += queue.count();
+                report.files_left += queue.pending.len();
                 break;
             }
+        }
+        if reusable
+            && report.error.is_none()
+            && report.files_changed == 0
+            && report.files_left == queue.pending.len()
+        {
+            queue.embedded += report.files_filled + report.files_filled_elsewhere;
+            queue.segments = vector_membership(&loaded);
+            *self.fill_queue.lock().expect("no panics while holding it") = Some(queue);
+            self.checkout.touch_memory();
         }
         Ok(report)
     }
 
+    fn maybe_merge(
+        &self,
+        loaded: &mut Arc<Loaded>,
+        round_lock: Option<&FillLock>,
+        report: &mut FillReport,
+    ) -> Result<(), DataError> {
+        if !self.merge_ready(loaded) {
+            return Ok(());
+        }
+        let taken = if round_lock.is_none() {
+            FillLock::try_take(self.checkout.family_dir())?
+        } else {
+            None
+        };
+        if round_lock.is_some() || taken.is_some() {
+            match self.merge_segments() {
+                Ok(Some(merged)) => {
+                    report.merges += 1;
+                    report.merged_segments += merged.merged;
+                    report.merge_ms += merged.ms;
+                    *loaded = self.load()?;
+                }
+                Ok(None) => {}
+                Err(error) => crate::slog_warn!(
+                    "data layer could not merge the vector segments of {}: {error}",
+                    self.checkout.root().display(),
+                ),
+            }
+        }
+        Ok(())
+    }
+
+    /// Memoize when a second segment ages into eligibility. No timer is
+    /// scheduled: another fill or publication checks again, so an idle
+    /// checkout can keep some young segments unmerged.
+    fn merge_ready(&self, loaded: &Loaded) -> bool {
+        if loaded.open.len() <= self.merge.merge_at {
+            return false;
+        }
+        let mut memo = self.merge_due.lock().expect("no panics while holding it");
+        let due = match *memo {
+            Some((generation, due)) if generation == loaded.generation => due,
+            _ => {
+                let mut oldest = [u64::MAX; 2];
+                for segment in loaded.open.values().filter(|segment| vector_only(segment)) {
+                    let created = segment.created_unix_ms();
+                    if created < oldest[0] {
+                        oldest = [created, oldest[0]];
+                    } else if created < oldest[1] {
+                        oldest[1] = created;
+                    }
+                }
+                let due = oldest[1].saturating_add(self.merge.grace_ms());
+                *memo = Some((loaded.generation, due));
+                due
+            }
+        };
+        merge_now_ms() >= due
+    }
+
     /// Publishes `builder` as one new segment, in a generation that
-    /// changes no checkout's state. Returns the segment's length.
-    fn publish(parts: &VectorParts<'_>, builder: VectorSectionsBuilder) -> Result<u64, DataError> {
+    /// changes no checkout's state. Returns the before and after generations
+    /// and the segment's length.
+    fn publish(
+        parts: &VectorParts<'_>,
+        builder: VectorSectionsBuilder,
+    ) -> Result<(Generation, Generation, u64), DataError> {
         let mut session = writer(parts.family)?;
+        let base = session.base().generation();
         let mut pending = session.create_segment().map_err(store_error)?;
         builder.write(pending.writer()).map_err(store_error)?;
         let id = session.finish_segment(pending).map_err(store_error)?;
-        session
+        check_cancelled()?;
+        let generation = session
             .publish(&Publication {
                 add_segments: vec![id],
                 ..Publication::default()
             })
             .map_err(store_error)?;
-        Ok(session.base().segment(id).map_or(0, |entry| entry.len))
+        Ok((
+            base,
+            generation,
+            session.base().segment(id).map_or(0, |entry| entry.len),
+        ))
     }
 
     /// Merges vector segments of this plane's model into one, when the
@@ -1869,6 +2019,28 @@ impl Default for MergeLimits {
     }
 }
 
+impl MergeLimits {
+    fn grace_ms(self) -> u64 {
+        u64::try_from(self.grace.as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+fn vector_only(segment: &Segment) -> bool {
+    segment.sections().all(|(_, section)| {
+        aft_store::vector::KNOWN
+            .iter()
+            .any(|known| known.kind == section.id.kind)
+    })
+}
+
+fn merge_now_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = MERGE_NOW_MS.with(std::cell::Cell::get) {
+        return now;
+    }
+    unix_ms()
+}
+
 /// Merges vector segments of `model` into one new segment, when the
 /// newest generation holds more than `limits.merge_at` of them.
 ///
@@ -1898,6 +2070,8 @@ pub(crate) fn merge_vector_segments(
     bound: &[CheckoutState],
     limits: MergeLimits,
 ) -> Result<Option<MergeReport>, DataError> {
+    #[cfg(test)]
+    MERGE_WRITER_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
     let started = Instant::now();
     let mut session = writer(parts.family)?;
     // With the writer held, this is the generation the merge changes.
@@ -1931,6 +2105,19 @@ pub(crate) fn merge_vector_segments(
     if ours.len() <= limits.merge_at {
         return Ok(None);
     }
+    let now = merge_now_ms();
+    let eligible = ours
+        .iter()
+        .copied()
+        .filter(|&place| {
+            let segment = &opened[place];
+            vector_only(segment)
+                && now.saturating_sub(segment.created_unix_ms()) >= limits.grace_ms()
+        })
+        .collect::<Vec<_>>();
+    if eligible.len() < 2 {
+        return Ok(None);
+    }
     let ours_at = |place: usize| vectors[place].as_ref().expect("a segment of the model");
 
     // The newest holder of each chunk map and vector of the model.
@@ -1956,6 +2143,20 @@ pub(crate) fn merge_vector_segments(
     }
     let mut reached_maps = HashMap::<usize, Vec<(ContentKey, Vec<u8>)>>::new();
     let mut reached_texts = HashMap::<usize, HashSet<TextDigest>>::new();
+    let mut reach_text = |text| {
+        if let Some(&holder) = texts.get(&text) {
+            reached_texts.entry(holder).or_default().insert(text);
+        }
+    };
+    for &place in &ours {
+        visit_young_map_texts(
+            &opened[place],
+            ours_at(place),
+            now,
+            limits.grace_ms(),
+            &mut reach_text,
+        )?;
+    }
     let mut asked = HashSet::new();
     for state in states.iter().chain(bound) {
         for record in state.paths() {
@@ -1978,12 +2179,7 @@ pub(crate) fn merge_vector_segments(
                 record.path.clone(),
             ));
             for chunk in chunks {
-                if let Some(&text_holder) = texts.get(&chunk.text) {
-                    reached_texts
-                        .entry(text_holder)
-                        .or_default()
-                        .insert(chunk.text);
-                }
+                reach_text(chunk.text);
             }
         }
     }
@@ -1991,24 +2187,10 @@ pub(crate) fn merge_vector_segments(
     // The segments to merge: vector-only and old enough, fewest reached
     // vector bytes first, cut where the copied bytes would pass the budget.
     let per_vector = VectorSectionsBuilder::bytes_per_vector(model.dimensions as usize);
-    let now = unix_ms();
-    let grace = u64::try_from(limits.grace.as_millis()).unwrap_or(u64::MAX);
     let mut candidates = Vec::new();
-    for &place in &ours {
-        let segment = &opened[place];
-        let vector_only = aft_store::text::TextSegment::open(segment)
-            .map_err(store_error)?
-            .is_none()
-            && aft_store::content::ContentSegment::open(segment)
-                .map_err(store_error)?
-                .is_none()
-            && aft_store::graph::GraphSegment::open(segment)
-                .map_err(store_error)?
-                .is_none();
-        if vector_only && now.saturating_sub(segment.created_unix_ms()) >= grace {
-            let bytes = reached_texts.get(&place).map_or(0, HashSet::len) * per_vector;
-            candidates.push((bytes, place));
-        }
+    for place in eligible {
+        let bytes = reached_texts.get(&place).map_or(0, HashSet::len) * per_vector;
+        candidates.push((bytes, place));
     }
     candidates.sort_unstable();
     let mut taken = Vec::new();
@@ -2065,6 +2247,7 @@ pub(crate) fn merge_vector_segments(
     let mut pending = session.create_segment().map_err(store_error)?;
     builder.write(pending.writer()).map_err(store_error)?;
     let id = session.finish_segment(pending).map_err(store_error)?;
+    check_cancelled()?;
     session
         .publish(&Publication {
             add_segments: vec![id],
@@ -2085,14 +2268,40 @@ pub(crate) fn merge_vector_segments(
     Ok(Some(report))
 }
 
+#[cfg(test)]
+thread_local! {
+    static MERGE_WRITER_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MERGE_NOW_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// A young chunk map can belong to another process's unpublished edit and
+/// reuse vectors from older segments. Protect those vectors even when no
+/// published or locally bound checkout names the map.
+fn visit_young_map_texts(
+    segment: &Segment,
+    vectors: &VectorSegment<'_>,
+    now: u64,
+    grace: u64,
+    mut visit: impl FnMut(TextDigest),
+) -> Result<(), DataError> {
+    if now.saturating_sub(segment.created_unix_ms()) < grace {
+        for ordinal in 0..vectors.chunk_map_count() {
+            for chunk in vectors.chunk_map_at(ordinal).map_err(store_error)? {
+                visit(chunk.text);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Which of `segments` (one generation's, in manifest order) hold vector
 /// units a reader of `states` needs, by the rule readers follow: for each
 /// member of each state, under each model, the newest segment holding the
 /// member's chunk map, and for each chunk of that map the newest segment
 /// holding its text's vector. A segment whose vectors and maps no member
-/// reaches is not needed, so vectors of contents no checkout holds any
-/// more are retired with their segment. Segments without vector sections
-/// are left to the other planes' rules.
+/// reaches can be retired once it is past the grace period. Younger vector
+/// segments may belong to unpublished changes in another process. Segments
+/// without vector sections are left to the other planes' rules.
 ///
 /// # Errors
 ///
@@ -2100,6 +2309,7 @@ pub(crate) fn merge_vector_segments(
 pub(crate) fn needed_vector_segments(
     segments: &[&Segment],
     states: &[&CheckoutState],
+    now: u64,
 ) -> Result<Vec<bool>, DataError> {
     let mut needed = vec![false; segments.len()];
     let opened = segments
@@ -2110,10 +2320,12 @@ pub(crate) fn needed_vector_segments(
     let mut maps: HashMap<(ModelId, ChunkMapKey), usize> = HashMap::new();
     let mut texts: HashMap<(ModelId, TextDigest), usize> = HashMap::new();
     let mut models = Vec::new();
+    let grace = u64::try_from(MERGE_GRACE.as_millis()).unwrap_or(u64::MAX);
     for (position, opened) in opened.iter().enumerate() {
         let Some(vectors) = opened else {
             continue;
         };
+        needed[position] = now.saturating_sub(segments[position].created_unix_ms()) < grace;
         let model = vectors.model().id();
         if !models.contains(&model) {
             models.push(model);
@@ -2127,6 +2339,16 @@ pub(crate) fn needed_vector_segments(
     }
     if maps.is_empty() {
         return Ok(needed);
+    }
+    for (position, vectors) in opened.iter().enumerate() {
+        if let Some(vectors) = vectors {
+            let model = vectors.model().id();
+            visit_young_map_texts(segments[position], vectors, now, grace, |text| {
+                if let Some(&holder) = texts.get(&(model, text)) {
+                    needed[holder] = true;
+                }
+            })?;
+        }
     }
     let mut asked = HashSet::new();
     for state in states {
@@ -2218,12 +2440,15 @@ impl VectorPlane {
             max_files: _,
             loaded,
             members,
+            fill_queue,
             old,
             merge: _,
+            merge_due: _,
         } = self;
         model.heap_bytes(seen)
             + loaded.heap_bytes(seen)
             + members.heap_bytes(seen)
+            + fill_queue.heap_bytes(seen)
             + old.heap_bytes(seen)
     }
 }
@@ -2304,6 +2529,80 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap()
+    }
+
+    #[test]
+    fn one_round_jobs_reuse_the_queue_until_the_view_or_shared_vectors_change() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let round = || {
+            plane
+                .fill_rounds(
+                    &mut |texts| Ok(texts.iter().map(|text| vector_of(text)).collect()),
+                    FillBudget {
+                        max_batch: 5,
+                        files_per_round: 1,
+                    },
+                    1,
+                    &mut |_| {},
+                )
+                .unwrap()
+        };
+        FILL_SURVEYS.with(|surveys| surveys.set(0));
+        let first = round();
+        let second = round();
+        assert_eq!(first.files_filled, 1);
+        assert_eq!(second.files_filled, 1);
+        assert_eq!(second.files_queued + 1, first.files_queued);
+        assert_eq!(FILL_SURVEYS.with(std::cell::Cell::get), 1);
+
+        write(dir.path(), "src/lib.rs", "pub fn edited() {}\n");
+        checkout.record_paths(&[b"src/lib.rs".to_vec()]).unwrap();
+        round();
+        assert_eq!(FILL_SURVEYS.with(std::cell::Cell::get), 2);
+
+        let mut external = VectorSectionsBuilder::new(producer().model).unwrap();
+        external
+            .add_vector(TextDigest::of(b"external"), &vector_of("external"))
+            .unwrap();
+        VectorPlane::publish(&checkout.vector_parts(), external).unwrap();
+        round();
+        assert_eq!(FILL_SURVEYS.with(std::cell::Cell::get), 3);
+    }
+
+    #[test]
+    fn cancelled_fill_neither_dispatches_another_batch_nor_publishes() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let family = checkout.vector_parts().family;
+        let initial = family.newest_generation().unwrap();
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        for max_batch in [1, usize::MAX] {
+            let token = crate::executor::JobCancellation::new();
+            let _context = crate::executor::install_job_cancellation(token.clone());
+            let mut calls = 0;
+            let result = plane.fill_rounds(
+                &mut |texts| {
+                    calls += 1;
+                    token.request_cancel();
+                    Ok(texts.iter().map(|text| vector_of(text)).collect())
+                },
+                FillBudget {
+                    max_batch,
+                    files_per_round: 100,
+                },
+                1,
+                &mut |_| {},
+            );
+            assert!(matches!(result, Err(DataError::Cancelled)));
+            assert_eq!(calls, 1);
+            assert_eq!(family.newest_generation().unwrap(), initial);
+        }
     }
 
     /// A small project in four languages, with exported and private
@@ -2781,6 +3080,180 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_fill_round_waits_for_the_second_eligible_vector_segment() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        extra_file(root.path(), 0, "value + 1");
+        extra_file(root.path(), 1, "value + 2");
+        let checkout = bind(store.path(), root.path());
+        let mut plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        plane.merge.merge_at = 1;
+        let grace = plane.merge.grace_ms();
+        let round = || {
+            plane
+                .fill_rounds(
+                    &mut |texts| Recorder::default().embed(texts),
+                    FillBudget {
+                        max_batch: 5,
+                        files_per_round: 1,
+                    },
+                    1,
+                    &mut |_| {},
+                )
+                .unwrap()
+        };
+        assert_eq!(round().segments_published, 1);
+        let first = plane.load().unwrap();
+        assert_eq!(first.open.len(), 1);
+        let first_created = first.open.values().next().unwrap().created_unix_ms();
+        drop(first);
+
+        // Write the second segment on a different millisecond. Only the
+        // eligibility clock advances by the grace period, not the disk clock.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unix_ms() <= first_created {
+            assert!(Instant::now() < deadline, "segment clock did not advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let now = first_created + grace;
+        MERGE_NOW_MS.with(|clock| clock.set(Some(now)));
+        MERGE_WRITER_ATTEMPTS.with(|attempts| attempts.set(0));
+        let young = round();
+        assert_eq!(young.segments_published, 1);
+        assert_eq!(young.merges, 0);
+        assert_eq!(MERGE_WRITER_ATTEMPTS.with(std::cell::Cell::get), 0);
+        let loaded = plane.load().unwrap();
+        assert_eq!(loaded.open.len(), 2);
+        assert_eq!(
+            loaded
+                .open
+                .values()
+                .filter(|segment| now.saturating_sub(segment.created_unix_ms()) >= grace)
+                .count(),
+            1,
+        );
+        let due = loaded
+            .open
+            .values()
+            .map(|segment| segment.created_unix_ms())
+            .max()
+            .unwrap()
+            + grace;
+        drop(loaded);
+
+        // The next fill sees that the second segment is old enough even
+        // though no other writer has published a new manifest.
+        MERGE_NOW_MS.with(|clock| clock.set(Some(due)));
+        let aged = round();
+        MERGE_NOW_MS.with(|clock| clock.set(None));
+        assert_eq!(MERGE_WRITER_ATTEMPTS.with(std::cell::Cell::get), 1);
+        assert_eq!(aged.segments_published, 0);
+        assert_eq!(aged.merges, 1);
+        assert_eq!(aged.merged_segments, 2);
+        assert_eq!(vector_segment_count(&checkout), 1);
+        assert!(plane
+            .coverage(&checkout.view().unwrap())
+            .unwrap()
+            .complete());
+    }
+
+    #[test]
+    fn compaction_copies_old_vectors_reused_by_a_young_map_from_another_process() {
+        let store = tempfile::tempdir().unwrap();
+        let editing_root = tempfile::tempdir().unwrap();
+        let merging_root = tempfile::tempdir().unwrap();
+        let path = b"src/lib.rs";
+        let edited = "pub fn changed_in_other_process(value: i32) -> i32 { value + 7 }\n";
+        write(editing_root.path(), "src/lib.rs", "pub fn original() {}\n");
+        write(merging_root.path(), "src/lib.rs", "pub fn sibling() {}\n");
+        // Each bind creates a separate DataLayer, so the merging checkout
+        // sees only the editing checkout's published state.
+        let editing = bind(store.path(), editing_root.path());
+        let merging = bind(store.path(), merging_root.path());
+        let editing_plane = VectorPlane::new(Arc::clone(&editing), producer(), 100);
+        let mut merging_plane = VectorPlane::new(Arc::clone(&merging), producer(), 100);
+        merging_plane.merge.merge_at = 2;
+        let parts = editing.vector_parts();
+
+        // Store the reusable vectors with no map, so published states alone
+        // cannot cause the merge to copy them.
+        let Cut::Chunks(chunks) =
+            cut_file(editing.root(), path, edited.as_bytes(), producer().caps)
+        else {
+            panic!("the edited file must produce chunks");
+        };
+        let reusable = chunks
+            .into_iter()
+            .map(|chunk| chunk.text)
+            .collect::<HashSet<_>>();
+        assert!(!reusable.is_empty());
+        let mut old = VectorSectionsBuilder::new(producer().model).unwrap();
+        for text in &reusable {
+            old.add_vector(TextDigest::of(text.as_bytes()), &vector_of(text))
+                .unwrap();
+        }
+        VectorPlane::publish(&parts, old).unwrap();
+        let mut old = VectorSectionsBuilder::new(producer().model).unwrap();
+        old.add_vector(TextDigest::of(b"unreferenced"), &vector_of("unreferenced"))
+            .unwrap();
+        VectorPlane::publish(&parts, old).unwrap();
+        let old = editing_plane.load().unwrap();
+        let latest_old = old
+            .open
+            .values()
+            .map(|segment| segment.created_unix_ms())
+            .max()
+            .unwrap();
+        let old_ids = old.open.keys().copied().collect::<Vec<_>>();
+        assert_eq!(old_ids.len(), 2);
+        drop(old);
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unix_ms() <= latest_old {
+            assert!(Instant::now() < deadline, "segment clock did not advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        write(editing_root.path(), "src/lib.rs", edited);
+        editing.record_paths(&[path.to_vec()]).unwrap();
+        let view = editing.view().unwrap();
+        assert_ne!(
+            view.state().get(path).unwrap().content,
+            view.current_state().get(path).unwrap().content
+        );
+        let mut embedder = Recorder::default();
+        assert_eq!(fill(&editing_plane, &mut embedder, 1).files_filled, 1);
+        assert!(
+            embedder.texts.is_empty(),
+            "the young map must reuse the old vectors"
+        );
+        assert!(editing_plane.coverage(&view).unwrap().complete());
+        let loaded = editing_plane.load().unwrap();
+        let young = *loaded.open.keys().find(|id| !old_ids.contains(id)).unwrap();
+        assert!(loaded.open[&young].created_unix_ms() > latest_old);
+        drop(loaded);
+
+        MERGE_NOW_MS.with(|clock| clock.set(Some(latest_old + merging_plane.merge.grace_ms())));
+        let merged = merging_plane.merge_segments();
+        MERGE_NOW_MS.with(|clock| clock.set(None));
+        let merged = merged.unwrap().unwrap();
+        assert_eq!(merged.merged, 2);
+        assert_eq!(merged.vectors, reusable.len());
+        let loaded = editing_plane.load().unwrap();
+        assert!(
+            loaded.open.contains_key(&young),
+            "the young map was not merged"
+        );
+        assert!(old_ids.iter().all(|old| !loaded.open.contains_key(old)));
+        assert!(editing_plane.coverage(&view).unwrap().complete());
+        for text in reusable {
+            assert_eq!(
+                editing_plane.stored_vector(&text).unwrap(),
+                Some(vector_of(&text))
+            );
+        }
+    }
+
     /// Merging vector segments keeps exactly what a reader reaches in them:
     /// another checkout's vectors, those only its edit not yet published
     /// reads included, and the merging checkout's alike, so both search and
@@ -2809,9 +3282,11 @@ mod tests {
         // Two files a round, so the segment holding the first extra file's
         // vectors holds another file's too, and stays after the first one
         // changes.
+        MERGE_WRITER_ATTEMPTS.with(|attempts| attempts.set(0));
         let report = fill(&first_plane, &mut Recorder::default(), 2);
         assert!(report.segments_published > MERGE_AT, "{report:?}");
         assert_eq!(report.merges, 0, "every segment is younger than the grace");
+        assert_eq!(MERGE_WRITER_ATTEMPTS.with(std::cell::Cell::get), 0);
 
         // A second checkout: one function edited, a file added, and the
         // first extra file gone.
@@ -2948,7 +3423,7 @@ mod tests {
     }
 
     #[test]
-    fn vector_segments_no_checkout_needs_are_retired() {
+    fn vector_segments_no_checkout_needs_are_retired_after_grace() {
         let store = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(root.path()).unwrap();
@@ -2979,16 +3454,29 @@ mod tests {
         };
         let before = vector_segments();
         assert_eq!(before.len(), 1);
-        // The only file changes: no checkout holds the old content, so its
-        // vectors go with the next build.
+        // The only file changes. Its old vectors remain eligible for reuse
+        // during grace but are no longer needed once the grace has passed.
         write(
             &root,
             "src/only.rs",
             "pub fn second_version(b: u16) -> u16 {\n    b\n}\n",
         );
-        let report = checkout.build().unwrap();
-        assert!(report.retired_segments >= 1, "{report:?}");
-        assert!(vector_segments().is_empty());
+        checkout.build().unwrap();
+        assert_eq!(vector_segments(), before);
+        let snapshot = family_store.snapshot().unwrap();
+        let old = snapshot
+            .open_segment(
+                before[0],
+                &checkout.vector_parts().known,
+                Arc::new(BlockCache::new(1 << 20)),
+            )
+            .unwrap();
+        let view = checkout.view().unwrap();
+        let expiry = old.created_unix_ms() + u64::try_from(MERGE_GRACE.as_millis()).unwrap();
+        assert_eq!(
+            needed_vector_segments(&[&old], &[view.current_state()], expiry).unwrap(),
+            [false]
+        );
         // A checkout still holding a content keeps its vectors.
         let mut recorder = Recorder::default();
         fill(&plane, &mut recorder, 10);
@@ -2996,6 +3484,31 @@ mod tests {
         let kept = vector_segments();
         checkout.build().unwrap();
         assert_eq!(vector_segments(), kept);
+    }
+
+    #[test]
+    fn sibling_publication_keeps_fresh_maps_for_unpublished_content() {
+        let store = tempfile::tempdir().unwrap();
+        let left = tempfile::tempdir().unwrap();
+        let right = tempfile::tempdir().unwrap();
+        write(left.path(), "src/lib.rs", "pub fn before() {}\n");
+        write(right.path(), "src/lib.rs", "pub fn sibling() {}\n");
+        // Separate layers model processes that cannot see each other's live states.
+        let left_checkout = bind(store.path(), left.path());
+        let right_checkout = bind(store.path(), right.path());
+        write(left.path(), "src/lib.rs", "pub fn still_unpublished() {}\n");
+        left_checkout
+            .record_paths(&[b"src/lib.rs".to_vec()])
+            .unwrap();
+        let plane = VectorPlane::new(Arc::clone(&left_checkout), producer(), 20_000);
+        assert_eq!(fill(&plane, &mut Recorder::default(), 10).files_filled, 1);
+
+        right_checkout.build().unwrap();
+        plane.refresh().unwrap();
+        let view = left_checkout.view().unwrap();
+        let coverage = plane.coverage(&view).unwrap();
+        assert_eq!(coverage.files_embedded, 1);
+        assert!(coverage.pending.is_empty());
     }
 
     #[test]

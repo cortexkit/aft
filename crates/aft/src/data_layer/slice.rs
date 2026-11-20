@@ -806,6 +806,11 @@ impl<'s> EdgeView<'s> {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static EDGE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl FileSlice {
     pub(crate) fn path(&self) -> &str {
         &self.path
@@ -836,6 +841,8 @@ impl FileSlice {
 
     /// The edges, in the order of their ids.
     pub(crate) fn edges(&self) -> impl ExactSizeIterator<Item = EdgeView<'_>> + '_ {
+        #[cfg(test)]
+        EDGE_WALKS.with(|walks| walks.set(walks.get() + 1));
         (0..self.edges.source.len()).map(|index| EdgeView { slice: self, index })
     }
 

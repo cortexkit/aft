@@ -227,6 +227,8 @@ mod diagnostics_findings;
 // The secret vault seam and its consent adapter. They read ragged route
 // fields, so they live under `subc` rather than the public `secret` types.
 mod drain;
+#[cfg(test)]
+mod edge_lifecycle_tests;
 mod flow_read;
 mod fork_call;
 mod health;
@@ -265,6 +267,7 @@ mod persistence;
 mod prepared_bind_tests;
 mod push;
 mod queued_call;
+use queued_call::AdmissionWait;
 mod readiness;
 mod remote_policy;
 pub(crate) mod result_body;
@@ -607,52 +610,6 @@ struct RequestFrameMeta {
     ver: u8,
     flags: Flags,
     deadline: Option<queued_call::Deadline>,
-}
-
-#[derive(Clone)]
-struct AdmissionWait {
-    route: RouteChannel,
-    corr: u64,
-    meta: RequestFrameMeta,
-    bare_name: String,
-    held_since: Instant,
-}
-
-impl AdmissionWait {
-    fn from_decoded(decoded: &DecodedFrame, bare_name: &str) -> Self {
-        Self {
-            route: route_key(decoded.frame.header.channel, decoded.frame.header.epoch),
-            corr: decoded.frame.header.corr,
-            meta: RequestFrameMeta {
-                ver: decoded.frame.header.ver,
-                flags: decoded.frame.header.flags,
-                deadline: None,
-            },
-            bare_name: bare_name.to_owned(),
-            held_since: decoded.phase_trace.received_at(),
-        }
-    }
-
-    fn draining_frame(&self) -> Result<Frame, SubcError> {
-        let response = drain::module_draining_response("admission", &self.bare_name);
-        let error = ErrorBody::new(
-            drain::MODULE_DRAINING_ERROR_CODE,
-            response.data["message"]
-                .as_str()
-                .expect("drain response has a message"),
-        )
-        .with_detail(json!({"retryable": true}));
-        Frame::build_with_version(
-            self.meta.ver,
-            FrameType::Error,
-            self.meta.flags,
-            self.route.channel,
-            self.route.epoch,
-            self.corr,
-            serde_json::to_vec(&error).map_err(SubcError::Json)?,
-        )
-        .map_err(SubcError::FrameBuild)
-    }
 }
 
 #[derive(Clone)]
@@ -4132,6 +4089,8 @@ async fn end_bg_subscriptions_for_drain(
 #[allow(clippy::too_many_arguments)]
 async fn teardown_installed_route(
     tx: &WriterSender,
+    ledger: Option<&tool_provider::LedgerEdge>,
+    run_scopes: Option<&run_scope::RunScopes>,
     metrics: &DispatchPathMetrics,
     executor: &Arc<Executor>,
     channel: RouteChannel,
@@ -4156,6 +4115,7 @@ async fn teardown_installed_route(
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> Result<(), SubcError> {
+    queued_call::close_admissions(channel, tx, metrics, ledger, run_scopes).await?;
     // A replacement project route keeps replayable calls, even those still
     // waiting in the executor. Release queued calls only when no project route
     // replaces the old handle; already-running mutations keep their result.
@@ -4163,15 +4123,7 @@ async fn teardown_installed_route(
         let queued =
             queued_call::release_route(active_tool_calls, executor, channel, pending_responses);
         for (corr, request) in queued {
-            let terminal = build_error_frame(
-                request.ver,
-                channel.channel,
-                channel.epoch,
-                corr,
-                request.flags,
-                "route_released",
-                "route released before execution; the tool did not run",
-            )?;
+            let terminal = queued_call::released_frame(channel, corr, request)?;
             send_reliable_writer_frame(tx, metrics, terminal, "released queued call").await?;
         }
     }
@@ -5307,7 +5259,7 @@ where
             run_scopes.clone(),
             Arc::clone(&speech),
         );
-    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel::<DecodedFrame>();
+    let (run_ready_tx, mut run_ready_rx) = mpsc::unbounded_channel();
     let readiness_task = spawn_readiness(control.clone(), spawn_role, hello_at, session.clone());
 
     let shutdown = Arc::new(Notify::new());
@@ -5383,29 +5335,8 @@ where
         connection_file_path.to_path_buf(),
         storage_dir.join("aft.db"),
     );
-    // Withdraw the macOS access cards earlier builds filed. It runs beside the
-    // route loop, never before it: each withdrawal waits on Cingulate, and a
-    // slow or absent Cingulate must not delay route binds.
     #[cfg(target_os = "macos")]
-    {
-        let app = Arc::clone(&shared_app);
-        let path = storage_dir.join("aft.db");
-        tokio::spawn(async move {
-            match tokio::task::spawn_blocking(move || app.open_db(&path)).await {
-                Ok(Ok(db)) => {
-                    if let Err(error) = consent::withdraw_macos_permission_cards(db).await {
-                        log::warn!("macOS permission card startup cleanup failed: {error:?}");
-                    }
-                }
-                Ok(Err(error)) => log::warn!(
-                    "macOS permission card startup cleanup could not open database: {error}"
-                ),
-                Err(error) => {
-                    log::warn!("macOS permission card startup cleanup worker failed: {error}")
-                }
-            }
-        });
-    }
+    consent::start_macos_permission_cleanup(Arc::clone(&shared_app), storage_dir.join("aft.db"));
     rich_ui::display::start(connection_file_path, &shared_app, &storage_dir);
     runner_notices::install(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
@@ -5488,11 +5419,10 @@ where
             }
         },
     );
+    let mut shell_detaches = tool_provider::ShellDetaches::default();
     let loop_result: Result<ModuleLoopExit, SubcError> = 'module_loop: loop {
-        dispatch_path_metrics.mark_frame_loop_step("LedgerEdge::detach_shells", "", 0);
-        for route in ledger_edge.unrouted_shells(&routes) {
-            ledger_edge.detach_shells(&executor, Some(route)).await;
-        }
+        dispatch_path_metrics.mark_frame_loop_step("ShellDetaches::start", "", 0);
+        shell_detaches.start(&ledger_edge, &executor, &routes);
         dispatch_path_metrics.mark_frame_loop_tick();
         dispatch_path_metrics.mark_frame_loop_step("logging::perf_tick", "", 0);
         #[cfg(test)]
@@ -5826,7 +5756,7 @@ where
                 }
                 tokio::select! {
                     frame = reader_rx.recv() => (frame, false, false),
-                    frame = run_ready_rx.recv() => (frame.map(Ok), false, false),
+                    frame = run_scopes.next_ready(&mut run_ready_rx) => (frame.map(Ok), false, false),
                     frame = database_waits.next(), if !database_waits.is_empty() => (Some(Ok(frame)), true, false),
                     frame = ledger_ready_rx.recv() => (frame.map(Ok), true, true),
                 }
@@ -5910,6 +5840,8 @@ where
                         }
                         if let Err(error) = teardown_installed_route(
                             &writer_tx,
+                            Some(&ledger_edge),
+                            Some(&run_scopes),
                             &dispatch_path_metrics,
                             &executor,
                             channel,
@@ -5988,6 +5920,7 @@ where
                             &a0.writer,
                             &writer_tx,
                             &a0,
+                            Some(&ledger_edge),
                             &frame,
                             &shared_app,
                             &executor,
@@ -6389,7 +6322,7 @@ where
                             channel,
                             corr,
                             "Cancel frame",
-                        ).or_else(|| database_waits.cancel(channel, corr));
+                        ).or_else(|| database_waits.cancel(channel, corr)).or_else(|| run_scopes.cancel(channel, corr));
                         let cancelled_deferred = pending_responses.cancel_request(channel, corr);
                         if cancelled_call.is_some() || cancelled_deferred {
                             let request = cancelled_call.unwrap_or(RequestFrameMeta {
@@ -6397,15 +6330,7 @@ where
                                 ver: frame.header.ver,
                                 flags: frame.header.flags,
                             });
-                            let sent = match build_error_frame(
-                                request.ver,
-                                channel.channel,
-                                channel.epoch,
-                                corr,
-                                request.flags,
-                                "cancelled",
-                                "request cancelled",
-                            ) {
+                             let sent = match queued_call::cancelled_frame(channel, corr, request) {
                                 Ok(error_frame) => {
                                     send_reliable_writer_frame(
                                         &writer_tx,
@@ -6421,7 +6346,7 @@ where
                                 break Err(error);
                             }
                         }
-                        if bg_subs.contains_key(&channel) {
+                        if bg_subs.get(&channel).is_some_and(|sub| sub.corr == corr) {
                             if let Err(error) = end_bg_subscription(
                                 &writer_tx,
                                 &dispatch_path_metrics,
@@ -6507,6 +6432,7 @@ where
                                  let admission_frames = match database_waits.drain_for_module_drain()
                                      .and_then(|mut frames| {
                                          frames.extend(ledger_edge.drain_for_module_drain()?);
+                                         frames.extend(run_scopes.drain()?);
                                          Ok(frames)
                                      }) {
                                      Ok(frames) => frames,
@@ -6903,6 +6829,12 @@ where
                         &dispatch_path_metrics,
                     );
                     for frame in reclaim_frames {
+                        if frame.header.ty == FrameType::Goodbye {
+                            let route = route_key(frame.header.channel, frame.header.epoch);
+                            if let Err(error) = queued_call::close_admissions(route, &writer_tx, &dispatch_path_metrics, Some(&ledger_edge), Some(&run_scopes)).await {
+                                break 'module_loop Err(error);
+                            }
+                        }
                         if let Err(error) = send_reliable_writer_frame(
                             &writer_tx,
                             &dispatch_path_metrics,
@@ -6967,6 +6899,7 @@ where
     };
 
     drop(claim_lifetime);
+    crate::secret::consent::shutdown().await;
     shells_service.drain().await;
     shells_service.stop();
     dispatch_path_metrics.held_bash_calls.clear_all_progress();
@@ -7018,7 +6951,7 @@ where
     {
         speech_runtime.retain_until_process_exit();
     }
-    ledger_edge.detach_shells(&executor, None).await;
+    shell_detaches.finish(&ledger_edge, &executor).await;
     if let Some(task) = settings_worker {
         task.abort();
     }
@@ -8158,6 +8091,7 @@ async fn handle_control_request(
     tx: &WriterSender,
     legacy_tx: &WriterSender,
     a0: &A0Egress,
+    ledger: Option<&tool_provider::LedgerEdge>,
     frame: &Frame,
     shared_app: &Arc<App>,
     executor: &Arc<Executor>,
@@ -8414,6 +8348,8 @@ async fn handle_control_request(
                     a0.supersede(route_key(route_channel, installed_epoch));
                     teardown_installed_route(
                         legacy_tx,
+                        ledger,
+                        run_scopes,
                         metrics,
                         executor,
                         route_key(route_channel, installed_epoch),
@@ -8545,6 +8481,8 @@ async fn handle_control_request(
                 a0.supersede(route_key(route_channel, installed_epoch));
                 teardown_installed_route(
                     legacy_tx,
+                    ledger,
+                    run_scopes,
                     metrics,
                     executor,
                     route_key(route_channel, installed_epoch),
@@ -9578,13 +9516,8 @@ fn spawn_permissions_request(
         let result = match admitted {
             Err(error) => Err(error),
             Ok(request) => tokio::task::spawn_blocking(move || {
-                let registries = executor
-                    .actor_contexts()
-                    .iter()
-                    .map(|ctx| ctx.bash_background().clone())
-                    .collect::<Vec<_>>();
                 permissions::answer(db.as_deref(), &request, |row| {
-                    permissions::stop_folder_tasks(&registries, row)
+                    permissions::stop_folder_tasks(&executor, &row.scope, &row.path)
                 })
             })
             .await
@@ -10246,6 +10179,7 @@ async fn submit_provider_read(
         });
     phase_trace.mark_executor_submitted();
     let (trace_tx, trace_rx) = oneshot::channel();
+    let grant_executor = Arc::clone(executor);
     let mut rx = submit_active_tool_call(
         executor,
         active,
@@ -10269,7 +10203,9 @@ async fn submit_provider_read(
                     "scope persistence unavailable",
                 ))
             } else if job_operation.starts_with("grants.") {
-                access_grants::operation(body, &job_operation, &identity, ctx)
+                access_grants::operation(body, &job_operation, &identity, ctx, |scope, path| {
+                    permissions::stop_folder_tasks(&grant_executor, scope, path);
+                })
             } else {
                 remote_policy::catalog(body, &identity, ctx)
             };
@@ -22779,6 +22715,8 @@ mod terminal_lifecycle_tests {
                 } else {
                     teardown_installed_route(
                         &tx,
+                        None,
+                        None,
                         &metrics,
                         &executor,
                         route,

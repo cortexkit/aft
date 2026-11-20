@@ -4908,10 +4908,33 @@ mod tests {
             task_ids.len(),
             "maintenance must recover every disk-only task: {logs:?}"
         );
-        let completions = registry.drain_completions();
+        // The queue holds a bounded number of notices per session and refills
+        // as they are acknowledged, so every recovered task's notice arrives
+        // over successive drains rather than in one.
+        let cap = crate::bash_background::registry::completion_queue::MAX_QUEUED_PER_SESSION;
+        let mut delivered = std::collections::HashSet::new();
+        loop {
+            let completions = registry.drain_completions();
+            assert!(
+                completions.len() <= cap,
+                "{} notices resident at once",
+                completions.len()
+            );
+            if completions.is_empty() {
+                break;
+            }
+            let ids: Vec<String> = completions
+                .into_iter()
+                .map(|completion| completion.task_id)
+                .collect();
+            for id in &ids {
+                assert!(delivered.insert(id.clone()), "{id} delivered twice");
+            }
+            registry.ack_completions_for_session(None, &ids);
+        }
         assert_eq!(
-            completions.len(),
-            task_ids.len(),
+            delivered,
+            task_ids.iter().cloned().collect(),
             "every recovered task needs a completion notice"
         );
         assert!(

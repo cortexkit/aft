@@ -2,6 +2,104 @@
 
 use super::*;
 
+#[derive(Clone)]
+pub(super) struct AdmissionWait {
+    route: RouteChannel,
+    corr: u64,
+    pub(super) meta: RequestFrameMeta,
+    bare_name: String,
+    pub(super) held_since: Instant,
+}
+
+impl AdmissionWait {
+    pub(super) fn from_decoded(decoded: &DecodedFrame, bare_name: &str) -> Self {
+        Self {
+            route: route_key(decoded.frame.header.channel, decoded.frame.header.epoch),
+            corr: decoded.frame.header.corr,
+            meta: RequestFrameMeta {
+                ver: decoded.frame.header.ver,
+                flags: decoded.frame.header.flags,
+                deadline: None,
+            },
+            bare_name: bare_name.to_owned(),
+            held_since: decoded.phase_trace.received_at(),
+        }
+    }
+
+    pub(super) fn draining_frame(&self) -> Result<Frame, SubcError> {
+        let response = drain::module_draining_response("admission", &self.bare_name);
+        let error = ErrorBody::new(
+            drain::MODULE_DRAINING_ERROR_CODE,
+            response.data["message"]
+                .as_str()
+                .expect("drain response has a message"),
+        )
+        .with_detail(json!({"retryable": true}));
+        Frame::build_with_version(
+            self.meta.ver,
+            FrameType::Error,
+            self.meta.flags,
+            self.route.channel,
+            self.route.epoch,
+            self.corr,
+            serde_json::to_vec(&error).map_err(SubcError::Json)?,
+        )
+        .map_err(SubcError::FrameBuild)
+    }
+
+    pub(super) fn released_frame(&self) -> Result<Frame, SubcError> {
+        released_frame(self.route, self.corr, self.meta)
+    }
+}
+
+pub(super) fn cancelled_frame(
+    route: RouteChannel,
+    corr: u64,
+    request: RequestFrameMeta,
+) -> Result<Frame, SubcError> {
+    build_error_frame(
+        request.ver,
+        route.channel,
+        route.epoch,
+        corr,
+        request.flags,
+        "cancelled",
+        "request cancelled",
+    )
+}
+
+pub(super) fn released_frame(
+    route: RouteChannel,
+    corr: u64,
+    request: RequestFrameMeta,
+) -> Result<Frame, SubcError> {
+    build_error_frame(
+        request.ver,
+        route.channel,
+        route.epoch,
+        corr,
+        request.flags,
+        "route_released",
+        "route released before execution; the tool did not run",
+    )
+}
+
+pub(super) async fn close_admissions(
+    route: RouteChannel,
+    writer: &WriterSender,
+    metrics: &DispatchPathMetrics,
+    ledger: Option<&tool_provider::LedgerEdge>,
+    runs: Option<&run_scope::RunScopes>,
+) -> Result<(), SubcError> {
+    if let Some(ledger) = ledger {
+        ledger.close_route(route, writer, metrics).await?;
+    }
+    if let Some(runs) = runs {
+        runs.close_route(route, writer, metrics).await?;
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Deadline {
     at: Instant,
@@ -281,6 +379,8 @@ mod tests {
             HashMap::from([(route, test_support::route_identity(&root, "release-test"))]);
         teardown_installed_route(
             &writer,
+            None,
+            None,
             &DispatchPathMetrics::new(),
             &executor,
             route,

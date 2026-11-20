@@ -7,7 +7,8 @@
 //! replaying those inputs. The caller's path and record key are the
 //! fragment's key and are not repeated inside it.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use aft_store::content::codec::{Decoder, Encoder};
 use aft_store::content::DecodeError;
@@ -22,7 +23,7 @@ use crate::callgraph_store::join::{BlobRefKind, DerivedRow, ResolutionStatus};
 #[path = "fragment_strings.rs"]
 mod strings;
 
-const FORMAT: u8 = 2;
+const FORMAT: u8 = 3;
 /// The fragment format, for a build that names what its saved work
 /// depends on.
 pub(crate) const FORMAT_VERSION: u8 = FORMAT;
@@ -101,17 +102,27 @@ fn encode_expanded(
             encode_dispatch(&mut out, dispatch);
         }
     }
-    out.usize(file.sites.len());
+    let mut answers = Vec::new();
+    let mut by_value = HashMap::<&Resolution, usize>::new();
+    let mut by_pointer = HashMap::new();
+    let mut site_answers = Vec::with_capacity(file.sites.len());
     for kept in &file.sites {
         guard.site()?;
-        let site = &kept.site;
-        out.u32(site.ordinal);
-        out.opt_str(site.caller.as_deref());
-        out.u32(site.line);
-        out.opt_str(site.member.as_deref());
-        out.opt_str(site.receiver.as_deref());
-        out.bool(site.dynamic);
-        let resolution = &kept.resolution;
+        // A memoized answer can be wide; hash its contents only the first
+        // time we see its pointer, but also merge equal non-memoized answers.
+        let index = by_pointer
+            .entry(Arc::as_ptr(&kept.resolution))
+            .or_insert_with(|| {
+                *by_value.entry(&kept.resolution).or_insert_with(|| {
+                    let index = answers.len();
+                    answers.push(&*kept.resolution);
+                    index
+                })
+            });
+        site_answers.push(*index);
+    }
+    out.usize(answers.len());
+    for resolution in answers {
         out.usize(resolution.targets.len());
         for target in &resolution.targets {
             out.str(&target.file);
@@ -132,6 +143,17 @@ fn encode_expanded(
         out.usize(resolution.unresolved);
         out.usize(resolution.external);
         out.usize(resolution.dynamic);
+    }
+    out.usize(file.sites.len());
+    for (kept, index) in file.sites.iter().zip(site_answers) {
+        let site = &kept.site;
+        out.u32(site.ordinal);
+        out.opt_str(site.caller.as_deref());
+        out.u32(site.line);
+        out.opt_str(site.member.as_deref());
+        out.opt_str(site.receiver.as_deref());
+        out.bool(site.dynamic);
+        out.usize(index);
     }
     out.usize(file.site_dependencies.len());
     for key in &file.site_dependencies {
@@ -195,20 +217,11 @@ fn decode_expanded(
     } else {
         None
     };
-    // At least seven bytes per site: ordinal, caller, line, member,
-    // receiver, the dynamic flag and the target count.
-    let count = input.count_of(7)?;
-    let mut sites = Vec::with_capacity(count);
+    // Two set counts and three counters, even for an empty answer.
+    let count = input.count_of(5)?;
+    let mut answers = Vec::with_capacity(count);
     for _ in 0..count {
-        let site = SiteHint {
-            ordinal: input.u32()?,
-            caller: input.opt_string()?,
-            line: input.u32()?,
-            member: input.opt_string()?,
-            receiver: input.opt_string()?,
-            dynamic: input.bool()?,
-        };
-        let targets = (0..input.count()?)
+        let targets = (0..input.count_of(3)?)
             .map(|_| {
                 Ok(Target {
                     file: input.string()?,
@@ -220,18 +233,35 @@ fn decode_expanded(
                 })
             })
             .collect::<Result<_, DecodeError>>()?;
-        let protected = (0..input.count()?)
+        let protected = (0..input.count_of(2)?)
             .map(|_| Ok((input.string()?, input.string()?)))
             .collect::<Result<_, DecodeError>>()?;
+        answers.push(Arc::new(Resolution {
+            targets,
+            protected,
+            unresolved: input.usize()?,
+            external: input.usize()?,
+            dynamic: input.usize()?,
+        }));
+    }
+    // Ordinal, caller, line, member, receiver, dynamic flag and answer index.
+    let count = input.count_of(7)?;
+    let mut sites = Vec::with_capacity(count);
+    for _ in 0..count {
+        let site = SiteHint {
+            ordinal: input.u32()?,
+            caller: input.opt_string()?,
+            line: input.u32()?,
+            member: input.opt_string()?,
+            receiver: input.opt_string()?,
+            dynamic: input.bool()?,
+        };
+        let answer = answers
+            .get(input.usize()?)
+            .ok_or(DecodeError("unknown resolution answer index"))?;
         sites.push(SiteResolution {
             site,
-            resolution: std::sync::Arc::new(Resolution {
-                targets,
-                protected,
-                unresolved: input.usize()?,
-                external: input.usize()?,
-                dynamic: input.usize()?,
-            }),
+            resolution: Arc::clone(answer),
         });
     }
     let site_dependencies = (0..input.count()?)
@@ -250,6 +280,59 @@ fn decode_expanded(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fragment_interns_equal_answers_by_value() {
+        let answer = Resolution {
+            targets: [Target {
+                file: "target.rs".into(),
+                symbol: "run".into(),
+                provenance: "name_match",
+            }]
+            .into(),
+            protected: [("target.rs".into(), "run".into())].into(),
+            unresolved: 1,
+            external: 2,
+            dynamic: 3,
+        };
+        let other = Resolution {
+            dynamic: 4,
+            ..answer.clone()
+        };
+        let resolution = FileResolution {
+            sites: [answer.clone(), answer, other]
+                .into_iter()
+                .enumerate()
+                .map(|(i, answer)| SiteResolution {
+                    site: SiteHint {
+                        ordinal: i as u32,
+                        line: i as u32 + 1,
+                        caller: None,
+                        member: None,
+                        receiver: None,
+                        dynamic: false,
+                    },
+                    resolution: Arc::new(answer),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        assert!(!Arc::ptr_eq(
+            &resolution.sites[0].resolution,
+            &resolution.sites[1].resolution
+        ));
+        let bytes = encode(&resolution);
+        let decoded = decode("record", "caller.rs", &bytes).unwrap();
+        assert_eq!(decoded, resolution);
+        assert!(Arc::ptr_eq(
+            &decoded.sites[0].resolution,
+            &decoded.sites[1].resolution
+        ));
+        assert!(!Arc::ptr_eq(
+            &decoded.sites[0].resolution,
+            &decoded.sites[2].resolution
+        ));
+    }
 
     #[test]
     fn fragment_front_coding_roundtrip_and_every_truncation_is_rejected() {

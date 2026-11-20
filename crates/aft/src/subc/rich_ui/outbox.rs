@@ -215,7 +215,12 @@ impl Outbox {
 }
 
 pub(crate) fn ceilings() -> DisplayLimits {
-    DisplayLimits::new(16_384, 3_145_728, 16_384, 0)
+    DisplayLimits::new(
+        16_384,
+        crate::bash_background::frames::MAX_BASH_DETAIL_BYTES,
+        16_384,
+        0,
+    )
 }
 
 #[cfg(test)]

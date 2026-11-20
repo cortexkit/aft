@@ -148,6 +148,10 @@ impl EngineSlot {
     /// Lets the engine go for `reason`, unless a refresh holds it now; true
     /// when one went.
     fn release(&self, reason: Release, why: &str) -> bool {
+        self.release_with(reason, why, || {})
+    }
+
+    fn release_with(&self, reason: Release, why: &str, after_unlock: impl FnOnce()) -> bool {
         let mut engine = match self.engine.try_lock() {
             Ok(engine) => engine,
             Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
@@ -156,12 +160,20 @@ impl EngineSlot {
         let Some(released) = engine.take() else {
             return false;
         };
-        drop(engine);
+        // A census that can lock the empty slot must also see its new
+        // accounting. The detached graph can be expensive to drop.
         let bytes = self.bytes.swap(0, Ordering::AcqRel);
-        drop(released);
         self.memory_epoch.fetch_add(1, Ordering::AcqRel);
+        drop(engine);
+        after_unlock();
+        drop(released);
         log_release(&self.root, bytes, reason, why);
         true
+    }
+
+    #[cfg(test)]
+    pub(super) fn release_idle_for_test(&self, after_unlock: impl FnOnce()) -> bool {
+        self.release_with(Release::Idle, "requested by the test", after_unlock)
     }
 
     /// Whether the slot holds an engine, and whether a refresh holds the

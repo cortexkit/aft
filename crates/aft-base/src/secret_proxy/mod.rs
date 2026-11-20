@@ -575,8 +575,13 @@ async fn serve(
                 connections.spawn(async move {
                     let session = state.session.load(Ordering::Acquire);
                     if session <= 0 || !state.generation_valid() || !peer::authorized(&socket, session) || !state.generation_valid() { return; }
-                    let socket = limits::IdleIo::new(socket, state.idle_timeout()).with_approval_waits(state.approvals.activity());
-                    let service = service_fn(move |request| connect(request, state.clone(), lease.clone()));
+                    let refused_upload = Arc::new(AtomicBool::new(false));
+                    let socket = limits::IdleIo::new(socket, state.idle_timeout())
+                        .with_approval_waits(state.approvals.activity())
+                        .with_refused_upload_drain(refused_upload.clone());
+                    let service = service_fn(move |request| {
+                        connect(request, state.clone(), lease.clone(), refused_upload.clone())
+                    });
                     let _ = hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(socket), service).with_upgrades().await;
                 });
@@ -593,6 +598,7 @@ async fn connect(
     mut request: Request<Incoming>,
     state: Arc<State>,
     lease: Arc<tokio::sync::OwnedSemaphorePermit>,
+    refused_upload: Arc<AtomicBool>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     use diagnostics::Reason;
     let host = request
@@ -678,7 +684,12 @@ async fn connect(
                 return;
             };
             let service = service_fn(move |request| {
-                request::forward(request, authority.clone(), state.clone())
+                request::forward(
+                    request,
+                    authority.clone(),
+                    state.clone(),
+                    refused_upload.clone(),
+                )
             });
             let _ = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new())
                 .serve_connection_with_upgrades(TokioIo::new(tls), service)

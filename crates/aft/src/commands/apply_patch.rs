@@ -226,6 +226,28 @@ fn reject_symlink_delete(
     path: &str,
     resolved: &ResolvedPath,
 ) -> Result<(), Response> {
+    reject_symlink_leaf(req, "delete symlink", path, resolved)
+}
+
+/// A move writes its new content through a destination symlink into the
+/// link's target, while the access check and the undo snapshot cover only
+/// the link itself: the target could lie outside the project root, and undo
+/// would recreate the link without restoring the target's old content.
+fn reject_symlink_move_destination(
+    req: &RawRequest,
+    path: &str,
+    resolved: &ResolvedPath,
+) -> Result<(), Response> {
+    reject_symlink_leaf(req, "move onto symlink", path, resolved)
+}
+
+/// Refuse `action` when the final component of `resolved` is a symlink.
+fn reject_symlink_leaf(
+    req: &RawRequest,
+    action: &str,
+    path: &str,
+    resolved: &ResolvedPath,
+) -> Result<(), Response> {
     let metadata = match fs::symlink_metadata(&resolved.abs) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -242,13 +264,15 @@ fn reject_symlink_delete(
         return Err(Response::error(
             &req.id,
             "invalid_request",
-            format!(
-                "apply_patch: refusing to delete symlink '{path}'; symlink undo is not supported"
-            ),
+            format!("apply_patch: refusing to {action} '{path}'; symlink undo is not supported"),
         ));
     }
 
     Ok(())
+}
+
+fn is_symlink_leaf(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
 }
 
 fn remember_path(
@@ -287,6 +311,12 @@ fn resolve_hunks(
         if matches!(&hunk, Hunk::Delete { .. }) {
             reject_symlink_delete(req, source_path, &source)?;
         }
+        if move_path.is_some() && is_symlink_leaf(&source.abs) {
+            // A move keeps the source's own entry so it can remove a link
+            // rather than its target, but it still reads the content through
+            // the link: authorize that target exactly as a direct read would.
+            resolve_path(req, ctx, source_path, false)?;
+        }
         remember_path(
             &source.abs,
             &source.rel,
@@ -295,6 +325,10 @@ fn resolve_hunks(
         );
         let move_dest = if let Some(move_path) = move_path {
             let dest = resolve_path(req, ctx, move_path, true)?;
+            // Checked before the same-file case too: a move back onto the
+            // same symlink would otherwise become an in-place update through
+            // a link whose target was never authorized.
+            reject_symlink_move_destination(req, move_path, &dest)?;
             if dest.abs == source.abs {
                 // Models can spell an in-place edit as a move back to the same file.
                 // Drop the move so apply and preview both use the normal update path.

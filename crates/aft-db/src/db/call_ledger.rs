@@ -390,26 +390,41 @@ pub fn admit_with_tool_result_source(
     state: State,
     include_body: bool,
 ) -> rusqlite::Result<Admission> {
+    admit_with_event_id(conn, key, digest, scope, state, include_body)
+        .map(|(admission, _)| admission)
+}
+
+/// The event id is returned for new rows so deferred cleanup cannot settle a
+/// later call that reused the same key after acknowledgement.
+pub fn admit_with_event_id(
+    conn: &Connection,
+    key: &Key,
+    digest: &str,
+    scope: Option<&ScopeIdentity>,
+    state: State,
+    include_body: bool,
+) -> rusqlite::Result<(Admission, Option<String>)> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     if let Some(mut row) = get(&tx, key)? {
         return Ok(if row.digest == digest && row.scope.as_ref() == scope {
             if include_body && row.state == State::Settled {
                 row.tool_result_source = load_tool_result_source(&tx, key)?;
             }
-            Admission::Repeat(row)
+            (Admission::Repeat(row), None)
         } else {
-            Admission::Conflict
+            (Admission::Conflict, None)
         });
     }
     #[cfg(any(test, feature = "test-support"))]
     run_after_ledger_read(&tx);
+    let event_id = new_event_id();
     tx.execute("INSERT INTO call_ledger (carrier,call_key,digest,state,owner,scope_ref,scope_epoch,custodian,event_id)
         VALUES (?1,?2,?3,?4,?5,?6,?7,CASE WHEN ?5 IS NULL THEN NULL ELSE ?1 END,?8)",
-        params![key.carrier,key.call_key,digest,state.as_str(),scope.map(|s| &s.owner),scope.map(|s| &s.scope_ref),scope.map(|s| s.scope_epoch),new_event_id()])?;
+        params![key.carrier,key.call_key,digest,state.as_str(),scope.map(|s| &s.owner),scope.map(|s| &s.scope_ref),scope.map(|s| s.scope_epoch),event_id])?;
     tx.commit()?;
     crash_point(state);
     aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Held);
-    Ok(Admission::New)
+    Ok((Admission::New, Some(event_id)))
 }
 
 pub fn transition(conn: &Connection, key: &Key, from: State, to: State) -> rusqlite::Result<bool> {

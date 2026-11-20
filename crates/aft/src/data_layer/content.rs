@@ -56,8 +56,9 @@ use crate::parser::LangId;
 /// are read in (see [`CONFIG`]), so two configuration files with the same
 /// bytes and different names have different records; it also retained the
 /// contained type of proven standard-library smart-pointer fields (for example,
-/// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-14";
+/// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
+/// 15 stores each distinct method-call answer once per fragment.
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-15";
 
 /// The language of a resolver configuration file the call graph reads raw,
 /// or the start of it. A configuration record also holds the TODO markers

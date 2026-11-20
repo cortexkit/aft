@@ -14,15 +14,11 @@ use std::time::Duration;
 test_support_visibility! {
 /// The phone's approval window is independent of upstream network deadlines.
 pub(crate) trait ApprovalClock: Send + Sync {
-    fn now_ms(&self) -> u64;
     fn deadline(&self) -> Pin<Box<dyn Future<Output = ()> + Send>>;
 }
 }
 struct WallClock;
 impl ApprovalClock for WallClock {
-    fn now_ms(&self) -> u64 {
-        super::vault::now_ms()
-    }
     fn deadline(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
         Box::pin(tokio::time::sleep(Duration::from_secs(600)))
     }
@@ -30,7 +26,6 @@ impl ApprovalClock for WallClock {
 
 /// One absolute person-wait limit, shared by every label in an HTTP request.
 pub(crate) struct RequestBudget {
-    pub(crate) expires_at_ms: u64,
     deadline: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 impl RequestBudget {
@@ -128,6 +123,7 @@ pub(crate) struct RequestSecrets {
     activity: Arc<RequestActivity>,
     once: Mutex<BTreeMap<String, bool>>,
     request_cancelled: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    local_approval_cancel: Option<super::consent::Cancellation>,
 }
 }
 struct Waiting<'a> {
@@ -162,8 +158,17 @@ impl RequestSecrets {
             activity: Arc::default(),
             once: Mutex::default(),
             request_cancelled: None,
+            local_approval_cancel: None,
         }
     }
+    }
+
+    pub(crate) fn with_local_approval_cancel(
+        mut self,
+        cancel: super::consent::Cancellation,
+    ) -> Self {
+        self.local_approval_cancel = Some(cancel);
+        self
     }
     pub(crate) fn with_request_cancellation(
         mut self,
@@ -178,7 +183,6 @@ impl RequestSecrets {
     }
     pub(crate) fn budget(&self) -> RequestBudget {
         RequestBudget {
-            expires_at_ms: self.clock.now_ms().saturating_add(600_000),
             deadline: self.clock.deadline(),
         }
     }
@@ -236,9 +240,8 @@ impl RequestSecrets {
         label: &str,
         target: &ApiKeyTarget,
         pending: ApprovalRequest,
-        expires_at_ms: u64,
     ) -> Result<ConsentOutcome, UseError> {
-        self.approve_with_metadata(label, target, pending, expires_at_ms, &|_| {})
+        self.approve_with_metadata(label, target, pending, &|_| {})
             .await
     }
 }
@@ -248,7 +251,6 @@ impl RequestSecrets {
         label: &str,
         target: &ApiKeyTarget,
         pending: ApprovalRequest,
-        expires_at_ms: u64,
         observe: &(impl Fn(ApprovalMetadata) + Sync),
     ) -> Result<ConsentOutcome, UseError> {
         let request_id = pending.request_id.clone();
@@ -287,15 +289,18 @@ impl RequestSecrets {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(sequence, lines);
-        let (answer, outcome_code) = super::consent::wait_consent_with_code(SecretConsentRequest {
-            scope: self.scope.clone(),
-            project_root: project_root.clone(),
-            session: session.clone(),
-            label: label.into(),
-            request_id: pending.request_id,
-            statement_b64url: pending.statement_b64url,
-            expires_at_ms: Some(expires_at_ms.min(pending.expires_at_ms)),
-        })
+        let (answer, outcome_code) = super::consent::wait_consent_with_code(
+            SecretConsentRequest {
+                scope: self.scope.clone(),
+                project_root: project_root.clone(),
+                session: session.clone(),
+                label: label.into(),
+                request_id: pending.request_id,
+                statement_b64url: pending.statement_b64url,
+                expires_at_ms: Some(pending.expires_at_ms),
+            },
+            self.local_approval_cancel.as_ref(),
+        )
         .await;
         observe(ApprovalMetadata {
             request_id,
@@ -323,29 +328,20 @@ impl RequestSecrets {
         &self,
         label: &str,
         target: &ApiKeyTarget,
-        expires_at_ms: u64,
         before_retry: F,
     ) -> Result<UseAnswer, UseError>
     where
         F: FnMut() -> Fut,
         Fut: Future<Output = Result<(), UseError>>,
     {
-        self.use_planned_in_request(
-            label,
-            target,
-            expires_at_ms,
-            |_| Ok(()),
-            |_| Ok(()),
-            before_retry,
-        )
-        .await
+        self.use_planned_in_request(label, target, |_| Ok(()), |_| Ok(()), before_retry)
+            .await
     }
 
     pub(crate) async fn use_planned_in_request<F, Fut, P, O>(
         &self,
         label: &str,
         target: &ApiKeyTarget,
-        expires_at_ms: u64,
         plan: P,
         observe: O,
         before_retry: F,
@@ -356,23 +352,14 @@ impl RequestSecrets {
         P: Fn(&str) -> Result<(), UseError>,
         O: Fn(&[u8]) -> Result<(), UseError>,
     {
-        self.use_planned_with_metadata(
-            label,
-            target,
-            expires_at_ms,
-            plan,
-            observe,
-            before_retry,
-            |_| {},
-        )
-        .await
+        self.use_planned_with_metadata(label, target, plan, observe, before_retry, |_| {})
+            .await
     }
 
     pub(crate) async fn use_planned_with_metadata<F, Fut, P, O, M>(
         &self,
         label: &str,
         target: &ApiKeyTarget,
-        expires_at_ms: u64,
         plan: P,
         observe: O,
         mut before_retry: F,
@@ -432,7 +419,7 @@ impl RequestSecrets {
                     .insert(label.into(), true);
             }
             once = self
-                .approve_with_metadata(label, target, pending, expires_at_ms, &metadata)
+                .approve_with_metadata(label, target, pending, &metadata)
                 .await?
                 == ConsentOutcome::AnsweredOnce;
             before_retry().await?;

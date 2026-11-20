@@ -2,6 +2,9 @@ use super::*;
 use crate::log_redact::aft_redactor;
 use std::borrow::Cow;
 
+#[path = "capture_reads.rs"]
+pub(super) mod capture_reads;
+
 // Every host displays this Rust-owned text verbatim instead of reconstructing
 // an unsafe preview from bash_status or the capture files after a restart.
 pub(super) const RESTART_PREVIEW_WITHHELD: &str =
@@ -542,10 +545,22 @@ impl BgTaskRegistry {
             return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
         };
         let buffer = BgBuffer::registered(paths, BgMode::Pipes);
-        let Some((stdout, stderr)) = buffer.read_complete_for_notice() else {
-            return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
+        // Most captures hold nothing to mask. A scan of bounded windows proves
+        // that without holding the whole capture in memory; only a capture
+        // that may hold a credential is read whole and masked as one text.
+        let mut full = match capture_reads::capture_needs_full_mask(&buffer, secrets) {
+            None => return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache),
+            Some(false) => None,
+            Some(true) => match buffer.read_complete_for_notice() {
+                Some(streams) => Some(streams),
+                None => return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache),
+            },
         };
-        let mut raw = combine_streams(&stdout, &stderr);
+        let scanned_clean = full.is_none();
+        let mut raw = full
+            .as_ref()
+            .map(|(stdout, stderr)| combine_streams(stdout, stderr))
+            .unwrap_or_default();
         normalize_piped_display_output(&mut raw);
         let masked_raw = secrets.redact(&raw);
         let secret_redaction_changed = matches!(&masked_raw, Cow::Owned(_));
@@ -565,6 +580,7 @@ impl BgTaskRegistry {
                 // compressor that keeps stderr's last line can drop stdout's
                 // verdict. Each stream is masked the same way as the body, so
                 // a restored line carries placeholders, never the credential.
+                let (stdout, stderr) = full.take().unwrap_or_default();
                 let [stdout, stderr] = [stdout, stderr].map(|mut stream| {
                     normalize_piped_display_output(&mut stream);
                     let masked_values = secrets.redact(&stream);
@@ -620,8 +636,34 @@ impl BgTaskRegistry {
             .recovery
             .as_ref()
             .is_some_and(|recovery| recovery.byte_truncated);
+        // Ticket masking compares the preview with the capture's two ends. A
+        // capture the scan found clean is unchanged by masking, so its ends
+        // are read alone rather than the whole capture.
+        let width = preview.text.len() + crate::log_redact::TICKET_HALO_BYTES;
+        let edges = scanned_clean
+            .then(|| capture_reads::read_raw_edges(&buffer, width))
+            .flatten();
+        let mut whole = String::new();
+        if scanned_clean && edges.is_none() {
+            let Some((stdout, stderr)) = buffer.read_complete_for_notice() else {
+                return withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache);
+            };
+            whole = combine_streams(&stdout, &stderr);
+            normalize_piped_display_output(&mut whole);
+        }
+        let raw = match &edges {
+            Some(capture_reads::RawEdges::Ends { head, tail }) => RawSlices {
+                head,
+                more_after_head: true,
+                tail,
+                more_before_tail: true,
+            },
+            Some(capture_reads::RawEdges::Whole(text)) => RawSlices::of(text, width),
+            None if scanned_clean => RawSlices::of(&whole, width),
+            None => RawSlices::of(&masked_raw, width),
+        };
         match mask_rendered_ticket_preview(
-            &masked_raw,
+            raw,
             &safe_cache.output_preview,
             intact_cache,
             safe_cache
@@ -837,8 +879,32 @@ fn withheld_watch_preview() -> (String, String) {
     )
 }
 
+/// The start and end of the normalized capture that ticket masking locates in
+/// a rendered preview, and whether more of the capture lies past each.
+struct RawSlices<'a> {
+    head: &'a str,
+    more_after_head: bool,
+    tail: &'a str,
+    more_before_tail: bool,
+}
+
+impl<'a> RawSlices<'a> {
+    /// The first and last `width` bytes of `raw`, widened to char boundaries.
+    fn of(raw: &'a str, width: usize) -> Self {
+        let head_end = crate::compress::generic::ceil_char_boundary(raw, width.min(raw.len()));
+        let tail_start =
+            crate::compress::generic::floor_char_boundary(raw, raw.len().saturating_sub(width));
+        Self {
+            head: &raw[..head_end],
+            more_after_head: head_end < raw.len(),
+            tail: &raw[tail_start..],
+            more_before_tail: tail_start > 0,
+        }
+    }
+}
+
 fn mask_rendered_ticket_preview(
-    raw: &str,
+    raw: RawSlices<'_>,
     cache: &str,
     intact_cache: bool,
     final_lines: &[String],
@@ -856,14 +922,11 @@ fn mask_rendered_ticket_preview(
     // Locate whole bounded raw head/tail slices in the terminal cache first.
     // A displayed line inside one of them has its raw neighbors at a known
     // offset. A line elsewhere can use its cache neighbors only if no byte cut
-    // destroyed them; otherwise withhold rather than guess.
-    let width = preview.text.len() + TICKET_HALO_BYTES;
-    let head_end = crate::compress::generic::ceil_char_boundary(raw, width.min(raw.len()));
-    let tail_start =
-        crate::compress::generic::floor_char_boundary(raw, raw.len().saturating_sub(width));
+    // destroyed them; otherwise withhold rather than guess. The caller cut the
+    // slices at the preview's length plus the halo.
     let sources = [
-        (&raw[..head_end], false, head_end < raw.len()),
-        (&raw[tail_start..], tail_start > 0, false),
+        (raw.head, false, raw.more_after_head),
+        (raw.tail, raw.more_before_tail, false),
     ];
     let mappings = sources.map(|(source, cut_start, cut_end)| {
         cache
@@ -928,9 +991,9 @@ fn mask_rendered_ticket_preview(
                     .iter()
                     .any(|final_line| final_line == line)
                     .then(|| {
-                        let tail = &raw[tail_start..];
+                        let tail = raw.tail;
                         let prefix = tail.trim_end_matches('\n').strip_suffix(line)?;
-                        (prefix.ends_with('\n') || (tail_start == 0 && prefix.is_empty()))
+                        (prefix.ends_with('\n') || (!raw.more_before_tail && prefix.is_empty()))
                             .then_some((tail, prefix.len()))
                     })
                     .flatten();
@@ -1030,7 +1093,26 @@ mod ticket_preview_tests {
         };
         // A matching fragment at the start of raw output is not evidence for
         // the bytes neighboring the displayed, already-truncated occurrence.
-        assert!(mask_rendered_ticket_preview(&raw, &cache, false, &[], &preview, &digest).is_err());
+        assert!(mask_rendered_ticket_preview(
+            ticket_ends(&raw, &preview),
+            &cache,
+            false,
+            &[],
+            &preview,
+            &digest
+        )
+        .is_err());
+    }
+
+    /// The raw ends `masked_terminal_preview` hands to ticket masking.
+    fn ticket_ends<'a>(
+        raw: &'a str,
+        preview: &crate::bash_background::output::PiecedText,
+    ) -> RawSlices<'a> {
+        RawSlices::of(
+            raw,
+            preview.text.len() + crate::log_redact::TICKET_HALO_BYTES,
+        )
     }
 
     #[test]
@@ -1049,7 +1131,7 @@ mod ticket_preview_tests {
         let in_ticket = cache.rfind(fragment).unwrap();
         assert_eq!(
             mask_rendered_ticket_preview(
-                &cache,
+                ticket_ends(&cache, &copied_from(in_ticket)),
                 &cache,
                 true,
                 &[],
@@ -1060,8 +1142,15 @@ mod ticket_preview_tests {
             crate::log_redact::SECRET_PLACEHOLDER
         );
         assert_eq!(
-            mask_rendered_ticket_preview(&cache, &cache, true, &[], &copied_from(0), &digest)
-                .unwrap(),
+            mask_rendered_ticket_preview(
+                ticket_ends(&cache, &copied_from(0)),
+                &cache,
+                true,
+                &[],
+                &copied_from(0),
+                &digest
+            )
+            .unwrap(),
             fragment
         );
     }

@@ -261,7 +261,11 @@ impl State {
             statement["durations"] = json!(["permanent"]);
         }
         statement["agent_id"] = json!(stamp.attributes.agent_id);
-        if let Some(expires) = self.pending_expires_at_ms {
+        if let Some(expires) = self.pending_expires_at_ms.or_else(|| {
+            record
+                .as_ref()
+                .map(|_| crate::secret::vault::now_ms() + 600_000)
+        }) {
             pending["expires_at_ms"] = json!(expires);
             statement["request_expires_at_ms"] = json!(expires);
         }

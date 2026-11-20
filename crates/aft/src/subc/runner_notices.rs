@@ -16,7 +16,10 @@ use cortexkit_role_llm_runner::{
     send_status::SendStatusRequest,
 };
 use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
-use subc_protocol::{scope::ScopeSelector, BindIdentity, RouteTarget};
+use subc_protocol::{
+    scope::{ParentState, ScopeKind, ScopeSelector, ScopeStamp},
+    BindIdentity, RouteTarget,
+};
 
 const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -277,6 +280,20 @@ impl CodeSearchNotice {
         self
     }
 
+    pub(crate) fn log_code_search_ineligible(&self, reason: &'static str) {
+        let (session, harness) = self.log_target();
+        crate::slog_info!(
+            "runner code-search nudge call_key={} session={session} harness={harness} not eligible reason={reason}",
+            self.call_key
+        );
+    }
+
+    fn log_target(&self) -> (&str, &str) {
+        self.address.as_ref().map_or(("unknown", "unknown"), |a| {
+            (a.identity.session.as_str(), a.identity.harness.as_str())
+        })
+    }
+
     /// Send before returning the tool result. If the runner refuses the
     /// template (for example, the session plan omitted it), retry once as
     /// free text at tool-result authority, within the same deadline; never append.
@@ -286,14 +303,24 @@ impl CodeSearchNotice {
         let mut remaining = self.remaining.lock().unwrap();
         let budget = *remaining;
         let started = std::time::Instant::now();
+        let is_code_search = notice
+            .template
+            .as_ref()
+            .is_some_and(|(id, _)| *id == notice_templates::CODE_SEARCH);
+        let mut attempt = NudgeAttempt::default();
         // Rendering can run on either an actor thread or a Tokio worker. Keep
         // the synchronous send's runtime off both callers' runtime stacks.
-        let outcome =
-            std::thread::scope(|scope| scope.spawn(|| self.send_once(notice, budget)).join())
-                .unwrap_or_else(|_| {
-                    retry(FailureClass::Runtime, "code-search notice sender panicked")
-                });
+        let outcome = std::thread::scope(|scope| {
+            scope
+                .spawn(|| self.send_once(notice, budget, is_code_search.then_some(&mut attempt)))
+                .join()
+        })
+        .unwrap_or_else(|_| retry(FailureClass::Runtime, "code-search notice sender panicked"));
         *remaining = remaining.saturating_sub(started.elapsed());
+        if is_code_search {
+            self.log_code_search_outcome(&attempt, &outcome);
+            return;
+        }
         match outcome {
             Outcome::Accepted | Outcome::Pending => {}
             Outcome::NotDelivered(reason) => log::info!(
@@ -310,10 +337,52 @@ impl CodeSearchNotice {
         }
     }
 
+    fn log_code_search_outcome(&self, attempt: &NudgeAttempt, outcome: &Outcome) {
+        let (session, harness) = self.log_target();
+        let send_id = attempt.send_id.as_deref().unwrap_or("none");
+        let probe = match attempt.ordered {
+            Some(Some(true)) => "confirmed",
+            Some(Some(false)) => "not advertised",
+            Some(None) => "unavailable",
+            None => "not completed",
+        };
+        let result = match outcome {
+            Outcome::Pending => {
+                "sent, ordered, awaiting delivery reason=eligible code search".into()
+            }
+            Outcome::Accepted => match attempt.ack {
+                Some(SendAck::Delivered) => "delivered reason=runner confirmed delivery".into(),
+                Some(SendAck::Finished) => {
+                    "delivery not confirmed reason=runner finished without a receipt".into()
+                }
+                Some(SendAck::Superseded) => "dropped reason=runner superseded the notice".into(),
+                Some(SendAck::Expired) => "dropped reason=notice expired".into(),
+                Some(SendAck::TemplatePartGone) => "dropped reason=template part is gone".into(),
+                None => "sent reason=runner accepted without a receipt".into(),
+            },
+            Outcome::NotDelivered(reason) => format!("not_delivered reason={reason}; dropped"),
+            Outcome::Final(failure) | Outcome::Retry(failure) => {
+                let code = failure.code.as_deref().unwrap_or("none");
+                let class = failure.class;
+                let detail = &failure.detail;
+                if class == FailureClass::PeerRefusal {
+                    format!("refused; dropped code={code} detail={detail}")
+                } else {
+                    format!("dropped class={class:?} code={code} detail={detail}")
+                }
+            }
+        };
+        crate::slog_info!(
+            "runner code-search nudge call_key={} send_id={send_id} session={session} harness={harness} probe={probe}; {result}",
+            self.call_key
+        );
+    }
+
     fn send_once(
         &self,
         notice: &crate::subc::runner_notices::notice_templates::Notice,
         remaining: Duration,
+        mut attempt: Option<&mut NudgeAttempt>,
     ) -> Outcome {
         if remaining.is_zero() {
             return Outcome::Final(Failure::new(
@@ -347,7 +416,11 @@ impl CodeSearchNotice {
                 tokio::time::timeout(
                     remaining,
                     async {
-                        let modern = runner_delivery_order(&path, address).await == Some(true);
+                        let ordered = runner_delivery_order(&path, address).await;
+                        if let Some(attempt) = attempt.as_deref_mut() {
+                            attempt.ordered = Some(ordered);
+                        }
+                        let modern = ordered == Some(true);
                         if !modern {
                             // A send without a delivery order queues behind the
                             // running turn and then starts a turn of its own at
@@ -362,10 +435,10 @@ impl CodeSearchNotice {
                         }
                         let cleared = modern && runner_capability(&path, address, "delivery_order_modes:turn_system_cleared").await == Some(true);
                         let request = nudge_request(&self.call_key, notice, &self.preset, now, cleared, false);
-                        let outcome = send(&path, address, &request, modern).await;
+                        let outcome = send_nudge(&path, address, &request, attempt.as_deref_mut()).await;
                         let refused = matches!(&outcome, Outcome::Final(failure) | Outcome::Retry(failure) if failure.code.as_deref() == Some("invalid_params") && failure.field.as_deref() == Some("template"));
                         if request.runner_params.contains_key("template") && refused {
-                            send(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, false, true), true).await
+                            send_nudge(&path, address, &nudge_request(&self.call_key, notice, &self.preset, now, false, true), attempt).await
                         } else { outcome }
                     },
                 )
@@ -379,6 +452,34 @@ impl CodeSearchNotice {
             }))
         })()
         .unwrap_or_else(|outcome| outcome)
+    }
+}
+
+#[derive(Default)]
+struct NudgeAttempt {
+    ordered: Option<Option<bool>>,
+    send_id: Option<String>,
+    ack: Option<SendAck>,
+}
+
+async fn send_nudge(
+    path: &Path,
+    address: &Address,
+    request: &SendRequest,
+    attempt: Option<&mut NudgeAttempt>,
+) -> Outcome {
+    let Some(attempt) = attempt else {
+        return send(path, address, request, true).await;
+    };
+    attempt.send_id = Some(request.send_id.clone());
+    match call(path, address, envelope(request)).await {
+        Ok(bytes) => {
+            let (outcome, ack) =
+                decode_send_reply_with_ack(&bytes, tracks_delivery_receipt(request, true));
+            attempt.ack = ack;
+            outcome
+        }
+        Err(outcome) => outcome,
     }
 }
 
@@ -434,11 +535,79 @@ pub(super) fn route_unbound(route: &RouteIdentity) {
     }
 }
 
+type NoticeScope = (ScopeSelector, ScopeKind);
+
+fn route_notice_scope(stamp: &ScopeStamp) -> NoticeScope {
+    (
+        ScopeSelector::new(
+            stamp.owner.clone(),
+            stamp.scope_ref.clone(),
+            Some(stamp.scope_epoch),
+        ),
+        stamp.kind,
+    )
+}
+
+fn task_notice_scope(stamp: Option<&ScopeStamp>) -> Result<Option<NoticeScope>, ()> {
+    let Some(stamp) = stamp else {
+        return Ok(None);
+    };
+    if stamp.attributes.run_id.is_none() {
+        return Ok(Some(route_notice_scope(stamp)));
+    }
+
+    // The stored stamp still governs the command's lifetime. Runner notices
+    // use the parent session scope the daemon linked to the run instead.
+    if !stamp.owner_authorized || stamp.parent_state != Some(ParentState::Linked) {
+        return Err(());
+    }
+    let parent = stamp.parent.as_ref().ok_or(())?;
+    if parent.scope_ref.is_empty()
+        || (parent.owner == stamp.owner
+            && parent.scope_ref == stamp.scope_ref
+            && parent.scope_epoch == stamp.scope_epoch)
+    {
+        return Err(());
+    }
+    let kind = match super::codemode::run_kind(stamp).map_err(|_| ())?.0 {
+        super::codemode::RunKind::Agent { .. } => ScopeKind::Head,
+        super::codemode::RunKind::Worker { .. } => ScopeKind::Worker,
+    };
+    Ok(Some((
+        ScopeSelector::new(
+            parent.owner.clone(),
+            parent.scope_ref.clone(),
+            Some(parent.scope_epoch),
+        ),
+        kind,
+    )))
+}
+
+fn warn_missing_run_parent(task_id: &str) {
+    static LOGGED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    if LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(task_id.to_owned())
+    {
+        log::warn!("runner notice task={task_id} has no verified run parent scope; not sent");
+    }
+}
+
 impl Address {
     fn new(
         owner: &crate::bash_background::TaskIdentity,
         raw_harness: String,
-        stamp: Option<&subc_protocol::scope::ScopeStamp>,
+        stamp: Option<&ScopeStamp>,
+    ) -> Option<Self> {
+        Self::with_scope(owner, raw_harness, stamp.map(route_notice_scope))
+    }
+
+    fn with_scope(
+        owner: &crate::bash_background::TaskIdentity,
+        raw_harness: String,
+        scope: Option<NoticeScope>,
     ) -> Option<Self> {
         if retired(owner) {
             return None;
@@ -450,27 +619,20 @@ impl Address {
             .to_string();
         let raw_harness =
             concrete_runner_harness(owner.principal.as_deref(), &owner.session, &raw_harness)?;
+        let (scope, kind) = scope.unzip();
         Some(Self {
             // Broca hosts heads as well as workers, and a head's completion
             // must be allowed to wake it (idle_start). On Broca only a head
             // scope qualifies; every other Broca route, including an unscoped
             // one with no stamp to ask, keeps the worker delivery.
-            worker: match stamp {
-                Some(stamp) if module == "broca" => {
-                    stamp.kind != subc_protocol::scope::ScopeKind::Head
-                }
-                Some(stamp) => stamp.kind == subc_protocol::scope::ScopeKind::Worker,
+            worker: match kind {
+                Some(kind) if module == "broca" => kind != ScopeKind::Head,
+                Some(kind) => kind == ScopeKind::Worker,
                 None => module == "broca",
             },
             module,
             identity: BindIdentity::new(raw_harness, owner.session.clone()),
-            scope: stamp.map(|stamp| {
-                ScopeSelector::new(
-                    stamp.owner.clone(),
-                    stamp.scope_ref.clone(),
-                    Some(stamp.scope_epoch),
-                )
-            }),
+            scope,
         })
     }
 }
@@ -594,10 +756,14 @@ impl CapabilityConsumer {
         if let Some(probe) = test_endpoint::probe(_address) {
             return Ok(Self::Endpoint(probe));
         }
-        super::registration::connect_consumer(path, ConsumerOptions::default())
-            .await
-            .map(Self::Runner)
-            .map_err(|_| ("connect", None))
+        super::registration::connect_consumer(
+            "runner_notice_probe",
+            path,
+            ConsumerOptions::default(),
+        )
+        .await
+        .map(Self::Runner)
+        .map_err(|_| ("connect", None))
     }
 
     async fn incarnation(&self, module: &str) -> Result<RunnerIncarnation, ProbeFailure> {
@@ -1325,32 +1491,48 @@ fn flush_delivery_update(
 }
 
 fn decode_send_reply(bytes: &[u8], receipt_semantics: bool) -> Outcome {
+    decode_send_reply_with_ack(bytes, receipt_semantics).0
+}
+
+enum SendAck {
+    Delivered,
+    Finished,
+    Superseded,
+    Expired,
+    TemplatePartGone,
+}
+
+fn decode_send_reply_with_ack(bytes: &[u8], receipt_semantics: bool) -> (Outcome, Option<SendAck>) {
     match cortexkit_role_llm_runner::wire::read_reply::<SendReply>(bytes) {
         Ok(reply) => {
             // llm-runner 0.8.53 CONTRACT §9: not_delivered is final for this
             // send_id; only a new send_id may try the same words again.
             if reply.state == states::NOT_DELIVERED {
-                return Outcome::NotDelivered(reply.reason.unwrap_or_else(|| "unknown".into()));
+                return (
+                    Outcome::NotDelivered(reply.reason.unwrap_or_else(|| "unknown".into())),
+                    None,
+                );
             }
             // CONTRACT §9 and §9.7 list finished, superseded, expired
             // and template_part_gone as final. A run's active/paused state (or
             // a future state) does not prove ordered notice delivery: without a
             // receipt, both first and later replies need follow-up. Legacy sends
             // never get receipts, so only explicit pending keeps them followed.
-            let terminal = matches!(
-                reply.state.as_str(),
-                states::FINISHED
-                    | states::SUPERSEDED
-                    | states::EXPIRED
-                    | states::TEMPLATE_PART_GONE
-            );
-            if reply.delivered.is_none()
-                && !terminal
-                && (receipt_semantics || reply.state == "pending")
-            {
-                Outcome::Pending
+            let ack = if reply.delivered.is_some() {
+                Some(SendAck::Delivered)
             } else {
-                Outcome::Accepted
+                match reply.state.as_str() {
+                    states::FINISHED => Some(SendAck::Finished),
+                    states::SUPERSEDED => Some(SendAck::Superseded),
+                    states::EXPIRED => Some(SendAck::Expired),
+                    states::TEMPLATE_PART_GONE => Some(SendAck::TemplatePartGone),
+                    _ => None,
+                }
+            };
+            if ack.is_none() && (receipt_semantics || reply.state == "pending") {
+                (Outcome::Pending, None)
+            } else {
+                (Outcome::Accepted, ack)
             }
         }
         Err(error) => {
@@ -1366,10 +1548,10 @@ fn decode_send_reply(bytes: &[u8], receipt_semantics: bool) -> Outcome {
                             .map(str::to_owned);
                         failure.detail = refusal_body.to_string();
                     }
-                    return outcome;
+                    return (outcome, None);
                 }
             }
-            retry(FailureClass::ReplyDecode, error)
+            (retry(FailureClass::ReplyDecode, error), None)
         }
     }
 }
@@ -1540,11 +1722,16 @@ async fn call(path: &Path, address: &Address, body: Vec<u8>) -> Result<Vec<u8>, 
             "AFT launch has no consumer identity",
         ));
     }
-    let consumer =
-        match super::registration::connect_consumer(path, ConsumerOptions::default()).await {
-            Ok(consumer) => consumer,
-            Err(error) => return Err(retry(FailureClass::Connect, error)),
-        };
+    let consumer = match super::registration::connect_consumer(
+        "runner_notice_send",
+        path,
+        ConsumerOptions::default(),
+    )
+    .await
+    {
+        Ok(consumer) => consumer,
+        Err(error) => return Err(retry(FailureClass::Connect, error)),
+    };
     let route = open_notice_route(&consumer, address).await;
     let result = match route {
         Ok(route) => {
@@ -1788,6 +1975,14 @@ fn offer(
                     settled = true;
                 }
             }
+            let scope = task_notice_scope(metadata.scope.as_ref());
+            if !settled && scope.is_err() {
+                warn_missing_run_parent(&task_id);
+                if !completion {
+                    return Next::Done;
+                }
+                settled = true;
+            }
             if settled {
                 return if registry
                     .ack_completions_for_session(
@@ -1819,7 +2014,7 @@ fn offer(
                         .launching_raw_harness
                         .clone()
                         .unwrap_or_else(|| owner.harness.clone());
-                    let Some(address) = Address::new(&owner, raw, metadata.scope.as_ref()) else {
+                    let Some(address) = Address::with_scope(&owner, raw, scope.expect("invalid scope was settled")) else {
                         return retry(FailureClass::Address, "task has no runner notice address");
                     };
                     let runtime = match tokio::runtime::Builder::new_current_thread()

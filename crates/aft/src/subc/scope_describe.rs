@@ -5,6 +5,12 @@ use super::*;
 use crate::access_policy::prefrontal::{self, Continuation, CounterpartReply};
 use subc_protocol::{scope::ScopeStamp, session::ModuleControlResponseToModule};
 
+mod indexed_scopes;
+use indexed_scopes::IndexedScopes;
+#[path = "scope_routes.rs"]
+mod scope_routes;
+use scope_routes::RoutedScopes;
+
 pub(super) fn describe_timeout() -> Duration {
     timing(
         "AFT_TEST_SCOPE_DESCRIBE_TIMEOUT_MS",
@@ -48,7 +54,6 @@ pub(super) fn describe_answer_ends_scope(reply: &ModuleControlResponseToModule) 
 
 /// A live rebind does not end ordinary commands, but old-epoch grants must
 /// never authorize another request from a surviving secret command.
-#[cfg(unix)]
 fn secret_authorization_rebound(stamp: &ScopeStamp, reply: &ModuleControlResponseToModule) -> bool {
     matches!(reply, ModuleControlResponseToModule::ScopeDescribe { status: subc_protocol::scope::ScopeStatus::Live, scope_epoch: Some(epoch), .. } if *epoch != stamp.scope_epoch)
 }
@@ -98,7 +103,7 @@ impl CompletedEnds {
 #[derive(Clone)]
 pub(super) struct ScopeDescribes {
     goodbye: mpsc::UnboundedSender<ScopeStamp>,
-    routed: Arc<StdMutex<HashSet<(String, String, u64)>>>,
+    routed: Arc<StdMutex<RoutedScopes>>,
     observed: mpsc::UnboundedSender<ScopeStamp>,
     #[cfg(test)]
     iterations: Arc<std::sync::atomic::AtomicUsize>,
@@ -130,27 +135,10 @@ pub(super) fn start_for_speech(
 }
 impl ScopeDescribes {
     pub(super) fn routes(&self, routes: &HashMap<RouteChannel, RouteIdentity>) {
-        let current: HashSet<_> = routes
-            .values()
-            .filter_map(|identity| identity.scope.as_ref())
-            .map(stamp_key)
-            .collect();
-        let mut routed = self
-            .routed
+        self.routed
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for stamp in routes
-            .values()
-            .filter_map(|identity| identity.scope.as_ref())
-        {
-            if stamp.owner_authorized
-                && crate::access_policy::prefrontal::is_principal(&stamp.owner)
-                && !routed.contains(&stamp_key(stamp))
-            {
-                let _ = self.bound.send(stamp.clone());
-            }
-        }
-        *routed = current;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .update(routes, &self.bound);
     }
     pub(super) fn goodbye(&self, stamp: ScopeStamp) {
         let _ = self.goodbye.send(stamp);
@@ -258,7 +246,7 @@ where
     let (observed, mut observations) = mpsc::unbounded_channel();
     let (bound, mut bindings) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
-    let routed = Arc::new(StdMutex::new(HashSet::new()));
+    let routed = Arc::new(StdMutex::new(RoutedScopes::default()));
     let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
     #[cfg(test)]
     let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -311,6 +299,7 @@ where
         let mut next_scan = tokio::time::Instant::now() + interval;
         let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
         let mut inventory = scope_watch::Inventory::default();
+        let mut indexed = IndexedScopes::default();
         let mut inventory_revision = scope_watch::revisions();
         let mut refresh = scope_watch::Refresh::new();
         let mut verifications = scope_watch::Verifications::default();
@@ -330,16 +319,17 @@ where
                 inventory_revision = scope_watch::revisions();
                 let mut refreshed = scope_source().await;
                 refreshed.retain_unread(&inventory);
+                indexed.refresh(&inventory, &refreshed);
                 inventory = refreshed;
                 refresh.at = None;
             }
-            let mut held_scopes = inventory.scopes();
+            let all_scopes = indexed.all();
             for module_id in catalog.borrow_and_update().clone() {
                 if !catalog_seen.insert(module_id.clone()) {
                     continue;
                 }
                 let owner = Principal::Reserved { module_id };
-                for stamp in held_scopes.values() {
+                for stamp in all_scopes.values() {
                     if let Some(other) = crate::access_policy::prefrontal::counterpart(stamp)
                         .filter(|other| other.owner == owner)
                     {
@@ -358,15 +348,20 @@ where
                     }
                 }
             }
-            speech_pending
-                .retain(|key| held_scopes.contains_key(key) || cleanup_keys.contains(key));
+            speech_pending.retain(|key| all_scopes.contains_key(key) || cleanup_keys.contains(key));
+            let last_confirmed = confirmed.len();
             confirmed.retain(|key| {
-                held_scopes.contains_key(key)
+                all_scopes.contains_key(key)
                     || cleanup_keys.contains(key)
                     || speech_pending.contains(key)
             });
-            next_poll.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
-            retry.retain(|key, _| held_scopes.contains_key(key) && !confirmed.contains(key));
+            if confirmed.len() != last_confirmed {
+                indexed.mark_dirty();
+            }
+            indexed.reconcile(&confirmed);
+            let held_scopes = indexed.active();
+            next_poll.retain(|key, _| held_scopes.contains_key(key));
+            retry.retain(|key, _| held_scopes.contains_key(key));
             continuity_holds
                 .retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
             retrigger.retain(|key| held_scopes.contains_key(key) && !confirmed.contains(key));
@@ -378,11 +373,10 @@ where
                 .flat_map(|(_, group)| group.iter().map(|(key, _, _)| key.clone()))
                 .collect();
             pending.retain(|key| queued.contains_key(key) || active_keys.contains(key));
-            held_scopes.retain(|key, _| !confirmed.contains(key));
-            watches.reconcile(&held_scopes, &control, interval);
+            watches.reconcile(held_scopes, &control, interval);
             let protected = watches.coverage(held_scopes.len());
             let protected_keys = &protected.keys;
-            verifications.reconcile(&watches.healthy_keys(), &held_scopes);
+            verifications.reconcile(&watches.healthy_keys(), held_scopes);
             if let Some(key) = verifications.take_due() {
                 if let Some(stamp) = held_scopes.get(&key) {
                     verification_keys.insert(key.clone());
@@ -428,11 +422,7 @@ where
                 // confirms every retained epoch that existed when it was sent.
                 let reference = (key.0.clone(), key.1.clone());
                 inflight_refs.insert(reference.clone());
-                let mut group: HashMap<_, _> = held_scopes
-                    .iter()
-                    .filter(|(key, _)| (key.0.clone(), key.1.clone()) == reference)
-                    .map(|(key, stamp)| (key.clone(), stamp.clone()))
-                    .collect();
+                let mut group: HashMap<_, _> = indexed.group(&reference).collect();
                 group.entry(key).or_insert(stamp.clone());
                 let group: Vec<_> = group
                     .into_iter()
@@ -513,6 +503,7 @@ where
             let routed_now = routed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys
                 .clone();
             // A reopened watch can report a retired owner's stale scope as
             // live. Keep describing held scopes even after watch coverage resumes.
@@ -575,6 +566,7 @@ where
                         continue;
                     }
                     if let Some(service)=&speech { if speech_pending.remove(&stamp_key(&stamp)) || confirmed.insert(stamp_key(&stamp)) {
+                        indexed.mark_dirty();
                         let key = stamp_key(&stamp);
                         cleanup_keys.insert(key.clone());
                         accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
@@ -600,18 +592,19 @@ where
                     inventory_revision = scope_watch::revisions();
                     let mut current = scope_source().await;
                     current.retain_unread(&inventory);
+                    indexed.refresh(&inventory, &current);
                     inventory = current;
                     refresh.at = None;
-                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
+                    let scopes = indexed.all();
                     let key = stamp_key(&stamp);
                     // Let the test daemon observe the exact Goodbye snapshot,
                     // including a close that found no registered shell task.
                     #[cfg(feature = "test-timing-hooks")]
                     if let Some(path) = std::env::var_os("AFT_TEST_SCOPE_GOODBYE_SAMPLED_FILE") {
-                        let matches = scopes.iter().filter(|live| stamp_key(live) == key).count();
+                        let matches = usize::from(scopes.contains_key(&key));
                         let _ = std::fs::write(path, matches.to_string());
                     }
-                    if !protected_keys.contains(&key) && !confirmed.contains(&key) && scopes.iter().any(|live| stamp_key(live) == key) {
+                    if !protected_keys.contains(&key) && !confirmed.contains(&key) && scopes.contains_key(&key) {
                         #[cfg(feature = "test-timing-hooks")]
                         crate::slog_info!("scope diagnostic phase=goodbye_describe_queued scope_epoch={}", stamp.scope_epoch);
                         trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
@@ -625,6 +618,7 @@ where
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
                         watches.health.drift_repairs += refreshed.warn_drift(&inventory, inventory_revision, now);
+                        indexed.refresh(&inventory, &refreshed);
                         inventory = refreshed;
                         inventory_revision = now;
                         next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
@@ -635,27 +629,29 @@ where
                         inventory_revision = scope_watch::revisions();
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
+                        indexed.refresh(&inventory, &refreshed);
                         inventory = refreshed;
+                        secret_authorizations = crate::secret::consent::pending_scope_stamps().iter().map(stamp_key).collect();
                         #[cfg(unix)]
                         {
                             let executor = executor.clone();
-                            secret_authorizations = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                            let proxies: Vec<_> = tokio::task::spawn_blocking(move || executor.actor_contexts().into_iter().flat_map(|ctx| ctx.bash_background().secret_authorization_scope_stamps()).map(|stamp| stamp_key(&stamp)).collect()).await.unwrap_or_default();
+                            secret_authorizations.extend(proxies);
                         }
                         next_scan = tokio::time::Instant::now() + interval;
                     }
-                    let scopes: Vec<_> = inventory.scopes().into_values().collect();
-                    retry.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
-                    next_poll.retain(|key, _| scopes.iter().any(|stamp| &stamp_key(stamp) == key));
-                    let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-                    for stamp in scopes {
-                        let key = stamp_key(&stamp);
-                        if (!protected_keys.contains(&key) || continuity_holds.contains(&key)) && !confirmed.contains(&key) && !pending.contains(&key) && (!routed.contains(&key) || secret_authorizations.contains(&key) || retry.contains_key(&key))
-                            && next_poll.get(&key).map_or(scan_due, |due| tokio::time::Instant::now() >= *due) {
+                    let scopes = indexed.all();
+                    retry.retain(|key, _| scopes.contains_key(key));
+                    next_poll.retain(|key, _| scopes.contains_key(key));
+                    let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keys.clone();
+                    for (key, stamp) in scopes {
+                        if (!protected_keys.contains(key) || continuity_holds.contains(key)) && !confirmed.contains(key) && !pending.contains(key) && (!routed.contains(key) || secret_authorizations.contains(key) || retry.contains_key(key))
+                            && next_poll.get(key).map_or(scan_due, |due| tokio::time::Instant::now() >= *due) {
                             // A per-scope deadline can precede the next inventory
                             // scan. Consume it when queuing the probe so no past
                             // deadline remains an immediately-ready timer.
-                            next_poll.remove(&key);
-                            trigger_describe(key, stamp, &mut pending, &mut queued, &mut retrigger);
+                            next_poll.remove(key);
+                            trigger_describe(key.clone(), stamp.clone(), &mut pending, &mut queued, &mut retrigger);
                         }
                     }
                 }
@@ -724,13 +720,16 @@ where
                         } else if let Some(other) = prefrontal::counterpart(&stamp) {
                             prefrontal::log_continuation(&stamp, &other, prefrontal::retained_outcome(reply.as_ref().ok()));
                         }
-                        #[cfg(unix)]
                         if reply.as_ref().is_ok_and(|answer| secret_authorization_rebound(&stamp, answer)) {
+                            crate::secret::consent::revoke_scope(&stamp);
+                            #[cfg(unix)]
+                            {
                             let executor = executor.clone();
                             let described = stamp.clone();
                             let _ = tokio::task::spawn_blocking(move || {
                                 for ctx in executor.actor_contexts() { ctx.bash_background().revoke_secret_authorization(&described); }
                             }).await;
+                            }
                         }
                         let strict_end = speech.as_ref().filter(|_| full_stamp && source_ended).and_then(|service| {
                             let role=if stamp.attributes.run_id.is_some(){crate::gh_shim_speech::ScopeRole::Run}else{crate::gh_shim_speech::ScopeRole::Authority};
@@ -743,6 +742,7 @@ where
                             #[cfg(feature = "test-timing-hooks")]
                             crate::slog_info!("scope diagnostic phase=describe_ended scope_epoch={}", stamp.scope_epoch);
                             if confirmed.insert(key.clone()) {
+                                indexed.mark_dirty();
                                 accept_confirmed_end(&executor, run_scopes.as_deref(), &control.metrics, &stamp);
                                 if strict_end.is_some() {
                                     speech_pending.insert(key.clone());
@@ -779,7 +779,7 @@ where
                         // A terminal push is sent only once. If it raced this
                         // probe, a Live or failed answer may predate the end.
                         if retrigger.remove(&key) && !confirmed.contains(&key) {
-                            if let Some(current) = held_scopes.get(&key) {
+                            if let Some(current) = indexed.active().get(&key) {
                                 trigger_describe(key, current.clone(), &mut pending, &mut queued, &mut retrigger);
                             }
                         }
@@ -842,7 +842,13 @@ async fn work_scopes(
                 .flat_map(|ctx| ctx.bash_background().live_scope_stamps())
                 .collect::<Vec<_>>(),
         );
-        scopes.add(scope_watch::Source::Parked, run_scopes.parked_scopes());
+        scopes.add(
+            scope_watch::Source::Parked,
+            run_scopes
+                .parked_scopes()
+                .into_iter()
+                .chain(crate::secret::consent::pending_scope_stamps()),
+        );
         let mut seen = HashSet::new();
         for ctx in executor.actor_contexts() {
             let Some(db) = ctx.db() else { continue };
@@ -955,7 +961,7 @@ pub(crate) async fn confirm_secret_rebind_for_test(
             }
         });
     // A still-open head route must not suppress authorization-epoch checks.
-    scopes.routed.lock().unwrap().insert(stamp_key(&stamp));
+    scopes.routed.lock().unwrap().keys.insert(stamp_key(&stamp));
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut answered_head = false;
     loop {
@@ -1027,7 +1033,7 @@ fn fence_confirmed_end(executor: &Executor, stamp: &ScopeStamp) {
     }
 }
 
-fn accept_confirmed_end(
+pub(super) fn accept_confirmed_end(
     executor: &Executor,
     runs: Option<&super::run_scope::RunScopes>,
     metrics: &DispatchPathMetrics,
@@ -1041,6 +1047,7 @@ fn accept_confirmed_end(
     if let Some(runs) = runs {
         runs.revoke(stamp);
     }
+    crate::secret::consent::revoke_scope(stamp);
     fence_confirmed_end(executor, stamp);
 }
 

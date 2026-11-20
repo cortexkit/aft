@@ -1273,6 +1273,10 @@ impl SecretValues {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+    /// Whether a value contains a newline, so it can cross a cut made at one.
+    pub fn has_multiline_value(&self) -> bool {
+        self.0.iter().any(|value| value.contains('\n'))
+    }
 
     /// Byte ranges in `text` of every occurrence of a value that contains a
     /// newline. Only these occurrences can cross a cut made at a newline.
@@ -1477,6 +1481,16 @@ pub fn json_secret_value_open_at_end(text: &str, before: usize) -> bool {
                 }
             }
         })
+}
+
+static SECRET_JSON_LABEL_AT_END: LazyLock<Regex> =
+    LazyLock::new(|| compile(&format!(r#"(?i)"(?:{JSON_SECRET_LABELS})"\s*(?::\s*)?\z"#)));
+
+/// Whether `text` ends after a JSON secret field's label (and possibly its
+/// colon) but before the opening quote of its value. The value, and so the
+/// [`SECRET_JSON_FIELD`] match, would start past the end of `text`.
+pub fn json_secret_label_open_at_end(text: &str) -> bool {
+    text.contains('"') && SECRET_JSON_LABEL_AT_END.is_match(text)
 }
 
 /// Byte-level entry point for the log sink. Invalid UTF-8 is decoded with

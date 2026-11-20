@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use bytes::Bytes;
 use cortexkit_bus_client::BusClient;
 use cortexkit_bus_naming::{AccountNames, ModuleBucket, MODULE_BUCKETS};
 use serde::Serialize;
@@ -37,6 +38,8 @@ fn declaration() -> &'static ModuleBucket {
 
 fn key(session: &str) -> String {
     use std::fmt::Write;
+    #[cfg(test)]
+    tests::KEY_RENDERS.set(tests::KEY_RENDERS.get() + 1);
     let mut key = String::with_capacity(session.len() * 2);
     for byte in session.bytes() {
         write!(&mut key, "{byte:02x}").expect("write to string");
@@ -45,6 +48,8 @@ fn key(session: &str) -> String {
 }
 
 fn encode(segment: &str, generation: u64) -> Vec<u8> {
+    #[cfg(test)]
+    tests::VALUE_RENDERS.set(tests::VALUE_RENDERS.get() + 1);
     #[derive(Serialize)]
     struct Value<'a> {
         v: u8,
@@ -60,18 +65,18 @@ fn encode(segment: &str, generation: u64) -> Vec<u8> {
 }
 
 pub(crate) use aft_base::runner_status_state::{initialize, route_bound, route_unbound};
-use aft_base::runner_status_state::{notifier, snapshot_segments, Segment};
+use aft_base::runner_status_state::{notifier, snapshot_segments, Snapshot};
 #[cfg(test)]
 use aft_base::runner_status_state::{segment_for_test, Sessions};
 
 trait Writer {
-    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
+    async fn put(&mut self, key: &str, value: Bytes) -> Result<(), &'static str>;
 }
 struct RealWriter(async_nats::jetstream::kv::Store);
 impl Writer for RealWriter {
-    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str> {
+    async fn put(&mut self, key: &str, value: Bytes) -> Result<(), &'static str> {
         self.0
-            .put(key, value.into())
+            .put(key, value)
             .await
             .map(|_| ())
             .map_err(|_| "status_put")
@@ -80,22 +85,25 @@ impl Writer for RealWriter {
 
 #[derive(Default)]
 struct Publication {
-    written: HashMap<String, (u64, Instant)>,
-    skipped: HashMap<String, u64>,
+    written: HashMap<Arc<str>, (u64, Instant)>,
+    skipped: HashMap<Arc<str>, u64>,
+    live_ids: HashSet<Arc<str>>,
 }
 impl Publication {
     async fn sync(
         &mut self,
         writer: &mut impl Writer,
-        values: Vec<(String, Segment)>,
+        values: &mut Snapshot,
         health: &mut StatusHealth,
     ) -> Result<(), &'static str> {
-        let live: HashSet<_> = values.iter().map(|(session, _)| session.as_str()).collect();
+        self.live_ids
+            .extend(values.iter().map(|(session, _)| session.clone()));
         self.written
-            .retain(|session, _| live.contains(session.as_str()));
+            .retain(|session, _| self.live_ids.contains(session));
         self.skipped
-            .retain(|session, _| live.contains(session.as_str()));
-        for (session, segment) in values {
+            .retain(|session, _| self.live_ids.contains(session));
+        self.live_ids.clear();
+        for (session, segment) in values.drain(..) {
             // A previous put may have awaited I/O while this session ended.
             // A copied snapshot must not keep its route lifetime alive.
             if segment.live.strong_count() == 0 {
@@ -106,24 +114,30 @@ impl Publication {
             if self.skipped.get(&session) == Some(&segment.generation) {
                 continue;
             }
-            let value = encode(&segment.text, segment.generation);
-            if value.len() > declaration().max_value_bytes as usize {
+            let last_write = self
+                .written
+                .get(&session)
+                .filter(|(generation, _)| *generation == segment.generation);
+            if last_write.is_some_and(|(_, at)| at.elapsed() < REFRESH) {
+                continue;
+            }
+            let refresh = last_write.is_some();
+            let Some(value) = segment.value(|| {
+                let value = encode(&segment.text, segment.generation);
+                (value.len() <= declaration().max_value_bytes as usize).then(|| value.into())
+            }) else {
                 self.written.remove(&session);
                 self.skipped.insert(session, segment.generation);
                 health.skips += 1;
                 health.last_failure = Some("status_value_oversize");
                 continue;
-            }
-            let refresh = self
-                .written
-                .get(&session)
-                .is_some_and(|(generation, _)| *generation == segment.generation);
-            if refresh && self.written[&session].1.elapsed() < REFRESH {
-                continue;
-            }
-            tokio::time::timeout(IO_TIMEOUT, writer.put(&key(&session), value))
-                .await
-                .map_err(|_| "status_put_timeout")??;
+            };
+            tokio::time::timeout(
+                IO_TIMEOUT,
+                writer.put(segment.key(|| key(&session)), value.clone()),
+            )
+            .await
+            .map_err(|_| "status_put_timeout")??;
             self.written
                 .insert(session, (segment.generation, Instant::now()));
             if refresh {
@@ -162,18 +176,18 @@ impl Connector for RealConnector {
     }
 }
 
-async fn drive(
-    connector: &mut impl Connector,
-    snapshot: impl Fn() -> Vec<(String, Segment)>,
-    changed: &Notify,
-) {
+async fn drive(connector: &mut impl Connector, snapshot: impl Fn(&mut Snapshot), changed: &Notify) {
     let mut publication = Publication::default();
+    let mut values = Snapshot::new();
     let mut delay = Duration::from_secs(1);
     loop {
         match tokio::time::timeout(IO_TIMEOUT, connector.attach()).await {
             Ok(Ok(mut writer)) => loop {
                 let mut health = StatusHealth::default();
-                let result = publication.sync(&mut writer, snapshot(), &mut health).await;
+                snapshot(&mut values);
+                let result = publication
+                    .sync(&mut writer, &mut values, &mut health)
+                    .await;
                 {
                     let mut all = HEALTH.lock();
                     all.status.puts += health.puts;

@@ -1,6 +1,7 @@
 //! Addressed fetch secret use, independent of the route that stamped its scopes.
 
 use super::call_context::{current_call_scopes, current_secret_consent_context};
+use super::consent::CancellationReason;
 use super::LabelOutcome;
 use std::sync::Arc;
 
@@ -84,12 +85,14 @@ pub(crate) fn use_current_secret_labels(
         return refuse(0, crate::secret::requests::UseError::Unavailable);
     }
     let checkpoint = cancellation.clone();
+    let approval_cancel = crate::secret::consent::Cancellation::default();
     let coordinator = crate::secret::requests::RequestSecrets::new(
         vault,
         scopes.authorization,
         current_secret_consent_context(),
     )
-    .with_request_cancellation(move || checkpoint.is_cancelled());
+    .with_request_cancellation(move || checkpoint.is_cancelled())
+    .with_local_approval_cancel(approval_cancel.clone());
     let labels = labels.to_vec();
     let target = target.clone();
     let request_target = request_target.to_owned();
@@ -98,15 +101,18 @@ pub(crate) fn use_current_secret_labels(
     let future = async move {
         use futures_util::StreamExt;
         let mut budget = coordinator.budget();
-        if let Some(expires) = cancellation.expires_at_ms() {
-            budget.expires_at_ms = budget.expires_at_ms.min(expires);
-        }
+        let stop = |reason| {
+            approval_cancel.cancel_with_reason(match reason {
+                crate::secret::requests::UseError::Expired => CancellationReason::Expired,
+                _ => CancellationReason::Cancelled,
+            });
+            reason
+        };
         let mut pending = futures_util::stream::FuturesUnordered::new();
         for (index, label) in labels.iter().enumerate() {
             let target = &target;
             let request_target = &request_target;
             let coordinator = &coordinator;
-            let expires = budget.expires_at_ms;
             let observed = &observed;
             pending.push(async move {
                 (
@@ -115,7 +121,6 @@ pub(crate) fn use_current_secret_labels(
                         .use_planned_in_request(
                             label,
                             target,
-                            expires,
                             |location| {
                                 let location =
                                     secret_rules::location::parse_vault_location(location).ok_or(
@@ -196,12 +201,12 @@ pub(crate) fn use_current_secret_labels(
             let index = answers.iter().position(Option::is_none).unwrap_or(0);
             let (index, answer) = tokio::select! {
                 biased;
-                () = cancellation.cancelled() => return Err((index, cancellation.reason().unwrap_or(crate::secret::requests::UseError::Cancelled))),
-                () = budget.expired() => return Err((index, crate::secret::requests::UseError::Expired)),
+                () = cancellation.cancelled() => return Err((index, stop(cancellation.reason().unwrap_or(crate::secret::requests::UseError::Cancelled)))),
+                () = budget.expired() => return Err((index, stop(crate::secret::requests::UseError::Expired))),
                 result = pending.next() => result.ok_or((index, crate::secret::requests::UseError::Unavailable))?,
             };
             if let Some(reason) = cancellation.reason() {
-                return Err((index, reason));
+                return Err((index, stop(reason)));
             }
             match answer {
                 Ok(answer) => answers[index] = Some(answer),

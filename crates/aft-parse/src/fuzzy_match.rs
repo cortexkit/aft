@@ -253,17 +253,24 @@ fn append_diagnostic_line(
     ));
 }
 
-fn shorten_diagnostic_line(line: &str) -> String {
-    let chars = line.chars().collect::<Vec<_>>();
-    if chars.len() <= NEAREST_MISS_LINE_CHARS {
+/// `line` as is when it has at most [`NEAREST_MISS_LINE_CHARS`] characters,
+/// otherwise its first and last halves of that many characters around `…`.
+pub fn shorten_diagnostic_line(line: &str) -> String {
+    let count = line.chars().count();
+    if count <= NEAREST_MISS_LINE_CHARS {
         return line.to_string();
     }
 
     let head = NEAREST_MISS_LINE_CHARS / 2;
     let tail = NEAREST_MISS_LINE_CHARS - head;
-    let mut shortened = chars[..head].iter().collect::<String>();
+    let byte_at = |chars: usize| {
+        line.char_indices()
+            .nth(chars)
+            .map_or(line.len(), |(byte, _)| byte)
+    };
+    let mut shortened = line[..byte_at(head)].to_string();
     shortened.push('…');
-    shortened.extend(chars[chars.len() - tail..].iter());
+    shortened.push_str(&line[byte_at(count - tail)..]);
     shortened
 }
 

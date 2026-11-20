@@ -1503,14 +1503,15 @@ impl DataCheckout {
         let bound = family_of(root).and_then(|family| {
             let family_dir = storage.join("data").join(family.digest().to_string());
             Checkout::bind_planes(shared, &family_dir, family, root, planes)
+                .map(|checkout| (checkout, family))
         });
-        let checkout = match bound {
-            Ok(checkout) => {
+        let (checkout, family) = match bound {
+            Ok((checkout, family)) => {
                 bind_failures()
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(root);
-                Arc::new(checkout)
+                (Arc::new(checkout), family)
             }
             Err(error) => {
                 let mut failures = bind_failures()
@@ -1597,6 +1598,7 @@ impl DataCheckout {
         let checkout = Arc::new(Self {
             disk_measurement: super::surfaces::DiskMeasurement::for_family(
                 work.checkout.family_dir(),
+                family,
             ),
             work,
             quiet,
@@ -1751,8 +1753,22 @@ struct QuietTimer {
     /// Also fences dispatch against checkout shutdown.
     stopped: std::sync::Mutex<bool>,
     timer: std::sync::Mutex<Option<crate::shared_timer::Timer>>,
+    #[cfg(test)]
+    manual_clock: parking_lot::Mutex<Option<ManualQuietClock>>,
     #[cfg(feature = "test-timing-hooks")]
     test_gate: bool,
+}
+
+#[cfg(test)]
+struct ManualQuietClock {
+    now: Instant,
+    pending: Option<ManualQuietDeadline>,
+}
+
+#[cfg(test)]
+struct ManualQuietDeadline {
+    at: Instant,
+    fire: Box<dyn FnMut() -> Option<Instant> + Send>,
 }
 
 impl QuietTimer {
@@ -1766,6 +1782,8 @@ impl QuietTimer {
             fire: Box::new(fire),
             stopped: std::sync::Mutex::new(false),
             timer: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            manual_clock: parking_lot::Mutex::new(None),
             #[cfg(feature = "test-timing-hooks")]
             test_gate: false,
         }
@@ -1799,8 +1817,16 @@ impl QuietTimer {
         }
     }
 
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = self.manual_clock.lock().as_ref() {
+            return clock.now;
+        }
+        Instant::now()
+    }
+
     fn now_ms(&self) -> u64 {
-        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
+        u64::try_from(self.now().duration_since(self.epoch).as_millis()).unwrap_or(u64::MAX)
     }
 
     #[cfg(feature = "test-timing-hooks")]
@@ -1861,7 +1887,8 @@ impl QuietTimer {
         let mut gate = None;
         #[cfg(feature = "test-timing-hooks")]
         let mut gate_checked = false;
-        let scheduled = crate::shared_timer::Timer::at(Instant::now(), move || {
+        let at = self.now();
+        let fire = move || {
             let timer = timer.upgrade()?;
             let stopped = timer
                 .stopped
@@ -1880,7 +1907,7 @@ impl QuietTimer {
                     .as_ref()
                     .is_some_and(|gate| gate.exists() && !gate.with_extension("release").exists())
                 {
-                    return Some(Instant::now() + Duration::from_millis(10));
+                    return Some(timer.now() + Duration::from_millis(10));
                 }
             }
             let due = timer
@@ -1889,7 +1916,7 @@ impl QuietTimer {
                 .saturating_add(quiet_ms);
             let now = timer.now_ms();
             if now < due {
-                return Some(Instant::now() + Duration::from_millis(due - now));
+                return Some(timer.now() + Duration::from_millis(due - now));
             }
             timer.armed.store(false, Ordering::Release);
             // A change recorded between the deadline check and letting
@@ -1902,7 +1929,7 @@ impl QuietTimer {
                 > timer.now_ms()
                 && !timer.armed.swap(true, Ordering::AcqRel)
             {
-                return Some(Instant::now());
+                return Some(timer.now());
             }
             // The callback only admits/enqueues work; refreshes, builds and
             // fills still execute in their existing data pools.
@@ -1914,7 +1941,16 @@ impl QuietTimer {
                     .expect("signal quiet fire");
             }
             None
-        });
+        };
+        #[cfg(test)]
+        if let Some(clock) = self.manual_clock.lock().as_mut() {
+            clock.pending = Some(ManualQuietDeadline {
+                at,
+                fire: Box::new(fire),
+            });
+            return;
+        }
+        let scheduled = crate::shared_timer::Timer::at(at, fire);
         if let Ok(timer) = scheduled {
             *self
                 .timer
@@ -2565,6 +2601,31 @@ mod tests {
         );
     }
 
+    impl QuietTimer {
+        fn use_manual_clock_for_test(&self) {
+            assert!(!self.armed.load(Ordering::Acquire));
+            *self.manual_clock.lock() = Some(ManualQuietClock {
+                now: self.epoch,
+                pending: None,
+            });
+        }
+
+        fn advance_for_test(&self, delta: Duration) {
+            let pending = {
+                let mut clock = self.manual_clock.lock();
+                let clock = clock.as_mut().expect("manual clock is enabled");
+                clock.now += delta;
+                clock.pending.take_if(|deadline| deadline.at <= clock.now)
+            };
+            let Some(mut deadline) = pending else { return };
+            // The real deadline callback reads the clock again and can enqueue work.
+            if let Some(at) = (deadline.fire)() {
+                deadline.at = at;
+                self.manual_clock.lock().as_mut().unwrap().pending = Some(deadline);
+            }
+        }
+    }
+
     struct PublicationFixture {
         handle: Arc<DataCheckout>,
         _root: tempfile::TempDir,
@@ -2791,22 +2852,30 @@ mod tests {
     fn a_threshold_publication_waits_for_the_last_change_to_settle() {
         let settle = Duration::from_millis(400);
         let fixture = PublicationFixture::new(settle, QUIET);
+        let work = &fixture.handle.work;
+        work.settle.use_manual_clock_for_test();
+        // Only the settle timer should publish in this test, not the quiet timer.
+        fixture.handle.quiet.use_manual_clock_for_test();
         fixture.add("threshold", PUBLISH_AT);
         fixture.refresh();
         assert_eq!(fixture.publications(), 0);
         // Keep moving the deadline past its original due time, without
         // asking for another refresh. The timer must refresh this edit too.
         for i in 0..3 {
-            std::thread::sleep(Duration::from_millis(150));
+            work.settle.advance_for_test(Duration::from_millis(150));
+            wait_until(|| !work.running());
             fixture.add(&format!("later{i}"), 1);
             assert_eq!(fixture.publications(), 0);
         }
-        std::thread::sleep(Duration::from_millis(200));
+        let tick = Duration::from_millis(1);
+        work.settle.advance_for_test(settle - tick);
+        wait_until(|| !work.running());
         assert_eq!(
             fixture.publications(),
             0,
             "published before the last change settled"
         );
+        work.settle.advance_for_test(tick);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         assert_eq!(fixture.publications(), 1);
         assert!(!pending(fixture.handle.checkout()));
@@ -2850,9 +2919,12 @@ mod tests {
 
     #[test]
     fn quiet_changes_still_refresh_and_publish_below_the_threshold() {
-        let fixture = PublicationFixture::new(Duration::from_secs(60), Duration::from_millis(200));
+        let quiet = Duration::from_millis(200);
+        let fixture = PublicationFixture::new(Duration::from_secs(60), quiet);
+        fixture.handle.quiet.use_manual_clock_for_test();
         fixture.add("quiet_edit", 1);
         assert_eq!(fixture.publications(), 0);
+        fixture.handle.quiet.advance_for_test(quiet);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         assert_eq!(fixture.publications(), 1);
         assert!(matches!(
@@ -2907,10 +2979,12 @@ mod tests {
     fn a_head_joining_worker_only_routes_arms_pending_changes_and_leaving_cancels_them() {
         let quiet = Duration::from_millis(100);
         let fixture = PublicationFixture::new(quiet, quiet);
+        fixture.handle.quiet.use_manual_clock_for_test();
         let ctx = fixture.context();
         ctx.set_worker_only_routes(true);
         fixture.add("worker_pending", 1);
         ctx.set_worker_only_routes(false);
+        fixture.handle.quiet.advance_for_test(quiet);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         wait_until(|| !fixture.handle.work.running());
         let before = fixture.refreshes();
@@ -2918,7 +2992,8 @@ mod tests {
         fixture.add("mixed_pending", 1);
         assert!(fixture.handle.quiet.armed.load(Ordering::Acquire));
         ctx.set_worker_only_routes(true);
-        std::thread::sleep(quiet * 3);
+        fixture.handle.quiet.advance_for_test(quiet);
+        wait_until(|| !fixture.handle.work.running());
         assert_eq!(fixture.refreshes(), before);
         assert!(pending(fixture.handle.checkout()));
         assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
@@ -3151,27 +3226,25 @@ mod tests {
 
     #[test]
     fn a_new_edit_postpones_a_settled_request_already_waiting_for_refresh() {
-        let fixture = PublicationFixture::new(Duration::from_millis(400), QUIET);
+        let settle = Duration::from_millis(400);
+        let fixture = PublicationFixture::new(settle, QUIET);
+        let work = &fixture.handle.work;
+        work.settle.use_manual_clock_for_test();
+        fixture.handle.quiet.use_manual_clock_for_test();
         fixture.add("threshold", PUBLISH_AT);
-        fixture
-            .handle
-            .work
-            .refreshing
-            .store(true, Ordering::Release);
-        fixture.handle.work.settle.arm();
-        wait_until(|| *fixture.handle.work.publish_requested.lock() == Publish::Settled);
+        work.refreshing.store(true, Ordering::Release);
+        work.settle.arm();
+        work.settle.advance_for_test(settle);
+        assert!(*work.publish_requested.lock() == Publish::Settled);
         fixture.add("after_timer", 1);
-        fixture
-            .handle
-            .work
-            .refreshing
-            .store(false, Ordering::Release);
+        work.refreshing.store(false, Ordering::Release);
         fixture.refresh();
         assert_eq!(
             fixture.publications(),
             0,
             "a stale settle request published a new edit"
         );
+        work.settle.advance_for_test(settle);
         wait_until(|| fixture.handle.checkout().changed_paths() == 0);
         assert_eq!(fixture.publications(), 1);
     }
@@ -3650,51 +3723,25 @@ mod tests {
     #[test]
     fn the_quiet_timer_fires_once_after_a_burst_of_changes() {
         let window = Duration::from_millis(500);
-        // Changes closer together than the quiet window never fire in
-        // between. That claim needs every gap to be shorter than the window,
-        // and a loaded machine can oversleep a 60 ms sleep past it (macOS CI
-        // did). When a gap runs long, the timer is right to fire, so retry the
-        // burst on a fresh timer instead of blaming it.
-        let mut attempts = 0;
-        let (fired, timer) = loop {
-            attempts += 1;
-            let fired = Arc::new(AtomicUsize::new(0));
-            let count = Arc::clone(&fired);
-            let timer = Arc::new(QuietTimer::new(window, move || {
-                count.fetch_add(1, Ordering::SeqCst);
-            }));
-            let mut longest = Duration::ZERO;
-            let mut last = Instant::now();
-            for _ in 0..5 {
-                timer.changed();
-                longest = longest.max(last.elapsed());
-                last = Instant::now();
-                std::thread::sleep(Duration::from_millis(60));
-            }
-            longest = longest.max(last.elapsed());
-            if longest < window {
-                assert_eq!(fired.load(Ordering::SeqCst), 0);
-                break (fired, timer);
-            }
-            timer.stop();
-            assert!(
-                attempts < 5,
-                "every burst had a gap of at least {window:?}; the machine is too loaded to test this"
-            );
-        };
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fired.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
+        let gap = Duration::from_millis(120);
+        let fired = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&fired);
+        let timer = Arc::new(QuietTimer::new(window, move || {
+            count.fetch_add(1, Ordering::SeqCst);
+        }));
+        timer.use_manual_clock_for_test();
+        for _ in 0..5 {
+            timer.changed();
+            timer.advance_for_test(gap);
+            assert_eq!(fired.load(Ordering::SeqCst), 0);
         }
+        timer.advance_for_test(window - gap);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
         // The next change arms it again.
         timer.changed();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while fired.load(Ordering::SeqCst) == 1 && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(20));
-        }
+        timer.advance_for_test(window);
         assert_eq!(fired.load(Ordering::SeqCst), 2);
-        std::thread::sleep(window * 2);
+        timer.advance_for_test(window * 2);
         assert_eq!(fired.load(Ordering::SeqCst), 2, "fired without a change");
     }
 

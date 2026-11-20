@@ -1,0 +1,174 @@
+{
+  "role.describe": {
+    "capabilities": [
+      "plans",
+      "adopt",
+      "queue",
+      "steer",
+      "send_status",
+      "run_status",
+      "run_ops",
+      "run_cancel",
+      "run_cancel_by_interrupt",
+      "delivery_order",
+      "template_datetime",
+      "head_sender",
+      "app_readers",
+      "transcript_reads",
+      "host_history",
+      "history_display",
+      "finish_reason",
+      "step_events",
+      "read_display_facts",
+      "run_usage",
+      "session_usage",
+      "call_identity",
+      "run_tool_calls",
+      "retract",
+      "sender_succession",
+      "client_message_id",
+      "message_marks",
+      "notice_with_speaks_for",
+      "notice_keep",
+      "tag_read",
+      "turn_directives",
+      "rich_ui_stamp",
+      "interrupt",
+      "interrupt_reason",
+      "user_commands",
+      "streaming",
+      "live_events",
+      "message_senders",
+      "session_change",
+      "plan_notes",
+      "plan_view",
+      "notices",
+      "head_selection",
+      "max_steps",
+      "max_output_tokens",
+      "no_tools",
+      "system_text_default",
+      "stop_all",
+      "send_promote",
+      "fork_answer",
+      "attachments",
+      "media_only_send",
+      "media_refs",
+      "retention",
+      "admission_reports",
+      "fork_effort",
+      "fork_tools"
+    ],
+    "delivery_order_modes": [
+      "tool_result",
+      "turn_system",
+      "steer",
+      "idle_start"
+    ],
+    "extensions": [
+      "harness.host_start"
+    ],
+    "fork_idle_s": 600,
+    "fork_tools": {
+      "anthropic": "prefix"
+    },
+    "implementation_version": "<v>",
+    "majors": [
+      {
+        "ops": [
+          "role.describe",
+          "session.baseline",
+          "session.send",
+          "session.send_status",
+          "send.status",
+          "session.read",
+          "session.plan_view",
+          "session.history",
+          "session.head",
+          "run.result",
+          "run.status",
+          "run.cancel",
+          "session.adopt",
+          "run.tool_calls",
+          "session.retract",
+          "session.user_command",
+          "session.user_command_status",
+          "session.subscribe",
+          "session.refresh",
+          "session.refresh_policy",
+          "session.flush_prefix",
+          "session.stop_all",
+          "session.promote",
+          "session.fork_prepare",
+          "session.fork_ask",
+          "session.fork_end",
+          "session.upload_begin",
+          "session.upload_append",
+          "session.upload_status",
+          "session.upload_commit",
+          "session.media_read"
+        ],
+        "stability": "alpha",
+        "version": "llm-runner/v1"
+      }
+    ],
+    "max_bytes": {
+      "default": 1048576,
+      "maximum": 3145728
+    },
+    "retention": {
+      "delete_within_ms": 300000,
+      "max_seconds": 31536000
+    },
+    "session_capabilities_from": "admission",
+    "step_events": {
+      "granularity": "per_completed_step",
+      "history_key": "harness"
+    }
+  },
+  "session.fork_ask": {
+    "reply": {
+      "answer": "Thinking ahead.",
+      "finish": "step_limit",
+      "usage": {
+        "by_model": [
+          {
+            "input_tokens": 360,
+            "model": "claude-haiku-5-5",
+            "output_tokens": 52,
+            "provider": "anthropic",
+            "steps": 8,
+            "unreported_steps": 0
+          }
+        ],
+        "input_tokens": 360,
+        "output_tokens": 52,
+        "steps": 8,
+        "unreported_steps": 0
+      }
+    },
+    "request": {
+      "allowed_tools": [
+        "echo"
+      ],
+      "ask_id": "ask-0",
+      "fork_id": "fork_11111111111111111111111111111111",
+      "framing": "Answer briefly.",
+      "question": "Continue?"
+    }
+  },
+  "tool.call": {
+    "provider": "prefrontal-core",
+    "request": {
+      "arguments": {
+        "text": "hi"
+      },
+      "call_key": "fork_run_22222222222222222222222222222222/33333333333333333333333333333333",
+      "fork_id": "fork_11111111111111111111111111111111",
+      "name": "echo",
+      "preset": "worker",
+      "schema_pin": "tp1:echo:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa:1",
+      "tool_call_id": "toolu_1"
+    }
+  }
+}

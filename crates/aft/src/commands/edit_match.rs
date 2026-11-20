@@ -1775,9 +1775,13 @@ pub(crate) fn push_fuzzy_replacement(
     let end = matched.byte_start + matched.byte_len;
     // When the match leaves the source line separator outside its span, a
     // replacement ending in a newline must not introduce a second separator.
+    // A match that already ends with its line's separator replaces it, so the
+    // text after it (such as a following blank line) is not a separator to
+    // drop.
     let remaining = source[end..].trim_start_matches([' ', '\t']);
-    let separator_is_outside =
-        matched.pass > 1 && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
+    let separator_is_outside = matched.pass > 1
+        && !source[..end].ends_with('\n')
+        && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
     if separator_is_outside && replacement.ends_with('\n') {
         output.push_str(
             replacement
@@ -1950,11 +1954,15 @@ fn handle_single_file_edit_match(
         }
     }
 
-    // Multiple matches without occurrence selector → disambiguation (unless replace_all)
+    // Multiple matches without occurrence selector → disambiguation (unless replace_all).
+    // Only the first rows the message lists get structured context: one row
+    // per match on a long shared line would copy that line once per match.
+    // The message keeps the exact count and says how many more there are.
     if positions.len() > 1 && occurrence.is_none() && !replace_all {
         let line_index = edit::SourceLineIndex::new(&source);
         let occurrences: Vec<serde_json::Value> = positions
             .iter()
+            .take(crate::fuzzy_match::AMBIGUOUS_OCCURRENCE_LIST_LIMIT)
             .enumerate()
             .map(|(idx, &byte_pos)| {
                 let line = line_index.line_at(byte_pos);
@@ -1972,7 +1980,7 @@ fn handle_single_file_edit_match(
             "ambiguous_match",
             format!(
                 "Found {} matches. Use 'occurrence' (1-based) to select one, or 'replaceAll: true' to replace all.{}",
-                occurrences.len(),
+                positions.len(),
                 crate::fuzzy_match::render_occurrence_listing(&source, &positions),
             ),
             serde_json::json!({
@@ -2591,6 +2599,146 @@ mod audit_regressions {
         assert_eq!(index.context(0, 0), "é");
         assert_eq!(index.context(99, 2), "");
         assert_eq!(index.context(usize::MAX, usize::MAX), "é\ntext");
+    }
+
+    /// Every match on one long line used to get its own row holding a copy
+    /// of that whole line: 8,192 matches on an 8,192-byte line made a
+    /// 67 MB reply, and a 128 KiB line about 16 GiB. The rows now stop at
+    /// the eight the message lists, each line in a row is shortened, and
+    /// the message still states the exact count.
+    #[test]
+    fn ambiguous_matches_on_one_long_line_give_a_small_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("long.txt");
+        let length = 8192;
+        std::fs::write(&path, "x".repeat(length)).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::language::StubProvider),
+            crate::config::Config::default(),
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "long-line", "command": "edit_match", "file": path,
+            "match": "x", "replacement": "y",
+        }))
+        .unwrap();
+
+        let response = super::handle_edit_match(&req, &ctx);
+
+        assert!(!response.success);
+        assert_eq!(response.data["code"], "ambiguous_match");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.starts_with("Found 8192 matches."), "{message}");
+        assert!(message.contains("… and 8184 more"), "{message}");
+        let rows = response.data["occurrences"].as_array().unwrap();
+        assert_eq!(
+            rows.len(),
+            crate::fuzzy_match::AMBIGUOUS_OCCURRENCE_LIST_LIMIT
+        );
+        assert_eq!(rows[7]["occurrence"], 8);
+        let shortened = format!("{}…{}", "x".repeat(120), "x".repeat(120));
+        assert!(rows.iter().all(|row| row["context"] == shortened.as_str()));
+        let reply_bytes = serde_json::to_vec(&response.data).unwrap().len();
+        assert!(reply_bytes < 8 * 1024, "reply is {reply_bytes} bytes");
+        assert_eq!(std::fs::read_to_string(&path).unwrap().len(), length);
+    }
+
+    fn edit_file(dir: &Path, name: &str, source: &str, needle: &str, replacement: &str) -> String {
+        let path = dir.join(name);
+        std::fs::write(&path, source).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::language::StubProvider),
+            crate::config::Config {
+                storage_dir: Some(dir.join(format!("state-{name}"))),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "loose", "command": "edit_match", "file": path,
+            "match": needle, "replacement": replacement,
+        }))
+        .unwrap();
+        let response = super::handle_edit_match(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    /// A loose match (here trailing whitespace on `foo `) whose oldString
+    /// ends with a newline already covers its last line's separator. The
+    /// blank or whitespace-only line after it used to be taken for that
+    /// separator and removed along with the replacement's final newline.
+    #[test]
+    fn loose_match_ending_in_newline_keeps_the_following_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            edit_file(
+                dir.path(),
+                "blank.txt",
+                "foo \nbar\n\nbaz\n",
+                "foo\nbar\n",
+                "FOO\nBAR\n"
+            ),
+            "FOO\nBAR\n\nbaz\n"
+        );
+        assert_eq!(
+            edit_file(
+                dir.path(),
+                "spaces.txt",
+                "foo \nbar\n    \nbaz\n",
+                "foo\nbar\n",
+                "FOO\nBAR\n"
+            ),
+            "FOO\nBAR\n    \nbaz\n"
+        );
+    }
+
+    /// The exact pass never took that path: the same edit spelled exactly
+    /// keeps the blank line, before and after the fix.
+    #[test]
+    fn exact_match_ending_in_newline_keeps_the_following_blank_line() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            edit_file(
+                dir.path(),
+                "exact.txt",
+                "foo \nbar\n\nbaz\n",
+                "foo \nbar\n",
+                "FOO\nBAR\n"
+            ),
+            "FOO\nBAR\n\nbaz\n"
+        );
+    }
+
+    /// The 1-based selector still reaches a match past the listed eight.
+    #[test]
+    fn occurrence_past_the_listed_rows_still_selects_that_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("many.txt");
+        std::fs::write(&path, "a\n".repeat(20)).unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::language::StubProvider),
+            crate::config::Config {
+                storage_dir: Some(dir.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "select", "command": "edit_match", "file": path,
+            "match": "a", "replacement": "b", "occurrence": 12,
+        }))
+        .unwrap();
+
+        let response = super::handle_edit_match(&req, &ctx);
+
+        assert!(response.success, "{response:?}");
+        let lines: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(lines[11], "b");
+        assert_eq!(lines.iter().filter(|line| *line == "b").count(), 1);
     }
 
     #[test]

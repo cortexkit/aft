@@ -56,15 +56,17 @@ fn size(value: &Value) -> usize {
 
 /// Budget the escaped canonical document, including omission counters, not just
 /// the unescaped text. Security omissions must be made before this size cut.
+/// A producer that read only part of its output marks the body `truncated`
+/// with the unread bytes in `omittedBytes`; the cut adds its own to those.
 pub(crate) fn cut_detail(mut body: Value, limit: usize) -> Option<Value> {
     if size(&body) <= limit {
         return Some(body);
     }
-    let mut omitted_bytes = 0usize;
-    let mut omitted_items = 0usize;
+    let mut omitted_bytes = body["omittedBytes"].as_u64().unwrap_or(0) as usize;
+    let mut omitted_items = body["omittedItems"].as_u64().unwrap_or(0) as usize;
     body["truncated"] = json!(true);
-    body["omittedItems"] = json!(0);
-    body["omittedBytes"] = json!(0);
+    body["omittedItems"] = json!(omitted_items);
+    body["omittedBytes"] = json!(omitted_bytes);
     while body.get("hunks").is_some() && size(&body) > limit {
         let hunks = body["hunks"].as_array_mut()?;
         let Some(last) = hunks.last_mut() else { break };

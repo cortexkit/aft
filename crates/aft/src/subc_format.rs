@@ -79,7 +79,8 @@ impl BashCodeSearchHint {
         if !crate::bash_rewrite::bash_hints::is_terminal_native_reply(response) {
             return;
         }
-        let Some(hint) = crate::bash_rewrite::bash_hints::code_search_nudge(
+        use crate::bash_rewrite::bash_hints::{code_search_decision, Rejection};
+        let hint = match code_search_decision(
             response.data["output"].as_str().unwrap_or_default(),
             &self.command,
             Some(root),
@@ -87,8 +88,16 @@ impl BashCodeSearchHint {
             self.search_tool.as_deref(),
             self.grep_tool.as_deref(),
             &self.shell_tool,
-        ) else {
-            return;
+        ) {
+            Ok(hint) => hint,
+            Err(rejection) => {
+                if let (Some(route), Rejection::Ineligible(reason)) =
+                    (&self.runner_notice, rejection)
+                {
+                    route.log_code_search_ineligible(reason);
+                }
+                return;
+            }
         };
         response.notices.route = self.runner_notice.clone().map(|route| route.into_sink());
         response

@@ -15,7 +15,7 @@
 //! reference-to-edge join, method-call sites replacing ordinary edges, the
 //! members an unknown receiver keeps alive, and Go package initialization.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -491,12 +491,18 @@ pub(crate) struct FileProjection {
     /// (in no particular order).
     pub(crate) outbound_calls: Vec<CallgraphOutboundCall>,
     /// Members an unknown receiver in this file keeps alive: target file
-    /// (absolute, as the snapshot names files), symbol, and the line of the
-    /// call site in this file (a site in test code keeps them alive for
-    /// tests only).
-    pub(crate) unknown_live: Vec<(PathBuf, String, u32)>,
+    /// (absolute, as the snapshot names files), symbol, and seed class.
+    pub(crate) unknown_live: Vec<(PathBuf, String, SeedClass)>,
     /// Its Go package initialization group, when it has callers.
     pub(crate) go_initializers: Option<GoInitializerGroup>,
+}
+
+/// The call-site information that affects liveness and its finding labels.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SeedClass {
+    Production,
+    TestFile,
+    TestLine(u32),
 }
 
 /// The exported symbols of `file`, named `resolved`, in the snapshot's
@@ -815,33 +821,46 @@ impl<'f> DeadCodeGraph<'f> {
         self.indexed(file)?.lookup.get(symbol).map(|id| &**id)
     }
 
-    /// Members unknown receivers in caller file `path` keep alive: target
-    /// file (absolute, as the snapshot names files), symbol and the line of
-    /// the call site. Reads only the file's method-call sites, not the rest
-    /// of its rows.
+    /// Members unknown receivers in an excluded or out-of-scope caller
+    /// file keep alive as production roots.
     ///
     /// # Errors
     ///
     /// When its resolution cannot be read.
-    pub(crate) fn unknown_live(&self, path: &str) -> Result<Vec<(PathBuf, String, u32)>, String> {
+    pub(crate) fn unknown_live(
+        &self,
+        path: &str,
+    ) -> Result<Vec<(PathBuf, String, SeedClass)>, String> {
         if self.indexed(path).is_none() {
             return Ok(Vec::new());
         }
         let resolution = self.source.resolution(path)?;
-        let live = resolution
-            .sites
-            .iter()
-            .flat_map(|kept| {
-                kept.resolution
-                    .protected
-                    .iter()
-                    .map(|(file, symbol)| (file.clone(), symbol.clone(), kept.site.line))
-            })
-            .collect::<BTreeSet<(String, String, u32)>>();
-        Ok(live
-            .into_iter()
-            .map(|(file, symbol, line)| (self.resolve(&file), symbol, line))
-            .collect())
+        Ok(self.live_seeds(&resolution, &|_| SeedClass::Production))
+    }
+
+    fn live_seeds(
+        &self,
+        resolution: &FileResolution,
+        classify: &dyn Fn(u32) -> SeedClass,
+    ) -> Vec<(PathBuf, String, SeedClass)> {
+        let mut seen = HashSet::new();
+        let mut live = BTreeSet::new();
+        for kept in &resolution.sites {
+            if !kept.resolution.protected.is_empty() {
+                let class = classify(kept.site.line);
+                if seen.insert((Arc::as_ptr(&kept.resolution), class)) {
+                    live.extend(
+                        kept.resolution
+                            .protected
+                            .iter()
+                            .map(|(file, symbol)| (file, symbol, class)),
+                    );
+                }
+            }
+        }
+        live.into_iter()
+            .map(|(file, symbol, class)| (self.resolve(file), symbol.clone(), class))
+            .collect()
     }
 
     /// Projects caller file `path`.
@@ -849,28 +868,42 @@ impl<'f> DeadCodeGraph<'f> {
     /// # Errors
     ///
     /// When its parse or resolution cannot be read.
-    pub(crate) fn project_file(&self, path: &str) -> Result<FileProjection, String> {
+    pub(crate) fn project_file(
+        &self,
+        path: &str,
+        classify: &dyn Fn(u32) -> SeedClass,
+        keep_call_lines: bool,
+    ) -> Result<FileProjection, String> {
         let Some(file) = self.indexed(path) else {
             return Ok(FileProjection::default());
         };
         let parse = self.source.parse(path)?;
         let resolution = self.source.resolution(path)?;
-        let rows = self.file_rows(path, &parse, &resolution);
-        let mut projection = FileProjection::default();
-        for (_, target_file, symbol, line) in &rows.unknown_live {
-            projection
-                .unknown_live
-                .push((self.resolve(target_file), symbol.clone(), *line));
-        }
-        projection.outbound_calls = self.outbound_calls(&rows);
-        if &*file.language == "go" {
-            projection.go_initializers = self.go_initializers(path, file, &rows);
-        }
-        Ok(projection)
+        let rows = self.file_rows(
+            path,
+            &parse,
+            &resolution,
+            classify,
+            keep_call_lines || &*file.language == "rust",
+        );
+        Ok(FileProjection {
+            unknown_live: self.live_seeds(&resolution, classify),
+            outbound_calls: self.outbound_calls(&rows),
+            go_initializers: (&*file.language == "go")
+                .then(|| self.go_initializers(path, file, &rows))
+                .flatten(),
+        })
     }
 
     /// The rows `graph_rows::assemble` builds from caller file `path`.
-    fn file_rows(&self, path: &str, parse: &ParseBlob, resolution: &FileResolution) -> FileRows {
+    fn file_rows(
+        &self,
+        path: &str,
+        parse: &ParseBlob,
+        resolution: &FileResolution,
+        classify: &dyn Fn(u32) -> SeedClass,
+        keep_call_lines: bool,
+    ) -> FileRows {
         let mut rows = FileRows::default();
         let references = references_by_key(parse);
         let mut derived = resolution.rows.iter().collect::<Vec<_>>();
@@ -975,6 +1008,8 @@ impl<'f> DeadCodeGraph<'f> {
 
         // Method-call sites, in extraction order: each replaces its
         // reference's ordinary edge and target.
+        let mut seen_answers = HashSet::new();
+        let mut seen_targets = HashSet::new();
         for kept in &resolution.sites {
             let site = &kept.site;
             let site_resolution = &kept.resolution;
@@ -993,28 +1028,41 @@ impl<'f> DeadCodeGraph<'f> {
             } else {
                 "resolved"
             };
-            if let Some(reference) = rows.refs.get_mut(&ref_id) {
-                reference.status = status;
-                reference.target_node = None;
-                reference.target_file = None;
-                reference.target_symbol = None;
-            }
-            for (target_file, target_symbol) in &site_resolution.protected {
-                rows.unknown_live.insert((
-                    path.to_string(),
-                    target_file.clone(),
-                    target_symbol.clone(),
-                    site.line,
-                ));
+            let Some(reference) = rows.refs.get_mut(&ref_id) else {
+                continue;
+            };
+            reference.status = status;
+            reference.target_node = None;
+            reference.target_file = None;
+            reference.target_symbol = None;
+            if reference.kind != "call" || site_resolution.targets.is_empty() {
+                continue;
             }
             let Some(caller) = site.caller.as_deref().and_then(|symbol| {
                 let file = self.indexed(path)?;
                 let index = file.by_scoped_name.get(symbol)?;
-                Some(file.nodes[*index as usize].id.to_string())
+                Some(&*file.nodes[*index as usize].id)
             }) else {
                 continue;
             };
+            let raw = references[&site.ordinal];
+            let source = raw
+                .caller_symbol
+                .as_deref()
+                .and_then(|symbol| self.lookup(path, symbol));
+            let class = classify(reference.line);
+            // Removing all of a reference's edges must not turn it into a
+            // bare name lookup. It already resolved to a dispatch answer.
+            rows.dispatch_refs.insert(ref_id.clone());
+            if !keep_call_lines
+                && !seen_answers.insert((source, class, Arc::as_ptr(site_resolution)))
+            {
+                continue;
+            }
             for target in &site_resolution.targets {
+                if !keep_call_lines && !seen_targets.insert((source, class, target)) {
+                    continue;
+                }
                 let edge_id = format!(
                     "dispatch:{path}:{}:{}:{}",
                     site.ordinal, target.file, target.symbol
@@ -1026,7 +1074,7 @@ impl<'f> DeadCodeGraph<'f> {
                 rows.insert_edge(EdgeRow {
                     edge_id,
                     ref_id: ref_id.clone(),
-                    source_node: caller.clone(),
+                    source_node: caller.to_string(),
                     target_node,
                     target_file: target.file.clone(),
                     target_symbol: target.symbol.clone(),
@@ -1061,7 +1109,10 @@ impl<'f> DeadCodeGraph<'f> {
                         calls.extend(self.outbound_call(reference, Some(edge)));
                     }
                 }
-                None => calls.extend(self.outbound_call(reference, None)),
+                None if !rows.dispatch_refs.contains(&reference.ref_id) => {
+                    calls.extend(self.outbound_call(reference, None));
+                }
+                None => {}
             }
         }
         calls
@@ -1252,9 +1303,9 @@ struct FileRows {
     /// reference to its edges reads them in this order.
     edges: BTreeMap<String, (u64, EdgeRow)>,
     next_edge: u64,
-    /// Members unknown receivers keep alive: caller file, target file,
-    /// target symbol and the line of the call site.
-    unknown_live: BTreeSet<(String, String, String, u32)>,
+    /// References with dispatch edges, including those whose edges were
+    /// deduplicated against another reference.
+    dispatch_refs: BTreeSet<String>,
 }
 
 impl FileRows {

@@ -1389,7 +1389,8 @@ impl Drop for ModuleProcess {
 }
 
 async fn accept_module(listener: &TcpListener) -> TcpStream {
-    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(10), listener.accept())
+    // A fresh binary can be slow to start under load, before any timing assertion runs.
+    let (mut stream, _) = tokio::time::timeout(Duration::from_secs(30), listener.accept())
         .await
         .expect("timed out accepting module connection")
         .expect("accept module connection");

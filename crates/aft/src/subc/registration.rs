@@ -15,6 +15,11 @@ use super::health::DispatchPathMetrics;
 use super::readiness::{ControlError, DaemonControl};
 use super::{SubcError, AUTH_DEADLINE};
 
+use aft_base::registration::claim_cause;
+#[cfg(unix)]
+pub(crate) use aft_base::registration::count_live;
+#[cfg(test)]
+pub(crate) use aft_base::registration::live_consumers;
 pub(crate) use aft_base::registration::{
     connect_consumer, identity_ready, module_consumer_allowed, module_id,
 };
@@ -91,14 +96,20 @@ struct Minter {
 #[subc_client_rs::async_trait]
 impl ClaimMinter for Minter {
     async fn mint(&self, request: ClaimMintRequest) -> Result<ClaimMintReply, ClaimError> {
-        let control = self.control.upgrade().ok_or(ClaimError::Unavailable)?;
-        tokio::select! {
-            biased;
-            _ = self.closed.cancelled() => Err(ClaimError::Unavailable),
-            result = tokio::time::timeout(MINT_BUDGET, mint(&control, &request)) => {
-                result.map_err(|_| ClaimError::Timeout)?
-            }
+        let result = match self.control.upgrade() {
+            None => Err(ClaimError::Unavailable),
+            Some(control) => tokio::select! {
+                biased;
+                _ = self.closed.cancelled() => Err(ClaimError::Unavailable),
+                result = tokio::time::timeout(MINT_BUDGET, mint(&control, &request)) => {
+                    result.unwrap_or(Err(ClaimError::Timeout))
+                }
+            },
+        };
+        if let Err(error) = &result {
+            log::info!("subc claim mint failed: cause={}", claim_cause(error));
         }
+        result
     }
 }
 

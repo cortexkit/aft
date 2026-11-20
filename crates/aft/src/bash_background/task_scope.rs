@@ -150,8 +150,21 @@ mod linux {
                 .cloned()
         }
 
+        #[cfg(test)]
         pub(crate) fn kill(&self, task_id: &str, recorded: Option<&Path>) -> Result<(), String> {
+            self.kill_with_audit(task_id, recorded, None, None, "kill_requested")
+        }
+
+        pub(crate) fn kill_with_audit(
+            &self,
+            task_id: &str,
+            recorded: Option<&Path>,
+            pid: Option<u32>,
+            pgid: Option<i32>,
+            reason: &str,
+        ) -> Result<(), String> {
             if let Some(handle) = self.resolve_handle(task_id, recorded)? {
+                super::super::registry::log_bash_kill(task_id, pid, pgid, reason);
                 handle
                     .kill()
                     .map_err(|_| format!("task scope {} could not be killed", handle.unit))?;
@@ -474,6 +487,12 @@ mod linux {
         memory_bytes: Option<u64>,
         description: String,
         stop_warning_logged: AtomicBool,
+    }
+
+    impl ScopeLaunch {
+        pub(crate) fn task_id(&self) -> &str {
+            &self.task_id
+        }
     }
 
     pub(crate) fn scope_description(task_id: &str, storage_root: &Path) -> String {

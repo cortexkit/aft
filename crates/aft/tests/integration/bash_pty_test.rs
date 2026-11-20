@@ -137,9 +137,12 @@ fn pty_spawn_echo_exit() {
 }
 
 #[test]
-fn pty_replay_marks_killed_when_running_no_marker() {
+fn pty_replay_reports_fate_unknown_when_its_process_is_gone() {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
+    // `base_task` records pid and process group 999999, which no running
+    // process holds, so replay finds the command gone and cannot know how
+    // it ended.
     base_task(
         storage.path(),
         project.path(),
@@ -153,7 +156,7 @@ fn pty_replay_marks_killed_when_running_no_marker() {
     let snapshot = registry
         .status("bash-0000000000000201", SESSION, None, None, 1024)
         .unwrap();
-    assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+    assert_eq!(snapshot.info.status, BgTaskStatus::FateUnknown);
     let persisted: PersistedTask = serde_json::from_str(
         &fs::read_to_string(
             task_paths(storage.path(), SESSION, "bash-0000000000000201")
@@ -163,10 +166,90 @@ fn pty_replay_marks_killed_when_running_no_marker() {
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(persisted.status, BgTaskStatus::FateUnknown);
+    let reason = persisted.status_reason.unwrap_or_default();
+    assert!(
+        reason.starts_with("task bash-0000000000000201: daemon restarted, process fate unknown"),
+        "unexpected reason: {reason}"
+    );
+}
+
+/// Stops and reaps a test's helper process if the test ends early.
+#[cfg(unix)]
+struct KillOnDrop(std::process::Child);
+
+#[cfg(unix)]
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_replay_stops_a_live_process_and_reports_it_killed() {
+    use std::os::unix::process::CommandExt;
+
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let task_id = "bash-0000000000000202";
+    // A command that outlived AFT's restart: it leads its own process group,
+    // as a PTY command does.
+    let mut process = KillOnDrop(
+        std::process::Command::new("sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let pid = process.0.id();
+    let mut task = base_task(
+        storage.path(),
+        project.path(),
+        task_id,
+        BgMode::Pty,
+        BgTaskStatus::Running,
+    );
+    task.child_pid = Some(pid);
+    task.pgid = Some(pid as i32);
+    // Replay trusts a live pid only when its process started no later than
+    // shortly after the task, so record the process's own start time.
+    if let Some(started_at) = aft::process_identity::process_start_time_ms(pid) {
+        task.started_at = started_at;
+    }
+    write_task(
+        &task_paths(storage.path(), SESSION, task_id).unwrap().json,
+        &task,
+    )
+    .unwrap();
+
+    let registry = registry();
+    registry.replay_session(storage.path(), SESSION).unwrap();
+    let snapshot = registry.status(task_id, SESSION, None, None, 1024).unwrap();
+    assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+    let persisted: PersistedTask = serde_json::from_str(
+        &fs::read_to_string(task_paths(storage.path(), SESSION, task_id).unwrap().json).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(persisted.status, BgTaskStatus::Killed);
     assert_eq!(
         persisted.status_reason.as_deref(),
         Some("pty_lost_on_bridge_restart")
     );
+
+    // Replay signalled the process; it is this test's child, so reap it.
+    let started = Instant::now();
+    loop {
+        if process.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the command was still running after replay reported it killed"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 #[test]

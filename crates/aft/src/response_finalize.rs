@@ -273,7 +273,7 @@ fn acknowledge_terminal_bash_reply(
 /// still running after their waiting call was cancelled, and commands stopped
 /// by an owner cancellation. The registry supplies the appropriate status for each.
 pub(crate) fn append_cancelled_call_notices(
-    response: &Response,
+    response: &mut Response,
     text: &mut String,
     ctx: &AppContext,
     session_id: &str,
@@ -281,14 +281,18 @@ pub(crate) fn append_cancelled_call_notices(
     // An internal access ask is held for consent and replaced by a later tool reply.
     if response.data.get("code").and_then(Value::as_str)
         == Some(crate::access_policy::ACCESS_ASK_REQUIRED)
+        || response.notices.cancelled_calls.is_some()
     {
         return;
     }
-    for line in ctx
+    let receipt = ctx
         .bash_background()
-        .take_cancelled_call_notices(session_id)
-    {
-        append_trailing_line(text, &line);
+        .reserve_cancelled_call_notices(session_id);
+    if receipt.lines().next().is_some() {
+        for line in receipt.lines() {
+            append_trailing_line(text, line);
+        }
+        response.notices.cancelled_calls = Some(std::sync::Arc::new(receipt));
     }
 }
 

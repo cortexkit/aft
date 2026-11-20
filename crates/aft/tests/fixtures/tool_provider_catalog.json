@@ -16,8 +16,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "97bdadf0fd7628e0562f03251ae0250307affa1d02aaf3b381fdfbc957698f6d",
-      "catalog_digest": "97bdadf0fd7628e0562f03251ae0250307affa1d02aaf3b381fdfbc957698f6d",
+      "generation": "96a393419ebcda02c65397f94255155cb3554388917bdb67211cf76450d5671f",
+      "catalog_digest": "96a393419ebcda02c65397f94255155cb3554388917bdb67211cf76450d5671f",
       "tools": [
         {
           "name": "status",
@@ -39,7 +39,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -1239,8 +1239,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "55dca5ad51c8fcbfe801db8af6f87a029d89ecf53318105661345f7bc3320ba2",
-      "catalog_digest": "55dca5ad51c8fcbfe801db8af6f87a029d89ecf53318105661345f7bc3320ba2",
+      "generation": "4e4e86736f44efc37283149fc9d819706ee4d302d61a6af54c0d2c65cf329a21",
+      "catalog_digest": "4e4e86736f44efc37283149fc9d819706ee4d302d61a6af54c0d2c65cf329a21",
       "tools": [
         {
           "name": "status",
@@ -1262,7 +1262,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -3606,8 +3606,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "739a85f8ea852546036fa6cae707cdcfebee20fcb6aa4b7b2feb49064e74f207",
-      "catalog_digest": "739a85f8ea852546036fa6cae707cdcfebee20fcb6aa4b7b2feb49064e74f207",
+      "generation": "b1e619f2309c2d698706dd28794828edfdfe957c20bf646d0e5f1eae3579c657",
+      "catalog_digest": "b1e619f2309c2d698706dd28794828edfdfe957c20bf646d0e5f1eae3579c657",
       "tools": [
         {
           "name": "status",
@@ -3629,7 +3629,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -4783,8 +4783,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "49de630b0f06dbee029628561f1d9f9570f5ae193f806e41575f8b310ccb1a68",
-      "catalog_digest": "49de630b0f06dbee029628561f1d9f9570f5ae193f806e41575f8b310ccb1a68",
+      "generation": "c31dea461d49a67d8ea36f960c289d364b37d92fa0a0c2cb12c49f312530114e",
+      "catalog_digest": "c31dea461d49a67d8ea36f960c289d364b37d92fa0a0c2cb12c49f312530114e",
       "tools": [
         {
           "name": "status",
@@ -4806,7 +4806,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -5958,8 +5958,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "41028d4bf9abd24ef34bafc1a427aece96c824457fb8d2241c94a9a7aa96866a",
-      "catalog_digest": "41028d4bf9abd24ef34bafc1a427aece96c824457fb8d2241c94a9a7aa96866a",
+      "generation": "9178063f357e7bdb3ebffaee6f9e4b54df3b12a48a253dad0414afc57406cf75",
+      "catalog_digest": "9178063f357e7bdb3ebffaee6f9e4b54df3b12a48a253dad0414afc57406cf75",
       "tools": [
         {
           "name": "status",
@@ -5981,7 +5981,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -7075,8 +7075,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "36b9bafc12e61b7413a8535ccdf1b61abea121c1f0fb7613d0dc55ed8acb591b",
-      "catalog_digest": "36b9bafc12e61b7413a8535ccdf1b61abea121c1f0fb7613d0dc55ed8acb591b",
+      "generation": "fa070032cb0b0a833d701b55db72b25b1eed634956982bcc753109f396b88c57",
+      "catalog_digest": "fa070032cb0b0a833d701b55db72b25b1eed634956982bcc753109f396b88c57",
       "tools": [
         {
           "name": "status",
@@ -7098,7 +7098,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -8189,8 +8189,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "84baab7eae2f6450049604f363ddf99fe445c0ae4dcec9d5c2253371ae1b571c",
-      "catalog_digest": "84baab7eae2f6450049604f363ddf99fe445c0ae4dcec9d5c2253371ae1b571c",
+      "generation": "c93df283d8b960290472345f343c3514778c8edce0dc50b01d4bf33e19be2448",
+      "catalog_digest": "c93df283d8b960290472345f343c3514778c8edce0dc50b01d4bf33e19be2448",
       "tools": [
         {
           "name": "status",
@@ -8212,7 +8212,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -9299,8 +9299,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ab97e13bf4b392423b98f940bb9657feba6cc0c504dae6c950fb9ac71cdc5c40",
-      "catalog_digest": "ab97e13bf4b392423b98f940bb9657feba6cc0c504dae6c950fb9ac71cdc5c40",
+      "generation": "afbaeb38450cc0ff82cb4f4433e6dea1f1d0cf0da751b216861bbefcfed082d8",
+      "catalog_digest": "afbaeb38450cc0ff82cb4f4433e6dea1f1d0cf0da751b216861bbefcfed082d8",
       "tools": [
         {
           "name": "status",
@@ -9322,7 +9322,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -10403,8 +10403,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "dc8a586da625ee2da056eb6faac6fcacfb1c06b9ecfc81a1d9bd2187039a5e39",
-      "catalog_digest": "dc8a586da625ee2da056eb6faac6fcacfb1c06b9ecfc81a1d9bd2187039a5e39",
+      "generation": "1b1c2a26886a9d27df0c357e3c0a22ce6029159ca5b956b49672f9ea291290c9",
+      "catalog_digest": "1b1c2a26886a9d27df0c357e3c0a22ce6029159ca5b956b49672f9ea291290c9",
       "tools": [
         {
           "name": "status",
@@ -10426,7 +10426,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -11701,8 +11701,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "42b0d3cfed5c19377b5f7bc9c6cf3ea269986f7a795cfa80dad5df22d0bfa3fc",
-      "catalog_digest": "42b0d3cfed5c19377b5f7bc9c6cf3ea269986f7a795cfa80dad5df22d0bfa3fc",
+      "generation": "75f9e421a5a7f7c4532b698e45a66ca93ca81f7fa8e93de57de8f556f3316493",
+      "catalog_digest": "75f9e421a5a7f7c4532b698e45a66ca93ca81f7fa8e93de57de8f556f3316493",
       "tools": [
         {
           "name": "status",
@@ -11724,7 +11724,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -14218,8 +14218,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5d4d3ed34a10e7a4dd8612144f564c1deca6def33e149507a5255d3037c6deea",
-      "catalog_digest": "5d4d3ed34a10e7a4dd8612144f564c1deca6def33e149507a5255d3037c6deea",
+      "generation": "93ee1801ef0199e16023d21a061b58111bac4f5c8e2184b59f0875ed48b67be7",
+      "catalog_digest": "93ee1801ef0199e16023d21a061b58111bac4f5c8e2184b59f0875ed48b67be7",
       "tools": [
         {
           "name": "status",
@@ -14241,7 +14241,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -15470,8 +15470,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "c64d7e132efe14d0fe133df4c5e0d7aee0205a3876df28af40154c76c46e4b77",
-      "catalog_digest": "c64d7e132efe14d0fe133df4c5e0d7aee0205a3876df28af40154c76c46e4b77",
+      "generation": "25b45146a812fb60f188a87f46b69419d8a5d9f1af0bea620834b3d0dcb1a942",
+      "catalog_digest": "25b45146a812fb60f188a87f46b69419d8a5d9f1af0bea620834b3d0dcb1a942",
       "tools": [
         {
           "name": "status",
@@ -15493,7 +15493,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -16720,8 +16720,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "ef517c0071890f8b35f96a07adae546fd4328b9b7a732f51f4141bfd25d23639",
-      "catalog_digest": "ef517c0071890f8b35f96a07adae546fd4328b9b7a732f51f4141bfd25d23639",
+      "generation": "e2c801841911f5891ee4e645789a5b2fae84897a36675e72ab9706fabf98029a",
+      "catalog_digest": "e2c801841911f5891ee4e645789a5b2fae84897a36675e72ab9706fabf98029a",
       "tools": [
         {
           "name": "status",
@@ -16743,7 +16743,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -17912,8 +17912,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "fc87f1c4453657a874869ec6e4bb1e07f4aeb772c064ebae61666bfe7e7061da",
-      "catalog_digest": "fc87f1c4453657a874869ec6e4bb1e07f4aeb772c064ebae61666bfe7e7061da",
+      "generation": "d81dcf20e79285b24f085f1430c08c954bf90a463cb3249418560f8049a5a360",
+      "catalog_digest": "d81dcf20e79285b24f085f1430c08c954bf90a463cb3249418560f8049a5a360",
       "tools": [
         {
           "name": "status",
@@ -17935,7 +17935,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -19101,8 +19101,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "5bb098407453a67fa99ba3d349448e656482526387146e243fea5c227e750dc4",
-      "catalog_digest": "5bb098407453a67fa99ba3d349448e656482526387146e243fea5c227e750dc4",
+      "generation": "5d0a7b921e251fcf26b654df71eb0ac0e85e55a839b399283a3333776a1c9ce0",
+      "catalog_digest": "5d0a7b921e251fcf26b654df71eb0ac0e85e55a839b399283a3333776a1c9ce0",
       "tools": [
         {
           "name": "status",
@@ -19124,7 +19124,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"
@@ -20286,8 +20286,8 @@
       "version": "0.58.1"
     },
     "reply": {
-      "generation": "f4d803038bf414aa1f9d6bc03a2ca21b65c8e91ca5530da8860411d6694f9706",
-      "catalog_digest": "f4d803038bf414aa1f9d6bc03a2ca21b65c8e91ca5530da8860411d6694f9706",
+      "generation": "ae54f33b83ab33a58003e2228c72a91c59302897712ac2b8a7b39f98b860ee45",
+      "catalog_digest": "ae54f33b83ab33a58003e2228c72a91c59302897712ac2b8a7b39f98b860ee45",
       "tools": [
         {
           "name": "status",
@@ -20309,7 +20309,7 @@
         {
           "name": "bash",
           "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
-          "semantics": 2,
+          "semantics": 3,
           "modes": [
             "classic",
             "codemode"

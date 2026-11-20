@@ -5,8 +5,9 @@
 //! Paths are sorted by their bytes, so a directory is a contiguous range and
 //! a lookup is a binary search.
 
+use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::content::DecodeError;
 use crate::content::codec::{Decoder, Encoder};
@@ -109,6 +110,152 @@ pub struct PathRecord {
     pub language: String,
 }
 
+const MAX_PATH_EDITS: usize = 1024;
+
+/// A sorted base shared by checkout views, plus one bounded overlay. Only
+/// callers that need a contiguous slice materialize it, once per change.
+#[derive(Clone, Debug)]
+struct PathRecords {
+    base: Arc<Vec<PathRecord>>,
+    edits: Arc<BTreeMap<Vec<u8>, Option<PathRecord>>>,
+    len: usize,
+    flat: Arc<OnceLock<Vec<PathRecord>>>,
+}
+
+impl PartialEq for PathRecords {
+    fn eq(&self, other: &Self) -> bool {
+        self.len == other.len
+            && ((Arc::ptr_eq(&self.base, &other.base) && Arc::ptr_eq(&self.edits, &other.edits))
+                || self.iter().eq(other.iter()))
+    }
+}
+
+impl Eq for PathRecords {}
+
+impl PathRecords {
+    fn new(base: Vec<PathRecord>) -> Self {
+        Self {
+            len: base.len(),
+            base: Arc::new(base),
+            edits: Arc::default(),
+            flat: Arc::default(),
+        }
+    }
+
+    fn base_position(&self, path: &[u8]) -> Option<usize> {
+        self.base
+            .binary_search_by(|record| record.path.as_slice().cmp(path))
+            .ok()
+    }
+
+    fn get(&self, path: &[u8]) -> Option<&PathRecord> {
+        match self.edits.get(path) {
+            Some(edit) => edit.as_ref(),
+            None => self.base_position(path).map(|index| &self.base[index]),
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &PathRecord> {
+        Self::merge(self.base.iter(), self.edits.iter())
+    }
+
+    fn directory(&self, dir: &[u8]) -> impl Iterator<Item = &PathRecord> {
+        let (range, bounds) = if dir.is_empty() {
+            (
+                0..self.base.len(),
+                (std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+            )
+        } else {
+            let mut prefix = dir.to_vec();
+            prefix.push(b'/');
+            let start = self.base.partition_point(|record| record.path < prefix);
+            let end = start
+                + self.base[start..].partition_point(|record| record.path.starts_with(&prefix));
+            let mut upper = prefix.clone();
+            *upper.last_mut().expect("prefix ends with a slash") = b'/' + 1;
+            (
+                start..end,
+                (
+                    std::ops::Bound::Included(prefix),
+                    std::ops::Bound::Excluded(upper),
+                ),
+            )
+        };
+        Self::merge(self.base[range].iter(), self.edits.range(bounds))
+    }
+
+    fn merge<'a>(
+        base: impl Iterator<Item = &'a PathRecord>,
+        edits: impl Iterator<Item = (&'a Vec<u8>, &'a Option<PathRecord>)>,
+    ) -> impl Iterator<Item = &'a PathRecord> {
+        let mut base = base.peekable();
+        let mut edits = edits.peekable();
+        std::iter::from_fn(move || {
+            loop {
+                match (base.peek(), edits.peek()) {
+                    (Some(record), Some((path, _))) => match record.path.cmp(path) {
+                        std::cmp::Ordering::Less => return base.next(),
+                        std::cmp::Ordering::Equal => {
+                            base.next();
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    },
+                    (_, None) => return base.next(),
+                    (None, Some(_)) => {}
+                }
+                if let Some((_, Some(record))) = edits.next() {
+                    return Some(record);
+                }
+            }
+        })
+    }
+
+    fn slice(&self) -> &[PathRecord] {
+        if self.edits.is_empty() {
+            &self.base
+        } else {
+            self.flat.get_or_init(|| self.collect())
+        }
+    }
+
+    fn collect(&self) -> Vec<PathRecord> {
+        let mut paths = Vec::with_capacity(self.len);
+        paths.extend(self.iter().cloned());
+        paths
+    }
+
+    fn apply(&mut self, changes: BTreeMap<Vec<u8>, Option<PathRecord>>) {
+        if changes.is_empty() {
+            return;
+        }
+        self.flat = Arc::default();
+        for (path, record) in changes {
+            match (self.get(&path).is_some(), record.is_some()) {
+                (false, true) => self.len += 1,
+                (true, false) => self.len -= 1,
+                _ => {}
+            }
+            let base_at = self.base_position(&path);
+            let edits = Arc::make_mut(&mut self.edits);
+            if base_at.map(|index| &self.base[index]) == record.as_ref() {
+                edits.remove(&path);
+            } else {
+                edits.insert(path, record);
+            }
+        }
+        if self.edits.len() >= MAX_PATH_EDITS {
+            *self = Self::new(self.collect());
+        }
+    }
+}
+
+crate::heap_bytes_of_fields!(PathRecords {
+    base,
+    edits,
+    len,
+    flat
+});
+
 /// Which content each path of a checkout held at one moment.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CheckoutState {
@@ -130,7 +277,7 @@ pub struct CheckoutState {
     root: Vec<u8>,
     /// Shared by every copy of the state, so copying a state (a view, the
     /// call graph's inputs) copies no record.
-    paths: Arc<Vec<PathRecord>>,
+    paths: PathRecords,
     /// For each path, the call-graph fragment that holds its resolution in
     /// this checkout, when it has one. Empty, or one entry per path.
     fragments: Arc<Vec<Option<Digest128>>>,
@@ -181,7 +328,7 @@ impl CheckoutState {
             git,
             conversion,
             root: Vec::new(),
-            paths: Arc::new(paths),
+            paths: PathRecords::new(paths),
             fragments: Arc::default(),
             graph_extractor: None,
         })
@@ -276,7 +423,7 @@ impl CheckoutState {
     ///
     /// When `fragments` does not have one entry per path.
     pub fn with_fragments(mut self, fragments: Vec<Option<Digest128>>) -> Result<Self, StateError> {
-        if fragments.len() != self.paths.len() {
+        if fragments.len() != self.paths.len {
             return Err(StateError::PlaneMismatch);
         }
         self.fragments = Arc::new(fragments);
@@ -312,7 +459,7 @@ impl CheckoutState {
     /// published before the call graph was built names none.
     #[must_use]
     pub fn has_fragments(&self) -> bool {
-        !self.fragments.is_empty() || self.paths.is_empty()
+        !self.fragments.is_empty() || self.paths.len == 0
     }
 
     /// The call-graph fragment of the path at `index`, if it has one.
@@ -324,7 +471,38 @@ impl CheckoutState {
     /// The paths in byte order.
     #[must_use]
     pub fn paths(&self) -> &[PathRecord] {
-        &self.paths
+        self.paths.slice()
+    }
+
+    /// Number of member records without building a contiguous slice.
+    #[must_use]
+    pub fn path_count(&self) -> usize {
+        self.paths.len
+    }
+
+    /// The members strictly inside `dir`, in byte order, without flattening
+    /// an overlay. An empty directory name means the whole checkout.
+    pub fn directory_records(&self, dir: &[u8]) -> impl Iterator<Item = &PathRecord> {
+        self.paths.directory(dir)
+    }
+
+    /// Applies an owned batch of path replacements and deletions to the
+    /// sorted base. The caller supplies a record under its own path.
+    pub(crate) fn apply_scan_changes(
+        &mut self,
+        changes: BTreeMap<Vec<u8>, Option<PathRecord>>,
+    ) -> Result<(), StateError> {
+        if changes.values().flatten().any(|record| {
+            u32::try_from(record.path.len()).is_err()
+                || record.language.len() > usize::from(u8::MAX)
+        }) {
+            return Err(StateError::TooLong);
+        }
+        self.paths.apply(changes);
+        self.fragments = Arc::default();
+        self.graph_extractor = None;
+        self.skipped_parses = Arc::default();
+        Ok(())
     }
 
     /// Sets the language of the path at `index` in [`paths`](Self::paths),
@@ -342,20 +520,53 @@ impl CheckoutState {
         if language.len() > usize::from(u8::MAX) {
             return Err(StateError::TooLong);
         }
-        Arc::make_mut(&mut self.paths)[index].language = language;
+        if self.paths.edits.is_empty() {
+            Arc::make_mut(&mut self.paths.base)[index].language = language;
+        } else {
+            let path = self.paths()[index].path.clone();
+            self.set_languages_at([(path.as_slice(), language)])?;
+        }
+        Ok(())
+    }
+
+    /// Sets member languages without flattening path changes.
+    ///
+    /// # Errors
+    ///
+    /// When `language` is too long to store.
+    pub fn set_languages_at<'a>(
+        &mut self,
+        languages: impl IntoIterator<Item = (&'a [u8], String)>,
+    ) -> Result<(), StateError> {
+        let mut changes = BTreeMap::new();
+        for (path, language) in languages {
+            if language.len() > usize::from(u8::MAX) {
+                return Err(StateError::TooLong);
+            }
+            if let Some(record) = self
+                .paths
+                .get(path)
+                .filter(|record| record.language != language)
+            {
+                let mut record = record.clone();
+                record.language = language;
+                changes.insert(path.to_vec(), Some(record));
+            }
+        }
+        self.paths.apply(changes);
         Ok(())
     }
 
     /// The record of `path`.
     #[must_use]
     pub fn get(&self, path: &[u8]) -> Option<&PathRecord> {
-        self.position(path).map(|index| &self.paths[index])
+        self.paths.get(path)
     }
 
     /// The index of `path` in [`paths`](Self::paths).
     #[must_use]
     pub fn position(&self, path: &[u8]) -> Option<usize> {
-        self.paths
+        self.paths()
             .binary_search_by(|record| record.path.as_slice().cmp(path))
             .ok()
     }
@@ -365,15 +576,13 @@ impl CheckoutState {
     #[must_use]
     pub fn directory(&self, dir: &[u8]) -> std::ops::Range<usize> {
         if dir.is_empty() {
-            return 0..self.paths.len();
+            return 0..self.paths.len;
         }
         let mut prefix = dir.to_vec();
         prefix.push(b'/');
-        let start = self
-            .paths
-            .partition_point(|record| record.path.as_slice() < prefix.as_slice());
-        let end =
-            start + self.paths[start..].partition_point(|record| record.path.starts_with(&prefix));
+        let paths = self.paths();
+        let start = paths.partition_point(|record| record.path.as_slice() < prefix.as_slice());
+        let end = start + paths[start..].partition_point(|record| record.path.starts_with(&prefix));
         start..end
     }
 
@@ -403,7 +612,7 @@ impl CheckoutState {
         out.blob(&self.git);
         out.blob(self.conversion.as_bytes());
         out.blob(&self.root);
-        out.usize(self.paths.len());
+        out.usize(self.paths.len);
         let mut previous: Option<&PathRecord> = None;
         for record in self.paths.iter() {
             let shared = previous.map_or(0, |previous| {
@@ -682,7 +891,7 @@ impl CheckoutState {
             git,
             conversion,
             root,
-            paths: Arc::new(paths),
+            paths: PathRecords::new(paths),
             fragments: Arc::new(fragments),
             graph_extractor,
         })
@@ -815,7 +1024,7 @@ mod tests {
         out.blob(&state.git);
         out.blob(state.conversion.as_bytes());
         out.blob(&state.root);
-        out.usize(state.paths.len());
+        out.usize(state.path_count());
         let mut previous: Option<&PathRecord> = None;
         for record in state.paths.iter() {
             let shared = previous.map_or(0, |previous| {

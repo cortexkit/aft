@@ -74,7 +74,18 @@ impl BgTaskRegistry {
                     return Ok(false);
                 };
                 super::super::persistence::reread_storage_task_record(record)
-                    .map(|metadata| !terminal_only || metadata.is_terminal())
+                    .map(|metadata| {
+                        let stop = !terminal_only || metadata.is_terminal();
+                        if stop {
+                            let reason = if terminal_only {
+                                "startup_terminal_scope_cleanup"
+                            } else {
+                                "module_shutdown"
+                            };
+                            log_bash_kill(id, metadata.child_pid, metadata.pgid, reason);
+                        }
+                        stop
+                    })
                     .map_err(|error| error.to_string())
             },
             &mut pending_ids,
@@ -177,9 +188,10 @@ impl BgTaskRegistry {
         child: &mut Child,
         scope: Option<&super::super::task_scope::ScopeLaunch>,
     ) -> Result<(), String> {
-        let result = self.kill_task_scope(task_id);
+        let result = self.kill_task_scope_with_reason(task_id, "spawn_scope_cleanup");
         if let Some(scope) = scope {
             // The scope's RuntimeMaxSec backstop and the next startup cleanup still end it.
+            log_bash_kill(task_id, Some(child.id()), None, "spawn_scope_cleanup");
             let _ = scope.stop();
         }
         let _ = child.wait();
@@ -201,6 +213,13 @@ impl BgTaskRegistry {
             Err(error) => {
                 let exited = child.try_wait().map_err(|e| e.to_string())?.is_some();
                 let gate_held = child.stdin.take().is_some();
+                #[cfg(target_os = "linux")]
+                log_bash_kill(
+                    scope.task_id(),
+                    Some(child.id()),
+                    None,
+                    "spawn_scope_placement_failed",
+                );
                 if !exited {
                     super::super::process::terminate_pgid(child.id() as i32, None);
                 }
@@ -270,12 +289,36 @@ impl BgTaskRegistry {
         Ok(None)
     }
 
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn kill_task_scope(&self, task_id: &str) -> Result<(), String> {
+        self.kill_task_scope_with_reason(task_id, "kill_requested")
+    }
+
+    pub(crate) fn kill_task_scope_with_reason(
+        &self,
+        task_id: &str,
+        reason: &str,
+    ) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
             if self.inner.task_scopes.get(task_id).is_some() {
-                return self.inner.task_scopes.kill(task_id, None);
+                let (pid, pgid) = self
+                    .inner
+                    .tasks
+                    .try_lock()
+                    .ok()
+                    .and_then(|tasks| tasks.get(task_id).cloned())
+                    .and_then(|task| {
+                        let state = task.state.try_lock().ok()?;
+                        Some((state.metadata.child_pid, state.metadata.pgid))
+                    })
+                    .unwrap_or_default();
+                return self
+                    .inner
+                    .task_scopes
+                    .kill_with_audit(task_id, None, pid, pgid, reason);
             }
+            let (mut pid, mut pgid) = (None, None);
             let recorded = if let Some(task) = self.task(task_id) {
                 let metadata = match resolve_task_layout(&task.paths.session_dir, task_id)
                     .and_then(|record| read_task_at(&record))
@@ -300,6 +343,8 @@ impl BgTaskRegistry {
                     }
                 };
                 if let Some(metadata) = metadata {
+                    pid = metadata.child_pid;
+                    pgid = metadata.pgid;
                     let policy = metadata.memory_policy.filter(|policy| {
                         policy.kind
                             == super::super::memory_limit::MemoryPolicy::TASK_SCOPE_MEMORY_KIND
@@ -316,11 +361,13 @@ impl BgTaskRegistry {
             } else {
                 None
             };
-            self.inner.task_scopes.kill(task_id, recorded.as_deref())
+            self.inner
+                .task_scopes
+                .kill_with_audit(task_id, recorded.as_deref(), pid, pgid, reason)
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = task_id;
+            let _ = (task_id, reason);
             Ok(())
         }
     }
@@ -370,7 +417,13 @@ impl BgTaskRegistry {
     }
 
     pub(crate) fn kill_for_memory(&self, task: &Arc<BgTask>, reason: String) {
+        #[cfg(windows)]
+        let mut pid = None;
         if let Ok(mut state) = task.lock_state() {
+            #[cfg(windows)]
+            {
+                pid = state.metadata.child_pid;
+            }
             if !state.metadata.is_terminal() {
                 state.pending_terminal_override = Some(BgTaskStatus::Failed);
                 state.metadata.status_reason = Some(reason.clone());
@@ -379,6 +432,8 @@ impl BgTaskRegistry {
         if let Ok(monitors) = self.inner.memory_monitors.lock() {
             if let Some(monitor) = monitors.get(&task.task_id) {
                 if !monitor.is_task_scope() {
+                    #[cfg(windows)]
+                    log_bash_kill(&task.task_id, pid, None, &reason);
                     monitor.terminate();
                 }
             }
@@ -416,6 +471,13 @@ impl BgTaskRegistry {
             if monitor.is_task_scope() {
                 kill_scope = true;
             } else {
+                #[cfg(windows)]
+                log_bash_kill(
+                    &task.task_id,
+                    state.metadata.child_pid,
+                    None,
+                    &monitor.reason(),
+                );
                 monitor.terminate();
             }
             state
@@ -449,7 +511,7 @@ impl BgTaskRegistry {
         drop(monitors);
         drop(state);
         if kill_scope {
-            self.kill_task_scope(&task.task_id)?;
+            self.kill_task_scope_with_reason(&task.task_id, "terminal_memory_limit")?;
         }
         Ok(())
     }

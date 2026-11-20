@@ -622,7 +622,7 @@ fn client_child() {
     tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
         enum Sender {
             H1(hyper::client::conn::http1::SendRequest<http_body_util::Full<Bytes>>),
-            H2(hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>>),
+            H2(hyper::client::conn::http2::SendRequest<http_body_util::Full<Bytes>>, tokio::task::JoinHandle<()>),
         }
         let mut senders: Vec<Sender> = Vec::new();
         let mut raw_sockets = Vec::new();
@@ -655,6 +655,17 @@ fn client_child() {
                     let socket: &mut tokio_rustls::client::TlsStream<TcpStream> = raw_sockets.last_mut().ok_or(())?;
                     socket.write_all(value["wire"].as_str().ok_or(())?.as_bytes()).await.map_err(|_| ())?;
                     let mut response = Vec::new(); socket.read_to_end(&mut response).await.map_err(|_| ())?;
+                    if let Some(length) = value["tail_bytes"].as_u64() {
+                        if length < 2 { return Err(()); }
+                        let mut tail = vec![b'x'; length as usize];
+                        let end = tail.len();
+                        tail[end - 2..].copy_from_slice(b"\"}");
+                        let tail_error = async {
+                            socket.write_all(&tail).await?;
+                            socket.shutdown().await
+                        }.await.err().map(|error| error.to_string());
+                        return Ok(json!({"wire":String::from_utf8_lossy(&response), "tail_error":tail_error}));
+                    }
                     return Ok(json!({"wire":String::from_utf8_lossy(&response)}));
                 }
                 if value["op"] == "idle" {
@@ -713,7 +724,8 @@ fn client_child() {
                     let h2 = alpn.as_deref() == Some("h2");
                     if h2 {
                         let (sender, connection) = hyper::client::conn::http2::handshake(TokioExecutor::new(), TokioIo::new(tls)).await.map_err(|_| ())?;
-                        tokio::spawn(async move { let _ = connection.await; }); senders.push(Sender::H2(sender));
+                        let task = tokio::spawn(async move { let _ = connection.await; });
+                        senders.push(Sender::H2(sender, task));
                     } else {
                         let (sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(tls)).await.map_err(|_| ())?;
                         tokio::spawn(async move { let _ = connection.with_upgrades().await; }); senders.push(Sender::H1(sender));
@@ -723,7 +735,7 @@ fn client_child() {
                 let index = value["connection"].as_u64().map(|v| v as usize).unwrap_or(senders.len().saturating_sub(1));
                 let sender = senders.get_mut(index).ok_or(())?;
                 if value["op"] == "many" {
-                    let Sender::H2(sender) = sender else { return Err(()); };
+                    let Sender::H2(sender, _) = sender else { return Err(()); };
                     let uri = format!("https://{}/approved",std::env::var("AFT_UPSTREAM").unwrap());
                     let futures = (0..36).map(|_| {
                         let mut sender = sender.clone(); let uri = uri.clone();
@@ -733,7 +745,7 @@ fn client_child() {
                     return Ok(json!({"statuses":futures_util::future::join_all(futures).await.into_iter().collect::<Result<Vec<_>,_>>()?}));
                 }
                 if value["op"] == "overlap" {
-                    let Sender::H2(sender) = sender else { return Err(()); };
+                    let Sender::H2(sender, _) = sender else { return Err(()); };
                     let mut second = sender.clone();
                     let uri = format!("https://{}/approved", std::env::var("AFT_UPSTREAM").unwrap());
                     let make = || Request::builder().uri(&uri).header("authorization",format!("Bearer {MARKER}"))
@@ -744,7 +756,7 @@ fn client_child() {
                 }
                 let authority = value["authority"].as_str().map(str::to_owned).unwrap_or_else(|| std::env::var("AFT_UPSTREAM").unwrap());
                 let path = value["path"].as_str().unwrap_or("/approved");
-                let uri = if matches!(sender, Sender::H2(_)) { format!("https://{authority}{path}") } else { path.to_owned() };
+                let uri = if matches!(sender, Sender::H2(..)) { format!("https://{authority}{path}") } else { path.to_owned() };
                 let mut request = Request::builder().uri(uri).method(value["method"].as_str().unwrap_or("POST")).header("te", "trailers");
                 if value["omit_host"] != true { request = request.header("host", value["host_override"].as_str().unwrap_or(&authority)); }
                 if let Some(headers) = value["headers"].as_object() {
@@ -756,9 +768,25 @@ fn client_child() {
                     Bytes::copy_from_slice(value["body"].as_str().unwrap_or("").as_bytes())
                 };
                 let request = request.body(Full::new(body)).unwrap();
-                let mut response = match sender {
-                    Sender::H1(sender) => sender.send_request(request).await.map_err(|_| ())?,
-                    Sender::H2(sender) => sender.send_request(request).await.map_err(|_| ())?,
+                let sent = async {
+                    match sender {
+                        Sender::H1(sender) => sender.send_request(request).await,
+                        Sender::H2(sender, _) => sender.send_request(request).await,
+                    }
+                };
+                let mut response = if let Some(ms) = value["client_timeout_ms"].as_u64() {
+                    match tokio::time::timeout(Duration::from_millis(ms), sent).await {
+                        Ok(result) => result.map_err(|_| ())?,
+                        Err(_) => {
+                            if let Sender::H2(_, task) = senders.remove(index) {
+                                task.abort();
+                                let _ = task.await;
+                            }
+                            return Ok(json!({"client_timed_out":true}));
+                        }
+                    }
+                } else {
+                    sent.await.map_err(|_| ())?
                 };
                 let status = response.status().as_u16();
                 let headers: HashMap<_, _> = response.headers().iter().map(|(n,v)| (n.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string())).collect();
@@ -973,6 +1001,191 @@ async fn proxy_refuses_a_json_body_location_for_gzip_without_sending_upstream() 
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("reason=location_mismatch "), "{lines:?}");
     assert!(server.seen.lock().is_empty());
+}
+
+fn padded_json(size: usize, start: &str, end: &str) -> String {
+    let mut body = String::with_capacity(size);
+    body.push_str(start);
+    body.extend(std::iter::repeat_n('x', size - start.len() - end.len()));
+    body.push_str(end);
+    body
+}
+
+fn assert_received_body(request: &Value, expected: &str) {
+    let received = base64::engine::general_purpose::STANDARD
+        .decode(request["body_base64"].as_str().unwrap())
+        .unwrap();
+    assert!(
+        received == expected.as_bytes(),
+        "request body changed in transit (sent {}, received {} bytes)",
+        expected.len(),
+        received.len()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_streams_large_json_with_bearer_and_leaves_placeholders_after_first_mib_literal() {
+    let server = Server::new("binary-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[
+                ("test", Location::Bearer),
+                ("query", Location::Query("q".into())),
+                ("json", Location::Json("/key".into())),
+            ],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let size = 3 * 1024 * 1024;
+    let plain = padded_json(size, r#"{"padding":""#, r#""}"#);
+    let tail = padded_json(size, r#"{"padding":""#, r#"","key":"{{ck-secret:json}}"}"#);
+    let auth = format!("Bearer {MARKER}");
+    for (path, authorization, body) in [
+        ("/approved", Some(&auth), &plain),
+        ("/approved?q=%7B%7Bck-secret%3Aquery%7D%7D", None, &tail),
+        ("/approved", None, &plain),
+    ] {
+        let mut headers = json!({"content-type":"application/json"});
+        if let Some(authorization) = authorization {
+            headers["authorization"] = json!(authorization);
+        }
+        let reply = client.command(json!({
+            "op":"request", "method":"PUT", "path":path, "headers":headers, "body":body,
+        }));
+        assert_eq!(reply["status"], 204, "{path}: {reply}");
+    }
+    let seen = server.seen.lock();
+    assert_eq!(seen.len(), 3);
+    assert_eq!(
+        seen[0]["headers"]["authorization"],
+        "Bearer test-key-12345678"
+    );
+    assert!(seen[1]["target"]
+        .as_str()
+        .unwrap()
+        .ends_with("/approved?q=test-key-12345678"));
+    for (request, expected) in seen.iter().zip([&plain, &tail, &plain]) {
+        assert_received_body(request, expected);
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_refuses_a_json_only_placeholder_in_the_first_mib_before_sending_large_body() {
+    let server = Server::new("raw-transfer-h1").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("json", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let body = padded_json(
+        3 * 1024 * 1024,
+        r#"{"key":"{{ck-secret:json}}","padding":""#,
+        r#""}"#,
+    );
+    let reply = client.request(
+        "/approved",
+        json!({"content-type":"application/json"}),
+        &body,
+    );
+    assert_eq!(reply["status"], 403, "{reply}");
+    assert_eq!(reply["body"], "AFT's secret proxy refused the request: json (localhost). The placeholder is not in a place where this secret may go.");
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 1);
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reason=location_mismatch "), "{lines:?}");
+    // This origin records request headers without waiting for the body.
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_refuses_a_json_only_placeholder_and_half_closes_before_draining_upload() {
+    let server = Server::new("raw-transfer-h1").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault,
+            server.address.port(),
+            &[("json", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    assert_eq!(
+        client.command(json!({"op":"connect", "raw":true}))["ok"],
+        true
+    );
+    let total = 3 * 1024 * 1024;
+    let prefix = padded_json(
+        1024 * 1024 + 1,
+        r#"{"key":"{{ck-secret:json}}","padding":""#,
+        "",
+    );
+    let authority = format!("localhost:{}", server.address.port());
+    // The client holds the tail until it can read the refusal and the server's
+    // TLS close-notify. A full socket close would reset the remaining writes.
+    let reply = client.command(json!({
+        "op":"raw",
+        "wire":format!("PUT /approved HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {total}\r\n\r\n{prefix}"),
+        "tail_bytes":total - prefix.len(),
+    }));
+    let wire = reply["wire"].as_str().unwrap_or_default();
+    assert!(wire.starts_with("HTTP/1.1 403 "), "{reply}");
+    assert!(reply["tail_error"].is_null(), "{reply}");
+    assert!(wire.contains("AFT's secret proxy refused the request: json (localhost). The placeholder is not in a place where this secret may go."), "{reply}");
+    assert!(wire.contains("\r\nconnection: close\r\n"), "{reply}");
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_substitutes_json_body_locations_up_to_and_including_one_mib() {
+    let server = Server::new("binary-request").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault.clone(),
+            server.address.port(),
+            &[("json", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    for size in [1024, 1024 * 1024] {
+        let body = padded_json(
+            size,
+            r#"{ "padding": ""#,
+            r#"", "key": "{{ck-secret:json}}" }"#,
+        );
+        let reply = client.request(
+            "/approved",
+            json!({"content-type":"application/json"}),
+            &body,
+        );
+        assert_eq!(reply["status"], 204, "{size} bytes: {reply}");
+        let expected = body.replace("{{ck-secret:json}}", "test-key-12345678");
+        assert_received_body(server.seen.lock().last().unwrap(), &expected);
+    }
+    assert_eq!(vault.calls.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

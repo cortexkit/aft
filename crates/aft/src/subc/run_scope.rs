@@ -156,6 +156,7 @@ pub(super) struct RunScope {
     /// They are withdrawn once the run's scope is confirmed ended.
     parked_asks: StdMutex<Vec<super::consent::ParkedAsk>>,
     pub(super) permission_budget: Arc<super::consent::RunPermissionBudget>,
+    registration: records::Registration,
 }
 
 impl RunScope {
@@ -189,10 +190,10 @@ impl RunScope {
     /// Keep an ask the run left open so the run's end withdraws it. An ask
     /// parked after the end was confirmed is withdrawn at once.
     pub(super) fn park_ask(self: &Arc<Self>, ask: super::consent::ParkedAsk) {
-        self.parked_asks
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push(ask);
+        let mut parked = self.parked_asks.lock().unwrap();
+        parked.push(ask);
+        self.registration.keep_parked(self);
+        drop(parked);
         super::scope_watch::changed(super::scope_watch::Source::Parked);
         if self.revoked() {
             self.withdraw_parked_asks();
@@ -200,12 +201,10 @@ impl RunScope {
     }
 
     fn withdraw_parked_asks(&self) {
-        let parked = std::mem::take(
-            &mut *self
-                .parked_asks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let mut asks = self.parked_asks.lock().unwrap();
+        let parked = std::mem::take(&mut *asks);
+        self.registration.release_parked();
+        drop(asks);
         if parked.is_empty() {
             return;
         }
@@ -300,45 +299,69 @@ impl RunScope {
 
 pub(super) struct RunScopes {
     control: Arc<readiness::DaemonControl>,
-    scopes: StdMutex<HashMap<(String, String, u64), Arc<RunScope>>>,
+    scopes: records::Registry,
+    waits: budget_waits::BudgetWaits,
 }
+
+mod budget_waits;
+mod records;
+pub(super) use budget_waits::Ready;
+#[cfg(test)]
+mod budget_wait_tests;
 
 impl RunScopes {
     pub(super) fn new(control: Arc<readiness::DaemonControl>) -> Self {
         Self {
             control,
-            scopes: StdMutex::new(HashMap::new()),
+            scopes: Default::default(),
+            waits: Default::default(),
         }
     }
 
-    pub(super) fn revoke(&self, stamp: &subc_protocol::scope::ScopeStamp) {
-        if let Some(scope) = self
-            .scopes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .get(&super::scope_describe::stamp_key(stamp))
-        {
-            scope.revoke();
+    pub(super) fn cancel(&self, route: RouteChannel, corr: u64) -> Option<RequestFrameMeta> {
+        self.waits.cancel(route, corr)
+    }
+
+    pub(super) fn resume(&self, ready: Ready) -> Option<DecodedFrame> {
+        self.waits.resume(ready)
+    }
+
+    pub(super) async fn next_ready(
+        &self,
+        receiver: &mut mpsc::UnboundedReceiver<Ready>,
+    ) -> Option<DecodedFrame> {
+        while let Some(ready) = receiver.recv().await {
+            if let Some(decoded) = self.resume(ready) {
+                return Some(decoded);
+            }
         }
+        None
+    }
+
+    pub(super) fn drain(&self) -> Result<Vec<Frame>, SubcError> {
+        self.waits.drain()
+    }
+
+    pub(super) async fn close_route(
+        &self,
+        route: RouteChannel,
+        writer: &WriterSender,
+        metrics: &DispatchPathMetrics,
+    ) -> Result<(), SubcError> {
+        for frame in self.waits.release(route)? {
+            send_reliable_writer_frame(writer, metrics, frame, "released queued call").await?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn revoke(&self, stamp: &subc_protocol::scope::ScopeStamp) {
+        self.scopes.revoke(stamp);
     }
 
     /// Pending Cingulate asks keep a run alive for scope confirmation even
     /// when the run currently has no shell process to watch.
     pub(super) fn parked_scopes(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
-        self.scopes
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .filter(|scope| {
-                !scope.revoked()
-                    && !scope
-                        .parked_asks
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .is_empty()
-            })
-            .map(|scope| scope.stamp.clone())
-            .collect()
+        self.scopes.parked_scopes()
     }
 
     pub(super) fn bind(&self, identity: &RouteIdentity) -> Option<Arc<RunScope>> {
@@ -346,27 +369,11 @@ impl RunScopes {
             .scope
             .as_ref()
             .filter(|_| identity.call_mode == subc_protocol::call_mode::CallMode::Codemode)?;
-        Some(Arc::clone(identity.run_scope.get_or_init(|| {
-            let key = super::scope_describe::stamp_key(stamp);
-            Arc::clone(
-                self.scopes
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .entry(key)
-                    .or_insert_with(|| {
-                        Arc::new(RunScope {
-                            stamp: stamp.clone(),
-                            control: Arc::clone(&self.control),
-                            describe_lock: tokio::sync::Mutex::new(()),
-                            budget: StdMutex::new(None),
-                            revoked: AtomicBool::new(false),
-                            authorization: StdMutex::new(()),
-                            parked_asks: StdMutex::new(Vec::new()),
-                            permission_budget: Arc::default(),
-                        })
-                    }),
-            )
-        })))
+        Some(Arc::clone(
+            identity
+                .run_scope
+                .get_or_init(|| self.scopes.bind(stamp, &self.control)),
+        ))
     }
 }
 
@@ -381,9 +388,9 @@ impl RunScopes {
         &self,
         decoded: DecodedFrame,
         identity: &RouteIdentity,
-        ready: &mpsc::UnboundedSender<DecodedFrame>,
+        ready: &mpsc::UnboundedSender<Ready>,
     ) -> Result<(), DecodedFrame> {
-        let body = serde_json::from_slice::<Value>(&decoded.frame.body).unwrap_or(Value::Null);
+        let body = decoded.body().unwrap_or(&Value::Null);
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
         if body
             .get("op")
@@ -455,39 +462,15 @@ impl RunScopes {
         if background_error.is_none() && scope.cached_budget().is_ok() {
             return Err(decoded);
         }
-        let control = Arc::clone(&self.control);
-        let ready = ready.clone();
-        tokio::spawn(async move {
-            let result = match background_error {
-                Some(error) => Err(error),
-                None => scope.read_budget().await,
-            };
-            match result {
-                Ok(_) => {
-                    let _ = ready.send(decoded);
-                }
-                Err(error) => {
-                    let frame = &decoded.frame;
-                    if let Ok(refusal) = build_error_frame(
-                        frame.header.ver,
-                        frame.header.channel,
-                        frame.header.epoch,
-                        frame.header.corr,
-                        frame.header.flags,
-                        &error.code,
-                        &error.message,
-                    ) {
-                        let _ = send_reliable_writer_frame(
-                            &control.writer,
-                            &control.metrics,
-                            refusal,
-                            "run scope refusal",
-                        )
-                        .await;
-                    }
-                }
-            }
-        });
+        let name = name.to_owned();
+        self.waits.start(
+            decoded,
+            &name,
+            scope,
+            background_error,
+            self.control.clone(),
+            ready.clone(),
+        );
         Ok(())
     }
 }
@@ -571,6 +554,7 @@ impl RunScope {
             authorization: StdMutex::new(()),
             parked_asks: StdMutex::new(Vec::new()),
             permission_budget: Arc::default(),
+            registration: Default::default(),
         })
     }
 }

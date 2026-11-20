@@ -1,6 +1,22 @@
 use super::*;
 use crate::access_policy::{AccessDecision, AccessDenial};
 
+fn operation(
+    body: Value,
+    op: &str,
+    identity: &RouteIdentity,
+    ctx: &AppContext,
+) -> Result<Value, subc_protocol::ErrorBody> {
+    super::operation(body, op, identity, ctx, |scope, path| {
+        let db = ctx.db().unwrap();
+        assert!(
+            db.try_lock().is_ok(),
+            "revoke must release aft.db before stopping tasks"
+        );
+        permissions::stop_folder_tasks_in(std::slice::from_ref(ctx.bash_background()), scope, path);
+    })
+}
+
 #[cfg(unix)]
 #[path = "access_grants_restore_tests.rs"]
 mod slow_restore;
@@ -131,6 +147,199 @@ fn fixture() -> (tempfile::TempDir, AppContext, RouteIdentity, RouteIdentity) {
     result
 }
 
+#[cfg(unix)]
+#[test]
+fn grants_revoke_by_listed_path_does_not_follow_a_changed_identity() {
+    let (dir, ctx, head, _) = fixture();
+    let original = dir.path().join("original");
+    let moved = dir.path().join("moved");
+    std::fs::create_dir(&original).unwrap();
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: original.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    let list = operation(json!({}), "grants.list", &head, &ctx).unwrap();
+    let listed = list["grants"][0]["path"].as_str().unwrap();
+    std::fs::rename(&original, &moved).unwrap();
+    std::os::unix::fs::symlink(&moved, &original).unwrap();
+    assert_ne!(policy_path(Path::new(listed)), Path::new(listed));
+
+    let revoke = operation(json!({"path": listed}), "grants.revoke", &head, &ctx).unwrap();
+    assert_eq!(
+        revoke,
+        json!({"scope":"head", "scope_epoch":7, "path":listed, "revoked":1})
+    );
+    assert!(store::list(&db.lock().unwrap(), &scope_key(&head))
+        .unwrap()
+        .is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn grants_revoke_resolves_an_alias_with_database_unlocked() {
+    use crate::access_policy::path_probe;
+    let (dir, ctx, head, _) = fixture();
+    let target = policy_path(&dir.path().join("target"));
+    let alias = dir.path().join("alias");
+    std::fs::create_dir(&target).unwrap();
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &scope_key(&head),
+        &AccessGrant {
+            path: target.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+    let probes = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let revoke = path_probe::capture(
+        {
+            let (db, probes, alias) = (db.clone(), probes.clone(), alias.clone());
+            move |kind, path| {
+                if path == alias {
+                    probes.borrow_mut().push((kind, db.try_lock().is_ok()));
+                }
+            }
+        },
+        || operation(json!({"path":alias}), "grants.revoke", &head, &ctx).unwrap(),
+    );
+    assert_eq!(revoke["revoked"], 1);
+    assert_eq!(revoke["path"], json!(target));
+    assert_eq!(*probes.borrow(), [(path_probe::Kind::Resolve, true)]);
+}
+
+#[cfg(unix)]
+#[test]
+fn grants_revoke_by_path_stops_only_shells_using_the_saved_grant() {
+    use crate::bash_background::{
+        registry::folder_grants::FOLDER_ACCESS_REVOKED_REASON, BgTaskStatus,
+    };
+    use crate::sandbox_spawn::SpawnPlan;
+    let (dir, ctx, head, _) = fixture();
+    ctx.update_config(|config| {
+        config.experimental_bash_background = true;
+        config.sandbox.profile.head = crate::config::SandboxMode::Off;
+    });
+    let key = scope_key(&head);
+    let granted = policy_path(&dir.path().join("shared"));
+    std::fs::create_dir(&granted).unwrap();
+    let db = ctx.db().unwrap();
+    store::insert(
+        &db.lock().unwrap(),
+        &key,
+        &AccessGrant {
+            path: granted.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        },
+    )
+    .unwrap();
+
+    // Use a stand-in launcher so this test checks the production grant capture
+    // and process stop without requiring a host sandbox backend.
+    crate::executable_cache::write_executable_with_mode(
+        &head.project_root.join("sandbox-launch"),
+        b"while [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = -- ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 78\n",
+        0o700,
+    ).unwrap();
+    let mut profile = crate::sandbox_profile::SandboxProfile::build(
+        vec![head.project_root.clone()],
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        dir.path().to_path_buf(),
+    )
+    .unwrap();
+    let spawn = |profile| {
+        let plan = SpawnPlan::launcher_for_test(profile, "/bin/sh".into());
+        let _scope = crate::access_policy::scope_guard(Some(key.clone()));
+        let response = crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+            crate::bash_background::spawn(
+                "path-revoke",
+                &head.session,
+                "sleep 30",
+                crate::bash_background::BashShell::Bash,
+                crate::bash_background::registry::resolve_posix_shell(),
+                Some(head.project_root.clone()),
+                None,
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                &ctx,
+                true,
+                false,
+                false,
+                false,
+                24,
+                80,
+                Vec::new(),
+                false,
+                None,
+                None,
+            )
+        });
+        assert!(response.success, "{:?}", response.data);
+        response.data["task_id"].as_str().unwrap().to_owned()
+    };
+    let kept = spawn(profile.clone());
+    profile.data_policy.read_allow.push(granted.clone());
+    let held = spawn(profile);
+    let registry = ctx.bash_background();
+    assert_eq!(
+        registry
+            .folder_grant_tasks(&key, &granted)
+            .iter()
+            .map(|task| &task.task_id)
+            .collect::<Vec<_>>(),
+        [&held]
+    );
+
+    let reply = operation(json!({"path":granted}), "grants.revoke", &head, &ctx).unwrap();
+    let status = |id| {
+        registry
+            .status(id, &head.session, None, None, 0)
+            .unwrap()
+            .info
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let stopped = loop {
+        let result = status(&held);
+        if result.status.is_terminal() || std::time::Instant::now() >= deadline {
+            break result;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let kept_running = !status(&kept).status.is_terminal();
+    let _ = registry.kill(&kept, &head.session);
+    if !stopped.status.is_terminal() {
+        let _ = registry.kill(&held, &head.session);
+    }
+    assert_eq!(
+        reply,
+        json!({"scope":"head", "scope_epoch":7, "path":granted, "revoked":1})
+    );
+    assert_eq!(stopped.status, BgTaskStatus::Killed);
+    assert_eq!(
+        stopped.status_reason.as_deref(),
+        Some(FOLDER_ACCESS_REVOKED_REASON)
+    );
+    assert!(
+        kept_running,
+        "the shell that never used the grant must keep running"
+    );
+}
+
 #[test]
 fn grants_answer_source_does_not_change_head_authority() {
     use crate::access_policy::HeadPolicy;
@@ -148,7 +357,14 @@ fn grants_answer_source_does_not_change_head_authority() {
         .unwrap();
     assert_eq!(policy.head_policy(&inside), HeadPolicy::Allow);
     assert_eq!(
-        answer_source(&conn, &worker, false, Some(&policy), &inside).unwrap(),
+        answer_source(
+            &conn,
+            &worker,
+            false,
+            head_default_allows(Some(&policy), &inside),
+            &inside
+        )
+        .unwrap(),
         Some(GrantSource::HeadPolicy)
     );
     assert_eq!(policy.head_policy(&inside), HeadPolicy::Allow);
@@ -168,7 +384,14 @@ fn grants_answer_source_does_not_change_head_authority() {
             .unwrap();
         assert_eq!(policy.head_policy(&grant), HeadPolicy::Allow);
         assert_eq!(
-            answer_source(&conn, &worker, false, Some(&policy), &grant).unwrap(),
+            answer_source(
+                &conn,
+                &worker,
+                false,
+                head_default_allows(Some(&policy), &grant),
+                &grant
+            )
+            .unwrap(),
             Some(source.map_or(GrantSource::Unknown, |_| GrantSource::HeadGrant))
         );
         assert_eq!(
@@ -178,7 +401,7 @@ fn grants_answer_source_does_not_change_head_authority() {
         );
     }
     assert_eq!(
-        answer_source(&conn, &worker, true, None, &grant).unwrap(),
+        answer_source(&conn, &worker, true, false, &grant).unwrap(),
         Some(GrantSource::Person)
     );
 }

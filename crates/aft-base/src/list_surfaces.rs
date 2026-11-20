@@ -451,6 +451,24 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Repository identity checks bound traversal and pointer reads; neither returns a partial tool result.",
     },
     ExclusionEntry {
+        file: "commands/edit_match.rs",
+        enclosing_item: "handle_single_file_edit_match",
+        location_or_primitive: "take(AMBIGUOUS_OCCURRENCE_LIST_LIMIT)",
+        reason: "An ambiguous edit is a refusal, not a result list: its structured occurrence rows stop at the same eight the error message lists, and the message states the exact match count and how many more were not listed.",
+    },
+    ExclusionEntry {
+        file: "commands/batch.rs",
+        enclosing_item: "resolve_edit_with_offsets",
+        location_or_primitive: "take(AMBIGUOUS_OCCURRENCE_LIST_LIMIT)",
+        reason: "An ambiguous batch edit is a refusal, not a result list: its structured occurrence rows stop at the same eight the error message lists, and the message states the exact match count and how many more were not listed.",
+    },
+    ExclusionEntry {
+        file: "subc/rich_ui/display/bash_tail.rs",
+        enclosing_item: "from_streams",
+        location_or_primitive: "MAX_LINES, MAX_CHARS, .take(MAX_LINES)",
+        reason: "The optional tool-display completion preview uses the shared text_lines limits; the command output and its list envelope are unchanged.",
+    },
+    ExclusionEntry {
         file: "context/checkout_suggestion.rs",
         enclosing_item: "unique_indexed_checkout_suffix",
         location_or_primitive: "MAX_PATHS, MAX_COMPONENTS",
@@ -1188,6 +1206,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         enclosing_item: "RepairBudget, DirectoryEntries, unix_entries, unix_names, repair_names, directory_identities, collect_directory_identities, repair_measure, repair_remove_contents, windows_repair_names, repair_descendant, repair_validate_descendants",
         location_or_primitive: "repair traversal depth, entry and deadline bounds",
         reason: "internal cache repair and retention walks, not result lists; an incomplete identity census or inventory refuses deletion and interrupted removal reports partial progress",
+    },
+    ExclusionEntry {
+        file: "crates/aft-store/src/family/disk.rs",
+        enclosing_item: "Scan::open_dir, Scan::next_entry",
+        location_or_primitive: "shared entry cap and deadline across manifest discovery and leftover file measurement",
+        reason: "internal index store disk accounting, not a result list; a stopped scan keeps bytes, examined entries and the stop reason and withholds the total from status",
     },
     ExclusionEntry {
         file: "views/callgraph_copies.rs",

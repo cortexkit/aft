@@ -78,6 +78,22 @@ impl BashDeferredCompletion {
     pub(super) fn text_for_test(&self) -> Option<&str> {
         self.result.as_ref().map(|result| result.text.as_str())
     }
+
+    #[cfg(unix)]
+    pub(super) fn reply_frame_for_test(
+        &self,
+        policy: super::wire::ToolResponsePolicy,
+    ) -> super::wire::WriterFrame {
+        build_tool_response_frame(
+            self.ver,
+            self.route,
+            self.corr,
+            self.flags,
+            self.result.as_ref().expect("bash completion result"),
+            policy,
+        )
+        .unwrap()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]

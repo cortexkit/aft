@@ -26,6 +26,7 @@ const PTY_SETUP_REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_se
 /// setup fails before handing the child to its waiter thread, dropping this
 /// attempts to kill and reap the child within a deadline, logging reap failures.
 struct SpawnedPtyChild {
+    task_id: String,
     child: Option<Box<dyn portable_pty::Child + Send + Sync>>,
     master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     root: Option<subc_client_rs::AgentCommandRoot>,
@@ -33,10 +34,12 @@ struct SpawnedPtyChild {
 
 impl SpawnedPtyChild {
     fn new(
+        task_id: String,
         child: Box<dyn portable_pty::Child + Send + Sync>,
         root: Option<subc_client_rs::AgentCommandRoot>,
     ) -> Self {
         Self {
+            task_id,
             child: Some(child),
             master: None,
             root,
@@ -60,6 +63,7 @@ impl Drop for SpawnedPtyChild {
         };
         // Dropping a PTY handle is not a termination guarantee: a child can
         // ignore HUP. Setup still owns this child, so kill and reap it here.
+        super::registry::log_bash_kill(&self.task_id, child.process_id(), None, "pty_setup_failed");
         #[cfg(unix)]
         if let Some(pid) = child.process_id() {
             unsafe {
@@ -440,6 +444,7 @@ fn try_spawn_pty(
     // Own the master in the child guard so every later setup error closes it
     // before cleanup waits for the session leader to exit.
     let mut child = SpawnedPtyChild {
+        task_id: task_id.to_owned(),
         child: Some(child),
         master: Some(pair.master),
         root: None,
@@ -660,12 +665,22 @@ pub(crate) fn spawn_reader(
         let result = (|| -> io::Result<()> {
             let mut buf = [0_u8; 8192];
             let mut dsr = DsrScanner::default();
+            // After the capture file fails, the pseudoterminal is still read
+            // to the end and the bytes dropped: a reader that stopped would
+            // leave the command blocked writing to a full pseudoterminal. The
+            // error makes the task's output count as incomplete.
+            let mut capture_error = None;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        file.write_all(&buf[..n])?;
-                        file.flush()?;
+                        if capture_error.is_none() {
+                            if let Err(error) =
+                                file.write_all(&buf[..n]).and_then(|()| file.flush())
+                            {
+                                capture_error = Some(error);
+                            }
+                        }
                         if dsr.scan(&buf[..n]) {
                             // Some Windows console hosts/apps query the
                             // terminal cursor position with DSR (ESC[6n)
@@ -686,7 +701,7 @@ pub(crate) fn spawn_reader(
                     Err(error) => return Err(error),
                 }
             }
-            Ok(())
+            capture_error.map_or(Ok(()), Err)
         })();
         drop(file);
         if let Err(ref error) = result {
@@ -771,7 +786,7 @@ pub(crate) fn spawn_waiter(
     coordinator: Arc<CompletionCoordinator>,
     root: Option<subc_client_rs::AgentCommandRoot>,
 ) -> io::Result<()> {
-    let mut owned_child = SpawnedPtyChild::new(child, root);
+    let mut owned_child = SpawnedPtyChild::new(coordinator.task_id.clone(), child, root);
     super::worker_thread::spawn(super::worker_thread::Worker::PtyWaiter, move || {
         let mut child = owned_child.child.take().unwrap();
         let marker = loop {
@@ -1026,6 +1041,7 @@ mod tests {
             .unwrap();
         let fd = pair.master.as_raw_fd().unwrap();
         let guard = SpawnedPtyChild {
+            task_id: "pty-setup-test".into(),
             master: Some(pair.master),
             child: Some(Box::new(MasterCloseCheckedChild(fd))),
             root: None,
@@ -1122,6 +1138,59 @@ mod tests {
         assert_eq!(scan_chunks(&[b"hello"]), 0);
         // Partial-but-never-completed sequence must not fire.
         assert_eq!(scan_chunks(&[b"\x1b[6", b"x"]), 0);
+    }
+
+    #[test]
+    fn reader_keeps_draining_the_pty_after_its_capture_fails() {
+        use std::io::{Cursor, Read};
+        use std::sync::atomic::AtomicUsize;
+        struct Counted(Cursor<Vec<u8>>, Arc<AtomicUsize>);
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let read = self.0.read(buf)?;
+                self.1.fetch_add(read, Ordering::SeqCst);
+                Ok(read)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pty");
+        std::fs::write(&path, b"").unwrap();
+        // A read-only handle, so every capture write fails.
+        let capture = std::fs::File::open(&path).unwrap();
+        let output = vec![b'x'; 256 * 1024];
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let coordinator = Arc::new(CompletionCoordinator::new(
+            "bash-0000000000000001".into(),
+            "session".into(),
+            wake_tx,
+        ));
+        let done = Arc::new(AtomicBool::new(false));
+        let eof = Arc::new(AtomicBool::new(true));
+        spawn_reader(
+            Box::new(Counted(Cursor::new(output.clone()), consumed.clone())),
+            capture,
+            done.clone(),
+            eof.clone(),
+            coordinator,
+            None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the reader never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            consumed.load(Ordering::SeqCst),
+            output.len(),
+            "the reader stopped reading the pseudoterminal"
+        );
+        assert!(
+            !eof.load(Ordering::SeqCst),
+            "a failed capture must not count as complete output"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
 }
 #[cfg(unix)]

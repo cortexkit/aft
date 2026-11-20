@@ -1,6 +1,6 @@
 use serde_json::json;
 
-use super::Shipped;
+use super::{Shipped, BASH_SEMANTICS};
 
 pub(super) const CATALOG_DIGEST: &str =
     "sha256:af4559652b832b8908f4dc39364874eea6950ab708567e70f17d304e8c0f9a32";
@@ -22,4 +22,22 @@ pub(super) fn append(entry: &mut Shipped) {
     }
     manifest.template_revision += 1;
     entry.history.push(manifest);
+}
+
+pub(super) fn bash_tail_view(older: &Shipped) -> Shipped {
+    let mut tool = older.tool.clone();
+    tool.semantics = BASH_SEMANTICS;
+    let mut manifest = older.history.last().expect("shipped bash view").clone();
+    manifest.template["row"]["source"] = json!(include_str!("bash-v2.row.ui"));
+    manifest.template["page"]["source"] = json!(include_str!("bash-v2.page.ui"));
+    manifest.template_revision = 1;
+    manifest.record_schema.revision += 1;
+    manifest.record_schema.completion_fields.insert(
+        "tail".into(),
+        cortexkit_role_tool_display::FieldKind::TextLines,
+    );
+    Shipped {
+        tool,
+        history: vec![manifest],
+    }
 }

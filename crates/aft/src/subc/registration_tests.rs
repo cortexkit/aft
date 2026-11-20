@@ -126,7 +126,7 @@ async fn consumer_cases() {
     connection_file::write_atomic(&path, &info).unwrap();
 
     assert!(!identity_ready());
-    let open = || connect_consumer(&path, ConsumerOptions::default());
+    let open = || connect_consumer("registration_test", &path, ConsumerOptions::default());
     tokio::select! {
         result = open() => assert!(matches!(claim_error(result), ClaimError::Unavailable)),
         _ = listener.accept() => panic!("consumer dialed before the minter was installed"),

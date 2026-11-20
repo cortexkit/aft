@@ -11,7 +11,7 @@ fn discovery_skips_repositories_on_different_devices() {
     git_init(&root.join("mounted").join("external"));
     crate::watcher_filter::EXCLUSION_TEST_DEVICE
         .with(|device| *device.borrow_mut() = Some(root.join("mounted")));
-    let found = walk(&root, &|_| false);
+    let found = walk(&root, MAX_DISCOVERY_ENTRIES, &|_| false);
     crate::watcher_filter::EXCLUSION_TEST_DEVICE.with(|device| *device.borrow_mut() = None);
     assert_eq!(found.repositories, vec![root.join("local")]);
 }
@@ -136,6 +136,68 @@ fn session_stops_when_its_context_is_dropped() {
     drop(ctx);
     wait_stopped(&session);
     assert!(session_for_root(&root).is_none());
+}
+
+#[test]
+fn discovery_limits_stop_the_directory_iterator_before_sorting() {
+    use std::cell::Cell;
+
+    let visits = Cell::new(0);
+    let entries = || {
+        (0..10).map(|i| {
+            visits.set(visits.get() + 1);
+            if i == 0 {
+                Err(())
+            } else {
+                Ok(i)
+            }
+        })
+    };
+    let mut remaining = 3;
+    assert_eq!(
+        read_discovery_entries(entries(), &mut remaining, || false),
+        [1, 2]
+    );
+    assert_eq!(visits.get(), 3);
+    assert_eq!(remaining, 0);
+
+    visits.set(0);
+    let mut remaining = 10;
+    assert_eq!(
+        read_discovery_entries(entries(), &mut remaining, || visits.get() >= 2),
+        [1]
+    );
+    assert_eq!(visits.get(), 2);
+    assert_eq!(remaining, 8);
+}
+
+#[test]
+fn exhausted_discovery_discloses_uncertain_scope_not_known_children() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = std::fs::canonicalize(temp.path()).unwrap();
+    // Only one child is read, independently of filesystem enumeration order.
+    git_init(&root.join("one"));
+    git_init(&root.join("two"));
+    let found = discover_with_limit(&root, DEFAULT_MAX_CHILD_REPOS, 1).unwrap();
+    assert!(found.entry_limit_reached);
+    assert_eq!(found.children.len(), 1);
+    let mut gaps = query::Gaps::default();
+    gaps.discovery_scope(&found, &found.children[0].join("src"));
+    assert!(gaps.into_values().is_empty());
+
+    let absent = if found.children[0].ends_with("one") {
+        "two"
+    } else {
+        "one"
+    };
+    let mut gaps = query::Gaps::default();
+    gaps.discovery_scope(&found, &root.join(absent));
+    let mut reply = serde_json::json!({"complete": true, "text": "No matches"});
+    query::attach_search_gaps(&mut reply, gaps.into_values());
+    assert_eq!(reply["complete"], false);
+    assert_eq!(reply["gaps"][0]["kind"], "parent_discovery_entry_limit");
+    assert_eq!(reply["gaps"][0]["path"], absent);
+    assert_eq!(reply["text"], format!("(Parent folder: not covered by this answer:\n- {absent}: AFT stopped looking for repositories here after 20,000 entries, so some repositories in this folder were not searched.)\n\nNo matches"));
 }
 
 #[test]

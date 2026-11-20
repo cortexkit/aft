@@ -14,6 +14,8 @@ use crate::policy_path::policy_path;
 #[allow(unused_imports)]
 use crate::sandbox_profile::{SandboxDataPolicy, SandboxProfile, SandboxProfileError};
 #[cfg(test)]
+pub(crate) use aft_base::policy_path::path_probe;
+#[cfg(test)]
 #[allow(unused_imports)]
 pub(crate) use directory_scope::directory_scope;
 #[cfg(test)]

@@ -1,6 +1,27 @@
 use super::*;
 use serde::de::DeserializeOwned;
 
+#[test]
+fn settings_declaration_leaves_a_missing_synapse_model_for_review_to_refuse() {
+    use ::subc_config::{Layer, LayerValue, Schema, ValidationContext};
+
+    let schema = Schema::new(crate::config_live::schema::settings_declaration()).unwrap();
+    let tuple = schema
+        .review_tuple(
+            &[LayerValue::new(
+                Layer::User,
+                json!({"semantic": {"backend": "synapse"}}),
+            )],
+            &ValidationContext::default(),
+        )
+        .unwrap();
+    assert!(tuple.effective.pointer("/semantic/model").is_none());
+    assert_eq!(
+        validate_user(&tuple.effective).unwrap_err(),
+        "/semantic/model"
+    );
+}
+
 macro_rules! golden {
     ($name:literal) => {
         include_str!(concat!(

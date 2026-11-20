@@ -7,9 +7,11 @@
 //! row for row. Node ids come from the target file's own symbols at assembly
 //! time; a file's resolution stores only target paths and symbol names.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use super::callgraph::{CheckoutInputs, FileResolution};
+use crate::callgraph_store::join::dispatch::Resolution;
 use crate::callgraph_store::join::{BlobRef, BlobRefKind, ParseBlob, ResolutionStatus};
 use crate::callgraph_store::{MACRO_BODY_CALL_REF_KIND, PROVENANCE_TREESITTER};
 
@@ -102,10 +104,9 @@ pub(crate) struct GraphRows {
     pub(crate) refs: BTreeMap<String, RefRow>,
     pub(crate) edges: BTreeMap<String, EdgeRow>,
     pub(crate) sites: BTreeMap<(String, u32), SiteRow>,
-    /// Members an unknown receiver keeps alive: caller file, target file,
-    /// target symbol, and the line of the call site (a site in test code
-    /// keeps them alive for tests only).
-    pub(crate) unknown_live: BTreeSet<(String, String, String, u32)>,
+    /// Shared answers by caller file and site line. The independent snapshot
+    /// retains each line so it can verify the line-aware rollup.
+    pub(crate) unknown_live: BTreeMap<String, BTreeMap<u32, Vec<Arc<Resolution>>>>,
 }
 
 /// The nodes table, with the rules a SQLite `INSERT OR REPLACE` applies: a
@@ -340,6 +341,7 @@ pub(crate) fn assemble(
     let by_scoped_name = nodes.by_scoped_name();
     for (path, file) in resolved {
         let language = &inputs.parses[path].1.language;
+        let mut unknown_live = BTreeMap::<u32, Vec<Arc<Resolution>>>::new();
         for kept in &file.sites {
             let site = &kept.site;
             let resolution = &kept.resolution;
@@ -376,13 +378,11 @@ pub(crate) fn assemble(
                     external: resolution.external,
                 },
             );
-            for (target_file, target_symbol) in &resolution.protected {
-                rows.unknown_live.insert((
-                    path.clone(),
-                    target_file.clone(),
-                    target_symbol.clone(),
-                    site.line,
-                ));
+            if !resolution.protected.is_empty() {
+                unknown_live
+                    .entry(site.line)
+                    .or_default()
+                    .push(Arc::clone(resolution));
             }
             let Some(caller) = site
                 .caller
@@ -415,6 +415,9 @@ pub(crate) fn assemble(
                     },
                 );
             }
+        }
+        if !unknown_live.is_empty() {
+            rows.unknown_live.insert(path.clone(), unknown_live);
         }
     }
     let mut order = nodes

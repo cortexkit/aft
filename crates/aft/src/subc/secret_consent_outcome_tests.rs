@@ -27,7 +27,6 @@ async fn exact_line(scope_ref: &str, outcome: ConsentOutcome, expected: &str) {
                 statement_b64url: "c3RhdGVtZW50".into(),
                 expires_at_ms: end,
             },
-            end,
         )
         .await
         .unwrap_err();

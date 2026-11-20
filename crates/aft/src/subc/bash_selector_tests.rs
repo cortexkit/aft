@@ -38,7 +38,6 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         made_tool_call: AtomicBool::new(false),
         run_owner: None,
     }));
-    let routes = HashMap::from([(route_key(41, 1), identity)]);
     // The bash tool runs PowerShell on Windows, where `printf` does not exist.
     // Each command writes the proof text with no trailing newline, so the
     // exact output comparison below holds on every platform.
@@ -47,16 +46,41 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     } else {
         "printf v1-bash-proof"
     };
+    let done = call_v1_bash(&executor, identity, command, None).await;
+    let response = done.response_for_test();
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["exit_code"], 0, "{response:?}");
+    // A command that finishes within the call still names its task, so the
+    // caller can find it again with bash_status.
+    let task_id = response.data["task_id"].as_str().unwrap();
+    assert_eq!(
+        response.data["output"],
+        format!("v1-bash-proof\n[task {task_id}]"),
+        "{response:?}"
+    );
+}
+
+pub(super) async fn call_v1_bash(
+    executor: &Arc<Executor>,
+    identity: RouteIdentity,
+    command: &str,
+    preset: Option<&str>,
+) -> bash::BashDeferredCompletion {
+    let routes = HashMap::from([(route_key(41, 1), identity)]);
+    let mut body = json!({"name":"bash","arguments":{"command":command}});
+    if let Some(preset) = preset {
+        body["preset"] = json!(preset);
+    }
     let frame = Frame::build(
         FrameType::Request,
         control_flags(),
         41,
         1,
         7,
-        serde_json::to_vec(&json!({"name":"bash","arguments":{"command":command}})).unwrap(),
+        serde_json::to_vec(&body).unwrap(),
     )
     .unwrap();
-    let (writer, _replies) = mpsc::channel(8);
+    let (writer, mut replies) = mpsc::channel(8);
     let (bash_tx, mut bash_rx) = mpsc::channel(8);
     let (touch_tx, _touch_rx) = mpsc::channel(8);
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
@@ -74,7 +98,7 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
         &HashMap::new(),
         &ReclaimedRoutes::default(),
         &mut HashMap::new(),
-        &executor,
+        executor,
         &Arc::default(),
         &Arc::new(PendingDeferredSetups::default()),
         &Arc::new(Notify::new()),
@@ -98,21 +122,17 @@ async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() 
     )
     .await
     .unwrap();
-    let done = tokio::time::timeout(Duration::from_secs(10), bash_rx.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    let response = done.response_for_test();
-    assert!(response.success, "{response:?}");
-    assert_eq!(response.data["exit_code"], 0, "{response:?}");
-    // A command that finishes within the call still names its task, so the
-    // caller can find it again with bash_status.
-    let task_id = response.data["task_id"].as_str().unwrap();
-    assert_eq!(
-        response.data["output"],
-        format!("v1-bash-proof\n[task {task_id}]"),
-        "{response:?}"
-    );
+    tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::select! {
+            done = bash_rx.recv() => done.unwrap(),
+            reply = replies.recv() => {
+                let reply: WriterFrame = reply.unwrap();
+                panic!("expected deferred bash result, got {}", String::from_utf8_lossy(&reply.frame.body));
+            }
+        }
+    })
+    .await
+    .expect("bash call must answer")
 }
 
 #[cfg(unix)]
@@ -262,7 +282,35 @@ async fn next_bash_reply(
         .await
         .expect("bash reply within 20 s")
         .expect("bash reply");
-    let text = done.text_for_test().expect("bash result").to_string();
+    let mut reply = done.reply_frame_for_test(wire::ToolResponsePolicy {
+        trust: BindTrust::FirstParty,
+        tool_result_body: false,
+        model_only: false,
+        output_scope: None,
+    });
+    reply.project_tool_result().unwrap();
+    let mut written = Vec::new();
+    write_frame_contiguous(
+        &mut written,
+        reply.frame(),
+        reply.body(),
+        &mut Vec::new(),
+        false,
+    )
+    .await
+    .expect("write the bash reply frame");
+    let frame = read_frame(&mut written.as_slice())
+        .await
+        .expect("decode the written bash reply frame")
+        .expect("a written reply frame");
+    let body: Value = serde_json::from_slice(&frame.body).expect("bash reply JSON");
+    let text = body["content"][0]["text"]
+        .as_str()
+        .expect("written bash reply text")
+        .to_owned();
+    if let Some(write) = reply.finish_cancelled_call_notices(true) {
+        write.await.unwrap();
+    }
     (text, done.response_for_test().data.clone())
 }
 
@@ -274,6 +322,9 @@ async fn next_cancel_test_tool_reply(replies: &mut mpsc::Receiver<wire::WriterFr
         .expect("tool call reply");
     reply.project_tool_result().unwrap();
     let body: Value = serde_json::from_slice(reply.body()).unwrap();
+    if let Some(write) = reply.finish_cancelled_call_notices(true) {
+        write.await.unwrap();
+    }
     body["content"][0]["text"]
         .as_str()
         .unwrap_or_else(|| panic!("tool reply has no text: {body}"))
@@ -305,10 +356,17 @@ async fn cancelled_call_notice_survives_argument_refusal_and_appears_on_read_onc
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn cancelled_call_notice_survives_discarded_and_failed_reply() {
+    cancelled_call_notice_read_case(NoticeInterveningCall::FailedWrite, false).await;
+}
+
+#[cfg(unix)]
 enum NoticeInterveningCall {
     None,
     NativeStatus,
     ArgumentRefusal,
+    FailedWrite,
 }
 
 #[cfg(unix)]
@@ -350,7 +408,7 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
     let notice = format!("task {task_id} from your cancelled call is still running; check it with bash_status or stop it with bash_kill");
 
     let arguments = match intervening {
-        NoticeInterveningCall::None => None,
+        NoticeInterveningCall::None | NoticeInterveningCall::FailedWrite => None,
         NoticeInterveningCall::NativeStatus => Some(("bash_status", json!({"task_id": task_id}))),
         NoticeInterveningCall::ArgumentRefusal => Some(("read", json!([]))),
     };
@@ -375,6 +433,34 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
 
     let path = root.as_path().join("notice.txt");
     std::fs::write(&path, "file contents").unwrap();
+    if matches!(intervening, NoticeInterveningCall::FailedWrite) {
+        for corr in [7, 8] {
+            let mut replies = route_cancel_test_tool(
+                &executor,
+                &root,
+                &connection,
+                &bash_tx,
+                corr,
+                "read",
+                json!({"path":path}),
+                false,
+            )
+            .await;
+            let mut reply = tokio::time::timeout(Duration::from_secs(10), replies.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            reply.project_tool_result().unwrap();
+            let body: Value = serde_json::from_slice(reply.body()).unwrap();
+            assert!(body["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&notice));
+            if corr == 8 {
+                reply.finish_ack_write(false);
+            }
+        }
+    }
     let mut held = Response::error("held", crate::access_policy::ACCESS_ASK_REQUIRED, "ask");
     let mut text = String::new();
     crate::response_finalize::finalize_tool_response(
@@ -419,7 +505,9 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
             .contains("cancelled call"));
         request.params["preview"] = json!(false);
         let read = crate::commands::tool_call::handle_with_dispatch(&request, &ctx, &dispatch);
-        read.data["text"].as_str().unwrap().to_string()
+        let text = read.data["text"].as_str().unwrap();
+        read.notices.acknowledge_written_text(text);
+        text.to_string()
     } else {
         let mut read = route_cancel_test_tool(
             &executor,

@@ -23,7 +23,10 @@ use subc_protocol::ErrorBody;
 use super::manifest;
 use crate::hashline::integration::RegistrationRequest;
 
+mod admission_close;
 mod guidance;
+mod shell_detaches;
+pub(super) use shell_detaches::ShellDetaches;
 #[cfg(test)]
 mod guidance_text_tests;
 #[cfg(test)]
@@ -554,12 +557,11 @@ fn build_tools(preset: CatalogPreset) -> Vec<ServedVariants> {
     served
         .into_iter()
         .map(|(name, schema, description)| {
-            let semantics =
-                if name == "bash" || (preset == CatalogPreset::Worker && name == "bash_watch") {
-                    2
-                } else {
-                    1
-                };
+            let semantics = match name.as_str() {
+                "bash" => super::tool_views::BASH_SEMANTICS,
+                "bash_watch" if preset == CatalogPreset::Worker => 2,
+                _ => 1,
+            };
             let entry = |schema: Value, description: Option<String>| {
                 let mut entry = catalog_entry(&name, semantics, schema, description);
                 // A head's waiting `bash` call can be handed back with
@@ -1926,6 +1928,7 @@ struct LedgerWait {
     admission: super::AdmissionWait,
     cancel: super::PersistentCancelSignal,
     terminal_claim: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    undispatched: Option<admission_close::Undispatched>,
 }
 
 struct LedgerCall {
@@ -1933,6 +1936,7 @@ struct LedgerCall {
     key: crate::db::call_ledger::Key,
     shell: bool,
     detached: bool,
+    detach_ready: Option<tokio::sync::oneshot::Receiver<()>>,
     expires_at: std::time::Instant,
     /// A `tool.withdraw` settled this held call before the frame loop filed
     /// its question; the request is answered `not_started` when it arrives.
@@ -2196,16 +2200,14 @@ struct WithdrawKill {
     body: Vec<u8>,
 }
 
-/// The refusal for a withdraw whose running call could not be stopped. No
-/// answer was stored, so retrying the withdraw tries the kill again.
-fn withdraw_kill_failed(task: &str, error: &str) -> ErrorBody {
-    ErrorBody::new(
-        "withdraw_incomplete",
-        format!(
-            "the withdrawn call's task {task} could not be stopped: {error}; retry tool.withdraw"
-        ),
-    )
-    .with_detail(json!({"retryable": true, "task_id": task}))
+/// The refusal for a withdraw whose running call is not yet confirmed
+/// stopped: its task is still alive, or whether it is cannot be checked yet.
+/// The withdrawal was accepted but no answer was stored, so it stays owed: the
+/// caller retries (`withdraw_pending` is retryable and carries no delay hint,
+/// so the caller's own backoff applies) and the retry tries the kill again.
+/// The task and the reason are logged by the caller, not sent.
+fn withdraw_not_confirmed() -> ErrorBody {
+    errors::withdraw_pending(None)
 }
 
 /// Store a withdraw's answer once its kill landed (or was not needed), and
@@ -2241,7 +2243,7 @@ fn kill_withdrawn_call(
         // terminal state through the same `aft.db` connection.
         if let Err(error) = ctx.bash_background().kill_withdrawn(&kill.task) {
             log::warn!("withdrawn call task {} was not killed: {error}", kill.task);
-            return Err(withdraw_kill_failed(&kill.task, &error));
+            return Err(withdraw_not_confirmed());
         }
         return freeze_withdraw_answer(ctx, kill);
     }
@@ -2266,10 +2268,7 @@ fn kill_withdrawn_call(
         "withdrawn call task {} was not killed: no bound project root holds it",
         kill.task
     );
-    Err(withdraw_kill_failed(
-        &kill.task,
-        "no bound project root holds the task",
-    ))
+    Err(withdraw_not_confirmed())
 }
 
 /// Runs a custody request against the route root's ledger, on the actor's
@@ -2423,6 +2422,7 @@ impl LedgerEdge {
                 },
                 shell: true,
                 detached: false,
+                detach_ready: None,
                 expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 withdrawn: None,
                 yieldable: None,
@@ -2730,6 +2730,7 @@ impl LedgerEdge {
                 admission,
                 cancel: cancel.clone(),
                 terminal_claim: terminal_claim.clone(),
+                undispatched: None,
             },
         );
         let (result_tx, result_rx) = tokio::sync::oneshot::channel();
@@ -2775,7 +2776,7 @@ impl LedgerEdge {
                     }
                     ledger::reduce_expired(&conn, &key, now)
                         .and_then(|_| {
-                            ledger::admit_with_tool_result_source(
+                            ledger::admit_with_event_id(
                                 &conn,
                                 &key,
                                 &digest,
@@ -2786,6 +2787,16 @@ impl LedgerEdge {
                                     State::DispatchStarted
                                 },
                                 include_tool_result_body,
+                            )
+                        })
+                        .map(|(admission, event_id)| {
+                            (
+                                admission,
+                                event_id.map(|event_id| admission_close::Undispatched {
+                                    db: db.clone(),
+                                    key,
+                                    event_id,
+                                }),
                             )
                         })
                         .map_err(|error| {
@@ -2805,12 +2816,13 @@ impl LedgerEdge {
             let response = await_executor_response(rx, "ledger-admission".into()).await;
             let result = result_rx.await.unwrap_or(Err(response));
             match result {
-                Ok(Admission::New) => {
-                    super::rich_ui::display::register(&response_key, &identity, &call);
+                Ok((Admission::New, mut undispatched)) => {
                     let admitted = {
-                        let waiting = edge.waiting.lock().unwrap();
-                        let admitted = waiting.contains_key(&(route, decoded.frame.header.corr));
-                        if admitted {
+                        let mut waiting = edge.waiting.lock().unwrap();
+                        let wait = waiting.get_mut(&(route, decoded.frame.header.corr));
+                        if let Some(wait) = wait {
+                            super::rich_ui::display::register(&response_key, &identity, &call);
+                            wait.undispatched = undispatched.take();
                             edge.calls.lock().unwrap().insert(
                                 (route, decoded.frame.header.corr),
                                 LedgerCall {
@@ -2823,6 +2835,7 @@ impl LedgerEdge {
                                     yieldable: super::call_yield::YieldableTool::of(&call.name),
                                     yielded: false,
                                     detached: false,
+                                    detach_ready: None,
                                 },
                             );
                             if let Some(received) = edge
@@ -2833,23 +2846,15 @@ impl LedgerEdge {
                             {
                                 let _ = received.live.send_replace(true);
                             }
+                            true
+                        } else {
+                            false
                         }
-                        admitted
                     };
                     if !admitted {
-                        // Drain answered before admission completed. No tool was
-                        // dispatched, so leave a durable not-started result for repeats.
-                        drop(repeat_executor.submit_async(root, Lane::CallLedger, "ledger-drained-admission".into(), Box::new(move |ctx| {
-                            if let Some(db) = ctx.db() {
-                                if let Ok(conn) = db.lock() {
-                                    let recorded = ledger::not_started(&response_key, "cancelled");
-                                    if let Err(error) = ledger::settle(&conn, &response_key, &recorded, "not_started", Some("cancelled"), ledger::now_ms()) {
-                                        log::warn!("call ledger drained admission settlement failed: {error}");
-                                    }
-                                }
-                            }
-                            Response::success("ledger-drained-admission", json!({}))
-                        })));
+                        if let Some(new) = undispatched {
+                            new.settle();
+                        }
                         return;
                     }
                     // Without `test-timing-hooks` the gate is an empty async fn:
@@ -2859,7 +2864,7 @@ impl LedgerEdge {
                     admission_gate().await;
                     let _ = edge.ready.send(decoded);
                 }
-                Ok(Admission::Repeat(row)) if row.state != State::Settled => {
+                Ok((Admission::Repeat(row), _)) if row.state != State::Settled => {
                     // Repeats observe the same durable execution, including a
                     // shell recovered after restart. They never dispatch again.
                     loop {
@@ -2960,7 +2965,7 @@ impl LedgerEdge {
                         }
                     }
                 }
-                Ok(Admission::Repeat(row)) => {
+                Ok((Admission::Repeat(row), _)) => {
                     if terminal_claim.swap(true, Ordering::SeqCst) {
                         return;
                     }
@@ -2987,7 +2992,7 @@ impl LedgerEdge {
                         .await;
                     }
                 }
-                Ok(Admission::Conflict) => {
+                Ok((Admission::Conflict, _)) => {
                     if terminal_claim.swap(true, Ordering::SeqCst) {
                         return;
                     }
@@ -3452,45 +3457,7 @@ impl LedgerEdge {
         }
     }
 
-    /// The shell command outlives the request on its former route. Once that
-    /// request cannot receive a reply, terminal task writes must store the
-    /// result in the call ledger for replay and late_results.
-    pub(super) async fn detach_shells(
-        &self,
-        executor: &std::sync::Arc<crate::context::Executor>,
-        route: Option<super::RouteChannel>,
-    ) {
-        self.received
-            .lock()
-            .unwrap()
-            .retain(|(channel, _), _| route.is_some_and(|route| *channel != route));
-        let calls: Vec<_> = self
-            .calls
-            .lock()
-            .unwrap()
-            .iter_mut()
-            .filter(|((channel, _), call)| {
-                call.shell && !call.detached && route.is_none_or(|route| *channel == route)
-            })
-            .map(|(_, call)| {
-                call.detached = true;
-                (call.root.clone(), call.key.clone())
-            })
-            .collect();
-        for (root, key) in calls {
-            let rx = executor.submit_async(
-                root,
-                crate::executor::Lane::Mutating,
-                "ledger-detach".into(),
-                Box::new(move |ctx| {
-                    detach_shell_row(ctx, &key);
-                    crate::protocol::Response::success("ledger-detach", serde_json::json!({}))
-                }),
-            );
-            let _ = super::await_executor_response(rx, "ledger-detach".into()).await;
-        }
-    }
-
+    #[cfg(test)]
     pub(super) fn unrouted_shells(
         &self,
         routes: &std::collections::HashMap<super::RouteChannel, super::RouteIdentity>,
@@ -3601,12 +3568,8 @@ impl LedgerEdge {
         &self,
     ) -> Result<Vec<subc_protocol::Frame>, super::SubcError> {
         let mut frames = Vec::new();
-        for (_, wait) in self.waiting.lock().unwrap().drain() {
-            if !wait
-                .terminal_claim
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
-                wait.cancel.cancel();
+        for (key, mut wait) in self.waiting.lock().unwrap().drain() {
+            if self.retire_wait(key, &mut wait) {
                 frames.push(wait.admission.draining_frame()?);
             }
         }
@@ -3614,18 +3577,22 @@ impl LedgerEdge {
     }
 
     pub(super) fn finish_waiting(&self, request: &subc_protocol::Frame) -> bool {
-        self.received.lock().unwrap().remove(&(
+        let key = (
             super::route_key(request.header.channel, request.header.epoch),
             request.header.corr,
-        ));
+        );
+        self.received.lock().unwrap().remove(&key);
         self.waiting
             .lock()
             .unwrap()
-            .remove(&(
-                super::route_key(request.header.channel, request.header.epoch),
-                request.header.corr,
-            ))
-            .is_some_and(|waiting| waiting.cancel.is_cancelled())
+            .remove(&key)
+            .is_some_and(|mut wait| {
+                let cancelled = wait.cancel.is_cancelled();
+                if cancelled {
+                    self.retire_wait(key, &mut wait);
+                }
+                cancelled
+            })
     }
 
     fn cancelled_frame(
@@ -3845,7 +3812,7 @@ impl LedgerEdge {
                 } else {
                     None
                 };
-                let Some(call) = call else {
+                let Some(mut call) = call else {
                     if actual.send(outgoing).await.is_err() {
                         break;
                     }
@@ -3905,88 +3872,107 @@ impl LedgerEdge {
                 // The reply is held until this settlement commits. On the
                 // call-ledger lane it does not wait for the root's reads,
                 // maintenance or a running writer.
-                let rx = executor.submit_async(
-                    call.root.clone(),
-                    Lane::CallLedger,
-                    "ledger-settle".into(),
-                    Box::new(move |ctx| {
-                        if let Some(error) = projection_error {
-                            return Response::error("ledger-settle", "database_unavailable", error);
-                        }
-                        let Some(db) = ctx.db() else {
-                            return Response::error(
-                                "ledger-settle",
-                                "database_unavailable",
-                                "Call ledger is unavailable",
-                            );
-                        };
-                        let Ok(conn) = db.lock() else {
-                            return Response::error(
-                                "ledger-settle",
-                                "database_unavailable",
-                                "Call ledger database mutex is poisoned",
-                            );
-                        };
-                        let row = ledger::get(&conn, &call.key).ok().flatten();
-                        let reason = row
-                            .as_ref()
-                            .filter(|row| row.state == State::Prepared && !detached)
-                            .map(|_| {
-                                if std::time::Instant::now() >= call.expires_at {
-                                    "expired"
-                                } else {
-                                    "denied"
+                let detach_ready = call.detach_ready.take();
+                let executor = executor.clone();
+                let submit =
+                    move || {
+                        executor.submit_async(
+                            call.root.clone(),
+                            Lane::CallLedger,
+                            "ledger-settle".into(),
+                            Box::new(move |ctx| {
+                                if let Some(error) = projection_error {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        error,
+                                    );
                                 }
-                            });
-                        let inferred = ledger::outcome(&record_for_job);
-                        let outcome = if reason.is_some() {
-                            "bash_denied_untrusted".into()
-                        } else if record_for_job.ty == FrameType::Response && inferred == "unknown"
-                        {
-                            row.and_then(|row| row.outcome)
-                                .filter(|outcome| outcome != "ok")
-                                .unwrap_or(inferred)
-                        } else {
-                            inferred
-                        };
-                        match ledger::settle_with_tool_result_source(
-                            &conn,
-                            &call.key,
-                            &record_for_job,
-                            &outcome,
-                            reason,
-                            ledger::now_ms(),
-                            tool_body_for_job.as_deref(),
-                        ) {
-                            Ok(true) => {}
-                            Ok(false)
-                                if ledger::get_for_replay(&conn, &call.key)
-                                    .ok()
-                                    .flatten()
-                                    .is_some_and(|row| {
-                                        row.tool_result_source.as_deref()
-                                            == tool_body_for_job.as_deref()
-                                            && row.frame.is_some_and(|frame| {
-                                                frame.ty == record_for_job.ty
-                                                    && frame.body == record_for_job.body
-                                            })
-                                    }) => {}
-                            result => {
-                                return Response::error(
-                                    "ledger-settle",
-                                    "database_unavailable",
-                                    match result {
-                                        Err(error) => error.to_string(),
-                                        _ => "Call ledger did not retain this terminal result"
-                                            .to_owned(),
-                                    },
-                                )
-                            }
-                        }
-                        Response::success("ledger-settle", json!({}))
-                    }),
-                );
+                                let Some(db) = ctx.db() else {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        "Call ledger is unavailable",
+                                    );
+                                };
+                                let Ok(conn) = db.lock() else {
+                                    return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        "Call ledger database mutex is poisoned",
+                                    );
+                                };
+                                let row = ledger::get(&conn, &call.key).ok().flatten();
+                                let reason = row
+                                    .as_ref()
+                                    .filter(|row| row.state == State::Prepared && !detached)
+                                    .map(|_| {
+                                        if std::time::Instant::now() >= call.expires_at {
+                                            "expired"
+                                        } else {
+                                            "denied"
+                                        }
+                                    });
+                                let inferred = ledger::outcome(&record_for_job);
+                                let outcome = if reason.is_some() {
+                                    "bash_denied_untrusted".into()
+                                } else if record_for_job.ty == FrameType::Response
+                                    && inferred == "unknown"
+                                {
+                                    row.and_then(|row| row.outcome)
+                                        .filter(|outcome| outcome != "ok")
+                                        .unwrap_or(inferred)
+                                } else {
+                                    inferred
+                                };
+                                match ledger::settle_with_tool_result_source(
+                                    &conn,
+                                    &call.key,
+                                    &record_for_job,
+                                    &outcome,
+                                    reason,
+                                    ledger::now_ms(),
+                                    tool_body_for_job.as_deref(),
+                                ) {
+                                    Ok(true) => {}
+                                    Ok(false)
+                                        if ledger::get_for_replay(&conn, &call.key)
+                                            .ok()
+                                            .flatten()
+                                            .is_some_and(|row| {
+                                                row.tool_result_source.as_deref()
+                                                    == tool_body_for_job.as_deref()
+                                                    && row.frame.is_some_and(|frame| {
+                                                        frame.ty == record_for_job.ty
+                                                            && frame.body == record_for_job.body
+                                                    })
+                                            }) => {}
+                                    result => return Response::error(
+                                        "ledger-settle",
+                                        "database_unavailable",
+                                        match result {
+                                            Err(error) => error.to_string(),
+                                            _ => "Call ledger did not retain this terminal result"
+                                                .to_owned(),
+                                        },
+                                    ),
+                                }
+                                Response::success("ledger-settle", json!({}))
+                            }),
+                        )
+                    };
+                let (rx, delayed) = match detach_ready {
+                    Some(receipt) => (None, Some((receipt, submit))),
+                    None => (Some(submit()), None),
+                };
                 tokio::spawn(async move {
+                    let rx = match delayed {
+                        Some((receipt, submit)) => {
+                            let _ = receipt.await;
+                            submit()
+                        }
+                        None => rx.expect("an attached settlement was already submitted"),
+                    };
                     let settled = await_executor_response(rx, "ledger-settle".into()).await;
                     if !settled.success {
                         log::warn!(
@@ -5077,7 +5063,7 @@ mod tests {
             assert_eq!(inventory.len(), if available { 24 } else { 23 });
             for tool in &inventory {
                 assert!(expected.contains(tool.name.as_str()));
-                assert_eq!(tool.semantics, if tool.name == "bash" { 2 } else { 1 });
+                assert_eq!(tool.semantics, if tool.name == "bash" { 3 } else { 1 });
                 assert_eq!(tool.capabilities.is_empty(), tool.name == "status");
                 assert_eq!(
                     tool.result_ops,
@@ -5149,7 +5135,7 @@ mod tests {
         let mut request = call("bash", json!({"command":"echo"}));
         request.preset = Some("head".into());
         request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 1)
+            SchemaPin::new("bash", &tool.schema_digest, 2)
                 .encode()
                 .unwrap(),
         );
@@ -5157,10 +5143,10 @@ mod tests {
         assert_eq!(refusal.code, "tool_semantics_changed");
         assert_eq!(
             refusal.detail.unwrap(),
-            json!({"tool":"bash","expected":1,"current":2})
+            json!({"tool":"bash","expected":2,"current":3})
         );
         request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 2)
+            SchemaPin::new("bash", &tool.schema_digest, 3)
                 .encode()
                 .unwrap(),
         );
@@ -5178,6 +5164,7 @@ mod tests {
     #[test]
     fn worker_shell_calls_with_old_semantics_pins_are_refused() {
         for name in ["bash", "bash_watch"] {
+            let (old, current) = if name == "bash" { (2, 3) } else { (1, 2) };
             let tool = tools_for_session(CatalogPreset::Worker, &[], true, false, false)
                 .into_iter()
                 .find(|tool| tool.name == name)
@@ -5190,7 +5177,7 @@ mod tests {
             let mut request = call(name, arguments);
             request.preset = Some("worker".into());
             request.schema_pin = Some(
-                SchemaPin::new(name, &tool.schema_digest, 1)
+                SchemaPin::new(name, &tool.schema_digest, old)
                     .encode()
                     .unwrap(),
             );
@@ -5198,10 +5185,10 @@ mod tests {
             assert_eq!(refusal.code, "tool_semantics_changed");
             assert_eq!(
                 refusal.detail.unwrap(),
-                json!({"tool":name,"expected":1,"current":2})
+                json!({"tool":name,"expected":old,"current":current})
             );
             request.schema_pin = Some(
-                SchemaPin::new(name, &tool.schema_digest, 2)
+                SchemaPin::new(name, &tool.schema_digest, current)
                     .encode()
                     .unwrap(),
             );
@@ -5218,12 +5205,25 @@ mod tests {
     }
 
     const REGENERATE_CATALOG: &str = "cargo test -p agent-file-tools --lib regenerate_tool_provider_catalog --locked -- --ignored";
+    const NOTICE_TEMPLATE_VECTORS: &str = "../../test-vectors/aft-notice-templates-v1.2";
 
     fn notice_template_vectors() -> BTreeMap<String, String> {
         use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
         let mut files = BTreeMap::new();
-        files.insert("README.md".into(), "# AFT notice templates v1.1\n\nThe same opt-in `tool.catalog` replies and example `session.send` requests as\n`aft-notice-templates-v1` (see its README for the fixed clock, call key and\ndelivery mode they use), except that every catalog now carries the\ntool-provider 0.15.12 `read_only: true` mark on the tools AFT marks read-only.\nThe mark is always sent, so each catalog's `generation` and `catalog_digest`\nchange; the `*.sends.json` files are unchanged. v1 stays as published.\nRegenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n`notice_template_vectors_match_samples` compares every byte.\n".into());
+        files.insert(
+            "README.md".into(),
+            concat!(
+                "# AFT notice templates v1.2\n\n",
+                "These opt-in `tool.catalog` replies and example `session.send` requests follow\n",
+                "`aft-notice-templates-v1.1`. The head and worker catalogs have a new bash pin\n",
+                "for completion output tails, which also changes their `generation` and\n",
+                "`catalog_digest`. The reader catalog and `*.sends.json` files are unchanged.\n",
+                "Versions 1 and 1.1 remain as published.\n\n",
+                "Regenerate with `cargo test -p agent-file-tools --lib regenerate_notice_template_vectors -- --ignored`;\n",
+                "`notice_template_vectors_match_samples` compares every byte.\n",
+            ).into(),
+        );
         for preset in ["head", "worker", "reader"] {
             let reply = catalog(
                 json!({"preset": preset, "notice_templates": true}),
@@ -5283,8 +5283,8 @@ mod tests {
 
     #[test]
     fn notice_template_vectors_match_samples() {
-        let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1.1");
+        let root =
+            std::path::Path::new(crate::test_support::manifest_dir()).join(NOTICE_TEMPLATE_VECTORS);
         for (path, expected) in notice_template_vectors() {
             assert_eq!(
                 std::fs::read_to_string(root.join(&path)).unwrap(),
@@ -5297,8 +5297,8 @@ mod tests {
     #[test]
     #[ignore = "explicit sample regeneration, not a verification gate"]
     fn regenerate_notice_template_vectors() {
-        let root = std::path::Path::new(crate::test_support::manifest_dir())
-            .join("../../test-vectors/aft-notice-templates-v1.1");
+        let root =
+            std::path::Path::new(crate::test_support::manifest_dir()).join(NOTICE_TEMPLATE_VECTORS);
         std::fs::create_dir_all(&root).unwrap();
         for (path, text) in notice_template_vectors() {
             std::fs::write(root.join(path), text).unwrap();
@@ -7242,15 +7242,15 @@ mod tests {
             .find(|tool| tool.name == "bash")
             .unwrap();
         for (digest, semantics, expected) in [
-            (schema.schema_digest.as_str(), 2, None),
+            (schema.schema_digest.as_str(), 3, None),
             (
                 "0000000000000000000000000000000000000000000000000000000000000000",
-                2,
+                3,
                 Some("tool_schema_changed"),
             ),
             (
                 schema.schema_digest.as_str(),
-                1,
+                2,
                 Some("tool_semantics_changed"),
             ),
         ] {
@@ -7270,6 +7270,7 @@ pub(in crate::subc) mod route_tests {
     mod carrier_samples;
     #[path = "../../rich_ui/admission/route_tests.rs"]
     mod operation_admission;
+    mod thalamus_fork_samples;
 
     use super::super::*;
     use super::*;
@@ -11288,15 +11289,33 @@ mod ledger_terminal_tests {
         (dir, ctx, kill, cgroup)
     }
 
+    /// An unconfirmed withdrawal is refused with exactly the published
+    /// `withdraw-pending.json` sample that carries no delay hint, which the
+    /// role classes as retryable.
+    fn assert_withdraw_pending(refused: &ErrorBody) {
+        let (_, samples) = cortexkit_role_tool_provider::vectors::FILES
+            .iter()
+            .find(|(file, _)| *file == "withdraw-pending.json")
+            .expect("the role ships its withdraw-pending samples");
+        let samples: Value = serde_json::from_str(samples).unwrap();
+        let unhinted = samples["samples"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|sample| sample["error"].get("detail").is_none())
+            .expect("a sample without a delay hint");
+        assert_eq!(
+            serde_json::to_vec(refused).unwrap(),
+            serde_json::to_vec(&unhinted["error"]).unwrap()
+        );
+        assert!(errors::is_transient(&refused.code));
+    }
+
     #[cfg(target_os = "linux")]
-    fn assert_scoped_withdraw_incomplete(ctx: &crate::context::AppContext, kill: &WithdrawKill) {
+    fn assert_scoped_withdraw_pending(ctx: &crate::context::AppContext, kill: &WithdrawKill) {
         use crate::db::call_ledger as ledger;
         let refused = kill_withdrawn_call(ctx, kill).unwrap_err();
-        assert_eq!(refused.code, "withdraw_incomplete");
-        assert_eq!(
-            refused.detail,
-            Some(json!({"retryable": true, "task_id": kill.task}))
-        );
+        assert_withdraw_pending(&refused);
         let db = ctx.db().unwrap();
         assert!(ledger::get(&db.lock().unwrap(), &kill.key)
             .unwrap()
@@ -11330,7 +11349,7 @@ mod ledger_terminal_tests {
     fn withdraw_unregistered_recorded_scope_populated_keeps_answer_unfrozen() {
         let (_dir, ctx, kill, _cgroup) =
             unregistered_scoped_withdraw_fixture(Some("populated 1\n"));
-        assert_scoped_withdraw_incomplete(&ctx, &kill);
+        assert_scoped_withdraw_pending(&ctx, &kill);
     }
 
     #[cfg(target_os = "linux")]
@@ -11360,7 +11379,7 @@ mod ledger_terminal_tests {
             current,
             dir.path().to_path_buf(),
             || {
-                assert_scoped_withdraw_incomplete(&ctx, &kill);
+                assert_scoped_withdraw_pending(&ctx, &kill);
             },
         );
     }
@@ -11373,14 +11392,14 @@ mod ledger_terminal_tests {
         // A self-referencing link makes try_exists fail, rather than report absence.
         std::os::unix::fs::symlink(cgroup.file_name().unwrap(), &cgroup).unwrap();
         assert!(cgroup.try_exists().is_err());
-        assert_scoped_withdraw_incomplete(&ctx, &kill);
+        assert_scoped_withdraw_pending(&ctx, &kill);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn withdraw_unregistered_recorded_scope_unconfirmed_population_keeps_answer_unfrozen() {
         let (_dir, ctx, kill, _cgroup) = unregistered_scoped_withdraw_fixture(Some(""));
-        assert_scoped_withdraw_incomplete(&ctx, &kill);
+        assert_scoped_withdraw_pending(&ctx, &kill);
     }
 
     #[test]
@@ -11388,15 +11407,7 @@ mod ledger_terminal_tests {
         use crate::db::call_ledger as ledger;
         let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(std::process::id()), None);
         let refused = kill_withdrawn_call(&ctx, &kill).unwrap_err();
-        assert_eq!(refused.code, "withdraw_incomplete");
-        assert_eq!(
-            refused.detail,
-            Some(json!({"retryable": true, "task_id": kill.task}))
-        );
-        assert_eq!(refused.message, format!(
-            "the withdrawn call's task {} could not be stopped: no bound project root holds the task; retry tool.withdraw",
-            kill.task
-        ));
+        assert_withdraw_pending(&refused);
         assert!(crate::bash_background::process::is_process_alive(
             std::process::id()
         ));
@@ -11413,11 +11424,7 @@ mod ledger_terminal_tests {
         use crate::db::call_ledger as ledger;
         let (_dir, ctx, kill) = unregistered_withdraw_fixture(Some(0), None);
         let refused = kill_withdrawn_call(&ctx, &kill).unwrap_err();
-        assert_eq!(refused.code, "withdraw_incomplete");
-        assert_eq!(
-            refused.detail,
-            Some(json!({"retryable": true, "task_id": kill.task}))
-        );
+        assert_withdraw_pending(&refused);
         let db = ctx.db().unwrap();
         assert!(ledger::get(&db.lock().unwrap(), &kill.key)
             .unwrap()
@@ -11468,8 +11475,7 @@ mod ledger_terminal_tests {
         };
         assert!(!ctx.bash_background().holds_task(task));
         let refused = kill_withdrawn_call(&ctx, &kill).expect_err("no registry holds the task");
-        assert_eq!(refused.code, "withdraw_incomplete");
-        assert_eq!(refused.detail.as_ref().unwrap()["retryable"], true);
+        assert_withdraw_pending(&refused);
         let row = ledger::get(&db.lock().unwrap(), &key).unwrap().unwrap();
         assert!(
             row.withdraw_answer.is_none(),
@@ -12098,6 +12104,7 @@ mod ledger_terminal_tests {
                 ),
                 cancel: cancel.clone(),
                 terminal_claim: terminal_claim.clone(),
+                undispatched: None,
             },
         );
         let census = crate::subc::drain::held_request_census(
@@ -12142,6 +12149,7 @@ mod ledger_terminal_tests {
                 ),
                 cancel: PersistentCancelSignal::new(),
                 terminal_claim: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                undispatched: None,
             },
         );
         let frame = edge
@@ -12245,6 +12253,7 @@ mod settlement_failure_tests {
                 key,
                 shell: false,
                 detached: false,
+                detach_ready: None,
                 withdrawn: None,
                 yieldable: None,
                 yielded: false,
@@ -12506,6 +12515,7 @@ mod authorization_failure_tests {
                 key,
                 shell: true,
                 detached: false,
+                detach_ready: None,
                 withdrawn: None,
                 yieldable: None,
                 yielded: false,

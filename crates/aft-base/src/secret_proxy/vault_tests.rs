@@ -154,9 +154,6 @@ impl Clock {
 }
 
 impl crate::secret::requests::ApprovalClock for Clock {
-    fn now_ms(&self) -> u64 {
-        self.now.load(Ordering::SeqCst)
-    }
     fn deadline(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
         let end = self.now.load(Ordering::SeqCst) + 600_000;
         let mut ticks = self.ticks.subscribe();
@@ -716,17 +713,13 @@ async fn pending_label_does_not_block_an_immediate_vault_answer_for_another_targ
     ));
     let held = secrets.clone();
     let first = tokio::spawn(async move {
-        held.use_in_request("test", &addressed("localhost"), u64::MAX, || async {
-            Ok(())
-        })
-        .await
+        held.use_in_request("test", &addressed("localhost"), || async { Ok(()) })
+            .await
     });
     phone.phone.card(1).await;
     let answer = tokio::time::timeout(
         Duration::from_millis(500),
-        secrets.use_in_request("test", &addressed("other.test"), u64::MAX, || async {
-            Ok(())
-        }),
+        secrets.use_in_request("test", &addressed("other.test"), || async { Ok(()) }),
     )
     .await
     .expect("a pending card must not lock another vault lookup")
@@ -743,9 +736,7 @@ async fn pending_label_does_not_block_an_immediate_vault_answer_for_another_targ
     daemon.state.lock().unwrap().approve(&statement);
     let released = tokio::time::timeout(
         Duration::from_millis(500),
-        secrets.use_in_request("test", &addressed("localhost"), u64::MAX, || async {
-            Ok(())
-        }),
+        secrets.use_in_request("test", &addressed("localhost"), || async { Ok(()) }),
     )
     .await
     .expect("an already-covered request must not wait on the older card")
@@ -754,16 +745,15 @@ async fn pending_label_does_not_block_an_immediate_vault_answer_for_another_targ
     assert!(!first.is_finished());
     first.abort();
     let _ = first.await;
-    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
     assert!(
         secrets.status().is_empty(),
         "cancelled waiter removes its waiting line in Drop"
     );
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn cancelling_one_waiter_keeps_the_pending_card_and_a_retry_joins_until_the_last_waiter_leaves(
-) {
+async fn dropping_all_waiters_keeps_the_pending_card_for_an_identical_retry() {
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
     let phone = PhoneGuard::install();
@@ -777,9 +767,7 @@ async fn cancelling_one_waiter_keeps_the_pending_card_and_a_retry_joins_until_th
         let secrets = secrets.clone();
         tokio::spawn(async move {
             secrets
-                .use_in_request("test", &addressed("localhost"), u64::MAX, || async {
-                    Ok(())
-                })
+                .use_in_request("test", &addressed("localhost"), || async { Ok(()) })
                 .await
         })
     };
@@ -802,8 +790,16 @@ async fn cancelling_one_waiter_keeps_the_pending_card_and_a_retry_joins_until_th
     assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
     retry.abort();
     let _ = retry.await;
-    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
     assert!(secrets.status().is_empty());
+    let after_last_left = spawn();
+    condition(|| secrets.status().len() == 1).await;
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+    assert!(matches!(
+        after_last_left.await.unwrap().unwrap(),
+        crate::secret::UseAnswer::Released(_)
+    ));
+    assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -812,7 +808,12 @@ async fn two_labels_file_concurrently_and_share_one_absolute_deadline() {
     let mut second = record("header:x-second");
     second.name = "second".into();
     second.key = K2.to_vec();
-    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
+    let vault_expiry = crate::secret::vault::now_ms() + 540_000;
+    {
+        let mut state = daemon.state.lock().unwrap();
+        state.records = vec![record("authorization_bearer"), second];
+        state.pending_expires_at_ms = Some(vault_expiry);
+    }
     let phone = PhoneGuard::install();
     let clock = Clock::new();
     let server = Server::new("echo-request").await;
@@ -835,8 +836,8 @@ async fn two_labels_file_concurrently_and_share_one_absolute_deadline() {
     assert!(
         requests
             .iter()
-            .all(|r| r.expires_at_ms == Some(1_700_000_600_000)),
-        "each filed card expires by the request's one deadline"
+            .all(|r| r.expires_at_ms == Some(vault_expiry)),
+        "the vault expiry, not the local HTTP deadline, bounds each card"
     );
     clock.advance(599_999);
     tokio::task::yield_now().await;
@@ -855,7 +856,7 @@ async fn two_labels_file_concurrently_and_share_one_absolute_deadline() {
         server.seen.lock().is_empty(),
         "the earlier release is spent, not sent or reused when another label times out"
     );
-    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
     assert!(proxy.approval_status().is_empty());
 }
 
@@ -1103,7 +1104,7 @@ async fn approval_log_concurrent_decline_and_deadline_have_distinct_ids() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn stopping_a_proxy_with_a_held_request_withdraws_the_card_and_removes_status() {
+async fn stopping_a_command_proxy_removes_status_without_withdrawing_the_scope_card() {
     let daemon = FakeClaustrum::start();
     daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
     let phone = PhoneGuard::install();
@@ -1120,10 +1121,10 @@ async fn stopping_a_proxy_with_a_held_request_withdraws_the_card_and_removes_sta
     phone.phone.card(1).await;
     assert!(!proxy.approval_status().is_empty());
     proxy.stop();
-    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
     assert!(proxy.approval_status().is_empty());
     assert!(server.seen.lock().is_empty());
     let _ = worker.join().unwrap();
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1153,6 +1154,67 @@ async fn pending_statement_location_is_planned_before_filing_or_consuming_a_rele
     );
     assert!(phone.phone.state.lock().unwrap().requests.is_empty());
     assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_h2_client_timeout_allows_an_identical_retry_on_the_same_phone_card() {
+    let daemon = FakeClaustrum::start();
+    {
+        let mut state = daemon.state.lock().unwrap();
+        state.record = Some(record("authorization_bearer"));
+        state.once = true;
+    }
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(true);
+    let first = std::thread::spawn(move || {
+        let reply = client.command(json!({
+            "op": "request",
+            "headers": { "authorization": format!("Bearer {MARKER}") },
+            "client_timeout_ms": 1000,
+        }));
+        (reply, client)
+    });
+    phone.phone.card(1).await;
+    let (reply, mut client) = first.join().unwrap();
+    assert_eq!(reply["client_timed_out"], true, "{reply}");
+    condition(|| proxy.approval_status().is_empty()).await;
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
+
+    client.connect(true);
+    let retry = request_in_thread(client, false);
+    condition(|| daemon.state.lock().unwrap().calls == 2).await;
+    condition(|| !proxy.approval_status().is_empty()).await;
+    assert!(!retry.is_finished(), "retry must wait on the live card");
+    assert!(server.seen.lock().is_empty());
+    phone.phone.decide(&daemon, 1, ConsentOutcome::AnsweredOnce);
+    let (reply, client) = retry.join().unwrap();
+    assert_eq!(reply["status"], 200, "{reply}");
+    assert_eq!(server.seen.lock().len(), 1);
+    {
+        let state = phone.phone.state.lock().unwrap();
+        assert_eq!(state.requests.len(), 1);
+        assert!(state.withdrawn.is_empty());
+    }
+
+    let next = request_in_thread(client, false);
+    let card = phone.phone.card(2).await;
+    assert_ne!(card.request_id, phone.phone.card(1).await.request_id);
+    phone.phone.decide(&daemon, 2, ConsentOutcome::Declined);
+    let (reply, _client) = next.join().unwrap();
+    assert_eq!(reply["status"], 403, "{reply}");
+    assert_eq!(
+        server.seen.lock().len(),
+        1,
+        "the first approval was used once"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1210,10 +1272,10 @@ async fn live_vault_negotiated_h2_client_holds_then_returns_clean_responses() {
         });
         phone.phone.card(1).await;
         tokio::time::sleep(Duration::from_millis(350)).await;
-        assert!(
-            !worker.is_finished(),
-            "the h2 approval hold must outlive several socket idle intervals"
-        );
+        if worker.is_finished() {
+            let (reply, _) = worker.join().unwrap();
+            panic!("the h2 approval hold must outlive several socket idle intervals: {reply}");
+        }
         assert!(
             server.seen.lock().is_empty(),
             "approval must precede upstream dispatch"

@@ -129,10 +129,13 @@ impl ManagementSession {
         connection_file: &std::path::Path,
         test_principal: Option<ConsumerIdentity>,
     ) -> Result<Self, ()> {
-        let consumer =
-            crate::fleet_status::connect_subc_consumer(connection_file, ConsumerOptions::default())
-                .await
-                .map_err(|_| ())?;
+        let consumer = crate::fleet_status::connect_subc_consumer(
+            "secret_transport",
+            connection_file,
+            ConsumerOptions::default(),
+        )
+        .await
+        .map_err(|_| ())?;
         let route = match open_vault_route(
             &consumer,
             BindIdentity::new("aft-manifest-sync", "daemon"),
@@ -382,6 +385,7 @@ impl SubcSecretUseTransport {
                 if consumer.is_none() {
                     consumer = Some(
                         crate::fleet_status::connect_subc_consumer(
+                            "secret_use",
                             &config.connection_file,
                             ConsumerOptions::default(),
                         )

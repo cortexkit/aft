@@ -759,6 +759,9 @@ struct SynapseConnection {
 }
 
 impl SynapseConnection {
+    /// A private connection on its own runtime, for tests that need one
+    /// outside the shared map.
+    #[cfg(test)]
     fn new() -> Result<Arc<Self>, SynapseEmbeddingError> {
         Ok(Arc::new(Self {
             active: tokio::sync::Mutex::new(None),
@@ -805,6 +808,7 @@ impl SynapseConnection {
 struct SynapseRuntime(Option<tokio::runtime::Runtime>);
 
 impl SynapseRuntime {
+    #[cfg(test)]
     fn new() -> Result<Self, SynapseEmbeddingError> {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1433,9 +1437,15 @@ impl SynapseState {
             },
             ..ConsumerOptions::default()
         };
-        let consumer = crate::subc::registration::connect_consumer(&self.connection_file, options)
-            .await
-            .map_err(|error| classify_transport_failure("route setup", &error))?;
+        let owner = if self.required_operations.contains(&RERANK_OPERATION) {
+            "rerank"
+        } else {
+            "synapse_embed"
+        };
+        let consumer =
+            crate::subc::registration::connect_consumer(owner, &self.connection_file, options)
+                .await
+                .map_err(|error| classify_transport_failure("route setup", &error))?;
         let catalog = consumer
             .catalog_list()
             .await
@@ -2895,6 +2905,11 @@ mod tests {
     }
 }
 
+/// The Synapse operations a reranker needs; also part of its shared-connection key.
+const RERANK_OPERATIONS: &[&str] = &[MODELS_LIST_OPERATION, RERANK_OPERATION];
+
+const RERANK_OPERATION: &str = "rerank.score";
+
 /// Uses the embedding transport's daemon connection and management-route identity,
 /// but does not require embedding capabilities or retry an interactive rerank call.
 pub(crate) struct SynapseRerankTransport {
@@ -2909,7 +2924,17 @@ impl SynapseRerankTransport {
             .clone()
             .ok_or(SynapseEmbeddingError::MissingConnectionFile)?;
         validate_connection_file(&connection_file)?;
-        let connection = SynapseConnection::new()?;
+        let route_harness = config.route_harness.clone().unwrap_or_else(|| "aft".into());
+        // Every reranker shares one daemon connection and route per connection
+        // file and harness, like the embedding clients. Each project context
+        // builds its own reranker and keeps it while the context lives, so a
+        // connection per reranker grew with every root AFT served.
+        let connection = SynapseConnection::shared(ConnectionKey {
+            connection_file: std::fs::canonicalize(&connection_file)
+                .unwrap_or_else(|_| connection_file.clone()),
+            harness: route_harness.clone(),
+            operations: RERANK_OPERATIONS,
+        })?;
         let runtime = Arc::clone(&connection.runtime);
         Ok(Self {
             runtime,
@@ -2920,10 +2945,10 @@ impl SynapseRerankTransport {
                     .clone()
                     .or_else(|| std::env::current_dir().ok())
                     .unwrap_or_else(|| PathBuf::from(".")),
-                route_harness: config.route_harness.clone().unwrap_or_else(|| "aft".into()),
+                route_harness,
                 model: config.model.clone(),
                 call_timeout: Duration::from_millis(config.timeout_ms.max(1)),
-                required_operations: &[MODELS_LIST_OPERATION, "rerank.score"],
+                required_operations: RERANK_OPERATIONS,
                 connection,
                 consecutive_timeouts: 0,
                 circuit_open_until: None,

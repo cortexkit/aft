@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "note": "Post-0.66 batch 21 changes no RANKING_FENCE_PREFIXES path relative to the split base. It carries shell timing and notices, secret handling, edit refusals, consumer connection reuse, index disk sampling and maintenance, settings declaration, call-graph memory, and withdrawal reply changes. No ranking or count difference is authorized."
+}

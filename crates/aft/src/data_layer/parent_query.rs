@@ -4,8 +4,10 @@
 //! answer for.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use serde_json::{json, Value};
 
@@ -14,7 +16,9 @@ use crate::grep_executor::{GrepExecutionPhaseTimings, GrepParams, GrepScope};
 use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{GrepResult, IndexStatus, PathFilters, SearchIndexSnapshot};
 
-use super::parent_session::{display_relative, Child, ParentView, Plane};
+use super::parent_session::{display_relative, Child, Discovery, ParentView, Plane};
+
+const DISCOVERY_ENTRY_LIMIT_REASON: &str = "AFT stopped looking for repositories here after 20,000 entries, so some repositories in this folder were not searched.";
 
 /// Named gaps collected while answering one request, deduplicated.
 #[derive(Default)]
@@ -40,6 +44,23 @@ impl Gaps {
             self.discovering();
             return;
         };
+        self.discovery_scope(&discovery, scope);
+    }
+
+    pub(crate) fn discovery_scope(&mut self, discovery: &Discovery, scope: &Path) {
+        if discovery.entry_limit_reached
+            && !discovery
+                .children
+                .iter()
+                .chain(&discovery.skipped)
+                .any(|child| scope.starts_with(child))
+        {
+            self.push(
+                "parent_discovery_entry_limit",
+                display_relative(&discovery.root, scope),
+                DISCOVERY_ENTRY_LIMIT_REASON.to_string(),
+            );
+        }
         let in_scope = |path: &Path| path.starts_with(scope) || scope.starts_with(path);
         let skipped = discovery
             .skipped
@@ -426,6 +447,7 @@ pub(crate) fn grep_fan_out(
 /// The parent session's glob answer for `search_roots`.
 pub(crate) struct GlobFanOut {
     pub files: Vec<PathBuf>,
+    pub indexed_mtimes: HashMap<PathBuf, SystemTime>,
     pub scope_has_files: bool,
     pub entries_visited: usize,
     pub walked: bool,
@@ -446,6 +468,7 @@ pub(crate) fn glob_fan_out(
 ) -> Option<GlobFanOut> {
     let mut answer = GlobFanOut {
         files: Vec::new(),
+        indexed_mtimes: HashMap::new(),
         scope_has_files: false,
         entries_visited: 0,
         walked: false,
@@ -508,8 +531,16 @@ pub(crate) fn glob_fan_out(
                 answer.files.extend(outcome.files);
                 continue;
             }
+            let snapshot = text.listing();
             let (files, scope_has_files, visited) =
-                text.listing().glob_profiled(pattern, &search_root, false);
+                snapshot.glob_profiled(pattern, &search_root, false);
+            answer
+                .indexed_mtimes
+                .extend(files.iter().filter_map(|path| {
+                    snapshot
+                        .file_modified(path)
+                        .map(|time| (path.clone(), time))
+                }));
             answer.scope_has_files |= scope_has_files;
             answer.entries_visited += visited;
             answer.files.extend(files);

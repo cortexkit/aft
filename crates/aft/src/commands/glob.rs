@@ -164,6 +164,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     ) = if let Some(answer) = parent_answer {
         // A parent folder session answers from its child repositories' indexes.
         parent_gaps = answer.gaps;
+        indexed_mtimes = answer.indexed_mtimes;
         (
             answer.files,
             answer.walk_truncated,
