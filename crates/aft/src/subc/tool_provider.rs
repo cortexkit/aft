@@ -10300,7 +10300,7 @@ pub(in crate::subc) mod route_tests {
             let data = Arc::get_mut(&mut identity.0).unwrap();
             let mut scope = stamp("worker");
             scope.owner = Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             };
             data.scope = Some(scope);
             if untrusted {
@@ -10426,7 +10426,7 @@ pub(in crate::subc) mod route_tests {
         let data = Arc::get_mut(&mut identity.0).unwrap();
         let mut scope = stamp("worker");
         scope.owner = Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         };
         data.scope = Some(scope);
         assert!(super::super::access_grants::alfonso_worker(&identity));

@@ -5193,7 +5193,7 @@ mod grant_path_tests {
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx);
         let metrics = Arc::new(DispatchPathMetrics::new());
-        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","kind":"worker","scope_epoch":1,"owner_authorized":true})).unwrap();
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","kind":"worker","scope_epoch":1,"owner_authorized":true})).unwrap();
         for (stamped, resumed) in [(true, false), (true, true), (false, false)] {
             let (tx, mut rx) = mpsc::channel(8);
             let (touch, _touch_rx) = mpsc::channel(8);

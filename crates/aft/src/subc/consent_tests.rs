@@ -6424,20 +6424,33 @@ fn consent_vectors_folder_grant_withdraw() {
     assert_eq!(notice["asker"]["scope_ref"], json!("worker"));
     assert_eq!(notice["asker"]["scope_epoch"], json!(3));
     let stamps = vector_json("withdraw-bind-stamps.json");
-    assert_eq!(stamps["scope-owner-withdraw"], json!("reserved:prefrontal"));
+    assert_eq!(
+        stamps["scope-owner-withdraw"],
+        json!("reserved:prefrontal-core")
+    );
     assert_eq!(stamps["non-owner-withdraw"], json!("reserved:basal"));
-    assert_eq!(stamps["settled-withdraw"], json!("reserved:prefrontal"));
+    assert_eq!(
+        stamps["settled-withdraw"],
+        json!("reserved:prefrontal-core")
+    );
 }
 
 #[cfg(unix)]
 #[test]
 fn consent_vectors_bind_stamps_route_asks_under_the_worker_stamp() {
     let stamps = vector_json("bind-stamps.json");
-    let worker: subc_protocol::scope::ScopeStamp =
+    let mut worker: subc_protocol::scope::ScopeStamp =
         serde_json::from_value(stamps["worker"]["scope"].clone()).unwrap();
-    let head: subc_protocol::scope::ScopeStamp =
+    let mut head: subc_protocol::scope::ScopeStamp =
         serde_json::from_value(stamps["head"]["scope"].clone()).unwrap();
     assert_eq!(stamps["worker"]["principal"], "reserved:aft");
+    // The pinned samples predate the module rename; live routes use the current owner.
+    let owner = subc_protocol::Principal::Reserved {
+        module_id: "prefrontal".into(),
+    };
+    worker.owner = owner.clone();
+    worker.parent.as_mut().unwrap().owner = owner.clone();
+    head.owner = owner;
     let dir = tempfile::tempdir().unwrap();
     let worker_identity = identity(dir.path(), Some(worker.clone()));
     let head_identity = identity(dir.path(), Some(head));

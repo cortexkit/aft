@@ -53,7 +53,7 @@ fn identity(root: &Path, kind: &str, id: &str, channel: u16) -> RouteIdentity {
         disabled_tools: Arc::new(vec![]),
         scope: Some(
             serde_json::from_value(json!({
-                "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+                "owner":{"kind":"reserved","module_id":"prefrontal"},
                 "ref":"session-scope", "scope_epoch":7, "kind":kind, "owner_authorized":true
             }))
             .unwrap(),
@@ -95,7 +95,7 @@ impl Fixture {
             if kind == "worker" {
                 "reserved:broca"
             } else {
-                "reserved:prefrontal-core"
+                "reserved:prefrontal"
             },
             43,
         );
@@ -325,12 +325,7 @@ fn session_identity_is_scope_then_exact_labels() {
                 data.root = ProjectRootId::from_path(&data.project_root).unwrap();
             }
         }
-        let mut decoy = identity(
-            &carrier.project_root,
-            "head",
-            "reserved:prefrontal-core",
-            45,
-        );
+        let mut decoy = identity(&carrier.project_root, "head", "reserved:prefrontal", 45);
         let decoy_data = Arc::get_mut(&mut decoy.0).unwrap();
         decoy_data.harness = carrier.harness.clone();
         decoy_data.session = carrier.session.clone();
@@ -482,7 +477,7 @@ fn multi_root_and_duplicate_head_routes_select_before_root_agreement() {
     let other = identity(
         &other_root.path().canonicalize().unwrap(),
         "head",
-        "reserved:prefrontal-core",
+        "reserved:prefrontal",
         45,
     );
     for other in [other, f.policy.clone()] {
@@ -500,12 +495,7 @@ fn multi_root_and_duplicate_head_routes_select_before_root_agreement() {
 #[test]
 fn transient_owner_route_never_qualifies_even_with_worker_row() {
     let f = Fixture::new("worker");
-    let transient = identity(
-        &f.policy.project_root,
-        "worker",
-        "reserved:prefrontal-core",
-        45,
-    );
+    let transient = identity(&f.policy.project_root, "worker", "reserved:prefrontal", 45);
     f.record(&transient, "worker");
     for routes in [
         vec![f.policy.clone(), transient.clone()],

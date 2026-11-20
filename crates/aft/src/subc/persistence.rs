@@ -968,12 +968,12 @@ mod tests {
         let scope = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();
         scope.kind = subc_protocol::scope::ScopeKind::Head;
         scope.owner = Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         };
         if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
             &mut Arc::get_mut(&mut head.0).unwrap().spawn_principal
         {
-            *principal_id = Some("reserved:prefrontal-core".into());
+            *principal_id = Some("reserved:prefrontal".into());
         }
         let decoded = DecodedFrame {
             parsed_body: Default::default(),
