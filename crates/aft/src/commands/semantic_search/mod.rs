@@ -18,7 +18,7 @@ pub use crate::search_b2::plan_table;
 pub mod planner;
 pub mod provenance;
 mod recall_audit;
-mod regex_route;
+pub(crate) mod regex_route;
 pub use crate::search_state::request_files;
 pub(crate) mod rerank;
 pub mod scoring;
@@ -645,24 +645,36 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
     )
 }
 
-mod entry;
+pub(crate) mod entry;
 pub use entry::handle_semantic_search;
 
 /// Parent-folder children may have no publication yet. Their reader engines
 /// must still run the bounded exact/lexical scan while the indexes warm.
 pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::with_skip_disclosure(|| handle_parent_child_search_with_disclosure(req, ctx))
+    handle_child_search(req, ctx, None)
 }
 
-fn handle_parent_child_search_with_disclosure(req: &RawRequest, ctx: &AppContext) -> Response {
-    let config = ctx.config();
-    let mut response = handle_semantic_search_with_disk_fallback(
-        req,
-        ctx,
-        config.indexes.trigram || config.indexes.semantic,
-    );
-    disclose_skipped_folders(req, ctx, &mut response);
-    response
+pub(crate) enum ChildPatternPage {
+    Regex(regex_route::ChildPage),
+    Split(split_query::ChildPage),
+}
+
+pub(crate) fn handle_child_search(
+    req: &RawRequest,
+    ctx: &AppContext,
+    pattern_page: Option<&mut Option<ChildPatternPage>>,
+) -> Response {
+    crate::bounded_io::with_skip_disclosure(|| {
+        let config = ctx.config();
+        let mut response = handle_semantic_search_with_disk_fallback(
+            req,
+            ctx,
+            config.indexes.trigram || config.indexes.semantic,
+            pattern_page,
+        );
+        disclose_skipped_folders(req, ctx, &mut response);
+        response
+    })
 }
 
 fn disclose_skipped_folders(req: &RawRequest, ctx: &AppContext, response: &mut Response) {
@@ -711,6 +723,7 @@ fn handle_semantic_search_with_disk_fallback(
     req: &RawRequest,
     ctx: &AppContext,
     allow_disk_fallback: bool,
+    pattern_page: Option<&mut Option<ChildPatternPage>>,
 ) -> Response {
     let config = ctx.config();
     let _pin = false.then(|| ctx.pin_config_to(config));
@@ -723,28 +736,11 @@ fn handle_semantic_search_with_disk_fallback(
         Ok(request) => request,
         Err(error) => return Response::error(&req.id, error.code(), error.to_string()),
     };
-    let raw_query = RawQuery::new(
-        req.params
-            .get("query")
-            .and_then(|value| value.as_str())
-            .unwrap_or_default(),
-    );
-    let pattern = match split_pattern_param(req) {
-        Ok(pattern) => pattern,
+    let entry::SearchInput { query, pattern } = match entry::SearchInput::parse(req) {
+        Ok(input) => input,
         Err(response) => return response,
     };
-    let has_query = !raw_query.original_query().trim().is_empty();
-    if !has_query && pattern.is_none() {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            if req.params.get("pattern").is_some() {
-                "at least one of query or pattern must be non-empty"
-            } else {
-                "query must be non-empty"
-            },
-        );
-    }
+    let raw_query = RawQuery::new(query);
     let project_root = grep_executor::project_root(ctx);
     let requested_path = req
         .params
@@ -870,10 +866,11 @@ fn handle_semantic_search_with_disk_fallback(
             ctx,
             page_request,
             extensions,
-            has_query.then(|| raw_query.original_query()),
-            &pattern_text,
+            (!query.trim().is_empty()).then_some(query),
+            pattern_text,
             &compiled,
             external_root.as_deref(),
+            pattern_page,
         );
     }
     if let Some(reason) = ctx.cache_unavailable_reason() {
@@ -1050,46 +1047,6 @@ fn attach_not_opened_notice(
     data.insert("semantic_notice".to_string(), serde_json::json!(notice));
 }
 
-/// The request's `pattern`, compiled with grep's syntax and case default
-/// (case-sensitive). A missing, null or whitespace-only pattern is absent. A
-/// pattern that does not compile is refused with grep's own error code and
-/// text, which names the position of the error.
-fn split_pattern_param(
-    req: &RawRequest,
-) -> Result<Option<(String, pattern_compile::CompiledPattern)>, Response> {
-    let pattern = match req.params.get("pattern") {
-        None | Some(serde_json::Value::Null) => return Ok(None),
-        Some(serde_json::Value::String(pattern)) => pattern,
-        Some(_) => {
-            return Err(Response::error(
-                &req.id,
-                "invalid_request",
-                "pattern must be a string",
-            ));
-        }
-    };
-    if pattern.trim().is_empty() {
-        return Ok(None);
-    }
-    match pattern_compile::compile(pattern, CompileOpts::default()) {
-        CompileResult::Ok(compiled) => Ok(Some((pattern.clone(), compiled))),
-        CompileResult::InvalidPattern { message, .. } => Err(Response::error_with_data(
-            &req.id,
-            "invalid_pattern",
-            message,
-            serde_json::json!({ "pattern": pattern }),
-        )),
-        CompileResult::UnsupportedSyntax { feature, .. } => Err(Response::error_with_data(
-            &req.id,
-            "unsupported_pattern",
-            format!(
-                "Pattern uses regex syntax not supported by AFT's engine: {feature}. Rewrite without {feature} or use grep for explicit regex control."
-            ),
-            serde_json::json!({ "pattern": pattern, "feature": feature }),
-        )),
-    }
-}
-
 /// Serve a request that carries a `pattern`. With `pattern` alone, the
 /// pattern runs the ranked regex route (one result per matching file,
 /// definitions first). With `query` beside it, the split-query plan runs (see
@@ -1104,6 +1061,7 @@ fn handle_pattern_request(
     pattern: &str,
     compiled: &pattern_compile::CompiledPattern,
     external_root: Option<&Path>,
+    pattern_page: Option<&mut Option<ChildPatternPage>>,
 ) -> Response {
     use extensions::Root;
 
@@ -1165,6 +1123,7 @@ fn handle_pattern_request(
                 &plan,
                 true,
                 None,
+                pattern_page,
             );
             if let Some(data) = response.data.as_object_mut() {
                 data.insert("query".to_string(), serde_json::json!(""));
@@ -1186,6 +1145,7 @@ fn handle_pattern_request(
                 compiled,
                 include_tests,
                 None,
+                pattern_page,
             )
         }
     };
@@ -1549,6 +1509,7 @@ fn handle_split_search<'a>(
     compiled: &pattern_compile::CompiledPattern,
     include_tests: bool,
     external: Option<&external_pattern::Corpus<'_>>,
+    pattern_page: Option<&mut Option<ChildPatternPage>>,
 ) -> (extensions::LanePlan<'a>, Response) {
     let lexical_ready = if external.is_some() {
         true
@@ -1682,11 +1643,11 @@ fn handle_split_search<'a>(
         Some(ctx),
         None,
     );
-    let summary = patterns.summary_line(
-        &prose_found,
+    let summary = patterns.summary(&prose_found);
+    let mut header = vec![summary.line(
+        &patterns.pattern,
         display_root.as_deref().unwrap_or(project_root),
-    );
-    let mut header = vec![summary];
+    )];
     if !lexical_ready {
         header.push(
             "[lexical lane unavailable: the trigram index is not ready; the pattern ran as a bounded scan]"
@@ -1766,9 +1727,9 @@ fn handle_split_search<'a>(
         );
     }
     // The same sites, in the same order, as the summary line names.
-    let definition_sites = patterns
-        .definition_sites()
-        .into_iter()
+    let definition_sites = summary
+        .sites
+        .iter()
         .map(|(file, line)| {
             serde_json::json!({
                 "file": file.display().to_string(),
@@ -1779,12 +1740,8 @@ fn handle_split_search<'a>(
     extras.insert(
         "pattern_summary".to_string(),
         serde_json::json!({
-            "files_matched": patterns.len(),
-            "also_found_by_query": patterns
-                .files
-                .iter()
-                .filter(|file| prose_found.contains(file.path()))
-                .count(),
+            "files_matched": summary.files,
+            "also_found_by_query": summary.overlap,
             "definition_files": definition_sites.len(),
             "definition_sites": definition_sites.into_iter().take(3).collect::<Vec<_>>(),
             "examination_capped": patterns.examination.capped,
@@ -1842,6 +1799,13 @@ fn handle_split_search<'a>(
             value
         })
         .collect();
+    if let Some(page) = pattern_page {
+        *page = Some(ChildPatternPage::Split(split_query::ChildPage {
+            summary,
+            results: ranked.results,
+            snippets_incomplete,
+        }));
+    }
     let response = search_response(
         req,
         SearchResponseParts {
@@ -2452,6 +2416,7 @@ fn handle_semantic_search_inner(
                 engine_plan,
                 false,
                 None,
+                None,
             ),
             SearchMode::Semantic | SearchMode::Hybrid => handle_semantic_or_hybrid_search(
                 req,
@@ -2909,6 +2874,7 @@ fn handle_grep_search(
     engine_plan: &extensions::LanePlan<'_>,
     explicit_pattern: bool,
     external: Option<&external_pattern::Corpus<'_>>,
+    pattern_page: Option<&mut Option<ChildPatternPage>>,
 ) -> Response {
     // An explicit `pattern` is the agent's regex: it is never re-read as a
     // literal, and a pattern that matches nothing is reported as such rather
@@ -3008,34 +2974,41 @@ fn handle_grep_search(
         Some(Err(error)) => return Response::error(&req.id, "internal_error", error.to_string()),
         None => None,
     };
-    let (mut result, ranked_files, examination_note) = if let Some((ranked, note)) = ranked {
-        (ranked.summary, Some(ranked.files), note)
-    } else {
-        let scope = match grep_executor::resolve_grep_scope(
-            ctx,
-            None,
-            fetch_limit,
-            &req.id,
-            req.session(),
-            ctx,
-        ) {
-            Ok(scope) => scope,
-            Err(response) => return response,
+    let (mut result, ranked_files, examination_note, candidate_files) =
+        if let Some((ranked, note)) = ranked {
+            (
+                ranked.summary,
+                Some(ranked.files),
+                note,
+                ranked.candidate_files,
+            )
+        } else {
+            let scope = match grep_executor::resolve_grep_scope(
+                ctx,
+                None,
+                fetch_limit,
+                &req.id,
+                req.session(),
+                ctx,
+            ) {
+                Ok(scope) => scope,
+                Err(response) => return response,
+            };
+            let params = GrepParams {
+                include: Vec::new(),
+                exclude: Vec::new(),
+                max_results: fetch_limit,
+                path_exclusion: grep_path_exclusion(include_tests),
+            };
+            (
+                waits::timed(waits::SearchWait::Grep, || {
+                    grep_executor::execute(ctx, &compiled, &scope, &params)
+                }),
+                None,
+                None,
+                0,
+            )
         };
-        let params = GrepParams {
-            include: Vec::new(),
-            exclude: Vec::new(),
-            max_results: fetch_limit,
-            path_exclusion: grep_path_exclusion(include_tests),
-        };
-        (
-            waits::timed(waits::SearchWait::Grep, || {
-                grep_executor::execute(ctx, &compiled, &scope, &params)
-            }),
-            None,
-            None,
-        )
-    };
     if result.index_sources_unavailable {
         return Response::error(&req.id, "internal_error", result.index_read_gaps.join("; "));
     }
@@ -3105,29 +3078,17 @@ fn handle_grep_search(
         );
     let display_root = external.map(|_| absolute_display_root(project_root));
     let render_root = display_root.as_deref().unwrap_or(project_root);
-    let mut text = match &ranked_page {
-        Some(page) => format!(
-            "{}\n[interpreted_as: {interpreted_as}]",
-            regex_route::format_ranked_page(page, &result, render_root)
-        ),
-        None => format_grep_search_text(&result, render_root, interpreted_as),
-    };
-    if let Some(note) = examination_note.as_deref() {
-        text.push('\n');
-        text.push_str(note);
-    }
-    if explicit_pattern
-        && result_values.is_empty()
-        && offset == 0
-        && result.index_read_gaps.is_empty()
-    {
-        text.push('\n');
-        text.push_str(if result.engine_capped {
-            "[pattern: no match in the files examined; files not examined were not searched]"
-        } else {
-            "[pattern: no match]"
-        });
-    }
+    let mut text = regex_route::format_search_page(
+        ranked_page.as_deref(),
+        &result,
+        render_root,
+        interpreted_as,
+        examination_note.as_deref(),
+        explicit_pattern
+            && result_values.is_empty()
+            && offset == 0
+            && result.index_read_gaps.is_empty(),
+    );
     let mut extras = serde_json::Map::new();
     disclose_index_gaps(&result.index_read_gaps, &mut text, &mut extras);
     if trigram_index_building {
@@ -3162,7 +3123,7 @@ fn handle_grep_search(
     } {
         crate::list_surfaces::search::attach_projected_search_envelope(&mut extras, &envelope);
     }
-    search_response(
+    let response = search_response(
         req,
         SearchResponseParts {
             query,
@@ -3185,7 +3146,15 @@ fn handle_grep_search(
             warnings,
             extras,
         },
-    )
+    );
+    if let Some(page) = pattern_page {
+        *page = Some(ChildPatternPage::Regex(regex_route::ChildPage {
+            summary: result,
+            ranked: ranked_page,
+            candidate_files,
+        }));
+    }
+    response
 }
 
 /// Run the regex or literal route over the ready trigram index and rank the
@@ -6710,6 +6679,7 @@ fn handle_semantic_or_hybrid_search(
                     engine_plan,
                     false,
                     None,
+                    None,
                 );
             }
 
@@ -9586,7 +9556,7 @@ fn format_ranked_text(
     .0
 }
 
-fn format_ranked_text_counted(
+pub(crate) fn format_ranked_text_counted(
     results: &[HybridResult],
     display_root: &Path,
     more_available: bool,

@@ -158,12 +158,85 @@ pub(crate) fn has_query_relevance(
 }
 
 /// How much of the candidate set the pattern's examination covered.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PatternExamination {
     /// A file or time bound left candidate files unexamined.
     pub capped: bool,
     pub files_examined: usize,
     pub candidate_files: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct PatternSummary {
+    pub files: usize,
+    pub overlap: usize,
+    pub sites: Vec<(PathBuf, u32)>,
+    pub examination: PatternExamination,
+}
+
+impl PatternSummary {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.files += other.files;
+        self.overlap += other.overlap;
+        self.sites.extend(other.sites);
+        self.examination.capped |= other.examination.capped;
+        self.examination.files_examined += other.examination.files_examined;
+        self.examination.candidate_files += other.examination.candidate_files;
+    }
+
+    pub(crate) fn line(&self, pattern: &str, project_root: &Path) -> String {
+        let project_root = super::result_display_root(project_root);
+        let Self {
+            files,
+            overlap,
+            sites,
+            examination: examined,
+        } = self;
+        if *files == 0 {
+            return if examined.capped {
+                format!(
+                    "[pattern `{pattern}`: no match in the {} of {} candidate files examined; files not examined were not searched]",
+                    examined.files_examined, examined.candidate_files
+                )
+            } else {
+                format!("[pattern `{pattern}`: no match]")
+            };
+        }
+        let mut line = format!(
+            "[pattern `{pattern}`: {files} file{} matched, {overlap} also found by the query",
+            if *files == 1 { "" } else { "s" }
+        );
+        let sites = sites
+            .iter()
+            .take(SUMMARY_DEFINITION_SITES)
+            .map(|(path, line)| {
+                format!(
+                    "{}:{line}",
+                    path.strip_prefix(project_root).unwrap_or(path).display()
+                )
+            })
+            .collect::<Vec<_>>();
+        if sites.is_empty() {
+            line.push_str("; no definition found");
+        } else {
+            line.push_str("; defined in ");
+            line.push_str(&sites.join(", "));
+        }
+        if examined.capped {
+            line.push_str(&format!(
+                "; examined {} of {} candidate files",
+                examined.files_examined, examined.candidate_files
+            ));
+        }
+        line.push(']');
+        line
+    }
+}
+
+pub(crate) struct ChildPage {
+    pub summary: PatternSummary,
+    pub results: Vec<super::HybridResult>,
+    pub snippets_incomplete: bool,
 }
 
 /// One file the pattern matched, in pattern rank order.
@@ -383,60 +456,26 @@ impl PatternList {
     /// One line describing the pattern's matches, computed from the pattern
     /// list and the set of files the prose lanes enumerated, never from the
     /// page, so every page of one search shows the same line.
+    pub(crate) fn summary(&self, prose_found: &HashSet<PathBuf>) -> PatternSummary {
+        PatternSummary {
+            files: self.len(),
+            overlap: self
+                .files
+                .iter()
+                .filter(|file| prose_found.contains(file.path()))
+                .count(),
+            sites: self.definition_sites(),
+            examination: self.examination,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn summary_line(
         &self,
         prose_found: &HashSet<PathBuf>,
         project_root: &Path,
     ) -> String {
-        let project_root = super::result_display_root(project_root);
-        let pattern = &self.pattern;
-        let examined = &self.examination;
-        if self.files.is_empty() {
-            return if examined.capped {
-                format!(
-                    "[pattern `{pattern}`: no match in the {} of {} candidate files examined; files not examined were not searched]",
-                    examined.files_examined, examined.candidate_files
-                )
-            } else {
-                format!("[pattern `{pattern}`: no match]")
-            };
-        }
-        let files = self.files.len();
-        let overlap = self
-            .files
-            .iter()
-            .filter(|file| prose_found.contains(file.path()))
-            .count();
-        let mut line = format!(
-            "[pattern `{pattern}`: {files} file{} matched, {overlap} also found by the query",
-            if files == 1 { "" } else { "s" }
-        );
-        let sites = self
-            .definition_sites()
-            .into_iter()
-            .take(SUMMARY_DEFINITION_SITES)
-            .map(|(path, line)| {
-                format!(
-                    "{}:{}",
-                    path.strip_prefix(project_root).unwrap_or(&path).display(),
-                    line
-                )
-            })
-            .collect::<Vec<_>>();
-        if sites.is_empty() {
-            line.push_str("; no definition found");
-        } else {
-            line.push_str("; defined in ");
-            line.push_str(&sites.join(", "));
-        }
-        if examined.capped {
-            line.push_str(&format!(
-                "; examined {} of {} candidate files",
-                examined.files_examined, examined.candidate_files
-            ));
-        }
-        line.push(']');
-        line
+        self.summary(prose_found).line(&self.pattern, project_root)
     }
 
     /// Every file that defines something the pattern names, one site per

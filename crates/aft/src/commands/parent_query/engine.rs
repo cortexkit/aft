@@ -16,8 +16,10 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 
+use crate::commands::semantic_search::{self, regex_route, split_query, ChildPatternPage};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
+use crate::search_index::{GrepMatch, GrepResult, IndexStatus};
 
 use crate::parent_search::engine::ChildEngine;
 use crate::parent_search::query::{attach_gaps, Gaps};
@@ -40,8 +42,40 @@ fn data_layer_answers() -> bool {
 /// The page size `aft_search` uses when the request names none.
 const DEFAULT_TOP_K: usize = 10;
 
-fn wire_score(row: &Value) -> f64 {
-    row["score"].as_f64().unwrap_or(f64::MIN)
+enum RowText {
+    Ranked(regex_route::RankedFile),
+    Grep(GrepMatch),
+    Split(semantic_search::HybridResult),
+}
+
+struct Row {
+    wire: Value,
+    text: Option<RowText>,
+}
+
+impl Row {
+    fn regex_rank(&self) -> Option<regex_route::RankKey> {
+        match &self.text {
+            Some(RowText::Ranked(file)) => Some(file.rank),
+            _ => None,
+        }
+    }
+
+    fn score(&self, field: &str) -> f64 {
+        self.wire[field].as_f64().unwrap_or(f64::MIN)
+    }
+}
+
+fn prefix_path(parent: &Path, child: &Child, path: &Path) -> String {
+    if path.is_absolute() {
+        display_relative(parent, path)
+    } else {
+        child
+            .relative
+            .join(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
 }
 
 /// Rewrites a child row's paths to be relative to the parent folder. The
@@ -51,20 +85,14 @@ fn prefix_row(row: &mut Value, parent: &Path, child: &Child) {
     let Some(file) = row["file"].as_str().map(str::to_owned) else {
         return;
     };
-    let path = Path::new(&file);
-    let prefixed = if path.is_absolute() {
-        display_relative(parent, path)
-    } else {
-        child
-            .relative
-            .join(&file)
-            .to_string_lossy()
-            .replace('\\', "/")
-    };
+    let prefixed = prefix_path(parent, child, Path::new(&file));
     if let Some(Value::String(location)) = row.get_mut("location") {
         if let Some(rest) = location.strip_prefix(file.as_str()) {
             *location = format!("{prefixed}{rest}");
         }
+    }
+    if let Some(Value::String(supports)) = row.get_mut("supports") {
+        *supports = prefix_path(parent, child, Path::new(supports));
     }
     row["file"] = Value::String(prefixed);
 }
@@ -74,7 +102,7 @@ fn prefix_row(row: &mut Value, parent: &Path, child: &Child) {
 /// (combined score, or an individual search score when available) gives its
 /// next row. Ties prefer the higher semantic similarity, which uses the same
 /// model in every child, then the earlier child.
-fn merge(mut lists: Vec<VecDeque<Value>>, limit: usize) -> Vec<Value> {
+fn merge(mut lists: Vec<VecDeque<Row>>, limit: usize) -> Vec<Row> {
     let mut merged = Vec::new();
     while merged.len() < limit {
         let best = lists
@@ -82,15 +110,21 @@ fn merge(mut lists: Vec<VecDeque<Value>>, limit: usize) -> Vec<Value> {
             .enumerate()
             .filter_map(|(index, list)| list.front().map(|row| (index, row)))
             .max_by(|(left_index, left), (right_index, right)| {
-                wire_score(left)
-                    .total_cmp(&wire_score(right))
-                    .then_with(|| {
-                        left["semantic_score"]
-                            .as_f64()
-                            .unwrap_or(f64::MIN)
-                            .total_cmp(&right["semantic_score"].as_f64().unwrap_or(f64::MIN))
-                    })
-                    .then_with(|| right_index.cmp(left_index))
+                match (left.regex_rank(), right.regex_rank()) {
+                    (Some(left_rank), Some(right_rank)) => right_rank
+                        .cmp(&left_rank)
+                        .then_with(|| right.wire["file"].as_str().cmp(&left.wire["file"].as_str())),
+                    (Some(_), None) => std::cmp::Ordering::Greater,
+                    (None, Some(_)) => std::cmp::Ordering::Less,
+                    (None, None) => left
+                        .score("score")
+                        .total_cmp(&right.score("score"))
+                        .then_with(|| {
+                            left.score("semantic_score")
+                                .total_cmp(&right.score("semantic_score"))
+                        }),
+                }
+                .then_with(|| right_index.cmp(left_index))
             })
             .map(|(index, _)| index);
         let Some(index) = best else {
@@ -101,6 +135,129 @@ fn merge(mut lists: Vec<VecDeque<Value>>, limit: usize) -> Vec<Value> {
         }
     }
     merged
+}
+
+#[derive(Default)]
+struct PatternRendering {
+    grep: Option<GrepResult>,
+    ranked: bool,
+    candidate_files: usize,
+    files_examined: usize,
+    examination_capped: bool,
+    split: split_query::PatternSummary,
+    snippets_incomplete: bool,
+}
+
+impl PatternRendering {
+    fn collect(&mut self, page: ChildPatternPage, root: &Path, child: &Child) -> Vec<RowText> {
+        match page {
+            ChildPatternPage::Regex(mut page) => {
+                self.ranked |= page.ranked.is_some();
+                self.candidate_files += page.candidate_files;
+                if page.ranked.is_some() {
+                    self.files_examined += page.summary.files_searched;
+                }
+                self.examination_capped |= page.ranked.is_some() && page.summary.engine_capped;
+                let matches = std::mem::take(&mut page.summary.matches);
+                if let Some(total) = &mut self.grep {
+                    total.files_with_matches += page.summary.files_with_matches;
+                    total.total_matches += page.summary.total_matches;
+                    total.files_searched += page.summary.files_searched;
+                    total.truncated |= page.summary.truncated;
+                    total.engine_capped |= page.summary.engine_capped;
+                    total.index_read_gaps.extend(page.summary.index_read_gaps);
+                    if total.index_status == IndexStatus::Ready {
+                        total.index_status = page.summary.index_status;
+                    }
+                } else {
+                    self.grep = Some(page.summary);
+                }
+                match page.ranked {
+                    Some(files) => files.into_iter().map(RowText::Ranked).collect(),
+                    None => matches.into_iter().map(RowText::Grep).collect(),
+                }
+            }
+            ChildPatternPage::Split(mut page) => {
+                for (file, _) in &mut page.summary.sites {
+                    *file = prefix_path(root, child, file).into();
+                }
+                self.split.merge(page.summary);
+                self.snippets_incomplete |= page.snippets_incomplete;
+                page.results.into_iter().map(RowText::Split).collect()
+            }
+        }
+    }
+
+    fn render(
+        self,
+        rows: Vec<RowText>,
+        pattern: &str,
+        root: &Path,
+        ctx: &AppContext,
+        offset: usize,
+    ) -> String {
+        if let Some(mut grep) = self.grep {
+            let no_match = rows.is_empty() && offset == 0 && grep.index_read_gaps.is_empty();
+            let note = self.examination_capped.then(|| {
+                regex_route::examination_disclosure(self.files_examined, self.candidate_files)
+            });
+            let mut ranked = Vec::new();
+            for row in rows {
+                match row {
+                    RowText::Ranked(file) => ranked.push(file),
+                    RowText::Grep(line) if self.ranked => {
+                        ranked.push(regex_route::RankedFile::unranked(line))
+                    }
+                    RowText::Grep(line) => grep.matches.push(line),
+                    RowText::Split(_) => {
+                        unreachable!("a pattern-only page cannot contain split results")
+                    }
+                }
+            }
+            regex_route::format_search_page(
+                self.ranked.then_some(&ranked),
+                &grep,
+                root,
+                "regex",
+                note.as_deref(),
+                no_match,
+            )
+        } else {
+            let results = rows
+                .into_iter()
+                .filter_map(|row| match row {
+                    RowText::Split(result) => Some(result),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            let (text, _) = semantic_search::format_ranked_text_counted(
+                &results,
+                root,
+                false,
+                self.snippets_incomplete,
+                Some(ctx),
+                None,
+            );
+            format!("{}\n\n{text}", self.split.line(pattern, root))
+        }
+    }
+}
+
+fn row_with_text(mut wire: Value, mut text: Option<RowText>, root: &Path, child: &Child) -> Row {
+    prefix_row(&mut wire, root, child);
+    if let Some(path) = wire["file"].as_str() {
+        match &mut text {
+            Some(RowText::Ranked(file)) => {
+                for line in &mut file.lines {
+                    line.file = path.into();
+                }
+            }
+            Some(RowText::Grep(line)) => line.file = path.into(),
+            Some(RowText::Split(result)) => result.file = path.into(),
+            None => {}
+        }
+    }
+    Row { wire, text }
 }
 
 fn render_text(query: &str, page: &[Value], more_available: bool) -> String {
@@ -144,13 +301,13 @@ pub(super) fn search(req: &RawRequest, ctx: &AppContext, session: &ParentSession
 }
 
 fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSession) -> Response {
-    let Some(query) = req.params.get("query").and_then(Value::as_str) else {
-        return Response::error(
-            &req.id,
-            "invalid_request",
-            "semantic_search: missing required param 'query'",
-        );
-    };
+    let semantic_search::entry::SearchInput { query, pattern } =
+        match semantic_search::entry::SearchInput::parse(req) {
+            Ok(input) => input,
+            Err(response) => return response,
+        };
+    let pattern = pattern.map(|(text, _)| text);
+    let query_for_embedding = (!query.trim().is_empty()).then_some(query);
     let top_k = req
         .params
         .get("top_k")
@@ -211,13 +368,13 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
     // cannot be embedded, the model is lent to each engine in turn instead,
     // which reports the failure the way a direct search would.
     let semantic = read(&session.semantic).clone();
-    let mut model = semantic
-        .ready()
+    let mut model = query_for_embedding
+        .and_then(|_| semantic.ready())
         .and_then(|semantic| lock(&semantic.model).take());
     let vector = model.as_mut().and_then(|model| {
         model
             .embed_query_cached(
-                query,
+                query_for_embedding?,
                 crate::semantic_index::QueryBudget::from_config(&session.semantic_config),
             )
             .ok()
@@ -268,34 +425,47 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
         if let Some(checkout) = checkout {
             engine.ctx.pin_data_checkout(Arc::clone(checkout));
         }
-        let mut params = json!({
-            "id": req.id,
-            "command": "semantic_search",
-            "query": query,
-            "top_k": wanted,
-            "include_tests": include_tests,
-        });
-        if scope != session.root() && scope.starts_with(&child.root) {
-            params["path"] = json!(scope);
+        let mut params = req
+            .params
+            .as_object()
+            .expect("search parameter object")
+            .clone();
+        // Each child supplies the prefix of its list; the offset is applied
+        // once to the merged list, not separately to each child's list.
+        for key in ["topK", "offset", "includeTests", "path"] {
+            params.remove(key);
         }
-        let child_req: RawRequest = match serde_json::from_value(params) {
-            Ok(request) => request,
-            Err(error) => return (Err(format!("aft_search: {error}")), lent),
+        params.insert("top_k".into(), json!(wanted));
+        params.insert("include_tests".into(), json!(include_tests));
+        if scope != session.root() && scope.starts_with(&child.root) {
+            params.insert("path".into(), json!(scope));
+        }
+        let child_req = RawRequest {
+            id: req.id.clone(),
+            command: req.command.clone(),
+            lsp_hints: None,
+            session_id: None,
+            params: Value::Object(params),
         };
         let lending = lent.is_some();
         if lending {
             *engine.ctx.semantic_embedding_model().lock() = lent;
         }
-        let search = || {
-            crate::commands::semantic_search::handle_parent_child_search(&child_req, &engine.ctx)
+        let mut pattern_page = None;
+        let mut search = || {
+            semantic_search::handle_child_search(
+                &child_req,
+                &engine.ctx,
+                pattern.map(|_| &mut pattern_page),
+            )
         };
-        let response = crate::bounded_io::with_budget(skip_scope.clone(), || match vector {
-            Some(vector) => crate::commands::semantic_search::with_precomputed_query_vector(
-                query,
-                vector.clone(),
-                search,
-            ),
-            None => search(),
+        let response = crate::bounded_io::with_budget(skip_scope.clone(), || {
+            match (query_for_embedding, vector) {
+                (Some(query), Some(vector)) => {
+                    semantic_search::with_precomputed_query_vector(query, vector.clone(), search)
+                }
+                _ => search(),
+            }
         });
         let returned = if lending {
             engine.ctx.semantic_embedding_model().lock().take()
@@ -311,7 +481,7 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
                 returned,
             );
         }
-        (Ok(response.data), returned)
+        (Ok((response.data, pattern_page)), returned)
     };
     let outcomes = if model.is_some() {
         let mut outcomes = Vec::new();
@@ -341,6 +511,7 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
     let mut lexical_only_fallback = false;
     let mut bounded_disk_fallback = false;
     let mut semantic_statuses = Vec::new();
+    let mut rendering = PatternRendering::default();
     for (index, (child, outcome)) in children.iter().zip(outcomes).enumerate() {
         let data_child = data_children.as_ref().map(|searches| &searches[index]);
         if session.planes.trigram {
@@ -355,7 +526,7 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
                 gaps.child(child, reason);
             }
         }
-        let data = match outcome {
+        let (data, pattern_page) = match outcome {
             Ok(data) => data,
             Err(reason) => {
                 gaps.child(child, reason);
@@ -382,15 +553,16 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
         if let Some(status) = data["semantic_status"].as_str() {
             semantic_statuses.push(status.to_owned());
         }
+        let mut display_rows = pattern_page
+            .map(|page| rendering.collect(page, session.root(), child))
+            .unwrap_or_default()
+            .into_iter();
         let rows = data["results"]
             .as_array()
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .map(|mut row| {
-                prefix_row(&mut row, session.root(), child);
-                row
-            })
+            .map(|row| row_with_text(row, display_rows.next(), session.root(), child))
             .collect::<VecDeque<_>>();
         lists.push(rows);
         first.get_or_insert(data);
@@ -400,7 +572,11 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
     let total = lists.iter().map(VecDeque::len).sum::<usize>();
     let merged = merge(lists, wanted);
     more_available |= total > wanted;
-    let page = merged.into_iter().skip(offset).collect::<Vec<_>>();
+    let (page, display_rows): (Vec<_>, Vec<_>) = merged
+        .into_iter()
+        .skip(offset)
+        .map(|row| (row.wire, row.text))
+        .unzip();
     let envelope = crate::list_envelope::ListEnvelope::new(
         page.len(),
         if more_available {
@@ -426,9 +602,19 @@ fn search_with_disclosure(req: &RawRequest, ctx: &AppContext, session: &ParentSe
     let searched = first.is_some();
     let first = first.unwrap_or(Value::Null);
     let mut text = if searched {
-        render_text(query, &page, more_available)
+        match pattern {
+            Some(pattern) => rendering.render(
+                display_rows.into_iter().flatten().collect(),
+                pattern,
+                session.root(),
+                ctx,
+                offset,
+            ),
+            None => render_text(query, &page, more_available),
+        }
     } else {
-        format!("Search unavailable for \"{query}\" in this parent folder's repositories.")
+        let search = query_for_embedding.or(pattern).unwrap_or_default();
+        format!("Search unavailable for \"{search}\" in this parent folder's repositories.")
     };
     if bounded_disk_fallback {
         text.push_str(

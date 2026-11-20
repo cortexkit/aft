@@ -203,6 +203,7 @@ pub(super) fn handle(
             compiled,
             include_tests,
             Some(&corpus),
+            None,
         )
     } else {
         let plan = extensions.plan(
@@ -227,6 +228,7 @@ pub(super) fn handle(
             &plan,
             true,
             Some(&corpus),
+            None,
         );
         if let Some(data) = response.data.as_object_mut() {
             data.insert("query".to_string(), serde_json::json!(""));
