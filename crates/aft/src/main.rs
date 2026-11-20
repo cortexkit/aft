@@ -4863,7 +4863,9 @@ mod config_pin_tests {
 mod policy_environment_startup_tests {
     #[test]
     fn both_entry_modes_register_policy_environment_before_config_or_context() {
-        let source = include_str!("main.rs");
+        // A Windows checkout may convert line endings to CRLF, so search a
+        // copy with LF endings.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
         let (_, main) = source.split_once("\nfn main() {\n").unwrap();
         let (main, _) = main.split_once("\n}\n").unwrap();
         let registration = main

@@ -92,10 +92,10 @@ mod tests {
     fn missing_tail_keeps_identity_of_existing_ancestor() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("missing").join("leaf");
-        assert_eq!(
-            policy_path(&missing),
-            dir.path().canonicalize().unwrap().join("missing/leaf")
-        );
+        // `policy_path` returns the normalized form (no Windows verbatim
+        // `\\?\` prefix), so compare against the normalized ancestor.
+        let ancestor = crate::path_identity::normalize_path(&dir.path().canonicalize().unwrap());
+        assert_eq!(policy_path(&missing), ancestor.join("missing").join("leaf"));
     }
 
     #[test]
