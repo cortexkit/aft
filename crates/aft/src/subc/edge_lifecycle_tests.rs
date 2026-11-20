@@ -166,7 +166,7 @@ async fn route_close_retires_admission_before_dispatch() {
         .db()
         .expect("both binds must share the configured ledger");
     let release = hold_lane(&daemon.executor, &root, Lane::CallLedger).await;
-    let call = json!({"name":"read", "arguments":{"filePath":"README.md"}, "call_key":"same-read"});
+    let call = json!({"name":"read", "arguments":{"path":"README.md"}, "call_key":"same-read"});
     daemon.send(FrameType::Request, 1, 10, call.clone()).await;
     let executor = daemon.executor.clone();
     tokio::select! {
