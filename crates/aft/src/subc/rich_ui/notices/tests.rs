@@ -1,6 +1,9 @@
 use super::*;
 use crate::bash_background::BgTaskStatus;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame};
+
+mod samples;
+
 use std::ffi::OsStr;
 
 fn metadata() -> PersistedTask {

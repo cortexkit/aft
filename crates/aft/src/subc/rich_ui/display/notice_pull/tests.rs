@@ -7,6 +7,72 @@ use subc_protocol::Principal;
 use super::super::{announce_retained, read_for_reader, tests::test_writer};
 
 #[tokio::test]
+async fn notice_records_no_write_or_announcement_queued_before_views_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let conn = crate::db::open(&path).unwrap();
+    let record = || {
+        pull(
+            "broca",
+            "session",
+            "aft:bash:bash-gated",
+            NoticeBody::new("bash_finished:1", None, Default::default()),
+        )
+        .unwrap()
+    };
+    let id = record().id;
+    let ready = NoticeViewsReady::default();
+    stage_after_views(&writer, record(), &ready, Duration::ZERO).await;
+    assert!(
+        crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms())
+            .unwrap()
+            .is_none()
+    );
+    assert!(writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .due(Instant::now())
+        .is_none());
+
+    let ready = NoticeViewsReady::default();
+    let waiting = stage_after_views(&writer, record(), &ready, Duration::from_secs(5));
+    tokio::pin!(waiting);
+    std::future::poll_fn(|cx| {
+        use std::future::Future;
+        assert!(waiting.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+    assert!(
+        crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms())
+            .unwrap()
+            .is_none()
+    );
+    assert!(writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .due(Instant::now())
+        .is_none());
+    ready.confirm();
+    waiting.await;
+    assert_eq!(
+        writer
+            .outbox
+            .lock()
+            .unwrap()
+            .reads
+            .due(Instant::now())
+            .as_deref(),
+        Some(id.as_str())
+    );
+}
+
+#[tokio::test]
 async fn notice_records_persist_before_wake_and_display_read_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.db");

@@ -105,7 +105,7 @@ pub(crate) fn answer(body: Value) -> Result<Value, ErrorBody> {
 pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
     SHIPPED
         .keys()
-        .chain(notices::view_pins())
+        .chain(notice_view_pins())
         .map(|pin| {
             let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
             (
@@ -114,6 +114,10 @@ pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
             )
         })
         .collect()
+}
+
+pub(crate) fn notice_view_pins() -> impl Iterator<Item = &'static String> {
+    notices::view_pins()
 }
 
 #[cfg(test)]

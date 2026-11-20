@@ -10,9 +10,47 @@ impl Writer for RecordingWriter {
 }
 
 #[tokio::test]
+async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowledged() {
+    struct RejectLast(usize);
+    impl Writer for RejectLast {
+        async fn put(&mut self, _key: &str, _value: Vec<u8>) -> Result<(), &'static str> {
+            self.0 -= 1;
+            if self.0 == 0 {
+                Err("put_not_acknowledged")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let notice_views: Vec<_> = crate::subc::tool_views::bus_snapshot()
+        .into_iter()
+        .filter(|(pin, _)| pin.starts_with("nv1:"))
+        .collect();
+    assert_eq!(notice_views.len(), 3);
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
+    let mut writer = RejectLast(notice_views.len());
+    assert_eq!(
+        publication.sync(&mut writer, notice_views.clone()).await,
+        Err("put_not_acknowledged")
+    );
+    assert!(!ready.wait(Duration::ZERO).await);
+
+    let mut writer = RecordingWriter::default();
+    publication.sync(&mut writer, notice_views).await.unwrap();
+    assert_eq!(writer.0.len(), 1, "only the unacknowledged view is retried");
+    assert!(
+        ready.wait(Duration::ZERO).await,
+        "acknowledgments reopen admission even after a timed-out send"
+    );
+}
+
+#[tokio::test]
 async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     let mut writer = RecordingWriter::default();
-    let mut publication = Publication::default();
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
     publication
         .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
         .await
@@ -61,7 +99,7 @@ async fn notice_records_bus_views_and_tool_views_decode_as_the_same_one_pin_repl
     use serde_json::json;
 
     let mut writer = RecordingWriter::default();
-    Publication::default()
+    Publication::new(&NoticeViewsReady::default())
         .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
         .await
         .unwrap();
@@ -101,7 +139,8 @@ async fn notice_records_bus_views_and_tool_views_decode_as_the_same_one_pin_repl
 #[tokio::test]
 async fn bus_views_oversized_is_skipped_not_truncated_and_changes_republish() {
     let mut writer = RecordingWriter::default();
-    let mut publication = Publication::default();
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
     let cap = declaration().max_value_bytes as usize;
     publication
         .sync(

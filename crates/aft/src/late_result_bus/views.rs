@@ -8,6 +8,9 @@ use serde::Serialize;
 
 use super::{backoff, HEALTH, IO_TIMEOUT};
 
+mod notice_ready;
+pub(crate) use notice_ready::{NoticeViewsReady, NOTICE_VIEWS_READY};
+
 #[derive(Default, Serialize)]
 pub(super) struct ViewsHealth {
     attached: bool,
@@ -69,13 +72,21 @@ impl Writer for RealWriter {
     }
 }
 
-#[derive(Default)]
-struct Publication {
+struct Publication<'a> {
+    notice_views: &'a NoticeViewsReady,
     written: HashSet<(String, blake3::Hash)>,
     skipped: HashSet<(String, blake3::Hash)>,
 }
 
-impl Publication {
+impl<'a> Publication<'a> {
+    fn new(notice_views: &'a NoticeViewsReady) -> Self {
+        Self {
+            notice_views,
+            written: HashSet::new(),
+            skipped: HashSet::new(),
+        }
+    }
+
     async fn sync(
         &mut self,
         writer: &mut impl Writer,
@@ -102,6 +113,12 @@ impl Publication {
                 .await
                 .map_err(|_| "views_put_timeout")??;
             self.written.insert(identity);
+            if pin.starts_with("nv1:")
+                && crate::subc::tool_views::notice_view_pins()
+                    .all(|pin| self.written.iter().any(|(written, _)| written == pin))
+            {
+                self.notice_views.confirm();
+            }
             HEALTH.lock().views.writes += 1;
         }
         Ok(())
@@ -115,7 +132,7 @@ pub(super) async fn run(client: Arc<BusClient>) {
         .module_bucket_name(row.owner, row.name)
         .expect("reviewed bucket");
     let mut changes = client.connection_changes();
-    let mut publication = Publication::default();
+    let mut publication = Publication::new(&NOTICE_VIEWS_READY);
     let mut delay = Duration::from_secs(1);
     loop {
         changes.borrow_and_update();

@@ -3,10 +3,28 @@
 use std::time::{Duration, Instant};
 
 use super::{Writer, SENDER};
+use crate::late_result_bus::{NoticeViewsReady, NOTICE_VIEWS_READY};
 use crate::subc::rich_ui::notices::PullRecord;
 
 pub(in crate::subc) async fn stage_notice(record: PullRecord) {
     if let Some(writer) = SENDER.get() {
+        stage_after_views(
+            writer,
+            record,
+            &NOTICE_VIEWS_READY,
+            Duration::from_millis(250),
+        )
+        .await;
+    }
+}
+
+async fn stage_after_views(
+    writer: &Writer,
+    record: PullRecord,
+    views: &NoticeViewsReady,
+    budget: Duration,
+) {
+    if views.wait(budget).await {
         stage(writer, record, Duration::from_millis(50)).await;
     }
 }

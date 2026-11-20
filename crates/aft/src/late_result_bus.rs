@@ -32,6 +32,7 @@ pub(crate) use display::with_test_reader;
 pub(crate) mod readers;
 pub(crate) mod status;
 mod views;
+pub(crate) use views::{NoticeViewsReady, NOTICE_VIEWS_READY};
 
 const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
