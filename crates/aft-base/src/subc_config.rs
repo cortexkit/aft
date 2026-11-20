@@ -411,6 +411,67 @@ mod tests {
         check([None, None, None, None], Path::new(".config"));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_startup_moves_home_settings_to_appdata() {
+        const FIXTURE: &str = "AFT_TEST_WINDOWS_SETTINGS_RELOCATION";
+        const ORIGINAL: &str = "{\r\n  // keep this setting\r\n  \"bash\": true\r\n}\r\n";
+        if let Some(root) = std::env::var_os(FIXTURE).map(PathBuf::from) {
+            let legacy = root.join("home/.config/cortexkit/aft.jsonc");
+            let canonical = root.join("roaming/cortexkit/aft.jsonc");
+            let data = root.join("data");
+            assert_eq!(cortexkit_user_config_path(), Some(legacy.clone()));
+            assert_eq!(
+                startup_cortexkit_user_config_path(),
+                Some(canonical.clone())
+            );
+            assert!(
+                missing(&legacy),
+                "the production move must delete the old path"
+            );
+            let converted = std::fs::read_to_string(&canonical).unwrap();
+            assert!(converted.contains("// keep this setting\r\n"));
+            let strict = subc_jsonc::jsonc_to_json(&converted).unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&strict).unwrap();
+            assert_eq!(settings["bash"]["enabled"], true);
+            assert_eq!(cortexkit_user_config_path(), Some(canonical.clone()));
+            assert_eq!(startup_cortexkit_user_config_path(), Some(canonical));
+            let backups: Vec<_> = std::fs::read_dir(data)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(std::fs::read(&backups[0]).unwrap(), ORIGINAL.as_bytes());
+            return;
+        }
+
+        // Exercise filesystem operations and path resolution with real child
+        // environment variables; parallel tests keep their own environment.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let legacy = root.join("home/.config/cortexkit/aft.jsonc");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(legacy, ORIGINAL).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc_config::tests::windows_config_startup_moves_home_settings_to_appdata",
+            ])
+            .env(FIXTURE, root)
+            .env("HOME", root.join("home"))
+            .env("APPDATA", root.join("roaming"))
+            .env("AFT_STORAGE_DIR", root.join("data"))
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn settings_relocation_uses_canonical_file_even_if_legacy_delete_fails() {
         let dir = tempfile::tempdir().unwrap();
