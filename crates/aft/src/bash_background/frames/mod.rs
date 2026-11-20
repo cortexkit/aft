@@ -177,7 +177,9 @@ pub(crate) fn bash_tail(
 }
 
 pub(crate) fn bash_detail_byte_limit() -> u64 {
-    HOOKS.get().map_or(MAX_BASH_DETAIL_BYTES, |hooks| (hooks.bash_detail_byte_limit)())
+    HOOKS.get().map_or(MAX_BASH_DETAIL_BYTES, |hooks| {
+        (hooks.bash_detail_byte_limit)()
+    })
 }
 pub(crate) fn recovered_bash_frame(
     snapshot: super::registry::BgTaskSnapshot,

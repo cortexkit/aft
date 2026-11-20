@@ -63,7 +63,9 @@ fn display_detail_reads_only_the_lines_its_limit_can_show() {
         .unwrap();
     metadata.display = Some(TaskDisplay {
         identity: Identity {
-            runner: subc_protocol::Principal::Reserved { module_id: "broca".into() },
+            runner: subc_protocol::Principal::Reserved {
+                module_id: "broca".into(),
+            },
             call_key: "large-display".into(),
             schema_pin: pin.clone(),
         },

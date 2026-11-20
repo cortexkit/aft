@@ -27,8 +27,11 @@ impl BgTaskRegistry {
                     stdout.saturating_add(buffer.stream_len(StreamKind::Stderr))
                 }
             });
-        let (streams, unread, tail) = completion_preview::capture_reads::masked_display_streams(task, metadata, buffer)
-            .map_or((None, 0, None), |read| (Some(read.streams), read.unread, read.tail));
+        let (streams, unread, tail) =
+            completion_preview::capture_reads::masked_display_streams(task, metadata, buffer)
+                .map_or((None, 0, None), |read| {
+                    (Some(read.streams), read.unread, read.tail)
+                });
         let mut bodies = bash_bodies(metadata, Some(bytes), streams);
         bodies.tail = tail;
         if unread > 0 {
