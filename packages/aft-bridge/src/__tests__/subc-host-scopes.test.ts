@@ -490,9 +490,7 @@ test("a cached head scope refusal rechecks core before binding unscoped", async 
   client.scopeOpenError = new SubcError("core restarting", "module_reloading");
   const other = pool.getBridge(TEST_OTHER_ROOT);
   await other.toolCall("head", "read", {});
-  expect(client.opens.filter((open) => open.target.module_id === "prefrontal")).toHaveLength(
-    2,
-  );
+  expect(client.opens.filter((open) => open.target.module_id === "prefrontal")).toHaveLength(2);
   expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toBeUndefined();
   expect(clock.pending.size).toBe(1);
   client.refusal = undefined;
@@ -541,9 +539,9 @@ test("client reconnect waits for a fresh scope when the old lookup is cancelled"
   try {
     await settle();
     expect(replacement.opens.filter((open) => open.target.module_id === "aft")).toHaveLength(0);
-    expect(
-      replacement.opens.filter((open) => open.target.module_id === "prefrontal"),
-    ).toHaveLength(1);
+    expect(replacement.opens.filter((open) => open.target.module_id === "prefrontal")).toHaveLength(
+      1,
+    );
   } finally {
     releaseOld();
     releaseNew();
