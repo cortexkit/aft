@@ -15,6 +15,21 @@ export const RpcSession = Schema.Struct({
   sessionID: Schema.optional(Schema.String),
 });
 
+const BackgroundTaskSession = Schema.Struct({ sessionID: Schema.String });
+const StopBackgroundTaskInput = Schema.Struct({
+  sessionID: Schema.String,
+  taskID: Schema.String,
+});
+const BackgroundTask = Schema.Struct({
+  id: Schema.String,
+  command: Schema.optional(Schema.String),
+  workdir: Schema.optional(Schema.String),
+  elapsedMs: Schema.optional(Schema.Number),
+});
+const StopBackgroundTaskResult = Schema.Struct({
+  outcome: Schema.Literals(["stopped", "finished", "not-active"]),
+});
+
 export const IndexProgress = Schema.Struct({
   index: Schema.Literals(["search", "semantic"]),
   status: Schema.String,
@@ -34,6 +49,10 @@ export const HostToolOverlapNotice = Schema.Struct({
 });
 
 export type AftRpcSession = typeof RpcSession.Type;
+export type AftBackgroundTaskSession = typeof BackgroundTaskSession.Type;
+export type AftStopBackgroundTaskInput = typeof StopBackgroundTaskInput.Type;
+export type AftBackgroundTask = typeof BackgroundTask.Type;
+export type AftStopBackgroundTaskResult = typeof StopBackgroundTaskResult.Type;
 export type AftIndexProgress = typeof IndexProgress.Type;
 export type AftHostToolOverlapNotice = typeof HostToolOverlapNotice.Type;
 
@@ -43,6 +62,14 @@ export const AftRpc = Rpc.define({
     getStatus: {
       input: RpcSession,
       output: Schema.Record(Schema.String, Schema.Unknown),
+    },
+    getBackgroundTasks: {
+      input: BackgroundTaskSession,
+      output: Schema.mutable(Schema.Array(BackgroundTask)),
+    },
+    stopBackgroundTask: {
+      input: StopBackgroundTaskInput,
+      output: StopBackgroundTaskResult,
     },
   },
   events: {

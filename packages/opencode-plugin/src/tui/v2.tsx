@@ -9,6 +9,11 @@ import {
   formatStatusDialogMessage,
 } from "../shared/status";
 import { AftRpc } from "./aft-rpc";
+import {
+  type BackgroundTasksDialog,
+  type BackgroundTasksRpc,
+  showBackgroundTasksDialog,
+} from "./background-tasks";
 import { readTuiPreferencesFile, resolveAftPrefs, watchTuiPreferences } from "./preferences";
 import {
   AftSidebarPanel,
@@ -84,7 +89,7 @@ const BADGE_ACCENT_STEP: GaHueStep = "200";
 
 type V2TuiContext = {
   location?: unknown;
-  client: { rpc(definition: typeof AftRpc): AftRpcClient };
+  client: { rpc(definition: typeof AftRpc): AftRpcClient & BackgroundTasksRpc };
   /** Resolved for the active theme mode by the host; see GaResolvedTheme. */
   theme?: GaResolvedTheme;
   themeMode?: "dark" | "light";
@@ -92,7 +97,7 @@ type V2TuiContext = {
     layer(input: () => { commands: Array<Record<string, unknown>>; bindings: string[] }): void;
   };
   ui: {
-    dialog: { alert(input: { title: string; message: string }): Promise<void> };
+    dialog: BackgroundTasksDialog;
     toast?: {
       show(input: {
         title?: string;
@@ -351,7 +356,7 @@ async function showStatusDialog(
 // Rendering this component instead puts the call inside the provider tree,
 // which is where the contract allows it. The component renders nothing; it
 // exists only to own the layer, and is mounted through the `app` slot below.
-function AftStatusCommands(props: { context: V2TuiContext; rpc: AftRpcClient }) {
+function AftCommands(props: { context: V2TuiContext; rpc: AftRpcClient & BackgroundTasksRpc }) {
   props.context.keymap.layer(() => ({
     // A layer without a mode is limited to the host's base input mode, and the
     // command palette runs as a dialog, which switches the mode away from base.
@@ -370,6 +375,21 @@ function AftStatusCommands(props: { context: V2TuiContext; rpc: AftRpcClient }) 
         // submitted to the model.
         slash: { name: "aft-status" },
         run: () => showStatusDialog(props.context, props.rpc, activeSessionID(props.context)),
+      },
+      {
+        id: "aft.tasks",
+        title: "AFT: Background Tasks",
+        description: "View and stop background tasks in this session",
+        group: "AFT",
+        palette: true,
+        slash: { name: "aft-tasks" },
+        run: () =>
+          showBackgroundTasksDialog(
+            props.context.ui.dialog,
+            props.rpc,
+            () => activeSessionID(props.context),
+            props.context.location,
+          ),
       },
     ],
     bindings: [],
@@ -420,7 +440,7 @@ export async function setupV2Tui(context: V2TuiContext): Promise<() => void> {
     // completion are.
     context.ui.slot({
       append: "app",
-      render: () => <AftStatusCommands context={context} rpc={rpc} />,
+      render: () => <AftCommands context={context} rpc={rpc} />,
     }),
     context.ui.slot({
       append: "prompt.footer.status",
