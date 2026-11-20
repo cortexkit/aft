@@ -8320,9 +8320,7 @@ impl BgTaskRegistry {
             BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
         ) {
             let mut marker = read_exit_marker(&paths).ok().flatten();
-            let process_alive = if marker.is_none()
-                && (metadata.status == BgTaskStatus::Starting || metadata.mode != BgMode::Pty)
-            {
+            let process_alive = if marker.is_none() {
                 let alive = process_is_alive(&metadata);
                 #[cfg(target_os = "linux")]
                 let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
@@ -8409,11 +8407,7 @@ impl BgTaskRegistry {
                         self.insert_rehydrated_task(metadata, paths, true)?;
                     } else {
                         let completion_was_delivered = metadata.completion_delivered;
-                        metadata.mark_terminal(
-                            BgTaskStatus::Killed,
-                            None,
-                            Some("pty_lost_on_bridge_restart".to_string()),
-                        );
+                        pty_replay::settle_unattached_pty(&mut metadata, &paths, process_alive);
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -18588,6 +18582,9 @@ mod completion_preview;
 #[path = "watch_scan.rs"]
 mod watch_scan;
 
+#[path = "pty_replay.rs"]
+mod pty_replay;
+
 fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     let warning = metadata
         .remote
@@ -20234,6 +20231,73 @@ mod tests {
         loop {
             std::thread::park();
         }
+    }
+
+    #[cfg(unix)]
+    fn persisted_running_pty(storage: &Path, id: &str, pid: u32) -> TaskPaths {
+        let layout = create_task_layout(storage, "session", id).unwrap();
+        drop(TaskIoHandles::create(&layout, BgMode::Pty, false).unwrap());
+        let mut metadata = PersistedTask::starting(
+            id.to_string(),
+            "session".to_string(),
+            "sleep 30".to_string(),
+            storage.to_path_buf(),
+            Some(storage.to_path_buf()),
+            Some(30_000),
+            true,
+            false,
+        );
+        metadata.mode = BgMode::Pty;
+        metadata.mark_running(pid, pid as i32);
+        metadata.started_at = unix_millis();
+        write_task(&layout.paths.json, &metadata).unwrap();
+        layout.paths
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_stops_a_pty_command_that_survived_the_restart() {
+        use std::os::unix::process::CommandExt;
+        let storage = tempfile::tempdir().unwrap();
+        // Its own process group, like a PTY child that ignored the hangup.
+        let mut survivor = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let paths = persisted_running_pty(storage.path(), "bash-00000000000000a1", survivor.id());
+        BgTaskRegistry::default()
+            .replay_session(storage.path(), "session")
+            .unwrap();
+        let metadata = read_task(&paths.json).unwrap();
+        let exited = survivor.try_wait().unwrap();
+        if exited.is_none() {
+            let _ = survivor.kill();
+            let _ = survivor.wait();
+        }
+        assert_eq!(metadata.status, BgTaskStatus::Killed);
+        assert!(
+            exited.is_some(),
+            "replay reported Killed but left the command running"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replay_reports_a_vanished_pty_command_as_fate_unknown() {
+        let storage = tempfile::tempdir().unwrap();
+        let mut gone = std::process::Command::new("true").spawn().unwrap();
+        let pid = gone.id();
+        gone.wait().unwrap();
+        let paths = persisted_running_pty(storage.path(), "bash-00000000000000a2", pid);
+        BgTaskRegistry::default()
+            .replay_session(storage.path(), "session")
+            .unwrap();
+        assert_eq!(
+            read_task(&paths.json).unwrap().status,
+            BgTaskStatus::FateUnknown,
+            "nothing stopped this command, so its outcome is unknown, not killed"
+        );
     }
 
     #[cfg(target_os = "linux")]
