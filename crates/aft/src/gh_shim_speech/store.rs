@@ -189,7 +189,10 @@ impl Store {
     }
 
     pub(crate) fn connect(&self) -> Result<TrackedConnection, Refusal> {
-        let conn = rows::connect(&self.path).map_err(db_error)?;
+        Self::checked_connection(rows::connect(&self.path).map_err(db_error)?)
+    }
+
+    fn checked_connection(conn: TrackedConnection) -> Result<TrackedConnection, Refusal> {
         let mode: String = conn
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .map_err(db_error)?;
@@ -268,7 +271,13 @@ impl Store {
                 "task_unverifiable",
             ));
         }
-        let mut conn = self.connect()?;
+        let mut conn = Self::checked_connection(
+            rows::connect_with_busy_timeout(&self.path, crate::db::TOOL_RETRY_BUSY_WAIT)
+                .map_err(db_error)?,
+        )?;
+        // Reading the committed revocation does not need the write lock. Recheck
+        // inside the transaction in case a revocation committed while we waited.
+        check_not_revoked(&conn, incarnation)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;

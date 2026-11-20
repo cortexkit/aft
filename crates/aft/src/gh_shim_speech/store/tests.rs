@@ -291,6 +291,34 @@ fn candidate_revocation_prevents_seal_activation_and_promotion_without_a_digest(
 }
 
 #[test]
+fn restarted_seal_reports_committed_revocation_under_a_write_lock() {
+    let (_dir, store, record) = fixture();
+    let mut writer = store.connect().unwrap();
+    store.capture(&record).unwrap();
+    store.revoke(&record.incarnation, "cancelled").unwrap();
+
+    let write_tx = writer
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let restarted = Store::new(store.path());
+    let error = restarted
+        .seal(
+            &record.incarnation,
+            &ExecutionSeal {
+                child_pid: 1,
+                child_start_time_ms: 2,
+                birth_identity: "birth".into(),
+            },
+        )
+        .unwrap_err();
+    assert_eq!(
+        (error.code, error.reason.as_str()),
+        (Code::AuthorityUnavailable, "revoked")
+    );
+    write_tx.rollback().unwrap();
+}
+
+#[test]
 fn task_marker_can_precede_association_creation() {
     let (_dir, store, record) = fixture();
     store
