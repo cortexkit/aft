@@ -275,6 +275,69 @@ async fn cancel_and_revoke_queued_edits(
         .any(|f| f.header.channel == 3 && f.header.corr == 741));
 }
 
+#[cfg(unix)]
+async fn refuses_checkout_control_edits(peer: &mut Peer, root: &Path) {
+    let git = |args: &[&str]| {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "--local", "core.hooksPath", "tools/git-hooks"]);
+    for dir in [".cortexkit/aft/filters", "tools/git-hooks"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    let config = std::fs::read(root.join(".git/config")).unwrap();
+    for path in [
+        ".cortexkit/aft.jsonc",
+        ".cortexkit/aft/filters/custom",
+        "tools/git-hooks/config",
+    ] {
+        std::fs::write(root.join(path), "original\n").unwrap();
+    }
+    std::os::unix::fs::symlink(".git", root.join("git-alias")).unwrap();
+    std::os::unix::fs::symlink(".cortexkit/aft.jsonc", root.join("aft-alias")).unwrap();
+    let paths = [
+        ".git/config",
+        ".git/hooks/pre-commit",
+        ".cortexkit/aft.jsonc",
+        ".cortexkit/aft/filters/custom",
+        "tools/git-hooks/config",
+        "git-alias/config",
+        "aft-alias",
+    ];
+    let mut corr = 1500;
+    for path in paths {
+        for (name, args) in [
+            ("write", json!({"path":path,"content":"changed"})),
+            (
+                "edit",
+                json!({"path":path,"edits":[{"oldString":"original","newString":"changed"}]}),
+            ),
+            (
+                "apply_patch",
+                json!({"patchText":format!("*** Begin Patch\n*** Add File: {path}\n+changed\n*** End Patch")}),
+            ),
+        ] {
+            refusal(
+                peer.call(3, corr, tool(name, args, corr)).await,
+                "denied_floor",
+            );
+            corr += 1;
+        }
+    }
+    assert_eq!(std::fs::read(root.join(".git/config")).unwrap(), config);
+    assert!(!root.join(".git/hooks/pre-commit").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.join(".cortexkit/aft.jsonc")).unwrap(),
+        "original\n"
+    );
+}
+
 #[test]
 fn every_remote_edit_spelling_requires_read_write() {
     for (name, canonical) in [
@@ -691,7 +754,10 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
             "inside\n"
         );
         #[cfg(unix)]
-        exercise_external_tools(&mut peer, &mut cards, &ctx, root.as_path()).await;
+        {
+            exercise_external_tools(&mut peer, &mut cards, &ctx, root.as_path()).await;
+            refuses_checkout_control_edits(&mut peer, root.as_path()).await;
+        }
         cancel_and_revoke_queued_edits(&mut peer, &executor, &root, &saved_edit).await;
         write_frame(
             &mut peer.daemon,

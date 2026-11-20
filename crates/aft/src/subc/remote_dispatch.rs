@@ -197,7 +197,7 @@ impl FileTool {
             .session_id
             .as_deref()
             .expect("remote file-tool session");
-        edit_paths::check(ctx, id, session, paths)
+        edit_paths::check(ctx, id, session, &self.context.project_root, paths)
     }
 
     pub(super) fn run(

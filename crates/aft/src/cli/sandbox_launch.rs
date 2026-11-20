@@ -439,6 +439,9 @@ fn apply_remote_sandbox(_: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 }
 
 #[cfg(target_os = "linux")]
+const REMOTE_PROTECTED_GRANT: &str = "remote shell grant overlaps a protected path";
+
+#[cfg(target_os = "linux")]
 fn apply_remote_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     if profile.mode != aft::config::SandboxMode::Strict {
         return Err(SandboxLaunchError::unavailable(
@@ -452,9 +455,8 @@ fn apply_remote_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchErr
         .chain(profile.write_allow_roots());
     for path in granted {
         if profile
-            .write_deny_nested
+            .keychain_deny
             .iter()
-            .chain(&profile.keychain_deny)
             .any(|deny| paths_overlap(path, deny))
             || profile.deny_prefixes.iter().any(|prefix| {
                 path.as_os_str()
@@ -463,12 +465,10 @@ fn apply_remote_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchErr
                     || prefix.starts_with(path)
             })
         {
-            return Err(SandboxLaunchError::unavailable(
-                "remote shell grant overlaps a protected path",
-            ));
+            return Err(SandboxLaunchError::unavailable(REMOTE_PROTECTED_GRANT));
         }
     }
-    landlock_backend::apply(profile).map_err(SandboxLaunchError::unavailable)?;
+    landlock_backend::apply_remote(profile).map_err(SandboxLaunchError::unavailable)?;
     // The failure channel closes on exec. Do not delegate the other reserved
     // launcher descriptor or any host service to the untrusted shell.
     unsafe { libc::close(4) };

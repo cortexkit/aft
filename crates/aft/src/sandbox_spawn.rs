@@ -57,6 +57,10 @@ use crate::sandbox_profile::SandboxProfile;
 
 #[cfg(unix)]
 mod build_slots;
+mod checkout_controls;
+#[cfg(unix)]
+use checkout_controls::checkout_control_denies;
+pub(crate) use checkout_controls::remote_control_denies;
 pub(crate) mod remote;
 #[doc(hidden)]
 pub mod remote_shell_guard;
@@ -2543,45 +2547,6 @@ fn git_worktree_registration_inputs(common_dir: &Path) -> Option<GitPolicyInputs
     }
     inputs.listed_dirs.push((registrations, names));
     Some(inputs)
-}
-
-/// Build the same control-file denies for project and granted write roots,
-/// including a linked worktree's common Git directory. Backends that cannot
-/// enforce nested denies report those paths as unenforced.
-#[cfg(unix)]
-fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>, String> {
-    let mut denies = Vec::new();
-    let git_dirs = if git.read_roots.is_empty() {
-        vec![root.join(".git")]
-    } else {
-        git.read_roots.clone()
-    };
-    for dir in git_dirs {
-        denies.extend(["config", "config.worktree", "hooks"].map(|name| dir.join(name)));
-    }
-    denies.extend(git.hooks.iter().cloned());
-    denies.extend(
-        git.configured_paths
-            .iter()
-            .filter(|(key, _)| key != "core.excludesFile")
-            .map(|(_, path)| path.clone()),
-    );
-    denies.extend(resolve_missing_repository_hooks(
-        root,
-        git,
-        &mut Vec::new(),
-    )?);
-    if let Some((git_dir, _)) = &git.linked {
-        // Binding pointers must stay immutable too: redirecting one would
-        // replace the operator-owned configuration used on the next spawn.
-        denies.push(root.join(".git"));
-        denies.extend(["commondir", "gitdir"].map(|name| git_dir.join(name)));
-    }
-    denies.extend([
-        root.join(".cortexkit/aft.jsonc"),
-        root.join(".cortexkit/aft/filters"),
-    ]);
-    Ok(denies)
 }
 
 /// Credential clients may use HOME, the password database, or explicit config

@@ -128,7 +128,7 @@ pub(crate) fn prepare_with_launcher(
     let mut profile = SandboxProfile::build(
         vec![folder.to_path_buf()],
         writable_deny,
-        Vec::new(),
+        native::checkout_control_denies(folder, &native::resolve_git_policy(folder)?)?,
         reads,
         policy.absolute_floor,
         Vec::new(),

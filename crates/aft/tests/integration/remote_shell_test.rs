@@ -76,6 +76,28 @@ async fn native() {
     fs::create_dir_all(&shims).unwrap();
     symlink(executable, shims.join("gh")).unwrap();
     fs::write(project.join("inside"), "project contents").unwrap();
+    for dir in ["src", ".cortexkit", "tools/git-hooks"] {
+        fs::create_dir_all(project.join(dir)).unwrap();
+    }
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    };
+    git(&["init", "-q"]);
+    git(&["config", "--local", "core.hooksPath", "tools/git-hooks"]);
+    let git_config = fs::read(project.join(".git/config")).unwrap();
+    fs::write(project.join(".cortexkit/aft.jsonc"), "{}\n").unwrap();
+    fs::write(project.join("src/x"), "before").unwrap();
+    fs::write(project.join("top-existing"), "before").unwrap();
+    fs::write(project.join("tools/ordinary"), "before").unwrap();
+    symlink(".git/hooks", project.join("hook-link")).unwrap();
+    symlink("../.git/config", project.join("src/config-link")).unwrap();
+    fs::hard_link(project.join("inside"), project.join("ordinary-link")).unwrap();
     fs::write(other.join("credential"), TOKEN).unwrap();
     fs::write(ctx.storage_dir().join("private"), TOKEN).unwrap();
     let upstream = project.join("upstream-gh");
@@ -123,7 +145,13 @@ print('service control: ' + sys.argv[1])
     let command = format!(
         r#"set -eu
 test "$(cat inside)" = 'project contents'
-printf writable > project-write
+printf writable > src/x
+printf writable > top-existing
+for protected in .git/config .git/hooks/pre-commit .cortexkit/aft.jsonc hook-link/pre-commit src/config-link tools/git-hooks/pre-commit tools/ordinary ordinary-link project-write; do
+  if (printf refused > "$protected"); then echo "unexpected write: $protected"; exit 16; fi
+done
+if ln top-existing src/top-link || mv top-existing src/top-moved; then exit 17; fi
+if ln src/x "$TMPDIR/cross-link" || mv src/x "$TMPDIR/cross-move"; then exit 18; fi
 printf scratch > "$TMPDIR/scratch-write"
 if cat '{}' || cat '{}' || printf nope > '{}/unregistered'; then exit 11; fi
 test -z "${{GH_TOKEN-}}${{GITHUB_TOKEN-}}${{GH_ENTERPRISE_TOKEN-}}"
@@ -156,6 +184,41 @@ printf 'native confinement checked\n'
         "{result:?}"
     );
     assert!(!base.join("unregistered").exists());
+    assert_eq!(fs::read(project.join(".git/config")).unwrap(), git_config);
+    assert_eq!(
+        fs::read_to_string(project.join(".cortexkit/aft.jsonc")).unwrap(),
+        "{}\n"
+    );
+    for path in [
+        ".git/hooks/pre-commit",
+        "tools/git-hooks/pre-commit",
+        "project-write",
+        "src/top-link",
+        "src/top-moved",
+    ] {
+        assert!(!project.join(path).exists(), "unexpected {path}");
+    }
+    for path in ["src/x", "top-existing"] {
+        assert_eq!(fs::read_to_string(project.join(path)).unwrap(), "writable");
+    }
+    for alias in ["config-hardlink", "src/config-hardlink"] {
+        fs::hard_link(project.join(".git/config"), project.join(alias)).unwrap();
+        let result = run_remote_shell_for_test(
+            &ctx,
+            &project,
+            executable,
+            format!("printf refused > {alias}; touch src/shell-started"),
+            Duration::from_secs(15),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "protected inode alias did not refuse launch: {result:?}"
+        );
+        assert!(!project.join("src/shell-started").exists());
+        assert_eq!(fs::read(project.join(".git/config")).unwrap(), git_config);
+        fs::remove_file(project.join(alias)).unwrap();
+    }
 
     fs::write(
         project.join("daemon.py"),
@@ -174,6 +237,7 @@ while True: time.sleep(10)
 "#,
     )
     .unwrap();
+    fs::write(project.join("daemon-pid"), "").unwrap();
     let result = run_remote_shell_for_test(&ctx, &project, executable, "python3 daemon.py; while [[ ! -s daemon-pid ]]; do sleep .02; done; echo before-timeout; sleep 20".into(), Duration::from_secs(2)).await.unwrap();
     assert_eq!(result.response.data["timedOut"], true, "{result:?}");
     assert!(result.text.contains("before-timeout"), "{result:?}");
