@@ -421,6 +421,7 @@ impl WatchRegistry {
         scan_bytes.extend_from_slice(&overlap);
         scan_bytes.extend_from_slice(bytes);
         let text = String::from_utf8_lossy(&scan_bytes);
+        let offsets = LossyOffsets::new(&scan_bytes);
         let scan_base_offset = base_offset.saturating_sub(prefix_len as u64);
         let mut matches = Vec::new();
         let mut remove_once = Vec::new();
@@ -433,7 +434,7 @@ impl WatchRegistry {
             if let Some(((text_start, text_end, source_start, source_end), more)) = find_match(
                 &watch.pattern,
                 &text,
-                &scan_bytes,
+                &offsets,
                 prefix_len,
                 end_held,
                 at_end,
@@ -501,7 +502,7 @@ impl WatchRegistry {
 fn find_match(
     pattern: &WatchPattern,
     text: &str,
-    source: &[u8],
+    offsets: &LossyOffsets,
     prefix_len: usize,
     end_held: bool,
     at_end: bool,
@@ -532,15 +533,9 @@ fn find_match(
             *held = true;
             return None;
         }
-        let source_end = source_offset_for_lossy_utf8(source, end);
-        (source_end > min_source_end_exclusive).then(|| {
-            (
-                start,
-                end,
-                source_offset_for_lossy_utf8(source, start),
-                source_end,
-            )
-        })
+        let source_end = offsets.source_offset(end);
+        (source_end > min_source_end_exclusive)
+            .then(|| (start, end, offsets.source_offset(start), source_end))
     })?;
     // Matches do not overlap, so every later one ends after the first and so
     // past the overlap. A later regex match still being written is held for
@@ -559,37 +554,98 @@ fn find_match(
     Some((first, more))
 }
 
-fn source_offset_for_lossy_utf8(source: &[u8], lossy_offset: usize) -> usize {
-    let mut source_start = 0;
-    let mut rendered_start = 0;
-    while source_start < source.len() {
-        match std::str::from_utf8(&source[source_start..]) {
-            Ok(valid) => {
-                return source_start
-                    .saturating_add(lossy_offset.saturating_sub(rendered_start).min(valid.len()));
-            }
-            Err(error) => {
-                let valid_len = error.valid_up_to();
-                let rendered_valid_end = rendered_start.saturating_add(valid_len);
-                if lossy_offset <= rendered_valid_end {
-                    return source_start
-                        .saturating_add(lossy_offset.saturating_sub(rendered_start));
-                }
-                source_start = source_start.saturating_add(valid_len);
-                rendered_start = rendered_valid_end;
+/// Maps byte offsets in `String::from_utf8_lossy(source)` back to `source`.
+/// Built once per scan, so each match costs a binary search rather than a
+/// fresh decode of the whole scan buffer.
+struct LossyOffsets {
+    /// Runs of `source` that decode byte for byte, each but the last followed
+    /// by an invalid sequence that renders as one U+FFFD.
+    runs: Vec<LossyRun>,
+    source_len: usize,
+}
 
-                let invalid_len = error
-                    .error_len()
-                    .unwrap_or_else(|| source.len().saturating_sub(source_start));
-                if lossy_offset < rendered_start.saturating_add('\u{FFFD}'.len_utf8()) {
-                    return source_start;
+struct LossyRun {
+    rendered: usize,
+    source: usize,
+    valid: usize,
+    /// Bytes of the invalid sequence after the run; 0 for the final run.
+    invalid: usize,
+}
+
+impl LossyOffsets {
+    fn new(source: &[u8]) -> Self {
+        let replacement = '\u{FFFD}'.len_utf8();
+        let mut runs = Vec::new();
+        let (mut source_start, mut rendered_start) = (0, 0);
+        while source_start < source.len() {
+            #[cfg(test)]
+            count_validated_bytes(source.len() - source_start);
+            match std::str::from_utf8(&source[source_start..]) {
+                Ok(valid) => {
+                    runs.push(LossyRun {
+                        rendered: rendered_start,
+                        source: source_start,
+                        valid: valid.len(),
+                        invalid: 0,
+                    });
+                    break;
                 }
-                source_start = source_start.saturating_add(invalid_len);
-                rendered_start = rendered_start.saturating_add('\u{FFFD}'.len_utf8());
+                Err(error) => {
+                    let valid = error.valid_up_to();
+                    let invalid = error
+                        .error_len()
+                        .unwrap_or(source.len() - source_start - valid);
+                    runs.push(LossyRun {
+                        rendered: rendered_start,
+                        source: source_start,
+                        valid,
+                        invalid,
+                    });
+                    source_start += valid + invalid;
+                    rendered_start += valid + replacement;
+                }
             }
         }
+        Self {
+            runs,
+            source_len: source.len(),
+        }
     }
-    source.len()
+
+    /// The `source` offset of byte `lossy_offset` of the decoded text. An
+    /// offset inside a U+FFFD maps to the start of the invalid sequence it
+    /// stands for.
+    fn source_offset(&self, lossy_offset: usize) -> usize {
+        let Some(run) = self
+            .runs
+            .partition_point(|run| run.rendered <= lossy_offset)
+            .checked_sub(1)
+            .map(|index| &self.runs[index])
+        else {
+            return self.source_len;
+        };
+        let offset = lossy_offset - run.rendered;
+        if run.invalid == 0 {
+            run.source + offset.min(run.valid)
+        } else if offset <= run.valid {
+            run.source + offset
+        } else if offset < run.valid + '\u{FFFD}'.len_utf8() {
+            run.source + run.valid
+        } else {
+            run.source + run.valid + run.invalid
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static VALIDATED_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes handed to UTF-8 validation while mapping match offsets.
+#[cfg(test)]
+fn count_validated_bytes(bytes: usize) {
+    VALIDATED_BYTES.with(|count| count.set(count.get() + bytes));
 }
 
 pub fn context_snippet(text: &str, start: usize, end: usize) -> String {
@@ -855,6 +911,82 @@ mod tests {
 
     fn found(hits: Vec<(PatternMatch, u64)>) -> Vec<PatternMatch> {
         hits.into_iter().map(|(hit, _)| hit).collect()
+    }
+
+    /// The per-offset decode the scan used before [`LossyOffsets`], kept as
+    /// the reference its answers must equal.
+    fn decoded_source_offset(source: &[u8], lossy_offset: usize) -> usize {
+        let (mut source_start, mut rendered_start) = (0, 0);
+        while source_start < source.len() {
+            match std::str::from_utf8(&source[source_start..]) {
+                Ok(valid) => {
+                    return source_start
+                        + lossy_offset.saturating_sub(rendered_start).min(valid.len());
+                }
+                Err(error) => {
+                    let valid_len = error.valid_up_to();
+                    if lossy_offset <= rendered_start + valid_len {
+                        return source_start + lossy_offset.saturating_sub(rendered_start);
+                    }
+                    source_start += valid_len;
+                    rendered_start += valid_len;
+                    let invalid_len = error.error_len().unwrap_or(source.len() - source_start);
+                    if lossy_offset < rendered_start + 3 {
+                        return source_start;
+                    }
+                    source_start += invalid_len;
+                    rendered_start += 3;
+                }
+            }
+        }
+        source.len()
+    }
+
+    #[test]
+    fn lossy_offsets_match_a_fresh_decode_at_every_offset() {
+        let mut seed = 0x5eed_u64;
+        for round in 0..300 {
+            let mut source = Vec::new();
+            for _ in 0..(round % 40) {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                // Mostly ASCII, with multi-byte starts and stray continuations.
+                source.push(match (seed >> 33) % 8 {
+                    0 => 0xe2,
+                    1 => 0x82,
+                    2 => 0xff,
+                    3 => 0xc3,
+                    _ => b'a' + (seed >> 40) as u8 % 26,
+                });
+            }
+            let offsets = LossyOffsets::new(&source);
+            let rendered = String::from_utf8_lossy(&source).len();
+            for lossy in 0..=rendered + 4 {
+                assert_eq!(
+                    offsets.source_offset(lossy),
+                    decoded_source_offset(&source, lossy),
+                    "{source:?} at {lossy}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dense_matches_in_the_overlap_cost_one_decode_per_scan() {
+        let mut registry = WatchRegistry::default();
+        registry
+            .register("bash-1".into(), WatchPattern::Substring("a".into()), false)
+            .unwrap();
+        let chunk = vec![b'a'; 64 * 1024];
+        registry.scan_new_bytes("bash-1", &chunk);
+        VALIDATED_BYTES.with(|count| count.set(0));
+        // Every byte of the 8 KiB overlap is a rejected candidate.
+        assert_eq!(registry.scan_new_bytes("bash-1", &chunk).len(), 1);
+        let validated = VALIDATED_BYTES.with(std::cell::Cell::get);
+        let scanned = chunk.len() + SCAN_OVERLAP_BYTES;
+        assert!(
+            validated <= scanned,
+            "decoded {validated} bytes to scan {scanned}"
+        );
     }
 
     fn chunk(registry: &mut WatchRegistry, bytes: &[u8], start: u64) -> Vec<(String, u64)> {
