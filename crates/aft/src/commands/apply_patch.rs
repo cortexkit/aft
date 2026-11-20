@@ -408,10 +408,10 @@ fn snapshot_for_write_once(
 fn restore_pre_write_state(path: &Path, existed: bool, original: Option<&str>) {
     if existed {
         if let Some(original) = original {
-            let _ = fs::write(path, original);
+            let _ = edit::remote_links::restore(path, original.as_bytes());
         }
     } else if path.exists() {
-        let _ = fs::remove_file(path);
+        let _ = edit::remote_links::unlink(path);
     }
 }
 
@@ -525,7 +525,7 @@ fn delete_file_with_backup(
         true
     };
 
-    if let Err(error) = fs::remove_file(path) {
+    if let Err(error) = edit::remote_links::unlink(path) {
         if snapshot_taken {
             discard_latest_backup(ctx, req, op_id, path);
             backed_paths.remove(path);
@@ -918,7 +918,7 @@ fn apply_move_update(
         Ok(outcome) => outcome,
         Err(error) => {
             if !dest_existed && dest.abs.exists() {
-                let _ = fs::remove_file(&dest.abs);
+                let _ = edit::remote_links::unlink(&dest.abs);
             }
             return Err(error);
         }
@@ -956,7 +956,7 @@ fn apply_move_update(
         true
     };
 
-    if let Err(error) = fs::remove_file(&resolved.source.abs) {
+    if let Err(error) = edit::remote_links::unlink(&resolved.source.abs) {
         if source_snapshot_taken {
             discard_latest_backup(ctx, req, op_id, &resolved.source.abs);
             backed_paths.remove(&resolved.source.abs);
@@ -1006,10 +1006,11 @@ fn rollback_move_destination(
 ) -> Result<(), String> {
     if dest_existed {
         if let Some(snapshot) = dest_snapshot {
-            fs::write(dest, snapshot).map_err(|error| error.to_string())?;
+            edit::remote_links::restore(dest, snapshot.as_bytes())
+                .map_err(|error| error.to_string())?;
         }
     } else if dest.exists() {
-        fs::remove_file(dest).map_err(|error| error.to_string())?;
+        edit::remote_links::unlink(dest).map_err(|error| error.to_string())?;
     }
     // Recovery data is only expendable after the destination is restored.
     if dest_snapshot_taken {

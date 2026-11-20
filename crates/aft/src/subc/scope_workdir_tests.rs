@@ -9,7 +9,7 @@ pub(super) fn take_comparison_observer() -> Option<oneshot::Sender<()>> {
     COMPARISON_OBSERVER.with(|observer| observer.borrow_mut().take())
 }
 
-fn observe_next_comparison() -> oneshot::Receiver<()> {
+pub(super) fn observe_next_comparison() -> oneshot::Receiver<()> {
     let (tx, rx) = oneshot::channel();
     COMPARISON_OBSERVER.with(|observer| assert!(observer.borrow_mut().replace(tx).is_none()));
     rx

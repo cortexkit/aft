@@ -102,3 +102,77 @@ mod tests {
         assert!(status::test_value(other).is_none());
     }
 }
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn process_route_bind_completion(
+    writer_tx: &WriterSender,
+    completion: ControlCompletion,
+    a0: &A0Egress,
+    on_management_install: impl FnOnce(&ManagementIdentity),
+    management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
+    routes: &mut HashMap<RouteChannel, RouteIdentity>,
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
+    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
+    installed_route_epochs: &mut HashMap<u16, u32>,
+    executor: &Arc<Executor>,
+    shutdown: &Arc<Notify>,
+    metrics: &Arc<DispatchPathMetrics>,
+    lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+) -> Result<(), SubcError> {
+    decrement_counted_channel(&metrics.control_completion_queued);
+    let (completion, ack_written) = match completion {
+        ControlCompletion::ConfigureReady(completion) => (completion, false),
+        ControlCompletion::AckWritten(completion) => (completion, true),
+        ControlCompletion::AckCancelled(completion) => match *completion {
+            ControlCompletion::AckWritten(completion) => (completion, false),
+            ControlCompletion::ManagementAckWritten { route, .. } => {
+                a0.retire(route);
+                remove_installed_route(installed_route_epochs, route);
+                return Ok(());
+            }
+            ControlCompletion::BindRetracted { route, .. } => {
+                a0.retire(route);
+                remove_installed_route(installed_route_epochs, route);
+                return Ok(());
+            }
+            _ => return Err(SubcError::WriterClosed),
+        },
+        ControlCompletion::ManagementAckWritten {
+            route, identity, ..
+        } => {
+            a0.retire(route);
+            if installed_route_epochs.get(&route.channel) == Some(&route.epoch) {
+                on_management_install(&identity);
+                management_routes.insert(route, identity);
+            }
+            return Ok(());
+        }
+        ControlCompletion::WriteFailed => return Err(SubcError::WriterClosed),
+        ControlCompletion::BindRetracted { route, .. } => {
+            a0.retire(route);
+            remove_installed_route(installed_route_epochs, route);
+            return Ok(());
+        }
+    };
+    handle_route_bind_completion(
+        writer_tx,
+        completion,
+        ack_written,
+        a0,
+        routes,
+        root_channels,
+        session_identity,
+        push_buffer,
+        live_roots,
+        pending_binds,
+        installed_route_epochs,
+        executor,
+        shutdown,
+        metrics,
+        lifecycle_probe,
+    )
+    .await
+}

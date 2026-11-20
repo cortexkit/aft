@@ -299,7 +299,7 @@ pub(super) fn install_test_transport(transport: Option<Arc<dyn ConsentTransport>
         .unwrap_or_else(std::sync::PoisonError::into_inner) = transport;
 }
 
-fn transport() -> Option<Arc<dyn ConsentTransport>> {
+pub(super) fn transport() -> Option<Arc<dyn ConsentTransport>> {
     #[cfg(test)]
     {
         let test = TEST_TRANSPORT
@@ -1738,7 +1738,7 @@ enum Prep {
     Busy,
 }
 
-fn selector(stamp: &subc_protocol::scope::ScopeStamp) -> ScopeSelector {
+pub(super) fn selector(stamp: &subc_protocol::scope::ScopeStamp) -> ScopeSelector {
     ScopeSelector::new(
         stamp.owner.clone(),
         stamp.scope_ref.clone(),
@@ -1800,7 +1800,7 @@ fn with_head_policy<T, R>(
     )
 }
 
-fn new_call_key() -> String {
+pub(super) fn new_call_key() -> String {
     let mut id = [0u8; 16];
     getrandom::fill(&mut id).expect("operating system random source for consent call keys");
     let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();

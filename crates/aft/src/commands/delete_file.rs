@@ -1040,6 +1040,8 @@ fn unlink_pinned(req: &RawRequest, ctx: &AppContext, path: &Path) -> Result<(), 
     let name = std::ffi::CString::new(name.as_bytes()).map_err(|error| {
         UnlinkError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
     })?;
+    crate::edit::remote_links::check_at(directory.as_raw_fd(), &name, path)
+        .map_err(UnlinkError::Io)?;
     // SAFETY: `directory` is an open descriptor for the whole call and `name`
     // is a NUL-terminated single path component.
     if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
@@ -1100,6 +1102,7 @@ fn unlink_pinned(req: &RawRequest, ctx: &AppContext, path: &Path) -> Result<(), 
     }
     #[cfg(test)]
     unlink_seam(UnlinkStage::BeforeUnlink);
+    crate::edit::remote_links::check_open(&entry, path).map_err(UnlinkError::Io)?;
     dispose(&entry).map_err(UnlinkError::Io)?;
     drop(entry);
     Ok(())

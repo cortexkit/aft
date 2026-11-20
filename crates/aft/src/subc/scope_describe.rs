@@ -10,6 +10,8 @@ use indexed_scopes::IndexedScopes;
 #[path = "scope_routes.rs"]
 mod scope_routes;
 use scope_routes::RoutedScopes;
+#[path = "scope_describe_remote.rs"]
+pub(super) mod remote;
 
 pub(super) fn describe_timeout() -> Duration {
     timing(

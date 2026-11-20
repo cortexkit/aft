@@ -2424,7 +2424,7 @@ fn search_path_exists(project_root: &Path, raw: &str) -> bool {
     resolve_path_from_project_root(project_root, raw).exists()
 }
 
-fn split_search_path_arg(project_root: &Path, raw: &str) -> Vec<String> {
+pub(crate) fn split_search_path_arg(project_root: &Path, raw: &str) -> Vec<String> {
     if search_path_exists(project_root, raw) || !raw.chars().any(char::is_whitespace) {
         return vec![raw.to_string()];
     }

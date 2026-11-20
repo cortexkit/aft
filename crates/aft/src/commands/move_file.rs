@@ -200,6 +200,9 @@ fn move_file_on_disk(src_path: &Path, dst_path: &Path) -> MoveOutcome {
             MoveOutcome::Moved
         }
         Err(rename_error) => {
+            if let Err(error) = crate::edit::remote_links::check_path(src_path) {
+                return MoveOutcome::Failed(error.to_string());
+            }
             let source_is_symlink = fs::symlink_metadata(src_path)
                 .is_ok_and(|metadata| metadata.file_type().is_symlink());
             if source_is_symlink {
@@ -228,8 +231,21 @@ fn copy_regular_file_noreplace(source: &Path, destination: &Path) -> MoveOutcome
         return MoveOutcome::Failed(error.to_string());
     }
     let staged_file = staging.join("file");
-    let installed =
-        fs::copy(source, &staged_file).and_then(|_| rename_noreplace(&staged_file, destination));
+    let copied = if crate::context::confinement::remote_mutation() {
+        (|| {
+            let mut source = fs::File::open(source)?;
+            let mut staged = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&staged_file)?;
+            crate::edit::remote_links::check_open(&staged, &staged_file)?;
+            std::io::copy(&mut source, &mut staged)?;
+            staged.set_permissions(source.metadata()?.permissions())
+        })()
+    } else {
+        fs::copy(source, &staged_file).map(|_| ())
+    };
+    let installed = copied.and_then(|()| rename_noreplace(&staged_file, destination));
     let _ = fs::remove_file(&staged_file);
     let _ = fs::remove_dir(&staging);
     match installed {
@@ -245,8 +261,18 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
         std::ffi::CString::new(path.as_os_str().as_bytes())
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
     };
-    let source = path(source)?;
-    let destination = path(destination)?;
+    let (from_dir, source, to_dir, destination) = if crate::context::confinement::remote_mutation()
+    {
+        let (from, source_name) = crate::edit::remote_links::pin_parent(source)?;
+        let (to, destination_name) = crate::edit::remote_links::pin_parent(destination)?;
+        crate::edit::remote_links::check_at(from.as_raw_fd(), &source_name, source)?;
+        (Some(from), source_name, Some(to), destination_name)
+    } else {
+        (None, path(source)?, None, path(destination)?)
+    };
+    let fd = |dir: &Option<crate::pinned_dir::PinnedDir>| {
+        dir.as_ref().map_or(libc::AT_FDCWD, |dir| dir.as_raw_fd())
+    };
     // Both NUL-terminated path buffers remain live through the native call.
     // The raw syscall is used instead of glibc's renameat2() wrapper, which
     // only exists from glibc 2.28: the release builds Linux binaries against an
@@ -256,16 +282,27 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     let result = unsafe {
         libc::syscall(
             libc::SYS_renameat2,
-            libc::AT_FDCWD,
+            fd(&from_dir),
             source.as_ptr(),
-            libc::AT_FDCWD,
+            fd(&to_dir),
             destination.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
     };
     #[cfg(target_os = "macos")]
-    let result =
-        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) };
+    let result = if from_dir.is_some() {
+        unsafe {
+            libc::renameatx_np(
+                fd(&from_dir),
+                source.as_ptr(),
+                fd(&to_dir),
+                destination.as_ptr(),
+                libc::RENAME_EXCL,
+            )
+        }
+    } else {
+        unsafe { libc::renamex_np(source.as_ptr(), destination.as_ptr(), libc::RENAME_EXCL) }
+    };
     if result == 0 {
         Ok(())
     } else {
@@ -276,6 +313,7 @@ fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
 #[cfg(windows)]
 fn rename_noreplace(source: &Path, destination: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    crate::edit::remote_links::check_path(source)?;
     let path = |path: &Path| -> std::io::Result<Vec<u16>> {
         let mut units: Vec<_> = path.as_os_str().encode_wide().collect();
         if units.contains(&0) {
@@ -337,7 +375,7 @@ fn move_symlink_after_rename_failure(
 }
 
 fn remove_source_after_fallback(src_path: &Path) -> MoveOutcome {
-    match fs::remove_file(src_path) {
+    match crate::edit::remote_links::unlink(src_path) {
         Ok(()) => MoveOutcome::Moved,
         Err(remove_error) => MoveOutcome::CopiedSourceDeleteFailed(remove_error.to_string()),
     }
@@ -600,18 +638,25 @@ fn rename_case_only(source: &Path, destination: &Path) -> MoveOutcome {
     // A private temporary directory avoids collisions and forces the filesystem
     // to store the requested spelling even if a direct rename is a no-op.
     let result = (|| -> std::io::Result<()> {
+        let rename = |source: &Path, destination: &Path| {
+            if crate::context::confinement::remote_mutation() {
+                rename_noreplace(source, destination)
+            } else {
+                std::fs::rename(source, destination)
+            }
+        };
         let temporary = source
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join(format!(".aft-case-rename-{}", crate::backup::new_op_id()));
         std::fs::create_dir(&temporary)?;
         let intermediate = temporary.join("file");
-        if let Err(error) = std::fs::rename(source, &intermediate) {
+        if let Err(error) = rename(source, &intermediate) {
             let _ = std::fs::remove_dir(&temporary);
             return Err(error);
         }
-        if let Err(error) = std::fs::rename(&intermediate, destination) {
-            if let Err(restore_error) = std::fs::rename(&intermediate, source) {
+        if let Err(error) = rename(&intermediate, destination) {
+            if let Err(restore_error) = rename(&intermediate, source) {
                 return Err(std::io::Error::other(format!(
                     "{error}; restore failed: {restore_error}; source retained at {}",
                     intermediate.display()
@@ -627,4 +672,25 @@ fn rename_case_only(source: &Path, destination: &Path) -> MoveOutcome {
         Ok(()) => MoveOutcome::Moved,
         Err(error) => MoveOutcome::Failed(error.to_string()),
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn remote_rename_refuses_a_multiply_linked_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source");
+    let alias = dir.path().join("alias");
+    let destination = dir.path().join("destination");
+    fs::write(&source, b"original").unwrap();
+    fs::hard_link(&source, &alias).unwrap();
+    let result = crate::context::confinement::with_remote_mutation(true, || {
+        rename_noreplace(&alias, &destination)
+    });
+    assert_eq!(
+        result.unwrap_err().kind(),
+        std::io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(fs::read(&source).unwrap(), b"original");
+    assert_eq!(fs::read(&alias).unwrap(), b"original");
+    assert!(!destination.exists());
 }

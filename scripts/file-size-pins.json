@@ -12,7 +12,7 @@
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
-    "lines": 13251,
+    "lines": 13036,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
@@ -24,7 +24,7 @@
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
   "crates/aft/src/sandbox_spawn.rs": {
-    "lines": 10689,
+    "lines": 10653,
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft/src/commands/semantic_search/mod.rs": {
@@ -40,7 +40,7 @@
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {
-    "lines": 8536,
+    "lines": 8527,
     "reason": "Split GitHub shim policy and commands pending; AFT crate split lane."
   },
   "crates/aft/src/subc/consent_tests.rs": {

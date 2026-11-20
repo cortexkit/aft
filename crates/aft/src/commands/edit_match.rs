@@ -274,6 +274,12 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
         Ok(metadata) => metadata.len(),
         Err(error) => return Response::error(&req.id, "write_error", error.to_string()),
     };
+    if let Err(error) = edit::remote_links::check_open(&file_handle, path.as_path()) {
+        ctx.backup()
+            .lock()
+            .discard_operation_entries(req.session(), op_id);
+        return Response::error(&req.id, "denied_floor", error.to_string());
+    }
     if let Err((bytes_written, error, restore_error)) = append_with_rollback(
         &mut file_handle,
         append_content.as_bytes(),
@@ -284,13 +290,14 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
                     "rollback could not be verified without read access",
                 ));
             }
+            edit::remote_links::check_open(file, path.as_path())?;
             restore_append_length(file, original_len, appended)
         },
     ) {
         let restored = restore_error.is_none();
         drop(file_handle);
         let removal_error = if !existed && restored {
-            std::fs::remove_file(path.as_path()).err()
+            edit::remote_links::unlink(path.as_path()).err()
         } else {
             None
         };
@@ -341,9 +348,12 @@ fn handle_append(req: &RawRequest, ctx: &AppContext, op_id: &str) -> Response {
     #[cfg(unix)]
     if !existed {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(error) =
+        if let Err(error) = if crate::context::confinement::remote_mutation() {
+            edit::remote_links::check_open(&file_handle, path.as_path())
+                .and_then(|()| file_handle.set_permissions(std::fs::Permissions::from_mode(0o644)))
+        } else {
             std::fs::set_permissions(path.as_path(), std::fs::Permissions::from_mode(0o644))
-        {
+        } {
             warnings.push(format!(
                 "Append wrote {} bytes to {}, but setting permissions failed: {}. Do not retry the append.",
                 bytes_written, file, error,

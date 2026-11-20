@@ -1834,9 +1834,18 @@ fn scope_project_case_034(
             assert_eq!(ack.header.ty, FrameType::Error, "{}", frame_body(&ack));
             let error: Value = serde_json::from_slice(&ack.body).unwrap();
             assert_eq!(error["code"], code);
-            assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This connection has no project folder, so AFT cannot run project tools on it.");
-            assert_eq!(error["detail"]["cause"], "invalid_workdir");
-            assert_eq!(error["detail"]["source"], "scope_workdir");
+            match code {
+                "invalid_workdir" => {
+                    assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This connection has no project folder, so AFT cannot run project tools on it.");
+                    assert_eq!(error["detail"]["cause"], "invalid_workdir");
+                    assert_eq!(error["detail"]["source"], "scope_workdir");
+                }
+                "remote_call_not_admitted" => {
+                    assert_eq!(error["message"].as_str().unwrap().as_bytes(), b"This computer's AFT can't take calls from other computers.");
+                    assert!(error["detail"].is_null(), "{error}");
+                }
+                _ => panic!("unexpected scope bind refusal: {error}"),
+            }
         } else {
             assert_eq!(ack.header.ty, FrameType::Response, "{}", frame_body(&ack));
             assert_eq!(
@@ -1959,14 +1968,14 @@ fn subc_034_project_missing_scope_workdir_uses_daemon_filled_root() {
 }
 
 #[test]
-fn subc_federated_bind_metadata_does_not_change_project_admission() {
+fn subc_federated_peer_labels_are_refused_on_tool_provider_binds() {
     for (harness, peer_class) in [
         ("fed-app:person", "app"),
         ("fed-computer:person", "computer"),
     ] {
         for extended in [false, true] {
             scope_project_case_034(
-                |_, _| {
+                |project, decoy| {
                     let principal = json!({"kind":"reserved", "module_id":"callosum"});
                     let mut facts = json!({
                         "peer_class": peer_class,
@@ -1986,17 +1995,17 @@ fn subc_federated_bind_metadata_does_not_change_project_admission() {
                     json!({
                         "op": "route.bind", "route_channel": ROUTE_CHANNEL, "epoch": 1,
                         "target": {"kind":"tool_provider", "module_id":"aft"},
-                        "identity": {"harness":harness, "session":SESSION_ID},
+                        "identity": {"harness":harness, "session":SESSION_ID, "project_root":decoy},
                         "principal": principal,
                         "scope": {
                             "owner": principal, "ref": "peer", "scope_epoch": 1,
-                            "kind": "federated", "owner_authorized": false,
+                            "kind": "federated", "owner_authorized": false, "workdir":project,
                             "attributes": {"federated":facts},
                         },
                     })
                 },
-                None,
-                true,
+                Some("remote_call_not_admitted"),
+                false,
             );
         }
     }

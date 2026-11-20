@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "note": "Remote AFT calls from paired computers is non-ranking: its diff against main changes no RANKING_FENCE_PREFIXES path (crates/aft/src/lib.rs is unchanged). It adds remote-call admission, approval cards, audit records, remote read and edit tools and Linux-only foreground remote shells. No ranking or count difference is authorized."
+}

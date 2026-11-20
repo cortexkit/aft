@@ -2,6 +2,23 @@
 
 use super::*;
 
+/// True when the operator asked to run administration under their own `gh`.
+pub(super) fn operator_bypass_requested() -> bool {
+    std::env::var_os("GH_SHIM_BYPASS").as_deref() == Some(OsStr::new("operator"))
+}
+
+pub(super) fn refuse_bypass_bot_credentials(detectors: &Detectors) -> Option<i32> {
+    find_ambient_agent_credential(detectors).map(|credential| {
+        refuse(
+            RefusalCode::BypassBotCredentials,
+            &format!(
+                "{}; operator commands must run from a shell without bot credentials",
+                credential.presence()
+            ),
+        )
+    })
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(super) struct ShellSignals {
     pub(super) sandboxed: bool,

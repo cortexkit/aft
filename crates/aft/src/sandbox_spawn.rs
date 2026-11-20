@@ -57,11 +57,21 @@ use crate::sandbox_profile::SandboxProfile;
 
 #[cfg(unix)]
 mod build_slots;
+pub mod checkout_controls;
+#[cfg(unix)]
+use checkout_controls::checkout_control_denies;
+pub(crate) use checkout_controls::remote_control_denies;
+pub(crate) mod remote;
+#[doc(hidden)]
+pub mod remote_shell_guard;
 mod requirement;
 #[cfg(unix)]
 mod settings_grants;
 #[cfg(unix)]
 mod task_temp;
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+pub use remote::run_for_test as run_remote_shell_for_test;
+mod tool_launch_policy;
 #[cfg(unix)]
 mod worker_reads;
 pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
@@ -2537,45 +2547,6 @@ fn git_worktree_registration_inputs(common_dir: &Path) -> Option<GitPolicyInputs
     }
     inputs.listed_dirs.push((registrations, names));
     Some(inputs)
-}
-
-/// Build the same control-file denies for project and granted write roots,
-/// including a linked worktree's common Git directory. Backends that cannot
-/// enforce nested denies report those paths as unenforced.
-#[cfg(unix)]
-fn checkout_control_denies(root: &Path, git: &GitPolicy) -> Result<Vec<PathBuf>, String> {
-    let mut denies = Vec::new();
-    let git_dirs = if git.read_roots.is_empty() {
-        vec![root.join(".git")]
-    } else {
-        git.read_roots.clone()
-    };
-    for dir in git_dirs {
-        denies.extend(["config", "config.worktree", "hooks"].map(|name| dir.join(name)));
-    }
-    denies.extend(git.hooks.iter().cloned());
-    denies.extend(
-        git.configured_paths
-            .iter()
-            .filter(|(key, _)| key != "core.excludesFile")
-            .map(|(_, path)| path.clone()),
-    );
-    denies.extend(resolve_missing_repository_hooks(
-        root,
-        git,
-        &mut Vec::new(),
-    )?);
-    if let Some((git_dir, _)) = &git.linked {
-        // Binding pointers must stay immutable too: redirecting one would
-        // replace the operator-owned configuration used on the next spawn.
-        denies.push(root.join(".git"));
-        denies.extend(["commondir", "gitdir"].map(|name| git_dir.join(name)));
-    }
-    denies.extend([
-        root.join(".cortexkit/aft.jsonc"),
-        root.join(".cortexkit/aft/filters"),
-    ]);
-    Ok(denies)
 }
 
 /// Credential clients may use HOME, the password database, or explicit config
@@ -5790,17 +5761,11 @@ pub fn managed_task_temp_root() -> &'static Path {
 }
 
 #[cfg(unix)]
-pub(crate) fn create_provider_temp_layout() -> std::io::Result<PathBuf> {
-    task_temp::create_provider_layout()
-}
-#[cfg(unix)]
-pub(crate) fn remove_provider_temp_layout(path: &Path) -> std::io::Result<()> {
-    task_temp::remove_provider_layout(path)
-}
-#[cfg(unix)]
-pub(crate) fn sweep_provider_temp_layouts() -> std::io::Result<()> {
-    task_temp::sweep_provider_layouts()
-}
+pub(crate) use task_temp::{
+    create_provider_layout as create_provider_temp_layout,
+    remove_provider_layout as remove_provider_temp_layout,
+    sweep_provider_layouts as sweep_provider_temp_layouts,
+};
 
 #[cfg(target_os = "macos")]
 fn install_worker_mktemp(temp_dir: &Path) -> Result<(), String> {
@@ -6822,11 +6787,10 @@ impl RequestToolLaunch {
 mod edit_tool_launcher;
 
 impl<'ctx> ToolLaunchPolicy<'ctx> {
-    /// The policy for a command's tools: the tool call's policy installed by
-    /// [`Self::with_current`], or else one resolved now from the current
-    /// principal and worker-jail scope.
+    /// The inherited external-tool policy, or one resolved for this request.
     pub(crate) fn for_request(ctx: &'ctx AppContext) -> Self {
         match CURRENT_TOOL_POLICY.with(|slot| slot.borrow().clone()) {
+            _ if crate::context::confinement::remote_mutation() => Self::remote_edit_refusal(),
             Some(request) => Self {
                 ctx: Some(ctx),
                 request,

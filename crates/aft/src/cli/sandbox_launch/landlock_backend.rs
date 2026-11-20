@@ -3,11 +3,13 @@ use landlock::{
     AccessFs, BitFlags, CompatLevel, Compatible, LandlockStatus, PathBeneath, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, Scope, ABI,
 };
-use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
+use std::{borrow::Cow, collections::BTreeMap};
+
+mod remote_writes;
 
 /// Highest ABI understood by the pinned landlock crate.
 pub(super) const TARGET_ABI: ABI = ABI::V7;
@@ -25,6 +27,25 @@ pub(super) struct AppliedLandlock {
 }
 
 pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
+    apply_with_write_policy(profile, None)
+}
+
+pub(super) fn apply_remote(profile: &SandboxProfile) -> Result<AppliedLandlock, String> {
+    let [folder] = profile.writable_roots.as_slice() else {
+        return Err(super::REMOTE_PROTECTED_GRANT.into());
+    };
+    if !profile.writable_files.is_empty() || !profile.cache_roots.is_empty() {
+        return Err(super::REMOTE_PROTECTED_GRANT.into());
+    }
+    let mut restricted = profile.clone();
+    restricted.writable_roots.clear();
+    apply_with_write_policy(&restricted, Some(folder))
+}
+
+fn apply_with_write_policy(
+    profile: &SandboxProfile,
+    remote_folder: Option<&Path>,
+) -> Result<AppliedLandlock, String> {
     if profile.mode == aft::config::SandboxMode::Relaxed {
         // Landlock cannot subtract protected paths from a root-wide grant.
         // Grant reads and writes beneath /, then list each unenforced path on
@@ -97,6 +118,10 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
             .any(|deny| path.starts_with(deny) || deny.starts_with(path))
     });
     close_inherited_fds()?;
+    let remote_writes = remote_folder
+        .map(|folder| remote_writes::prepare(profile, folder))
+        .transpose()?
+        .unwrap_or_default();
     // Git and other standard tools open /dev/null read-write; granting only
     // file rights on this sink does not make any persistent path writable.
     apply_paths(
@@ -120,6 +145,8 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<AppliedLandlock, String>
         &session_reads,
         yama_same_uid_exposed,
         profile.worker_jail,
+        remote_folder.is_some(),
+        remote_writes,
     )
 }
 
@@ -201,6 +228,8 @@ fn probe_with_signal_scope(scope_signals: bool) -> Result<AppliedLandlock, Strin
         &[],
         false,
         scope_signals,
+        false,
+        Vec::new(),
     )
 }
 
@@ -210,12 +239,17 @@ fn apply_paths<'a>(
     exact_read_paths: &[PathBuf],
     yama_same_uid_exposed: bool,
     scope_signals: bool,
+    remote: bool,
+    remote_writes: Vec<(PathBuf, OpenedRulePath)>,
 ) -> Result<AppliedLandlock, String> {
     let read_access = AccessFs::from_read(TARGET_ABI);
     // Refer is a V2 write-class right. Granting it only with writable-root
     // rules keeps in-root renames working without allowing access widening.
-    let write_access = AccessFs::from_write(TARGET_ABI) & !AccessFs::IoctlDev;
+    let mut write_access = AccessFs::from_write(TARGET_ABI) & !AccessFs::IoctlDev;
     let handled_access = read_access | write_access;
+    if remote {
+        write_access &= !AccessFs::Refer;
+    }
     let mut ruleset = Ruleset::default()
         .set_compatibility(CompatLevel::BestEffort)
         .handle_access(handled_access)
@@ -224,9 +258,21 @@ fn apply_paths<'a>(
         .map_err(|error| format!("failed to create Landlock ruleset: {error}"))?;
 
     let mut read_paths = read_paths.into_iter().collect::<BTreeMap<_, _>>();
-    for path in write_paths {
-        let opened = open_rule_path(path).map_err(|error| error.to_string())?;
-        let access = if read_paths.remove(path).is_some() {
+    let write_rules = write_paths
+        .into_iter()
+        .map(|path| {
+            open_rule_path(path)
+                .map(|opened| (Cow::Borrowed(path), opened))
+                .map_err(|error| error.to_string())
+        })
+        .chain(
+            remote_writes
+                .into_iter()
+                .map(|(path, opened)| Ok((Cow::Owned(path), opened))),
+        );
+    for rule in write_rules {
+        let (path, opened) = rule?;
+        let access = if read_paths.remove(path.as_ref()).is_some() {
             read_access | write_access
         } else {
             write_access

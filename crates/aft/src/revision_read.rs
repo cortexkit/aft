@@ -60,14 +60,18 @@ pub(crate) fn check_enabled(req: &RawRequest, ctx: &AppContext) -> Result<(), Re
     if ctx.config().revision_reads {
         return Ok(());
     }
-    Err(Response::error(
+    Err(disabled(req))
+}
+
+pub(crate) fn disabled(req: &RawRequest) -> Response {
+    Response::error(
         &req.id,
         DISABLED_CODE,
         format!(
             "{}: 'ref' was refused because reading at a git revision is turned off. Set \"revision_reads\": true in the AFT config to enable it, or call without 'ref' to read the working tree.",
             req.command
         ),
-    ))
+    )
 }
 
 /// One call's view of a git revision: the revision resolved to a commit once,
