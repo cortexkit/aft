@@ -118,6 +118,8 @@ export interface ToolRuntime {
    * of a resumed session rather than the session's project.
    */
   directoryIsSessionRoot?: boolean;
+  /** A UI status read is not a delegated worker waiting on its task. */
+  observeBashStatus?: boolean;
   /** The OpenCode 1 SDK aborts this signal when the user cancels the tool call. */
   abort?: AbortSignal;
   /** The OpenCode 2 execution fiber owns this signal; it takes precedence over the SDK signal. */
@@ -293,7 +295,7 @@ export async function callBridge(
   // Both host lookups are bounded; run them together so their timeout budgets
   // do not add up before a tool can reach the bridge.
   const [workerSession] = await Promise.all([
-    isWorkerRuntime(ctx, runtime),
+    command === "bash_status" && runtime.observeBashStatus ? false : isWorkerRuntime(ctx, runtime),
     runtime.sessionID && getSessionDirectoryCached(runtime.sessionID) === undefined
       ? getSessionDirectory(ctx.client, runtime.sessionID, runtime.directory)
       : Promise.resolve(),

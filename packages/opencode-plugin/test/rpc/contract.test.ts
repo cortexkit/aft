@@ -6,7 +6,11 @@ import { AftRpc } from "../../src/rpc/contract.js";
 describe("AFT V2 RPC contract", () => {
   test("keeps the chair-fixed method and event ids", () => {
     expect(AftRpc.id).toBe("aft");
-    expect(Object.keys(AftRpc.methods)).toEqual(["getStatus"]);
+    expect(Object.keys(AftRpc.methods)).toEqual([
+      "getStatus",
+      "getBackgroundTasks",
+      "stopBackgroundTask",
+    ]);
     expect(Object.keys(AftRpc.events)).toEqual([
       "statusInvalidated",
       "showStatusDialog",
