@@ -105,7 +105,14 @@ impl ModuleHandler for Peer {
         let binding = self.bindings.lock().unwrap()[&ctx.route_handle()]
             .identity
             .clone();
-        writeln!(file, "{}", json!({"module":self.module,"harness":binding.harness,"session":binding.session,"request":body})).unwrap();
+        // Several fake runner processes append to this file at once. Write each
+        // record with one write call so an O_APPEND write can't interleave with
+        // another process's partial line (writeln! issues several writes).
+        let line = format!(
+            "{}\n",
+            json!({"module":self.module,"harness":binding.harness,"session":binding.session,"request":body})
+        );
+        file.write_all(line.as_bytes()).unwrap();
         HandlerOutcome::Response(
             cortexkit_role_llm_runner::wire::reply_body(
                 &cortexkit_role_llm_runner::send::SendReply::new("active").with_delivered(
