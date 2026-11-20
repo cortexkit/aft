@@ -1,5 +1,7 @@
 //! Additional facts for calls that may be written on a type rather than a value.
 
+#[path = "static_receiver/bindings.rs"]
+mod bindings;
 #[path = "static_receiver/codec.rs"]
 mod codec;
 #[path = "static_receiver/extract.rs"]

@@ -8,6 +8,11 @@ use super::site_records_tests::records_match_files;
 use crate::callgraph_store::join::dispatch::{Resolution, Resolver};
 use crate::callgraph_store::join::{BlobRefKind, CallgraphBlob, ParseBlob};
 
+#[path = "static_receiver_tests/bindings.rs"]
+mod bindings;
+#[path = "static_receiver_tests/visibility.rs"]
+mod visibility;
+
 fn round_trip(source: &str, language: &str) -> ParseBlob {
     let extracted = super::content::extract(source.as_bytes(), language).unwrap();
     let (surface, body) = extracted.encode();
@@ -218,14 +223,14 @@ fn csharp_static_receiver_resolves_qualified_overloads_and_not_open_hierarchies(
 #[test]
 fn java_static_receiver_requires_package_import_or_java_lang_evidence() {
     let inputs = checkout(&[
-        ("src/control/User.java", "package own; import java.util.Objects; import external.Api; class User { void use() { Objects.equals(null, null); Api.load(); Math.abs(-1); Widget.create(); } }"),
-        ("other/root/Widget.java", "package own; public class Widget extends Parent { private void ignore() {} }"),
-        ("other/root/Parent.java", "package own; public class Parent { public static void create() {} }"),
-        ("src/control/Widget.java", "package unrelated; public class Widget { public static void create() {} }"),
+        ("a/src/test/java/own/User.java", "package own; import java.util.Objects; import external.Api; class User { void use() { Objects.equals(null, null); Api.load(); Math.abs(-1); Widget.create(); } }"),
+        ("a/src/main/java/own/Widget.java", "package own; public class Widget extends Parent { private void ignore() {} }"),
+        ("a/src/main/java/own/Parent.java", "package own; public class Parent { public static void create() {} }"),
+        ("a/src/test/java/own/Other.java", "package unrelated; class Widget { public static void create() {} }"),
         ("other/Names.java", "package other; interface Names { boolean equals(Object o); void load(); int abs(); }"),
     ], &[]);
     let resolved = records_match_files(&inputs);
-    let user = &resolved["src/control/User.java"];
+    let user = &resolved["a/src/test/java/own/User.java"];
     for member in ["equals", "load", "abs"] {
         external(answer(user, member));
     }
@@ -233,7 +238,7 @@ fn java_static_receiver_requires_package_import_or_java_lang_evidence() {
     assert_eq!(create.targets.len(), 1, "{create:?}");
     let target = create.targets.first().unwrap();
     assert!(target.symbol.ends_with("Parent::create"), "{target:?}");
-    exact(create, "other/root/Parent.java", &[&target.symbol]);
+    exact(create, "a/src/main/java/own/Parent.java", &[&target.symbol]);
 }
 
 #[test]

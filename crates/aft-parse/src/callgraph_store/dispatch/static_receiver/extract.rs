@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use super::super::{field, text, typescript, Nav, FUNCTIONS};
-use super::{Declaration, Receiver, Scope, StaticFacts};
+use super::{bindings, Declaration, Receiver, Scope, StaticFacts};
 use crate::callgraph_store::join::ParseBlob;
 
 const CS_NAMESPACES: &[&str] = &["namespace_declaration", "file_scoped_namespace_declaration"];
@@ -119,14 +119,17 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                 let mut cursor = node.walk();
                 let children = node.children(&mut cursor).collect::<Vec<_>>();
                 let alias = children.iter().position(|n| n.kind() == "=");
-                if children.iter().any(|n| n.kind() == "static") {
+                if children.iter().any(|n| n.kind() == "global") {
                     continue;
                 }
                 let target = children
                     .iter()
                     .skip(alias.map_or(0, |eq| eq + 1))
                     .find_map(|n| path(*n, source, true));
-                if let Some(target) = target {
+                if let Some(mut target) = target {
+                    if children.iter().any(|n| n.kind() == "static") {
+                        target.insert_str(0, "static:");
+                    }
                     let alias = alias.and_then(|eq| eq.checked_sub(1)).map(|i| {
                         text(children[i], source)
                             .trim_start_matches('@')
@@ -227,9 +230,7 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
             index.types.insert(node.id(), id);
             index.facts.types.push(declaration);
         }
-        if matches!(language, "csharp" | "java") {
-            index.index_values(all);
-        }
+        index.index_values(all);
         for symbol in parse
             .symbols
             .iter()
@@ -272,42 +273,18 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
     fn index_values(&mut self, all: &[Node<'tree>]) {
         let nav = self.nav;
         for &node in all {
-            let kind = node.kind();
-            let name = match kind {
-                "variable_declarator"
-                | "parameter"
-                | "formal_parameter"
-                | "spread_parameter"
-                | "catch_formal_parameter"
-                | "property_declaration"
-                | "event_declaration"
-                | "enum_constant"
-                | "enum_member_declaration"
-                | "declaration_expression"
-                | "declaration_pattern"
-                | "recursive_pattern"
-                | "var_pattern"
-                | "from_clause"
-                | "let_clause"
-                | "join_clause"
-                | "query_continuation"
-                | "enhanced_for_statement"
-                | "catch_declaration"
-                | "for_each_statement" => field(node, &["name", "left"]),
-                "single_variable_designation" => node.named_child(0).or(Some(node)),
-                "lambda_expression" => field(node, &["parameter", "parameters"]),
-                _ => continue,
-            };
-            let Some(name) = name else { continue };
+            let names = bindings::names(node, self.language);
+            if names.is_empty() {
+                continue;
+            }
             let type_owner = nav.enclosing(node, type_kinds(self.language));
-            let function = nav.enclosing(node, FUNCTIONS);
-            let names = binding_names(name);
+            let scope = bindings::scope(node, self.language, nav);
             for binding in names {
                 let name = text(binding, self.source).trim_start_matches('@');
-                if let Some(function) = function
-                    .filter(|f| type_owner.is_none_or(|ty| f.start_byte() >= ty.start_byte()))
+                if let Some(scope) =
+                    scope.filter(|f| type_owner.is_none_or(|ty| f.start_byte() >= ty.start_byte()))
                 {
-                    self.values.entry(name).or_default().push(function);
+                    self.values.entry(name).or_default().push(scope);
                 } else if let Some(owner) = type_owner.and_then(|n| self.types.get(&n.id())) {
                     self.facts.types[*owner as usize]
                         .values
@@ -347,18 +324,17 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
             .enclosing(call, type_kinds(self.language))
             .and_then(|n| self.types.get(&n.id()).copied());
         let scope = owner.map_or(self.root_scope, |i| self.facts.types[i as usize].scope);
+        if !name.starts_with("global::")
+            && (self.values.get(root).is_some_and(|scopes| {
+                scopes.iter().any(|scope| {
+                    scope.start_byte() <= call.start_byte() && call.end_byte() <= scope.end_byte()
+                })
+            }) || enclosing_value(&self.facts.types, owner, root))
+        {
+            return;
+        }
         let owner = match self.language {
             "java" | "csharp" => {
-                if !name.starts_with("global::")
-                    && (self.values.get(root).is_some_and(|scopes| {
-                        scopes.iter().any(|scope| {
-                            scope.start_byte() <= call.start_byte()
-                                && call.end_byte() <= scope.end_byte()
-                        })
-                    }) || enclosing_value(&self.facts.types, owner, root))
-                {
-                    return;
-                }
                 if self.language == "csharp" && owner.is_none() {
                     return;
                 }
@@ -495,22 +471,6 @@ fn ts_lexical_scope<'tree>(node: Node<'tree>, nav: impl Nav<'tree>) -> Option<us
         parent = nav.parent(parent)?;
     }
     Some(parent.id())
-}
-
-fn binding_names(node: Node<'_>) -> Vec<Node<'_>> {
-    if matches!(node.kind(), "identifier" | "single_variable_designation") {
-        return vec![node];
-    }
-    let mut names = Vec::new();
-    let mut pending = vec![node];
-    while let Some(node) = pending.pop() {
-        if node.kind() == "identifier" {
-            names.push(node);
-        } else {
-            pending.extend(node.named_children(&mut node.walk()));
-        }
-    }
-    names
 }
 
 fn add_usings(scope: &mut Scope, entries: Option<&Vec<(Option<String>, String)>>) {

@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::path::Path;
 
 use super::super::{dependency, typescript, Resolution, Resolver, Target};
 use super::extract::join;
@@ -126,7 +127,7 @@ impl<'a> Resolver<'a> {
         }])
     }
 
-    fn csharp_type(&self, scope: &Scope, owner: &str, name: &str) -> Vec<Type<'a>> {
+    fn csharp_type(&self, file: &str, scope: &Scope, owner: &str, name: &str) -> Vec<Type<'a>> {
         if let Some(name) = name.strip_prefix("global::") {
             return self.static_types("csharp", name);
         }
@@ -134,52 +135,47 @@ impl<'a> Resolver<'a> {
             return self.static_types("csharp", target.trim_start_matches("global::"));
         }
         let mut prefix = owner;
-        loop {
+        while !prefix.is_empty() {
             let found = self.static_types("csharp", &join(prefix, name));
             if !found.is_empty() {
                 return found;
             }
-            let Some((outer, _)) = prefix.rsplit_once('.') else {
-                if !prefix.is_empty() {
-                    let found = self.static_types("csharp", name);
-                    if !found.is_empty() {
-                        return found;
-                    }
-                }
-                break;
-            };
-            prefix = outer;
+            prefix = prefix.rsplit_once('.').map_or("", |(outer, _)| outer);
         }
-        let mut candidates = scope
-            .imports
-            .iter()
-            .map(|namespace| {
-                self.static_types(
-                    "csharp",
-                    &join(namespace.trim_start_matches("global::"), name),
-                )
-            })
-            .filter(|found| !found.is_empty());
-        let Some(found) = candidates.next() else {
-            return Vec::new();
-        };
-        if candidates.any(|other| other[0].declaration.name != found[0].declaration.name) {
-            // A lookup in two imported namespaces must not pick an arbitrary type.
-            return Vec::new();
+        // A global name in another C# compilation is not visible just because
+        // its source is present. A written qualifier can name it explicitly.
+        let mut found = self.static_types("csharp", name);
+        if !name.contains('.') {
+            found.retain(|candidate| candidate.file == file);
+        }
+        if !found.is_empty() {
+            return found;
+        }
+        let mut seen = BTreeSet::new();
+        for namespace in &scope.imports {
+            // A static using lets a caller name nested types of the imported type.
+            let prefix = namespace
+                .trim_start_matches("static:")
+                .trim_start_matches("global::");
+            for candidate in self.static_types("csharp", &join(prefix, name)) {
+                if seen.insert((candidate.file.clone(), candidate.declaration.name.as_str())) {
+                    found.push(candidate);
+                }
+            }
         }
         found
     }
 
-    fn java_type(&self, scope: &Scope, name: &str) -> (Vec<Type<'a>>, bool) {
+    fn java_type(&self, file: &str, scope: &Scope, name: &str) -> Option<Vec<Type<'a>>> {
         if let Some((_, target)) = scope
             .aliases
             .iter()
             .find(|(alias, target)| alias == name || target == name)
         {
-            return (self.static_types("java", target), true);
+            return unambiguous(self.static_types("java", target));
         }
         let package_prefix = format!("{}.", scope.namespace);
-        let found = self.static_types(
+        let mut found = self.static_types(
             "java",
             &if name.starts_with(&package_prefix) {
                 name.to_string()
@@ -187,14 +183,15 @@ impl<'a> Resolver<'a> {
                 join(&scope.namespace, name)
             },
         );
+        found.retain(|candidate| java_package_visible(file, &candidate.file, &scope.namespace));
         if !found.is_empty() {
-            return (found, true);
+            return unambiguous(found);
         }
         let core = name.strip_prefix("java.lang.").unwrap_or(name);
         if java_lang_class(core) {
-            return (self.static_types("java", &join("java.lang", core)), true);
+            return unambiguous(self.static_types("java", &join("java.lang", core)));
         }
-        (Vec::new(), false)
+        None
     }
 
     fn csharp_closed(
@@ -219,8 +216,13 @@ impl<'a> Resolver<'a> {
             // A base expression is outside the declaring type's body, so it
             // can see the enclosing type and namespace, not its own members.
             let prefix = ty.name.rsplit_once('.').map_or("", |(prefix, _)| prefix);
-            let bases = self.csharp_type(&owner.facts.scopes[ty.scope as usize], prefix, base);
-            !bases.is_empty()
+            let bases = self.csharp_type(
+                &owner.file,
+                &owner.facts.scopes[ty.scope as usize],
+                prefix,
+                base,
+            );
+            bases.len() == 1
                 && bases
                     .iter()
                     .all(|base| self.csharp_closed(base, name, seen))
@@ -233,7 +235,7 @@ impl<'a> Resolver<'a> {
         let mut seen = BTreeSet::new();
         let mut pending = vec![owner];
         while let Some(ty) = pending.pop() {
-            if !seen.insert((ty.file, ty.declaration.name.as_str())) {
+            if !seen.insert((ty.file.clone(), ty.declaration.name.as_str())) {
                 continue;
             }
             if ty
@@ -246,7 +248,7 @@ impl<'a> Resolver<'a> {
             }
             let scope = &ty.facts.scopes[ty.declaration.scope as usize];
             for base in &ty.declaration.bases {
-                pending.extend(self.java_type(scope, base).0);
+                pending.extend(self.java_type(&ty.file, scope, base).into_iter().flatten());
             }
         }
         false
@@ -264,10 +266,7 @@ impl<'a> Resolver<'a> {
         let scope = &facts.scopes[receiver.scope as usize];
         let mut pending = match language {
             "java" => {
-                let (types, proven) = self.java_type(scope, &receiver.name);
-                if !proven {
-                    return None;
-                }
+                let types = self.java_type(file, scope, &receiver.name)?;
                 if let Some(owner) = receiver.owner {
                     let root = receiver.name.split('.').next()?;
                     if self.java_inherited_value(
@@ -285,7 +284,8 @@ impl<'a> Resolver<'a> {
             }
             "csharp" => {
                 let owner = &facts.types[receiver.owner? as usize];
-                let types = self.csharp_type(scope, &owner.name, &receiver.name);
+                let types =
+                    unambiguous(self.csharp_type(file, scope, &owner.name, &receiver.name))?;
                 if types.is_empty()
                     && !scope
                         .aliases
@@ -299,6 +299,21 @@ impl<'a> Resolver<'a> {
                     .trim_start_matches("global::")
                     .split(['.', '`'])
                     .next()?;
+                if !receiver.name.starts_with("global::")
+                    && scope
+                        .imports
+                        .iter()
+                        .filter_map(|import| import.strip_prefix("static:"))
+                        .any(|import| {
+                            let providers = self.csharp_type(file, scope, &owner.name, import);
+                            providers.len() != 1
+                                || providers
+                                    .iter()
+                                    .any(|ty| !self.csharp_closed(ty, name, &mut BTreeSet::new()))
+                        })
+                {
+                    return None;
+                }
                 // Check all parts of partial types, as well as containing
                 // types whose members are visible inside the nested type.
                 let mut qualified_owner = owner.name.as_str();
@@ -331,6 +346,12 @@ impl<'a> Resolver<'a> {
             },
             _ => return None,
         };
+        if pending.is_empty() {
+            return Some(Resolution {
+                external: 1,
+                ..Resolution::default()
+            });
+        }
         let mut answer = Resolution::default();
         let mut seen = BTreeSet::new();
         while let Some(ty) = pending.pop() {
@@ -350,22 +371,53 @@ impl<'a> Resolver<'a> {
             let scope = &ty.facts.scopes[ty.declaration.scope as usize];
             for base in &ty.declaration.bases {
                 pending.extend(match language {
-                    "java" => self.java_type(scope, base).0,
-                    "csharp" => self.csharp_type(
-                        scope,
-                        ty.declaration
-                            .name
-                            .rsplit_once('.')
-                            .map_or("", |(prefix, _)| prefix),
-                        base,
-                    ),
+                    "java" => self.java_type(&ty.file, scope, base).unwrap_or_default(),
+                    "csharp" => unambiguous(
+                        self.csharp_type(
+                            &ty.file,
+                            scope,
+                            ty.declaration
+                                .name
+                                .rsplit_once('.')
+                                .map_or("", |(prefix, _)| prefix),
+                            base,
+                        ),
+                    )
+                    .unwrap_or_default(),
                     _ => self.ts_static_types(&ty.file, base),
                 });
             }
         }
-        answer.external = usize::from(answer.targets.is_empty());
-        Some(answer)
+        (!answer.targets.is_empty()).then_some(answer)
     }
+}
+
+fn unambiguous(types: Vec<Type<'_>>) -> Option<Vec<Type<'_>>> {
+    (types.len() <= 1).then_some(types)
+}
+
+fn java_package_visible(caller: &str, declaration: &str, package: &str) -> bool {
+    let caller = Path::new(caller).parent();
+    let declared = Path::new(declaration).parent();
+    if caller == declared {
+        return true;
+    }
+    fn module<'a>(mut directory: &'a Path, package: &str) -> Option<&'a Path> {
+        for part in package.rsplit('.').filter(|part| !part.is_empty()) {
+            if directory.file_name()? != part {
+                return None;
+            }
+            directory = directory.parent()?;
+        }
+        if directory.file_name()? != "java" {
+            return None;
+        }
+        let src = directory.parent()?.parent()?;
+        (src.file_name()? == "src").then(|| src.parent()).flatten()
+    }
+    caller
+        .and_then(|path| module(path, package))
+        .is_some_and(|root| declared.and_then(|path| module(path, package)) == Some(root))
 }
 
 fn java_lang_class(name: &str) -> bool {
