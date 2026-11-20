@@ -1341,6 +1341,8 @@ impl ModuleProcess {
                 ),
             );
         }
+        #[cfg(target_os = "linux")]
+        crate::test_helpers::subc_pin::prepare(&command).expect("prepare module fixture pin");
         unsafe {
             command.pre_exec(|| {
                 if libc::setsid() == -1 {

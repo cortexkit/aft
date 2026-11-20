@@ -10,6 +10,8 @@ use std::sync::{Mutex, OnceLock};
 
 #[cfg(target_os = "linux")]
 mod linux_image;
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+pub use linux_image::prepare_fixture_pin;
 
 #[rustfmt::skip]
 test_support_visibility! {

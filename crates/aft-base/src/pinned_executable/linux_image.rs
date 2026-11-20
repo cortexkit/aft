@@ -182,5 +182,38 @@ fn copy_held_image(source: &File, output: &mut File) -> io::Result<()> {
     }
 }
 
+/// Seed an isolated test storage root with an already-published Linux pin.
+#[cfg(feature = "test-hooks")]
+pub fn prepare_fixture_pin(source: &Path, seed: &Path, storage: &Path) -> io::Result<()> {
+    let source = File::open(source)?;
+    let key = ImageKey::new(&source)?;
+    open_private_dir(seed)?;
+    let (seed_image, _) = key.pin(seed, &source)?;
+
+    crate::private_storage::open_root(storage)?;
+    let run = storage.canonicalize()?.join("run");
+    let images = run.join("aft-images");
+    let directory = images.join(key.directory_name());
+    for path in [&run, &images, &directory] {
+        open_private_dir(path)?;
+    }
+
+    // Link only the closed, immutable copy, not the executable the fixture
+    // starts. Publication by hard link is atomic; the daemon still verifies
+    // the image at its usual protected pathname before using it.
+    match fs::hard_link(seed_image, directory.join("aft")) {
+        Ok(()) => Ok(()),
+        // Restarts must not overwrite an existing pin. When roots are on
+        // different mounts the daemon can still publish its own copy.
+        Err(error)
+            if error.kind() == io::ErrorKind::AlreadyExists
+                || error.raw_os_error() == Some(libc::EXDEV) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests;
