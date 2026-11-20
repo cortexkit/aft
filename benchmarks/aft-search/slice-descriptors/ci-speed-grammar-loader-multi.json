@@ -1,0 +1,105 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs"
+  ],
+  "slices": [
+    "grammar-loader-multi"
+  ],
+  "note": "Grammar loader handles more than one downloaded grammar: downloaded grammars are keyed by manifest language and mapped to extractors through one explicit table (Luau only today). Ranking-fenced files change only how a downloaded grammar's language id is resolved (lang_id, parser file-language selection) and one grammar gap disclosure entry point in semantic_search; Luau's identity, cache path and stored record keys are unchanged, so no row moves. Rows must stay byte-equal to the reference. The committed reference still predates 0.64, so the nine pattern-lane candidate-count transitions declared for the index-store cutover are declared here unchanged; files_matched, ranked paths and rendered lines stay byte-equal.",
+  "pattern_counts": {
+    "followup-census:910002": {
+      "candidate_files": {
+        "before": 3,
+        "after": 6
+      },
+      "files_examined": {
+        "before": 3,
+        "after": 6
+      }
+    },
+    "followup-census:910003": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910004": {
+      "candidate_files": {
+        "before": 972,
+        "after": 860
+      },
+      "files_examined": {
+        "before": 972,
+        "after": 860
+      }
+    },
+    "followup-census:910005": {
+      "candidate_files": {
+        "before": 194,
+        "after": 141
+      },
+      "files_examined": {
+        "before": 194,
+        "after": 141
+      }
+    },
+    "followup-census:910010": {
+      "candidate_files": {
+        "before": 6,
+        "after": 19
+      },
+      "files_examined": {
+        "before": 6,
+        "after": 19
+      }
+    },
+    "followup-census:910011": {
+      "candidate_files": {
+        "before": 942,
+        "after": 729
+      },
+      "files_examined": {
+        "before": 942,
+        "after": 729
+      }
+    },
+    "followup-census:910012": {
+      "candidate_files": {
+        "before": 1031,
+        "after": 730
+      },
+      "files_examined": {
+        "before": 1031,
+        "after": 730
+      }
+    },
+    "followup-census:910013": {
+      "candidate_files": {
+        "before": 908,
+        "after": 45
+      },
+      "files_examined": {
+        "before": 908,
+        "after": 45
+      }
+    },
+    "followup-census:910014": {
+      "candidate_files": {
+        "before": 1011,
+        "after": 24
+      },
+      "files_examined": {
+        "before": 1011,
+        "after": 24
+      }
+    }
+  }
+}
