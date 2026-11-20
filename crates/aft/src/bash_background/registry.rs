@@ -1559,7 +1559,7 @@ pub(crate) struct RegistryInner {
     /// those go to a project registry that registered the task, or are left
     /// in the task's record for its project's later replay.
     saved_task_recovery: AtomicBool,
-    pub(crate) completions: Mutex<VecDeque<BgCompletion>>,
+    pub(crate) completions: Mutex<completion_queue::NoticeQueue<BgCompletion>>,
     pub(crate) progress_sender: SharedProgressSender,
     watchdog_started: AtomicBool,
     pub(crate) shutdown: AtomicBool,
@@ -2286,7 +2286,7 @@ impl BgTaskRegistry {
                 revoked_scopes: Mutex::new(HashSet::new()),
                 held_remote_workers: Mutex::new(None),
                 saved_task_recovery: AtomicBool::new(false),
-                completions: Mutex::new(VecDeque::new()),
+                completions: Mutex::new(Default::default()),
                 progress_sender,
                 watchdog_started: AtomicBool::new(false),
                 shutdown: AtomicBool::new(false),
@@ -12015,7 +12015,7 @@ impl BgTaskRegistry {
                 delivered.push(task_id.clone());
             }
         }
-
+        self.refill_completion_queue();
         delivered
     }
 
@@ -15274,7 +15274,7 @@ impl BgTaskRegistry {
             .inner
             .completions
             .lock()
-            .is_ok_and(|mut queue| completion_queue::push(&mut queue, completion.clone()));
+            .is_ok_and(|mut queue| queue.push(completion.clone()));
 
         drop(ack_state);
         if pushed && emit_frame {
@@ -18573,7 +18573,7 @@ mod pty_replay;
 mod adopted_identity;
 
 #[path = "completion_queue.rs"]
-mod completion_queue;
+pub(crate) mod completion_queue;
 
 fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     let warning = metadata
