@@ -3,7 +3,7 @@ use serde_json::json;
 use super::{Shipped, BASH_SEMANTICS};
 
 pub(super) const CATALOG_DIGEST: &str =
-    "sha256:af4559652b832b8908f4dc39364874eea6950ab708567e70f17d304e8c0f9a32";
+    "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0";
 
 pub(super) fn append(entry: &mut Shipped) {
     let mut manifest = entry.history.last().expect("shipped view").clone();
@@ -20,7 +20,8 @@ pub(super) fn append(entry: &mut Shipped) {
             manifest.template[slot]["source"] = json!(sources[index]);
         }
     }
-    manifest.template_revision += 1;
+    // The revision served on the previous catalog was one ahead of shipped.json.
+    manifest.template_revision += 2;
     entry.history.push(manifest);
 }
 
@@ -30,7 +31,7 @@ pub(super) fn bash_tail_view(older: &Shipped) -> Shipped {
     let mut manifest = older.history.last().expect("shipped bash view").clone();
     manifest.template["row"]["source"] = json!(include_str!("bash-v2.row.ui"));
     manifest.template["page"]["source"] = json!(include_str!("bash-v2.page.ui"));
-    manifest.template_revision = 1;
+    manifest.template_revision = 2;
     manifest.record_schema.revision += 1;
     manifest.record_schema.completion_fields.insert(
         "tail".into(),

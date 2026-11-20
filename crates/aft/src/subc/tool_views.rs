@@ -116,6 +116,16 @@ mod tests {
     use super::*;
     use cortexkit_role_tool_provider::{catalog::schema_digest, views::ViewChange};
     use serde_json::json;
+    use sha2::{Digest, Sha256};
+
+    fn assert_template_digests(template: &Value, expected: [&str; 2]) {
+        for (slot, digest) in ["row", "page"].into_iter().zip(expected) {
+            let canonical =
+                cortexkit_role_tool_display::canonical_body(template[slot].as_object().unwrap())
+                    .unwrap();
+            assert_eq!(format!("{:x}", Sha256::digest(canonical)), digest, "{slot}");
+        }
+    }
 
     #[test]
     fn every_shipped_pin_remains_servable() {
@@ -192,14 +202,14 @@ mod tests {
                 crate::subc::rich_ui::records::files_schema()
             };
             if has_bash_tail(pin) {
-                assert_eq!(view.template_revision, 1);
+                assert_eq!(view.template_revision, 2);
                 schema.revision = 2;
                 schema.completion_fields.insert(
                     "tail".into(),
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
             } else {
-                assert_eq!(view.template_revision, 2);
+                assert_eq!(view.template_revision, 3);
             }
             assert_eq!(view.record_schema, schema);
             assert!(view.check_pin(pin).unwrap());
@@ -232,32 +242,49 @@ mod tests {
             } else {
                 "view.output ??"
             }));
+            // Canonical row and page SHA-256s reported by occipital-check from
+            // cortexkit/occipital at 6771d71. The run used the edit call from
+            // the phone-reader-tool-display-v7 tag and AFT's exported write and
+            // apply_patch samples at phone and desktop widths.
+            let digests = match entry.tool.name.as_str() {
+                "apply_patch" => [
+                    "808bb3c1e481027c3e5b8ab46f532ca0ed91be1936064dbda748a854d39ce434",
+                    "e6a2c7a3607648817895ed3c4cd3e40f868d8ddef0ac54dd654e13a42b0ee4d2",
+                ],
+                "edit" => [
+                    "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
+                    "3a457fd30d60ca7acc5bab258da9786bc309a44190d5454795f2b80a870332d7",
+                ],
+                "write" => [
+                    "39eb5d8d7be00d7b901f5bf5ee6f0a47d5840989349fe61bf61e70ddb564e3ec",
+                    "c87fe9bf996c6a5c84488a4a063a96939c79ea4e2d4597c16f696852c4f912df",
+                ],
+                "bash" => continue, // Covered by the tail-pin compatibility test.
+                name => panic!("missing template digests for {name}"),
+            };
+            assert_template_digests(&view.template, digests);
         }
     }
 
     #[test]
     fn bash_catalog_serves_a_new_tail_pin_without_changing_the_old_record_schema() {
         use crate::subc::tool_provider::{tools_for_session, CatalogPreset};
-        use sha2::{Digest, Sha256};
 
-        // These source digests were served before the completion schema had a tail.
+        // Canonical row and page SHA-256s reported by occipital-check from
+        // cortexkit/occipital at 6771d71. The run used bash calls from the
+        // phone-reader-tool-display-v7 and phone-reader-tool-tail-v2 tags
+        // at phone and desktop widths.
         let legacy_template_digests = [
-            (
-                "row",
-                "f735ae10c6e774181736e0f126c6250a37ac37c7a80ef77d7cef0ed89f6b553a",
-            ),
-            (
-                "page",
-                "ec82b0c56449e389316211a1a5da560e2fb9c680ad36bd901762e8d22b80623b",
-            ),
+            "2d048532a4777592f2d30c03fac3beab2c6d9a01c54a3e3a5086265d5237e9b7",
+            "e8d1495e42c90404af114aaa5e369d1e57e24571174798dd974589c3a07e173a",
         ];
-        // The Occipital checker hashes the entire canonical template document.
-        // The row is the one-line row (icon, title, narrow Failed mark) that
-        // OCCI re-ran through occipital-check on 20 Nov; the page is unchanged
-        // from the phone-reader-tool-tail-v1 sample.
+        // The Occipital checker hashes the entire canonical template document,
+        // which names the tool catalog. These are the one-line row and the
+        // unchanged page re-declared on catalog 6e323928…, as passed by
+        // occipital-check from occipital 6771d71.
         let tail_template_digests = [
-            "8444993fa225504435700391cbcc97b7fd1f641622724106388bd89bd72199f2",
-            "d0f88d63925c8d289d6f273a7a9f5743e67f49f24e5d7020536cf254f40c9cb4",
+            "a4aae30e9c270aa93f496e89c8462bc8d73c73bdb146d1edb1e899b9fe84d964",
+            "448495cc4f693bb622f407532eabddae4fdfc55a249de00eec08ab13eef2a658",
         ];
 
         let base: BTreeMap<String, Shipped> = serde_json::from_str(include_str!(
@@ -300,25 +327,8 @@ mod tests {
                 schema["fields"],
                 reply["views"][&old]["record_schema"]["fields"]
             );
-            for ((slot, legacy_digest), tail_digest) in legacy_template_digests
-                .into_iter()
-                .zip(tail_template_digests)
-            {
-                let legacy_source = reply["views"][&old]["template"][slot]["source"]
-                    .as_str()
-                    .unwrap();
-                assert_eq!(
-                    format!("{:x}", Sha256::digest(legacy_source.as_bytes())),
-                    legacy_digest
-                );
-                let template = reply["views"][&pin]["template"][slot].as_object().unwrap();
-                let canonical = cortexkit_role_tool_display::canonical_body(template).unwrap();
-                assert_eq!(
-                    format!("{:x}", Sha256::digest(canonical)),
-                    tail_digest,
-                    "{slot}"
-                );
-            }
+            assert_template_digests(&reply["views"][&old]["template"], legacy_template_digests);
+            assert_template_digests(&reply["views"][&pin]["template"], tail_template_digests);
         }
     }
 
