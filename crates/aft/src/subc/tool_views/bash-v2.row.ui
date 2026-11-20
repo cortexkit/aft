@@ -1,22 +1,6 @@
 <ToolHeader icon="terminal" title={input.description ?? input.command}>
-<Slot width="short">
-{view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />
- : (view.completion.endReason ?? view.record.endReason) == "timed_out" ? <ToolText text="Timed out" size="small" tone="danger" />
- : (view.completion.endReason ?? view.record.endReason) == "killed" ? <ToolText text="Stopped" size="small" tone="danger" />
- : (view.completion.exitCode ?? view.record.exitCode) != null ? <ToolText text={"Exit " + Text(view.completion.exitCode ?? view.record.exitCode)} font="mono" size="small" tone={(view.completion.exitCode ?? view.record.exitCode) == 0 ? "muted" : "danger"} />
- : (view.completion.phase ?? view.record.phase) == "background_started" ? <Badge text="In background" tone="neutral" />
- : view.call.phase == "running" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} />
- : view.call.isError == true ? <ToolText text="Failed" size="small" tone="danger" /> : null}
+<Slot width="narrow" needs={view.completion ?? view.record}>
+{(view.completion.endReason ?? view.record.endReason) == "timed_out" || (view.completion.endReason ?? view.record.endReason) == "killed" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true
+ ? <ToolText text="Failed" size="small" tone="danger" /> : null}
 </Slot>
 </ToolHeader>
-
-<ToolText font="mono" size="small" maxLines={2} text={input.command} />
-
-<Slot width="fill" lines={3} box="code">
-{Count(view.completion.tail ?? []) > 0
- ? Each(view.completion.tail ?? [], "line", <ToolText font="mono" size="small" maxLines={1} tone={line.tone ?? "neutral"} text={line.text} />)
- : view.record.phase == "background_started" && view.completion == null
- ? <ToolText font="mono" size="small" tone="muted" text="Running in the background." />
- : view.call.phase == "running" ? <ToolText font="mono" size="small" tone="muted" text="Waiting for output…" />
- : view.call.phase == "answered" ? <ToolText font="mono" size="small" tone="muted" text="No output was kept." /> : null}
-</Slot>

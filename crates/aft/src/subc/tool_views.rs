@@ -252,8 +252,11 @@ mod tests {
             ),
         ];
         // The Occipital checker hashes the entire canonical template document.
+        // The row is the one-line row (icon, title, narrow Failed mark) that
+        // OCCI re-ran through occipital-check on 20 Nov; the page is unchanged
+        // from the phone-reader-tool-tail-v1 sample.
         let tail_template_digests = [
-            "8eb7c2fa8911e0f41c0cd33a90804397b5eccfc8afc038712a8d448eef4d0957",
+            "8444993fa225504435700391cbcc97b7fd1f641622724106388bd89bd72199f2",
             "d0f88d63925c8d289d6f273a7a9f5743e67f49f24e5d7020536cf254f40c9cb4",
         ];
 
