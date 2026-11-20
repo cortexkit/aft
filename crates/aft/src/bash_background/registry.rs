@@ -15035,9 +15035,7 @@ impl BgTaskRegistry {
 
         // One final scan runs before terminal notification routing so bytes
         // printed immediately before exit can win over the exit safety net.
-        self.scan_task_watch_output(task);
-
-        self.post_terminal_transition(task, true)
+        self.scan_watches_then_post_terminal(task)
     }
 
     fn enqueue_completion_if_needed(
@@ -30038,6 +30036,64 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn finished_task_backlog_reaches_its_watch_before_the_exit_is_routed() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let go = storage.join("go");
+        let command = format!(
+            "{}; head -c 8388608 /dev/zero; printf '\\nLATE\\n'",
+            crate::test_gate::gate_exists(&format!("'{}'", go.display()), "sleep 0.01")
+        );
+        let id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                &command,
+                "session".into(),
+                storage.into(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.into(),
+                10,
+                true,
+                false,
+                Some(storage.into()),
+            )
+            .unwrap();
+        registry
+            .register_watch(id.clone(), WatchPattern::Substring("LATE".into()), true)
+            .unwrap();
+        let task = registry.task_for_session(&id, "session").unwrap();
+        fs::write(&go, "").unwrap();
+        // Every scan on this thread is out of time after one chunk, so the
+        // exit's final scan cannot drain the 8 MiB backlog itself.
+        watch_scan::set_watch_scan_budget_for_test(Some(Duration::ZERO));
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !task.is_terminal() {
+            assert!(Instant::now() < deadline, "the command never finished");
+            let _ = registry.poll_task(&task);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        watch_scan::set_watch_scan_budget_for_test(None);
+        let hits = loop {
+            let hits = pattern_match_frames(&frames);
+            if !hits.is_empty() {
+                break hits;
+            }
+            assert!(Instant::now() < deadline, "no watch notice arrived");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(
+            hits.iter().any(|hit| hit.match_text == "LATE"),
+            "the exit was routed before the drain reached LATE: {:?}",
+            hits.iter().map(|hit| &hit.match_text).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a02_running_watch_catches_up_before_child_exit() {
         use crate::bash_background::persistence::work_counts;
         let dir = tempfile::tempdir().unwrap();
@@ -30189,11 +30245,15 @@ mod tests {
         // so the watch can start past offset zero. Measure the tick from
         // wherever the cursor stood before it.
         let before = registry.watch_stream_cursors(&noisy).0;
+        // A tick out of time reads one chunk per stream and leaves the rest
+        // of the burst for later ticks.
+        watch_scan::set_watch_scan_budget_for_test(Some(Duration::ZERO));
         registry.scan_task_watch_output(&noisy_task);
+        watch_scan::set_watch_scan_budget_for_test(None);
         let first = registry.watch_stream_cursors(&noisy).0;
         assert_eq!(
             first - before,
-            1024 * 1024,
+            64 * 1024,
             "one running tick must not consume the whole burst"
         );
         registry.scan_task_watch_output(&other_task);
@@ -30205,6 +30265,72 @@ mod tests {
         assert!(hits
             .iter()
             .any(|hit| hit.task_id == noisy && hit.match_text == "CROSS-CHUNK"));
+    }
+
+    #[test]
+    fn running_watch_scan_catches_up_on_a_large_backlog_in_one_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        registry
+            .register_watch(
+                task.task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                true,
+            )
+            .unwrap();
+        let mut output = vec![b'.'; 4 * 1024 * 1024];
+        output.extend_from_slice(b"READY\n");
+        fs::write(&task.paths.stdout, &output).unwrap();
+        // Time is not what this checks: a tick may read past the old 1 MiB cap.
+        watch_scan::set_watch_scan_budget_for_test(Some(Duration::from_secs(30)));
+        registry.scan_task_watch_output(&task);
+        watch_scan::set_watch_scan_budget_for_test(None);
+        assert_eq!(
+            registry.watch_stream_cursors(&task.task_id).0,
+            output.len() as u64
+        );
+        assert_eq!(
+            registry.active_watch_count(&task.task_id),
+            0,
+            "READY not seen"
+        );
+    }
+
+    #[test]
+    fn terminal_watch_drain_is_bounded_per_pass_and_finishes_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let task = lifecycle_running_fixture(&registry, &dir);
+        registry
+            .register_watch(
+                task.task_id.clone(),
+                WatchPattern::Substring("READY".into()),
+                true,
+            )
+            .unwrap();
+        let mut output = vec![b'.'; 4 * 1024 * 1024];
+        output.extend_from_slice(b"READY\n");
+        fs::write(&task.paths.stdout, &output).unwrap();
+        task.lock_state()
+            .unwrap()
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        assert!(!task.is_running());
+        watch_scan::set_watch_scan_budget_for_test(Some(Duration::ZERO));
+        let mut passes = 1;
+        while !registry.scan_task_watch_output(&task) {
+            passes += 1;
+            assert!(passes <= 100, "the drain never finished");
+        }
+        watch_scan::set_watch_scan_budget_for_test(None);
+        // A drain out of time reads one 64 KiB chunk per pass.
+        assert!(passes > 60, "the drain took {passes} passes");
+        assert_eq!(
+            registry.active_watch_count(&task.task_id),
+            0,
+            "READY not seen"
+        );
     }
 
     #[test]

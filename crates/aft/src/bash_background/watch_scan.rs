@@ -2,74 +2,137 @@
 
 use super::*;
 
+/// How long one call may spend feeding a task's output to its watches. The
+/// watchdog makes these calls for every task of every project on one thread,
+/// so a task with a large backlog continues on the next pass instead of
+/// holding that thread. Each stream still reads at least one chunk per call.
+const WATCH_SCAN_BUDGET: Duration = Duration::from_millis(50);
+
+#[cfg(test)]
+thread_local! {
+    static WATCH_SCAN_BUDGET_FOR_TEST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn watch_scan_budget() -> Duration {
+    #[cfg(test)]
+    if let Some(budget) = WATCH_SCAN_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
+        return budget;
+    }
+    WATCH_SCAN_BUDGET
+}
+
+/// Give watch scans on this thread `budget` instead of [`WATCH_SCAN_BUDGET`].
+#[cfg(test)]
+pub(crate) fn set_watch_scan_budget_for_test(budget: Option<Duration>) {
+    WATCH_SCAN_BUDGET_FOR_TEST.with(|cell| cell.set(budget));
+}
+
 impl BgTaskRegistry {
-    pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) {
+    /// Run a finished task's final watch scan, then its terminal transition,
+    /// which routes the exit to watches that never matched. A backlog the scan
+    /// budget cannot finish is drained on its own thread, which then runs the
+    /// transition: the watchdog is not held, and the output printed before the
+    /// exit still reaches its watches before the exit is routed.
+    pub(super) fn scan_watches_then_post_terminal(&self, task: &Arc<BgTask>) -> Result<(), String> {
+        if self.scan_task_watch_output(task) {
+            return self.post_terminal_transition(task, true);
+        }
+        let registry = self.clone();
+        let drained = Arc::clone(task);
+        let spawned = std::thread::Builder::new()
+            .name("aft-watch-drain".into())
+            .spawn(move || {
+                registry.finish_watch_drain(&drained);
+                if let Err(error) = registry.post_terminal_transition(&drained, true) {
+                    crate::slog_warn!(
+                        "failed to finish background task {} after its watch drain: {error}",
+                        drained.task_id
+                    );
+                }
+            });
+        if spawned.is_err() {
+            self.finish_watch_drain(task);
+            return self.post_terminal_transition(task, true);
+        }
+        Ok(())
+    }
+
+    /// Scan until the watches have read all of a finished task's output, or a
+    /// scan makes no progress.
+    fn finish_watch_drain(&self, task: &Arc<BgTask>) {
+        loop {
+            let before = self.watch_stream_cursors(&task.task_id);
+            if self.scan_task_watch_output(task)
+                || self.watch_stream_cursors(&task.task_id) == before
+            {
+                return;
+            }
+        }
+    }
+    /// Feed `task`'s output written since the last scan to its watches,
+    /// within [`WATCH_SCAN_BUDGET`]. Returns whether every watched stream was
+    /// read to its end, which for a finished task means its watches have seen
+    /// all of its output.
+    pub(crate) fn scan_task_watch_output(&self, task: &Arc<BgTask>) -> bool {
         if self.active_watch_count(&task.task_id) == 0 {
-            return;
+            return true;
         }
         let mode = match task.lock_state() {
             Ok(state) => state.metadata.mode.clone(),
-            Err(_) => return,
+            Err(_) => return true,
         };
-        let mut stdout = (mode == BgMode::Pipes)
-            .then(|| open_task_artifact(&task.paths, TaskArtifact::Stdout))
-            .transpose()
-            .ok()
-            .flatten();
-        let mut stderr = (mode == BgMode::Pipes)
-            .then(|| open_task_artifact(&task.paths, TaskArtifact::Stderr))
-            .transpose()
-            .ok()
-            .flatten();
-        let mut pty = (mode == BgMode::Pty)
-            .then(|| open_task_artifact(&task.paths, TaskArtifact::Pty))
-            .transpose()
-            .ok()
-            .flatten();
+        let open = |artifact| open_task_artifact(&task.paths, artifact).ok();
+        let mut files = match mode {
+            BgMode::Pipes => vec![
+                ("stdout", open(TaskArtifact::Stdout)),
+                ("stderr", open(TaskArtifact::Stderr)),
+            ],
+            BgMode::Pty => vec![("pty", open(TaskArtifact::Pty))],
+        };
+        if files.iter().any(|(_, file)| file.is_none()) {
+            // Nothing can be scanned; waiting would not change that.
+            return true;
+        }
+        let deadline = Instant::now() + watch_scan_budget();
         let drain = !task.is_running();
         let mut matches = Vec::new();
-        // Catch up using the same fresh handles in bounded stdout/stderr rounds.
-        // The chunk order matters: a once watch can match either stream, so a
-        // later stdout chunk must not overtake stderr's first chunk. Terminal
-        // drains keep their existing stdout-before-stderr ordering.
-        let rounds = if drain { 1 } else { 16 };
-        for _ in 0..rounds {
+        // Catch up using the same fresh handles in stdout/stderr rounds of one
+        // chunk each. The chunk order matters: a once watch can match either
+        // stream, so a later stdout chunk must not overtake stderr's first
+        // chunk. Terminal drains keep their stdout-before-stderr ordering, so
+        // a drain the budget stops does not start the next stream.
+        let mut at_end;
+        loop {
             let before = self.watch_stream_cursors(&task.task_id);
-            match mode {
-                BgMode::Pipes => {
-                    let (Some(stdout), Some(stderr)) = (stdout.as_mut(), stderr.as_mut()) else {
-                        return;
-                    };
-                    matches.extend(self.scan_watch_file(
-                        &task.task_id,
-                        &format!("{}:stdout", task.task_id),
-                        stdout,
-                        drain,
-                    ));
-                    matches.extend(self.scan_watch_file(
-                        &task.task_id,
-                        &format!("{}:stderr", task.task_id),
-                        stderr,
-                        drain,
-                    ));
+            at_end = true;
+            for (stream, file) in &mut files {
+                if drain && !at_end {
+                    break;
                 }
-                BgMode::Pty => {
-                    let Some(pty) = pty.as_mut() else { return };
-                    matches.extend(self.scan_watch_file(
-                        &task.task_id,
-                        &format!("{}:pty", task.task_id),
-                        pty,
-                        drain,
-                    ));
-                }
+                let (found, reached_end) = self.scan_watch_file_until(
+                    &task.task_id,
+                    &format!("{}:{stream}", task.task_id),
+                    file.as_mut().expect("every stream opened"),
+                    drain,
+                    Some(deadline),
+                );
+                matches.extend(found);
+                at_end &= reached_end;
             }
-            if self.active_watch_count(&task.task_id) == 0
+            if self.active_watch_count(&task.task_id) == 0 {
+                at_end = true;
+            }
+            if drain
+                || at_end
+                || Instant::now() >= deadline
                 || self.watch_stream_cursors(&task.task_id) == before
             {
                 break;
             }
         }
-        matches.extend(self.take_watch_line_batches(&task.task_id, drain));
+        // Partial last lines are final only once the drain read everything.
+        matches.extend(self.take_watch_line_batches(&task.task_id, drain && at_end));
         let (stdout_offset, stderr_offset, pty_offset) = self.watch_stream_cursors(&task.task_id);
         if matches.is_empty() {
             // Advance durable cursors even when nothing matched so a restart
@@ -83,7 +146,7 @@ impl BgTaskRegistry {
                     pty_offset,
                 );
             }
-            return;
+            return at_end;
         }
         for mut pattern_match in matches {
             let mut fresh = pattern_match.clone();
@@ -105,6 +168,7 @@ impl BgTaskRegistry {
             stderr_offset,
             pty_offset,
         );
+        at_end
     }
 
     pub(super) fn scan_watch_file(
@@ -114,11 +178,30 @@ impl BgTaskRegistry {
         file: &mut crate::bash_background::persistence::ValidatedArtifact,
         drain: bool,
     ) -> Vec<PatternMatch> {
+        self.scan_watch_file_until(task_id, cursor_key, file, drain, None)
+            .0
+    }
+
+    /// Scan one stream's unread bytes: one chunk for a running task, or up to
+    /// the end for a drain, stopping at `deadline` once a chunk was read. Also
+    /// returns whether the scan reached the end of what the stream holds (or
+    /// nothing is left to watch).
+    fn scan_watch_file_until(
+        &self,
+        task_id: &str,
+        cursor_key: &str,
+        file: &mut crate::bash_background::persistence::ValidatedArtifact,
+        drain: bool,
+        deadline: Option<Instant>,
+    ) -> (Vec<PatternMatch>, bool) {
         const CHUNK: u64 = 64 * 1024;
         // Charge reads even when another scanner advances the cursor, so a
         // contended running scan still yields after one chunk.
         let mut bytes_read = 0;
         let mut matches = Vec::new();
+        // A scan that cannot go on (no watch left, an unreadable stream) has
+        // nothing more to wait for either.
+        let mut reached_end = true;
         // The capture file a withheld watch preview names, so the agent can
         // read the matched output itself.
         let output_file =
@@ -130,7 +213,10 @@ impl BgTaskRegistry {
                     _ => None,
                 });
         loop {
-            if !drain && bytes_read >= CHUNK as usize {
+            let out_of_budget =
+                bytes_read > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline);
+            if (!drain && bytes_read >= CHUNK as usize) || out_of_budget {
+                reached_end = false;
                 break;
             }
             let cursor = match self.inner.watch_registry.lock() {
@@ -221,6 +307,6 @@ impl BgTaskRegistry {
                 break;
             }
         }
-        matches
+        (matches, reached_end)
     }
 }

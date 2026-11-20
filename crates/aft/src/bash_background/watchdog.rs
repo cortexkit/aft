@@ -539,8 +539,11 @@ pub(super) fn run_pass(
             continue;
         }
         if !task.is_running() {
-            registry.scan_task_watch_output(&task);
-            retire_terminal_task(registry, &task, pass_cause, awaiting_reader);
+            // A large drain continues on later passes; the task is watched
+            // until its watches have seen all of its output.
+            if registry.scan_task_watch_output(&task) {
+                retire_terminal_task(registry, &task, pass_cause, awaiting_reader);
+            }
             continue;
         }
         let timeout_expired = task
@@ -563,8 +566,7 @@ pub(super) fn run_pass(
             continue;
         }
         registry.reap_child(&task);
-        if !task.kill_in_flight() && !task.is_running() {
-            registry.scan_task_watch_output(&task);
+        if !task.kill_in_flight() && !task.is_running() && registry.scan_task_watch_output(&task) {
             retire_terminal_task(registry, &task, pass_cause, awaiting_reader);
         }
     }
