@@ -47,7 +47,7 @@ impl Gaps {
         self.discovery_scope(&discovery, scope);
     }
 
-    pub(super) fn discovery_scope(&mut self, discovery: &Discovery, scope: &Path) {
+    pub(crate) fn discovery_scope(&mut self, discovery: &Discovery, scope: &Path) {
         if discovery.entry_limit_reached
             && !discovery
                 .children
