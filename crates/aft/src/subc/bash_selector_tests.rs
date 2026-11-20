@@ -283,6 +283,17 @@ async fn next_bash_reply(
         .expect("bash reply within 20 s")
         .expect("bash reply");
     let text = done.text_for_test().expect("bash result").to_string();
+    let mut reply = done.reply_frame_for_test(wire::ToolResponsePolicy {
+        trust: BindTrust::FirstParty,
+        tool_result_body: false,
+        model_only: false,
+        output_scope: None,
+    });
+    reply.project_tool_result().unwrap();
+    // Acknowledge task notices only after the reply frame is written.
+    if let Some(write) = reply.finish_cancelled_call_notices(true) {
+        write.await.unwrap();
+    }
     (text, done.response_for_test().data.clone())
 }
 
