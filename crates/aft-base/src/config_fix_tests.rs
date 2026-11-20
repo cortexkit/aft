@@ -626,6 +626,41 @@ fn config_migration_directory_sync_error_is_before_commit() {
 }
 
 #[test]
+fn config_migration_post_rename_sync_error_keeps_backup() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    fs::write(&path, TRANSLATED_USER_FILE).unwrap();
+    let outcome =
+        auto_migrate_user_config_with_writer(&path, |target, contents, permissions, relocating| {
+            publish_conversion(target, contents, permissions, relocating)?;
+            crate::durability::FAIL_DIRECTORY_SYNC
+                .with(|slot| slot.replace(Some(target.parent().unwrap().to_path_buf())));
+            Ok(())
+        })
+        .expect("reported failure");
+
+    let UserConfigMigration::NotMigrated { reason, .. } = outcome else {
+        panic!("an unsynced replacement must not be reported as migrated: {outcome:?}");
+    };
+    assert!(
+        reason.contains("injected directory sync failure"),
+        "{reason}"
+    );
+    let converted = fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        parse_document(&converted).unwrap(),
+        json!({"idle": {"checkout_hours": 72}})
+    );
+    let copies = backups(dir.path());
+    assert_eq!(copies.len(), 1);
+    assert_eq!(
+        fs::read_to_string(&copies[0]).unwrap(),
+        TRANSLATED_USER_FILE
+    );
+}
+
+#[test]
 fn settings_editor_error_discards_successful_prior_edits_without_an_old_copy() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("aft.jsonc");

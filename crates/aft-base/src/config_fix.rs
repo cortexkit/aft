@@ -1008,11 +1008,17 @@ fn auto_migrate_user_config_with_reader(
         }
         return not_migrated(reason, translation.as_ref(), &text);
     }
+    // The rename has replaced the file, but its directory entry isn't durable
+    // yet. Keep the backup if syncing fails, and don't remove a legacy source.
+    if let Err(error) = crate::durability::sync_dir(parent) {
+        return not_migrated(
+            format!("publish settings at /: {error}"),
+            translation.as_ref(),
+            &text,
+        );
+    }
     if relocating {
-        // Do not remove the source until the new name is durable. A cleanup
-        // failure leaves both copies; subsequent starts prefer the canonical one.
-        if let Err(error) = crate::durability::sync_dir(parent).and_then(|()| remove_legacy(source))
-        {
+        if let Err(error) = remove_legacy(source) {
             crate::slog_warn!("config user: could not finish removing legacy settings {} after publishing {}: {error}", source.display(), target.display());
         }
     }
