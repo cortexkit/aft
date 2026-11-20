@@ -251,6 +251,11 @@ mod tests {
                 "ec82b0c56449e389316211a1a5da560e2fb9c680ad36bd901762e8d22b80623b",
             ),
         ];
+        // The Occipital checker hashes the entire canonical template document.
+        let tail_template_digests = [
+            "8eb7c2fa8911e0f41c0cd33a90804397b5eccfc8afc038712a8d448eef4d0957",
+            "d0f88d63925c8d289d6f273a7a9f5743e67f49f24e5d7020536cf254f40c9cb4",
+        ];
 
         let base: BTreeMap<String, Shipped> = serde_json::from_str(include_str!(
             "../../tests/fixtures/tool_views/shipped-v1.json"
@@ -292,7 +297,10 @@ mod tests {
                 schema["fields"],
                 reply["views"][&old]["record_schema"]["fields"]
             );
-            for (slot, legacy_digest) in legacy_template_digests {
+            for ((slot, legacy_digest), tail_digest) in legacy_template_digests
+                .into_iter()
+                .zip(tail_template_digests)
+            {
                 let legacy_source = reply["views"][&old]["template"][slot]["source"]
                     .as_str()
                     .unwrap();
@@ -300,10 +308,13 @@ mod tests {
                     format!("{:x}", Sha256::digest(legacy_source.as_bytes())),
                     legacy_digest
                 );
-                assert!(reply["views"][&pin]["template"][slot]["source"]
-                    .as_str()
-                    .unwrap()
-                    .contains("view.completion.tail"));
+                let template = reply["views"][&pin]["template"][slot].as_object().unwrap();
+                let canonical = cortexkit_role_tool_display::canonical_body(template).unwrap();
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(canonical)),
+                    tail_digest,
+                    "{slot}"
+                );
             }
         }
     }

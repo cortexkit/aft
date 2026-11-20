@@ -1,5 +1,5 @@
 <ToolHeader icon="terminal" title={input.description ?? input.command}>
-<Slot width="medium">
+<Slot width="short">
 {view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />
  : (view.completion.endReason ?? view.record.endReason) == "timed_out" ? <ToolText text="Timed out" size="small" tone="danger" />
  : (view.completion.endReason ?? view.record.endReason) == "killed" ? <ToolText text="Stopped" size="small" tone="danger" />
@@ -10,12 +10,13 @@
 </Slot>
 </ToolHeader>
 
-<ToolText font="mono" maxLines={2} text={input.command} />
+<ToolText font="mono" size="small" maxLines={2} text={input.command} />
 
 <Slot width="fill" lines={3} box="code">
-{view.completion.tail != null
+{Count(view.completion.tail ?? []) > 0
  ? Each(view.completion.tail ?? [], "line", <ToolText font="mono" size="small" maxLines={1} tone={line.tone ?? "neutral"} text={line.text} />)
  : view.record.phase == "background_started" && view.completion == null
  ? <ToolText font="mono" size="small" tone="muted" text="Running in the background." />
- : view.call.phase == "running" ? <ToolText font="mono" size="small" tone="muted" text="Waiting for output…" /> : null}
+ : view.call.phase == "running" ? <ToolText font="mono" size="small" tone="muted" text="Waiting for output…" />
+ : view.call.phase == "answered" ? <ToolText font="mono" size="small" tone="muted" text="No output was kept." /> : null}
 </Slot>
