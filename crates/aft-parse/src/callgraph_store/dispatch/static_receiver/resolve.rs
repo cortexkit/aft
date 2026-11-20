@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::super::{dependency, typescript, Resolution, Resolver, Target};
 use super::extract::join;
-use super::{csharp_projects::ProjectId, Declaration, Scope, StaticFacts};
+use super::{csharp_projects::ProjectId, relative_module, Declaration, Scope, StaticFacts};
 
 pub(in crate::callgraph_store) const STATIC_IMPORT_PREFIX: &str = "@static-import:";
 // An import can resolve to a project module without resolving to a class.
@@ -153,17 +153,16 @@ impl<'a> Resolver<'a> {
     }
 
     fn ts_import_type(&self, file: &str, name: &str, module: &str) -> Option<Vec<Type<'a>>> {
+        // A host can supply a bare module at runtime without any file for
+        // import resolution to find. Only relative imports can prove a class.
+        if !relative_module(module) {
+            return None;
+        }
         let key = format!("{STATIC_IMPORT_PREFIX}{name}");
-        let bound = match self.projections() {
+        let (path, index) = match self.projections() {
             Some(projections) => self.replay_static_import(projections, file, &key),
             None => self.static_import_projection(file, &key),
-        };
-        let Some((path, index)) = bound else {
-            // Relative and absolute paths, and package-internal aliases, do
-            // not establish that a module lives outside this project.
-            let package = !module.starts_with(['.', '/', '#']);
-            return package.then(Vec::new);
-        };
+        }?;
         let facts = self.lookup(&path)?.dispatch.static_facts.as_deref()?;
         let declaration = facts.types.get(index as usize)?;
         Some(vec![Type {

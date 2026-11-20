@@ -14,6 +14,10 @@ mod msbuild;
 #[path = "static_receiver/resolve.rs"]
 mod resolve;
 
+fn relative_module(module: &str) -> bool {
+    matches!(module, "." | "..") || module.starts_with("./") || module.starts_with("../")
+}
+
 pub(super) use extract::Index;
 pub(in crate::callgraph_store) use resolve::STATIC_IMPORT_PREFIX;
 

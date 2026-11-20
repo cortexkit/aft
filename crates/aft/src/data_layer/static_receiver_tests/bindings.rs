@@ -98,7 +98,7 @@ macro_rules! js {
     ($($case:ident: $body:literal,)*) => {$(
         #[test]
         fn $case() {
-            let source = format!("import {{ Receiver }} from 'outside'; {}", $body);
+            let source = format!("import {{ Receiver }} from './other'; {}", $body);
             for language in ["javascript", "typescript"] {
                 check(language, &source, stringify!($case));
             }

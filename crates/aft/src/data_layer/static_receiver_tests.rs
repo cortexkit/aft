@@ -130,7 +130,7 @@ public class SampleReflection {
 
 #[test]
 fn duplicate_static_receiver_ordinals_round_trip_typescript_nested_callback() {
-    let source = r#"import path from 'node:path';
+    let source = r#"import path from './path';
 function createCheckoutReaders() {
     const root = '/checkout';
     return {
@@ -147,7 +147,10 @@ function createCheckoutReaders() {
         .iter()
         .find(|site| site.member.as_deref() == Some("join"))
         .unwrap();
-    external(&resolver.resolve(file, site));
+    assert_eq!(
+        resolver.resolve(file, site),
+        resolver.resolve_nonstatic(file, site)
+    );
 }
 
 fn answer<'a>(file: &'a FileResolution, member: &str) -> &'a Resolution {
@@ -265,7 +268,18 @@ fn typescript_static_receiver_preserves_namespace_imports_and_local_shadowing() 
     let run = &resolved["src/run.ts"];
     exact(answer(run, "create"), "src/lib.ts", &["Real::create"]);
     exact(answer(run, "run"), "src/run.ts", &["Local::run"]);
-    external(answer(run, "check"));
+    let package = answer(run, "check");
+    assert_eq!(
+        (package.unresolved, package.external),
+        (1, 0),
+        "{package:?}"
+    );
+    assert!(
+        package
+            .protected
+            .contains(&("src/run.ts".into(), "Names::check".into())),
+        "{package:?}"
+    );
     let registry = answer(run, "register");
     assert_eq!(registry.unresolved, 1, "{registry:?}");
     assert!(
@@ -298,6 +312,91 @@ fn typescript_static_receiver_preserves_namespace_imports_and_local_shadowing() 
         .rows
         .iter()
         .any(|row| row.target_symbol.as_deref() == Some("ordinary")));
+}
+
+#[test]
+fn typescript_bare_virtual_module_keeps_runtime_matches_and_protection() {
+    let inputs = checkout(&[
+        ("src/consumer.ts", "import { languages, Uri } from 'virtual-api'; languages.match('javascript'); Uri.parse('resource');"),
+        ("src/api.d.ts", "declare module 'virtual-api' { export const languages: { match(text: string): boolean }; export class Uri { static parse(text: string): Uri; } }"),
+        ("src/runtime.ts", "interface Matcher { match(text: string): boolean; parse(text: string): object; } export const languages = { match(text: string) { return !!text; } }; export class RuntimeUri { static parse(text: string) { return { text }; } }"),
+    ], &[]);
+    let rows = records_match_files(&inputs);
+    let caller = &rows["src/consumer.ts"];
+    let (_, runtime) = inputs.parses.get("src/runtime.ts").unwrap();
+    let object_method = runtime
+        .dispatch
+        .methods
+        .iter()
+        .find(|method| method.name == "match" && method.symbol.starts_with("@object:"))
+        .expect("the runtime API object has an indexed match method");
+    for (member, implementation) in [
+        ("match", object_method.symbol.as_str()),
+        ("parse", "RuntimeUri::parse"),
+    ] {
+        let value = answer(caller, member);
+        assert_eq!((value.unresolved, value.external), (1, 0), "{value:?}");
+        assert!(
+            value
+                .targets
+                .iter()
+                .any(|target| target.provenance == "name_match"
+                    && target.symbol == format!("Matcher::{member}")),
+            "{value:?}"
+        );
+        assert!(
+            value
+                .protected
+                .contains(&("src/runtime.ts".into(), implementation.into())),
+            "{value:?}"
+        );
+    }
+}
+
+#[test]
+fn typescript_bare_alias_does_not_prove_a_project_class() {
+    let inputs = checkout(
+        &[
+            (
+                "tsconfig.json",
+                r#"{"compilerOptions":{"baseUrl":".","paths":{"runtime-api":["src/api"]}}}"#,
+            ),
+            ("src/api.ts", "export class Api { static probe() {} }"),
+            (
+                "src/bare.ts",
+                "import { Api } from 'runtime-api'; Api.probe();",
+            ),
+            (
+                "src/relative.ts",
+                "import { Api } from './api'; Api.probe();",
+            ),
+            (
+                "src/base.ts",
+                "import { Api } from 'runtime-api'; class Derived extends Api {} Derived.probe();",
+            ),
+        ],
+        &[],
+    );
+    let rows = records_match_files(&inputs);
+    for file in ["src/bare.ts", "src/base.ts"] {
+        let value = answer(&rows[file], "probe");
+        assert_eq!(
+            (value.unresolved, value.external),
+            (1, 0),
+            "{file}: {value:?}"
+        );
+        assert!(
+            value
+                .protected
+                .contains(&("src/api.ts".into(), "Api::probe".into())),
+            "{file}: {value:?}"
+        );
+    }
+    exact(
+        answer(&rows["src/relative.ts"], "probe"),
+        "src/api.ts",
+        &["Api::probe"],
+    );
 }
 
 #[test]

@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use tree_sitter::Node;
 
 use super::super::{field, text, typescript, Nav, FUNCTIONS};
-use super::{bindings, Declaration, Receiver, Scope, StaticFacts};
+use super::{bindings, relative_module, Declaration, Receiver, Scope, StaticFacts};
 use crate::callgraph_store::join::ParseBlob;
 
 const CS_NAMESPACES: &[&str] = &["namespace_declaration", "file_scoped_namespace_declaration"];
@@ -202,7 +202,7 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
             index.ts_imports = parse
                 .imports
                 .iter()
-                .filter(|i| !i.type_only)
+                .filter(|i| !i.type_only && relative_module(&i.module_path))
                 .flat_map(|import| {
                     import
                         .default_import
@@ -218,6 +218,30 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                 .collect();
         }
         index.root_scope = index.scope(root.clone());
+        // A base bound by a non-relative import is no proof of a runtime
+        // class. Record only eligible bases so cold and live readers agree.
+        let ts_nonrelative_roots = if typescript::supported(language) {
+            parse
+                .imports
+                .iter()
+                .filter(|import| !relative_module(&import.module_path))
+                .flat_map(|import| {
+                    import
+                        .default_import
+                        .as_deref()
+                        .into_iter()
+                        .chain(import.namespace_import.as_deref())
+                        .chain(
+                            import
+                                .names
+                                .iter()
+                                .map(|spec| crate::imports::specifier_local_name(spec)),
+                        )
+                })
+                .collect::<HashSet<_>>()
+        } else {
+            HashSet::new()
+        };
         // The walk visits an enclosing type before its children.
         for &node in all
             .iter()
@@ -281,10 +305,14 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                         .or_insert(Some(id));
                 }
             }
+            let mut bases = bases(node, source, language);
+            bases.retain(|base| {
+                !ts_nonrelative_roots.contains(base.split('.').next().unwrap_or(base))
+            });
             let declaration = Declaration {
                 name: qualified,
                 scope: scope_id,
-                bases: bases(node, source, language),
+                bases,
                 values: Vec::new(),
                 methods: Vec::new(),
             };
