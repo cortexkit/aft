@@ -23,16 +23,19 @@ pub(super) async fn check_shell_pin_protection(
         "background": true, "permissions_requested": true, "compressed": false,
         "command": format!(
             "pin={}; pin_dir={}; \
-             gh --shim-version || exit 11; \
+             printf 'PATH=%s SHIMS=%s\\n' \"$PATH\" \"$AFT_GH_SHIMS_DIR\"; \
+             alias_path=${{AFT_GH_SHIMS_DIR%/shims}}/aft; \
+             \"$pin\" gh-shim --shim-version || exit 10; \
+             \"$alias_path\" gh-shim --shim-version || exit 11; \
              if ls -- \"$pin_dir\" >/dev/null 2>&1; then exit 12; fi; \
              chmod u+w -- \"$pin\" 2>/dev/null || :; \
              if ( printf 'corrupted image' > \"$pin\" ) 2>/dev/null; then exit 13; fi; \
-             if ( printf 'corrupted through symlink' > \"$AFT_GH_SHIM_BINARY\" ) 2>/dev/null; then exit 14; fi; \
+             if ( printf 'corrupted through symlink' > \"$alias_path\" ) 2>/dev/null; then exit 14; fi; \
              chmod u-w -- \"$pin\" 2>/dev/null || :; \
              printf 'wrong pin' > replacement-pin; \
              if mv -f -- replacement-pin \"$pin\" 2>/dev/null; then exit 15; fi; \
              if rm -- \"$pin\" 2>/dev/null; then exit 16; fi; \
-             printf '%s' \"$AFT_GH_SHIM_BINARY\" > {}.part; \
+             printf '%s' \"$alias_path\" > {}.part; \
              mv -- {}.part {}; sleep 30",
             quote(pin), quote(pin.parent().unwrap()), quote(&ready), quote(&ready), quote(&ready),
         ),
@@ -46,7 +49,10 @@ pub(super) async fn check_shell_pin_protection(
             let status = aft
                 .tool_call("bash_status", json!({"task_id": task_id}))
                 .await;
-            panic!("strict shell did not execute its shim and reject all pin writes: {status:?}");
+            panic!(
+                "strict shell did not execute its shim and reject pin writes (exit {}): {}",
+                status["exit_code"], status["output_preview"]
+            );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
