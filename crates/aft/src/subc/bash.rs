@@ -79,6 +79,7 @@ impl BashDeferredCompletion {
         self.result.as_ref().map(|result| result.text.as_str())
     }
 
+    #[cfg(unix)]
     pub(super) fn reply_frame_for_test(
         &self,
         policy: super::wire::ToolResponsePolicy,
