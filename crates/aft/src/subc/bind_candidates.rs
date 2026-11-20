@@ -513,7 +513,7 @@ mod tests {
         assert_eq!(body.matches("candidate_requests.intercept(").count(), 1);
         let hold = body.find("candidate_requests.intercept(").unwrap();
         assert!(hold < body.find("!ingress_route_should_be_processed(").unwrap());
-        assert!(hold < body.find("codemode::admit(").unwrap());
+        assert!(hold < body.find("codemode_owners::admit_frame(").unwrap());
         assert!(
             body.find("candidate_requests.next_ready()").unwrap()
                 < body.find("frame=reader_rx.recv()").unwrap()
