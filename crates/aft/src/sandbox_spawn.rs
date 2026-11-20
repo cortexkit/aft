@@ -61,10 +61,10 @@ pub mod checkout_controls;
 #[cfg(unix)]
 use checkout_controls::checkout_control_denies;
 pub(crate) use checkout_controls::remote_control_denies;
+mod launcher_image;
 pub(crate) mod remote;
 #[doc(hidden)]
 pub mod remote_shell_guard;
-mod launcher_image;
 mod requirement;
 #[cfg(unix)]
 mod settings_grants;
