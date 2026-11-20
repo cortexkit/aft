@@ -3447,8 +3447,8 @@ impl Checkout {
     }
 
     /// The bytes the call-graph engine holds, as the budget every
-    /// checkout's engine shares counts them; `None` without an engine or
-    /// while a refresh holds it. For measurement.
+    /// checkout's engine shares counts them. This measurement never waits:
+    /// `None` means either the slot is empty or it could not be locked.
     #[doc(hidden)]
     #[must_use]
     pub fn engine_census_bytes(&self) -> Option<u64> {
@@ -7706,9 +7706,20 @@ pub fn other() { callee(); }
                 .unwrap();
             assert!(stale.is_empty(), "round {round}: stale {stale:?}");
             checkout.publish_changes().unwrap().expect("published");
+            let published = checkout.live.read().unwrap().published.clone().unwrap();
+            // Publication wakes the idle reaper, which briefly locks the slot
+            // just to inspect it. A busy slot is not evidence of eviction.
+            let slot = checkout.engine.lock().unwrap();
+            let engine = slot
+                .as_ref()
+                .unwrap_or_else(|| panic!("round {round}: the publication dropped the engine"));
             assert!(
-                checkout.engine_census_bytes().is_some(),
-                "round {round}: the publication dropped the engine"
+                Arc::ptr_eq(&engine.published, &published),
+                "round {round}: the engine did not move onto the new publication"
+            );
+            assert!(
+                checkout.engine_census_bytes().is_none(),
+                "round {round}: a locked slot cannot be measured"
             );
         }
         let callers = callers_of(&checkout.view().unwrap(), "src/util.rs", "other");
