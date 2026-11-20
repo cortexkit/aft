@@ -930,7 +930,7 @@ pub(super) fn accept_confirmed_end(
     fence_confirmed_end(executor, stamp);
 }
 
-async fn finish_confirmed_end(
+pub(super) async fn finish_confirmed_end(
     executor: Arc<Executor>,
     stamp: ScopeStamp,
     metrics: Arc<DispatchPathMetrics>,
@@ -1036,6 +1036,7 @@ async fn revoke(executor: Arc<Executor>, stamp: &ScopeStamp) -> ScopeRevokeResul
                                 log::warn!("scope-ended grant revocation failed scope_ref={:?} scope_epoch={}: {error}", stamp.scope_ref, stamp.scope_epoch);
                                 failures.push(format!("grant revocation: {error}"));
                             }
+                            codemode_owners::confirmed_end(&conn, &stamp, &mut failures);
                             match crate::db::call_ledger::end_scope(
                                 &conn,
                                 &scope,

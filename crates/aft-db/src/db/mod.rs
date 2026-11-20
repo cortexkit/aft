@@ -21,6 +21,7 @@ pub mod bash_tasks;
 pub mod bash_watches;
 pub mod call_ledger;
 pub mod catalog_edit_modes;
+pub mod codemode_owners;
 pub mod compression_events;
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
 pub mod contention_probe;
@@ -712,6 +713,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
         display_records::install(&conn)?;
+        codemode_owners::install(&conn)?;
         clear_stored_compression_commands(&mut conn)?;
         access_grants::migrate_prefrontal_owner(&mut conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
@@ -746,6 +748,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
             display_records::install(&conn)?;
+            codemode_owners::install(&conn)?;
             clear_stored_compression_commands(&mut conn)?;
             access_grants::migrate_prefrontal_owner(&mut conn)?;
             Ok::<(), OpenError>(())
@@ -1269,6 +1272,7 @@ pub mod tests {
         "rich_ui_cursor_key",
         "rich_ui_session_presets",
         "display_records",
+        "codemode_owners",
     ];
 
     const EXPECTED_INDEXES: &[&str] = &[

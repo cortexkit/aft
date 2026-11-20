@@ -1243,6 +1243,11 @@ pub fn maybe_spawn_retention(
                 ) {
                     crate::slog_warn!("display record retention failed: {error}");
                 }
+                if let Err(error) = crate::db::codemode_owners::sweep(
+                    &conn, i64::try_from(now).unwrap_or(i64::MAX),
+                ) {
+                    crate::slog_warn!("codemode runner snapshot retention failed: {error}");
+                }
             }
             IN_FLIGHT.store(false, Ordering::Release);
         })

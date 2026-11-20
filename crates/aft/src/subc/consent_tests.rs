@@ -1507,10 +1507,10 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
             run_id: run_id.into(),
             task_identity: None,
             owner_route: parent.clone(),
-            owner_route_channel: RouteChannel {
+            owner_route_channel: Some(RouteChannel {
                 channel: 41,
                 epoch: 1,
-            },
+            }),
             run_route: RouteChannel {
                 channel: 42,
                 epoch: 1,

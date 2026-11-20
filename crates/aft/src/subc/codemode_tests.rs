@@ -9,6 +9,9 @@ use subc_protocol::scope::ScopeStamp;
 
 const OWNER: &str = "prefrontal";
 
+#[path = "codemode_restart_tests.rs"]
+mod restart;
+
 fn head_stamp(scope_ref: &str, agent: &str) -> ScopeStamp {
     serde_json::from_value(json!({
         "owner": {"kind": "reserved", "module_id": OWNER},
@@ -108,7 +111,7 @@ fn refusal(admission: Admission) -> subc_protocol::ErrorBody {
         Admission::Refused(error) => error,
         Admission::Owner(identity) => panic!("admitted as {}", identity.session),
         Admission::Unchanged => panic!("admission left the call unchanged"),
-        Admission::AwaitPolicies(_) => panic!("policies were not read"),
+        Admission::AwaitPolicies(_) | Admission::AwaitOwner(_) => panic!("admission is pending"),
     }
 }
 
@@ -117,7 +120,7 @@ fn owner(admission: Admission) -> RouteIdentity {
         Admission::Owner(identity) => identity,
         Admission::Refused(error) => panic!("refused: {} {:?}", error.code, error.detail),
         Admission::Unchanged => panic!("admission left the call unchanged"),
-        Admission::AwaitPolicies(_) => panic!("policies were not read"),
+        Admission::AwaitPolicies(_) | Admission::AwaitOwner(_) => panic!("admission is pending"),
     }
 }
 
@@ -630,7 +633,7 @@ fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
             run_id: "earlier-run".into(),
             task_identity: None,
             owner_route: other,
-            owner_route_channel: channel(2),
+            owner_route_channel: Some(channel(2)),
             run_route: channel(5),
             run_principal: other_principal,
         }));
@@ -716,7 +719,7 @@ fn codemode_head_inherits_runner_route_instead_of_scope_owner() {
     let runner = &f.routes[&channel(1)];
     assert_eq!(effective.spawn_principal, runner.spawn_principal);
     let run_owner = effective.run_owner.as_ref().unwrap();
-    assert_eq!(run_owner.owner_route_channel, channel(1));
+    assert_eq!(run_owner.owner_route_channel, Some(channel(1)));
     assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
 }
 
@@ -1428,7 +1431,7 @@ fn codemode_worker_runner_route_is_inherited_instead_of_owner_lease() {
         assert_eq!(effective.harness, runner.harness);
         assert_eq!(effective.disabled_tools, runner.disabled_tools);
         let run_owner = effective.run_owner.as_ref().unwrap();
-        assert_eq!(run_owner.owner_route_channel, channel(4));
+        assert_eq!(run_owner.owner_route_channel, Some(channel(4)));
         assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
     }
 }

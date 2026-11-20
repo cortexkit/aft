@@ -687,6 +687,21 @@ impl DaemonControl {
         &self,
         stamp: &subc_protocol::scope::ScopeStamp,
     ) -> Result<ModuleControlResponseToModule, ControlError> {
+        self.describe_scope(&stamp.owner, &stamp.scope_ref).await
+    }
+
+    pub(super) async fn describe_parent(
+        &self,
+        parent: &subc_protocol::scope::ScopeParent,
+    ) -> Result<ModuleControlResponseToModule, ControlError> {
+        self.describe_scope(&parent.owner, &parent.scope_ref).await
+    }
+
+    async fn describe_scope(
+        &self,
+        owner: &subc_protocol::Principal,
+        scope_ref: &str,
+    ) -> Result<ModuleControlResponseToModule, ControlError> {
         #[cfg(test)]
         if self.panic_next_describe.swap(false, Ordering::Relaxed) {
             panic!("injected scope describe task panic");
@@ -701,8 +716,8 @@ impl DaemonControl {
             .await
             .map_err(|_| ControlError::ConnectionClosed)?;
         let body = ModuleControlRequestFromModule::ScopeDescribe {
-            owner: stamp.owner.clone(),
-            scope_ref: stamp.scope_ref.clone(),
+            owner: owner.clone(),
+            scope_ref: scope_ref.to_owned(),
         };
         #[cfg(feature = "test-timing-hooks")]
         if let Some(directory) = std::env::var_os("AFT_TEST_SCOPE_DESCRIBE_CLOCK_DIR") {

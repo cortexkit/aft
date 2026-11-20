@@ -220,6 +220,7 @@ mod bash_grant_tests;
 #[cfg(test)]
 mod bash_selector_tests;
 mod codemode;
+mod codemode_owners;
 mod consent;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
@@ -582,8 +583,8 @@ struct DecodedFrame {
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
     confinement: Option<remote_policy::CarriedConfinement>,
-    /// Candidate head policies read off-loop before codemode chooses an owner.
-    codemode_policies: Option<Result<codemode::SavedPolicies, subc_protocol::ErrorBody>>,
+    /// Saved owner candidates and policies read off-loop for code-mode admission.
+    codemode_policies: Option<codemode_owners::CallRead>,
     /// Result of restoring launch grants for this frame; retain it so later
     /// admission waits do not repeat restoration.
     launch_restore: Option<Result<(), subc_protocol::ErrorBody>>,
@@ -1774,7 +1775,7 @@ fn speech_launch_seed(
                         head,
                         lifecycle.clone(),
                         origin(route),
-                        origin(owner.owner_route_channel),
+                        owner.owner_route_channel.and_then(origin),
                     )
                 })
         }
@@ -5989,36 +5990,14 @@ where
                         // every step below sees the owner-derived identity.
                         let codemode_routes;
                         ledger_edge.note_received(&decoded, &routes);
-                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
-                            let Some(ctx) = executor.actor_context(&identity.root) else {
-                                return Some(Err(remote_policy::policy_unavailable()));
-                            };
-                            if ctx.database_runtime_unconfigured() || (remote_policy::key(identity, Some("worker")).is_none()
-                                && !identity.scope.as_ref().is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)) {
-                                return Some(Ok(codemode::EffectiveSavedPolicy::default()));
-                            }
-                            match decoded.codemode_policies.as_ref()? {
-                                Ok(policies) => policies.get(&ctx, identity),
-                                Err(error) => Some(Err(error.clone())),
-                            }
-                        }) {
-                            codemode::Admission::Unchanged => (&routes, false),
-                            codemode::Admission::Owner(effective) => {
+                        let (decoded, routes_for_call, codemode_call) = match codemode_owners::admit_frame(&routes, route, decoded, &mut database_waits, &executor) {
+                            codemode_owners::FrameAdmission::Ready(decoded, None) => (decoded, &routes, false),
+                            codemode_owners::FrameAdmission::Ready(decoded, Some(effective)) => {
                                 codemode_routes = codemode::overlay(&routes, route, effective);
-                                (&codemode_routes, true)
+                                (decoded, &codemode_routes, true)
                             }
-                            codemode::Admission::AwaitPolicies(heads) => {
-                                match database_waits.read_codemode_policies(decoded, heads, &executor) {
-                                    Ok(()) => continue,
-                                    Err(decoded) => {
-                                        if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, remote_policy::policy_unavailable()).await {
-                                            break Err(error);
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                            codemode::Admission::Refused(error) => {
+                            codemode_owners::FrameAdmission::Deferred => continue,
+                            codemode_owners::FrameAdmission::Refused(decoded, error) => {
                                 if let Some(run) = routes.get(&route) {
                                     note_route_tool_call(run, &dispatch_path_metrics);
                                 }
@@ -7813,6 +7792,7 @@ async fn handle_route_bind_completion(
                 );
                 match access_grants::register(&identity, ctx) {
                     Ok(()) => {
+                        codemode_owners::save(ctx, &identity);
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
                         if let Some(ctx) = consent_executor.actor_context(&identity.root) {

@@ -47,6 +47,59 @@ impl DatabaseWaits {
         self.tasks.is_empty()
     }
 
+    pub(super) fn read_codemode_owner(
+        &mut self,
+        mut decoded: DecodedFrame,
+        identity: &RouteIdentity,
+        parent: subc_protocol::scope::ScopeParent,
+        executor: &Executor,
+    ) -> Result<(), DecodedFrame> {
+        let (Some(ctx), Some(run)) = (
+            executor.actor_context(&identity.root),
+            identity.run_scope.get(),
+        ) else {
+            return Err(decoded);
+        };
+        let deadline = wait_deadline(
+            &decoded,
+            decoded
+                .body()
+                .ok()
+                .and_then(|body| body["deadline_ms"].as_u64()),
+        );
+        if deadline <= Instant::now() || self.pending.len() >= MAX_WAITERS {
+            return Err(decoded);
+        }
+        let Ok(permit) = self.confinement_reads.clone().try_acquire_owned() else {
+            return Err(decoded);
+        };
+        let route = route_key(decoded.frame.header.channel, decoded.frame.header.epoch);
+        let key = (route, decoded.frame.header.corr);
+        let admission = AdmissionWait::from_decoded(&decoded, "tool.call");
+        let run = run.clone();
+        let handle = self.tasks.spawn(async move {
+            let read = async move {
+                if ctx.database_runtime_initializing() {
+                    crate::database_open::dispatch(&ctx);
+                    ctx.wait_for_database_open(deadline).await;
+                }
+                codemode_owners::read(ctx, run, parent, permit).await
+            };
+            let owners = tokio::time::timeout_at(deadline.into(), read)
+                .await
+                .unwrap_or_default();
+            decoded
+                .codemode_policies
+                .get_or_insert_with(Default::default)
+                .owners = Some(owners);
+            decoded
+        });
+        if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
+            old.abort();
+        }
+        Ok(())
+    }
+
     /// Compare codemode candidates only after their own saved policies have
     /// been read. Share the confinement read budget so a locked database cannot
     /// block the frame loop or create an unbounded number of blocking readers.
@@ -108,7 +161,10 @@ impl DatabaseWaits {
                 .and_then(Result::ok)
                 .ok_or_else(remote_policy::policy_unavailable)
             };
-            decoded.codemode_policies = Some(read);
+            decoded
+                .codemode_policies
+                .get_or_insert_with(Default::default)
+                .policies = Some(read);
             decoded
         });
         if let Some((old, _)) = self.pending.insert(key, (handle, admission)) {
@@ -1273,7 +1329,7 @@ mod tests {
         let resumed = tokio::time::timeout(Duration::from_secs(5), waits.next())
             .await
             .unwrap();
-        let Some(Ok(policies)) = resumed.codemode_policies else {
+        let Some(Ok(policies)) = resumed.codemode_policies.and_then(|read| read.policies) else {
             panic!("saved policies were not read");
         };
         for candidate in &candidates {

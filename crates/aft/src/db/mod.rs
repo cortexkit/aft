@@ -15,6 +15,8 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
 #[cfg(test)]
 pub(crate) use display_records::test_support::{current_schema_version, run_migrations_supported};
 #[cfg(test)]
+mod codemode_owners_tests;
+#[cfg(test)]
 mod display_records_tests;
 
 #[cfg(test)]
