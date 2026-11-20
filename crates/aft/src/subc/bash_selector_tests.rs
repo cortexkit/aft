@@ -282,7 +282,6 @@ async fn next_bash_reply(
         .await
         .expect("bash reply within 20 s")
         .expect("bash reply");
-    let text = done.text_for_test().expect("bash result").to_string();
     let mut reply = done.reply_frame_for_test(wire::ToolResponsePolicy {
         trust: BindTrust::FirstParty,
         tool_result_body: false,
@@ -290,7 +289,25 @@ async fn next_bash_reply(
         output_scope: None,
     });
     reply.project_tool_result().unwrap();
-    // Acknowledge task notices only after the reply frame is written.
+    let mut written = Vec::new();
+    write_frame_contiguous(
+        &mut written,
+        reply.frame(),
+        reply.body(),
+        &mut Vec::new(),
+        false,
+    )
+    .await
+    .expect("write the bash reply frame");
+    let frame = read_frame(&mut written.as_slice())
+        .await
+        .expect("decode the written bash reply frame")
+        .expect("a written reply frame");
+    let body: Value = serde_json::from_slice(&frame.body).expect("bash reply JSON");
+    let text = body["content"][0]["text"]
+        .as_str()
+        .expect("written bash reply text")
+        .to_owned();
     if let Some(write) = reply.finish_cancelled_call_notices(true) {
         write.await.unwrap();
     }
