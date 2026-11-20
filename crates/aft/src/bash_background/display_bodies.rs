@@ -8,7 +8,7 @@ impl BgTaskRegistry {
         buffer: &BgBuffer,
     ) -> crate::bash_background::frames::BashBodies {
         use crate::bash_background::buffer::StreamKind;
-        use crate::bash_background::frames::{bash_bodies, bash_tail};
+        use crate::bash_background::frames::bash_bodies;
         let bytes = metadata
             .remote
             .as_ref()
@@ -27,30 +27,15 @@ impl BgTaskRegistry {
                     stdout.saturating_add(buffer.stream_len(StreamKind::Stderr))
                 }
             });
-        let secrets = task.completion_secrets.lock().ok();
-        let masker = secrets.as_deref().and_then(Option::as_ref);
-        let safe = masker.is_some() || metadata.has_safe_completion_redaction_after_restart();
-        let mask = |text: &str| -> Option<String> {
-            let masked = masker.map_or_else(
-                || crate::log_redact::aft_redactor(text),
-                |masker| masker.redact(text),
-            );
-            crate::log_redact::redact_ticket_digest(
-                &masked,
-                metadata.completion_ticket_digest.as_deref(),
-            )
-            .ok()
-            .map(|text| text.into_owned())
-        };
-        let streams = safe
-            .then(|| buffer.read_complete_for_notice())
-            .flatten()
-            .and_then(|(stdout, stderr)| Some((mask(&stdout)?, mask(&stderr)?)));
-        let tail = streams
-            .as_ref()
-            .and_then(|(stdout, stderr)| bash_tail(metadata, stdout, stderr, &mask));
+        let (streams, unread, tail) = completion_preview::capture_reads::masked_display_streams(task, metadata, buffer)
+            .map_or((None, 0, None), |read| (Some(read.streams), read.unread, read.tail));
         let mut bodies = bash_bodies(metadata, Some(bytes), streams);
         bodies.tail = tail;
+        if unread > 0 {
+            // `cut_detail` adds the bytes it cuts to these.
+            bodies.detail["truncated"] = serde_json::json!(true);
+            bodies.detail["omittedBytes"] = serde_json::json!(unread);
+        }
         if let Some(refusal) = (!metadata.local_fallback_started)
             .then(|| remote::remote_refusal(metadata))
             .flatten()

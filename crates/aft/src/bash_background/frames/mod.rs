@@ -112,6 +112,8 @@ use super::persistence::PersistedTask;
 type Redact<'a> = dyn Fn(&str) -> Option<String> + 'a;
 type BashTail = fn(&PersistedTask, &str, &str, &Redact<'_>) -> Option<Value>;
 
+pub(crate) const MAX_BASH_DETAIL_BYTES: u64 = 3_145_728;
+
 pub(crate) type RecoveredFrame = (
     crate::db::call_ledger::RecordedFrame,
     String,
@@ -124,6 +126,7 @@ pub(crate) struct Hooks {
     pub bash_reply: fn(&mut TaskDisplay, BashBodies, bool),
     pub bash_terminal: fn(&TaskDisplay, BashBodies, &str, Option<u64>),
     pub bash_tail: BashTail,
+    pub bash_detail_byte_limit: fn() -> u64,
     pub recovered_bash_frame: fn(
         super::registry::BgTaskSnapshot,
         &crate::db::call_ledger::Key,
@@ -171,6 +174,10 @@ pub(crate) fn bash_tail(
     HOOKS
         .get()
         .and_then(|hooks| (hooks.bash_tail)(metadata, stdout, stderr, redact))
+}
+
+pub(crate) fn bash_detail_byte_limit() -> u64 {
+    HOOKS.get().map_or(MAX_BASH_DETAIL_BYTES, |hooks| (hooks.bash_detail_byte_limit)())
 }
 pub(crate) fn recovered_bash_frame(
     snapshot: super::registry::BgTaskSnapshot,

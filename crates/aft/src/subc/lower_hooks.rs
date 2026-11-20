@@ -9,6 +9,7 @@ pub(crate) fn register() {
         bash_reply: super::rich_ui::display::bash_reply,
         bash_terminal: super::rich_ui::display::bash_terminal,
         bash_tail: super::rich_ui::display::bash_tail,
+        bash_detail_byte_limit: super::rich_ui::display::detail_byte_limit,
         recovered_bash_frame: super::recovered_bash_frame,
     });
     crate::edit::register_file_reporter(super::rich_ui::display::file);

@@ -93,6 +93,21 @@ pub(crate) fn enabled() -> bool {
     SENDER.get().is_some()
 }
 
+/// The most bytes a detail body may hold once published; text past it is cut.
+/// Producers can stop reading their output there.
+pub(crate) fn detail_byte_limit() -> u64 {
+    SENDER
+        .get()
+        .and_then(|writer| {
+            writer
+                .limits
+                .try_lock()
+                .ok()
+                .map(|limits| limits.max_detail_bytes)
+        })
+        .unwrap_or_else(|| outbox::ceilings().max_detail_bytes)
+}
+
 // Module-mode publication is on by default, with an explicit opt-out.
 fn display_switch() -> Result<(), &'static str> {
     match std::env::var("AFT_TOOL_DISPLAY").as_deref() {

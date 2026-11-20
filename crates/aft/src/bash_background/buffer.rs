@@ -330,9 +330,26 @@ impl BgBuffer {
     }
 
     pub fn stream_len(&self, stream: StreamKind) -> u64 {
-        self.source(stream)
-            .and_then(|source| source.sampled().ok().map(|(_, len)| len))
-            .unwrap_or(0)
+        self.stream_len_checked(stream).unwrap_or(0)
+    }
+
+    /// The stream's current length, or the error that kept it from being read.
+    pub(crate) fn stream_len_checked(&self, stream: StreamKind) -> io::Result<u64> {
+        let source = self.source(stream).ok_or(io::ErrorKind::NotFound)?;
+        source.sampled().map(|(_, len)| len)
+    }
+
+    /// Raw bytes `start..start + len` of one stream, fewer at end of file,
+    /// without the UTF-8 alignment the text readers apply.
+    pub(crate) fn read_stream_bytes(
+        &self,
+        stream: StreamKind,
+        start: u64,
+        len: u64,
+    ) -> io::Result<Vec<u8>> {
+        let source = self.source(stream).ok_or(io::ErrorKind::NotFound)?;
+        let mut file = source.open()?;
+        source.read_range(&mut file, start, len)
     }
 
     pub fn read_for_token_count(&self, max_bytes_per_stream: usize) -> TokenCountInput {
