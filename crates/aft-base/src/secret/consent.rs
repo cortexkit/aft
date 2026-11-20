@@ -484,8 +484,8 @@ async fn run_card(
 
 #[rustfmt::skip]
 test_support_visibility! {
-/// Every HTTP request joins the same recorded card outcome without locking
-/// another request's vault lookup or charging it another waiter's queue time.
+/// Each retry shares the recorded outcome of the secret-approval request
+/// without blocking another vault lookup or counting another waiter's queue time.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcome {
     wait_consent_with_code(request, None).await.0
