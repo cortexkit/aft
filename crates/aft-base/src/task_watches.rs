@@ -93,6 +93,9 @@ pub struct WatchRegistry {
     watches: HashMap<String, Vec<WatchSpec>>,
     scan_cursors: HashMap<String, u64>,
     scan_overlaps: HashMap<String, Vec<u8>>,
+    /// Cursor keys whose last scan held back a regex match that reached the
+    /// end of the bytes read so far (see [`find_match`]).
+    held_ends: HashSet<String>,
     controlled_tasks: HashSet<String>,
     matched_tasks: HashSet<String>,
     /// Process-local tombstones keep `bash_status` informative after the durable
@@ -299,6 +302,8 @@ impl WatchRegistry {
             .retain(|key, _| key != task_id && !key.starts_with(&prefix));
         self.scan_overlaps
             .retain(|key, _| key != task_id && !key.starts_with(&prefix));
+        self.held_ends
+            .retain(|key| key != task_id && !key.starts_with(&prefix));
     }
 
     pub fn terminalize_erased_task(&mut self, task_id: &str) -> Vec<String> {
@@ -341,21 +346,30 @@ impl WatchRegistry {
     pub fn set_file_cursor(&mut self, cursor_key: &str, offset: u64) {
         self.scan_cursors.insert(cursor_key.to_string(), offset);
         self.scan_overlaps.remove(cursor_key);
+        self.held_ends.remove(cursor_key);
     }
 
+    /// Scan `bytes`, read from a stream at `start`, for every watch of
+    /// `task_id`. `at_end` says the stream ends with them: the task finished
+    /// and nothing more will be written. Until then a regex match reaching the
+    /// end of the bytes is held back; an `at_end` scan of no bytes reports it.
     pub fn scan_chunk(
         &mut self,
         cursor_key: &str,
         task_id: &str,
         bytes: &[u8],
         start: u64,
+        at_end: bool,
         render: &mut dyn FnMut(&str, usize, usize, u64, u64) -> (String, String),
     ) -> Vec<PatternMatch> {
+        if bytes.is_empty() && !self.held_ends.contains(cursor_key) {
+            return Vec::new();
+        }
         self.scan_cursors.insert(
             cursor_key.to_string(),
             start.saturating_add(bytes.len() as u64),
         );
-        self.scan_new_bytes_at(cursor_key, task_id, bytes, start, render)
+        self.scan_new_bytes_at(cursor_key, task_id, bytes, start, at_end, render)
     }
 
     pub fn scan_new_bytes(&mut self, task_id: &str, bytes: &[u8]) -> Vec<PatternMatch> {
@@ -367,6 +381,7 @@ impl WatchRegistry {
             task_id,
             bytes,
             base,
+            false,
             &mut |text, start, end, _, _| {
                 (
                     text[start..end].to_string(),
@@ -382,11 +397,14 @@ impl WatchRegistry {
         task_id: &str,
         bytes: &[u8],
         base_offset: u64,
+        at_end: bool,
         render: &mut dyn FnMut(&str, usize, usize, u64, u64) -> (String, String),
     ) -> Vec<PatternMatch> {
         let Some(watches) = self.watches.get(task_id).cloned() else {
             return Vec::new();
         };
+        let end_held = self.held_ends.remove(cursor_key);
+        let mut held = false;
         let overlap = self
             .scan_overlaps
             .get(cursor_key)
@@ -406,9 +424,15 @@ impl WatchRegistry {
                 delivery.scan(stream, bytes, base_offset, &watch.pattern);
                 continue;
             }
-            if let Some((text_start, text_end, source_start, source_end)) =
-                find_match(&watch.pattern, &text, &scan_bytes, prefix_len)
-            {
+            if let Some((text_start, text_end, source_start, source_end)) = find_match(
+                &watch.pattern,
+                &text,
+                &scan_bytes,
+                prefix_len,
+                end_held,
+                at_end,
+                &mut held,
+            ) {
                 self.matched_tasks.insert(task_id.to_string());
                 let (rendered_match, context) = render(
                     &text,
@@ -442,6 +466,9 @@ impl WatchRegistry {
         for watch_id in remove_once {
             self.unregister(task_id, &watch_id);
         }
+        if held {
+            self.held_ends.insert(cursor_key.to_string());
+        }
         let keep = scan_bytes.len().min(SCAN_OVERLAP_BYTES);
         self.scan_overlaps.insert(
             cursor_key.to_string(),
@@ -451,13 +478,34 @@ impl WatchRegistry {
     }
 }
 
+/// The first match of `pattern` in `text` (`source` decoded) that ends past
+/// the `prefix_len` overlap bytes an earlier scan already searched.
+///
+/// A regex match that reaches the end of `text` before the stream ends may
+/// depend on what follows (`$`, `\b`, a greedy repeat such as `\d+`), so it is
+/// held back: `held` is set and the match is skipped. The overlap keeps its
+/// bytes, and the next scan finds it again ending exactly at `prefix_len`,
+/// which `end_held` then admits. A literal is complete once its bytes are in.
 fn find_match(
     pattern: &WatchPattern,
     text: &str,
     source: &[u8],
-    min_source_end_exclusive: usize,
+    prefix_len: usize,
+    end_held: bool,
+    at_end: bool,
+    held: &mut bool,
 ) -> Option<(usize, usize, usize, usize)> {
-    let make_match = |start: usize, end: usize| {
+    let regex = matches!(pattern, WatchPattern::Regex(_));
+    let min_source_end_exclusive = if regex && end_held {
+        prefix_len.saturating_sub(1)
+    } else {
+        prefix_len
+    };
+    let mut make_match = |start: usize, end: usize| {
+        if regex && !at_end && end == text.len() {
+            *held = true;
+            return None;
+        }
         let source_end = source_offset_for_lossy_utf8(source, end);
         (source_end > min_source_end_exclusive).then(|| {
             (
@@ -707,5 +755,72 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].match_offset, 1);
         assert!(registry.scan_new_bytes(&task_id, b"\n").is_empty());
+    }
+
+    fn regex_watch(pattern: &str, once: bool) -> WatchRegistry {
+        let mut registry = WatchRegistry::default();
+        registry
+            .register("bash-1".into(), WatchPattern::regex(pattern).unwrap(), once)
+            .unwrap();
+        registry
+    }
+
+    fn texts(hits: &[PatternMatch]) -> Vec<(String, u64)> {
+        hits.iter()
+            .map(|hit| (hit.match_text.clone(), hit.match_offset))
+            .collect()
+    }
+
+    #[test]
+    fn regex_match_reaching_the_read_end_waits_for_the_rest_of_its_value() {
+        let mut registry = regex_watch(r"port (\d+)", true);
+        assert!(registry
+            .scan_new_bytes("bash-1", b"listening on port 30")
+            .is_empty());
+        let hits = registry.scan_new_bytes("bash-1", b"00\n");
+        assert_eq!(texts(&hits), vec![("port 3000".to_string(), 13)]);
+    }
+
+    #[test]
+    fn regex_end_anchor_does_not_match_a_line_still_being_written() {
+        let mut registry = regex_watch(r"^READY$", true);
+        assert!(registry.scan_new_bytes("bash-1", b"boot\nREADY").is_empty());
+        assert!(registry
+            .scan_new_bytes("bash-1", b"ING to start\n")
+            .is_empty());
+        assert_eq!(registry.active_count("bash-1"), 1);
+        assert!(registry.scan_new_bytes("bash-1", b"READY").is_empty());
+        let hits = registry.scan_new_bytes("bash-1", b"\n");
+        assert_eq!(texts(&hits), vec![("READY".to_string(), 23)]);
+    }
+
+    #[test]
+    fn sticky_regex_reports_a_growing_token_once() {
+        let mut registry = regex_watch(r"id=\d+", false);
+        assert!(registry.scan_new_bytes("bash-1", b"job id=12").is_empty());
+        let hits = registry.scan_new_bytes("bash-1", b"34 queued\n");
+        assert_eq!(texts(&hits), vec![("id=1234".to_string(), 4)]);
+        assert!(registry.scan_new_bytes("bash-1", b"done\n").is_empty());
+    }
+
+    #[test]
+    fn held_regex_match_is_reported_once_when_the_stream_ends() {
+        let mut registry = regex_watch(r"READY$", false);
+        let mut render = |text: &str, start: usize, end: usize, _: u64, _: u64| {
+            (text[start..end].to_string(), String::new())
+        };
+        let key = "bash-1:stdout";
+        assert!(registry
+            .scan_chunk(key, "bash-1", b"boot\nREADY", 0, false, &mut render)
+            .is_empty());
+        let hits = registry.scan_chunk(key, "bash-1", b"", 10, true, &mut render);
+        assert_eq!(texts(&hits), vec![("READY".to_string(), 5)]);
+        assert!(registry
+            .scan_chunk(key, "bash-1", b"", 10, true, &mut render)
+            .is_empty());
+        // A match ending where a finished stream ends is reported at once.
+        let mut registry = regex_watch(r"READY$", false);
+        let hits = registry.scan_chunk(key, "bash-1", b"boot\nREADY", 0, true, &mut render);
+        assert_eq!(texts(&hits), vec![("READY".to_string(), 5)]);
     }
 }
