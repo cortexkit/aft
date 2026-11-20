@@ -7841,11 +7841,38 @@ pub fn other() { callee(); }
             "the engine went though its checkout was edited within the period"
         );
         let epoch = checkout.memory_epoch();
-        wait_until_not(|| checkout.engine_census_bytes().is_some());
+        // A failed try-lock is not evidence that the slot is empty.
+        wait_until_not(|| checkout.engine.lock().unwrap().is_some());
         assert!(edited.elapsed() >= idle);
         assert!(checkout.memory_epoch() > epoch, "the census was not told");
         checkout.refresh_callgraph().unwrap().expect("applied");
         assert_eq!(checkout.engine_starts(), 2);
+    }
+
+    #[test]
+    fn an_empty_engine_slot_has_already_notified_the_census() {
+        let root = tempfile::tempdir().unwrap();
+        let store = tempfile::tempdir().unwrap();
+        demo(root.path());
+        let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
+        checkout.build().unwrap();
+        edit(
+            &checkout,
+            "src/util.rs",
+            "pub fn callee() {}\npub fn added() {}\n",
+        );
+        checkout.refresh_callgraph().unwrap().expect("applied");
+        assert!(checkout.engine_budget_bytes() > 0);
+        let epoch = checkout.memory_epoch();
+
+        assert!(checkout.engine.release_idle_for_test(|| {
+            // Observe the slot after unlock, while release is paused before
+            // it drops the engine outside the lock.
+            assert!(checkout.engine.try_lock().unwrap().is_none());
+            assert_eq!(checkout.engine_budget_bytes(), 0);
+            assert!(checkout.memory_epoch() > epoch, "the census was not told");
+        }));
     }
 
     /// Past the budget the engines of every checkout share, a refresh lets
