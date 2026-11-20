@@ -154,29 +154,40 @@ impl Fixture {
         stage: &str,
         expected: &ScopeStamp,
         reply: ModuleControlResponseToModule,
-    ) -> Option<WriterFrame> {
-        let mut reopened = None;
+    ) {
+        // Fallback polling and the watch retry can send their requests in either
+        // order. Answer the reopen first: a describe reply with owner_configured
+        // false cancels that watch but does not remove its queued request.
         let query = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
+            let mut reopened = false;
+            let mut query = None;
+            while !reopened || query.is_none() {
                 let frame = self.frames.recv().await.unwrap();
                 if frame.header.ty == FrameType::Cancel {
                     continue;
                 }
                 let body: Value = serde_json::from_slice(&frame.body).unwrap();
-                if body["op"] == "scope.watch" {
-                    snapshot(&self.pending, &frame);
-                    reopened = Some(frame);
-                    continue;
+                match body["op"].as_str() {
+                    Some("scope.watch") => {
+                        assert!(!reopened, "duplicate scope.watch {stage}");
+                        snapshot(&self.pending, &frame);
+                        reopened = true;
+                    }
+                    Some("scope.describe") => {
+                        assert!(
+                            query.replace(frame).is_none(),
+                            "duplicate scope.describe {stage}"
+                        );
+                    }
+                    _ => panic!("unexpected control frame {stage}: {body}"),
                 }
-                assert_eq!(body["op"], "scope.describe");
-                break frame;
             }
+            query.unwrap()
         })
         .await
-        .unwrap_or_else(|error| panic!("missing scope.describe {stage}: {error}"));
+        .unwrap_or_else(|error| panic!("missing scope.watch or scope.describe {stage}: {error}"));
         self.respond_to_describe(&query, expected, reply);
         turns().await;
-        reopened
     }
 
     fn continuity_holds(&self) -> Value {
@@ -201,7 +212,7 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
     let old = named("prefrontal");
     let mut f = Fixture::new(&old).await;
@@ -295,6 +306,9 @@ async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
         described(ScopeStatus::Ended, true, true),
     )
     .await;
+    // Let the cleanup deadline use real time: database cleanup and process
+    // termination run on worker threads outside the paused Tokio runtime.
+    tokio::time::resume();
     f.killed().await;
     assert_eq!(f.task_status(&second), BgTaskStatus::Killed);
     assert_eq!(f.ctx.bash_background().with_live_scope(&old, || ()), None);
