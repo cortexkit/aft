@@ -3458,6 +3458,7 @@ export default entry;
       "v2-synthetic-completion",
       "v2-completion-detach",
       "v2-host-tool-names",
+      "v2-background-tasks",
       "v2-subc-tool-names",
       "v2-tui-keymap",
       "v2-tui-late-service",
