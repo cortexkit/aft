@@ -539,6 +539,26 @@ const RETIRED_USER_FILE: &str =
 const TRANSLATED_USER_FILE: &str =
     "{\n  // my settings\n  \"views\": {\"idle_checkout_hours\": 72}\n}\n";
 
+fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
+    with_backup_dir_for_test(path.parent().unwrap(), || {
+        super::auto_migrate_user_config(path)
+    })
+}
+
+fn auto_migrate_user_config_with_writer(
+    path: &Path,
+    write: impl FnOnce(&Path, &str, Permissions, bool) -> io::Result<()>,
+) -> Option<UserConfigMigration> {
+    auto_migrate_user_config_with_reader(
+        path,
+        path,
+        || path.parent().unwrap().to_path_buf(),
+        write,
+        |path| fs::read_to_string(path),
+        |_| unreachable!("in-place writes do not remove a legacy path"),
+    )
+}
+
 #[test]
 fn failed_user_config_migration_at_0_65_leaves_idle_key_for_refusal() {
     let _release = feature_config::override_running_release_for_test((0, 65));
@@ -548,7 +568,7 @@ fn failed_user_config_migration_at_0_65_leaves_idle_key_for_refusal() {
 
     let attempted = std::cell::Cell::new(false);
     assert_eq!(
-        auto_migrate_user_config_with_writer(&path, |_, _| {
+        auto_migrate_user_config_with_writer(&path, |_, _, _, _| {
             attempted.set(true);
             Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -578,37 +598,120 @@ fn failed_user_config_migration_at_0_65_leaves_idle_key_for_refusal() {
 }
 
 #[test]
-fn migration_keeps_backup_and_reports_applied_after_directory_sync_error() {
+fn config_migration_directory_sync_error_is_before_commit() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
-    std::fs::write(&path, RETIRED_USER_FILE).unwrap();
-    let expected = migrate_config_text(RETIRED_USER_FILE, FixTier::User)
-        .unwrap()
-        .text;
-    let outcome = auto_migrate_user_config_with_writer(&path, |target, contents| {
-        jsonc_edit::write_atomic_with_sync_dir(target, contents, |_| {
-            assert_eq!(std::fs::read_to_string(target).unwrap(), expected);
-            Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "directory sync denied",
-            ))
+    std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
+    let outcome =
+        auto_migrate_user_config_with_writer(&path, |target, contents, permissions, relocating| {
+            crate::durability::FAIL_DIRECTORY_SYNC
+                .with(|slot| slot.replace(Some(target.parent().unwrap().to_path_buf())));
+            publish_conversion(target, contents, permissions, relocating)
         })
-    })
-    .expect("reported migration");
+        .expect("reported failure");
 
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
     assert_eq!(
-        backups(dir.path()).len(),
-        1,
-        "the committed write must retain its backup"
+        std::fs::read_to_string(&path).unwrap(),
+        TRANSLATED_USER_FILE
     );
-    let UserConfigMigration::Migrated { backup, notice, .. } = outcome else {
-        panic!("a committed write must be reported as applied: {outcome:?}");
+    assert!(backups(dir.path()).is_empty());
+    let UserConfigMigration::NotMigrated { reason, .. } = outcome else {
+        panic!("a failed sync must leave the settings unchanged: {outcome:?}");
     };
-    assert_eq!(std::fs::read_to_string(backup).unwrap(), RETIRED_USER_FILE);
-    assert!(notice.contains("directory sync denied"), "{notice}");
-    assert!(notice.contains("updated"), "{notice}");
-    assert_eq!(auto_migrate_user_config(&path), None);
+    assert!(
+        reason.contains("injected directory sync failure"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn settings_editor_error_discards_successful_prior_edits_without_an_old_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("aft.jsonc");
+    let data = dir.path().join("data");
+    let original = "{\n  // user settings\n  \"bash\": {\"runon_enabled\": false},\n  \"remote_exec\": false\n}\n";
+    fs::write(&file, original).unwrap();
+
+    // Removing bash.runon_enabled is valid, but the next edit cannot set a
+    // member of remote_exec because the existing value isn't an object.
+    let error = migrate_user_config_text(original).unwrap_err();
+    assert!(
+        error.contains("set_member at /remote_exec/enabled"),
+        "{error}"
+    );
+    with_backup_dir_for_test(&data, || super::auto_migrate_user_config(&file));
+    assert_eq!(fs::read(&file).unwrap(), original.as_bytes());
+    assert!(!data.exists(), "an editor error must not attempt a backup");
+    assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn settings_conversion_keeps_comments_order_and_private_old_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("aft.jsonc");
+    let data = dir.path().join("data");
+    let original = concat!(
+        "{\r\n",
+        "  // leave the keys in this order\r\n",
+        "  \"storage\": {\r\n",
+        "    // custom storage\r\n",
+        "    \"cache_dir\": \"~/aft-cache\", // keep this cache comment\r\n",
+        "  },\r\n",
+        "  \"bash\": true, // keep this shell comment\r\n",
+        "  \"format_on_edit\": false,\r\n",
+        "}\r\n",
+    );
+    fs::write(&file, original).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&file, Permissions::from_mode(0o640)).unwrap();
+    }
+    let start = || with_backup_dir_for_test(&data, || super::auto_migrate_user_config(&file));
+    let Some(UserConfigMigration::Migrated { backup, .. }) = start() else {
+        panic!("both old settings must migrate");
+    };
+    assert_eq!(backup.parent(), Some(data.as_path()));
+    assert_eq!(fs::read(&backup).unwrap(), original.as_bytes());
+    assert!(backups(dir.path()).is_empty());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&backup), 0o600);
+        assert_eq!(mode(&file), 0o640);
+    }
+
+    let converted = fs::read_to_string(&file).unwrap();
+    let value = parse_document(&converted).unwrap();
+    assert_eq!(
+        value["storage"]["cache_dir"],
+        serde_json::json!({"kind":"dir", "path":"~/aft-cache"})
+    );
+    assert_eq!(value["bash"]["enabled"], true);
+    let mut last = 0;
+    for part in [
+        "// leave the keys in this order\r\n",
+        "\"storage\"",
+        "// custom storage\r\n",
+        "\"cache_dir\"",
+        "// keep this cache comment\r\n",
+        "\"bash\"",
+        "// keep this shell comment\r\n",
+        "\"format_on_edit\"",
+    ] {
+        let next = converted
+            .find(part)
+            .unwrap_or_else(|| panic!("{part:?} missing: {converted}"));
+        assert!(next > last, "{part:?} out of order: {converted}");
+        last = next;
+    }
+    let modified = fs::metadata(&file).unwrap().modified().unwrap();
+    assert_eq!(start(), None);
+    assert_eq!(fs::read_to_string(&file).unwrap(), converted);
+    assert_eq!(fs::metadata(&file).unwrap().modified().unwrap(), modified);
+    assert_eq!(backups(&data), [backup]);
 }
 
 #[test]
@@ -617,7 +720,7 @@ fn migration_pre_rename_error_preserves_original_and_removes_backup() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.jsonc");
     std::fs::write(&path, TRANSLATED_USER_FILE).unwrap();
-    let outcome = auto_migrate_user_config_with_writer(&path, |_, _| {
+    let outcome = auto_migrate_user_config_with_writer(&path, |_, _, _, _| {
         Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "rename denied",
@@ -669,8 +772,7 @@ fn auto_migration_rewrites_the_user_file_once_and_keeps_a_backup() {
     assert!(text.contains("// my settings"), "{text}");
     assert!(retired_key_translation(&text).is_none(), "{text}");
     assert_eq!(std::fs::read_to_string(backup).unwrap(), RETIRED_USER_FILE);
-    // The backup sits next to the canonical file, and macOS's temp dir is a
-    // symlink (/var -> /private/var), so compare canonical paths.
+    // macOS's temp dir is a symlink (/var -> /private/var).
     let canonical = |paths: Vec<std::path::PathBuf>| -> Vec<std::path::PathBuf> {
         paths
             .into_iter()

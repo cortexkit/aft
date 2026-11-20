@@ -22,13 +22,15 @@
 //! names) are dropped from what it materializes and reported, matching what
 //! the resolver would ignore anyway.
 
+use std::fs::{self, Permissions};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::feature_config::{self, INDEX_INPUTS, RETIRED_PATHS};
-use crate::jsonc_edit::{self, JsoncDocument};
+use crate::jsonc_edit;
 
 /// Which trust tier a config file belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -46,6 +48,84 @@ pub struct Migration {
     /// Human-readable notes: conflicts resolved by precedence and ignored
     /// protected project disables.
     pub notes: Vec<String>,
+}
+
+struct Document(String);
+
+impl Document {
+    fn value(&self) -> Result<Value, String> {
+        parse_document(&self.0).map_err(|error| format!("parse document at /: {error}"))
+    }
+
+    fn set(&mut self, path: &[&str], value: &Value) -> Result<(), String> {
+        let pointer = jsonc_edit::pointer(path);
+        let current = self.value()?;
+        let old = current.pointer(&pointer);
+        if old == Some(value) {
+            return Ok(());
+        }
+        if let (Some(Value::Array(old)), Value::Array(new)) = (old, value) {
+            for (i, (old, new)) in old.iter().zip(new).enumerate() {
+                if old != new {
+                    subc_jsonc::set_element(&mut self.0, path, i, new)
+                        .map_err(|error| format!("set_element at {pointer}/{i}: {error}"))?;
+                }
+            }
+            for i in (new.len()..old.len()).rev() {
+                subc_jsonc::remove_element(&mut self.0, path, i)
+                    .map_err(|error| format!("remove_element at {pointer}/{i}: {error}"))?;
+            }
+            for element in new.iter().skip(old.len()) {
+                subc_jsonc::push_element(&mut self.0, path, element)
+                    .map_err(|error| format!("push_element at {pointer}: {error}"))?;
+            }
+        } else {
+            subc_jsonc::set_member(&mut self.0, path, value)
+                .map_err(|error| format!("set_member at {pointer}: {error}"))?;
+        }
+        // The editor addresses the first occurrence of a duplicate key; the
+        // resolver uses the last. Refuse an edit that didn't reach its value.
+        if self.value()?.pointer(&pointer) != Some(value) {
+            return Err(format!("verify set at {pointer}: edited value is shadowed"));
+        }
+        Ok(())
+    }
+
+    fn remove(&mut self, path: &[&str]) -> Result<(), String> {
+        let pointer = jsonc_edit::pointer(path);
+        subc_jsonc::remove_member(&mut self.0, path)
+            .map_err(|error| format!("remove_member at {pointer}: {error}"))?;
+        if self.value()?.pointer(&pointer).is_some() {
+            return Err(format!(
+                "verify removal at {pointer}: a duplicate key remains"
+            ));
+        }
+        Ok(())
+    }
+
+    fn remove_if_empty_object(&mut self, path: &[&str]) -> Result<(), String> {
+        if self
+            .value()?
+            .pointer(&jsonc_edit::pointer(path))
+            .and_then(Value::as_object)
+            .is_some_and(Map::is_empty)
+        {
+            self.remove(path)?;
+        }
+        Ok(())
+    }
+}
+
+fn parse_document(text: &str) -> Result<Value, String> {
+    let strict = subc_jsonc::jsonc_to_json(text)?;
+    if strict.trim().is_empty() {
+        return Ok(Value::Object(Map::new()));
+    }
+    let value: Value = serde_json::from_str(&strict).map_err(|error| error.to_string())?;
+    if !value.is_object() {
+        return Err("the root value must be an object".to_string());
+    }
+    Ok(value)
 }
 
 fn block_label(prefix: &[String]) -> String {
@@ -79,7 +159,7 @@ fn get_bool(block: &Map<String, Value>, container: &str, leaf: &str) -> Option<b
 /// canonical leaf, then the value `github.enabled:false` generates, then the
 /// alias. The aliases are removed; `gh_shim.binary_path` is kept.
 fn repair_github_aliases(
-    doc: &mut JsoncDocument,
+    doc: &mut Document,
     prefix: &[String],
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -107,6 +187,17 @@ fn repair_github_aliases(
                 .and_then(Value::as_bool),
         ),
     ];
+    if block.contains_key("gh_read") {
+        doc.remove(&path_of(prefix, &["gh_read"]))?;
+    }
+    if block
+        .get("gh_shim")
+        .and_then(Value::as_object)
+        .is_some_and(|shim| shim.contains_key("enabled"))
+    {
+        doc.remove(&path_of(prefix, &["gh_shim", "enabled"]))?;
+        doc.remove_if_empty_object(&path_of(prefix, &["gh_shim"]))?;
+    }
     for (alias, leaf, alias_value) in aliases {
         let canonical = get_bool(block, "github", leaf);
         if let Some(alias_value) = alias_value {
@@ -130,17 +221,6 @@ fn repair_github_aliases(
             }
         }
     }
-    if block.contains_key("gh_read") {
-        doc.remove(&path_of(prefix, &["gh_read"]))?;
-    }
-    if block
-        .get("gh_shim")
-        .and_then(Value::as_object)
-        .is_some_and(|shim| shim.contains_key("enabled"))
-    {
-        doc.remove(&path_of(prefix, &["gh_shim", "enabled"]))?;
-        doc.remove_if_empty_object(&path_of(prefix, &["gh_shim"]))?;
-    }
     Ok(())
 }
 
@@ -157,7 +237,7 @@ enum RemovedKeys {
 /// Rewrite one block's retired keys to the canonical values ordinary loading
 /// derives from them ([`feature_config::translate_document`]).
 fn migrate_block(
-    doc: &mut JsoncDocument,
+    doc: &mut Document,
     prefix: &[String],
     raw: &Map<String, Value>,
     translated: &Map<String, Value>,
@@ -166,12 +246,18 @@ fn migrate_block(
     notes: &mut Vec<String>,
 ) -> Result<(), String> {
     let label = block_label(prefix);
+    let mut emptied = Vec::new();
+    remove_retired_members(doc, prefix, raw, removed_keys, &mut emptied)?;
     let document_tier = if tier == FixTier::User {
         feature_config::DocumentTier::User
     } else {
         feature_config::DocumentTier::Project
     };
-    for edit in feature_config::settings_shape::edits(raw, document_tier, prefix.is_empty()) {
+    let mut edits = feature_config::settings_shape::edits(raw, document_tier, prefix.is_empty());
+    // Read replacements from the original values, then remove the old names
+    // before writing their replacements into the staged text.
+    edits.sort_by_key(|edit| edit.value.is_some());
+    for edit in edits {
         let path: Vec<_> = prefix
             .iter()
             .chain(&edit.path)
@@ -306,6 +392,19 @@ fn migrate_block(
         )?;
     }
 
+    for container in emptied {
+        doc.remove_if_empty_object(&path_of(prefix, &[container]))?;
+    }
+    Ok(())
+}
+
+fn remove_retired_members(
+    doc: &mut Document,
+    prefix: &[String],
+    raw: &Map<String, Value>,
+    removed_keys: RemovedKeys,
+    emptied: &mut Vec<&'static str>,
+) -> Result<(), String> {
     let removed_paths: &[&str] = match removed_keys {
         RemovedKeys::Delete => &feature_config::REMOVED_DATA_LAYER_PATHS,
         RemovedKeys::Keep => &[],
@@ -337,7 +436,7 @@ fn migrate_block(
             // An empty bash object keeps its precedence over retired
             // experimental bash defaults after the old remote gate is gone.
             if segments.len() == 2 && path != "bash.runon_enabled" {
-                doc.remove_if_empty_object(&path_of(prefix, &segments[..1]))?;
+                emptied.push(segments[0]);
             }
         }
     }
@@ -365,7 +464,7 @@ fn migrate_config_text_with(
     tier: FixTier,
     removed_keys: RemovedKeys,
 ) -> Result<Migration, String> {
-    let mut doc = JsoncDocument::parse(text)?;
+    let mut doc = Document(text.to_string());
     let mut notes = Vec::new();
 
     let harness_names: Vec<String> = doc
@@ -416,9 +515,9 @@ fn migrate_config_text_with(
         )?;
     }
 
-    let changed = doc.text() != text;
+    let changed = doc.0 != text;
     Ok(Migration {
-        text: doc.text().to_string(),
+        text: doc.0,
         changed,
         notes,
     })
@@ -530,7 +629,7 @@ const MIGRATION_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(
 /// The retired-key translation of a config text, when it parses as an object
 /// and uses at least one retired key.
 fn retired_key_translation(text: &str) -> Option<feature_config::DocumentTranslation> {
-    let value = serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text)).ok()?;
+    let value = parse_document(text).ok()?;
     let Value::Object(mut map) = value else {
         return None;
     };
@@ -553,7 +652,7 @@ fn retired_key_translation(text: &str) -> Option<feature_config::DocumentTransla
 /// Whether loading refuses a config text for a retired or removed key
 /// ([`feature_config::removed_config_key_errors`]).
 fn names_refused_key(text: &str) -> bool {
-    serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text))
+    parse_document(text)
         .ok()
         .and_then(|value| {
             value
@@ -631,102 +730,103 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
     }
 }
 
-/// Write `text` to a new sibling backup file `<name>.bak-<unix seconds>`
-/// (with a counter when that name is taken) carrying `target`'s permissions.
-fn write_backup(target: &Path, text: &str) -> std::io::Result<PathBuf> {
-    use std::io::Write as _;
-    let name = target
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "aft.jsonc".to_string());
+/// The old bytes may contain credentials, even if the settings file is public.
+fn write_backup(dir: &Path, text: &str) -> io::Result<PathBuf> {
+    crate::production_storage::refuse_write(dir)?;
+    crate::private_storage::create_dir_all(dir)?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs())
+        .map(|elapsed| elapsed.as_nanos())
         .unwrap_or_default();
-    let mut attempt = 0u32;
-    loop {
-        let candidate = if attempt == 0 {
-            target.with_file_name(format!("{name}.bak-{stamp}"))
-        } else {
-            target.with_file_name(format!("{name}.bak-{stamp}-{attempt}"))
-        };
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&candidate)
-        {
-            Ok(mut file) => {
-                let written = (|| {
-                    file.write_all(text.as_bytes())?;
-                    aft_store::sync::sync_all(&file, &candidate)?;
-                    if let Ok(metadata) = std::fs::metadata(target) {
-                        std::fs::set_permissions(&candidate, metadata.permissions())?;
-                    }
-                    Ok(())
-                })();
-                return match written {
-                    Ok(()) => Ok(candidate),
-                    Err(error) => {
-                        let _ = std::fs::remove_file(&candidate);
-                        Err(error)
-                    }
-                };
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && attempt < 100 => {
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
+    let mut backup = tempfile::Builder::new()
+        .prefix(&format!("aft.jsonc.bak-{stamp}-"))
+        .tempfile_in(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        backup
+            .as_file()
+            .set_permissions(Permissions::from_mode(0o600))?;
     }
+    backup.write_all(text.as_bytes())?;
+    crate::durability::sync_file(backup.as_file(), backup.path())?;
+    crate::durability::sync_dir(dir)?;
+    backup
+        .keep()
+        .map(|(_, path)| path)
+        .map_err(|error| error.error)
 }
 
-/// Rewrite the user config file at `path` to current keys when it uses
-/// retired ones, with the same comment-preserving migration `doctor --fix`
-/// performs.
-///
-/// Returns `None` when there is nothing to report: the file is missing,
-/// unreadable, does not parse (ordinary loading reports that), uses no retired
-/// key, or another process migrated it meanwhile. The rewrite is atomic (a
-/// sibling temporary file renamed over the target, keeping its permissions),
-/// keeps the previous text in a `<name>.bak-<unix seconds>` file beside it,
-/// and is serialized across processes by a lock file, so only one of several
-/// loaders rewrites the file and reports it. A symlinked file is rewritten at
-/// its target so the link survives. A read-only file, a debug build pointed at
-/// the account's own config directory (see
-/// [`crate::production_storage::config_write_refusal`]), or a failure before
-/// replacement leaves the file as it was and returns
-/// [`UserConfigMigration::NotMigrated`]; the caller's in-memory translation still
-/// applies its current equivalents. A directory-sync failure after replacement
-/// keeps the backup and returns [`UserConfigMigration::Migrated`] with a warning.
-pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
-    auto_migrate_user_config_with_writer(path, jsonc_edit::write_atomic_with_sync_warning)
-}
-
-fn auto_migrate_user_config_with_writer(
+fn publish_conversion(
     path: &Path,
-    write: impl FnOnce(&Path, &str) -> std::io::Result<Option<std::io::Error>>,
-) -> Option<UserConfigMigration> {
-    auto_migrate_user_config_with_reader(path, write, |path| std::fs::read_to_string(path))
+    contents: &str,
+    permissions: Permissions,
+    relocating: bool,
+) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut temp = tempfile::Builder::new()
+        .prefix(".aft.jsonc.tmp-")
+        .tempfile_in(parent)?;
+    temp.write_all(contents.as_bytes())?;
+    temp.as_file().set_permissions(permissions)?;
+    crate::durability::sync_file(temp.as_file(), temp.path())?;
+    // Complete fallible preparation before the rename commits new settings.
+    crate::durability::sync_dir(parent)?;
+    if relocating {
+        // The desktop may have created the canonical settings since we checked.
+        temp.persist_noclobber(path)
+    } else {
+        temp.persist(path)
+    }
+    .map(|_| ())
+    .map_err(|error| error.error)
+}
+
+/// Rewrite retired user keys, retaining the old bytes in AFT's data folder.
+pub fn auto_migrate_user_config(path: &Path) -> Option<UserConfigMigration> {
+    auto_migrate_user_config_bounded(path, crate::subc_config::CONFIG_READ_LIMIT)
+        .ok()
+        .flatten()
 }
 
 pub(crate) fn auto_migrate_user_config_bounded(
     path: &Path,
     limit: usize,
-) -> std::io::Result<Option<UserConfigMigration>> {
+) -> io::Result<Option<UserConfigMigration>> {
+    if crate::subc_config::is_legacy_user_config_path(path) {
+        // If startup couldn't relocate the legacy file, read it as-is. An
+        // in-place rewrite would change it without reaching the canonical path.
+        return Ok(None);
+    }
+    migrate_user_config_to(path, path, limit, |path| fs::remove_file(path))
+}
+
+pub(crate) fn migrate_user_config_to(
+    source: &Path,
+    destination: &Path,
+    limit: usize,
+    remove_legacy: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<Option<UserConfigMigration>> {
     let mut failure = None;
     let result = auto_migrate_user_config_with_reader(
-        path,
-        jsonc_edit::write_atomic_with_sync_warning,
+        source,
+        destination,
+        migration_backup_dir,
+        publish_conversion,
         |path| {
             let read = (|| {
                 let file = crate::config::open_config_file(path)?;
                 crate::subc_config::read_bounded_config(file, limit)
             })();
             if let Err(error) = &read {
-                failure = Some(std::io::Error::new(error.kind(), error.to_string()));
+                failure = Some(io::Error::new(error.kind(), error.to_string()));
             }
             read
         },
+        remove_legacy,
     );
     match failure {
         Some(error) => Err(error),
@@ -734,98 +834,199 @@ pub(crate) fn auto_migrate_user_config_bounded(
     }
 }
 
-fn auto_migrate_user_config_with_reader(
-    path: &Path,
-    write: impl FnOnce(&Path, &str) -> std::io::Result<Option<std::io::Error>>,
-    mut read: impl FnMut(&Path) -> std::io::Result<String>,
-) -> Option<UserConfigMigration> {
-    let text = read(path).ok()?;
-    let translation = retired_key_translation(&text)?;
-    let display = path.display().to_string();
-    let not_migrated = |reason: String,
-                        translation: &feature_config::DocumentTranslation,
-                        text: &str| {
-        // Loading refuses a file that still names a key retired in 0.62 or
-        // earlier, and that refusal names the key and `doctor --fix`. A notice
-        // saying AFT applied the current equivalents would be wrong for it.
-        if names_refused_key(text) {
-            return None;
-        }
-        Some(UserConfigMigration::NotMigrated {
-            path: path.to_path_buf(),
-            notice: feature_config::user_config_not_migrated_notice(&display, &reason, translation),
-            reason,
-        })
-    };
-
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    if let Some(reason) = crate::production_storage::config_write_refusal(&target) {
-        return not_migrated(reason, &translation, &text);
+fn migration_backup_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) = TEST_BACKUP_DIR.with(|slot| slot.borrow().clone()) {
+        return path;
     }
-    match std::fs::metadata(&target) {
-        Ok(metadata) if metadata.permissions().readonly() => {
-            return not_migrated("the file is read-only".to_string(), &translation, &text);
+    crate::storage_path::storage_dir(None)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_BACKUP_DIR: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_backup_dir_for_test<T>(path: &Path, run: impl FnOnce() -> T) -> T {
+    struct Restore(Option<PathBuf>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_BACKUP_DIR.with(|slot| slot.replace(self.0.take()));
         }
-        Ok(_) => {}
+    }
+    let _restore = Restore(TEST_BACKUP_DIR.with(|slot| slot.replace(Some(path.to_path_buf()))));
+    run()
+}
+
+fn auto_migrate_user_config_with_reader(
+    source: &Path,
+    destination: &Path,
+    backup_dir: impl FnOnce() -> PathBuf,
+    write: impl FnOnce(&Path, &str, Permissions, bool) -> io::Result<()>,
+    mut read: impl FnMut(&Path) -> io::Result<String>,
+    remove_legacy: impl FnOnce(&Path) -> io::Result<()>,
+) -> Option<UserConfigMigration> {
+    let relocating = source != destination;
+    let text = read(source).ok()?;
+    let translation = retired_key_translation(&text);
+    if translation.is_none() && !relocating {
+        return None;
+    }
+    let not_migrated =
+        |reason: String, translation: Option<&feature_config::DocumentTranslation>, text: &str| {
+            // Loading refuses a file that still names a key retired in 0.62 or
+            // earlier, and that refusal names the key and `doctor --fix`. A notice
+            // saying AFT applied the current equivalents would be wrong for it.
+            let notice = translation
+                .filter(|_| !names_refused_key(text))
+                .map_or_else(String::new, |translation| {
+                    feature_config::user_config_not_migrated_notice(
+                        &source.display().to_string(),
+                        &reason,
+                        translation,
+                    )
+                });
+            if notice.is_empty() {
+                crate::slog_warn!("config user {}: {reason}", source.display());
+                return None;
+            }
+            Some(UserConfigMigration::NotMigrated {
+                path: source.to_path_buf(),
+                notice,
+                reason,
+            })
+        };
+
+    let actual = match fs::canonicalize(source) {
+        Ok(path) => path,
         Err(error) => {
             return not_migrated(
-                format!("could not inspect it: {error}"),
-                &translation,
+                format!("resolve source at /: {error}"),
+                translation.as_ref(),
                 &text,
             )
         }
+    };
+    let target = if relocating {
+        destination
+    } else {
+        actual.as_path()
+    };
+    if actual.ends_with(Path::new(".cortexkit").join("aft.jsonc")) {
+        return not_migrated(
+            "refused to replace a project settings file at /".to_string(),
+            translation.as_ref(),
+            &text,
+        );
     }
-    let _lock = match acquire_migration_lock(&target) {
+    if let Some(reason) = crate::production_storage::config_write_refusal(&actual)
+        .or_else(|| crate::production_storage::config_write_refusal(target))
+    {
+        return not_migrated(reason, translation.as_ref(), &text);
+    }
+    let permissions = match fs::metadata(&actual) {
+        Ok(metadata) if metadata.permissions().readonly() => {
+            return not_migrated(
+                "the file is read-only".to_string(),
+                translation.as_ref(),
+                &text,
+            );
+        }
+        Ok(metadata) => metadata.permissions(),
+        Err(error) => {
+            return not_migrated(
+                format!("inspect source at /: {error}"),
+                translation.as_ref(),
+                &text,
+            )
+        }
+    };
+    let _lock = match acquire_migration_lock(&actual) {
         LockAttempt::Acquired(lock) => lock,
         // Another loader is rewriting the file and will report it.
         LockAttempt::Busy => return None,
         LockAttempt::Failed(error) => {
-            return not_migrated(format!("could not lock it: {error}"), &translation, &text);
-        }
-    };
-
-    // Re-read under the lock: another process may have finished meanwhile.
-    let text = match read(&target) {
-        Ok(text) => text,
-        Err(error) => {
-            return not_migrated(format!("could not read it: {error}"), &translation, &text)
-        }
-    };
-    let translation = retired_key_translation(&text)?;
-    let migration = match migrate_config_text_with(&text, FixTier::User, RemovedKeys::Keep) {
-        Ok(migration) if migration.changed => migration,
-        Ok(_) => return None,
-        Err(error) => return not_migrated(error, &translation, &text),
-    };
-    let backup = match write_backup(&target, &text) {
-        Ok(backup) => backup,
-        Err(error) => {
             return not_migrated(
-                format!("could not write a backup: {error}"),
-                &translation,
+                format!("lock source at /: {error}"),
+                translation.as_ref(),
                 &text,
             );
         }
     };
-    let sync_warning = match write(&target, &migration.text) {
-        Ok(warning) => warning,
+
+    if relocating
+        && !matches!(fs::symlink_metadata(target), Err(error) if error.kind() == io::ErrorKind::NotFound)
+    {
+        return None;
+    }
+    // Re-read under the lock: another process may have finished meanwhile.
+    let text = match read(&actual) {
+        Ok(text) => text,
         Err(error) => {
-            let _ = std::fs::remove_file(&backup);
-            return not_migrated(format!("could not write it: {error}"), &translation, &text);
+            return not_migrated(
+                format!("read source at /: {error}"),
+                translation.as_ref(),
+                &text,
+            )
         }
     };
-    let mut notice = feature_config::user_config_migrated_notice(
-        &display,
-        &backup.display().to_string(),
-        &translation,
-    );
-    if let Some(warning) = sync_warning {
-        notice.push_str(&format!(
-            " Warning: the config was updated, but syncing its directory failed: {warning}. The backup was kept."
-        ));
+    let translation = retired_key_translation(&text);
+    if !relocating && translation.is_none() {
+        return None;
     }
+    let migration = match migrate_user_config_text(&text) {
+        Ok(migration) if migration.changed || relocating => migration,
+        Ok(_) => return None,
+        Err(error) => return not_migrated(error, translation.as_ref(), &text),
+    };
+    let backup = match write_backup(&backup_dir(), &text) {
+        Ok(backup) => backup,
+        Err(error) => {
+            return not_migrated(
+                format!("write old copy at /: {error}"),
+                translation.as_ref(),
+                &text,
+            );
+        }
+    };
+    let parent = target
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let publish = || {
+        if relocating {
+            fs::create_dir_all(parent)?;
+        }
+        write(target, &migration.text, permissions, relocating)
+    };
+    if let Err(error) = publish() {
+        let cleanup = fs::remove_file(&backup);
+        let mut reason = format!("publish settings at /: {error}");
+        if let Err(error) = cleanup {
+            reason.push_str(&format!("; could not remove {}: {error}", backup.display()));
+        }
+        return not_migrated(reason, translation.as_ref(), &text);
+    }
+    if relocating {
+        // Do not remove the source until the new name is durable. A cleanup
+        // failure leaves both copies; subsequent starts prefer the canonical one.
+        if let Err(error) = crate::durability::sync_dir(parent).and_then(|()| remove_legacy(source))
+        {
+            crate::slog_warn!("config user: could not finish removing legacy settings {} after publishing {}: {error}", source.display(), target.display());
+        }
+    }
+    let notice = translation
+        .as_ref()
+        .map_or_else(String::new, |translation| {
+            feature_config::user_config_migrated_notice(
+                &destination.display().to_string(),
+                &backup.display().to_string(),
+                translation,
+            )
+        });
     Some(UserConfigMigration::Migrated {
-        path: path.to_path_buf(),
+        path: destination.to_path_buf(),
         notice,
         backup,
     })
