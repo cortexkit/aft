@@ -17,7 +17,10 @@ const DAEMON_SEMANTIC_INDEX_SOURCE = join(
   import.meta.dir,
   "../../../../../crates/aft/src/semantic_index.rs",
 );
-const ONNX_RUNTIME_PIN_SOURCE = join(import.meta.dir, "../../../../../crates/aft-base/src/ort_pin.rs");
+const ONNX_RUNTIME_PIN_SOURCE = join(
+  import.meta.dir,
+  "../../../../../crates/aft-base/src/ort_pin.rs",
+);
 
 function readDaemonSource(): string {
   const source = readFileSync(DAEMON_SEMANTIC_INDEX_SOURCE, "utf8");
