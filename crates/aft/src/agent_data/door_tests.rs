@@ -302,7 +302,7 @@ fn cut_below_floor_stops_without_retrying_error_floor() {
 #[test]
 fn door_stream_refusal_table_matches_published_contract() {
     let doc =
-        include_str!("../../tests/fixtures/agent_data/session-door-stream-refusals-6ca43ec0.md");
+        include_str!("../../tests/fixtures/agent_data/session-door-stream-refusals-bbeca1a9.md");
     let mut expected = Vec::new();
     for line in doc.lines().filter(|line| line.starts_with("| `")) {
         let cells: Vec<_> = line.split('|').map(str::trim).collect();
@@ -318,7 +318,7 @@ fn door_stream_refusal_table_matches_published_contract() {
         };
         expected.push((code, methods, next));
     }
-    assert_eq!(expected.len(), 19);
+    assert_eq!(expected.len(), 21);
     let actual = STREAM_REFUSALS
         .iter()
         .map(|row| {
@@ -355,4 +355,37 @@ fn door_stream_refusal_table_matches_published_contract() {
         EngramDoor(InternalRefusal).offsets("one").unwrap_err().code,
         "unavailable"
     );
+}
+
+#[test]
+fn session_read_hub_and_legacy_refusals_survive_normalization() {
+    struct Refusing(&'static str);
+    impl JsonDoorTransport for Refusing {
+        fn call(&self, _: &str, _: Value, _: std::time::Duration) -> Result<Value, DoorError> {
+            Err(DoorError {
+                code: self.0.into(),
+                detail: Value::Null,
+            })
+        }
+    }
+    for (code, expected) in [
+        ("cut_import_pending", FailureClass::Retry),
+        ("cut_takeover_closed", FailureClass::Stop),
+        ("cut_range_not_local", FailureClass::Stop),
+        ("not_found", FailureClass::Stop),
+    ] {
+        assert_eq!(classify("session.read", code), expected, "{code}");
+        assert_eq!(
+            EngramDoor(Refusing(code))
+                .read("one", 0, 1, Some("cut"))
+                .unwrap_err()
+                .code,
+            code
+        );
+        assert_eq!(classify("session.cover", code), FailureClass::Retry);
+        assert_eq!(
+            EngramDoor(Refusing(code)).cover("one").unwrap_err().code,
+            "unavailable"
+        );
+    }
 }
