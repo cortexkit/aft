@@ -1341,6 +1341,7 @@ pub(crate) struct ScopeKillReport {
 }
 
 mod cancelled_notices;
+mod completion_listener;
 #[path = "scratch_retention.rs"]
 mod scratch_retention;
 #[path = "shell_registry.rs"]
@@ -1648,6 +1649,7 @@ pub(crate) struct RegistryInner {
     /// bind/unbind transitions; standalone replay relies on its binding-session
     /// exception instead.
     live_delivery_sessions: Mutex<HashSet<String>>,
+    completion_delivery_listener: Mutex<Option<completion_listener::Listener>>,
     live_delivery_lock_diagnostics: Arc<crate::lock_diagnostics::LockDiagnostics>,
     wait_detach: Mutex<WaitDetachState>,
     wait_registered_tasks: Mutex<HashMap<String, HashSet<String>>>,
@@ -2326,6 +2328,7 @@ impl BgTaskRegistry {
                 watch_registry: Mutex::new(WatchRegistry::default()),
                 persisted_watch_cursors: Mutex::new(HashMap::new()),
                 live_delivery_sessions: Mutex::new(HashSet::new()),
+                completion_delivery_listener: Mutex::default(),
                 live_delivery_lock_diagnostics: crate::lock_diagnostics::LockDiagnostics::new(
                     file!(),
                 ),
@@ -12209,6 +12212,7 @@ impl BgTaskRegistry {
                         // insertion, so this also removes any pending completion
                         // inserted while the ack waited for that lock.
                         let _ = self.remove_pending_completion(task_id);
+                        self.notify_completion_delivered(task_id);
                         delivered.push(task_id.clone());
                     }
                 } else {
@@ -12469,32 +12473,6 @@ impl BgTaskRegistry {
             .runner_completion_notice
             .clone()
             .expect("notice was frozen"))
-    }
-
-    pub fn pending_completions_for_session(&self, session_id: &str) -> Vec<BgCompletion> {
-        self.inner
-            .completions
-            .lock()
-            .map(|completions| {
-                completions
-                    .iter()
-                    .filter(|completion| completion_matches_session(completion, Some(session_id)))
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn pending_completion_ids(&self) -> HashMap<String, HashSet<String>> {
-        let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
-        if let Ok(completions) = self.inner.completions.lock() {
-            for completion in completions.iter() {
-                ids.entry(completion.session_id.clone())
-                    .or_default()
-                    .insert(completion.task_id.clone());
-            }
-        }
-        ids
     }
 
     fn remove_pending_completion(&self, task_id: &str) -> Option<BgCompletion> {

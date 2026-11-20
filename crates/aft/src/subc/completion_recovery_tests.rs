@@ -304,6 +304,14 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
     assert!(output.try_recv().is_err());
     let task =
         crate::bash_background::persistence::resolve_task(storage.path(), SESSION, TASK).unwrap();
+    let delivery_key = (root.clone(), TASK.to_owned());
+    assert!(metrics
+        .completion_delivery
+        .state
+        .lock()
+        .unwrap()
+        .admitted
+        .contains(&delivery_key));
     assert!(
         !read_task_at(&task).unwrap().completion_delivered,
         "push enqueue is not an ack"
@@ -314,6 +322,14 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
             registry.ack_completions_for_session(Some(SESSION), &[TASK.into()]),
             vec![TASK]
         );
+    }
+    {
+        let state = metrics.completion_delivery.state.lock().unwrap();
+        assert!(
+            !state.admitted.contains(&delivery_key),
+            "durably delivered completions must not occupy admission space"
+        );
+        assert!(!state.recipients.contains_key(&delivery_key));
     }
     recover_registry_completions(
         &writer,

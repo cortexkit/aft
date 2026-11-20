@@ -1,4 +1,4 @@
-use super::{ReplayKey, UnackedCompletions};
+use super::{completion_dedupe, CompletionOffers, ReplayKey, UnackedCompletions};
 use crate::bash_background::{task_identity_scope, BgTaskRegistry, TaskIdentity};
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::sync::OnceLock;
@@ -8,6 +8,7 @@ pub(super) struct Settlement {
     pub(super) key: ReplayKey,
     pub(super) task: String,
     pub(super) unacked: UnackedCompletions,
+    pub(super) state: std::sync::Arc<std::sync::Mutex<CompletionOffers>>,
     pub(super) offers: Option<usize>,
     #[cfg(test)]
     pub(super) gate: Option<TestGate>,
@@ -55,6 +56,14 @@ enum Work {
     Settle(Settlement),
     #[cfg(test)]
     Barrier(std::sync::mpsc::Sender<()>),
+}
+
+impl Drop for Settlement {
+    fn drop(&mut self) {
+        if self.offers.is_none() {
+            completion_dedupe::finished(&self.state, (self.key.root.clone(), self.task.clone()));
+        }
+    }
 }
 
 fn sender() -> Result<&'static SyncSender<Work>, &'static String> {

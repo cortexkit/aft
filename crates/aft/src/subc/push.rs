@@ -25,6 +25,7 @@ impl ReplayKey {
     }
 }
 
+mod completion_dedupe;
 #[path = "completion_settlement.rs"]
 mod completion_settlement;
 
@@ -35,7 +36,7 @@ type UnackedCompletions =
 /// session.send instead; durable plugin delivery writes run off-thread.
 #[derive(Default)]
 pub(super) struct CompletionDelivery {
-    state: std::sync::Mutex<CompletionOffers>,
+    state: Arc<std::sync::Mutex<CompletionOffers>>,
     pub(super) registries:
         std::sync::Mutex<HashMap<ProjectRootId, crate::bash_background::BgTaskRegistry>>,
     unacked: UnackedCompletions,
@@ -48,7 +49,8 @@ pub(super) struct CompletionDelivery {
 #[derive(Debug, Default)]
 struct CompletionOffers {
     admitted: HashSet<(ProjectRootId, String)>,
-    settled: HashSet<(ProjectRootId, String)>,
+    settling: HashSet<completion_dedupe::TaskKey>,
+    settled: completion_dedupe::Tombstones,
     recipients: HashMap<(ProjectRootId, String), HashSet<RouteChannel>>,
     retry_copies: HashMap<(ProjectRootId, String), usize>,
 }
@@ -73,11 +75,14 @@ enum CompletionSend {
 
 impl CompletionDelivery {
     fn admit(&self, root: &ProjectRootId, task: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .admitted
-            .insert((root.clone(), task.into()))
+        if self.durably_delivered(root, task) {
+            return false;
+        }
+        let key = (root.clone(), task.into());
+        let mut state = self.state.lock().unwrap();
+        !state.settling.contains(&key)
+            && !state.settled.contains(&key)
+            && state.admitted.insert(key)
     }
 
     fn forget(&self, root: &ProjectRootId, task: &str) {
@@ -85,10 +90,7 @@ impl CompletionDelivery {
         let key = (root.clone(), task.into());
         // A failed copy must not re-offer to another route while a successful
         // recipient is still open. Its durable record still awaits an ack.
-        if !state.settled.contains(&key)
-            && !state.recipients.contains_key(&key)
-            && !state.retry_copies.contains_key(&key)
-        {
+        if !state.recipients.contains_key(&key) && !state.retry_copies.contains_key(&key) {
             state.admitted.remove(&key);
         }
     }
@@ -126,6 +128,9 @@ impl CompletionDelivery {
         {
             let mut state = self.state.lock().unwrap();
             let task_key = (key.root.clone(), task.into());
+            if state.settled.contains(&task_key) {
+                return;
+            }
             state.admitted.insert(task_key.clone());
             if !state
                 .recipients
@@ -143,21 +148,25 @@ impl CompletionDelivery {
     }
 
     fn is_settled(&self, root: &ProjectRootId, task: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .settled
-            .contains(&(root.clone(), task.into()))
+        let key = (root.clone(), task.into());
+        let already = {
+            let mut state = self.state.lock().unwrap();
+            state.settling.contains(&key) || state.settled.contains(&key)
+        };
+        already || self.durably_delivered(root, task)
+    }
+
+    fn durably_delivered(&self, root: &ProjectRootId, task: &str) -> bool {
+        self.registry(root)
+            .and_then(|registry| registry.runner_completion_state(task))
+            .is_some_and(|status| status.completion_delivered)
     }
 
     fn settle(&self, key: &ReplayKey, task: &str) -> bool {
         {
             let mut state = self.state.lock().unwrap();
             let task_key = (key.root.clone(), task.into());
-            // Retain admission even if persistence fails: reconnects in this
-            // process must not repeat a completion already written to a runner.
-            state.admitted.insert(task_key.clone());
-            if !state.settled.insert(task_key) {
+            if state.settled.contains(&task_key) || !state.settling.insert(task_key) {
                 return false;
             }
         }
@@ -177,6 +186,7 @@ impl CompletionDelivery {
                     key: key.clone(),
                     task: task.into(),
                     unacked: Arc::clone(&self.unacked),
+                    state: Arc::clone(&self.state),
                     offers,
                     #[cfg(test)]
                     gate: self.settlement_gate.lock().unwrap().take(),
@@ -185,12 +195,8 @@ impl CompletionDelivery {
         match queued {
             Ok(()) => true,
             Err(error) => {
-                log::warn!("subc completion push: task={task} could not queue durable runner completion delivery key={key:?}: {error}; suppressing further offers in this process");
-                self.state
-                    .lock()
-                    .unwrap()
-                    .settled
-                    .insert((key.root.clone(), task.into()));
+                log::warn!("subc completion push: task={task} could not queue durable runner completion delivery key={key:?}: {error}; suppressing near-term replay");
+                completion_dedupe::finished(&self.state, (key.root.clone(), task.into()));
                 false
             }
         }
@@ -240,7 +246,7 @@ impl CompletionDelivery {
         });
         for (root, task) in released {
             let key = (root.clone(), task.clone());
-            if state.settled.contains(&key) || state.retry_copies.contains_key(&key) {
+            if state.settling.contains(&key) || state.retry_copies.contains_key(&key) {
                 continue;
             }
             state.admitted.remove(&key);
@@ -318,10 +324,7 @@ pub(super) fn purge_completion_root(
         }
     }
     let mut state = metrics.completion_delivery.state.lock().unwrap();
-    let settled = state.settled.clone();
-    state
-        .admitted
-        .retain(|key| &key.0 != root || settled.contains(key));
+    state.admitted.retain(|key| &key.0 != root);
     state.recipients.retain(|(key, _), _| key != root);
     state.retry_copies.retain(|(key, _), _| key != root);
     metrics
@@ -383,6 +386,13 @@ pub(super) fn recover_registry_completions(
         .lock()
         .unwrap()
         .insert(root.clone(), registry.clone());
+    let state = Arc::downgrade(&metrics.completion_delivery.state);
+    let ack_root = root.clone();
+    registry.set_completion_delivery_listener(Arc::new(move |task| {
+        if let Some(state) = state.upgrade() {
+            completion_dedupe::finished(&state, (ack_root.clone(), task.into()));
+        }
+    }));
     metrics
         .completion_delivery
         .unacked
@@ -421,15 +431,10 @@ pub(super) fn recover_registry_completions(
                     }
                     continue;
                 }
-                if metrics.completion_delivery.admit(root, &task_id) {
-                    if super::runner_notices::enqueue(
-                        registry.clone(),
-                        completion.into_push_frame(),
-                    ) {
-                        queued_replays += 1;
-                    } else {
-                        metrics.completion_delivery.forget(root, &task_id);
-                    }
+                // Runner notices never enter the route replay buffer. The
+                // scheduler deduplicates them until delivery is durable.
+                if super::runner_notices::enqueue(registry.clone(), completion.into_push_frame()) {
+                    queued_replays += 1;
                 }
                 continue;
             }
@@ -1761,12 +1766,6 @@ fn process_reliable_push_frame(
     let durable_bg_session = durable_bg_session_key(&root, &frame);
     if frame_task_identity(&frame).is_some_and(super::runner_notices::is_runner) {
         let task = completed_task_id(&frame).map(str::to_string);
-        if task
-            .as_ref()
-            .is_some_and(|task| !metrics.completion_delivery.admit(&root, task))
-        {
-            return None;
-        }
         if let Some(owner) =
             frame_task_identity(&frame).filter(|owner| super::runner_notices::retired(owner))
         {
@@ -1784,13 +1783,12 @@ fn process_reliable_push_frame(
             return None;
         }
         if let Some(registry) = metrics.completion_delivery.registry(&root) {
-            if !super::runner_notices::enqueue(registry, frame) {
-                if let Some(task) = &task {
-                    metrics.completion_delivery.forget(&root, task);
-                }
+            if !task
+                .as_ref()
+                .is_some_and(|task| metrics.completion_delivery.is_settled(&root, task))
+            {
+                super::runner_notices::enqueue(registry, frame);
             }
-        } else if let Some(task) = &task {
-            metrics.completion_delivery.forget(&root, task);
         }
         return None;
     }
