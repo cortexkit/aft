@@ -665,12 +665,22 @@ pub(crate) fn spawn_reader(
         let result = (|| -> io::Result<()> {
             let mut buf = [0_u8; 8192];
             let mut dsr = DsrScanner::default();
+            // After the capture file fails, the pseudoterminal is still read
+            // to the end and the bytes dropped: a reader that stopped would
+            // leave the command blocked writing to a full pseudoterminal. The
+            // error makes the task's output count as incomplete.
+            let mut capture_error = None;
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        file.write_all(&buf[..n])?;
-                        file.flush()?;
+                        if capture_error.is_none() {
+                            if let Err(error) =
+                                file.write_all(&buf[..n]).and_then(|()| file.flush())
+                            {
+                                capture_error = Some(error);
+                            }
+                        }
                         if dsr.scan(&buf[..n]) {
                             // Some Windows console hosts/apps query the
                             // terminal cursor position with DSR (ESC[6n)
@@ -691,7 +701,7 @@ pub(crate) fn spawn_reader(
                     Err(error) => return Err(error),
                 }
             }
-            Ok(())
+            capture_error.map_or(Ok(()), Err)
         })();
         drop(file);
         if let Err(ref error) = result {
@@ -1128,6 +1138,59 @@ mod tests {
         assert_eq!(scan_chunks(&[b"hello"]), 0);
         // Partial-but-never-completed sequence must not fire.
         assert_eq!(scan_chunks(&[b"\x1b[6", b"x"]), 0);
+    }
+
+    #[test]
+    fn reader_keeps_draining_the_pty_after_its_capture_fails() {
+        use std::io::{Cursor, Read};
+        use std::sync::atomic::AtomicUsize;
+        struct Counted(Cursor<Vec<u8>>, Arc<AtomicUsize>);
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let read = self.0.read(buf)?;
+                self.1.fetch_add(read, Ordering::SeqCst);
+                Ok(read)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pty");
+        std::fs::write(&path, b"").unwrap();
+        // A read-only handle, so every capture write fails.
+        let capture = std::fs::File::open(&path).unwrap();
+        let output = vec![b'x'; 256 * 1024];
+        let consumed = Arc::new(AtomicUsize::new(0));
+        let (wake_tx, _wake_rx) = crossbeam_channel::unbounded();
+        let coordinator = Arc::new(CompletionCoordinator::new(
+            "bash-0000000000000001".into(),
+            "session".into(),
+            wake_tx,
+        ));
+        let done = Arc::new(AtomicBool::new(false));
+        let eof = Arc::new(AtomicBool::new(true));
+        spawn_reader(
+            Box::new(Counted(Cursor::new(output.clone()), consumed.clone())),
+            capture,
+            done.clone(),
+            eof.clone(),
+            coordinator,
+            None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the reader never finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            consumed.load(Ordering::SeqCst),
+            output.len(),
+            "the reader stopped reading the pseudoterminal"
+        );
+        assert!(
+            !eof.load(Ordering::SeqCst),
+            "a failed capture must not count as complete output"
+        );
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
     }
 }
 #[cfg(unix)]
