@@ -1225,17 +1225,18 @@ pub fn extract_with<'tree>(
                 )
             })
         };
-        if !dynamic && receiver.is_none() {
-            if let (Some(index), Some(written)) = (&mut static_receivers, receiver_node) {
-                index.site(reference.ordinal, written, call, |identifier| {
-                    ts_objects.as_ref().map_or((None, None), |objects| {
-                        (
-                            objects.binding(identifier),
-                            objects.binding_scope(identifier),
-                        )
-                    })
-                });
-            }
+        if let Some(index) = &mut static_receivers {
+            let written = (!dynamic && receiver.is_none())
+                .then_some(receiver_node)
+                .flatten();
+            index.site(reference.ordinal, written, call, |identifier| {
+                ts_objects.as_ref().map_or((None, None), |objects| {
+                    (
+                        objects.binding(identifier),
+                        objects.binding_scope(identifier),
+                    )
+                })
+            });
         }
         facts.sites.push(SiteHint {
             ordinal: reference.ordinal,

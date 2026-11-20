@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::Node;
 
@@ -47,6 +47,7 @@ pub(in super::super) struct Index<'tree, 'source, N> {
     types: HashMap<usize, u32>,
     scopes: HashMap<Scope, u32>,
     receivers: HashMap<Receiver, u32>,
+    seen_sites: HashSet<u32>,
     values: HashMap<&'source str, Vec<Node<'tree>>>,
     ts_imports: HashMap<&'source str, &'source str>,
     ts_dotted: HashMap<(usize, String), Option<u32>>,
@@ -74,6 +75,7 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
             types: HashMap::new(),
             scopes: HashMap::new(),
             receivers: HashMap::new(),
+            seen_sites: HashSet::new(),
             values: HashMap::new(),
             ts_imports: HashMap::new(),
             ts_dotted: HashMap::new(),
@@ -318,10 +320,17 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
     pub(in super::super) fn site(
         &mut self,
         ordinal: u32,
-        written: Node<'tree>,
+        written: Option<Node<'tree>>,
         call: Node<'tree>,
         ts_binding: impl FnOnce(Node<'tree>) -> (Option<Node<'tree>>, Option<usize>),
     ) {
+        // Several call references can name one AST ordinal. Dispatch
+        // keeps the first hint at that ordinal, including a hint without
+        // static evidence. Keep the evidence from the same occurrence.
+        if !self.seen_sites.insert(ordinal) {
+            return;
+        }
+        let Some(written) = written else { return };
         let Some(name) = path(written, self.source, self.language == "csharp") else {
             return;
         };

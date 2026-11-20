@@ -1,9 +1,136 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+use aft_store::content::ContentRecord;
 
 use super::callgraph::FileResolution;
 use super::incremental_tests::{checkout, update_checked_bytes};
 use super::site_records_tests::records_match_files;
-use crate::callgraph_store::join::dispatch::Resolution;
+use crate::callgraph_store::join::dispatch::{Resolution, Resolver};
+use crate::callgraph_store::join::{BlobRefKind, CallgraphBlob, ParseBlob};
+
+fn round_trip(source: &str, language: &str) -> ParseBlob {
+    let extracted = super::content::extract(source.as_bytes(), language).unwrap();
+    let (surface, body) = extracted.encode();
+    let decoded = ContentRecord::decode(&surface, &body).unwrap();
+    assert_eq!(extracted, decoded);
+    let CallgraphBlob::Parse(parse) = super::content::blob_from_record(&decoded).unwrap() else {
+        panic!("expected {language} parse");
+    };
+    parse
+}
+
+fn retained_static_call<'a>(parse: &'a ParseBlob, receiver: &str, member: &str) -> &'a str {
+    let sites: Vec<_> = parse
+        .dispatch
+        .sites
+        .iter()
+        .filter(|site| site.member.as_deref() == Some(member))
+        .collect();
+    assert_eq!(sites.len(), 1, "{:#?}", parse.dispatch.sites);
+    let site = sites[0];
+    let refs: Vec<_> = parse
+        .refs
+        .iter()
+        .filter(|reference| {
+            reference.kind == BlobRefKind::Call && reference.ordinal == site.ordinal
+        })
+        .collect();
+    assert!(
+        refs.len() > 1,
+        "witness must have multiple call references for one ordinal: {refs:#?}"
+    );
+    let first = refs[0];
+    assert!(
+        refs.iter()
+            .all(|reference| (reference.byte_start, reference.byte_end)
+                == (first.byte_start, first.byte_end)),
+        "{refs:#?}"
+    );
+    let evidence = parse
+        .dispatch
+        .static_facts
+        .as_ref()
+        .unwrap()
+        .site_evidence(site.ordinal)
+        .unwrap();
+    assert_eq!(evidence.receiver, receiver);
+    site.caller.as_deref().unwrap()
+}
+
+#[test]
+fn duplicate_static_receiver_ordinals_round_trip_csharp_yield_body() {
+    let source = r#"namespace System.Collections.Tests {
+    public static class Tuple {
+        public static int Create(int x) { return x; }
+    }
+    public static class TestData {
+        public static System.Collections.Generic.IEnumerable<int> GetData() {
+            yield return Tuple.Create(1);
+        }
+    }
+}"#;
+    let path = "InputData.cs";
+    let parse = round_trip(source, "csharp");
+    assert!(retained_static_call(&parse, "Tuple", "Create").contains("GetData"));
+    let resolver = Resolver::new(BTreeMap::from([(path.to_string(), &parse)]));
+    let site = parse
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.member.as_deref() == Some("Create"))
+        .unwrap();
+    let answer = resolver.resolve(path, site);
+    let target = parse
+        .symbols
+        .iter()
+        .find(|symbol| symbol.name == "Create")
+        .unwrap();
+    exact(&answer, path, &[&target.scoped_name]);
+}
+
+#[test]
+fn duplicate_static_receiver_ordinals_round_trip_java_field_initializer() {
+    let source = r#"package sample;
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+public class SampleReflection {
+    private final Log logger = LogFactory.getLog(SampleReflection.class);
+    public void performReflection() { logger.info("reflection"); }
+}"#;
+    let path = "SampleReflection.java";
+    let parse = round_trip(source, "java");
+    let _ = retained_static_call(&parse, "LogFactory", "getLog");
+    let resolver = Resolver::new(BTreeMap::from([(path.to_string(), &parse)]));
+    let site = parse
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.member.as_deref() == Some("getLog"))
+        .unwrap();
+    external(&resolver.resolve(path, site));
+}
+
+#[test]
+fn duplicate_static_receiver_ordinals_round_trip_typescript_nested_callback() {
+    let source = r#"import path from 'node:path';
+function createCheckoutReaders() {
+    const root = '/checkout';
+    return {
+        lf: relativePath => readFileSync(path.join(root, relativePath)),
+    };
+}"#;
+    let file = "detect.ts";
+    let parse = round_trip(source, "typescript");
+    let _ = retained_static_call(&parse, "path", "join");
+    let resolver = Resolver::new(BTreeMap::from([(file.to_string(), &parse)]));
+    let site = parse
+        .dispatch
+        .sites
+        .iter()
+        .find(|site| site.member.as_deref() == Some("join"))
+        .unwrap();
+    external(&resolver.resolve(file, site));
+}
 
 fn answer<'a>(file: &'a FileResolution, member: &str) -> &'a Resolution {
     let matches = file
