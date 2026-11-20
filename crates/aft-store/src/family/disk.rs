@@ -24,18 +24,25 @@ pub struct DiskUsage {
     pub bytes: u64,
     pub examined: usize,
     pub stop: Option<DiskUsageStop>,
-    stamp: Option<Stamp>,
+    reuse: Option<ReuseKey>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct Stamp {
+struct ReuseKey {
+    generation: Generation,
+    root_entries: usize,
+    stamps: DirectoryStamps,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DirectoryStamps {
     family: SystemTime,
     builds: Option<SystemTime>,
     tmp: Option<SystemTime>,
     segments: Option<SystemTime>,
 }
 
-impl Stamp {
+impl DirectoryStamps {
     fn read(layout: &Layout) -> Option<Self> {
         fn modified(path: &Path) -> Option<Option<SystemTime>> {
             match fs::symlink_metadata(path) {
@@ -44,10 +51,8 @@ impl Stamp {
                 Err(_) => None,
             }
         }
-        // Publishing a manifest adds a new immutable name to the family root.
-        // An unchanged root stamp means no new manifest has been published.
-        // Scratch creation/removal and segment reclamation can happen without
-        // publishing, so check those directories before reusing the sample.
+        // Directory timestamps are hints for changes outside the manifest,
+        // not evidence that no new generation has been published.
         Some(Self {
             family: fs::metadata(&layout.dir).ok()?.modified().ok()?,
             builds: modified(&layout.dir.join("builds"))?,
@@ -60,8 +65,9 @@ impl Stamp {
 /// Measures a family without opening a snapshot or taking a lease. Published
 /// lengths come from the newest readable manifest; other files are measured
 /// under the same entry and deadline limits as manifest discovery. Returns
-/// `None` to reuse `previous` when its directory stamps still match. Pass a
-/// previous sample only for the same family.
+/// `None` to reuse `previous` when bounded discovery finds the same published
+/// generation and the root entry count and directory stamps still match. Pass
+/// a previous sample only for the same family.
 #[must_use]
 pub fn measure_disk_usage(
     dir: &Path,
@@ -71,27 +77,68 @@ pub fn measure_disk_usage(
     deadline: Instant,
 ) -> Option<DiskUsage> {
     let layout = Layout::new(dir);
-    let stamp = Stamp::read(&layout);
-    if stamp.is_some() && previous.is_some_and(|old| old.stamp == stamp) {
-        return None;
-    }
+    let stamps = DirectoryStamps::read(&layout);
+    measure_with_stamps(&layout, family, previous, entry_cap, deadline, stamps)
+}
+
+fn measure_with_stamps(
+    layout: &Layout,
+    family: FamilyId,
+    previous: Option<DiskUsage>,
+    entry_cap: usize,
+    deadline: Instant,
+    stamps: Option<DirectoryStamps>,
+) -> Option<DiskUsage> {
     let mut scan = Scan {
         bytes: 0,
         examined: 0,
         entry_cap,
         deadline,
     };
-    let stop = scan.run(&layout, family).err();
+    let (stop, reuse) = match scan.read_root(layout) {
+        Ok(root) => {
+            // Manifest names are immutable and numbered. When the highest name
+            // still matches a generation we validated, there's no newer
+            // publication to open. A higher name that could not be validated
+            // may still be in the middle of being written.
+            let highest = root
+                .manifests
+                .iter()
+                .map(|(number, _)| *number)
+                .max()
+                .map_or(Generation::EMPTY, Generation::new);
+            let reuse = stamps.map(|stamps| ReuseKey {
+                generation: highest,
+                root_entries: root.entries.len(),
+                stamps,
+            });
+            if reuse.is_some() && previous.is_some_and(|old| old.reuse == reuse) {
+                return None;
+            }
+            match scan.manifest(family, root.manifests) {
+                Ok((manifest, manifest_bytes)) => {
+                    let reuse = reuse.filter(|key| key.generation == manifest.generation());
+                    (
+                        scan.walk(layout, root.entries, &manifest, manifest_bytes)
+                            .err(),
+                        reuse,
+                    )
+                }
+                Err(stop) => (Some(stop), None),
+            }
+        }
+        Err(stop) => (Some(stop), None),
+    };
     // I/O failures may be transient even when the directory stamps don't move.
-    let stamp = match stop {
-        None | Some(DiskUsageStop::EntryCap | DiskUsageStop::Deadline) => stamp,
+    let reuse = match stop {
+        None | Some(DiskUsageStop::EntryCap | DiskUsageStop::Deadline) => reuse,
         _ => None,
     };
     Some(DiskUsage {
         bytes: scan.bytes,
         examined: scan.examined,
         stop,
-        stamp,
+        reuse,
     })
 }
 
@@ -102,8 +149,13 @@ struct Scan {
     deadline: Instant,
 }
 
+struct RootEntries {
+    entries: Vec<DirEntry>,
+    manifests: Vec<(u64, PathBuf)>,
+}
+
 impl Scan {
-    fn run(&mut self, layout: &Layout, family: FamilyId) -> Result<(), DiskUsageStop> {
+    fn read_root(&mut self, layout: &Layout) -> Result<RootEntries, DiskUsageStop> {
         let mut entries = self.open_dir(&layout.dir)?;
         let mut root = Vec::new();
         let mut manifests = Vec::new();
@@ -119,8 +171,19 @@ impl Scan {
             }
             root.push(entry);
         }
-        drop(entries);
-        let (manifest, manifest_bytes) = self.manifest(family, manifests)?;
+        Ok(RootEntries {
+            entries: root,
+            manifests,
+        })
+    }
+
+    fn walk(
+        &mut self,
+        layout: &Layout,
+        entries: Vec<DirEntry>,
+        manifest: &Manifest,
+        manifest_bytes: u64,
+    ) -> Result<(), DiskUsageStop> {
         self.bytes = manifest_bytes;
         for segment in manifest.segments() {
             self.add(segment.len);
@@ -133,7 +196,7 @@ impl Scan {
         let current_manifest = layout.manifest(manifest.generation());
         let segments = layout.segments_dir();
         let mut pending = Vec::new();
-        for entry in root {
+        for entry in entries {
             self.check_deadline()?;
             if manifest_bytes == 0 || entry.path() != current_manifest {
                 self.measure_entry(entry, &mut pending)?;
@@ -142,7 +205,7 @@ impl Scan {
         while let Some(dir) = pending.pop() {
             let mut entries = self.open_dir(&dir)?;
             while let Some(entry) = self.next_entry(&mut entries)? {
-                if (dir == segments && published_segment(&entry, &manifest))
+                if (dir == segments && published_segment(&entry, manifest))
                     || (!covered_states.is_empty() && covered_states.contains(&entry.path()))
                 {
                     continue;
@@ -246,4 +309,71 @@ fn published_segment(entry: &DirEntry, manifest: &Manifest) -> bool {
         .and_then(|name| name.strip_suffix(".seg"))
         .and_then(canonical_number)
         .is_some_and(|id| manifest.segment(SegmentId::new(id)).is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::family::{Family, Publication};
+    use crate::ids::Digest128;
+
+    #[test]
+    fn disk_usage_detects_a_new_generation_even_with_identical_directory_stamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = FamilyId::from_digest(Digest128::of(b"disk usage test"));
+        let family = Family::open(dir.path(), id).unwrap();
+        let mut writer = family.try_write().unwrap().unwrap();
+        let first = writer.publish(&Publication::default()).unwrap();
+        let layout = Layout::new(dir.path());
+        let stamps = DirectoryStamps::read(&layout).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let sample =
+            |previous, cap| measure_with_stamps(&layout, id, previous, cap, deadline, Some(stamps));
+        let previous = sample(None, 256).unwrap();
+        assert_eq!(previous.stop, None);
+        assert!(sample(Some(previous), 256).is_none());
+        let capped = sample(Some(previous), 1).unwrap();
+        assert_eq!(capped.stop, Some(DiskUsageStop::EntryCap));
+        assert_eq!(capped.examined, 1);
+
+        let second = writer.publish(&Publication::default()).unwrap();
+        // Replace one manifest with another so the root count also matches.
+        fs::remove_file(layout.manifest(first)).unwrap();
+        let next = sample(Some(previous), 256).unwrap();
+        assert_eq!(next.stop, None);
+        assert_eq!(next.reuse.unwrap().generation, second);
+        assert_eq!(
+            next.reuse.unwrap().root_entries,
+            previous.reuse.unwrap().root_entries
+        );
+    }
+
+    #[test]
+    fn disk_usage_does_not_reuse_a_sample_taken_during_manifest_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = FamilyId::from_digest(Digest128::of(b"disk usage test"));
+        let layout = Layout::new(dir.path());
+        let generation = Generation::new(1);
+        let path = layout.manifest(generation);
+        fs::write(&path, b"incomplete").unwrap();
+        let stamps = DirectoryStamps::read(&layout).unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(60);
+        let sample = |previous| {
+            measure_with_stamps(&layout, id, previous, 256, deadline, Some(stamps)).unwrap()
+        };
+        let previous = sample(None);
+        assert_eq!(previous.bytes, 10);
+
+        let manifest = Manifest::new(generation, 0, SegmentId::new(1), vec![], vec![]);
+        let record = record::encode(
+            record::Kind::Manifest,
+            id,
+            generation.get(),
+            &manifest.encode(),
+        );
+        fs::write(path, &record).unwrap();
+        let next = sample(Some(previous));
+        assert_eq!(next.stop, None);
+        assert_eq!(next.bytes, record.len() as u64);
+    }
 }
