@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use sha2::Digest;
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp, ScopeStatus};
@@ -190,6 +191,98 @@ fn fixture() -> (tempfile::TempDir, Store, AuthorityRecord) {
     let path = dir.path().join("aft.db");
     drop(crate::db::open(&path).unwrap());
     (dir, Store::new(path), record())
+}
+
+#[test]
+fn request_closes_keep_wal_reusable_until_the_store_drops() {
+    use crate::db::deferred_checkpoint::test_hooks;
+
+    let (_dir, store, record) = fixture();
+    let path = store.path().to_path_buf();
+    let wal = path.with_extension("db-wal");
+    let timeout = Duration::from_secs(10);
+
+    let seen = test_hooks::finished(&path);
+    store.capture(&record).unwrap();
+    assert!(test_hooks::wait_finished_after(&path, seen, timeout));
+    assert_eq!(file_identity::open_connections(&path), 1, "idle anchor");
+    assert!(
+        wal.is_file(),
+        "request close must not run last-close cleanup"
+    );
+
+    let mut max_wal_bytes = 0;
+    for i in 0..64 {
+        let seen = test_hooks::finished(&path);
+        store
+            .prepare_request(
+                &format!("nonce-{i}"),
+                &record.incarnation,
+                &[3; 32],
+                "expect",
+            )
+            .unwrap();
+        assert!(test_hooks::wait_finished_after(&path, seen, timeout));
+        max_wal_bytes = max_wal_bytes.max(std::fs::metadata(&wal).unwrap().len());
+    }
+    assert!(
+        max_wal_bytes < 256 * 1024,
+        "WAL grew to {max_wal_bytes} bytes"
+    );
+    eprintln!("maximum WAL size over 64 prepared requests: {max_wal_bytes} bytes");
+
+    store.revoke(&record.incarnation, "cancelled").unwrap();
+    drop(store);
+    assert!(test_hooks::wait_closed(&path, timeout));
+    match std::fs::metadata(&wal) {
+        Ok(metadata) => assert_eq!(metadata.len(), 0, "last close must truncate the WAL"),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::NotFound),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn roots_sharing_a_database_add_one_anchor_to_the_resident_connection() {
+    use crate::db::deferred_checkpoint::test_hooks;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("aft.db");
+    let resident = crate::db::open(&path).unwrap();
+    let before = file_identity::open_connections(&path);
+    assert_eq!(before, 1);
+
+    let mut stores = Vec::new();
+    for i in 0..4 {
+        let alias = dir.path().join(format!("root-{i}"));
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        let store = Store::new(alias.join("aft.db"));
+        let seen = test_hooks::finished(&path);
+        if i == 0 {
+            store.keep_schema_connection(crate::db::open(store.path()).unwrap());
+        }
+        store.revoke("inc-a", "cancelled").unwrap();
+        assert!(test_hooks::wait_finished_after(
+            &path,
+            seen,
+            Duration::from_secs(10)
+        ));
+        stores.push(store);
+    }
+    let after = file_identity::open_connections(&path);
+    assert_eq!(after, before + 1, "all roots must share one anchor");
+    eprintln!("aft.db connections for four roots: {before} resident, {after} with speech");
+
+    let seen = test_hooks::finished(&path);
+    drop(stores);
+    assert!(test_hooks::wait_finished_after(
+        &path,
+        seen,
+        Duration::from_secs(10)
+    ));
+    assert_eq!(file_identity::open_connections(&path), before);
+    drop(resident);
 }
 
 fn activate(store: &Store, record: &AuthorityRecord) -> StoredAuthority {
