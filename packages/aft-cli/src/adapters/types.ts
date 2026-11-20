@@ -75,7 +75,7 @@ export interface HarnessAdapter {
   isInstalled(): boolean;
   getHostVersion(): string | null;
 
-  detectConfigPaths(): HarnessConfigPaths;
+  detectConfigPaths(purpose?: "read" | "write"): HarnessConfigPaths;
 
   /**
    * Check whether our plugin is registered with the harness. For OpenCode this

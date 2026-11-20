@@ -1,4 +1,11 @@
-import { existsSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
 import { openPrivateStorageDir, PRIVATE_FILE_MODE } from "./private-storage.js";
@@ -56,6 +63,47 @@ export function resolveCortexKitUserConfigPath(
     (env.APPDATA || (env.USERPROFILE && path.join(env.USERPROFILE, "AppData", "Roaming")));
   const home = env.XDG_CONFIG_HOME || windowsHome || (env.HOME && path.join(env.HOME, ".config"));
   return path.join(home || ".config", "cortexkit", "aft.jsonc");
+}
+
+function configPathMissing(path: string): boolean {
+  try {
+    return lstatSync(path, { throwIfNoEntry: false }) === undefined;
+  } catch {
+    // Like the Rust reader, only fall back for a missing path, not an I/O error.
+    return false;
+  }
+}
+
+function legacyWindowsUserConfigPath(
+  env: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform,
+): string | undefined {
+  if (platform !== "win32") return undefined;
+  // Both path rules honor an absolute XDG override. A bare drive or root
+  // (C: or \) does not count, because its location depends on the working directory.
+  if (env.XDG_CONFIG_HOME && win32.parse(env.XDG_CONFIG_HOME).root.length > 2) return undefined;
+  const home = env.HOME || env.USERPROFILE;
+  return home ? win32.join(home, ".config", "cortexkit", "aft.jsonc") : undefined;
+}
+
+/** Read legacy Windows settings in place until the native AFT startup moves them. */
+export function resolveCortexKitUserConfigReadPath(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const canonical = resolveCortexKitUserConfigPath(env, platform);
+  const legacy = legacyWindowsUserConfigPath(env, platform);
+  return legacy &&
+    legacy !== canonical &&
+    !configPathMissing(legacy) &&
+    configPathMissing(canonical)
+    ? legacy
+    : canonical;
+}
+
+/** Creating the canonical file would prevent native AFT from moving the legacy file. */
+export function hasPendingWindowsUserConfigMove(): boolean {
+  return resolveCortexKitUserConfigReadPath() !== resolveCortexKitUserConfigPath();
 }
 
 export function resolveCortexKitProjectConfigPath(projectDirectory: string): string {
@@ -116,12 +164,14 @@ export function resolveLegacyAftConfigSources(projectDirectory: string): {
       ...project.map((source) => source.path),
     ].map(identity),
   );
+  const legacyWindowsUserConfig = legacyWindowsUserConfigPath(process.env, process.platform);
+  if (legacyWindowsUserConfig) protectedPaths.add(identity(legacyWindowsUserConfig));
   return {
     user: [
       ...legacySources(join(legacyOpenCodeConfigDir(), "aft"), "OpenCode user", "opencode"),
       ...legacySources(join(legacyPiAgentDir(), "aft"), "Pi user", "pi"),
-      // OPENCODE_CONFIG_DIR can point at a project config directory. Do not
-      // relocate those committed files as user sources, even through a symlink.
+      // OPENCODE_CONFIG_DIR can point at a project config directory or at old
+      // Windows settings. Neither should be moved by the importer.
     ].filter((source) => !protectedPaths.has(identity(source.path))),
     project,
   };

@@ -13,7 +13,16 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AftConfigSchema, resolveBridgePoolTransportOptions } from "../config.js";
+import {
+  enterWindowsUserConfigFixture,
+  writeSettingsFixture,
+} from "../../../aft-bridge/src/__tests__/test-utils/windows-user-config.js";
+import {
+  AftConfigSchema,
+  loadAftConfig,
+  migrateAftConfigLocations,
+  resolveBridgePoolTransportOptions,
+} from "../config.js";
 
 const packageRoot = fileURLToPath(new URL("../../", import.meta.url));
 
@@ -102,6 +111,26 @@ afterEach(() => {
 });
 
 describe("loadAftConfig", () => {
+  test("reads pending Windows settings without importing over them", () => {
+    const { root, projectDirectory } = createConfigFixture();
+    const { legacy, canonical, restore } = enterWindowsUserConfigFixture(root);
+    try {
+      const oldSettings = '{"subc":{"connection_file":"subc.json"}}';
+      const harnessSettings = join("opencode", "aft.jsonc");
+      writeSettingsFixture(legacy, oldSettings);
+      writeSettingsFixture(harnessSettings, "{}");
+
+      migrateAftConfigLocations(projectDirectory);
+
+      expect(loadAftConfig(projectDirectory).subc?.connection_file).toBe("subc.json");
+      expect(existsSync(canonical)).toBe(false);
+      expect(readFileSync(legacy, "utf8")).toBe(oldSettings);
+      expect(readFileSync(harnessSettings, "utf8")).toBe("{}");
+    } finally {
+      restore();
+    }
+  });
+
   test("memory uses only the user base and drops malformed project and harness values", () => {
     const fixture = createConfigFixture();
     const env = { HOME: join(fixture.root, "home"), XDG_CONFIG_HOME: fixture.xdgConfigHome };

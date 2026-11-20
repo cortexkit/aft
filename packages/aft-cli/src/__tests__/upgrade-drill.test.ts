@@ -13,9 +13,14 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  enterWindowsUserConfigFixture,
+  writeSettingsFixture,
+} from "../../../aft-bridge/src/__tests__/test-utils/windows-user-config.js";
 
 import type { HarnessAdapter, HarnessConfigPaths } from "../adapters/types.js";
 import { runDoctor } from "../commands/doctor.js";
+import { runSetup } from "../commands/setup.js";
 import { diagnoseOpenCodeLoad } from "../doctor/opencode.js";
 import {
   collectDiagnosticIssues,
@@ -329,6 +334,49 @@ async function doctorFix(
 }
 
 describe("the config migration is planned and its changes are reported", () => {
+  test("doctor --fix does not write $schema while Windows settings await relocation", async () => {
+    const { canonical, legacy, restore } = enterWindowsUserConfigFixture(process.cwd());
+    try {
+      userConfig = canonical;
+      const oldSettings = '{ "subc": { "connection_file": "subc.json" } }';
+      writeSettingsFixture(legacy, oldSettings);
+
+      const runNative = () => ({ ok: true, stdout: '{"files":[]}', stderr: "", status: 0 });
+      const text = await doctorFix(getSelfVersion(), runNative);
+
+      expect(text).not.toContain("with $schema URL");
+      expect(existsSync(canonical)).toBe(false);
+      expect(readFileSync(legacy, "utf8")).toBe(oldSettings);
+
+      unlinkSync(legacy);
+      await doctorFix(getSelfVersion(), runNative);
+      expect(readFileSync(canonical, "utf8")).toContain(AFT_SCHEMA_URL);
+    } finally {
+      restore();
+    }
+  });
+
+  test("setup does not write $schema while Windows settings await relocation", async () => {
+    const { canonical, legacy, restore } = enterWindowsUserConfigFixture(process.cwd());
+    try {
+      userConfig = canonical;
+      const oldSettings = '{ "subc": { "connection_file": "subc.json" } }';
+      writeSettingsFixture(legacy, oldSettings);
+
+      captureOutput();
+      const code = await runSetup(["--yes"], {
+        resolveAdapters: async () => [fixtureAdapter()],
+        features: { run: () => ({ ok: true, stdout: "", stderr: "", status: 0 }) },
+      });
+
+      expect(code).toBe(0);
+      expect(existsSync(canonical)).toBe(false);
+      expect(readFileSync(legacy, "utf8")).toBe(oldSettings);
+    } finally {
+      restore();
+    }
+  });
+
   test("lists the migration with its changes, then prints what changed", async () => {
     writeUserConfig({
       $schema: AFT_SCHEMA_URL,

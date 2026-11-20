@@ -10,9 +10,14 @@ import {
   resolveCortexKitConfigPaths,
   resolveCortexKitProjectConfigPath,
   resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
   resolveHarnessStoragePath,
   shouldShowAnnouncement,
 } from "../paths.js";
+import {
+  enterWindowsUserConfigFixture,
+  writeSettingsFixture,
+} from "./test-utils/windows-user-config.js";
 
 const tempRoots = new Set<string>();
 
@@ -76,11 +81,37 @@ describe("CortexKit config paths", () => {
       expect(resolveCortexKitUserConfigPath(env, platform)).toBe(
         "/home/me/.config/cortexkit/aft.jsonc",
       );
+      expect(resolveCortexKitUserConfigReadPath(env, platform)).toBe(
+        "/home/me/.config/cortexkit/aft.jsonc",
+      );
       expect(resolveCortexKitUserConfigPath({ ...env, HOME: "" }, platform)).toBe(
         ".config/cortexkit/aft.jsonc",
       );
     }
     expect(resolveCortexKitUserConfigPath({}, "win32")).toBe(".config\\cortexkit\\aft.jsonc");
+  });
+
+  test("Windows reads the old HOME file only until canonical settings exist", () => {
+    const { env, legacy, canonical, restore } = enterWindowsUserConfigFixture(createStorageRoot());
+    try {
+      expect(resolveCortexKitUserConfigPath(env, "win32")).toBe(canonical);
+      const readPath = () => resolveCortexKitUserConfigReadPath(env, "win32");
+      expect(readPath()).toBe(canonical);
+
+      writeSettingsFixture(legacy, "{ /* old */ }");
+      expect(readPath()).toBe(legacy);
+      expect(existsSync(canonical)).toBe(false);
+      expect(readFileSync(legacy, "utf8")).toBe("{ /* old */ }");
+
+      writeSettingsFixture(canonical, "{ /* new */ }");
+      expect(readPath()).toBe(canonical);
+      expect(readFileSync(legacy, "utf8")).toBe("{ /* old */ }");
+
+      rmSync(legacy);
+      expect(readPath()).toBe(canonical);
+    } finally {
+      restore();
+    }
   });
 
   test("project config lives under .cortexkit", () => {

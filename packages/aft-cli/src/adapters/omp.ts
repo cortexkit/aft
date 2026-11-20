@@ -1,6 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { resolveAftLogPath, resolveCortexKitUserConfigPath } from "@cortexkit/aft-bridge";
+import {
+  resolveAftLogPath,
+  resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
+} from "@cortexkit/aft-bridge";
 
 import { dirSize } from "../lib/fs-util.js";
 import {
@@ -53,10 +57,11 @@ export class OmpAdapter implements HarnessAdapter {
     return omp ? this.deps.getOmpVersion(omp.path) : null;
   }
 
-  detectConfigPaths(): HarnessConfigPaths {
+  detectConfigPaths(purpose: "read" | "write" = "read"): HarnessConfigPaths {
     const configDir = getOmpAgentDir();
     const harnessConfig = getOmpPluginsLockPath();
-    const aftConfig = resolveCortexKitUserConfigPath();
+    const aftConfig =
+      purpose === "write" ? resolveCortexKitUserConfigPath() : resolveCortexKitUserConfigReadPath();
     return {
       configDir,
       harnessConfig,

@@ -391,12 +391,14 @@ export {
 export type { LegacyAftConfigSource, MigrationHarness, ResolvedAftConfigPaths } from "./paths.js";
 export {
   decodeFileUrl,
+  hasPendingWindowsUserConfigMove,
   legacyProjectConfigLocationNotice,
   markAnnouncementSeen,
   repairRootScopedStorageFile,
   resolveCortexKitConfigPaths,
   resolveCortexKitProjectConfigPath,
   resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
   resolveHarnessStoragePath,
   resolveLegacyAftConfigSources,
   resolveProjectConfigReadPath,

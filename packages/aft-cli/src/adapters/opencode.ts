@@ -7,6 +7,7 @@ import {
   getOpenCodeConfigRoot,
   resolveAftLogPath,
   resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
 } from "@cortexkit/aft-bridge";
 
 import { formatFsError } from "../lib/fs-errors.js";
@@ -258,14 +259,13 @@ export class OpenCodeAdapter implements HarnessAdapter {
     return versions.length > 0 ? versions.join(" + ") : null;
   }
 
-  detectConfigPaths(): HarnessConfigPaths {
+  detectConfigPaths(purpose: "read" | "write" = "read"): HarnessConfigPaths {
     const configDir = getOpenCodeConfigDir();
     const harness = detectJsoncFile(configDir, "opencode");
     // AFT config lives in the shared CortexKit location since the v0.40.0
-    // consolidation, not the per-harness opencode config dir. Use the bridge's
-    // canonical path so the CLI and the plugin agree byte-for-byte (and so a
-    // fresh `setup` creates aft.jsonc, the only name the plugin reads).
-    const aftConfigPath = resolveCortexKitUserConfigPath();
+    // consolidation, not the per-harness opencode config dir.
+    const aftConfigPath =
+      purpose === "write" ? resolveCortexKitUserConfigPath() : resolveCortexKitUserConfigReadPath();
     const aftConfigExists = existsSync(aftConfigPath);
     const tui = detectJsoncFile(configDir, "tui");
     return {

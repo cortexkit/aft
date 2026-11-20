@@ -15,10 +15,11 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import {
   clearMigrationNotices,
+  hasPendingWindowsUserConfigMove,
   npmInvocation,
   npmSpawnEnv,
   type ResolvedNpm,
-  resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
   resolveNpm,
   spawn,
   spawnSync,
@@ -989,13 +990,14 @@ interface SchemaFixTarget {
  * Plain `aft doctor` stays read-only and only reports it.
  */
 function findSchemaFixTargets(adapters: HarnessAdapter[]): SchemaFixTarget[] {
+  if (hasPendingWindowsUserConfigMove()) return [];
   const targets: SchemaFixTarget[] = [];
   for (const adapter of adapters) {
     if (!adapter.isInstalled()) continue;
     let aftConfig: string;
     let aftConfigFormat: JsoncFormat;
     try {
-      ({ aftConfig, aftConfigFormat } = adapter.detectConfigPaths());
+      ({ aftConfig, aftConfigFormat } = adapter.detectConfigPaths("write"));
     } catch {
       continue;
     }
@@ -1335,7 +1337,7 @@ export function buildDoctorFixPlan(
 
 /** The shared user AFT config every harness reads (the same path for all of them). */
 function userAftConfigPath(report: DiagnosticReport): string {
-  return report.harnesses[0]?.configPaths.aftConfig ?? resolveCortexKitUserConfigPath();
+  return report.harnesses[0]?.configPaths.aftConfig ?? resolveCortexKitUserConfigReadPath();
 }
 
 /** Size, mtime and inode of a file, to tell whether it was replaced; null when unreadable. */
