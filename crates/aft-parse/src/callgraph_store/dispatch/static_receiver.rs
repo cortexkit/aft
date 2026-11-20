@@ -9,6 +9,8 @@ mod csharp_projects;
 pub use csharp_projects::CSharpProjects;
 #[path = "static_receiver/extract.rs"]
 mod extract;
+#[path = "static_receiver/msbuild.rs"]
+mod msbuild;
 #[path = "static_receiver/resolve.rs"]
 mod resolve;
 
@@ -21,6 +23,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct StaticFacts {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    namespaces: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub types: Vec<Declaration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -74,7 +78,7 @@ pub struct StaticSiteEvidence<'a> {
 
 impl StaticFacts {
     pub fn is_empty(&self) -> bool {
-        self.types.is_empty() && self.sites.is_empty()
+        self.types.is_empty() && self.sites.is_empty() && self.namespaces.is_empty()
     }
 
     /// Keys the exact qualified declaration lookup by language and name.
@@ -90,9 +94,20 @@ impl StaticFacts {
     }
 
     pub fn type_keys<'a>(&'a self, language: &'a str) -> impl Iterator<Item = String> + 'a {
-        self.types.iter().filter_map(move |ty| {
-            matches!(language, "java" | "csharp").then(|| Self::type_key(language, &ty.name))
-        })
+        self.types
+            .iter()
+            .filter_map(move |ty| {
+                matches!(language, "java" | "csharp").then(|| Self::type_key(language, &ty.name))
+            })
+            .chain(
+                self.namespaces
+                    .iter()
+                    .map(move |namespace| Self::namespace_key(language, namespace)),
+            )
+    }
+
+    fn namespace_key(language: &str, namespace: &str) -> String {
+        format!("sn:{language}\t{namespace}")
     }
 
     pub(super) fn site_key(&self, ordinal: u32) -> Option<u32> {
@@ -142,6 +157,20 @@ impl StaticFacts {
         if before == after {
             return;
         }
+        let namespaces = |facts: Option<&Self>| {
+            facts
+                .into_iter()
+                .flat_map(|facts| &facts.namespaces)
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        };
+        let before_namespaces = namespaces(before);
+        let after_namespaces = namespaces(after);
+        keys.extend(
+            before_namespaces
+                .symmetric_difference(&after_namespaces)
+                .map(|name| Self::namespace_key(language, name)),
+        );
         let before = Self::declarations(before);
         let after = Self::declarations(after);
         for name in before.keys().chain(after.keys()) {
@@ -170,6 +199,7 @@ impl StaticFacts {
 }
 
 aft_store::heap_bytes_of_fields!(StaticFacts {
+    namespaces,
     types,
     scopes,
     receivers,

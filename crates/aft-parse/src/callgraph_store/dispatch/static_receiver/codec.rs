@@ -34,6 +34,7 @@ impl StaticFacts {
             out.u32(ordinal);
             out.u32(id);
         }
+        out.strs(&self.namespaces);
         out.finish()
     }
 
@@ -71,11 +72,13 @@ impl StaticFacts {
             })
         })?;
         let sites = read_list(&mut input, |i| Ok((i.u32()?, index(i, receivers.len())?)))?;
+        let namespaces = input.strings()?;
         input.finish()?;
         if sites.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
             return Err(DecodeError("static receiver ordinals are not in order"));
         }
         Ok(Self {
+            namespaces,
             types,
             scopes,
             receivers,

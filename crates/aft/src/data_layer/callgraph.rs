@@ -72,9 +72,14 @@ pub(crate) struct CheckoutInputs {
 impl CheckoutInputs {
     fn csharp_projects(&self) -> crate::callgraph_store::join::dispatch::CSharpProjects {
         crate::callgraph_store::join::dispatch::CSharpProjects::new(
-            self.state
-                .directory_records(b"")
-                .map(|record| record.path.as_slice()),
+            self.state.directory_records(b"").map(|record| {
+                (
+                    record.path.as_slice(),
+                    self.configs
+                        .get(&record.path)
+                        .and_then(|markers| (markers.len() == 1).then(|| markers[0])),
+                )
+            }),
         )
     }
 }

@@ -876,7 +876,10 @@ impl LiveCheckout {
             .iter()
             .filter_map(|path| {
                 let path = path.as_bytes();
-                if old.state.get(path).is_some() == inputs.state.get(path).is_some() {
+                if old.state.get(path).map(|record| record.kind)
+                    == inputs.state.get(path).map(|record| record.kind)
+                    && old.configs.get(path) == inputs.configs.get(path)
+                {
                     return None;
                 }
                 use crate::callgraph_store::join::dispatch::CSharpProjects;

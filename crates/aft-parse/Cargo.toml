@@ -21,6 +21,7 @@ aft-store = { path = "../aft-store", version = "0.66.0" }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
+quick-xml = "0.39.4"
 parking_lot = "0.12"
 tree-sitter = "=0.26.7"
 tree-sitter-typescript = "0.23.2"

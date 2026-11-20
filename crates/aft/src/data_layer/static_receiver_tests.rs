@@ -87,7 +87,10 @@ fn duplicate_static_receiver_ordinals_round_trip_csharp_yield_body() {
     let path = "InputData.cs";
     let parse = round_trip(source, "csharp");
     assert!(retained_static_call(&parse, "Tuple", "Create").contains("GetData"));
-    let projects = CSharpProjects::new([b"Fixture.csproj".as_slice()]);
+    let projects = CSharpProjects::new([(
+        b"Fixture.csproj".as_slice(),
+        Some(CSharpProjects::project_markers(b"<Project />")),
+    )]);
     let resolver =
         Resolver::new(BTreeMap::from([(path.to_string(), &parse)])).with_csharp_projects(&projects);
     let site = parse

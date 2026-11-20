@@ -110,3 +110,84 @@ fn csharp_project_file_add_remove_move_refresh_matches_cold_bytes() {
         }
     }
 }
+
+#[test]
+fn csharp_unproven_alias_in_a_checkout_namespace_is_not_external() {
+    let files = [
+        ("app/App.csproj", "<Project />"),
+        ("app/Caller.cs", "using Debug = Startup.CompilerHelpers.StartupDebug; using Remote = NoCheckoutPackage.Api; namespace App; class Caller { void Run() { Debug.Assert(); Remote.Convert(); } }"),
+        ("shared/Namespace.cs", "namespace Startup.CompilerHelpers { }"),
+        ("other/Names.cs", "namespace Other; interface Names { void Assert(); void Convert(); }"),
+    ];
+    let rows = records_match_files(&project_checkout(&files, &[]));
+    let caller = &rows["app/Caller.cs"];
+    let startup = answer(caller, "Assert");
+    assert_eq!(
+        (startup.unresolved, startup.external),
+        (1, 0),
+        "{startup:?}"
+    );
+    assert!(!startup.protected.is_empty());
+    external(answer(caller, "Convert"));
+}
+
+#[test]
+fn java_unindexed_import_in_a_checkout_package_is_not_external() {
+    let files = [
+        (
+            "app/Caller.java",
+            "package app; import helpers.Missing; class Caller { void run() { Missing.check(); } }",
+        ),
+        ("src/helpers/Package.java", "package helpers;"),
+        (
+            "src/Names.java",
+            "package misc; interface Names { void check(); }",
+        ),
+    ];
+    let rows = records_match_files(&project_checkout(&files, &[]));
+    let result = answer(&rows["app/Caller.java"], "check");
+    assert_eq!((result.unresolved, result.external), (1, 0), "{result:?}");
+    let (stats, rows) = update_checked_bytes(
+        project_checkout(&[files[0], files[2]], &[]),
+        project_checkout(&files, &[]),
+        &[files[1].0],
+    );
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    assert_eq!(answer(&rows["app/Caller.java"], "check"), result);
+}
+
+#[test]
+fn csharp_project_lookup_skips_aggregators_but_not_unknown_compilers() {
+    for aggregator in [
+        r#"<Project Sdk="Microsoft.Build.NoTargets" />"#,
+        r#"<Project><Sdk Name="Microsoft.Build.Traversal" Version="1.0.0" /></Project>"#,
+    ] {
+        let files = [CALLER, APP, TYPE, ("app/src/Aggregator.csproj", aggregator)];
+        check_exact(&records_match_files(&project_checkout(&files, &[]))[CALLER.0]);
+    }
+    for unsupported in [
+        "<Project><PropertyGroup><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup></Project>",
+        "<Project><Unclosed></Project>",
+    ] {
+        let files = [CALLER, APP, TYPE, ("app/src/Nested.csproj", unsupported)];
+        check_unknown(&records_match_files(&project_checkout(&files, &[]))[CALLER.0]);
+    }
+}
+
+#[test]
+fn csharp_project_marker_edit_refresh_matches_cold_bytes() {
+    let nested = "app/src/Nested.csproj";
+    let before = project_checkout(
+        &[
+            CALLER,
+            APP,
+            TYPE,
+            (nested, r#"<Project Sdk="Microsoft.Build.NoTargets" />"#),
+        ],
+        &[],
+    );
+    let after = project_checkout(&[CALLER, APP, TYPE, (nested, "<Project />")], &[]);
+    let (stats, rows) = update_checked_bytes(before, after, &[nested]);
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    check_unknown(&rows[CALLER.0]);
+}

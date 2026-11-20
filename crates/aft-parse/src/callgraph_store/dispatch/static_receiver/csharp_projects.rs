@@ -15,6 +15,10 @@ enum Folder {
     Ambiguous,
 }
 
+pub(super) const UNKNOWN: u8 = 0;
+pub(super) const AGGREGATOR: u8 = 1;
+pub(super) const COMPILES: u8 = 2;
+
 #[derive(Debug)]
 struct Lookup {
     project: Option<Arc<str>>,
@@ -25,17 +29,29 @@ impl CSharpProjects {
     /// The supplied checkout paths include project files that are not parsed.
     /// Index the project filenames in one pass instead of reading directories
     /// from disk and accidentally looking beyond the checkout snapshot.
-    pub fn new<'a>(paths: impl IntoIterator<Item = &'a [u8]>) -> Self {
+    pub fn new<'a>(paths: impl IntoIterator<Item = (&'a [u8], Option<u8>)>) -> Self {
         let mut this = Self::default();
-        for path in paths {
+        for (path, kind) in paths {
+            if kind == Some(AGGREGATOR) {
+                continue;
+            }
             if let Some(folder) = Self::manifest_folder(path) {
                 this.declarations
                     .entry(folder)
                     .and_modify(|kind| *kind = Folder::Ambiguous)
-                    .or_insert(Folder::One);
+                    .or_insert(if kind == Some(COMPILES) {
+                        Folder::One
+                    } else {
+                        Folder::Ambiguous
+                    });
             }
         }
         this
+    }
+
+    /// Compact configuration fact, read without evaluating MSBuild imports or conditions.
+    pub fn project_markers(source: &[u8]) -> u8 {
+        super::msbuild::classify(source).unwrap_or(UNKNOWN)
     }
 
     pub fn manifest_folder(path: &[u8]) -> Option<String> {

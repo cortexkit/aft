@@ -91,6 +91,9 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                     .named_children(&mut package.walk())
                     .find_map(|n| path(n, source, false))
                     .unwrap_or_default();
+                if !root.namespace.is_empty() {
+                    index.facts.namespaces.push(root.namespace.clone());
+                }
             }
             for node in all.iter().filter(|n| n.kind() == "import_declaration") {
                 if node
@@ -108,6 +111,36 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                 }
             }
         } else if language == "csharp" {
+            // A namespace in any branch is enough to veto an external guess.
+            // It does not make the declarations inside the branch visible.
+            for &node in all
+                .iter()
+                .filter(|node| CS_NAMESPACES.contains(&node.kind()))
+            {
+                let mut parts = Vec::new();
+                let mut current = Some(node);
+                while let Some(namespace) = current {
+                    if let Some(name) =
+                        field(namespace, &["name"]).and_then(|n| path(n, source, true))
+                    {
+                        parts.push(name);
+                    }
+                    current = nav
+                        .parent(namespace)
+                        .and_then(|parent| nav.enclosing(parent, CS_NAMESPACES));
+                }
+                parts.reverse();
+                let mut qualified = parts.join(".");
+                while !qualified.is_empty() {
+                    index.facts.namespaces.push(qualified.clone());
+                    let Some(split) = qualified.rfind('.') else {
+                        break;
+                    };
+                    qualified.truncate(split);
+                }
+            }
+            index.facts.namespaces.sort_unstable();
+            index.facts.namespaces.dedup();
             if let Some(file_namespace) = all.iter().find(|n| {
                 n.kind() == "file_scoped_namespace_declaration"
                     && nav.enclosing(**n, CS_CONDITIONALS).is_none()

@@ -16,6 +16,33 @@ struct Type<'a> {
 }
 
 impl<'a> Resolver<'a> {
+    fn declares_namespace(&self, language: &str, namespace: &str) -> bool {
+        let key = StaticFacts::namespace_key(language, namespace);
+        self.depend(key.clone());
+        let declares = |parse: &super::super::ParseBlob| {
+            parse.language == language
+                && parse.dispatch.static_facts.as_ref().is_some_and(|facts| {
+                    facts
+                        .namespaces
+                        .binary_search_by(|name| name.as_str().cmp(namespace))
+                        .is_ok()
+                })
+        };
+        match self.source {
+            Some(source) => source
+                .files_with_static_type(&key)
+                .iter()
+                .any(|path| self.lookup(path).is_some_and(declares)),
+            None => self.files.values().copied().any(declares),
+        }
+    }
+
+    fn absent_namespace(&self, language: &str, type_name: &str) -> bool {
+        let Some((namespace, _)) = type_name.rsplit_once('.') else {
+            return false;
+        };
+        !self.declares_namespace(language, namespace)
+    }
     fn csharp_project(&self, file: &str) -> Option<std::sync::Arc<str>> {
         self.csharp_projects?.owner(file, |key| self.depend(key))
     }
@@ -188,7 +215,8 @@ impl<'a> Resolver<'a> {
             .iter()
             .find(|(alias, target)| alias == name || target == name)
         {
-            return unambiguous(self.static_types("java", target));
+            let found = unambiguous(self.static_types("java", target))?;
+            return (!found.is_empty() || self.absent_namespace("java", target)).then_some(found);
         }
         let package_prefix = format!("{}.", scope.namespace);
         let mut found = self.static_types(
@@ -205,7 +233,9 @@ impl<'a> Resolver<'a> {
         }
         let core = name.strip_prefix("java.lang.").unwrap_or(name);
         if java_lang_class(core) {
-            return unambiguous(self.static_types("java", &join("java.lang", core)));
+            let found = unambiguous(self.static_types("java", &join("java.lang", core)))?;
+            return (!found.is_empty() || !self.declares_namespace("java", "java.lang"))
+                .then_some(found);
         }
         None
     }
@@ -325,6 +355,7 @@ impl<'a> Resolver<'a> {
                     if !self
                         .static_types("csharp", target.trim_start_matches("global::"))
                         .is_empty()
+                        || !self.absent_namespace("csharp", target.trim_start_matches("global::"))
                     {
                         return None;
                     }
