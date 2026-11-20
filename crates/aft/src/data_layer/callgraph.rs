@@ -77,7 +77,7 @@ impl CheckoutInputs {
                     record.path.as_slice(),
                     self.configs
                         .get(&record.path)
-                        .and_then(|markers| (markers.len() == 1).then(|| markers[0])),
+                        .map(|markers| markers.as_ref()),
                 )
             }),
         )

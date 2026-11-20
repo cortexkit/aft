@@ -58,7 +58,7 @@ use crate::parser::LangId;
 /// contained type of proven standard-library smart-pointer fields (for example,
 /// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
 /// 15 stores each distinct method-call answer once per fragment.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-17";
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-18";
 
 /// The language of a resolver configuration file the call graph reads raw,
 /// or the start of it. A configuration record also holds the TODO markers
@@ -364,7 +364,7 @@ pub fn extract_with_tree(
             let blob = CallgraphBlob::Config(ConfigBlob {
                 extractor_version: EXTRACTOR_VERSION.into(),
                 language: language.into(),
-                source: vec![markers],
+                source: markers,
             });
             return Ok((record_from_blob(&blob), None));
         }

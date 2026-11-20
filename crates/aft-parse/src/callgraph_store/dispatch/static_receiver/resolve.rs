@@ -3,7 +3,7 @@ use std::path::Path;
 
 use super::super::{dependency, typescript, Resolution, Resolver, Target};
 use super::extract::join;
-use super::{Declaration, Scope, StaticFacts};
+use super::{csharp_projects::ProjectId, Declaration, Scope, StaticFacts};
 
 pub(in crate::callgraph_store) const STATIC_IMPORT_PREFIX: &str = "@static-import:";
 // An import can resolve to a project module without resolving to a class.
@@ -43,14 +43,23 @@ impl<'a> Resolver<'a> {
         };
         !self.declares_namespace(language, namespace)
     }
-    fn csharp_project(&self, file: &str) -> Option<std::sync::Arc<str>> {
+    fn csharp_project(&self, file: &str) -> Option<ProjectId> {
         self.csharp_projects?.owner(file, |key| self.depend(key))
     }
 
-    fn csharp_project_types(&self, project: &str, name: &str) -> Vec<Type<'a>> {
+    fn csharp_project_types(&self, project: ProjectId, name: &str) -> Vec<Type<'a>> {
+        let Some(visible) = self
+            .csharp_projects
+            .and_then(|projects| projects.reachable(project, |key| self.depend(key)))
+        else {
+            return Vec::new();
+        };
         self.static_types("csharp", name)
             .into_iter()
-            .filter(|ty| self.csharp_project(&ty.file).as_deref() == Some(project))
+            .filter(|ty| {
+                self.csharp_project(&ty.file)
+                    .is_some_and(|owner| visible.contains(&owner))
+            })
             .collect()
     }
     fn static_types(&self, language: &str, name: &str) -> Vec<Type<'a>> {
@@ -169,17 +178,17 @@ impl<'a> Resolver<'a> {
             return Vec::new();
         };
         if let Some(name) = name.strip_prefix("global::") {
-            return self.csharp_project_types(&project, name);
+            return self.csharp_project_types(project, name);
         }
         if let Some((_, target)) = scope.aliases.iter().find(|(alias, _)| alias == name) {
             if target.is_empty() {
                 return Vec::new();
             }
-            return self.csharp_project_types(&project, target.trim_start_matches("global::"));
+            return self.csharp_project_types(project, target.trim_start_matches("global::"));
         }
         let mut prefix = owner;
         while !prefix.is_empty() {
-            let found = self.csharp_project_types(&project, &join(prefix, name));
+            let found = self.csharp_project_types(project, &join(prefix, name));
             if !found.is_empty() {
                 return found;
             }
@@ -187,7 +196,7 @@ impl<'a> Resolver<'a> {
         }
         // A global name in another C# compilation is not visible just because
         // its source is present. A written qualifier can name it explicitly.
-        let mut found = self.csharp_project_types(&project, name);
+        let mut found = self.csharp_project_types(project, name);
         if !name.contains('.') {
             found.retain(|candidate| candidate.file == file);
         }
@@ -200,7 +209,7 @@ impl<'a> Resolver<'a> {
             let prefix = namespace
                 .trim_start_matches("static:")
                 .trim_start_matches("global::");
-            for candidate in self.csharp_project_types(&project, &join(prefix, name)) {
+            for candidate in self.csharp_project_types(project, &join(prefix, name)) {
                 if seen.insert((candidate.file.clone(), candidate.declaration.name.as_str())) {
                     found.push(candidate);
                 }
@@ -331,6 +340,8 @@ impl<'a> Resolver<'a> {
             "csharp" => {
                 let owner = &facts.types[receiver.owner? as usize];
                 let project = self.csharp_project(file)?;
+                self.csharp_projects?
+                    .reachable(project, |key| self.depend(key))?;
                 // An empty alias target means its declaration is conditional,
                 // ambiguous, or unreadable. It can still hide a visible type.
                 if scope.aliases.iter().any(|(alias, target)| {
@@ -384,7 +395,7 @@ impl<'a> Resolver<'a> {
                 // types whose members are visible inside the nested type.
                 let mut qualified_owner = owner.name.as_str();
                 loop {
-                    let parts = self.csharp_project_types(&project, qualified_owner);
+                    let parts = self.csharp_project_types(project, qualified_owner);
                     if parts.is_empty()
                         || parts
                             .iter()

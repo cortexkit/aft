@@ -191,3 +191,79 @@ fn csharp_project_marker_edit_refresh_matches_cold_bytes() {
     assert!(stats.sites_resolved > 0, "{stats:?}");
     check_unknown(&rows[CALLER.0]);
 }
+
+fn reference_xml(include: &str) -> String {
+    format!(r#"<Project><ItemGroup><ProjectReference Include="{include}" /></ItemGroup></Project>"#)
+}
+
+#[test]
+fn csharp_direct_and_transitive_project_references_prove_type() {
+    let caller_project = reference_xml("$(MSBuildThisFileDirectory)../forward/Forward.csproj");
+    let forward_project = reference_xml("$(MSBuildProjectDirectory)/../types/Types.csproj");
+    let target = ("types/src/Assert.cs", ASSERT);
+    for direct in [true, false] {
+        let direct_xml = reference_xml("../types/Types.csproj");
+        let files = [
+            CALLER,
+            (APP.0, if direct { &direct_xml } else { &caller_project }),
+            ("forward/Forward.csproj", &forward_project),
+            ("types/Types.csproj", "<Project />"),
+            target,
+        ];
+        let rows = records_match_files(&project_checkout(&files, &[]));
+        for member in ["Check", "AliasCheck"] {
+            exact(
+                answer(&rows[CALLER.0], member),
+                target.0,
+                &[&format!("Assert::{member}")],
+            );
+        }
+    }
+}
+
+#[test]
+fn csharp_imported_conditional_properties_and_wildcards_do_not_prove_reference() {
+    let import = reference_xml("../types/Types.csproj");
+    for xml in ["<Project><Import Project=\"Directory.Build.props\" /></Project>".to_string(),
+        r#"<Project><ItemGroup Condition="'$(Build)' == 'true'"><ProjectReference Include="../types/Types.csproj" /></ItemGroup></Project>"#.into(),
+        r#"<Project><ItemGroup><ProjectReference Include="../types/Types.csproj" Condition="'$(Build)' == 'true'" /></ItemGroup></Project>"#.into(),
+        reference_xml("$(UnknownRoot)/types/Types.csproj"), reference_xml("../types/*.csproj"), reference_xml("../../types/Types.csproj"), reference_xml("../types/NotTheSame.csproj")
+    ] {
+        let files = [CALLER, (APP.0,&xml), ("app/Directory.Build.props",&import), ("types/Types.csproj","<Project />"),("types/src/Assert.cs",ASSERT)];
+        check_unknown(&records_match_files(&project_checkout(&files,&[]))[CALLER.0]);
+    }
+}
+
+#[test]
+fn csharp_project_reference_cycle_and_reference_edit_have_cold_parity() {
+    let app = reference_xml("../bridge/Bridge.csproj");
+    let old = reference_xml("../app/App.csproj");
+    let next = r#"<Project><ItemGroup><ProjectReference Include="../app/App.csproj" /><ProjectReference Include="../types/Types.csproj" /></ItemGroup></Project>"#;
+    let target = ("types/src/Assert.cs", ASSERT);
+    let bridge = "bridge/Bridge.csproj";
+    let fixture = |bridge_xml: &str| {
+        project_checkout(
+            &[
+                CALLER,
+                (APP.0, &app),
+                (bridge, bridge_xml),
+                ("types/Types.csproj", "<Project />"),
+                target,
+            ],
+            &[],
+        )
+    };
+    let before = fixture(&old);
+    let after = fixture(next);
+    check_unknown(&records_match_files(&before)[CALLER.0]);
+    let (stats, rows) = update_checked_bytes(before.clone(), after.clone(), &[bridge]);
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    exact(
+        answer(&rows[CALLER.0], "Check"),
+        target.0,
+        &["Assert::Check"],
+    );
+    let (stats, rows) = update_checked_bytes(after, before, &[bridge]);
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    check_unknown(&rows[CALLER.0]);
+}
