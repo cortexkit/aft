@@ -298,7 +298,7 @@ impl BgTaskRegistry {
             drop(registry);
             // Keep cursor and one-shot updates atomic, but never read presentation
             // bytes or mask credentials while holding the watch registry lock.
-            for ((matched, _more), range) in found.iter_mut().zip(ranges) {
+            for ((matched, more), range) in found.iter_mut().zip(ranges) {
                 let rendered = file
                     .len()
                     .ok()
@@ -335,6 +335,10 @@ impl BgTaskRegistry {
                     });
                 let (match_text, context) = rendered;
                 matched.context = context;
+                if let Some(line) = super::super::watches::more_matches_line(*more) {
+                    matched.context.push('\n');
+                    matched.context.push_str(&line);
+                }
                 if !matched.literal_pattern {
                     matched.match_text = match_text;
                 }

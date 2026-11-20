@@ -30403,6 +30403,63 @@ mod tests {
     }
 
     #[test]
+    fn sticky_watch_notification_counts_further_matches_in_the_same_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        let _reap = KillTasksOnDrop(registry.clone());
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
+        let id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .register_watch(id.clone(), WatchPattern::Substring("READY".into()), false)
+            .unwrap();
+        let task = registry.task_for_session(&id, "session").unwrap();
+        let append = |bytes: &[u8]| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&task.paths.stdout)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        };
+        append(b"READY 1\nREADY 2\nREADY 3\n");
+        registry.scan_task_watch_output(&task);
+        let hits = pattern_match_frames(&frames);
+        assert_eq!(hits.len(), 1, "one notification per watch per scan");
+        assert!(
+            hits[0].context.ends_with(
+                "2 more matches followed in the same output; read them with bash_status."
+            ),
+            "{}",
+            hits[0].context
+        );
+        append(b"READY 4\n");
+        registry.scan_task_watch_output(&task);
+        let hits = pattern_match_frames(&frames);
+        assert_eq!(hits.len(), 2);
+        assert!(
+            !hits[1].context.contains("more matches"),
+            "{}",
+            hits[1].context
+        );
+    }
+
+    #[test]
     fn running_watch_scan_catches_up_on_a_large_backlog_in_one_tick() {
         let dir = tempfile::tempdir().unwrap();
         let registry = BgTaskRegistry::default();

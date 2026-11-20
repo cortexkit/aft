@@ -16,6 +16,15 @@ pub const WATCH_TARGET_ERASED_TEXT: &str = "watch target erased";
 pub const WATCH_TARGET_ERASED_CONTEXT: &str =
     "watch target erased: the background task row was erased before the watch reached a normal terminal result";
 pub const WATCH_TASK_EXIT_TEXT: &str = "watch task exited";
+/// The line a sticky watch's notification adds when more matches of the watch
+/// followed in the same scanned output. `{n}` is their count.
+pub const MORE_MATCHES_TEXT: &str =
+    "{n} more matches followed in the same output; read them with bash_status.";
+
+/// [`MORE_MATCHES_TEXT`] for `more` further matches, or `None` for none.
+pub fn more_matches_line(more: u64) -> Option<String> {
+    (more > 0).then(|| MORE_MATCHES_TEXT.replace("{n}", &more.to_string()))
+}
 
 #[derive(Debug, Clone)]
 pub struct WatchSpec {
