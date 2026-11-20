@@ -16,7 +16,10 @@ use cortexkit_role_llm_runner::{
     send_status::SendStatusRequest,
 };
 use subc_client_rs::{CallError, CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsumer};
-use subc_protocol::{scope::ScopeSelector, BindIdentity, RouteTarget};
+use subc_protocol::{
+    scope::{ParentState, ScopeKind, ScopeSelector, ScopeStamp},
+    BindIdentity, RouteTarget,
+};
 
 const MAX_ATTEMPTS: usize = 10;
 const MAX_AGE_MS: u64 = 24 * 60 * 60 * 1000;
@@ -532,11 +535,79 @@ pub(super) fn route_unbound(route: &RouteIdentity) {
     }
 }
 
+type NoticeScope = (ScopeSelector, ScopeKind);
+
+fn route_notice_scope(stamp: &ScopeStamp) -> NoticeScope {
+    (
+        ScopeSelector::new(
+            stamp.owner.clone(),
+            stamp.scope_ref.clone(),
+            Some(stamp.scope_epoch),
+        ),
+        stamp.kind,
+    )
+}
+
+fn task_notice_scope(stamp: Option<&ScopeStamp>) -> Result<Option<NoticeScope>, ()> {
+    let Some(stamp) = stamp else {
+        return Ok(None);
+    };
+    if stamp.attributes.run_id.is_none() {
+        return Ok(Some(route_notice_scope(stamp)));
+    }
+
+    // The stored stamp still governs the command's lifetime. Runner notices
+    // use the parent session scope the daemon linked to the run instead.
+    if !stamp.owner_authorized || stamp.parent_state != Some(ParentState::Linked) {
+        return Err(());
+    }
+    let parent = stamp.parent.as_ref().ok_or(())?;
+    if parent.scope_ref.is_empty()
+        || (parent.owner == stamp.owner
+            && parent.scope_ref == stamp.scope_ref
+            && parent.scope_epoch == stamp.scope_epoch)
+    {
+        return Err(());
+    }
+    let kind = match super::codemode::run_kind(stamp).map_err(|_| ())?.0 {
+        super::codemode::RunKind::Agent { .. } => ScopeKind::Head,
+        super::codemode::RunKind::Worker { .. } => ScopeKind::Worker,
+    };
+    Ok(Some((
+        ScopeSelector::new(
+            parent.owner.clone(),
+            parent.scope_ref.clone(),
+            Some(parent.scope_epoch),
+        ),
+        kind,
+    )))
+}
+
+fn warn_missing_run_parent(task_id: &str) {
+    static LOGGED: OnceLock<std::sync::Mutex<HashSet<String>>> = OnceLock::new();
+    if LOGGED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(task_id.to_owned())
+    {
+        log::warn!("runner notice task={task_id} has no verified run parent scope; not sent");
+    }
+}
+
 impl Address {
     fn new(
         owner: &crate::bash_background::TaskIdentity,
         raw_harness: String,
-        stamp: Option<&subc_protocol::scope::ScopeStamp>,
+        stamp: Option<&ScopeStamp>,
+    ) -> Option<Self> {
+        Self::with_scope(owner, raw_harness, stamp.map(route_notice_scope))
+    }
+
+    fn with_scope(
+        owner: &crate::bash_background::TaskIdentity,
+        raw_harness: String,
+        scope: Option<NoticeScope>,
     ) -> Option<Self> {
         if retired(owner) {
             return None;
@@ -548,27 +619,20 @@ impl Address {
             .to_string();
         let raw_harness =
             concrete_runner_harness(owner.principal.as_deref(), &owner.session, &raw_harness)?;
+        let (scope, kind) = scope.unzip();
         Some(Self {
             // Broca hosts heads as well as workers, and a head's completion
             // must be allowed to wake it (idle_start). On Broca only a head
             // scope qualifies; every other Broca route, including an unscoped
             // one with no stamp to ask, keeps the worker delivery.
-            worker: match stamp {
-                Some(stamp) if module == "broca" => {
-                    stamp.kind != subc_protocol::scope::ScopeKind::Head
-                }
-                Some(stamp) => stamp.kind == subc_protocol::scope::ScopeKind::Worker,
+            worker: match kind {
+                Some(kind) if module == "broca" => kind != ScopeKind::Head,
+                Some(kind) => kind == ScopeKind::Worker,
                 None => module == "broca",
             },
             module,
             identity: BindIdentity::new(raw_harness, owner.session.clone()),
-            scope: stamp.map(|stamp| {
-                ScopeSelector::new(
-                    stamp.owner.clone(),
-                    stamp.scope_ref.clone(),
-                    Some(stamp.scope_epoch),
-                )
-            }),
+            scope,
         })
     }
 }
@@ -1911,6 +1975,14 @@ fn offer(
                     settled = true;
                 }
             }
+            let scope = task_notice_scope(metadata.scope.as_ref());
+            if !settled && scope.is_err() {
+                warn_missing_run_parent(&task_id);
+                if !completion {
+                    return Next::Done;
+                }
+                settled = true;
+            }
             if settled {
                 return if registry
                     .ack_completions_for_session(
@@ -1942,7 +2014,7 @@ fn offer(
                         .launching_raw_harness
                         .clone()
                         .unwrap_or_else(|| owner.harness.clone());
-                    let Some(address) = Address::new(&owner, raw, metadata.scope.as_ref()) else {
+                    let Some(address) = Address::with_scope(&owner, raw, scope.expect("invalid scope was settled")) else {
                         return retry(FailureClass::Address, "task has no runner notice address");
                     };
                     let runtime = match tokio::runtime::Builder::new_current_thread()

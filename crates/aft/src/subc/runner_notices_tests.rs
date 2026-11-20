@@ -1499,6 +1499,172 @@ fn step(scheduler: &Scheduler, now: std::time::Instant) -> Next {
     result
 }
 
+fn run_stamp(worker: bool) -> ScopeStamp {
+    let owner = json!({"kind":"reserved","module_id":"prefrontal"});
+    let (scope_ref, attributes) = if worker {
+        (
+            "worker:session",
+            json!({"on_behalf_of_agent":"agent-a","run_id":"run-a"}),
+        )
+    } else {
+        (
+            "head:session",
+            json!({"agent_id":"agent-a","run_id":"run-a"}),
+        )
+    };
+    serde_json::from_value(json!({
+        "owner":owner, "ref":"run:program", "scope_epoch":1, "kind":"ephemeral",
+        "attributes":attributes, "owner_authorized":true,
+        "parent":{"owner":owner,"ref":scope_ref,"scope_epoch":7}, "parent_state":"linked",
+    }))
+    .unwrap()
+}
+
+#[test]
+fn runner_notices_run_owned_task_sends_only_to_its_parent_session_scope() {
+    use crate::bash_background::registry::with_scope_spawn;
+
+    for (worker, name, expected_ref) in [
+        (false, "bash-f58a000000000001", "head:session"),
+        (true, "bash-f58a000000000002", "worker:session"),
+    ] {
+        let stamp = run_stamp(worker);
+        let task = with_scope_spawn(Some(stamp.clone()), || Completion::new(name, 0));
+        let capture = test_endpoint::capture(name, false);
+        let scheduler = Scheduler::default();
+        let mut watch = crate::protocol::BashPatternMatchFrame::new(
+            name, name, "watch-a", "ready", 0, "", true,
+        );
+        watch.launching_identity = Some(task.route.task_identity());
+
+        for (frame, id_prefix) in [
+            (task.reminder(600_000), "aft:bash-reminder:"),
+            (PushFrame::BashPatternMatch(watch), "aft:bash-watch:"),
+            (task.frame(), "aft:bash:"),
+        ] {
+            let finished = task.finished;
+            assert!(offer(
+                &scheduler,
+                task.registry.clone(),
+                frame,
+                PathBuf::new(),
+                false,
+                move || finished,
+            ));
+            assert!(matches!(step(&scheduler, Instant::now()), Next::Done));
+            let notice = capture.receiver.try_recv().unwrap();
+            assert_eq!(notice.session, name);
+            assert_eq!(
+                notice.scope,
+                Some(ScopeSelector::new(
+                    stamp.owner.clone(),
+                    expected_ref,
+                    Some(7)
+                )),
+                "{id_prefix} must never route under the run scope"
+            );
+            assert!(notice.request["params"]["send_id"]
+                .as_str()
+                .unwrap()
+                .starts_with(id_prefix));
+            let expected_delivery = if id_prefix == "aft:bash:" && !worker {
+                json!(["tool_result", "steer", "idle_start"])
+            } else {
+                json!(["tool_result", "steer"])
+            };
+            assert_eq!(notice.request["params"]["delivery"], expected_delivery);
+        }
+        assert!(capture.receiver.try_recv().is_err());
+        assert!(task.delivered());
+        assert_eq!(
+            task.registry.notice_metadata(name).unwrap().scope,
+            Some(stamp),
+            "notice delivery must not change the recorded lifecycle scope"
+        );
+    }
+}
+
+#[test]
+fn runner_notices_run_owned_task_drops_notices_without_verified_parent() {
+    use crate::bash_background::registry::with_scope_spawn;
+
+    let linked = run_stamp(true);
+    let mut missing = linked.clone();
+    missing.parent = None;
+    let mut pending = linked;
+    pending.parent_state = Some(ParentState::Pending);
+    for (name, stamp) in [
+        ("bash-f58a000000000003", missing),
+        ("bash-f58a000000000004", pending),
+    ] {
+        let task = with_scope_spawn(Some(stamp), || Completion::new(name, 0));
+        let capture = test_endpoint::capture(name, false);
+        let scheduler = Scheduler::default();
+        for frame in [task.reminder(600_000), task.frame()] {
+            let finished = task.finished;
+            assert!(offer(
+                &scheduler,
+                task.registry.clone(),
+                frame,
+                PathBuf::new(),
+                false,
+                move || finished,
+            ));
+            assert!(matches!(step(&scheduler, Instant::now()), Next::Done));
+            assert!(capture.receiver.try_recv().is_err(), "{name} sent a notice");
+        }
+    }
+}
+
+#[test]
+fn code_search_nudge_on_a_run_uses_the_resolved_owner_scope() {
+    use super::super::test_support::route_identity;
+    use subc_protocol::call_mode::CallMode;
+
+    let (_root_dir, root) = super::super::test_support::test_root("run-code-search-nudge");
+    let session = "run-code-search-nudge";
+    let mut owner = super::super::test_support::route_identity_with_harness(
+        &root,
+        session,
+        BindTrust::FirstParty,
+        "broca",
+    );
+    let stamp = run_stamp(false);
+    let head = Arc::get_mut(&mut owner.0).unwrap();
+    let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut head.spawn_principal else {
+        panic!("head must have a runner bind");
+    };
+    *principal_id = Some("reserved:broca".into());
+    let mut head_stamp = ScopeStamp::new(stamp.owner.clone(), "head:session", 7, ScopeKind::Head);
+    head_stamp.owner_authorized = true;
+    head_stamp.attributes.agent_id = Some("agent-a".into());
+    head.scope = Some(head_stamp);
+    head.call_mode = CallMode::Classic;
+
+    let mut run = route_identity(&root, "program-session");
+    let data = Arc::get_mut(&mut run.0).unwrap();
+    data.call_mode = CallMode::Codemode;
+    data.scope = Some(stamp.clone());
+    let routes = HashMap::from([(route_key(1, 1), owner), (route_key(2, 1), run)]);
+    let codemode::Admission::Owner(effective) = codemode::admit(
+        &routes,
+        route_key(2, 1),
+        Some(&json!({"name":"bash"})),
+        |_| Some(Ok(Default::default())),
+    ) else {
+        panic!("run must act for the head");
+    };
+    let address = code_search_notice(&effective, "call-a")
+        .unwrap()
+        .address
+        .unwrap();
+    assert_eq!(address.identity.session, session);
+    assert_eq!(
+        address.scope,
+        Some(ScopeSelector::new(stamp.owner, "head:session", Some(7)))
+    );
+}
+
 fn advance_notice(
     scheduler: &Scheduler,
     clock: &AtomicU64,
