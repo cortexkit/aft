@@ -14004,16 +14004,20 @@ impl BgTaskRegistry {
             .ok()
             .flatten();
 
+        // Read each stream's bytes before its saved cursor before taking the
+        // watch registry lock; they resume the scans' overlap.
+        let resumed = watch_scan::resumed_cursors(
+            task,
+            &mode,
+            &rows[0],
+            [&mut stdout, &mut stderr, &mut pty],
+        );
         let mut pending_to_emit = Vec::new();
         let mut gap_matches = Vec::new();
         {
             let Ok(mut registry) = self.inner.watch_registry.lock() else {
                 return;
             };
-            let stdout_key = format!("{}:stdout", task.task_id);
-            let stderr_key = format!("{}:stderr", task.task_id);
-            let pty_key = format!("{}:pty", task.task_id);
-
             // All rows for a task share stream cursors; take them from the first row.
             let first = &rows[0];
             if let Ok(mut last) = self.inner.persisted_watch_cursors.lock() {
@@ -14026,16 +14030,9 @@ impl BgTaskRegistry {
                     ),
                 );
             }
-            match mode {
-                BgMode::Pipes => {
-                    registry.set_file_cursor(&stdout_key, first.stdout_offset.max(0) as u64);
-                    registry.set_file_cursor(&stderr_key, first.stderr_offset.max(0) as u64);
-                }
-                BgMode::Pty => {
-                    registry.set_file_cursor(&pty_key, first.pty_offset.max(0) as u64);
-                }
+            for (key, offset, before) in &resumed {
+                registry.restore_file_cursor(key, *offset, before, !terminal);
             }
-
             for row in &rows {
                 let Ok(pattern) = WatchPattern::from_persisted(&row.pattern_kind, &row.pattern)
                 else {
@@ -30507,6 +30504,89 @@ mod tests {
         }
         let after = db.lock().unwrap().total_changes();
         assert_eq!(after - before, 0, "idle ticks updated watch rows");
+    }
+
+    #[test]
+    fn held_regex_match_survives_a_restart_and_is_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path();
+        let (registry, _db, frames) = registry_with_db_and_frames(storage);
+        let task_id = registry
+            .spawn(
+                SpawnPlan::Unsandboxed,
+                LONG_RUNNING_COMMAND,
+                "session".to_string(),
+                storage.to_path_buf(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(30)),
+                None,
+                storage.to_path_buf(),
+                10,
+                true,
+                false,
+                Some(storage.to_path_buf()),
+            )
+            .unwrap();
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::regex("READY$").unwrap(),
+                true,
+            )
+            .unwrap();
+        // A watch that keeps reporting (not `once`) and matches inside the
+        // held line: the restart must not report it a second time.
+        registry
+            .register_watch(
+                task_id.clone(),
+                WatchPattern::Substring("EAD".into()),
+                false,
+            )
+            .unwrap();
+        let task = registry.task_for_session(&task_id, "session").unwrap();
+        let append = |bytes: &[u8]| {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&task.paths.stdout)
+                .unwrap()
+                .write_all(bytes)
+                .unwrap();
+        };
+        let texts = |frames| -> Vec<String> {
+            pattern_match_frames(frames)
+                .into_iter()
+                .filter(|frame| frame.task_id == task_id && frame.reason == "pattern_match")
+                .map(|frame| frame.match_text)
+                .collect()
+        };
+        // The command pauses mid-line: READY may still become READYING.
+        append(b"boot\nREADY");
+        registry.scan_task_watch_output(&task);
+        assert_eq!(texts(&frames), vec!["EAD".to_string()]);
+        registry.ack_completions_for_session(Some("session"), std::slice::from_ref(&task_id));
+
+        let (replayed, _db2, replay_frames) = registry_with_db_and_frames(storage);
+        registry
+            .inner
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        replayed
+            .replay_session_inner(storage, "session", None)
+            .unwrap();
+        let task = replayed.task_for_session(&task_id, "session").unwrap();
+        assert!(task.is_running());
+        assert!(
+            texts(&replay_frames).is_empty(),
+            "the restart reported a match on a line still being written"
+        );
+        append(b"\n");
+        replayed.scan_task_watch_output(&task);
+        replayed.scan_task_watch_output(&task);
+        assert_eq!(
+            texts(&replay_frames),
+            vec!["READY".to_string()],
+            "the held match must be reported once, and the sticky one not again"
+        );
     }
 
     #[test]

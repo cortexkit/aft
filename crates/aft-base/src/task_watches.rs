@@ -8,7 +8,9 @@ use crate::task_watch_lines::{LineBatch, LineDelivery};
 const MAX_WATCHES_PER_TASK: usize = 8;
 const CONTEXT_BEFORE: usize = 100;
 const CONTEXT_AFTER: usize = 500;
-const SCAN_OVERLAP_BYTES: usize = 8 * 1024;
+/// Bytes before a stream's cursor that each scan searches again, so a match
+/// split across two reads is still found.
+pub const SCAN_OVERLAP_BYTES: usize = 8 * 1024;
 
 pub const WATCH_TARGET_ERASED_TEXT: &str = "watch target erased";
 pub const WATCH_TARGET_ERASED_CONTEXT: &str =
@@ -347,6 +349,38 @@ impl WatchRegistry {
         self.scan_cursors.insert(cursor_key.to_string(), offset);
         self.scan_overlaps.remove(cursor_key);
         self.held_ends.remove(cursor_key);
+    }
+
+    /// Resume a stream's scanning at a saved `offset` after a restart, as if
+    /// the scans before it had run in this process. `before` holds the
+    /// stream's bytes just before `offset`; up to [`SCAN_OVERLAP_BYTES`] of
+    /// them become the overlap, so a match spanning the saved cursor is still
+    /// found and one that ended before it is not reported again.
+    ///
+    /// Only the cursor is saved, not whether the last scan held back a regex
+    /// match ending at it. While the task `running`, a scan reports no regex
+    /// match ending exactly at the end of the bytes read, so any such match
+    /// was held and is admitted again here. A finished task's scans reported
+    /// those matches already.
+    pub fn restore_file_cursor(
+        &mut self,
+        cursor_key: &str,
+        offset: u64,
+        before: &[u8],
+        running: bool,
+    ) {
+        self.set_file_cursor(cursor_key, offset);
+        let keep = before.len().min(SCAN_OVERLAP_BYTES);
+        if keep == 0 {
+            return;
+        }
+        self.scan_overlaps.insert(
+            cursor_key.to_string(),
+            before[before.len() - keep..].to_vec(),
+        );
+        if running {
+            self.held_ends.insert(cursor_key.to_string());
+        }
     }
 
     /// Scan `bytes`, read from a stream at `start`, for every watch of

@@ -28,6 +28,40 @@ pub(crate) fn set_watch_scan_budget_for_test(budget: Option<Duration>) {
     WATCH_SCAN_BUDGET_FOR_TEST.with(|cell| cell.set(budget));
 }
 
+/// Each watched stream's saved cursor from a task's watch `row`, with the
+/// capture bytes just before it (the overlap a scan keeps), so restored
+/// watches resume scanning as if the restart had not happened. `files` are
+/// the task's stdout, stderr and pseudoterminal captures; a stream whose
+/// capture is missing or unreadable resumes with no overlap.
+pub(super) fn resumed_cursors(
+    task: &BgTask,
+    mode: &BgMode,
+    row: &BashPatternWatchRow,
+    files: [&mut Option<crate::bash_background::persistence::ValidatedArtifact>; 3],
+) -> Vec<(String, u64, Vec<u8>)> {
+    let [stdout, stderr, pty] = files;
+    let streams = match mode {
+        BgMode::Pipes => vec![
+            ("stdout", row.stdout_offset, stdout),
+            ("stderr", row.stderr_offset, stderr),
+        ],
+        BgMode::Pty => vec![("pty", row.pty_offset, pty)],
+    };
+    streams
+        .into_iter()
+        .map(|(stream, offset, file)| {
+            let offset = offset.max(0) as u64;
+            let overlap = offset.min(crate::bash_background::watches::SCAN_OVERLAP_BYTES as u64);
+            let before = file
+                .as_mut()
+                .and_then(|file| file.read_range(offset - overlap, overlap).ok())
+                .filter(|bytes| bytes.len() as u64 == overlap)
+                .unwrap_or_default();
+            (format!("{}:{stream}", task.task_id), offset, before)
+        })
+        .collect()
+}
+
 impl BgTaskRegistry {
     /// Run a finished task's final watch scan, then its terminal transition,
     /// which routes the exit to watches that never matched. A backlog the scan
@@ -212,6 +246,10 @@ impl BgTaskRegistry {
                     "pty" => Some(task.paths.pty.clone()),
                     _ => None,
                 });
+        // A drain reads to the end of what is written; that end is where the
+        // stream ends only once the task has finished. A running task (a
+        // restart's catch-up scan) may still extend the line its bytes end in.
+        let finished = self.task(task_id).is_none_or(|task| !task.is_running());
         loop {
             let out_of_budget =
                 bytes_read > 0 && deadline.is_some_and(|deadline| Instant::now() >= deadline);
@@ -244,9 +282,8 @@ impl BgTaskRegistry {
                 continue;
             }
             let mut ranges = Vec::new();
-            // A finished task's capture ends at its current length; a running
-            // task may still extend the line its last bytes belong to.
-            let at_end = drain && file.len().is_ok_and(|total| start + len as u64 >= total);
+            let at_end =
+                drain && finished && file.len().is_ok_and(|total| start + len as u64 >= total);
             let mut found = registry.scan_chunk(
                 cursor_key,
                 task_id,
