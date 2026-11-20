@@ -154,3 +154,46 @@ fn idle_runs_release_records_but_confirmed_end_blocks_rebind() {
         assert_eq!(runs.scopes.counts(), (0, epoch as usize));
     }
 }
+
+#[test]
+fn ordinary_run_scope_routing_reuses_decoded_json() {
+    let (_dir, root) = test_support::test_root("cached-run-admission-json");
+    let (writer, _) = mpsc::channel(1);
+    let runs = RunScopes::new(Arc::new(readiness::DaemonControl::new(
+        writer,
+        Arc::new(DispatchPathMetrics::new()),
+        PROTOCOL_VERSION,
+        vec![],
+        vec![],
+        Default::default(),
+        200,
+    )));
+    let identity = test_support::route_identity(&root, "cached-json");
+    let arguments = "large request argument".repeat(2048);
+    let decoded = DecodedFrame {
+        frame: Frame::build(
+            FrameType::Request,
+            control_flags(),
+            1,
+            1,
+            101,
+            serde_json::to_vec(&json!({"name":"read","arguments":{"path":arguments}})).unwrap(),
+        )
+        .unwrap(),
+        phase_trace: PhaseTrace::new(Instant::now()),
+        parsed_body: Default::default(),
+        confinement: None,
+        codemode_policies: None,
+        launch_restore: None,
+    };
+    let (ready, _) = mpsc::unbounded_channel();
+    assert!(decoded.parsed_body.get().is_none());
+    let decoded = runs
+        .defer(decoded, &identity, &ready)
+        .expect_err("ordinary calls do not need a run budget");
+    assert!(
+        decoded.parsed_body.get().is_some(),
+        "the next admission stage must receive the parsed body, not parse it again"
+    );
+    assert_eq!(decoded.body().unwrap()["name"], "read");
+}

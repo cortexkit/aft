@@ -390,7 +390,7 @@ impl RunScopes {
         identity: &RouteIdentity,
         ready: &mpsc::UnboundedSender<Ready>,
     ) -> Result<(), DecodedFrame> {
-        let body = serde_json::from_slice::<Value>(&decoded.frame.body).unwrap_or(Value::Null);
+        let body = decoded.body().unwrap_or(&Value::Null);
         let name = body.get("name").and_then(Value::as_str).unwrap_or("");
         if body
             .get("op")
@@ -462,9 +462,10 @@ impl RunScopes {
         if background_error.is_none() && scope.cached_budget().is_ok() {
             return Err(decoded);
         }
+        let name = name.to_owned();
         self.waits.start(
             decoded,
-            name,
+            &name,
             scope,
             background_error,
             self.control.clone(),
