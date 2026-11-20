@@ -7,6 +7,9 @@ use subc_protocol::{scope::ScopeStamp, session::ModuleControlResponseToModule};
 
 mod indexed_scopes;
 use indexed_scopes::IndexedScopes;
+#[path = "scope_routes.rs"]
+mod scope_routes;
+use scope_routes::RoutedScopes;
 
 pub(super) fn describe_timeout() -> Duration {
     timing(
@@ -100,7 +103,7 @@ impl CompletedEnds {
 #[derive(Clone)]
 pub(super) struct ScopeDescribes {
     goodbye: mpsc::UnboundedSender<ScopeStamp>,
-    routed: Arc<StdMutex<HashSet<(String, String, u64)>>>,
+    routed: Arc<StdMutex<RoutedScopes>>,
     observed: mpsc::UnboundedSender<ScopeStamp>,
     #[cfg(test)]
     iterations: Arc<std::sync::atomic::AtomicUsize>,
@@ -132,27 +135,10 @@ pub(super) fn start_for_speech(
 }
 impl ScopeDescribes {
     pub(super) fn routes(&self, routes: &HashMap<RouteChannel, RouteIdentity>) {
-        let current: HashSet<_> = routes
-            .values()
-            .filter_map(|identity| identity.scope.as_ref())
-            .map(stamp_key)
-            .collect();
-        let mut routed = self
-            .routed
+        self.routed
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for stamp in routes
-            .values()
-            .filter_map(|identity| identity.scope.as_ref())
-        {
-            if stamp.owner_authorized
-                && crate::access_policy::prefrontal::is_principal(&stamp.owner)
-                && !routed.contains(&stamp_key(stamp))
-            {
-                let _ = self.bound.send(stamp.clone());
-            }
-        }
-        *routed = current;
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .update(routes, &self.bound);
     }
     pub(super) fn goodbye(&self, stamp: ScopeStamp) {
         let _ = self.goodbye.send(stamp);
@@ -260,7 +246,7 @@ where
     let (observed, mut observations) = mpsc::unbounded_channel();
     let (bound, mut bindings) = mpsc::unbounded_channel();
     let (ended, receiver) = mpsc::unbounded_channel();
-    let routed = Arc::new(StdMutex::new(HashSet::new()));
+    let routed = Arc::new(StdMutex::new(RoutedScopes::default()));
     let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
     #[cfg(test)]
     let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -656,7 +642,7 @@ where
                     let scopes = indexed.all();
                     retry.retain(|key, _| scopes.contains_key(key));
                     next_poll.retain(|key, _| scopes.contains_key(key));
-                    let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+                    let routed = routed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keys.clone();
                     for (key, stamp) in scopes {
                         if (!protected_keys.contains(key) || continuity_holds.contains(key)) && !confirmed.contains(key) && !pending.contains(key) && (!routed.contains(key) || secret_authorizations.contains(key) || retry.contains_key(key))
                             && next_poll.get(key).map_or(scan_due, |due| tokio::time::Instant::now() >= *due) {
@@ -974,7 +960,7 @@ pub(crate) async fn confirm_secret_rebind_for_test(
             }
         });
     // A still-open head route must not suppress authorization-epoch checks.
-    scopes.routed.lock().unwrap().insert(stamp_key(&stamp));
+    scopes.routed.lock().unwrap().keys.insert(stamp_key(&stamp));
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut answered_head = false;
     loop {
