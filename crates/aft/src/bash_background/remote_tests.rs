@@ -3480,6 +3480,13 @@ async fn exec_remote_bash_from_a_jailed_worker_is_submitted_unchanged() {
     ensure_git_fixture(dir.path());
     let temp = dir.path().join("sandbox-temp");
     fs::create_dir_all(&temp).unwrap();
+    let launcher = temp.join("unexpected-local-launch");
+    fs::write(&launcher, b"#!/bin/sh\nexit 99\n").unwrap();
+    fs::set_permissions(
+        &launcher,
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let profile = crate::sandbox_profile::SandboxProfile::build(
         vec![dir.path().into()],
         Vec::new(),
@@ -3496,7 +3503,7 @@ async fn exec_remote_bash_from_a_jailed_worker_is_submitted_unchanged() {
         registry
             .spawn_remote(
                 launch(daemon.connection.clone()),
-                SpawnPlan::launcher_for_test(profile, "/nonexistent/aft-launcher".into()),
+                SpawnPlan::launcher_for_test(profile, launcher),
                 "printf local-proof",
                 resolve_posix_shell(),
                 "session".into(),
@@ -14697,7 +14704,8 @@ async fn remote_local_fallback_has_no_broker(
     )
     .unwrap();
     profile.mode = mode;
-    let plan = crate::sandbox_spawn::SpawnPlan::launcher_for_test(profile, "/bin/sh".into());
+    let launcher = std::fs::canonicalize("/bin/sh").unwrap();
+    let plan = crate::sandbox_spawn::SpawnPlan::launcher_for_test(profile, launcher);
     let ctx = crate::context::AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
