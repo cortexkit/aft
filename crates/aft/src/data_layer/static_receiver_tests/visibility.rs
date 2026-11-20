@@ -118,3 +118,56 @@ fn known_project_type_without_an_indexed_member_keeps_fallback() {
         fallback(answer(&rows[path], member), path);
     }
 }
+
+#[test]
+fn csharp_conditional_alias_conflict_keeps_fallback() {
+    let inputs = checkout(&[
+        ("src/Quic.cs", "#if NETSTANDARD\nusing OperatingSystem = Quic.Polyfill.OperatingSystem;\n#else\nusing OperatingSystem = System.OperatingSystem;\n#endif\nnamespace Quic;\nclass Caller { void Run() { OperatingSystem.IsWindows(); } }"),
+        ("lib/OS.cs", "namespace System; class OperatingSystem { public static void IsWindows() {} }"),
+    ], &[]);
+    let rows = records_match_files(&inputs);
+    fallback(
+        answer(&rows["src/Quic.cs"], "IsWindows"),
+        "conditional branches disagree",
+    );
+}
+
+#[test]
+fn csharp_unique_unconditional_alias_retains_proof() {
+    let inputs = checkout(&[
+        ("src/Quic.cs", "using OS = System.OperatingSystem;\nnamespace Quic;\nclass Caller { void Run() {\n#if DEBUG\nWork();\n#endif\nOS.IsWindows(); } }"),
+        ("lib/OS.cs", "namespace System; class OperatingSystem { public static void IsWindows() {} }"),
+    ], &[]);
+    let rows = records_match_files(&inputs);
+    exact(
+        answer(&rows["src/Quic.cs"], "IsWindows"),
+        "lib/OS.cs",
+        &["OperatingSystem::IsWindows"],
+    );
+}
+
+#[test]
+fn csharp_preprocessor_bindings_are_not_type_or_import_proof() {
+    let inputs = checkout(&[
+        ("src/Caller.cs", "#if DEBUG\nusing Libraries;\n#elif OTHER\nusing static Libraries.Provider;\n#else\nusing Alias = Libraries.Type;\n#endif\nnamespace App;\nclass Caller { void Run() { Conditional.Declared(); Type.M(); Nested.Call(); Alias.A(); } }"),
+        ("src/Conditional.cs", "namespace App;\n#if DEBUG\nclass Conditional { public static void Declared() {} }\n#endif\n"),
+        ("lib/Types.cs", "namespace Libraries; class Type { public static void M() {} public static void A() {} } class Provider { public class Nested { public static void Call() {} } }"),
+    ], &[]);
+    let rows = records_match_files(&inputs);
+    for member in ["Declared", "M", "Call", "A"] {
+        fallback(answer(&rows["src/Caller.cs"], member), member);
+    }
+}
+
+#[test]
+fn csharp_duplicate_alias_blocks_even_when_one_binding_is_unconditional() {
+    let inputs = checkout(&[
+        ("src/Quic.cs", "using OS = System.OperatingSystem;\n#if DEBUG\nusing OS = Outside.OperatingSystem;\n#endif\nnamespace Quic; class Caller { void Run() { OS.IsWindows(); } }"),
+        ("lib/OS.cs", "namespace System; class OperatingSystem { public static void IsWindows() {} }"),
+    ], &[]);
+    let rows = records_match_files(&inputs);
+    fallback(
+        answer(&rows["src/Quic.cs"], "IsWindows"),
+        "alias has two declarations",
+    );
+}

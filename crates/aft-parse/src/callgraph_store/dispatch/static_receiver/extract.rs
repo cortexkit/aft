@@ -7,6 +7,7 @@ use super::{bindings, Declaration, Receiver, Scope, StaticFacts};
 use crate::callgraph_store::join::ParseBlob;
 
 const CS_NAMESPACES: &[&str] = &["namespace_declaration", "file_scoped_namespace_declaration"];
+const CS_CONDITIONALS: &[&str] = &["preproc_if", "preproc_elif", "preproc_else"];
 const CS_TYPES: &[&str] = &[
     "class_declaration",
     "struct_declaration",
@@ -107,10 +108,10 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                 }
             }
         } else if language == "csharp" {
-            if let Some(file_namespace) = all
-                .iter()
-                .find(|n| n.kind() == "file_scoped_namespace_declaration")
-            {
+            if let Some(file_namespace) = all.iter().find(|n| {
+                n.kind() == "file_scoped_namespace_declaration"
+                    && nav.enclosing(**n, CS_CONDITIONALS).is_none()
+            }) {
                 root.namespace = field(*file_namespace, &["name"])
                     .and_then(|n| path(n, source, true))
                     .unwrap_or_default();
@@ -118,25 +119,49 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
             for &node in all.iter().filter(|n| n.kind() == "using_directive") {
                 let mut cursor = node.walk();
                 let children = node.children(&mut cursor).collect::<Vec<_>>();
-                let alias = children.iter().position(|n| n.kind() == "=");
-                if children.iter().any(|n| n.kind() == "global") {
+                let equals = children.iter().position(|n| n.kind() == "=");
+                let alias = equals.and_then(|eq| eq.checked_sub(1)).map(|i| {
+                    text(children[i], source)
+                        .trim_start_matches('@')
+                        .to_string()
+                });
+                let scope = nav.enclosing(node, CS_NAMESPACES).map(|n| n.id());
+                let excluded = children.iter().any(|n| n.kind() == "global")
+                    || nav.enclosing(node, CS_CONDITIONALS).is_some();
+                if excluded {
+                    if let Some(alias) = alias {
+                        usings
+                            .entry(scope)
+                            .or_default()
+                            .push((Some(alias), String::new()));
+                    }
                     continue;
                 }
                 let target = children
                     .iter()
-                    .skip(alias.map_or(0, |eq| eq + 1))
+                    .skip(equals.map_or(0, |eq| eq + 1))
                     .find_map(|n| path(*n, source, true));
                 if let Some(mut target) = target {
                     if children.iter().any(|n| n.kind() == "static") {
                         target.insert_str(0, "static:");
                     }
-                    let alias = alias.and_then(|eq| eq.checked_sub(1)).map(|i| {
-                        text(children[i], source)
-                            .trim_start_matches('@')
-                            .to_string()
-                    });
-                    let scope = nav.enclosing(node, CS_NAMESPACES).map(|n| n.id());
                     usings.entry(scope).or_default().push((alias, target));
+                } else if let Some(alias) = alias {
+                    usings
+                        .entry(scope)
+                        .or_default()
+                        .push((Some(alias), String::new()));
+                }
+            }
+            let mut counts = HashMap::<String, usize>::new();
+            for (alias, _) in usings.values().flatten() {
+                if let Some(alias) = alias {
+                    *counts.entry(alias.clone()).or_default() += 1;
+                }
+            }
+            for (alias, target) in usings.values_mut().flatten() {
+                if alias.as_ref().is_some_and(|alias| counts[alias] > 1) {
+                    target.clear();
                 }
             }
             add_usings(&mut root, usings.get(&None));
@@ -165,6 +190,9 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
             .iter()
             .filter(|n| type_kinds(language).contains(&n.kind()))
         {
+            if language == "csharp" && nav.enclosing(node, CS_CONDITIONALS).is_some() {
+                continue;
+            }
             if language == "java" && nav.enclosing(node, FUNCTIONS).is_some() {
                 continue;
             }

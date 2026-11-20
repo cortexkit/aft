@@ -132,6 +132,9 @@ impl<'a> Resolver<'a> {
             return self.static_types("csharp", name);
         }
         if let Some((_, target)) = scope.aliases.iter().find(|(alias, _)| alias == name) {
+            if target.is_empty() {
+                return Vec::new();
+            }
             return self.static_types("csharp", target.trim_start_matches("global::"));
         }
         let mut prefix = owner;
@@ -284,6 +287,18 @@ impl<'a> Resolver<'a> {
             }
             "csharp" => {
                 let owner = &facts.types[receiver.owner? as usize];
+                // An empty alias target means its declaration is conditional,
+                // ambiguous, or unreadable. It can still hide a visible type.
+                if scope.aliases.iter().any(|(alias, target)| {
+                    target.is_empty()
+                        && (alias == &receiver.name
+                            || receiver
+                                .name
+                                .strip_prefix(alias)
+                                .is_some_and(|rest| rest.starts_with('.')))
+                }) {
+                    return None;
+                }
                 let types =
                     unambiguous(self.csharp_type(file, scope, &owner.name, &receiver.name))?;
                 if types.is_empty()
