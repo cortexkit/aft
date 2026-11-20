@@ -679,6 +679,29 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(crate) fn mask_notice_text(&self, metadata: &PersistedTask, text: &str) -> String {
+        if text.is_empty() {
+            return String::new();
+        }
+        let task = self.task(&metadata.task_id);
+        let guard = task.as_ref().map(|task| {
+            task.completion_secrets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
+        let masked = match guard.as_deref().and_then(Option::as_ref) {
+            Some(secrets) => secrets.redact(text),
+            None if metadata.has_safe_completion_redaction_after_restart() => aft_redactor(text),
+            None => return crate::log_redact::SECRET_PLACEHOLDER.into(),
+        };
+        crate::log_redact::redact_ticket_digest(
+            &masked,
+            metadata.completion_ticket_digest.as_deref(),
+        )
+        .map(|text| text.into_owned())
+        .unwrap_or_else(|_| crate::log_redact::SECRET_PLACEHOLDER.into())
+    }
+
     pub(super) fn mask_completion_text(&self, task_id: &str, text: &mut String) {
         let task = self.task(task_id);
         let ticket_digest = task.as_ref().and_then(|task| {

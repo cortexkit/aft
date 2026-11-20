@@ -111,6 +111,10 @@ pub(crate) fn display_reader() -> Result<Option<String>, subc_protocol::ErrorBod
     display::reader()
 }
 
+pub(crate) fn notice_display_reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
+    display::notice_reader()
+}
+
 pub(crate) struct Worker {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,

@@ -2,7 +2,7 @@ use serde_json::json;
 
 use super::{Shipped, BASH_SEMANTICS};
 
-pub(super) const CATALOG_DIGEST: &str =
+pub(in crate::subc) const CATALOG_DIGEST: &str =
     "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0";
 
 pub(super) fn append(entry: &mut Shipped) {

@@ -21,8 +21,10 @@ pub(crate) mod bash_tail;
 pub(super) mod counters;
 mod diagnostics;
 mod edit_hunks;
+mod notice_pull;
 mod store;
 use counters::{count, Counter::*};
+pub(in crate::subc) use notice_pull::stage_notice;
 
 struct Writer {
     outbox: Mutex<Outbox>,
@@ -1215,7 +1217,19 @@ pub(crate) async fn read(
     let writer = SENDER
         .get()
         .ok_or_else(cortexkit_role_tool_display::not_ready)?;
-    let discovered = crate::late_result_bus::display_reader()?;
+    let discovered = if arguments
+        .get("record_id")
+        .and_then(Value::as_str)
+        .is_some_and(super::notices::is_notice_id)
+    {
+        if super::notices::WRITER_CAPABILITY.is_none() {
+            None
+        } else {
+            crate::late_result_bus::notice_display_reader()?
+        }
+    } else {
+        crate::late_result_bus::display_reader()?
+    };
     read_for_reader(
         writer,
         principal,
@@ -1237,6 +1251,10 @@ async fn read_for_reader(
 ) -> Result<Vec<u8>, subc_protocol::ErrorBody> {
     check_reader(principal, discovered)?;
     let request = read_request(arguments)?;
+    if super::notices::is_notice_id(&request.record_id) {
+        // Pending notices are not readable from memory before they reach the store.
+        return writer.store.read(request.record_id, now_ms).await;
+    }
     let memory = writer
         .outbox
         .lock()

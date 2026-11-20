@@ -17,7 +17,7 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
         .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
         .await
         .unwrap();
-    assert_eq!(writer.0.len(), crate::subc::tool_views::SHIPPED.len());
+    assert_eq!(writer.0.len(), crate::subc::tool_views::SHIPPED.len() + 3);
     for (pin, _) in crate::subc::tool_views::SHIPPED.iter() {
         let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![pin.clone()]);
         let reply = cortexkit_role_tool_provider::views::ViewsReply::new(
@@ -53,6 +53,49 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
         .await
         .unwrap();
     assert_eq!(writer.0.len(), writes);
+}
+
+#[tokio::test]
+async fn notice_records_bus_views_and_tool_views_decode_as_the_same_one_pin_reply() {
+    use cortexkit_role_tool_provider::views::{ViewEntry, ViewsReply, ViewsRequest};
+    use serde_json::json;
+
+    let mut writer = RecordingWriter::default();
+    Publication::default()
+        .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
+        .await
+        .unwrap();
+    for name in ["bash_finished", "bash_still_running", "bash_watch"] {
+        let pin = format!("nv1:aft:{name}:1");
+        let route = crate::subc::tool_views::answer(json!({"pins":[pin]})).unwrap();
+        let bytes = &writer
+            .0
+            .iter()
+            .find(|(stored, _)| stored == &key(&pin))
+            .unwrap()
+            .1;
+        let decoded: ViewsReply = serde_json::from_slice(bytes).unwrap();
+        decoded
+            .validate_for(&ViewsRequest::new(vec![pin.clone()]))
+            .unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), route);
+        let ViewEntry::Notice(view) = &decoded.views[&pin] else {
+            panic!("missing {pin}");
+        };
+        view.check_pin("aft", &pin).unwrap();
+        assert_eq!(view.notice.name, name);
+        assert_eq!(view.bucket_key("aft").unwrap(), key(&pin));
+    }
+    for pin in [
+        "nv1:other:bash_finished:1",
+        "nv1:aft:bash_finished:01",
+        "nv1:aft:bash_finished:9007199254740992",
+    ] {
+        assert_eq!(
+            crate::subc::tool_views::answer(json!({"pins":[pin]})).unwrap()["views"][pin],
+            "unknown"
+        );
+    }
 }
 
 #[tokio::test]

@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "kind": {"type": "string", "enum": ["finished", "still_running", "watch"]},
+    "task_id": {"type": "string"},
+    "status": {"type": "string"},
+    "exit_code": {"type": "integer"},
+    "command": {"type": "string"},
+    "description": {"type": "string"},
+    "duration_ms": {"type": "integer"},
+    "elapsed_ms": {"type": "integer"},
+    "output_preview": {"type": "string"},
+    "output_cut": {"type": "boolean"},
+    "watch_match": {"type": "string"},
+    "watch_reason": {"type": "string"}
+  },
+  "required": ["kind", "task_id", "status", "command", "output_preview", "output_cut"],
+  "additionalProperties": false
+}

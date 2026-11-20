@@ -1,6 +1,7 @@
 //! The runner records each notice's send_id durably, so retries cannot deliver
 //! the same notice twice. Runner sessions do not acknowledge AFT push frames.
 
+mod bash_requests;
 pub(crate) mod notice_templates;
 
 use super::*;
@@ -1895,28 +1896,7 @@ fn offer(
         return false;
     };
     let task_id = task_id.clone();
-    let (id, text, completion) = match &frame {
-        PushFrame::BashCompleted(_) => (
-            format!("aft:bash:{task_id}"),
-            super::bash_notice_text::completion(&serde_json::to_value(&frame).unwrap()),
-            true,
-        ),
-        PushFrame::BashLongRunning(frame) => (
-            format!("aft:bash-reminder:{task_id}:{}", frame.elapsed_ms),
-            super::bash_notice_text::long_running(&serde_json::to_value(frame).unwrap()),
-            false,
-        ),
-        PushFrame::BashPatternMatch(frame) => (
-            format!(
-                "aft:bash-watch:{}:{}",
-                frame.watch_id,
-                blake3::hash(&serde_json::to_vec(frame).unwrap())
-            ),
-            super::bash_notice_text::watch(&serde_json::to_value(frame).unwrap()),
-            false,
-        ),
-        _ => unreachable!(),
-    };
+    let (id, text, completion) = bash_requests::parts(&frame);
     let reminder_elapsed_ms = match &frame {
         PushFrame::BashLongRunning(frame) => Some(frame.elapsed_ms),
         _ => None,
@@ -2086,14 +2066,16 @@ fn offer(
                         }
                     }
                     let send_request = |request: &SendRequest| {
+                        let send = || runtime.block_on(async {
+                            if let Some(record) = super::rich_ui::notices::for_send(&registry, &frame, &metadata, &address.module, &address.identity.session, &request.send_id, timestamp) {
+                                super::rich_ui::display::stage_notice(record).await;
+                            }
+                            send(&path, &address, request, delivery_order).await
+                        });
                         if completion {
-                            registry
-                                .send_runner_completion(&task_id, || {
-                                    runtime.block_on(send(&path, &address, request, delivery_order))
-                                })
-                                .unwrap_or(Outcome::Accepted)
+                            registry.send_runner_completion(&task_id, send).unwrap_or(Outcome::Accepted)
                         } else {
-                            runtime.block_on(send(&path, &address, request, delivery_order))
+                            send()
                         }
                     };
                     let mut outcome = send_request(&request);

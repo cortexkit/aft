@@ -13,7 +13,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use subc_protocol::ErrorBody;
 
-mod current;
+pub(super) mod current;
+use super::rich_ui::notices;
 
 pub(crate) const BASH_SEMANTICS: u64 = 3;
 
@@ -76,7 +77,7 @@ pub(crate) fn view(pin: &str) -> Option<ViewManifest> {
     ))
 }
 
-pub(super) fn answer(body: Value) -> Result<Value, ErrorBody> {
+pub(crate) fn answer(body: Value) -> Result<Value, ErrorBody> {
     let request: ViewsRequest = serde_json::from_value(body).map_err(|_| {
         cortexkit_role_tool_provider::errors::invalid_request("pins", "expected pins array")
     })?;
@@ -87,7 +88,10 @@ pub(super) fn answer(body: Value) -> Result<Value, ErrorBody> {
         .map(|pin| {
             (
                 pin.clone(),
-                view(pin).map_or(ViewEntry::Unknown, ViewEntry::Manifest),
+                view(pin)
+                    .map(ViewEntry::Manifest)
+                    .or_else(|| notices::view(pin).map(ViewEntry::Notice))
+                    .unwrap_or(ViewEntry::Unknown),
             )
         })
         .collect();
@@ -101,6 +105,7 @@ pub(super) fn answer(body: Value) -> Result<Value, ErrorBody> {
 pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
     SHIPPED
         .keys()
+        .chain(notices::view_pins())
         .map(|pin| {
             let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
             (

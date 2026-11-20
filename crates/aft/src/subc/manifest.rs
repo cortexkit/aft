@@ -413,7 +413,10 @@ pub(super) fn build_manifest_for_host(powershell_available: bool) -> ModuleManif
                 // only when this manifest list names the token; declaring it
                 // in role.describe alone leaves core sending no facts.
                 cortexkit_role_tool_provider::SYSTEM_TEXT_FACTS_V1.to_string(),
-            ],
+            ]
+            .into_iter()
+            .chain(super::rich_ui::notices::WRITER_CAPABILITY.map(str::to_owned))
+            .collect(),
             requires: Vec::new(),
             must_never_reach: Vec::new(),
         }))

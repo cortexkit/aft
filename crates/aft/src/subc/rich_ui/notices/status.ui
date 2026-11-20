@@ -1,0 +1,16 @@
+export const title = input.description ?? input.command
+export const elapsed = input.elapsed_ms ?? input.duration_ms
+export const seconds = Floor((elapsed ?? 0) / 1000)
+export const minutes = Floor(seconds / 60)
+export const hours = Floor(minutes / 60)
+export const remainder = minutes - hours * 60
+export const duration = elapsed == null ? "" : " · " + (hours > 0 ? Text(hours) + " h" + (remainder > 0 ? " " + Text(remainder) + " min" : "") : minutes > 0 ? Text(minutes) + " min" : Text(seconds) + " s")
+export const stopped = input.status == "killed"
+export const timedOut = input.status == "timed_out"
+export const finished = input.kind == "finished" || input.watch_reason == "task_exit"
+export const failed = finished && (stopped || timedOut || input.status != "completed" || (input.exit_code ?? 0) != 0)
+export const exit = input.exit_code == null ? "" : " · exit " + Text(input.exit_code)
+export const stoppedText = stopped ? "Stopped" : "Timed out"
+export const result = (stopped || timedOut ? stoppedText : failed ? "Failed" + exit : "Finished") + duration
+export const printed = "Printed “" + (input.watch_match ?? "") + "”"
+export const summary = finished ? result : input.kind == "still_running" ? "Still running" + duration : printed

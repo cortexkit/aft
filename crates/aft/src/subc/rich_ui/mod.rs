@@ -12,6 +12,7 @@ mod bash_watch;
 pub(crate) mod carrier;
 pub(crate) mod display;
 mod jcs_number;
+pub(crate) mod notices;
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod operations;
 pub(crate) mod outbox;
