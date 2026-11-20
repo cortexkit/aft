@@ -43,20 +43,10 @@ fn filler(bytes: usize) -> String {
     text
 }
 
-#[test]
-fn display_detail_reads_only_the_lines_its_limit_can_show() {
+fn install_tail_display(metadata: &mut crate::bash_background::persistence::PersistedTask) {
     use crate::bash_background::frames::{Identity, TaskDisplay};
 
     crate::subc::lower_hooks::register();
-    let fixture = tempfile::tempdir().unwrap();
-    let registry = BgTaskRegistry::default();
-    let stdout = filler(64 * 1024 * 1024);
-    let task = terminal_task(&registry, &fixture, &stdout, false);
-    let limit = crate::subc::rich_ui::display::detail_byte_limit();
-    let (mut metadata, buffer) = {
-        let state = task.lock_state().unwrap();
-        (state.metadata.clone(), state.buffer.clone())
-    };
     let pin = crate::subc::tool_views::SHIPPED
         .keys()
         .find(|pin| crate::subc::tool_views::has_bash_tail(pin))
@@ -66,15 +56,29 @@ fn display_detail_reads_only_the_lines_its_limit_can_show() {
             runner: subc_protocol::Principal::Reserved {
                 module_id: "broca".into(),
             },
-            call_key: "large-display".into(),
+            call_key: "capture-display".into(),
             schema_pin: pin.clone(),
         },
-        capture_key: "large-display".into(),
+        capture_key: "capture-display".into(),
         reply_produced: false,
         deferred: false,
         held_ms: None,
         attempted: false,
     });
+}
+
+#[test]
+fn display_detail_reads_only_the_lines_its_limit_can_show() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let stdout = filler(64 * 1024 * 1024);
+    let task = terminal_task(&registry, &fixture, &stdout, false);
+    let limit = crate::subc::rich_ui::display::detail_byte_limit();
+    let (mut metadata, buffer) = {
+        let state = task.lock_state().unwrap();
+        (state.metadata.clone(), state.buffer.clone())
+    };
+    install_tail_display(&mut metadata);
 
     work_counts::reset();
     let bodies = registry.display_bodies(&task, &metadata, &buffer);
@@ -91,6 +95,35 @@ fn display_detail_reads_only_the_lines_its_limit_can_show() {
     assert!(stdout.starts_with(shown) && shown.ends_with('\n'));
     assert_eq!(detail["truncated"], true);
     assert_eq!(detail["omittedBytes"], stdout.len() - shown.len());
+}
+
+#[test]
+fn display_detail_includes_tail_when_its_bounded_read_reaches_the_end() {
+    let fixture = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let limit = crate::subc::rich_ui::display::detail_byte_limit() as usize;
+    // The complete capture fits in the read's line-finishing allowance but
+    // not in the display detail's byte budget.
+    let stdout = format!("{}\nfirst\nsecond\nthird\nlast\n", filler(limit));
+    let task = terminal_task(&registry, &fixture, &stdout, false);
+    let (mut metadata, buffer) = {
+        let state = task.lock_state().unwrap();
+        (state.metadata.clone(), state.buffer.clone())
+    };
+    install_tail_display(&mut metadata);
+
+    work_counts::reset();
+    let bodies = registry.display_bodies(&task, &metadata, &buffer);
+
+    assert_eq!(work_counts::get().artifact_bytes as usize, stdout.len());
+    assert_eq!(
+        bodies.tail,
+        Some(serde_json::json!([
+            {"text": "second"},
+            {"text": "third"},
+            {"text": "last"}
+        ]))
+    );
 }
 
 #[test]
