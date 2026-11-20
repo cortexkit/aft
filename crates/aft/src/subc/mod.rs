@@ -6346,7 +6346,7 @@ where
                                 break Err(error);
                             }
                         }
-                        if bg_subs.contains_key(&channel) {
+                        if bg_subs.get(&channel).is_some_and(|sub| sub.corr == corr) {
                             if let Err(error) = end_bg_subscription(
                                 &writer_tx,
                                 &dispatch_path_metrics,

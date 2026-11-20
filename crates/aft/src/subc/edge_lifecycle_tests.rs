@@ -82,6 +82,10 @@ impl Daemon {
     }
 
     async fn bind(&mut self, root: &Path, channel: u16) {
+        self.bind_with_role(root, channel, true).await;
+    }
+
+    async fn bind_with_role(&mut self, root: &Path, channel: u16, provider_v1: bool) {
         let corr = u64::from(channel) + 100;
         let mut bind = serde_json::to_value(ModuleControlRequest::RouteBind {
             route_channel: channel,
@@ -94,10 +98,8 @@ impl Daemon {
             consumer_capabilities: None,
             admission_facts: Default::default(),
             scope: None,
-            role_versions: Some(std::collections::BTreeMap::from([(
-                "tool-provider".into(),
-                "v1".into(),
-            )])),
+            role_versions: provider_v1
+                .then(|| std::collections::BTreeMap::from([("tool-provider".into(), "v1".into())])),
             call_mode: None,
         })
         .unwrap();
@@ -291,4 +293,59 @@ async fn retired_shell_does_not_block_pong_or_unrelated_bind() {
     std::fs::write(stop, b"done").unwrap();
     daemon.finish().await;
     edge_replies.expect("root A's epoch reader must not delay the Pong or root B's bind");
+}
+
+#[tokio::test]
+async fn cancel_of_unrelated_corr_keeps_bg_events_stream_open() {
+    let (_dir, root) = test_support::test_root("bg-events-cancel-correlation");
+    let ctx = test_support::test_ctx();
+    let mut daemon = Daemon::start(root.as_path(), &ctx, &[], dispatch).await;
+    daemon.bind_with_role(root.as_path(), 1, false).await;
+    ctx.wait_for_database_settled(Instant::now() + Duration::from_secs(10))
+        .await;
+    // A second subscribe must end the first. This proves installation rather
+    // than treating the lack of a StreamEnd as proof of a working subscription.
+    daemon
+        .send(FrameType::Request, 1, 9, json!({"op":"bg_events"}))
+        .await;
+    daemon
+        .send(FrameType::Request, 1, 10, json!({"op":"bg_events"}))
+        .await;
+    assert_eq!(daemon.reply(1, 9).await.header.ty, FrameType::StreamEnd);
+    daemon.send(FrameType::Cancel, 1, 11, Value::Null).await;
+    daemon.send(FrameType::Ping, 0, 1010, Value::Null).await;
+    loop {
+        let frame = daemon.recv().await;
+        assert!(
+            !(frame.header.channel == 1
+                && frame.header.corr == 10
+                && frame.header.ty == FrameType::StreamEnd)
+        );
+        if frame.header.ty == FrameType::Pong && frame.header.corr == 1010 {
+            break;
+        }
+    }
+    let ended = tokio::time::timeout(Duration::from_millis(150), async {
+        loop {
+            let frame = daemon.reply(1, 10).await;
+            if frame.header.ty == FrameType::StreamEnd {
+                break;
+            }
+            assert_eq!(frame.header.ty, FrameType::StreamData);
+        }
+    })
+    .await;
+    assert!(
+        ended.is_err(),
+        "a Cancel for another correlation ended the stream"
+    );
+    daemon.send(FrameType::Cancel, 1, 10, Value::Null).await;
+    loop {
+        let frame = daemon.reply(1, 10).await;
+        if frame.header.ty == FrameType::StreamEnd {
+            break;
+        }
+        assert_eq!(frame.header.ty, FrameType::StreamData);
+    }
+    daemon.finish().await;
 }
