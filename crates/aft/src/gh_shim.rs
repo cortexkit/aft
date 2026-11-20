@@ -743,6 +743,7 @@ pub fn is_shim_invocation_from_env() -> bool {
 /// before logging initialization so delegating invocations cannot add shim bytes
 /// to upstream stderr.
 pub fn run_from_env() -> i32 {
+    crate::reader_floor::register_cache_hooks();
     let mut argv = std::env::args_os();
     let Some(program) = argv.next() else {
         return refuse(RefusalCode::NoRealGh, "the executing image was unavailable");
@@ -1119,7 +1120,7 @@ where
         now,
         delegate_to_upstream,
         relay,
-        &crate::bash_background::storage_dir(None),
+        &crate::storage_path::storage_dir(None),
     )
 }
 
@@ -8335,11 +8336,8 @@ thread_local! {
 pub(crate) struct RefusalSinkGuard;
 
 #[cfg(test)]
-impl Drop for RefusalSinkGuard {
-    fn drop(&mut self) {
-        REFUSAL_SINK.with(|slot| slot.replace(None));
-    }
-}
+#[path = "gh_shim/refusal_lifetime.rs"]
+mod refusal_lifetime;
 
 /// Records every `refuse` line until the returned guard drops.
 #[cfg(test)]
@@ -8462,7 +8460,7 @@ mod tests {
             );
             assert_eq!(configured_connection_file(), Some(connection_path));
             assert_eq!(read_user_config_doc(), Some(doc));
-            assert!(crate::data_layer::parent_session::discover(&profile, 1).is_none());
+            assert!(crate::parent_search::discover(&profile, 1).is_none());
 
             // With neither home available, do not read a config relative to cwd.
             std::env::set_var("USERPROFILE", "");

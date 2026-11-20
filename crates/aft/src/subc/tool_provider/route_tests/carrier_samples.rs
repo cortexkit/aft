@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-use crate::bash_background::BgTaskStatus;
+use crate::protocol::BgTaskStatus;
 use std::path::{Path, PathBuf};
 
 const TASK_ID: &str = "bash-0123456789abcdef";

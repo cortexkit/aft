@@ -217,6 +217,10 @@ async fn storage_lease_starts_without_reading_root_under_landlock() {
         for phase in ["storage_lease_done", "executable_pin_done", "logging_done"] {
             assert!(stderr.contains(phase), "missing {phase}: {stderr}");
         }
+        assert!(
+            stderr.contains("phase=unit_test_db_fence_disabled"),
+            "{stderr}"
+        );
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -234,7 +238,12 @@ async fn storage_lease_starts_without_reading_root_under_landlock() {
         );
         assert!(fs::read_dir(storage.join("logs")).unwrap().next().is_some());
         send_connection_goodbye(&mut stream).await;
-        assert!(module.wait_for_exit("Landlock daemon clean exit").success());
+        let status = module.wait_for_exit("Landlock daemon clean exit");
+        assert!(
+            status.success(),
+            "{status}: {}",
+            fs::read_to_string(&stderr_path).unwrap()
+        );
         lock.try_lock()
             .expect("daemon must release its lease on exit");
     }

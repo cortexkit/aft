@@ -784,7 +784,7 @@ fn handle_glob_edit_match_inner(
             .capability_floor(
                 AccessOperation::Write,
                 GrantKind::File,
-                &crate::access_policy::policy_path(path),
+                &crate::policy_path::policy_path(path),
             )
             .is_some()
         {
@@ -1013,7 +1013,7 @@ fn handle_glob_edit_match_inner(
             );
         }
         written_paths.push(edit.path.clone());
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
 
     drop(file_locks);
@@ -1086,7 +1086,7 @@ fn handle_glob_edit_match_inner(
             file_result["format_skipped_reason"] = serde_json::json!(reason);
         }
         file_results.push(file_result);
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
 
     // If any file's post-edit content is syntax-invalid, roll the entire

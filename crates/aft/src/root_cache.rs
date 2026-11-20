@@ -32,7 +32,7 @@ use crate::fs_lock;
 #[path = "root_cache_paths_tests.rs"]
 mod cache_paths_tests;
 #[cfg(test)]
-pub(crate) use location::prepare_cache_root_for_test;
+pub(crate) use crate::reader_floor::prepare_cache_root_for_test;
 
 use crate::cache_location as location;
 pub use crate::cache_location::CACHE_DOMAINS;
@@ -56,12 +56,9 @@ pub use location::{
     CACHE_DIR_BUSY_MESSAGE, CACHE_DIR_UNAVAILABLE,
 };
 pub(crate) use location::{
-    acquire_speech_serving_lease, release_quiescent_speech_serving_lease, SpeechServingLease,
-};
-pub(crate) use location::{
-    cache_status_code, check_cache_access, durable_route, ensure_config_storage_lease,
-    identity_storage_root, prepare_process_cache_root, prepare_third_party_cache_dir,
-    unavailable_code, unavailable_warning,
+    cache_status_code, check_cache_access, ensure_config_storage_lease, identity_storage_root,
+    prepare_process_cache_root, prepare_third_party_cache_dir, unavailable_code,
+    unavailable_warning,
 };
 use location::{canonical_process_lease_dir, existing_ancestor};
 
@@ -146,8 +143,6 @@ static PROCESS_LEASE_ACQUISITIONS: OnceLock<Mutex<HashMap<ProcessLeaseKey, Weak<
 static WRITER_LEASE_ACQUISITION_COUNTS: OnceLock<Mutex<HashMap<WriterLeaseAcquisitionKey, usize>>> =
     OnceLock::new();
 static WRITER_LEASE_ACQUISITION_COUNTER_ENABLED: AtomicBool = AtomicBool::new(false);
-static CONFIGURED_ARTIFACT_ACCESS: OnceLock<Mutex<HashMap<PathBuf, ArtifactAccess>>> =
-    OnceLock::new();
 static WARNED_BORROW_ONLY_WRITES: OnceLock<Mutex<HashSet<(PathBuf, PathBuf)>>> = OnceLock::new();
 
 /// Root-scoped capability that distinguishes shared repository artifacts from
@@ -162,27 +157,18 @@ pub struct ArtifactAccess {
 }
 
 impl ArtifactAccess {
-    fn configured(project_root: &Path, shared_key: &str, borrow_only_shared: bool) -> Self {
-        let project_root = canonical_root(project_root);
-        Self {
-            private_key: crate::path_identity::project_scope_key(&project_root),
-            project_root,
-            shared_key: shared_key.to_string(),
-            borrow_only_shared,
-            registered: true,
-        }
-    }
-
     /// Resolve the capability registered during configure. Unregistered roots
     /// receive a borrow-only capability without probing Git on the store path.
     pub fn for_root(project_root: &Path) -> Self {
         let project_root = canonical_root(project_root);
-        if let Some(access) = configured_artifact_access()
-            .lock()
-            .ok()
-            .and_then(|access| access.get(&project_root).cloned())
-        {
-            return access;
+        if let Some(access) = crate::root_identity::artifact_access(&project_root) {
+            return Self {
+                project_root: access.project_root,
+                shared_key: access.shared_key,
+                private_key: access.private_key,
+                borrow_only_shared: access.borrow_only_shared,
+                registered: access.registered,
+            };
         }
         // Unregistered root: fail closed without spawning git probes. Configure
         // registers every bound root before any store acquisition, so landing
@@ -296,39 +282,7 @@ impl ArtifactAccess {
     }
 }
 
-fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ArtifactAccess>> {
-    CONFIGURED_ARTIFACT_ACCESS.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Return the artifact key registered during configure without deriving a new
-/// key from Git or reading the older identity pin in aft.db.
-pub(crate) fn configured_artifact_key(project_root: &Path) -> Option<String> {
-    let project_root = canonical_root(project_root);
-    configured_artifact_access()
-        .lock()
-        .ok()?
-        .get(&project_root)
-        .filter(|access| !access.shared_key.is_empty())
-        .map(|access| access.shared_key.clone())
-}
-
-/// Register the worktree topology already detected by configure so artifact
-/// APIs can enforce it without repeating a Git subprocess on every write path.
-pub fn configure_artifact_access(project_root: &Path, shared_key: &str, borrow_only_shared: bool) {
-    let access = ArtifactAccess::configured(project_root, shared_key, borrow_only_shared);
-    if let Ok(mut configured) = configured_artifact_access().lock() {
-        // Bounded, but never a wholesale clear: dropping still-live roots'
-        // capabilities would silently flip them onto the fail-closed
-        // (borrow-only) fallback. Evict an arbitrary other entry instead —
-        // any evicted-but-live root re-registers on its next configure.
-        if configured.len() >= 4_096 && !configured.contains_key(&access.project_root) {
-            if let Some(evict) = configured.keys().next().cloned() {
-                configured.remove(&evict);
-            }
-        }
-        configured.insert(access.project_root.clone(), access);
-    }
-}
+pub use crate::root_identity::configure_artifact_access;
 
 fn process_leases() -> &'static Mutex<HashMap<ProcessLeaseKey, Weak<WriterLease>>> {
     PROCESS_LEASES.get_or_init(|| Mutex::new(HashMap::new()))

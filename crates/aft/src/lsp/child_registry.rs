@@ -958,13 +958,13 @@ mod tests {
             && (!registry.pids().is_empty()
                 || pids
                     .iter()
-                    .any(|pid| crate::bash_background::process::is_process_alive(*pid)))
+                    .any(|pid| crate::process_identity::is_process_alive(*pid)))
         {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(registry.pids().is_empty(), "background cleanup must finish");
         for pid in pids {
-            assert!(!crate::bash_background::process::is_process_alive(pid));
+            assert!(!crate::process_identity::is_process_alive(pid));
         }
     }
 
@@ -1006,7 +1006,7 @@ mod tests {
                     // ten-second waits are deadlock guards, not timing oracles.
                     killed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
                     assert!(registry.pids().is_empty());
-                    assert!(crate::bash_background::process::is_process_alive(pid));
+                    assert!(crate::process_identity::is_process_alive(pid));
                 }
                 Err(crossbeam_channel::RecvTimeoutError::Timeout)
             },
@@ -1025,7 +1025,7 @@ mod tests {
             outcome.unreaped, 1,
             "untracking must not hide a waitable child"
         );
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!crate::process_identity::is_process_alive(pid));
     }
 
     #[cfg(unix)]

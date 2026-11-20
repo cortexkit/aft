@@ -414,7 +414,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
 
             changes_to_apply.push((change, validated_path, backup_id));
         }
-        crate::run_tool_call::progress::report();
+        crate::tool_progress::report();
     }
 
     if !invalid_rewrites.is_empty() {
@@ -503,7 +503,7 @@ pub fn handle_ast_replace(req: &RawRequest, ctx: &AppContext) -> Response {
                         Some(validated_path.as_path()),
                     );
                     file_results.push(entry);
-                    crate::run_tool_call::progress::report();
+                    crate::tool_progress::report();
                 }
                 Err(e) => {
                     let rollback_error = rollback_written_changes(

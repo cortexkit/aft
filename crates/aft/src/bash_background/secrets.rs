@@ -70,7 +70,8 @@ pub(crate) fn vault() -> Arc<dyn SecretVault> {
 
 pub(crate) fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
     let vault = vault();
-    let scope = crate::subc::current_secret_audit_scope().map(|scope| scope.to_scope_ref());
+    let scope = crate::context::call_context::current_secret_audit_scope()
+        .map(|scope| scope.to_scope_ref());
     for label in labels {
         let mut record = secret_rules::audit::AuditRecordV1::new(
             crate::secret::now_ms(),
@@ -242,7 +243,7 @@ pub(crate) fn authorize(
     if env_conflicts(env) {
         return Err(refusal(id, labels, "secrets_env_conflict", ENV_CONFLICT));
     }
-    let (scopes, _) = crate::subc::current_call_scopes().map_err(|reason| {
+    let (scopes, _) = crate::context::call_context::current_call_scopes().map_err(|reason| {
         outcome_response(
             id,
             labels,
@@ -251,18 +252,24 @@ pub(crate) fn authorize(
     })?;
     let vault = vault();
     let task = preflight.task.as_ref().expect("preflight owns layout");
-    let proxy = start_proxy(ProxyConfig {
+    let proxy = start_proxy(ProxyConfig::new(
         vault,
-        authorization_scope: scopes.authorization.clone(),
-        lifetime_scope: scopes.lifetime.clone(),
-        scanned_labels: labels.to_vec(),
-        consent_context: crate::subc::current_secret_consent_context(),
-        #[cfg(test)]
-        test_https_port: TEST_HTTPS_PORT.with(std::cell::Cell::get),
-        #[cfg(test)]
-        approval_clock: None,
-        origin: task.paths.task_id.clone(),
-    })
+        scopes.authorization.clone(),
+        scopes.lifetime.clone(),
+        labels.to_vec(),
+        crate::context::call_context::current_secret_consent_context(),
+        {
+            #[cfg(test)]
+            {
+                TEST_HTTPS_PORT.with(std::cell::Cell::get)
+            }
+            #[cfg(not(test))]
+            {
+                None
+            }
+        },
+        task.paths.task_id.clone(),
+    ))
     .map_err(|_| refusal(id, labels, "secrets_unavailable", PROXY_UNAVAILABLE))?;
     preflight
         .plan

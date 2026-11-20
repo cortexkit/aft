@@ -26,20 +26,20 @@ LIST_TIMEOUT_S = 120
 TIMEOUT_EXIT = 124
 
 
-def library_harness(metadata: dict) -> Path:
+def library_harness(metadata: dict, library_name: str = "aft") -> Path:
     candidates = [
         binary for binary in metadata["rust-binaries"].values()
-        if binary["kind"] == "lib" and binary["binary-name"] == "aft"
+        if binary["kind"] == "lib" and binary["binary-name"] == library_name
     ]
     if len(candidates) != 1:
-        raise ValueError(f"expected one aft library harness in nextest metadata, found {len(candidates)}")
+        raise ValueError(f"expected one {library_name} library harness in nextest metadata, found {len(candidates)}")
     binary = Path(candidates[0]["binary-path"])
     if not binary.is_absolute() or not binary.is_file():
         raise ValueError(f"archive-built library harness is missing or not absolute: {binary}")
     return binary
 
 
-def archive_library_harness(archive_file: Path) -> Path:
+def archive_library_harness(archive_file: Path, library_name: str = "aft") -> Path:
     # The archive records producer-absolute paths. Read only its metadata, not
     # extracted executables: the original linked harness still has its local PDB.
     with tarfile.open(archive_file, mode="r|*") as archive:
@@ -48,7 +48,7 @@ def archive_library_harness(archive_file: Path) -> Path:
                 handle = archive.extractfile(member)
                 if handle is None:
                     raise ValueError("nextest binaries metadata is not a file")
-                return library_harness(json.load(handle))
+                return library_harness(json.load(handle), library_name)
     raise ValueError("nextest archive has no binaries metadata")
 
 
@@ -85,7 +85,7 @@ def run_probe(binary: Path, probe: str, timeout_s: float = PROBE_TIMEOUT_S) -> i
     name = PROBES[probe]
     # Cargo normally runs library tests from their package directory. Preserve
     # that working directory while using nextest's exact already-linked binary.
-    cwd = ROOT / "crates/aft"
+    cwd = ROOT / ("crates/aft-base" if probe == "backtrace" else "crates/aft")
     listing = subprocess.run(
         [str(binary), "--list", "--exact", name], cwd=cwd,
         capture_output=True, text=True, check=True, timeout=LIST_TIMEOUT_S,
@@ -102,7 +102,7 @@ def main() -> int:
     parser.add_argument("--probe", choices=PROBES, required=True)
     args = parser.parse_args()
     print(f"Windows serial probe runner: Python {platform.python_version()}", flush=True)
-    binary = archive_library_harness(args.archive_file)
+    binary = archive_library_harness(args.archive_file, "aft_base" if args.probe == "backtrace" else "aft")
     return run_probe(binary, args.probe)
 
 

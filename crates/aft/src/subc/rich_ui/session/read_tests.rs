@@ -219,7 +219,7 @@ async fn session_reads_outside_grants_and_asks_are_denied_on_the_outer_route() {
             // reads default to deny. Core Heads do not load those grants: their
             // FullAccess control succeeds only with root restriction disabled.
             let grant = crate::access_policy::AccessGrant {
-                path: crate::access_policy::policy_path(outside.path()),
+                path: crate::policy_path::policy_path(outside.path()),
                 kind: crate::access_policy::GrantKind::Subtree,
                 operation: crate::access_policy::AccessOperation::Read,
             };

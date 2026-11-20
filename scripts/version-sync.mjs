@@ -163,8 +163,9 @@ function updateCargoPathDep(filePath, depName, version, dryRun) {
   // Match a line starting with `<dep> = { ... version = "<old>" ... }`.
   // Capture the prefix up to (and including) `version = "` so we can rewrite
   // just the version literal without touching path or other fields.
-  const re = new RegExp(`^(${depEscaped}\\s*=\\s*\\{[^\\n]*version\\s*=\\s*)"([^"]+)"`, "m");
-  const match = content.match(re);
+  const re = new RegExp(`^(${depEscaped}\\s*=\\s*\\{[^\\n]*version\\s*=\\s*)"([^"]+)"`, "gm");
+  const matches = [...content.matchAll(re)];
+  const match = matches[0];
 
   if (!match) {
     return {
@@ -173,7 +174,7 @@ function updateCargoPathDep(filePath, depName, version, dryRun) {
     };
   }
 
-  if (match[2] === version) {
+  if (matches.every((entry) => entry[2] === version)) {
     return { path: filePath, changes: [`  (${depName} dep already at target version)`] };
   }
 
@@ -254,6 +255,22 @@ results.push(updateCargoPathDep(cargoPath, "secret-rules", version, dryRun));
 const storePath = join(root, "crates", "aft-store", "Cargo.toml");
 results.push(updateCargoToml(storePath, version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-store", version, dryRun));
+
+// Layered libraries publish after their local dependencies and before AFT.
+const basePath = join(root, "crates", "aft-base", "Cargo.toml");
+const dbPath = join(root, "crates", "aft-db", "Cargo.toml");
+const parsePath = join(root, "crates", "aft-parse", "Cargo.toml");
+results.push(updateCargoToml(basePath, version, dryRun));
+results.push(updateCargoToml(dbPath, version, dryRun));
+results.push(updateCargoToml(parsePath, version, dryRun));
+results.push(updateCargoPathDep(basePath, "aft-store", version, dryRun));
+results.push(updateCargoPathDep(basePath, "secret-rules", version, dryRun));
+results.push(updateCargoPathDep(dbPath, "aft-base", version, dryRun));
+results.push(updateCargoPathDep(parsePath, "aft-base", version, dryRun));
+results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-base", version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-db", version, dryRun));
+results.push(updateCargoPathDep(cargoPath, "aft-parse", version, dryRun));
 
 // Report
 let updateCount = 0;

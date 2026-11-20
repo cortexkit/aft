@@ -393,7 +393,7 @@ async fn worker_scope_policy_holds_rust_read_grants() {
     use crate::access_policy::{AccessDecision, AccessOperation};
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = rust_fixture();
-    let path = crate::access_policy::policy_path(&cargo_root().join("registry/src/example/lib.rs"));
+    let path = crate::policy_path::policy_path(&cargo_root().join("registry/src/example/lib.rs"));
     let db = f.ctx.db().unwrap();
     let conn = db.lock().unwrap();
     for (identity, expected) in [

@@ -3,8 +3,8 @@
 //! to the bus-owned bucket and never provisions it.
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, LazyLock, Weak},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    sync::Arc,
+    time::Duration,
 };
 
 use cortexkit_bus_client::BusClient;
@@ -15,14 +15,6 @@ use tokio::{sync::Notify, time::Instant};
 use super::{backoff, HEALTH, IO_TIMEOUT};
 
 const REFRESH: Duration = Duration::from_secs(5);
-static CHANGED: Notify = Notify::const_new();
-static SESSIONS: LazyLock<parking_lot::Mutex<Sessions>> = LazyLock::new(|| {
-    let start = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    parking_lot::Mutex::new(Sessions::new(start))
-});
 
 #[derive(Default, Serialize)]
 pub(super) struct StatusHealth {
@@ -67,95 +59,10 @@ fn encode(segment: &str, generation: u64) -> Vec<u8> {
     .expect("status is JSON")
 }
 
-#[derive(Clone)]
-struct Segment {
-    text: String,
-    generation: u64,
-    live: Weak<()>,
-}
-#[derive(Default)]
-struct Session {
-    routes: HashSet<usize>,
-    segment: Option<Segment>,
-    live: Arc<()>,
-}
-struct Sessions {
-    live: HashMap<String, Session>,
-    // Seed at process start to fence previous-process generations, assuming
-    // no more than one segment change per millisecond of process lifetime and
-    // no backwards wall-clock step across restarts. The high-water mark also
-    // fences a reopened session without retaining ended sessions in memory.
-    generation_floor: u64,
-}
-impl Sessions {
-    fn new(start_ms: u64) -> Self {
-        Self {
-            live: HashMap::new(),
-            generation_floor: start_ms,
-        }
-    }
-    fn bound(&mut self, route: usize, session: &str) {
-        self.live
-            .entry(session.into())
-            .or_default()
-            .routes
-            .insert(route);
-    }
-    fn unbound(&mut self, route: usize, session: &str) {
-        if let Some(live) = self.live.get_mut(session) {
-            live.routes.remove(&route);
-            if live.routes.is_empty() {
-                self.live.remove(session);
-            }
-        }
-    }
-    fn publish(&mut self, session: &str, text: &str) -> bool {
-        let Some(live) = self.live.get_mut(session) else {
-            return false;
-        };
-        if live.segment.as_ref().is_some_and(|old| old.text == text) {
-            return false;
-        }
-        let generation = live
-            .segment
-            .as_ref()
-            .map_or(self.generation_floor, |old| old.generation)
-            + 1;
-        self.generation_floor = self.generation_floor.max(generation);
-        live.segment = Some(Segment {
-            text: text.into(),
-            generation,
-            live: Arc::downgrade(&live.live),
-        });
-        true
-    }
-    fn snapshot(&self) -> Vec<(String, Segment)> {
-        self.live
-            .iter()
-            .filter_map(|(session, live)| {
-                live.segment
-                    .clone()
-                    .map(|segment| (session.clone(), segment))
-            })
-            .collect()
-    }
-}
-
-pub(crate) fn initialize() {
-    LazyLock::force(&SESSIONS);
-}
-pub(crate) fn route_bound(route: usize, session: &str) {
-    SESSIONS.lock().bound(route, session);
-}
-pub(crate) fn route_unbound(route: usize, session: &str) {
-    SESSIONS.lock().unbound(route, session);
-    CHANGED.notify_one();
-}
-pub(crate) fn publish(session: &str, text: &str) {
-    if SESSIONS.lock().publish(session, text) {
-        CHANGED.notify_one();
-    }
-}
+pub(crate) use aft_base::runner_status_state::{initialize, route_bound, route_unbound};
+use aft_base::runner_status_state::{notifier, snapshot_segments, Segment};
+#[cfg(test)]
+use aft_base::runner_status_state::{segment_for_test, Sessions};
 
 trait Writer {
     async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
@@ -305,7 +212,7 @@ pub(super) async fn run(client: Arc<BusClient>) {
     loop {
         changes.borrow_and_update();
         tokio::select! {
-            _ = drive(&mut connector, || SESSIONS.lock().snapshot(), &CHANGED) => {},
+            _ = drive(&mut connector, snapshot_segments, notifier()) => {},
             result = changes.changed() => {
                 failure("status_connection_changed");
                 if result.is_err() { return; }
@@ -320,11 +227,7 @@ pub(super) fn unavailable(reason: &'static str) {
 
 #[cfg(test)]
 pub(crate) fn test_value(session: &str) -> Option<serde_json::Value> {
-    SESSIONS
-        .lock()
-        .live
-        .get(session)
-        .and_then(|live| live.segment.as_ref())
+    segment_for_test(session)
         .map(|segment| serde_json::from_slice(&encode(&segment.text, segment.generation)).unwrap())
 }
 

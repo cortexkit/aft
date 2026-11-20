@@ -204,7 +204,7 @@ pub struct GithubReadCompletion {
 /// loop. Poll it from `PendingResponse`; never wait on it in standalone input
 /// handling.
 pub struct GithubReadDeferred {
-    receiver: crate::response_finalize::PendingResponseReceiver<
+    receiver: crate::pending_response::PendingResponseReceiver<
         Result<GithubReadCompletion, GithubReadError>,
     >,
     late: GithubReadLateAnswer,
@@ -249,7 +249,7 @@ impl GithubReadDeferred {
     pub(crate) fn into_parts(
         self,
     ) -> (
-        crate::response_finalize::PendingResponseReceiver<
+        crate::pending_response::PendingResponseReceiver<
             Result<GithubReadCompletion, GithubReadError>,
         >,
         GithubReadLateAnswer,
@@ -326,7 +326,7 @@ struct GithubReadFlightWaiter {
     selector: GithubReadSelector,
     view: GithubReadView,
     fallback: Option<GithubReadCacheEntry>,
-    sender: crate::response_finalize::PendingResponseSender<
+    sender: crate::pending_response::PendingResponseSender<
         Result<GithubReadCompletion, GithubReadError>,
     >,
 }
@@ -429,7 +429,7 @@ impl GithubReadEngine {
             // Every page must reflect a fresh PR head, even after a failed fetch.
             // The completion wake is captured here, so a quiet connection is
             // still told when the diff arrives.
-            let (sender, receiver) = crate::response_finalize::pending_response_channel();
+            let (sender, receiver) = crate::pending_response::pending_response_channel();
             let fetcher = Arc::clone(&self.fetcher);
             std::thread::spawn(move || {
                 let result = fetcher
@@ -537,7 +537,7 @@ impl GithubReadEngine {
             .map(|entry| (entry, selector.clone(), request.resource.kind));
         // Every coalesced caller owns its own wake-bound sender. Capturing only
         // the leader's connection would leave followers waiting on idle routes.
-        let (sender, receiver) = crate::response_finalize::pending_response_channel();
+        let (sender, receiver) = crate::pending_response::pending_response_channel();
         let leader = {
             let mut state = self.state.lock();
             let waiters = state.flights.entry(slot.clone()).or_default();
@@ -1343,7 +1343,7 @@ mod tests {
             Arc::new(CountingDownloader::default()),
             Arc::new(FixtureClock::new(1_000)),
         );
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let pending = {
             let _scope = wake.install();
             let GithubReadStart::Deferred(pending) = engine
@@ -1383,9 +1383,9 @@ mod tests {
             Arc::new(CountingDownloader::default()),
             Arc::new(FixtureClock::new(1_000)),
         );
-        let first_wake = crate::response_finalize::DeferredResponseWake::default();
-        let second_wake = crate::response_finalize::DeferredResponseWake::default();
-        let start = |wake: &crate::response_finalize::DeferredResponseWake| {
+        let first_wake = crate::pending_response::DeferredResponseWake::default();
+        let second_wake = crate::pending_response::DeferredResponseWake::default();
+        let start = |wake: &crate::pending_response::DeferredResponseWake| {
             let _scope = wake.install();
             let GithubReadStart::Deferred(pending) = engine
                 .start(

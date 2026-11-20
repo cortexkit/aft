@@ -371,7 +371,7 @@ fn luau_s3_complexity_spec_scores_the_fixture() {
 
 pub fn run_complexity_scan(job: &InspectJob) -> InspectResult {
     let started = Instant::now();
-    let progress = crate::run_tool_call::progress::FileProgress::current();
+    let progress = crate::tool_progress::FileProgress::current();
     let scans = job
         .scope_files
         .par_iter()

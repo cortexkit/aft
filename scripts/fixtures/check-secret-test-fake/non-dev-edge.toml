@@ -1,0 +1,10 @@
+[package]
+name = "candidate"
+version = "0.1.0"
+edition = "2021"
+
+[target.'cfg(unix)'.build-dependencies.base]
+workspace = true
+features = [
+    "test-support",
+]

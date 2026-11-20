@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::commands::semantic_search::extensions::{SearchExtensions, Token, TokenVariant};
+use crate::search_b2::contracts::{Token, TokenVariant};
 
 /// The variants lane shares one budget across every token in a query.
 pub const MAX_QUERY_VARIANTS: usize = 6;
@@ -8,12 +8,6 @@ pub const MAX_QUERY_VARIANTS: usize = 6;
 /// Deterministic implementation of the variants hook.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct OrderedVariantPipeline;
-
-impl SearchExtensions for OrderedVariantPipeline {
-    fn variants(&self, token: Token<'_>) -> Vec<TokenVariant> {
-        generate_variants(token)
-    }
-}
 
 /// Generates variants in token order, retaining the first emission globally.
 pub fn generate_variants(input: Token<'_>) -> Vec<TokenVariant> {

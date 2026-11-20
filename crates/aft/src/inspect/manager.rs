@@ -619,19 +619,8 @@ struct Tier2FlightExitGuard<'a> {
     identity: Option<Arc<()>>,
 }
 
-impl Drop for Tier2FlightExitGuard<'_> {
-    fn drop(&mut self) {
-        if let Some(identity) = &self.identity {
-            self.manager.finish_tier2_flight_if_current(
-                &self.key,
-                Some(identity),
-                JobOutcome::Failed {
-                    message: "tier2 reuse worker exited without publishing a result".to_string(),
-                },
-            );
-        }
-    }
-}
+#[path = "manager/flight_lifetime.rs"]
+mod flight_lifetime;
 
 fn cached_tier2_aggregate_usable(
     category: InspectCategory,
@@ -654,7 +643,7 @@ fn cached_tier2_aggregate_usable(
 }
 
 pub struct InspectManager {
-    file_progress: Arc<HashMap<InspectCategory, crate::run_tool_call::progress::FileProgress>>,
+    file_progress: Arc<HashMap<InspectCategory, crate::tool_progress::FileProgress>>,
     root_work_cancellation: Arc<Mutex<crate::executor::JobCancellation>>,
     dispatcher: InspectDispatcher,
     result_rx: Receiver<InspectResult>,
@@ -700,7 +689,7 @@ pub struct InspectManager {
     source_scan_files: AtomicU64,
     /// The data-layer checkouts dead code reads its call graph from while
     /// they are ready; empty unless the process runs the data layer.
-    data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources,
+    data_layer_dead_code: crate::inspect::data_sources::DeadCodeSources,
     /// When an `aft_inspect` that read the dead-code graph last finished;
     /// `None` once the graph was released, or before any such request.
     last_dead_code_request: Mutex<Option<Instant>>,
@@ -802,12 +791,7 @@ impl InspectManager {
         let file_progress: Arc<HashMap<_, _>> = Arc::new(
             InspectCategory::active()
                 .iter()
-                .map(|category| {
-                    (
-                        *category,
-                        crate::run_tool_call::progress::FileProgress::default(),
-                    )
-                })
+                .map(|category| (*category, crate::tool_progress::FileProgress::default()))
                 .collect(),
         );
         let worker_file_progress = file_progress.clone();
@@ -875,7 +859,7 @@ impl InspectManager {
             semantic_cold_seed_active,
             cold_build_limiter: Mutex::new(cold_build_limiter::global_limiter()),
             interactive_tier2_permits: Mutex::new(HashMap::new()),
-            data_layer_dead_code: crate::data_layer::tools::inspect::DeadCodeSources::default(),
+            data_layer_dead_code: crate::inspect::data_sources::DeadCodeSources::default(),
             last_dead_code_request: Mutex::new(None),
             dead_code_release_armed: AtomicBool::new(false),
             dead_code_release_timer: Mutex::new(None),
@@ -940,7 +924,10 @@ impl InspectManager {
         self.dead_code_release_armed.store(false, Ordering::SeqCst);
     }
 
-    pub(crate) fn set_root_lifecycle(&self, lifecycle: crate::context::SubcLifecycleAdmission) {
+    pub(crate) fn set_root_lifecycle(
+        &self,
+        lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
+    ) {
         let mut token = self
             .root_work_cancellation
             .lock()
@@ -1778,7 +1765,7 @@ impl InspectManager {
 
     /// Lets dead code at `project_root` read its call graph from the data
     /// layer's `checkout` whenever that graph is ready, in place of today's
-    /// database (see `data_layer::tools::inspect`).
+    /// database (see `inspect::data_sources`).
     pub(crate) fn read_dead_code_from_data_layer(
         &self,
         project_root: &Path,
@@ -2098,25 +2085,31 @@ impl InspectManager {
         let observer = self.cache_writer_watch_observer.lock().unwrap().clone();
         #[cfg(test)]
         let event_observer = observer.clone();
-        let watcher = crate::callgraph_store::watch_readiness_directory(&dir, move |event| {
-            if let Ok(event) = event {
-                let release = crate::callgraph_store::refresh_lease_release_event(&event, &lease);
-                if release {
-                    wake_cache_writer_if_available(&watched_identity, &waits, &caches);
+        let watcher = crate::callgraph_store::watch_readiness_directory(
+            &dir,
+            move |event| {
+                if let Ok(event) = event {
+                    let release =
+                        crate::callgraph_store::refresh_lease_release_event(&event, &lease);
+                    if release {
+                        wake_cache_writer_if_available(&watched_identity, &waits, &caches);
+                    }
+                    #[cfg(test)]
+                    if let Some(observer) = &event_observer {
+                        let _ = observer.send(CacheWriterWatchObservation::Activity {
+                            release,
+                            detail: format!(
+                                "event={event:?} lease={} exists={}",
+                                lease.display(),
+                                lease.exists()
+                            ),
+                        });
+                    }
                 }
-                #[cfg(test)]
-                if let Some(observer) = &event_observer {
-                    let _ = observer.send(CacheWriterWatchObservation::Activity {
-                        release,
-                        detail: format!(
-                            "event={event:?} lease={} exists={}",
-                            lease.display(),
-                            lease.exists()
-                        ),
-                    });
-                }
-            }
-        });
+            },
+            #[cfg(windows)]
+            &crate::watcher_backend::readiness::NativeReadinessWatcherFactory,
+        );
         match watcher {
             Ok(watcher) => {
                 watches.insert(identity, watcher);
@@ -4092,13 +4085,7 @@ fn render_no_projection_suffix(reason: &'static str) -> String {
 /// dead-code snapshot verdict. `reason` is omitted for spliced and reused
 /// projections.
 fn render_projection_suffix(verdict: ProjectionVerdict) -> String {
-    let kind = match verdict.kind {
-        #[cfg(test)]
-        ProjectionKind::Spliced => "spliced",
-        ProjectionKind::Full => "full",
-        #[cfg(test)]
-        ProjectionKind::Reused => "reused",
-    };
+    let kind = verdict.kind.as_str();
     let reason = match verdict.reason {
         Some("journal_oversize") => format!(" reason=journal_oversize:{MAX_DELTA_BYTES}"),
         Some(reason) => format!(" reason={reason}"),
@@ -4130,7 +4117,7 @@ pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf>
     // No caller installed a census on this thread (background jobs such as
     // the status bar's TODO refresh never do): the root's bound index-store
     // checkout lists the same files without touching the disk.
-    let miss = match crate::data_layer::tools::inspect::bound_inventory(project_root) {
+    let miss = match crate::inspect::data_sources::bound_inventory(project_root) {
         Ok(inventory) => return in_scope(&inventory),
         Err(miss) => miss,
     };
@@ -4139,9 +4126,16 @@ pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf>
     #[cfg(test)]
     SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));
     let started = Instant::now();
-    let mut files = crate::callgraph::walk_project_files(project_root)
-        .filter(|path| scope.contains(path))
-        .collect::<Vec<_>>();
+    let mut files = crate::callgraph::walk_project_files(
+        project_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter(|path| scope.contains(path))
+    .collect::<Vec<_>>();
     files.sort();
     crate::slog_info!(
         "inspect scope files walked: reason={} files={} ms={} root={}",
@@ -4168,7 +4162,7 @@ fn forced_relative_paths(job: &InspectJob, paths: &BTreeSet<PathBuf>) -> BTreeSe
         // silently misses).
         keys.insert(relative_cache_key(
             &job.project_root,
-            &crate::inspect::job::canonicalize_normalized(&absolute),
+            &crate::path_identity::canonicalize_normalized(&absolute),
         ));
     }
     keys
@@ -4196,7 +4190,7 @@ fn downgrade_unchanged_forced_paths_with_freshness(
         // Same normalized form as forced_relative_paths; see the comment there.
         let canonical_key = Some(relative_cache_key(
             project_root,
-            &crate::inspect::job::canonicalize_normalized(&absolute),
+            &crate::path_identity::canonicalize_normalized(&absolute),
         ));
         let freshness = cached
             .get(&direct_key)
@@ -4463,13 +4457,13 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
         return Err(CallGraphStoreError::Building);
     };
     match manager.data_layer_dead_code.snapshot(&job.project_root) {
-        crate::data_layer::tools::inspect::DeadCodeSnapshot::Ready(snapshot) => {
+        crate::inspect::data_sources::DeadCodeSnapshot::Ready(snapshot) => {
             Ok(Some((snapshot, DATA_LAYER_SNAPSHOT, started.elapsed())))
         }
-        crate::data_layer::tools::inspect::DeadCodeSnapshot::Building => {
+        crate::inspect::data_sources::DeadCodeSnapshot::Building => {
             Err(CallGraphStoreError::Building)
         }
-        crate::data_layer::tools::inspect::DeadCodeSnapshot::Failed(reason) => {
+        crate::inspect::data_sources::DeadCodeSnapshot::Failed(reason) => {
             Err(CallGraphStoreError::Unavailable(reason))
         }
     }
@@ -4479,7 +4473,7 @@ fn build_tier2_callgraph_snapshot_with_refresh_inner(
 fn canonicalize_for_snapshot(path: &Path) -> PathBuf {
     // Mirrors the projection's normalizer: snapshot paths are
     // verbatim-stripped, so test expectations must be too.
-    crate::inspect::job::canonicalize_normalized(path)
+    crate::path_identity::canonicalize_normalized(path)
 }
 
 fn load_contribution_freshness(
@@ -5544,7 +5538,7 @@ fn unused_public_api_entries(project_root: &Path) -> (BTreeSet<String>, Vec<Stri
 }
 
 fn filter_outcome_for_scope_with_contributions(
-    dead_code_sources: &crate::data_layer::tools::inspect::DeadCodeSources,
+    dead_code_sources: &crate::inspect::data_sources::DeadCodeSources,
     manager: Option<&InspectManager>,
     outcome: JobOutcome,
     snapshot: &InspectSnapshot,
@@ -6184,7 +6178,15 @@ mod guard_tests {
             std::os::unix::fs::symlink("src/main.rs", root.join("link.rs")).unwrap();
             std::os::unix::fs::symlink("src", root.join("linked_src")).unwrap();
         }
-        let mut walked = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let mut walked = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         walked.sort();
         for kept in ["src/main.rs", "src/lib.ts", "vendor/independent/inner.rs"] {
             assert!(walked.contains(&root.join(kept)), "{kept}: {walked:?}");
@@ -6239,7 +6241,7 @@ mod guard_tests {
             "no census is installed on this thread"
         );
         // The job must not wait for the store's TODO records on a worker.
-        crate::data_layer::tools::inspect::set_todo_store_wait_for_test(&root, Duration::ZERO);
+        crate::inspect::data_sources::set_todo_store_wait_for_test(&root, Duration::ZERO);
 
         SCOPE_FILE_WALKS.with(|walks| walks.set(0));
         crate::callgraph::PROJECT_WALK_ENTRIES.with(|entries| entries.set(0));
@@ -6277,7 +6279,7 @@ mod guard_tests {
         let unbound = tempfile::tempdir().unwrap();
         let unbound = canonicalize_for_snapshot(unbound.path());
         assert_eq!(
-            crate::data_layer::tools::inspect::bound_inventory(&unbound).err(),
+            crate::inspect::data_sources::bound_inventory(&unbound).err(),
             Some(StoreListMiss::NotBound)
         );
 
@@ -6286,7 +6288,7 @@ mod guard_tests {
         let project = JobScope::for_project(root.clone());
         checkout.checkout().begin_rescan();
         assert_eq!(
-            crate::data_layer::tools::inspect::bound_inventory(&root).err(),
+            crate::inspect::data_sources::bound_inventory(&root).err(),
             Some(StoreListMiss::Rescanning)
         );
         SCOPE_FILE_WALKS.with(|walks| walks.set(0));
@@ -6363,13 +6365,20 @@ mod guard_tests {
         let bind_ms = bind_started.elapsed().as_millis();
         let checkout = ctx.data_checkout().expect("bound");
         let project = JobScope::for_project(root.clone());
-        let targets = crate::callgraph::walk_project_files(&root)
-            .filter(|path| {
-                path.extension()
-                    .is_some_and(|extension| extension == "rs" || extension == "ts")
-            })
-            .take(64)
-            .collect::<Vec<_>>();
+        let targets = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "rs" || extension == "ts")
+        })
+        .take(64)
+        .collect::<Vec<_>>();
         assert!(!targets.is_empty(), "no source file to edit");
         let added_dir = root.join("crates/replay_added");
         std::fs::create_dir_all(&added_dir).unwrap();
@@ -6399,14 +6408,21 @@ mod guard_tests {
             checkout.note_paths(&changed);
 
             let (cpu, started) = (thread_cpu_ms(), Instant::now());
-            let mut walked = crate::callgraph::walk_project_files(&root)
-                .filter(|path| project.contains(path))
-                .collect::<Vec<_>>();
+            let mut walked = crate::callgraph::walk_project_files(
+                &root,
+                if crate::data_layer::read_fence::active() {
+                    crate::project_walk::IgnoreFileAccess::Fenced
+                } else {
+                    crate::project_walk::IgnoreFileAccess::Allowed
+                },
+            )
+            .filter(|path| project.contains(path))
+            .collect::<Vec<_>>();
             walked.sort();
             walk_cpu += thread_cpu_ms() - cpu;
             walk_ms += started.elapsed().as_secs_f64() * 1000.0;
 
-            if let Err(miss) = crate::data_layer::tools::inspect::bound_inventory(&root) {
+            if let Err(miss) = crate::inspect::data_sources::bound_inventory(&root) {
                 *misses.entry(miss.as_str()).or_default() += 1;
             }
             let walks = SCOPE_FILE_WALKS.with(std::cell::Cell::get);
@@ -6642,7 +6658,15 @@ mod guard_tests {
         std::fs::write(&undecodable, b"\xff\xfe<\x00?\x00p\x00h\x00p\x00")
             .expect("write undecodable file");
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let files = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         assert!(
             files.contains(&undecodable),
             "the walk must reach the undecodable file for this test to mean anything"
@@ -7119,7 +7143,7 @@ mod guard_tests {
         let snapshot = tier1_snapshot(&root);
         let inspect_dir = snapshot.inspect_dir.clone();
         // The count reads the index store's records of the root.
-        let _store = crate::data_layer::tools::inspect::bind_published_for_test(&root);
+        let _store = crate::inspect::data_sources::bind_published_for_test(&root);
         let manager = InspectManager::new();
 
         assert_eq!(
@@ -7275,7 +7299,15 @@ mod guard_tests {
         let dir = write_ts_project(3);
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let inspect_dir = root.join(".aft-cache").join("inspect");
-        let files = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let files = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         // The index store's call graph stays building until the hold drops.
         let hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
         let storage = tempfile::tempdir().expect("storage");
@@ -8060,13 +8092,20 @@ export function bannerUnused() {}
             let name = spec["name"].as_str().unwrap();
             let root = std::fs::canonicalize(spec["root"].as_str().unwrap()).unwrap();
             let prefix = spec["prefix"].as_str().unwrap_or("");
-            let files = crate::callgraph::walk_project_files(&root)
-                .filter(|path| {
-                    path.strip_prefix(&root)
-                        .is_ok_and(|path| path.starts_with(prefix))
-                        && crate::parser::detect_language(path).is_some_and(is_js_ts_language)
-                })
-                .collect::<Vec<_>>();
+            let files = crate::callgraph::walk_project_files(
+                &root,
+                if crate::data_layer::read_fence::active() {
+                    crate::project_walk::IgnoreFileAccess::Fenced
+                } else {
+                    crate::project_walk::IgnoreFileAccess::Allowed
+                },
+            )
+            .filter(|path| {
+                path.strip_prefix(&root)
+                    .is_ok_and(|path| path.starts_with(prefix))
+                    && crate::parser::detect_language(path).is_some_and(is_js_ts_language)
+            })
+            .collect::<Vec<_>>();
             assert!(!files.is_empty(), "empty corpus: {name}");
             let excluded = files
                 .iter()
@@ -8410,12 +8449,16 @@ export function bannerUnused() {}
             .view()
             .expect("cold view");
         let cold = cold_view
-            .dead_code_snapshot_shared()
+            .dead_code_snapshot_shared(&crate::inspect::InspectEntryPoints)
             .expect("cold snapshot");
         assert_eq!(parts(&refreshed), parts(&cold));
         // Every call row too, though dead code reads them file by file.
         let rows = |view: &crate::data_layer::checkout::CheckoutView| {
-            parts(&view.rows_dead_code_snapshot().expect("every call row"))
+            parts(
+                &view
+                    .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
+                    .expect("every call row"),
+            )
         };
         assert_eq!(rows(&checkout.view().expect("view")), rows(&cold_view));
         assert_eq!(aggregate, dead(&job, &cold).1);
@@ -8911,9 +8954,16 @@ export function bannerUnused() {}
             "{aggregate:#}"
         );
 
-        let walked = crate::callgraph::walk_project_files(&root)
-            .map(|path| relative_cache_key(&root, &path))
-            .collect::<BTreeSet<_>>();
+        let walked = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .map(|path| relative_cache_key(&root, &path))
+        .collect::<BTreeSet<_>>();
         let cache = manager
             .cache_for_snapshot(&snapshot)
             .expect("inspect cache");
@@ -9022,7 +9072,7 @@ export function bannerUnused() {}
                 .checkout
                 .view()
                 .expect("published call graph")
-                .dead_code_snapshot()
+                .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
                 .expect("project snapshot"),
         ));
         let cache = manager
@@ -9353,7 +9403,7 @@ mod dead_code_projection_tests {
         let projected = checkout
             .view()
             .expect("view")
-            .dead_code_snapshot()
+            .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
             .expect("project snapshot");
 
         let config = Arc::new(Config {
@@ -9589,7 +9639,9 @@ mod dead_code_projection_tests {
             Fresh::Building => panic!("edited call graph did not publish"),
             Fresh::Failed(reason) => panic!("edited call graph failed: {reason}"),
         };
-        let incremental = view.dead_code_snapshot().expect("snapshot");
+        let incremental = view
+            .dead_code_snapshot(&crate::inspect::InspectEntryPoints)
+            .expect("snapshot");
         let aggregate = dead_code_aggregate(&root, project_files(&root), incremental);
         assert_live_item(&aggregate, "src/commands.rs", "get_primers");
         assert_live_item(&aggregate, "src/db.rs", "helper");
@@ -9653,7 +9705,15 @@ mod dead_code_projection_tests {
     }
 
     fn project_files(root: &Path) -> Vec<PathBuf> {
-        walk_project_files(root).collect()
+        walk_project_files(
+            root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect()
     }
 
     fn canonical_root(root: &Path) -> PathBuf {

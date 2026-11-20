@@ -67,3 +67,19 @@ impl From<serde_json::Error> for LspError {
         Self::Json(value)
     }
 }
+
+fn check_lsp_initialization_options(
+    config: &crate::config::Config,
+    id: &str,
+) -> Result<(), LspError> {
+    if config
+        .invalid_lsp_initialization_options
+        .iter()
+        .any(|name| name == id)
+    {
+        return Err(LspError::ServerNotReady(format!(
+            "lsp.servers.{id}.initialization_options must contain valid JSON text"
+        )));
+    }
+    Ok(())
+}

@@ -3,9 +3,9 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
-use crate::commands::semantic_search::extensions::{QueryFacts, RawQuery, Span};
-use crate::commands::semantic_search::plan_table::SearchShape;
 use crate::query_shape::{self, QueryKind};
+use crate::search_b2::contracts::{QueryFacts, RawQuery, Span};
+use crate::search_b2::plan_table::SearchShape;
 
 static ISO_TIMESTAMP_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(

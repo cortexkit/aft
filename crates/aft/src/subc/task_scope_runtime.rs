@@ -32,6 +32,7 @@ pub fn run_subc_mode_with_registration(
     user_config_path: Option<PathBuf>,
     registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
+    lower_hooks::register();
     perf_sweep::initialize();
     run_subc_mode_with_probe(
         connection_file_path,
@@ -53,6 +54,7 @@ pub(super) fn run_subc_mode_with_probe(
     lifecycle_probe: Option<SubcTestLifecycleProbe>,
     registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
+    lower_hooks::register();
     // This entry point accepts only tools AFT advertises in its HELLO manifest.
     // A separate test entry point can also dispatch synthetic native commands.
     run_subc_mode_inner(

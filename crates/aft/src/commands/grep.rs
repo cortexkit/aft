@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::context::AppContext;
 use crate::file_kind::{ContentKind, FileKind, FileKindCache};
-use crate::grep_executor::{self, GrepParams};
+use crate::grep_executor::{self, plural, walk_coverage_note, GrepParams};
 use crate::pattern_compile::{self, CompileOpts, CompileResult};
 use crate::protocol::{RawRequest, Response};
 use crate::search_index::{
@@ -11,6 +11,7 @@ use crate::search_index::{
 };
 
 pub(crate) use crate::grep_executor::ripgrep_glob;
+pub(crate) use crate::search_index::{GREP_LINE_TRUNCATED_MARKER, GREP_MAX_LINE_CHARS};
 
 /// Matching lines the grep tool shows on a page after the first unless the
 /// caller asks for a different page size through `max_results`.
@@ -19,18 +20,9 @@ const MAX_GREP_OFFSET: usize = 100000;
 const MAX_LINE_CHARS: usize = 200;
 const MAX_MATCHES_PER_FILE: usize = 10;
 const MAX_DISPLAY_MATCHES_PER_FILE: usize = 5;
-/// Longest matching line, in characters, the grep tool prints before cutting
-/// it and appending `GREP_LINE_TRUNCATED_MARKER`.
-pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
 /// Byte budget for the match rows of one grep reply (file headers included).
 /// Rows past the budget are left for the next page instead of being printed.
 pub(crate) const GREP_MAX_OUTPUT_BYTES: usize = crate::tool_output::LIST_BODY_BYTES;
-/// Appended to a matching line cut at `GREP_MAX_LINE_CHARS`, so the reader
-/// knows the printed text is not the whole line.
-pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
-/// Text note for a grep or glob whose search path holds no searchable file.
-pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
-    "(No files were found after default directory skips (.git, node_modules, target, etc.); nothing was searched.)";
 
 #[cfg(test)]
 mod contract_tests {
@@ -138,7 +130,7 @@ pub fn handle_grep(req: &RawRequest, ctx: &AppContext) -> Response {
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::bounded_io::with_skip_disclosure(|| {
             crate::context::confinement::with_floor_disclosure(|| {
-                crate::bounded_io::command(req, ctx, handle_grep_inner)
+                crate::bounded_io_command::command(req, ctx, handle_grep_inner)
             })
         })
     })
@@ -242,7 +234,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         max_results,
         &req.id,
         req.session(),
-        Some(crate::context::WorkerSearchTool::Grep),
+        &ctx.search_read_policy(crate::context::WorkerSearchTool::Grep),
     ) {
         Ok(scope) => scope,
         Err(response) => return response,
@@ -283,9 +275,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::data_layer::parent_session::grep_fan_out(
-            ctx, &compiled, &scope, &params, &filters, order,
-        )
+        crate::parent_search::grep_fan_out(ctx, &compiled, &scope, &params, &filters, order)
     };
     let (result, phases, parent_gaps) = match parent_answer {
         Some(answer) => answer,
@@ -497,7 +487,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::data_layer::parent_session::attach_search_gaps(&mut body, parent_gaps);
+    crate::parent_search::attach_search_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     if let Some(mut envelope) = crate::list_surfaces::grep::build_grep_envelope(&body) {
@@ -555,6 +545,7 @@ fn handle_grep_inner(req: &RawRequest, ctx: &AppContext) -> Response {
 pub(crate) fn trigram_index_disclosure(ctx: &AppContext) -> serde_json::Value {
     serde_json::json!({
         "trigram": crate::feature_status::observed_index_status(
+            ctx,
             ctx,
             crate::feature_status::IndexPlane::Trigram,
         )
@@ -743,39 +734,6 @@ fn walk_bound_phrase(bound: WalkBound) -> String {
         WalkBound::FileLimit(limit) => format!("the walk's {limit}-file limit"),
         WalkBound::Cancelled => "the request was cancelled".to_string(),
     }
-}
-
-/// A note spelling out what an incomplete fallback walk left unsearched and
-/// how to get an exhaustive answer, or `None` when the walk reached every
-/// file (or no walk ran).
-pub(crate) fn walk_coverage_note(result: &GrepResult) -> Option<String> {
-    let bound = result.walk_bound?;
-    let files = result.files_read_directly;
-    let index = match result.index_status {
-        IndexStatus::Ready => "index ready",
-        IndexStatus::Building => "index building",
-        IndexStatus::Fallback => "index not used",
-        IndexStatus::Disabled => "index disabled",
-    };
-    let exhaustive = if result.index_status == IndexStatus::Building {
-        "For an exhaustive search, narrow with path or include so the walk reaches every file, or retry once the index is ready (an index search reads every indexed file)."
-    } else {
-        "For an exhaustive search, narrow with path or include so the walk reaches every file."
-    };
-    let checked = match bound {
-        WalkBound::FileLimit(limit) => format!(
-            "checked {files} of more than {limit} files ({index}); the fallback walk stops at {limit} files, so files past that limit were not searched and matches may be missing."
-        ),
-        WalkBound::TimeBudget => format!(
-            "checked {} ({index}); the fallback walk ran out of its time budget before reaching every file, so files it did not reach were not searched and matches may be missing.",
-            plural(files, "file")
-        ),
-        WalkBound::Cancelled => format!(
-            "checked {} ({index}); the request was cancelled before the fallback walk reached every file, so matches may be missing.",
-            plural(files, "file")
-        ),
-    };
-    Some(format!("({checked} {exhaustive})"))
 }
 
 /// Cut a matching line at `GREP_MAX_LINE_CHARS` characters and mark the cut.
@@ -1538,14 +1496,6 @@ fn shared_dotted_suffix(names: &[String]) -> String {
         .find('.')
         .map(|dot| shared[dot..].to_string())
         .unwrap_or_default()
-}
-
-fn plural(count: usize, word: &str) -> String {
-    if count == 1 {
-        format!("{count} {word}")
-    } else {
-        format!("{count} {word}s")
-    }
 }
 
 /// Whether an `include` value asks for a counted file: some pattern's last

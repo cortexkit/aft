@@ -412,7 +412,7 @@ fn queries(
     reference: Option<&Path>,
     sample: usize,
 ) -> GateResult<()> {
-    use crate::commands::callgraph_store_adapter as adapter;
+    use crate::data_layer::callgraph_store_adapter as adapter;
     let view = checkout.view().ok_or("no published view")?;
     let plan: Vec<QuerySpec> = if let Some(reference) = reference {
         serde_json::from_slice(&std::fs::read(reference.join("plan.json"))?)?
@@ -507,10 +507,10 @@ fn queries(
     }
     // Preserve every dead-code input row, including initializer groups and
     // protected roots. The timestamp is deliberately outside the comparison.
-    let dead = view.rows_dead_code_snapshot()?;
+    let dead = view.rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)?;
     save(
         &out.join("dead-code-findings.json"),
-        &super::super::dead_code_gate::exactness_rows(&view, &out.join("dead-code-work"))?,
+        &crate::inspect::dead_code_gate::exactness_rows(&view, &out.join("dead-code-work"))?,
     )?;
     let initializers = dead.go_initializers.iter().map(|group| json!({"caller_file": group.caller_file, "callers": group.callers, "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>()})).collect::<Vec<_>>();
     save(

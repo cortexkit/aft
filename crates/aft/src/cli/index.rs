@@ -193,6 +193,7 @@ fn run_snapshot(
 
     config.storage_dir = Some(paths.storage_dir);
     let notices = index_notices(&warnings);
+    aft::reader_floor::register_cache_hooks();
     if let Some(warning) = aft::root_cache::prepare_cache_root(&mut config) {
         return Err(IndexError::validation(format!(
             "cache_dir_unavailable: {}",
@@ -329,9 +330,16 @@ fn prepare_snapshot(
 }
 
 fn collect_semantic_files(root: &Path, max_files: usize) -> Result<Vec<PathBuf>, IndexError> {
-    let mut files = callgraph::walk_project_files(root)
-        .filter(|path| aft::semantic_index::is_semantic_indexed_extension(path))
-        .collect::<Vec<_>>();
+    let mut files = callgraph::walk_project_files(
+        root,
+        if aft::data_layer::read_fence::active() {
+            aft::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            aft::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter(|path| aft::semantic_index::is_semantic_indexed_extension(path))
+    .collect::<Vec<_>>();
     files.sort();
     if files.len() > max_files {
         return Err(IndexError::validation(format!(

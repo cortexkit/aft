@@ -191,7 +191,12 @@ fn dispatch_reaches_extra_compressors() {
     let ctx = compress_context();
     let output = "Progress: resolved 1, reused 0, downloaded 0, added 0\nProgress: resolved 2, reused 0, downloaded 0, added 0\nProgress: resolved 3, reused 0, downloaded 0, added 0\ndependencies:\n+ zod 3.22.0\n".to_string();
 
-    let compressed = compress::compress("pnpm install", output, &ctx);
+    let compressed = compress::compress(
+        "pnpm install",
+        output,
+        ctx.config().experimental_bash_compress,
+        &ctx.filter_registry(),
+    );
     assert_eq!(compressed.matches("Progress: resolved").count(), 2);
     assert!(compressed.contains("dependencies:"));
 }
@@ -369,7 +374,12 @@ fn bun_test_dispatch_routes_through_test_compressor_not_generic() {
     let ctx = compress_context();
     let output = "bun test v1.3.14 (0d9b296a)\n\nsrc/a.test.ts:\n\nsrc/b.test.ts:\n\nsrc/c.test.ts:\n12 | expect(1).toBe(2);\n              ^\nerror: expect(received).toBe(expected)\n(fail) c case [0.5ms]\n\n 0 pass\n 1 fail\n 1 expect() calls\nRan 1 tests across 3 files. [3.00ms]\n".to_string();
 
-    let compressed = compress::compress("bun test", output, &ctx);
+    let compressed = compress::compress(
+        "bun test",
+        output,
+        ctx.config().experimental_bash_compress,
+        &ctx.filter_registry(),
+    );
     // Pass-only sections dropped.
     assert!(!compressed.contains("src/a.test.ts:"));
     assert!(!compressed.contains("src/b.test.ts:"));

@@ -1,4 +1,4 @@
-use aft::memory::{MemoryEstimate, ProcessMemorySnapshot};
+use aft::memory::MemoryEstimate;
 use std::collections::BTreeMap;
 
 #[test]
@@ -30,7 +30,7 @@ fn linux_allocator_configuration_and_native_sqlite() {
     eprintln!("SQLite C allocation: requested={SIZE}, jemalloc allocated={before} -> {during}");
 
     let snapshot =
-        ProcessMemorySnapshot::from_roots(&BTreeMap::new(), &MemoryEstimate::estimated(0));
+        aft::memory_census::process_from_roots(&BTreeMap::new(), &MemoryEstimate::estimated(0));
     let jemalloc = snapshot.allocator.jemalloc.as_ref().unwrap();
     assert_eq!(jemalloc.accounting_source, "jemalloc");
     assert!(jemalloc.allocated > 0);

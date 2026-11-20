@@ -326,7 +326,7 @@ fn bash_background_completion_ignores_a_planned_ticket_when_counting_other_secre
     let plan = SpawnPlan::Host {
         shell_path: PathBuf::from("bash"),
         environment: std::collections::BTreeMap::from([(
-            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+            crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(),
             "0123456789abcdef0123456789abcdef".into(),
         )]),
     };

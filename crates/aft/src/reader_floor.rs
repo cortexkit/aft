@@ -543,6 +543,17 @@ pub fn prepare(storage_root: &Path) -> Vec<UnsupportedPersistedFormat> {
     prepare_uncached(storage_root)
 }
 
+/// Install the floor checks before preparing any durable or artifact storage.
+/// Library hosts that prepare cache roots directly must register these checks too.
+pub fn register_cache_hooks() {
+    crate::cache_location::register_reader_floor_hooks(crate::cache_location::ReaderFloorHooks {
+        prepare: |storage| {
+            prepare(storage);
+        },
+        prepare_artifact_root,
+    });
+}
+
 /// A floor lives in durable storage, and its refusals also cover artifacts on
 /// a separate `storage.cache_dir` volume: refusal routing spells paths inside
 /// a prepared cache root under the durable root that owns it (see
@@ -1360,4 +1371,28 @@ pub(crate) mod tests {
         assert_eq!(PARSE_COUNT.with(|count| count.get()), 0);
         assert!(persisted_format::refusals_under(root.path()).is_empty());
     }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_cache_root_for_test(
+    config: &mut crate::config::Config,
+) -> Option<crate::config_resolve::ConfigWarning> {
+    crate::reader_floor::register_cache_hooks();
+    let _volume = config
+        .cache_dir
+        .as_ref()
+        .filter(|parent| parent.is_dir())
+        .map(|parent| crate::walk_boundary::simulated_volumes::simulate(parent, u64::MAX - 17));
+    crate::cache_location::prepare_cache_root(config)
+}
+
+/// Register storage-format reader-version checks before testing obsolete-cache deletion.
+#[cfg(test)]
+pub(crate) fn clean_old_for_test(
+    tiers: &[crate::config_resolve::ConfigTier],
+    storage: &std::path::Path,
+    confirm: impl FnMut(&[crate::cache_location::CleanupCandidate]) -> bool,
+) -> crate::cache_location::CleanupReport {
+    register_cache_hooks();
+    crate::cache_location::clean_old_for_test(tiers, storage, confirm)
 }

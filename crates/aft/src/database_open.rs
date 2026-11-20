@@ -34,6 +34,63 @@ const SLOW_DATABASE_READY: Duration = Duration::from_secs(1);
 /// slower than this refused tools, so its readiness line is a warning.
 const TOOL_WAIT_BUDGET: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_configure_registration_refuses_staged_open() {
+        const TEST: &str =
+            "database_open::tests::missing_configure_registration_refuses_staged_open";
+        const CHILD: &str = "AFT_TEST_UNREGISTERED_DATABASE_OPEN";
+        if std::env::var(CHILD).as_deref() != Ok(TEST) {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, TEST)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed;"));
+            return;
+        }
+        assert!(crate::runtime_drain::configure::command_hooks().is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = AppContext::from_app(
+            crate::context::App::default_shared(),
+            crate::config::Config::default(),
+        );
+        {
+            let mut slot = ctx.database_open_slot().0.lock();
+            slot.epoch = 1;
+            slot.pending = Some(DatabaseOpenRequest {
+                epoch: 1,
+                canonical_cache_root: dir.path().into(),
+                storage_root: dir.path().into(),
+                session_id: "session".into(),
+                committed_at: Instant::now(),
+                dispatched_at: None,
+            });
+        }
+        run_staged_open(&ctx, DatabaseOpenRunner::ConfigureTail, true);
+        let response = ctx
+            .database_runtime_refusal("test", "db_set_host_state")
+            .unwrap();
+        assert!(!response.success);
+        assert!(serde_json::to_string(&response)
+            .unwrap()
+            .contains("register_runtime_hooks"));
+        assert!(!dir.path().join("aft.db").exists());
+        let slot = ctx.database_open_slot().0.lock();
+        assert!(!slot.running);
+        assert!(slot.ready_for.is_none());
+    }
+}
+
 /// The open a committed configure asked for, waiting for a runner.
 #[derive(Debug, Clone)]
 pub(crate) struct DatabaseOpenRequest {
@@ -181,13 +238,36 @@ pub(crate) fn run_staged_open(
         #[cfg(test)]
         let recorded = record_open_started_for_test(&request, runner, started_at);
         crate::log_ctx::with_session(Some(request.session_id.clone()), || {
-            let report = crate::commands::configure::open_database_runtime(
-                ctx,
-                &request.canonical_cache_root,
-                &request.storage_root,
-                crate::db::OpenMode::Deferred,
-                request.epoch,
-            );
+            let open = crate::runtime_drain::configure::command_hooks()
+                .and_then(|hooks| hooks.database_open);
+            let report = match open {
+                Some(open) => open(
+                    ctx,
+                    &request.canonical_cache_root,
+                    &request.storage_root,
+                    crate::db::OpenMode::Deferred,
+                    request.epoch,
+                ),
+                None => {
+                    let error = crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION;
+                    let published = ctx.publish_database_open(request.epoch, |slot| {
+                        slot.ready_for = None;
+                        ctx.backup().lock().clear_db_pool();
+                        ctx.bash_background().clear_db_pool();
+                        ctx.finish_database_runtime_error(error.into(), false);
+                    });
+                    DatabaseOpenReport {
+                        floor_check: Duration::ZERO,
+                        open: Duration::ZERO,
+                        reused_handle: false,
+                        outcome: if published {
+                            DatabaseOpenOutcome::Failed(error.into())
+                        } else {
+                            DatabaseOpenOutcome::Superseded
+                        },
+                    }
+                }
+            };
             let finished_at = Instant::now();
             log_database_ready(&request, runner, started_at, finished_at, &report);
             #[cfg(test)]

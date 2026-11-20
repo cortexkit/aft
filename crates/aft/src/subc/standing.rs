@@ -14,8 +14,9 @@ use std::sync::{
 use parking_lot::Mutex;
 
 use crate::config::{Config, IndexKind};
+use crate::context::Executor;
 use crate::context::{App, AppContext};
-use crate::executor::{Executor, Lane, MaintenanceCoalesceKey};
+use crate::executor::{Lane, MaintenanceCoalesceKey};
 use crate::path_identity::ProjectRootId;
 use crate::root_cache;
 use crate::standing_roots::{StandingRootEntry, StandingRoots};
@@ -155,7 +156,7 @@ enum ProbeLocation {
     Missing(std::path::PathBuf),
 }
 fn probe_location(path: &std::path::Path) -> ProbeLocation {
-    crate::config_live::dir_identity(path).map_or_else(
+    crate::dir_identity::dir_identity(path).map_or_else(
         || ProbeLocation::Missing(path.to_path_buf()),
         |(dev, ino)| ProbeLocation::Identity(dev, ino),
     )
@@ -932,8 +933,7 @@ mod startup_storage_tests {
         let ctx = super::super::test_support::test_ctx();
         let actor = StandingActor::new(ctx.app(), Arc::new(Executor::new()))
             .with_startup_storage_dir(root.path());
-        let default =
-            crate::bash_background::storage_dir_without_overrides_for_test().join("aft.db");
+        let default = crate::storage_path::storage_dir_without_overrides_for_test().join("aft.db");
         // Other tests in the same process may already have created a database
         // at the default root (CI shares one hermetic home), so compare its
         // state before and after instead of requiring it to be absent.

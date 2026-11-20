@@ -316,14 +316,24 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     if isinstance(spec, dict) and "path" in spec:
                         yield key, spec, (manifest_dir / spec["path"]).resolve()
 
-        published_before = run.index("cargo publish --package agent-file-tools")
+        # Check every edge, not only each dependency's position before AFT:
+        # siblings can all precede AFT while still preceding their own dependencies.
+        dry_run = next(
+            step["run"] for step in self.workflow("release.yml")["jobs"]["rehearse-publish"]["steps"]
+            if step.get("name") == "Rehearse crates.io publishing"
+        )
+        package_order = re.search(
+            r"release_crates=\(([^)]+)\)", (ROOT / "scripts/release.sh").read_text()
+        ).group(1).split()
+        dry_order = re.findall(r"-p ([\w-]+)", dry_run)
         pending, seen = [ROOT / "crates/aft"], set()
         while pending:
-            for key, spec, dep_dir in path_dependencies(pending.pop()):
-                if dep_dir in seen:
-                    continue
-                seen.add(dep_dir)
-                pending.append(dep_dir)
+            manifest_dir = pending.pop()
+            parent = tomllib.loads((manifest_dir / "Cargo.toml").read_text())["package"]["name"]
+            for key, spec, dep_dir in path_dependencies(manifest_dir):
+                if dep_dir not in seen:
+                    seen.add(dep_dir)
+                    pending.append(dep_dir)
                 package = tomllib.loads((dep_dir / "Cargo.toml").read_text())["package"]
                 name = package["name"]
                 with self.subTest(dependency=key, package=name):
@@ -331,13 +341,45 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                     self.assertIn("version", spec, f"{key} needs a version pin to publish")
                     publish = f"cargo publish --package {name} "
                     self.assertIn(publish, run, f"publish-crates.sh must publish {name}")
-                    self.assertLess(run.index(publish), published_before, f"{name} must publish before agent-file-tools")
+                    self.assertLess(run.index(publish), run.index(f"cargo publish --package {parent} "), f"{name} must publish before {parent}")
+                    for label, order in (("release.sh", package_order), ("publish dry-run", dry_order)):
+                        self.assertIn(name, order, f"{label} must include {name}")
+                        self.assertIn(parent, order, f"{label} must include {parent}")
+                        self.assertLess(order.index(name), order.index(parent), f"{label}: {name} must precede {parent}")
                     relative = dep_dir.relative_to(ROOT).parts
                     self.assertIn(
                         ", ".join(f'"{part}"' for part in relative), sync,
                         f"version-sync.mjs must keep {name}'s version in lockstep",
                     )
         self.assertTrue(seen, "agent-file-tools has no path dependencies; the check found nothing")
+
+    def test_version_sync_updates_layer_versions_and_all_path_pins(self):
+        scratch = ROOT / "target/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        version = "0.65.1-rehearsal.1.1"
+        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
+            fixture = Path(temporary)
+            (fixture / "scripts").mkdir()
+            shutil.copy2(ROOT / "scripts/version-sync.mjs", fixture / "scripts/version-sync.mjs")
+            packages = ["aft-bridge", "opencode-plugin", "pi-plugin", "aft-cli"]
+            packages += [f"npm/{platform}" for platform in ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")]
+            for package in packages:
+                manifest = fixture / "packages" / package / "package.json"
+                manifest.parent.mkdir(parents=True)
+                manifest.write_text(json.dumps({"version": "0.65.0"}))
+            crates = ("aft", "aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules")
+            for crate in crates:
+                manifest = fixture / "crates" / crate / "Cargo.toml"
+                manifest.parent.mkdir(parents=True)
+                shutil.copy2(ROOT / "crates" / crate / "Cargo.toml", manifest)
+            subprocess.run(["node", str(fixture / "scripts/version-sync.mjs"), version], check=True, capture_output=True, text=True)
+            for crate in crates:
+                manifest = tomllib.loads((fixture / "crates" / crate / "Cargo.toml").read_text())
+                self.assertEqual(manifest["package"]["version"], version, crate)
+                for table in ("dependencies", "dev-dependencies", "build-dependencies"):
+                    for name, spec in manifest.get(table, {}).items():
+                        if isinstance(spec, dict) and "path" in spec:
+                            self.assertEqual(spec["version"], version, f"{crate}: {table}.{name}")
 
 
 class ReleaseRehearsalWorkflowTests(unittest.TestCase):
@@ -419,7 +461,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         publish = next(step["run"] for step in steps if step.get("name") == "Rehearse crates.io publishing")
         self.assertEqual(
             publish,
-            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p agent-file-tools",
+            "cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p agent-file-tools",
         )
         self.assertNotIn("--no-verify", publish)
         names = [step.get("name") for step in steps]
@@ -489,22 +531,26 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
             target = Path(temporary)
             directory = target / "package"
             directory.mkdir()
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools")]
             files = [directory / f"{package['name']}-{package['version']}.crate" for package in packages]
             for file in files:
                 file.write_bytes(b"crate")
             metadata = json.dumps({"target_directory": str(target), "packages": packages})
             with mock.patch("subprocess.check_output", return_value=metadata):
                 exec(script, {})
-                for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
-                    with self.subTest(size=size):
-                        with files[-1].open("wb") as archive:
-                            archive.truncate(size)
-                        with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
-                            exec(script, {})
-                files[-1].unlink()
-                with self.assertRaisesRegex(AssertionError, "agent-file-tools"):
-                    exec(script, {})
+                for name in ("agent-file-tools", "aft-parse"):
+                    archive = next(file for file in files if file.name.startswith(name + "-"))
+                    for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
+                        with self.subTest(package=name, size=size):
+                            with archive.open("wb") as contents:
+                                contents.truncate(size)
+                            with self.assertRaisesRegex(SystemExit, "must be under 10485760 bytes"):
+                                exec(script, {})
+                    archive.write_bytes(b"crate")
+                    archive.unlink()
+                    with self.assertRaisesRegex(AssertionError, name):
+                        exec(script, {})
+                    archive.write_bytes(b"crate")
 
     def test_crate_size_check_finds_multi_package_archives_and_checks_every_copy(self):
         script = inline_python(self.rehearsal, "Check packaged crate sizes")
@@ -512,7 +558,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir=scratch) as temporary:
             target = Path(temporary)
-            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools")]
+            packages = [{"name": name, "version": "0.63.5-rehearsal.1.1"} for name in ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools")]
             metadata = json.dumps({"target_directory": str(target), "packages": packages})
             with mock.patch("subprocess.check_output", return_value=metadata):
                 copies = []

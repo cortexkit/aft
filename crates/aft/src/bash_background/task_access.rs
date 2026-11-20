@@ -223,30 +223,7 @@ pub(super) struct WorkCounters {
     task_folder_reads: AtomicUsize,
 }
 
-/// Recognize the task bundle structurally, without trusting a caller's session
-/// namespace or granting access to the enclosing private store.
-fn task_directory(path: &Path) -> Option<&Path> {
-    // Ordinary project paths never need ancestor-by-ancestor task validation.
-    // A marker match is only a fast prefilter; the component checks still win.
-    static MARKER: std::sync::LazyLock<memchr::memmem::Finder<'static>> =
-        std::sync::LazyLock::new(|| memchr::memmem::Finder::new(b"bash-tasks"));
-    MARKER.find(path.as_os_str().as_encoded_bytes())?;
-    path.ancestors().find(|ancestor| {
-        ancestor
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::file_name)
-            == Some(std::ffi::OsStr::new("bash-tasks"))
-            && ancestor
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| validate_task_id(name).is_ok())
-    })
-}
-
-pub(crate) fn is_task_environment(path: &Path) -> bool {
-    task_directory(path).is_some_and(|root| path == root.join("control/environment.bin"))
-}
+use crate::task_temp_reads::{is_task_environment, task_directory};
 
 /// Recursive readers must not bypass the explicit-path check by entering a
 /// bundle through its directory. Do not follow links or credential payloads.

@@ -1,0 +1,11 @@
+[package]
+name = "candidate"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# A registry dependency is not a workspace sibling, even under a member's name.
+aft-base = "0.1.0"
+
+[features]
+test-hooks = ["aft-base/test-hooks"]

@@ -1,5 +1,7 @@
 //! Deferred bash orchestration and trust-gated shell helpers for subc route calls.
 
+use crate::bash_background::TaskIdentityAuth;
+
 #[cfg(all(test, unix))]
 #[path = "bash_keepalive_tests.rs"]
 mod keepalive_wait_tests;
@@ -8,7 +10,7 @@ use super::*;
 
 #[derive(Clone)]
 pub(super) struct BashWaitCancel {
-    pub(super) keepalive: Option<crate::run_tool_call::progress::Progress>,
+    pub(super) keepalive: Option<crate::tool_progress::Progress>,
     pub(super) speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     pub(super) run_scope: Option<Arc<super::run_scope::RunScope>>,
     pub(super) scope: Option<subc_protocol::scope::ScopeStamp>,
@@ -387,7 +389,8 @@ mod frame_loop_lock_tests {
                 published
                     .uncaptured_terminal_facts
                     .as_ref()
-                    .is_some_and(|reply| reply.data["status"] == "failed"),
+                    .is_some_and(|snapshot| snapshot.info.status
+                        == crate::bash_background::BgTaskStatus::Failed),
                 "finished facts must accompany terminal metadata"
             );
             assert!(
@@ -766,8 +769,7 @@ mod default_kill_tests {
             child.kill().unwrap();
             child.wait().unwrap();
         }
-        task.state.lock().unwrap().metadata.status =
-            crate::bash_background::BgTaskStatus::Completed;
+        task.state.lock().unwrap().metadata.status = crate::protocol::BgTaskStatus::Completed;
         let terminal = observe_deferred_bash_wait(
             registry.clone(),
             task.task_id.clone(),
@@ -1138,9 +1140,10 @@ fn background_handoff_frame(
             .uncaptured_terminal
             .or(cached.uncaptured_terminal_facts)
         {
-            let mut reply = copy_response(&terminal);
-            reply.id = target.request_id.clone();
-            reply
+            crate::commands::bash_orchestrate::foreground_result_response(
+                &target.request_id,
+                (*terminal).clone(),
+            )
         } else {
             with_capture_warning(&response)
         }
@@ -1335,7 +1338,10 @@ pub(super) fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
-    response.notices.route = format_context.runner_notice.clone();
+    response.notices.route = format_context
+        .runner_notice
+        .clone()
+        .map(|route| route.into_sink());
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if let Some(hint) = &format_context.bash_code_search_hint {
         let root = ctx.config().project_root.clone().unwrap_or_default();
@@ -1365,7 +1371,10 @@ fn bash_result_from_response(
     mut response: Response,
     format_context: &crate::subc_format::FormatContext,
 ) -> ToolCallResult {
-    response.notices.route = format_context.runner_notice.clone();
+    response.notices.route = format_context
+        .runner_notice
+        .clone()
+        .map(|route| route.into_sink());
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
@@ -5240,7 +5249,7 @@ mod grant_path_tests {
             );
             assert_eq!(response.data["resolve_calls"], usize::from(stamped));
             assert!(matches!(
-                super::super::secret_consent::current_call_scopes(),
+                crate::context::call_context::current_call_scopes(),
                 Err(crate::secret::Ineligibility::NoScope)
             ));
         }
@@ -6587,7 +6596,7 @@ mod grant_path_tests {
         .unwrap();
         assert_eq!(
             finished.info.status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
         assert_eq!(cancels(), 0);
     }
@@ -7369,7 +7378,7 @@ mod grant_path_tests {
             .unwrap();
         assert_eq!(
             snapshot.info.status,
-            crate::bash_background::BgTaskStatus::Starting
+            crate::protocol::BgTaskStatus::Starting
         );
         assert!(snapshot
             .remote_phase_note
@@ -7395,10 +7404,7 @@ mod grant_path_tests {
             .into_iter()
             .find(|completion| completion.task_id == task_id)
             .expect("the killed task's completion must be retained");
-        assert_eq!(
-            completion.status,
-            crate::bash_background::BgTaskStatus::Killed
-        );
+        assert_eq!(completion.status, crate::protocol::BgTaskStatus::Killed);
     }
 
     #[cfg(unix)]
@@ -7703,7 +7709,7 @@ mod grant_path_tests {
         let clock = Arc::new(AtomicU64::new(0));
         let origin = Instant::now();
         let (pushes, mut received) = mpsc::unbounded_channel();
-        let progress = crate::run_tool_call::progress::Progress::with_clock(
+        let progress = crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))
@@ -8751,7 +8757,7 @@ mod grant_path_tests {
         let info = owner_status(&ctx, &task_id);
         assert_eq!(
             info.status,
-            crate::bash_background::BgTaskStatus::Running,
+            crate::protocol::BgTaskStatus::Running,
             "the run's end must not stop the head's background task: {info:?}"
         );
         std::fs::write(&release, "").unwrap();
@@ -8761,7 +8767,7 @@ mod grant_path_tests {
         .await;
         assert_eq!(
             owner_status(&ctx, &task_id).status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
         let completion = owner_completion(&ctx, &task_id).await;
         assert_eq!(completion.exit_code, Some(0));
@@ -8788,7 +8794,7 @@ mod grant_path_tests {
             .await
             .unwrap();
         let info = owner_status(&ctx, &task_id);
-        assert_eq!(info.status, crate::bash_background::BgTaskStatus::Killed);
+        assert_eq!(info.status, crate::protocol::BgTaskStatus::Killed);
         assert_eq!(
             info.status_reason.as_deref(),
             Some(crate::bash_background::registry::SCOPE_REVOKED_REASON)
@@ -8863,7 +8869,7 @@ mod grant_path_tests {
             let info = owner_status(&ctx, &task_id);
             assert_eq!(
                 info.status,
-                crate::bash_background::BgTaskStatus::Completed,
+                crate::protocol::BgTaskStatus::Completed,
                 "accepted_first={accepted_first}: {info:?}"
             );
             assert!(
@@ -8948,7 +8954,7 @@ mod grant_path_tests {
                 .unwrap()
                 .info
                 .status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
         wait_for_task_state(&ctx, "completion queued", |registry| {
             registry.has_completions_for_session(Some("deadline-session"))
@@ -9047,6 +9053,10 @@ mod grant_path_tests {
                 .drain_reply_cache(&task_id, "deadline-session")
                 .snapshot();
             let terminal = cached.uncaptured_terminal.unwrap();
+            let terminal = crate::commands::bash_orchestrate::foreground_result_response(
+                "",
+                (*terminal).clone(),
+            );
             assert_eq!(
                 terminal.data, expected.data,
                 "uncaptured drain must reuse the canonical terminal diagnostics"
@@ -9114,7 +9124,7 @@ mod grant_path_tests {
                 registry
                     .observed_status(&task_id, "deadline-session", 0)
                     .is_some_and(|snapshot| {
-                        snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown
+                        snapshot.info.status == crate::protocol::BgTaskStatus::FateUnknown
                     })
             })
             .await;
@@ -9124,7 +9134,7 @@ mod grant_path_tests {
                     .unwrap()
                     .info
                     .status,
-                crate::bash_background::BgTaskStatus::FateUnknown
+                crate::protocol::BgTaskStatus::FateUnknown
             );
         }
     }
@@ -9197,7 +9207,7 @@ mod grant_path_tests {
             registry
                 .observed_status(&task_id, "deadline-session", 0)
                 .is_some_and(|snapshot| {
-                    snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown
+                    snapshot.info.status == crate::protocol::BgTaskStatus::FateUnknown
                 })
         })
         .await;
@@ -9211,7 +9221,7 @@ mod grant_path_tests {
                 .unwrap()
                 .info
                 .status,
-            crate::bash_background::BgTaskStatus::FateUnknown
+            crate::protocol::BgTaskStatus::FateUnknown
         );
         assert!(ctx
             .bash_background()
@@ -9355,7 +9365,7 @@ mod grant_path_tests {
                 .unwrap()
                 .info
                 .status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
 
         // The launch reply is decided only after the job has finished.
@@ -9406,7 +9416,7 @@ mod grant_path_tests {
                 .unwrap()
                 .info
                 .status,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
     }
 
@@ -10517,10 +10527,7 @@ mod grant_path_tests {
     }
 
     #[cfg(unix)]
-    async fn wait_for_terminal(
-        ctx: &AppContext,
-        task_id: &str,
-    ) -> crate::bash_background::BgTaskStatus {
+    async fn wait_for_terminal(ctx: &AppContext, task_id: &str) -> crate::protocol::BgTaskStatus {
         let give_up = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(snapshot) =
@@ -10663,7 +10670,7 @@ mod grant_path_tests {
         let task_id = response.data["task_id"].as_str().unwrap();
         assert_eq!(
             wait_for_terminal(&ctx, task_id).await,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
     }
 
@@ -10836,7 +10843,7 @@ mod grant_path_tests {
         startup.finish().await;
         assert_eq!(
             wait_for_terminal(&startup.call.ctx, &task_id).await,
-            crate::bash_background::BgTaskStatus::Completed
+            crate::protocol::BgTaskStatus::Completed
         );
         assert!(startup.call.dir.path().join("started-command").exists());
     }
@@ -10910,7 +10917,7 @@ mod grant_path_tests {
                 assert_eq!(deadline_response.data["task_id"], task_id);
                 assert_eq!(
                     wait_for_terminal(&call.ctx, &task_id).await,
-                    crate::bash_background::BgTaskStatus::Completed,
+                    crate::protocol::BgTaskStatus::Completed,
                     "offset {offset}"
                 );
                 assert!(

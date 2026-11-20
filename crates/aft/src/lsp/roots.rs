@@ -15,7 +15,7 @@ pub(crate) enum RootPathMode {
 impl RootPathMode {
     pub(crate) fn resolve(self, path: &Path) -> PathBuf {
         match self {
-            Self::Resolve => crate::inspect::job::canonicalize_normalized(path),
+            Self::Resolve => crate::path_identity::canonicalize_normalized(path),
             Self::WalkEntry => path.to_path_buf(),
         }
     }
@@ -326,7 +326,7 @@ pub fn skip_in_server_walk(name: &str, depth: usize) -> bool {
     ) {
         return true;
     }
-    depth > 0 && (name == "spikes" || crate::inspect::job::is_test_support_dir_name(name))
+    depth > 0 && (name == "spikes" || crate::file_kind::is_test_support_dir_name(name))
 }
 
 /// Composite key for caching server instances.
@@ -347,8 +347,8 @@ mod tests {
     use super::{
         find_rust_workspace_root, find_workspace_root, find_workspace_root_within, ServerKey,
     };
-    use crate::inspect::job::canonicalize_normalized;
     use crate::lsp::registry::ServerKind;
+    use crate::path_identity::canonicalize_normalized;
 
     #[test]
     fn test_find_root_with_cargo_toml() {
@@ -364,7 +364,7 @@ mod tests {
         // Expectations go through the same normalization as production:
         // bare fs::canonicalize returns verbatim (\\?\) paths on Windows,
         // which find_workspace_root deliberately strips.
-        let expected_root = crate::inspect::job::canonicalize_normalized(&root);
+        let expected_root = crate::path_identity::canonicalize_normalized(&root);
         assert_eq!(
             find_workspace_root(&file, &["Cargo.toml"]),
             Some(expected_root)
@@ -384,7 +384,7 @@ mod tests {
         fs::write(crate_root.join("Cargo.toml"), "[package]\nname = \"foo\"\n").unwrap();
         fs::write(&file, "fn main() {}\n").unwrap();
 
-        let expected_root = crate::inspect::job::canonicalize_normalized(&crate_root);
+        let expected_root = crate::path_identity::canonicalize_normalized(&crate_root);
         assert_eq!(
             find_workspace_root(&file, &["Cargo.toml"]),
             Some(expected_root)
@@ -415,7 +415,7 @@ mod tests {
         fs::create_dir(root.join("package.json")).unwrap();
         fs::write(&file, "export {};\n").unwrap();
 
-        let expected_root = crate::inspect::job::canonicalize_normalized(&root);
+        let expected_root = crate::path_identity::canonicalize_normalized(&root);
         assert_eq!(
             find_workspace_root(&file, &["tsconfig.json", "package.json"]),
             Some(expected_root)

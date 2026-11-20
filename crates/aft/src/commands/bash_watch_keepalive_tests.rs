@@ -36,7 +36,7 @@ impl QuietWatch {
         let clock = Arc::new(AtomicU64::new(0));
         let (tx, pushes) = std::sync::mpsc::channel();
         let origin = Instant::now();
-        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+        token.set_progress(crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_millis(clock.load(Ordering::SeqCst))

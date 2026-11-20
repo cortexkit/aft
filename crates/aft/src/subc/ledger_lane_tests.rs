@@ -11,7 +11,8 @@
 //! background maintenance runs beside them.
 
 use super::*;
-use crate::executor::{ExecutorConfig, ExecutorJob};
+use crate::context::ExecutorJob;
+use crate::executor::ExecutorConfig;
 use crate::run_tool_call::PhaseTrace;
 use tool_provider::RouteRole;
 

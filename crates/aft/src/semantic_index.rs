@@ -3,7 +3,7 @@ use crate::config::{
     SemanticBackend, SemanticBackendConfig, DEFAULT_SEMANTIC_QUERY_TIMEOUT_MS,
     MAX_SEMANTIC_QUERY_TIMEOUT_MS, MIN_SEMANTIC_QUERY_TIMEOUT_MS,
 };
-use crate::context::SemanticIndexStatus;
+use crate::data_layer::status::SemanticIndexStatus;
 use crate::fs_lock;
 use crate::parser::{extract_symbols_from_tree, language_for_extension, parse_resolved_source};
 use crate::search_index::{
@@ -617,7 +617,7 @@ fn root_backend_probes() -> &'static Mutex<HashMap<PathBuf, RootBackendProbe>> {
 /// probe never overrides an outage the build recorded, and a later successful
 /// probe clears only an outage a probe recorded.
 pub(crate) fn check_remote_backend_while_building(
-    ctx: &crate::context::AppContext,
+    ctx: &dyn crate::data_layer::host::IndexHost,
 ) -> RemoteBackendCheck {
     let building = matches!(
         &*ctx
@@ -1013,7 +1013,7 @@ fn finish_semantic_index_build(
 /// `refreshing` means the index is queryable but a large batch of files has
 /// its vectors masked while they are re-embedded, so results for those files
 /// are missing until the refresh finishes.
-/// [`crate::context::SemanticIndexStatus::mass_refresh_pending`] decides when a
+/// [`crate::data_layer::status::SemanticIndexStatus::mass_refresh_pending`] decides when a
 /// refresh is large enough to report.
 ///
 /// A reader that does not recognise a word has nothing to render but the raw
@@ -1038,13 +1038,7 @@ pub const SEMANTIC_INDEX_STATUS_WORDS: &[&str] = &[
     "unavailable",
 ];
 
-/// Opening words of every missing-runtime message this crate produces.
-///
-/// `is_onnx_runtime_unavailable` treats this prefix as proof on its own, and
-/// readers outside the daemon (the OpenCode sidebar) key on the same prefix to
-/// tell "the runtime is not installed" apart from an ordinary backend failure.
-/// Changing it changes that contract.
-pub const ONNX_RUNTIME_MISSING_PREFIX: &str = "ONNX Runtime not found.";
+pub use crate::ort_pin::ONNX_RUNTIME_MISSING_PREFIX;
 
 /// What the daemon tells a user whose ONNX Runtime is missing.
 ///
@@ -3801,8 +3795,8 @@ impl SemanticEmbeddingModel {
                 EmbeddingRequestPolicy::Query(budget)
                     if matches!(&self.engine, SemanticEmbeddingEngine::Local(_)) =>
                 {
-                    Some(crate::commands::semantic_search::waits::timed(
-                        crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
+                    Some(crate::search_state::waits::timed(
+                        crate::search_state::waits::SearchWait::EmbedBackend,
                         || {
                             self.embed_local_query(
                                 texts.clone(),
@@ -3847,9 +3841,8 @@ impl SemanticEmbeddingModel {
 
         // A query that missed the cache waits here for its remote backend
         // (Synapse or HTTP) or the in-process model.
-        let backend_wait = crate::commands::semantic_search::waits::time(
-            crate::commands::semantic_search::waits::SearchWait::EmbedBackend,
-        );
+        let backend_wait =
+            crate::search_state::waits::time(crate::search_state::waits::SearchWait::EmbedBackend);
         let result = (|| match &mut self.engine {
             SemanticEmbeddingEngine::Local(engine) => engine
                 .model

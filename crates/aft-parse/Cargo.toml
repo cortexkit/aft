@@ -1,0 +1,80 @@
+[package]
+name = "aft-parse"
+version = "0.66.0"
+edition = "2021"
+rust-version.workspace = true
+license = "MIT"
+repository = "https://github.com/cortexkit/aft"
+description = "Syntax parsing, imports and call resolution for Agent Foundational Toolkit"
+autotests = false
+
+[features]
+test-support = ["aft-base/test-support", "dep:tempfile", "dep:rayon"]
+test-hooks = ["aft-base/test-hooks"]
+test-timing-hooks = ["aft-base/test-timing-hooks"]
+callgraph-shape-census = ["aft-base/callgraph-shape-census"]
+wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl", "dep:reqwest", "dep:getrandom"]
+
+[dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0" }
+aft-store = { path = "../aft-store", version = "0.66.0" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+parking_lot = "0.12"
+tree-sitter = "=0.26.7"
+tree-sitter-typescript = "0.23.2"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+tree-sitter-rust = "0.24"
+tree-sitter-go = "0.25"
+tree-sitter-c = "0.24"
+tree-sitter-cpp = "0.23"
+tree-sitter-cuda = "0.21.1"
+tree-sitter-zig = "1.1"
+tree-sitter-c-sharp = "0.23"
+tree-sitter-bash = "0.25"
+tree-sitter-html = "0.23"
+tree-sitter-md = "0.5"
+tree-sitter-solidity = "1.2"
+tree-sitter-vue = { package = "tree-sitter-vue-next", version = "0.1" }
+tree-sitter-json = "0.24"
+tree-sitter-toml = { package = "tree-sitter-toml-ng", version = "0.7.0" }
+tree-sitter-scala = "0.26"
+tree-sitter-java = "0.23"
+tree-sitter-ruby = "0.23"
+tree-sitter-kotlin-sg = "0.4"
+tree-sitter-swift = "0.7.4"
+tree-sitter-php = "0.24"
+tree-sitter-lua = "0.5"
+tree-sitter-perl = { package = "ts-parser-perl", version = "1.1" }
+tree-sitter-pascal = "0.10.2"
+tree-sitter-r = "1.2.0"
+tree-sitter-objc = "3.0.2"
+tree-sitter-yaml = "0.7"
+tree-sitter-scss = { package = "cortexkit-tree-sitter-scss", version = "1.0.1" }
+dekobon-tree-sitter-groovy = "0.2.2"
+ast-grep-core = "0.41"
+streaming-iterator = "0.1"
+ignore = "0.4"
+regex = "1"
+sha2 = { version = "0.10", features = ["compress"] }
+blake3 = "1"
+getrandom = { version = "0.3", optional = true }
+globset = "0.4"
+rustc-hash = "2"
+notify = "8"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+libc = "0.2"
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tempfile = { version = "3", optional = true }
+rayon = { version = "1", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["blocking", "json", "rustls-tls"] }
+wasmtime = { version = "=36.0.20", optional = true, default-features = false, features = ["pulley", "parallel-compilation"] }
+wasmtime-c-api-impl = { version = "=36.0.20", optional = true, default-features = false }
+
+[dev-dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+tempfile = "3"
+rayon = "1"

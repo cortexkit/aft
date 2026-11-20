@@ -172,7 +172,7 @@ fn notice_templates_repeat_observations_send_typed_counts_without_appending() {
                 .is_none());
         }
         let mut response = Response::success("notice-call", json!({"text":"unchanged"}));
-        response.notices.route = Some(notice_route(&session));
+        response.notices.route = Some(notice_route(&session).into_sink());
         let mut text = "unchanged".to_owned();
         crate::run_tool_call::RepeatObservation::for_agent_call(
             &session, "read", &args, false, true, true,
@@ -225,7 +225,7 @@ fn notice_templates_refusal_falls_back_once_at_user_authority() {
             }
         };
         let mut response = Response::success("notice-call", json!({"text":"body"}));
-        response.notices.route = Some(notice_route(&session));
+        response.notices.route = Some(notice_route(&session).into_sink());
         response.notices.items.push(Notice::template(
             id,
             slots,
@@ -259,7 +259,7 @@ fn notice_templates_unordered_runner_gets_no_nudge() {
     let capture = test_endpoint::capture("notice-legacy", false);
     capture.delivery_order(Some(false));
     let mut response = Response::success("notice-call", json!({"text":"body"}));
-    response.notices.route = Some(notice_route("notice-legacy"));
+    response.notices.route = Some(notice_route("notice-legacy").into_sink());
     response.notices.items.push(
         crate::subc::runner_notices::notice_templates::Notice::template(
             crate::subc::runner_notices::notice_templates::PREFER_TOOL,
@@ -343,7 +343,7 @@ fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
         }],
     );
     let mut response = Response::success("notice-call", json!({"text":"body"}));
-    response.notices.route = Some(notice_route(session));
+    response.notices.route = Some(notice_route(session).into_sink());
     crate::response_finalize::finalize_response_for_dispatch_root(
         &mut response,
         &ctx,
@@ -1152,6 +1152,8 @@ use cortexkit_role_llm_runner::{
     send::SendReply,
     wire::{read_reply, reply_body},
 };
+
+use crate::bash_background::TaskIdentityAuth;
 
 fn owner(principal: &str, harness: &str) -> crate::bash_background::TaskIdentity {
     crate::bash_background::TaskIdentity {
@@ -2055,6 +2057,7 @@ struct HeldCompletion {
 
 impl HeldCompletion {
     fn new(id: &str) -> Self {
+        crate::subc::lower_hooks::register();
         use crate::db::call_ledger as ledger;
         let task = Completion::new_runner(id, 0, "reserved:thalamus-harness", "opencode2");
         let db = Arc::new(std::sync::Mutex::new(

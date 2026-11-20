@@ -386,7 +386,7 @@ pub(crate) fn compare_readers(
     // over the views database built here they label those roots differently.
     // Every 400th symbol in path order; each operation runs at the depth
     // the commands default to and with tests both left out and included.
-    use crate::commands::callgraph_store_adapter as adapter;
+    use crate::data_layer::callgraph_store_adapter as adapter;
     let public = symbols
         .iter()
         .step_by(400 * sample_scale())

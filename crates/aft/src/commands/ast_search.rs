@@ -131,7 +131,7 @@ pub fn handle_ast_search(req: &RawRequest, ctx: &AppContext) -> Response {
     };
 
     use rayon::prelude::*;
-    let bounded = crate::subc::result_body::active();
+    let bounded = crate::context::call_context::active();
     let mut budget = MatchBudget {
         remaining: bounded.then_some(crate::tool_output::LIST_BODY_BYTES),
         cut: false,
@@ -415,7 +415,7 @@ mod tests {
             "id":"budget", "command":"ast_search", "pattern":"console.log($X)", "lang":"javascript"
         }))
         .unwrap();
-        let _budget = crate::subc::result_body::enter(true);
+        let _budget = crate::context::call_context::enter(true);
         let response = handle_ast_search(&req, &ctx);
         assert!(response.success);
         let shown = response.data["matches"].as_array().unwrap().len();

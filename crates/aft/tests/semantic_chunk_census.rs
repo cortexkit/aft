@@ -134,9 +134,10 @@ fn embed_text_header_census() {
             "census corpus is missing: {}",
             root.display()
         );
-        let mut files = aft::callgraph::walk_project_files(&root)
-            .filter(|path| is_semantic_indexed_extension(path))
-            .collect::<Vec<_>>();
+        let mut files =
+            aft::callgraph::walk_project_files(&root, aft::project_walk::IgnoreFileAccess::Allowed)
+                .filter(|path| is_semantic_indexed_extension(path))
+                .collect::<Vec<_>>();
         files.sort();
         let mut corpus_max = (0, String::new());
 
@@ -259,9 +260,10 @@ fn measure_corpus(
     tokenizer: &Tokenizer,
     tokenizer_sha256: String,
 ) -> CorpusResult {
-    let mut files = aft::callgraph::walk_project_files(&root)
-        .filter(|path| is_semantic_indexed_extension(path))
-        .collect::<Vec<_>>();
+    let mut files =
+        aft::callgraph::walk_project_files(&root, aft::project_walk::IgnoreFileAccess::Allowed)
+            .filter(|path| is_semantic_indexed_extension(path))
+            .collect::<Vec<_>>();
     files.sort();
 
     let total_files = files.len();

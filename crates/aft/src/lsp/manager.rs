@@ -84,19 +84,8 @@ impl Drop for BackgroundDocumentPullPause {
     }
 }
 
-impl Drop for DocumentPullWorker {
-    fn drop(&mut self) {
-        if let Some(owner) = self.0.upgrade() {
-            let mut manager = owner.lock();
-            manager.background_pull_running = false;
-            manager.background_pull_inflight = false;
-            for waiter in std::mem::take(&mut manager.background_pull_idle_waiters) {
-                let _ = waiter.send(());
-            }
-            manager.start_background_document_pull_worker();
-        }
-    }
-}
+#[path = "manager/document_pull_lifetime.rs"]
+mod document_pull_lifetime;
 
 fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
     let Some(manager) = owner.upgrade() else {
@@ -6298,7 +6287,7 @@ impl LspManager {
                 // Detached clients already have a reaping worker. Registry
                 // removal can precede its wait, so only process disappearance
                 // confirms that the worker (or the OS) has finished reaping.
-                while crate::bash_background::process::is_process_alive(pid) {
+                while crate::process_identity::is_process_alive(pid) {
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 let _ = result_tx.send((None, pid, Ok(())));
@@ -8014,7 +8003,7 @@ impl LspManager {
         let reclaim_root = config
             .project_root
             .as_deref()
-            .map(crate::inspect::job::canonicalize_normalized)
+            .map(crate::path_identity::canonicalize_normalized)
             .filter(|project_root| root.starts_with(project_root))
             .unwrap_or_else(|| root.to_path_buf());
 
@@ -8038,7 +8027,7 @@ impl LspManager {
             initialization_options,
             runtime_note,
             project_typescript,
-            storage_root: crate::bash_background::storage_dir(config.storage_dir.as_deref()),
+            storage_root: crate::storage_path::storage_dir(config.storage_dir.as_deref()),
             typescript_lookup,
         })
     }
@@ -8390,7 +8379,7 @@ fn initialization_options_for_spawn(
     server_root: &Path,
     config: &Config,
 ) -> Result<Option<serde_json::Value>, LspError> {
-    config.check_lsp_initialization_options(def.kind.id_str())?;
+    super::check_lsp_initialization_options(config, def.kind.id_str())?;
     if def.kind == ServerKind::Rust {
         // Cargo holds its target directory lock throughout a check, including
         // time spent waiting for compiler resources. Isolate analyzer checks
@@ -8773,7 +8762,7 @@ fn canonicalize_for_lsp(file_path: &Path) -> Result<PathBuf, LspError> {
     // fs::canonicalize here would produce verbatim paths on Windows that
     // never match any client root.
     std::fs::canonicalize(file_path)
-        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .map(|canonical| crate::path_identity::normalize_path(&canonical))
         .map_err(LspError::from)
 }
 
@@ -8781,7 +8770,7 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     // Same normalized form as canonicalize_for_lsp and the client roots;
     // see the comment there.
     if let Ok(path) = std::fs::canonicalize(file_path) {
-        return crate::inspect::job::normalize_path(&path);
+        return crate::path_identity::normalize_path(&path);
     }
 
     let mut existing = file_path.to_path_buf();
@@ -8798,7 +8787,7 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     }
 
     let mut resolved = std::fs::canonicalize(&existing)
-        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .map(|canonical| crate::path_identity::normalize_path(&canonical))
         .unwrap_or(existing);
     for segment in missing.into_iter().rev() {
         resolved.push(segment);
@@ -8917,7 +8906,7 @@ fn normalize_lookup_path(path: &Path) -> PathBuf {
     // store keys and lookups must share one canonical form or Windows verbatim
     // spellings silently miss.
     std::fs::canonicalize(path)
-        .map(|canonical| crate::inspect::job::normalize_path(&canonical))
+        .map(|canonical| crate::path_identity::normalize_path(&canonical))
         .unwrap_or_else(|_| path.to_path_buf())
 }
 
@@ -8942,7 +8931,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
         if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
             let reconstructed = canonical_parent.join(name);
             add(reconstructed.clone());
-            add(crate::inspect::job::normalize_path(&reconstructed));
+            add(crate::path_identity::normalize_path(&reconstructed));
         }
     }
 
@@ -10309,14 +10298,14 @@ pub fn walk_applicable_area(
     config: &Config,
     deadline: Option<std::time::Instant>,
 ) -> Result<ApplicabilityWalk, ApplicabilityResolutionError> {
-    let root = crate::inspect::job::canonicalize_normalized(project_root);
+    let root = crate::path_identity::canonicalize_normalized(project_root);
     let deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(10));
     let mut config = config.clone();
     if let Some(config_root) = &config.project_root {
         config.project_root = Some(if config_root == project_root {
             root.clone()
         } else {
-            crate::inspect::job::canonicalize_normalized(config_root)
+            crate::path_identity::canonicalize_normalized(config_root)
         });
     }
     let scan = || {
@@ -10340,11 +10329,11 @@ pub(crate) use super::applicability_cache::{ApplicabilityMetrics, InvalidationCa
 
 pub(crate) fn applicability_metrics(root: &Path) -> ApplicabilityMetrics {
     super::applicability_cache::shared()
-        .metrics(&crate::inspect::job::canonicalize_normalized(root))
+        .metrics(&crate::path_identity::canonicalize_normalized(root))
 }
 
 pub(crate) fn invalidate_applicability_walk(root: &Path, cause: InvalidationCause) {
-    let root = crate::inspect::job::canonicalize_normalized(root);
+    let root = crate::path_identity::canonicalize_normalized(root);
     // Invalidate selectors before waking a new scan, even when forwarding the
     // watcher events to a busy language-server manager has to be queued.
     super::typescript_project::clear_typescript_selection();
@@ -10391,7 +10380,7 @@ pub(crate) fn invalidate_applicability_batch(
             paths.iter().map(PathBuf::as_path),
         );
     }
-    let root = crate::inspect::job::canonicalize_normalized(root);
+    let root = crate::path_identity::canonicalize_normalized(root);
     super::applicability_cache::shared()
         .invalidate_batch(&root, paths, content_only)
         .is_some()
@@ -10436,7 +10425,7 @@ fn walk_applicable_area_uncached(
         // those once; recursive entries below them never follow symlinks.
         Some(roots) => roots
             .iter()
-            .map(|root| crate::inspect::job::canonicalize_normalized(root))
+            .map(|root| crate::path_identity::canonicalize_normalized(root))
             .collect(),
         None => vec![project_root.to_path_buf()],
     };
@@ -10453,14 +10442,22 @@ fn walk_applicable_area_uncached(
         .same_file_system(true)
         .standard_filters(true)
         .follow_links(false);
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, &walk_roots[0])
-        .filter_entry(|entry| {
-            !crate::lsp::roots::skip_in_server_walk(
-                entry.file_name().to_string_lossy().as_ref(),
-                entry.depth(),
-            )
-        })
-        .build();
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        &walk_roots[0],
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|entry| {
+        !crate::lsp::roots::skip_in_server_walk(
+            entry.file_name().to_string_lossy().as_ref(),
+            entry.depth(),
+        )
+    })
+    .build();
 
     let mut resolver = crate::lsp::registry::WalkServerResolver::new(config, mode);
     let mut entries = 0;
@@ -12070,7 +12067,7 @@ mod clear_diagnostics_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("normalized-gone.ts");
         std::fs::write(&file, "x").unwrap();
-        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
+        let normalized_file = crate::path_identity::canonicalize_normalized(&file);
 
         let mut manager = LspManager::new();
         let key = ServerKey {
@@ -12094,7 +12091,7 @@ mod clear_diagnostics_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("normalized-stale.ts");
         std::fs::write(&file, "x").unwrap();
-        let normalized_file = crate::inspect::job::canonicalize_normalized(&file);
+        let normalized_file = crate::path_identity::canonicalize_normalized(&file);
 
         let mut manager = LspManager::new();
         let key = ServerKey {
@@ -12256,7 +12253,7 @@ mod inspect_path_tests {
     #[test]
     fn per_package_biome_resolves_in_a_bun_workspace() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let root = crate::inspect::job::canonicalize_normalized(temp_dir.path()).join("workspace");
+        let root = crate::path_identity::canonicalize_normalized(temp_dir.path()).join("workspace");
         let write = |relative: &str, contents: &str| {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -12335,7 +12332,7 @@ mod inspect_path_tests {
     #[test]
     fn applicability_walk_skips_fixtures_spikes_and_ignored_directories() {
         let temp_dir = tempfile::tempdir().expect("tempdir");
-        let root = crate::inspect::job::canonicalize_normalized(temp_dir.path());
+        let root = crate::path_identity::canonicalize_normalized(temp_dir.path());
         let write = |relative: &str, contents: &str| {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -12414,7 +12411,7 @@ mod server_exit_reap_tests {
     fn wait_until_dead(pid: u32, timeout: Duration) -> bool {
         let started = Instant::now();
         while started.elapsed() < timeout {
-            if !crate::bash_background::process::is_process_alive(pid) {
+            if !crate::process_identity::is_process_alive(pid) {
                 return true;
             }
             thread::sleep(Duration::from_millis(20));
@@ -12562,8 +12559,8 @@ mod server_exit_reap_tests {
             assert!(
                 Instant::now() < deadline,
                 "orphans must exit after rebind reap (first alive={}, second alive={})",
-                crate::bash_background::process::is_process_alive(pid1),
-                crate::bash_background::process::is_process_alive(pid2)
+                crate::process_identity::is_process_alive(pid1),
+                crate::process_identity::is_process_alive(pid2)
             );
             thread::sleep(Duration::from_millis(20));
         }
@@ -12697,7 +12694,7 @@ mod typescript_worktree_tests {
     #[test]
     fn root_scripts_outside_every_typescript_project_are_a_named_gap() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path()).join("workspace");
+        let root = crate::path_identity::canonicalize_normalized(temp.path()).join("workspace");
         let write = |relative: &str, contents: &str| {
             let path = root.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -12948,7 +12945,7 @@ exit 1
     #[test]
     fn typescript_shim_runtime_uses_and_reports_the_resolved_sdk() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let shim = root.join("node_modules").join("typescript");
         std::fs::create_dir_all(&shim).unwrap();
         std::fs::write(
@@ -13024,7 +13021,7 @@ exit 1
     #[test]
     fn configured_typescript_servers_preserve_inputs_without_sdk_reads() {
         let temp = tempfile::tempdir().unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(temp.path());
+        let root = crate::path_identity::canonicalize_normalized(temp.path());
         let modules = root.join("node_modules");
         let shim = modules.join("typescript");
         std::fs::create_dir_all(&shim).unwrap();
@@ -13097,7 +13094,7 @@ exit 1
             eprintln!("SKIP: AFT_TS_SELECTION_CORPUS not set");
             return;
         };
-        let root = crate::inspect::job::canonicalize_normalized(&root);
+        let root = crate::path_identity::canonicalize_normalized(&root);
         let config = Config {
             project_root: Some(root.clone()),
             ..Config::default()
@@ -13466,7 +13463,7 @@ while True:
 
         assert_eq!(outcome.forced, 1);
         assert_eq!(outcome.unreaped, 0);
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!crate::process_identity::is_process_alive(pid));
         assert!(!registry.pids().contains(&pid));
         assert_eq!(lines.len(), 2, "captured shutdown errors: {lines:?}");
         assert!(lines[0].starts_with("WARN "), "{}", lines[0]);

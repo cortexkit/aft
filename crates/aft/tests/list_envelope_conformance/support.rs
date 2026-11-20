@@ -2481,6 +2481,10 @@ fn aft_src_dir() -> PathBuf {
     manifest_path("src")
 }
 
+fn base_src_dir() -> PathBuf {
+    manifest_path("../aft-base/src")
+}
+
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
     if let Ok(entries) = fs::read_dir(dir) {
@@ -2506,9 +2510,15 @@ fn registry_file_key(relative: &Path) -> String {
 }
 
 pub fn find_call_sites(function: &str) -> Vec<CallSite> {
-    let source_dir = aft_src_dir();
     let mut sites = Vec::new();
-    for path in collect_rs_files(&source_dir) {
+    for (source_dir, path) in [aft_src_dir(), base_src_dir()]
+        .into_iter()
+        .flat_map(|root| {
+            collect_rs_files(&root)
+                .into_iter()
+                .map(move |path| (root.clone(), path))
+        })
+    {
         let source = fs::read_to_string(&path).unwrap_or_default();
         let file = registry_file_key(path.strip_prefix(&source_dir).unwrap_or(&path));
         let mut in_test_module = false;
@@ -2552,7 +2562,7 @@ pub fn validate_renderer_call_sites(
         .iter()
         .map(|site| site.file.as_str())
         .collect::<Vec<_>>();
-    let expected_render_files = ["list_envelope.rs", "ndjson_text.rs", "subc_format.rs"];
+    let expected_render_files = ["list_envelope.rs", "list_surfaces.rs", "ndjson_text.rs"];
     if render_sites.len() != 3
         || expected_render_files
             .iter()
@@ -2590,16 +2600,25 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
+    let base_dir = base_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
+    paths.extend(collect_rs_files(&source_dir.join("search_state")));
+    paths.extend(collect_rs_files(&source_dir.join("search_index")));
+    paths.push(source_dir.join("data_layer/callgraph_store_adapter.rs"));
+    paths.push(source_dir.join("bash_background/scoped_tasks.rs"));
     paths.push(source_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
     paths.push(source_dir.join("tool_output.rs"));
+    paths.push(source_dir.join("output_store.rs"));
+    paths.push(source_dir.join("file_read_exact.rs"));
     paths.push(source_dir.join("subc/bind_log.rs"));
     paths.push(source_dir.join("subc/diagnostics_findings.rs"));
     paths.push(source_dir.join("runtime_drain.rs"));
+    paths.push(source_dir.join("parser/todo_markers.rs"));
+    paths.push(source_dir.join("parser/dead_code_facts.rs"));
     paths.push(source_dir.join("bash_permissions/scan.rs"));
-    paths.extend(collect_rs_files(&source_dir.join("compress")));
+    paths.extend(collect_rs_files(&base_dir.join("compress")));
     let primitives = [
         "budget.exhausted()",
         ".take(",
@@ -2618,11 +2637,20 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     ];
     let mut discovered = Vec::new();
     for path in paths {
+        let relocated = path
+            .strip_prefix(&source_dir)
+            .ok()
+            .map(|relative| base_dir.join(relative));
+        let path = relocated.filter(|file| file.exists()).unwrap_or(path);
         if !path.exists() {
             continue;
         }
         let source = fs::read_to_string(&path).unwrap_or_default();
-        let file = registry_file_key(path.strip_prefix(&source_dir).unwrap_or(&path));
+        let file = registry_file_key(
+            path.strip_prefix(&source_dir)
+                .or_else(|_| path.strip_prefix(&base_dir))
+                .unwrap_or(&path),
+        );
         let lines = source.lines().collect::<Vec<_>>();
         for (index, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
@@ -2664,7 +2692,7 @@ fn surface_matches_file(command: &str, file: &str) -> bool {
     match command {
         "grep" => file == "commands/grep.rs" || file == "subc_format.rs",
         "glob" => file == "commands/glob.rs" || file == "subc_format.rs",
-        "callgraph" => file == "commands/callgraph_store_adapter.rs" || file == "subc_format.rs",
+        "callgraph" => file == "data_layer/callgraph_store_adapter.rs" || file == "subc_format.rs",
         "search" => {
             file == "commands/semantic_search/mod.rs"
                 || file == "commands/semantic_search/exact_lane.rs"

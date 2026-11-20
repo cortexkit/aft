@@ -1799,7 +1799,7 @@ impl LspClient {
         !self.uses_analysis_progress()
             || (!self.uses_document_pull(Some(file))
                 && self.analysis_progress.certifies(
-                    &crate::inspect::job::normalize_path(file),
+                    &crate::path_identity::normalize_path(file),
                     epoch,
                     published_at,
                 ))
@@ -1822,7 +1822,7 @@ impl LspClient {
         published_at: Option<Instant>,
     ) {
         self.analysis_progress.published(
-            &crate::inspect::job::normalize_path(file),
+            &crate::path_identity::normalize_path(file),
             epoch,
             published_at,
         );
@@ -1856,7 +1856,7 @@ impl LspClient {
         else {
             return;
         };
-        let file = crate::inspect::job::normalize_path(&file);
+        let file = crate::path_identity::normalize_path(&file);
         if self.uses_document_pull(Some(&file)) {
             self.analysis_progress.opens.remove(&file);
             return;
@@ -3954,11 +3954,11 @@ with open(sys.argv[1], 'w') as output:
             .unwrap();
         drop(client);
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::bash_background::process::is_process_alive(pid) && Instant::now() < deadline {
+        while crate::process_identity::is_process_alive(pid) && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(20));
         }
         assert!(
-            !crate::bash_background::process::is_process_alive(pid),
+            !crate::process_identity::is_process_alive(pid),
             "descendant survived drop"
         );
     }
@@ -3980,7 +3980,7 @@ with open(sys.argv[1], 'w') as output:
             "leader must be reaped"
         );
         drop(client);
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!crate::process_identity::is_process_alive(pid));
     }
 
     #[cfg(unix)]
@@ -4001,14 +4001,14 @@ with open(sys.argv[1], 'w') as output:
             "child must be tracked before shutdown"
         );
         assert!(
-            crate::bash_background::process::is_process_alive(pid),
+            crate::process_identity::is_process_alive(pid),
             "child must still be running"
         );
         client.poison_writer_for_test();
         let result = client.shutdown();
         assert!(result.is_err(), "shutdown must return Err, got {result:?}");
         assert!(
-            !crate::bash_background::process::is_process_alive(pid),
+            !crate::process_identity::is_process_alive(pid),
             "shutdown Err must not leave a live child"
         );
         assert!(

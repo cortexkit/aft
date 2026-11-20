@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 use crate::context::AppContext;
 use crate::data_layer::checkout::DataError;
-use crate::data_layer::parent_session::Plane;
 use crate::data_layer::runtime::DataCheckout;
+use crate::parent_search::Plane;
 use crate::protocol::{RawRequest, Response};
 
 const DEADLINE: Duration = Duration::from_secs(180);
@@ -139,7 +139,7 @@ fn glob(ctx: &AppContext, pattern: &str) -> Value {
 
 /// A call-graph command as the parent session answers it.
 fn routed(ctx: &AppContext, req: &RawRequest) -> Response {
-    crate::data_layer::parent_session::route(req, ctx)
+    crate::commands::parent_query::route(req, ctx)
         .expect("a parent folder answers this command itself")
 }
 
@@ -155,7 +155,7 @@ fn child_gap(path: &str, reason: Option<String>) -> Value {
 /// unbound. The returned executor and context keep it that way.
 fn refusing_executor() -> (
     crate::executor::RootMaintenanceExecutor,
-    crate::executor::Executor,
+    crate::context::Executor,
     Arc<AppContext>,
     tempfile::TempDir,
 ) {
@@ -166,7 +166,7 @@ fn refusing_executor() -> (
         crate::config::Config::default(),
     ));
     ctx.mark_subc_bound();
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
     assert!(executor.register_actor(root_id, Arc::clone(&ctx)));
     let maintenance = ctx
@@ -191,11 +191,11 @@ fn settled<T: std::fmt::Debug>(ask: impl Fn() -> T, done: impl Fn(&T) -> bool) -
 
 /// The parent session `ctx` is bound to, once its worker's first round
 /// has loaded the children.
-fn parent_session(ctx: &AppContext) -> Arc<crate::data_layer::parent_session::ParentSession> {
+fn parent_session(ctx: &AppContext) -> Arc<crate::parent_search::ParentSession> {
     let deadline = Instant::now() + DEADLINE;
     let session = loop {
         crate::runtime_drain::drain_deferred_configure_maintenance(ctx);
-        if let Some(session) = crate::data_layer::parent_session::session_for(ctx) {
+        if let Some(session) = crate::parent_search::session_for(ctx) {
             break session;
         }
         assert!(Instant::now() < deadline, "no parent session started");
@@ -410,7 +410,7 @@ fn parent_loading_child_bounded_walk_keeps_matches_and_reports_a_gap() {
 /// every child remain named gaps.
 #[test]
 fn a_parent_folder_answers_from_its_childrens_checkouts() {
-    crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
+    crate::parent_search::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
@@ -628,10 +628,10 @@ fn a_parent_folders_todo_count_names_the_repositories_not_indexed_yet() {
     let mut job = crate::inspect::InspectJob {
         job_id: 1,
         key: crate::inspect::JobKey::for_category_scope(
-            crate::inspect::InspectCategory::Todos,
+            crate::inspect_category::InspectCategory::Todos,
             &crate::inspect::JobScope::for_project(root.clone()),
         ),
-        category: crate::inspect::InspectCategory::Todos,
+        category: crate::inspect_category::InspectCategory::Todos,
         scope_files: scope,
         project_root: root.clone(),
         inspect_dir: base.join("inspect"),
@@ -710,7 +710,7 @@ fn children_build_nothing_while_the_parent_root_is_unbound() {
     };
     let _session = parent_session(&parent);
     parent.mark_subc_bound();
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
     assert!(executor.register_actor(root_id, Arc::clone(&parent)));
     parent.mark_subc_unbound();
@@ -805,7 +805,7 @@ fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
 fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::data_layer::meaning::MeaningState;
-    crate::data_layer::parent_session::set_default_refresh_interval(Duration::from_millis(100));
+    crate::parent_search::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
@@ -814,7 +814,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     for name in ["alpha", "beta"] {
         init_repo(&root.join(name), name);
     }
-    let (base_url, gate) = crate::data_layer::tools::search::meaning::tests::serve("never-held");
+    let (base_url, gate) = crate::data_layer::meaning_query::tests::serve("never-held");
     gate.open();
     let semantic = SemanticBackendConfig {
         backend: SemanticBackend::OpenAiCompatible,

@@ -125,12 +125,28 @@ fn cargo_test_preserves_failures_verbatim() {
 fn dispatch_falls_back_to_generic_for_unknown_commands() {
     let ctx = compress_context(true);
     let output = "\x1b[31mred\x1b[0m\n".to_string();
-    assert_eq!(compress::compress("unknown", output, &ctx), "red\n");
+    assert_eq!(
+        compress::compress(
+            "unknown",
+            output,
+            ctx.config().experimental_bash_compress,
+            &ctx.filter_registry()
+        ),
+        "red\n"
+    );
 }
 
 #[test]
 fn dispatch_returns_unchanged_output_when_disabled() {
     let ctx = compress_context(false);
     let output = "\x1b[31mred\x1b[0m\n".to_string();
-    assert_eq!(compress::compress("unknown", output.clone(), &ctx), output);
+    assert_eq!(
+        compress::compress(
+            "unknown",
+            output.clone(),
+            ctx.config().experimental_bash_compress,
+            &ctx.filter_registry()
+        ),
+        output
+    );
 }

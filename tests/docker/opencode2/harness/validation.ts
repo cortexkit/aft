@@ -645,6 +645,8 @@ function ownerForCommand(command: string): string {
   return canonicalToolName(command === "semantic_search" ? "search" : command);
 }
 
+const LIST_SURFACE_CRATE = "aft-base";
+
 async function surfaceRequirement(repoRoot: string, body: string): Promise<string | null> {
   const requirement = body.match(/requires:\s*(None|Some\(([^)]+)\))/);
   if (!requirement) fail("matrix_invalid", "LIST_SURFACES requirement is missing");
@@ -656,7 +658,7 @@ async function surfaceRequirement(repoRoot: string, body: string): Promise<strin
   }
   const parts = expression.split("::").slice(1);
   const name = parts.pop();
-  const module = join(repoRoot, "crates", "aft", "src", ...parts);
+  const module = join(repoRoot, "crates", LIST_SURFACE_CRATE, "src", ...parts);
   const path = await firstExisting([`${module}.rs`, join(module, "mod.rs")]);
   if (!path) fail("matrix_invalid", `list surface requirement module is missing: ${expression}`);
   const source = await readFile(path, "utf8");
@@ -666,7 +668,7 @@ async function surfaceRequirement(repoRoot: string, body: string): Promise<strin
 }
 
 export async function deriveListSurfaces(repoRoot: string): Promise<ListSurface[]> {
-  const path = join(repoRoot, "crates", "aft", "src", "list_surfaces.rs");
+  const path = join(repoRoot, "crates", LIST_SURFACE_CRATE, "src", "list_surfaces.rs");
   const source = await readFile(path, "utf8");
   const registry = source.match(/pub static LIST_SURFACES[^=]*=\s*&\[(?<body>[\s\S]*?)\n\];/)
     ?.groups?.body;

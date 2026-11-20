@@ -4,13 +4,13 @@
 mod scope_fallback;
 #[cfg(unix)]
 use super::*;
-#[cfg(unix)]
-use crate::commands::inspect::thousands;
 use crate::exec_remote::types::*;
 #[cfg(unix)]
 use crate::exec_remote::{
     self as exec, ExecRemoteClient, OutputSink, ResumePoint, StreamProgress, Verdict,
 };
+#[cfg(unix)]
+use crate::inspect::thousands;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -18,18 +18,14 @@ use std::ffi::OsStr;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
-/// Memory-kill facts reported by the build server, not the local memory cap.
-#[derive(Clone, Debug, Serialize)]
-pub struct RemoteOomKill {
-    pub cause: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_stated_mib: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub memory_peak_working_mib: Option<u64>,
+pub use crate::protocol::RemoteOomKill;
+
+pub(crate) trait RemoteOomKillText {
+    fn message(&self) -> String;
 }
 
-impl RemoteOomKill {
-    pub(super) fn message(&self) -> String {
+impl RemoteOomKillText for RemoteOomKill {
+    fn message(&self) -> String {
         let peak = self
             .memory_peak_working_mib
             .map(|mib| format!(" (peak {mib} MiB)"))
@@ -2495,7 +2491,7 @@ fn runon_write_refusal(command: &str, request: &RunRequest) -> Option<String> {
     let returned: Vec<_> = request
         .return_paths
         .iter()
-        .map(|path| crate::bash_permissions::resolve_with_existing_ancestors(&cwd.join(path)))
+        .map(|path| crate::system_temp::resolve_with_existing_ancestors(&cwd.join(path)))
         .collect();
     let paths = crate::bash_permissions::writes::literal_write_targets(command, cwd, &|path| {
         runon_snapshot_directory_known(checkout, path, Path::new("git"), deadline)
@@ -2653,7 +2649,7 @@ fn runon_cd_refusal_with_git(
             siblings.push(crate::path_identity::lexical_normalize(&parent.join(name)));
         }
     }
-    let mut homes: Vec<PathBuf> = crate::commands::configure::resolve_account_home_dir()
+    let mut homes: Vec<PathBuf> = crate::production_storage::resolve_account_home_dir()
         .into_iter()
         .collect();
     if let Some(home) = std::env::var_os("HOME")
@@ -4669,7 +4665,7 @@ impl BgTaskRegistry {
         }
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         let _ = self.inner.wake_tx.try_send(());
     }
 
@@ -4818,7 +4814,7 @@ impl BgTaskRegistry {
         );
         let _ = self.post_terminal_transition(task, true);
         self.inner.terminal_transition.notify_waiters();
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         let _ = self.inner.wake_tx.try_send(());
     }
 

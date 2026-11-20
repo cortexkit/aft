@@ -1675,6 +1675,17 @@ impl InspectCache {
     }
 }
 
+impl crate::data_layer::parent_session::InspectCacheView for ReadonlyInspectCache {
+    fn project_aggregate(
+        &self,
+        category: InspectCategory,
+        config: &Config,
+    ) -> Result<Option<serde_json::Value>, String> {
+        self.get_aggregated_for_config(&JobKey::for_project_category(category), config)
+            .map_err(|error| error.to_string())
+    }
+}
+
 impl ReadonlyInspectCache {
     fn from_inner(inner: InspectCache) -> Self {
         Self { inner }
@@ -2567,32 +2578,40 @@ fn walk_resolver_config_files(project_root: &Path) -> BTreeSet<PathBuf> {
     // Resolver configs inside a nested linked worktree of this repository
     // belong to that checkout's own scope, not this one.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
-    let walker = crate::context::apply_project_ignore_rules(&mut builder, project_root)
-        .filter_entry(move |entry| {
-            if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
-                return false;
-            }
-            let name = entry.file_name().to_string_lossy();
-            if entry
-                .file_type()
-                .is_some_and(|file_type| file_type.is_dir())
-            {
-                return !matches!(
-                    name.as_ref(),
-                    "node_modules"
-                        | "target"
-                        | "venv"
-                        | ".venv"
-                        | ".git"
-                        | "__pycache__"
-                        | ".tox"
-                        | "dist"
-                        | "build"
-                );
-            }
-            true
-        })
-        .build();
+    let walker = crate::context::apply_project_ignore_rules(
+        &mut builder,
+        project_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(move |entry| {
+        if crate::search_index::is_nested_worktree_entry(entry, &worktrees) {
+            return false;
+        }
+        let name = entry.file_name().to_string_lossy();
+        if entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_dir())
+        {
+            return !matches!(
+                name.as_ref(),
+                "node_modules"
+                    | "target"
+                    | "venv"
+                    | ".venv"
+                    | ".git"
+                    | "__pycache__"
+                    | ".tox"
+                    | "dist"
+                    | "build"
+            );
+        }
+        true
+    })
+    .build();
 
     walker
         .filter_map(Result::ok)
@@ -2784,7 +2803,7 @@ fn update_manifest_fingerprint_hash(
     // verbatim (`\\?\`) on Windows, so mixing it with those non-verbatim
     // manifests makes `strip_prefix` hash an absolute path instead of its
     // project-relative name.
-    let manifest_root = crate::inspect::job::canonicalize_normalized(project_root);
+    let manifest_root = crate::path_identity::canonicalize_normalized(project_root);
     hasher.update(b"entry-point-manifests\0");
     for manifest in super::entry_points::collect_entry_point_manifests(project_root) {
         let relative_path = manifest
@@ -3527,7 +3546,7 @@ pub(crate) mod tests {
         let content = br#"{"name":"fixture"}"#;
         fs::write(&manifest, content).expect("write package manifest");
 
-        let normalized_project = crate::inspect::job::canonicalize_normalized(&project);
+        let normalized_project = crate::path_identity::canonicalize_normalized(&project);
         let mut actual = blake3::Hasher::new();
         update_manifest_fingerprint_hash(&mut actual, &verbatim_path(&normalized_project))
             .expect("hash entry-point manifest");

@@ -458,7 +458,7 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
     }
     let config = ctx.config();
     let root = config.project_root.clone().unwrap_or_default();
-    let normalized = crate::inspect::job::canonicalize_normalized(&root)
+    let normalized = crate::path_identity::canonicalize_normalized(&root)
         .display()
         .to_string();
     let own = object
@@ -474,7 +474,7 @@ pub(crate) fn project(ctx: &AppContext, mut snapshot: Value) -> Value {
         serde_json::json!({"applicability_by_root":roots}),
     );
 
-    let storage = crate::bash_background::storage_dir(config.storage_dir.as_deref());
+    let storage = crate::storage_path::storage_dir(config.storage_dir.as_deref());
     let canonical = ctx
         .canonical_cache_root_opt()
         .unwrap_or_else(|| root.clone());

@@ -238,7 +238,7 @@ fn capture_case(
         .wait_for_memory_profile_idle_for_test();
     let meaning = settled(
         || {
-            crate::data_layer::tools::search::DataSemantic::current(&ctx)
+            crate::data_layer::meaning_query::DataSemantic::current(&ctx)
                 .and_then(|data| data.serving().cloned())
                 .filter(|meaning| meaning.coverage().pending.is_empty())
         },

@@ -455,7 +455,7 @@ async fn unconfined_call_keeps_policy_answer_when_database_slot_becomes_busy() {
     let ctx = Arc::new(context(root.path(), storage.path(), None));
     let route = identity(root.path(), "designer", 7, true);
     assert_eq!(confined(&ctx, &route), Ok(false));
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let mut waits = DatabaseWaits::default();
@@ -523,7 +523,7 @@ async fn uncached_calls_wait_for_busy_database_slot_and_keep_saved_confinement()
         } else {
             context_without_database(root.path(), storage.path())
         });
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
         let routes = HashMap::from([(route_key(43, 1), route.clone())]);
         let (held_tx, held_rx) = mpsc::channel();
@@ -575,7 +575,7 @@ async fn keyed_call_waits_for_slow_policy_store_before_confinement_admission() {
     let ctx = Arc::new(context_without_database(root.path(), storage.path()));
     ctx.mark_database_runtime_initializing_for_test();
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let mut waits = DatabaseWaits::default();
@@ -615,7 +615,7 @@ async fn policy_read_wait_budget_exhaustion_fails_closed() {
     let storage = tempfile::tempdir().unwrap();
     let ctx = Arc::new(context(root.path(), storage.path(), None));
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let (held_tx, held_rx) = mpsc::channel();
@@ -702,7 +702,7 @@ async fn failed_policy_store_frame_read_fails_closed_after_off_loop_wait() {
     ctx.finish_database_runtime_error("configured store cannot open".into(), false);
     assert!(!ctx.database_runtime_unconfigured());
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
@@ -737,7 +737,7 @@ async fn opening_policy_store_past_wait_budget_fails_closed() {
     ctx.mark_database_runtime_initializing_for_test();
     assert!(!ctx.database_runtime_unconfigured());
     let route = identity(root.path(), "designer", 7, true);
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let mut frame = admission_frame_for("grep", json!({"pattern":"token"}));
@@ -797,7 +797,7 @@ async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
     holder.join().unwrap();
     assert_eq!(read, Ok(false));
 
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     assert!(executor.register_actor(route.root.clone(), Arc::clone(&ctx)));
     let routes = HashMap::from([(route_key(43, 1), route.clone())]);
     let holder = hold_empty_policy_slot_until_memory_miss(&ctx);
@@ -2552,16 +2552,16 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
             .info
             .status;
         if cancelled {
-            assert_eq!(status, crate::bash_background::BgTaskStatus::Killed);
+            assert_eq!(status, crate::protocol::BgTaskStatus::Killed);
         } else {
             assert_ne!(
                 status,
-                crate::bash_background::BgTaskStatus::Killed,
+                crate::protocol::BgTaskStatus::Killed,
                 "draining the wait must not kill the detached task"
             );
             assert_eq!(
                 status,
-                crate::bash_background::BgTaskStatus::Starting,
+                crate::protocol::BgTaskStatus::Starting,
                 "the fake runner has not sent Accepted yet"
             );
             daemon.acceptance_gate.notify_one();
@@ -2574,10 +2574,10 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                         .status;
                     assert_ne!(
                         status,
-                        crate::bash_background::BgTaskStatus::Killed,
+                        crate::protocol::BgTaskStatus::Killed,
                         "draining the wait must not kill the detached task"
                     );
-                    if status == crate::bash_background::BgTaskStatus::Running {
+                    if status == crate::protocol::BgTaskStatus::Running {
                         break;
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -2594,9 +2594,9 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         assert_eq!(
             status,
             if cancelled {
-                crate::bash_background::BgTaskStatus::Killed
+                crate::protocol::BgTaskStatus::Killed
             } else {
-                crate::bash_background::BgTaskStatus::Running
+                crate::protocol::BgTaskStatus::Running
             }
         );
         let sent = daemon
@@ -2887,7 +2887,7 @@ fn siblings_catalog_refuses_outside_checkout_and_dotdot_escape() {
                 &worker,
                 &ctx,
             ),
-            &not_readable(&crate::access_policy::policy_path(&outside)),
+            &not_readable(&crate::policy_path::policy_path(&outside)),
         );
         assert!(lookup(&ctx, &RemoteSource::Worker(key(&worker, Some("worker")))).is_none());
     }
@@ -2912,7 +2912,7 @@ fn siblings_catalog_refuses_symlink_to_outside_checkout() {
             &worker,
             &ctx,
         ),
-        &not_readable(&crate::access_policy::policy_path(outside.path())),
+        &not_readable(&crate::policy_path::policy_path(outside.path())),
     );
 }
 
@@ -2984,10 +2984,10 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
     for route in [&head, &worker] {
         assert_siblings_refused(
             catalog(request.clone(), route, &ctx),
-            &not_readable(&crate::access_policy::policy_path(outside.path())),
+            &not_readable(&crate::policy_path::policy_path(outside.path())),
         );
     }
-    let granted_path = crate::access_policy::policy_path(outside.path());
+    let granted_path = crate::policy_path::policy_path(outside.path());
     crate::db::access_grants::insert(
         &ctx.db().unwrap().lock().unwrap(),
         &access_grants::policy_scope_key(&head),
@@ -3069,7 +3069,7 @@ impl SiblingGrantFixture {
         )
         .unwrap();
         let head_grant = AccessGrant {
-            path: crate::access_policy::policy_path(&dir.path().join("granted")),
+            path: crate::policy_path::policy_path(&dir.path().join("granted")),
             kind: GrantKind::Subtree,
             operation: AccessOperation::Read,
         };
@@ -3125,7 +3125,7 @@ fn assert_siblings_refused(result: Result<Value, subc_protocol::ErrorBody>, mess
 /// grants do not cover or one that is not a checkout root.
 #[test]
 fn siblings_head_preflight_counts_the_plans_own_allow_paths() {
-    use crate::access_policy::policy_path;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-preflight-head");
     let (ctx, head) = (&fixture.ctx, &fixture.head);
     let commons = fixture.path("granted/commons");
@@ -3233,14 +3233,14 @@ fn siblings_worker_fetch_counts_only_saved_grants() {
         crate::db::access_grants::revoke(
             &ctx.db().unwrap().lock().unwrap(),
             &access_grants::policy_scope_key(&worker),
-            &crate::access_policy::policy_path(&commons),
+            &crate::policy_path::policy_path(&commons),
         )
         .unwrap(),
         1
     );
     assert_siblings_refused(
         catalog(request, &worker, ctx),
-        &not_readable(&crate::access_policy::policy_path(&commons)),
+        &not_readable(&crate::policy_path::policy_path(&commons)),
     );
 }
 
@@ -3342,7 +3342,7 @@ async fn siblings_pass_cores_launch_fetches_then_brocas_fetch_and_submit() {
 /// carries the fetch.
 #[test]
 fn siblings_worker_scope_fetches_still_refuse_ungranted_plans() {
-    use crate::access_policy::policy_path;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-refused-head");
     let ctx = &fixture.ctx;
     let commons = fixture.path("granted/commons");
@@ -3394,7 +3394,7 @@ fn siblings_worker_scope_fetches_still_refuse_ungranted_plans() {
 /// siblings are refused whichever connection carries the fetch.
 #[test]
 fn siblings_unauthorized_worker_scope_is_refused() {
-    use crate::access_policy::policy_path;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-unauthorized-head");
     let ctx = &fixture.ctx;
     let commons = fixture.path("granted/commons");
@@ -3441,7 +3441,8 @@ fn siblings_unauthorized_worker_scope_is_refused() {
 /// grants once, so a later plan naming the sibling in allow_paths adds none.
 #[test]
 fn siblings_owner_waiver_covers_only_the_owner_carried_worker_fetch() {
-    use crate::access_policy::{policy_path, ScopeGrantsDenial};
+    use crate::access_policy::ScopeGrantsDenial;
+    use crate::policy_path::policy_path;
     let fixture = SiblingGrantFixture::new("siblings-waiver-head");
     let ctx = &fixture.ctx;
     let commons = fixture.path("granted/commons");
@@ -3573,7 +3574,7 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     stamp.kind = subc_protocol::scope::ScopeKind::Head;
     stamp.scope_ref = "siblings-submit-head".into();
     access_grants::register(&head, &ctx).unwrap();
-    let path = crate::access_policy::policy_path(sibling.path());
+    let path = crate::policy_path::policy_path(sibling.path());
     crate::db::access_grants::insert(
         &ctx.db().unwrap().lock().unwrap(),
         &access_grants::policy_scope_key(&head),

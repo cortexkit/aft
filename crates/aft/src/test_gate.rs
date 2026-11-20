@@ -1,34 +1,5 @@
-//! Shell gates used by tests that hold a process until a file appears.
-#![allow(dead_code)]
-
-/// Render a POSIX shell loop. `file` is a shell word and `sleep` is the
-/// existing sleep command and interval, for example `sleep 0.05`.
-pub(crate) fn gate(file: &str, sleep: &str) -> String {
-    gate_with_limit(file, sleep, 600, "-f")
-}
-
-pub(crate) fn gate_exists(file: &str, sleep: &str) -> String {
-    gate_with_limit(file, sleep, 600, "-e")
-}
-
-pub(crate) fn gate_socket(file: &str, sleep: &str) -> String {
-    gate_with_limit(file, sleep, 600, "-S")
-}
-
-pub(crate) fn powershell_gate(file: &str, millis: u32) -> String {
-    let file = file.replace('\'', "''");
-    format!("$aftGateFile = '{file}'; $aftGateParent = Split-Path -Parent $aftGateFile; $aftGateDeadline = [DateTime]::UtcNow.AddSeconds(600); while (-not (Test-Path -LiteralPath $aftGateFile) -and (Test-Path -LiteralPath $aftGateParent -PathType Container) -and [DateTime]::UtcNow -lt $aftGateDeadline) {{ Start-Sleep -Milliseconds {millis} }}")
-}
-
-fn gate_with_limit(file: &str, sleep: &str, seconds: u64, predicate: &str) -> String {
-    format!(
-        "(aft_gate_file={file}; \
-         aft_gate_parent=$(cd \"$(dirname \"$aft_gate_file\")\" 2>/dev/null && pwd -P) || exit 0; \
-         aft_gate_deadline=$(($(date +%s) + {seconds})); \
-         while [ ! {predicate} \"$aft_gate_file\" ] && [ -d \"$aft_gate_parent\" ] && \
-         [ \"$(date +%s)\" -lt \"$aft_gate_deadline\" ]; do {sleep}; done)"
-    )
-}
+#[allow(unused_imports)]
+pub use aft_base::test_gate::*;
 
 #[cfg(all(test, unix))]
 mod tests {

@@ -874,7 +874,7 @@ fn outside_allow_paths_cannot_override_carrier_force_restriction_or_ask_deny() {
         std::fs::write(&path, "outside\n").unwrap();
         let db = f.ctx.db().unwrap();
         let grant = crate::access_policy::AccessGrant {
-            path: crate::access_policy::policy_path(outside.path()),
+            path: crate::policy_path::policy_path(outside.path()),
             kind: crate::access_policy::GrantKind::Subtree,
             operation: crate::access_policy::AccessOperation::Read,
         };
@@ -935,7 +935,7 @@ fn carrier_symlink_inside_root_cannot_use_agent_outside_grant() {
         let link = f.dir.path().join("inside-link.txt");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let grant = crate::access_policy::AccessGrant {
-            path: crate::access_policy::policy_path(outside.path()),
+            path: crate::policy_path::policy_path(outside.path()),
             kind: crate::access_policy::GrantKind::Subtree,
             operation: crate::access_policy::AccessOperation::Read,
         };

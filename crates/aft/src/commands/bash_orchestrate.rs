@@ -6,8 +6,9 @@ use serde_json::{json, Value};
 
 use crate::bash_background::registry::remote::{RemotePhase, RemoteProgress};
 use crate::bash_background::registry::{BgTaskSnapshot, HardKillDeadline, HardKillSource};
-use crate::bash_background::BgTaskStatus;
+use crate::bash_rewrite::bash_hints::split_reply_tail;
 use crate::context::AppContext;
+use crate::protocol::BgTaskStatus;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse, PendingResponsePoll};
 
@@ -110,14 +111,7 @@ pub fn format_foreground_result(snapshot: &BgTaskSnapshot) -> String {
     rendered
 }
 
-/// Port of `packages/aft-bridge/src/bash-format.ts` `formatSeconds` (lines 3-6).
-pub fn format_seconds(ms: u64) -> String {
-    let mut seconds = format!("{:.1}", ms as f64 / 1000.0);
-    if seconds.ends_with(".0") {
-        seconds.truncate(seconds.len() - 2);
-    }
-    format!("{seconds}s")
-}
+pub use crate::shell_format::format_seconds;
 
 /// What happens to a task once it runs in the background, worded for the
 /// caller's role and available tools. A primary session is woken by a completion
@@ -143,14 +137,7 @@ fn format_background_handoff_tail(
     )
 }
 
-/// A wait limit in words: whole minutes as minutes, anything else in seconds.
-pub(crate) fn format_wait_limit(ms: u64) -> String {
-    match ms {
-        60_000 => "1 minute".to_string(),
-        ms if ms > 0 && ms % 60_000 == 0 => format!("{} minutes", ms / 60_000),
-        ms => format_seconds(ms),
-    }
-}
+pub(crate) use crate::shell_format::format_wait_limit;
 
 /// The sentence naming a task's own kill deadline, for every reply that hands
 /// a task back. It is kept apart from any wait on the task: a worker whose
@@ -446,7 +433,7 @@ fn observe_raw_bash_response(
     ctx: &AppContext,
     response: &mut Response,
 ) {
-    crate::subc::runner_notices::notice_templates::deliver(response, None);
+    crate::bash_rewrite::notices::deliver(response, None);
     let Some(data) = response.data.as_object_mut() else {
         return;
     };
@@ -475,7 +462,7 @@ pub fn build_bash_outcome(
     ctx: &AppContext,
     spawn_response: Response,
 ) -> DispatchOutcome {
-    let wake = crate::response_finalize::deferred_completion_wake();
+    let wake = crate::pending_response::deferred_completion_wake();
     build_bash_outcome_with_wake(req, ctx, spawn_response, move || drop(wake))
 }
 
@@ -1322,25 +1309,6 @@ pub(crate) fn foreground_task_line(snapshot: &BgTaskSnapshot) -> String {
     }
 }
 
-/// True for a line [`foreground_task_line`] writes: `[task <id>]` or
-/// `[task <id> (job <job>)]`. It is AFT's annotation, not command output, so
-/// output line counts and the repeat breaker's output hash leave it out.
-pub(crate) fn is_foreground_task_line(line: &str) -> bool {
-    let Some(inner) = line
-        .strip_prefix("[task ")
-        .and_then(|rest| rest.strip_suffix(']'))
-    else {
-        return false;
-    };
-    let (id, rest) = inner.split_once(' ').unwrap_or((inner, ""));
-    !id.is_empty()
-        && (rest.is_empty()
-            || rest
-                .strip_prefix("(job ")
-                .and_then(|job| job.strip_suffix(')'))
-                .is_some_and(|job| !job.is_empty() && !job.contains(' ')))
-}
-
 /// Appends `line` to `output` on a line of its own.
 fn push_line(output: &mut String, line: &str) {
     if !output.is_empty() && !output.ends_with('\n') {
@@ -1397,24 +1365,6 @@ fn append_bash_reply_notices(
     if let Some(data) = response.data.as_object_mut() {
         data.insert("output".to_string(), Value::String(combined));
     }
-}
-
-/// Split a bash reply into its body and the closing lines AFT adds after the
-/// command output: an optional `[task <id>]` line followed by the optional
-/// list-envelope `trailer`. The tail is returned with its own line breaks.
-pub(crate) fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
-    let mut tail_start = output.len();
-    if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
-        if output.ends_with(trailer) {
-            tail_start -= trailer.len();
-        }
-    }
-    let before = output[..tail_start].trim_end_matches('\n');
-    let last_line_start = before.rfind('\n').map_or(0, |index| index + 1);
-    if is_foreground_task_line(&before[last_line_start..]) {
-        tail_start = last_line_start;
-    }
-    (&output[..tail_start], &output[tail_start..])
 }
 
 fn background_launch_response(
@@ -1664,7 +1614,7 @@ mod tests {
             BgTaskStatus::Completed,
             Some(0),
         );
-        task.changed_files = Some(crate::bash_changed_files::Report {
+        task.changed_files = Some(crate::protocol::Report {
             text: "Files changed while the command ran (changes by other processes may be included):\n  added new.txt".into(),
             files: vec![],
             incomplete: vec![],

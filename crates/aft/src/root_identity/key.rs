@@ -131,8 +131,7 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
 /// derive a key from Git at `project_root`. This fallback is for standalone build
 /// APIs whose callers have not configured a project or supplied a storage path.
 pub(crate) fn artifact_cache_key_for_build(project_root: &Path) -> String {
-    crate::root_cache::configured_artifact_key(project_root)
-        .unwrap_or_else(|| artifact_cache_key(project_root))
+    super::configured_artifact_key(project_root).unwrap_or_else(|| artifact_cache_key(project_root))
 }
 
 pub fn artifact_cache_key_with_memo(
@@ -698,7 +697,7 @@ pub(crate) fn resolve_root_identity_for_bind(
     // save them on the durable root that owns it, where configure memoizes
     // the key. Any other root, and every root without `cache_dir`, is used
     // as given.
-    let storage_root: &Path = &crate::root_cache::identity_storage_root(storage_root);
+    let storage_root: &Path = &crate::cache_location::identity_storage_root(storage_root);
     let mut git_unavailable = false;
     let mut choose = |pin: crate::root_identity::LegacyPin,
                       saved: Option<&crate::root_identity::Identity>|

@@ -20,18 +20,19 @@
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, OnceLock};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::watcher_filter::config_events::is_config_file_name;
+pub use crate::watcher_filter::config_events::{
+    is_project_config_event_path, ConfigReloadSignal, CONFIG_RELOAD_DEBOUNCE,
+};
+
 use crate::config::Config;
 use crate::config_resolve::ConfigTier;
+pub use crate::config_sources::{set_process_user_config_path, ConfigSources, TierSource};
 use crate::context::AppContext;
-
-/// How long a burst of file events must be quiet before the reload runs.
-/// Editors save by writing a temporary sibling and renaming it over the file,
-/// which arrives as several events.
-pub const CONFIG_RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 
 /// File name both config tiers use.
 const CONFIG_FILE_NAME: &str = "aft.jsonc";
@@ -40,191 +41,9 @@ const CONFIG_FILE_NAME: &str = "aft.jsonc";
 /// read applies. An oversized or invalid file is reported instead of applied.
 const CONFIG_READ_LIMIT: usize = 1024 * 1024;
 
-fn process_epoch() -> Instant {
-    static EPOCH: OnceLock<Instant> = OnceLock::new();
-    *EPOCH.get_or_init(Instant::now)
-}
-
-fn now_ms() -> u64 {
-    u64::try_from(process_epoch().elapsed().as_millis()).unwrap_or(u64::MAX)
-}
-
-/// A pending "re-read the config files" request for one root, with a trailing
-/// debounce: every new request pushes the due time out again.
-#[derive(Debug, Default)]
-pub struct ConfigReloadSignal {
-    /// Milliseconds since the process epoch at which the reload is due; zero
-    /// when no reload is pending.
-    due_at_ms: AtomicU64,
-}
-
-impl ConfigReloadSignal {
-    /// Ask for a reload once the debounce window has passed quietly.
-    pub fn request(&self) {
-        self.request_after(CONFIG_RELOAD_DEBOUNCE);
-    }
-
-    fn request_after(&self, delay: Duration) {
-        let due = now_ms()
-            .saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
-            .max(1);
-        self.due_at_ms.store(due, Ordering::Release);
-    }
-
-    /// Ask for a reload that is due at once (used when a root reattaches after
-    /// idle eviction: the content check makes an unneeded reload a no-op).
-    pub fn request_now(&self) {
-        self.request_after(Duration::ZERO);
-    }
-
-    pub fn is_pending(&self) -> bool {
-        self.due_at_ms.load(Ordering::Acquire) != 0
-    }
-
-    pub fn is_due(&self) -> bool {
-        let due = self.due_at_ms.load(Ordering::Acquire);
-        due != 0 && due <= now_ms()
-    }
-
-    /// Clear a due request and report whether there was one. A request that
-    /// arrives while the reload runs sets a new due time and is not lost.
-    pub fn take_if_due(&self) -> bool {
-        let due = self.due_at_ms.load(Ordering::Acquire);
-        if due == 0 || due > now_ms() {
-            return false;
-        }
-        self.due_at_ms
-            .compare_exchange(due, 0, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-    }
-}
-
-/// What one tier's text was when it was last applied, and where it lives.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TierSource {
-    /// `user` or `project`.
-    pub tier: &'static str,
-    /// The config file for this tier, when known.
-    pub path: Option<PathBuf>,
-    /// The text applied last, or `None` when the tier was absent.
-    pub text: Option<String>,
-    /// Whether `text` was read from `path`. A tier relayed on the wire by an
-    /// older plugin whose file does not exist is kept as it is.
-    pub from_file: bool,
-}
-
-/// What the last configure applied for a root, so a reload can tell whether
-/// the files changed and which changed keys are still waiting for a connect.
-#[derive(Debug, Clone)]
-pub struct ConfigSources {
-    pub(crate) prepared_bind_snapshot_id: Option<u64>,
-    pub(crate) approved_user: Option<crate::subc_config::ApprovedUser>,
-    pub user: TierSource,
-    pub project: TierSource,
-    /// The resolver output of the last configure, before configure's own
-    /// adjustments. Deferred keys are reported relative to it.
-    pub connected: Config,
-    /// Whether this root's context watches the user file itself. False in the
-    /// daemon, where one process-level watch serves every root.
-    pub owns_user_watch: bool,
-}
-
-impl ConfigSources {
-    /// Record what configure resolved from. `tiers` is what configure passed to
-    /// the resolver: a tier whose `source` names the tier's file was read from
-    /// that file (the daemon's bind reads the files and relays them this way).
-    pub fn from_configure(
-        user_config_path: Option<PathBuf>,
-        project_root: &Path,
-        tiers: &[ConfigTier],
-        connected: &Config,
-    ) -> Self {
-        let project_path =
-            crate::subc_config::project_config_read_path(project_root, connected.harness.as_ref());
-        Self::from_observed_paths(user_config_path, project_path, tiers, connected)
-    }
-
-    /// Record the source paths selected by a trusted local observation without
-    /// probing them again. Reload must watch the same files that supplied tiers.
-    pub(crate) fn from_observed_paths(
-        user_config_path: Option<PathBuf>,
-        project_path: PathBuf,
-        tiers: &[ConfigTier],
-        connected: &Config,
-    ) -> Self {
-        let owns_user_watch = user_config_path.is_some() && process_user_config_path().is_none();
-        let user_path = user_config_path.or_else(process_user_config_path);
-        let source_for = |tier: &'static str, path: Option<PathBuf>| {
-            let used = tiers.iter().find(|candidate| candidate.tier == tier);
-            let from_file = match (used, path.as_ref()) {
-                (Some(used), Some(path)) => Path::new(&used.source) == path.as_path(),
-                (None, _) => true,
-                (Some(_), None) => false,
-            };
-            TierSource {
-                tier,
-                path,
-                text: used.map(|used| used.doc.clone()),
-                from_file,
-            }
-        };
-        Self {
-            prepared_bind_snapshot_id: None,
-            approved_user: None,
-            user: source_for("user", user_path),
-            project: source_for("project", Some(project_path)),
-            connected: connected.clone(),
-            owns_user_watch,
-        }
-    }
-}
-
 /// `<root>/.cortexkit/aft.jsonc`.
 pub fn project_config_path(project_root: &Path) -> PathBuf {
     project_root.join(".cortexkit").join(CONFIG_FILE_NAME)
-}
-
-/// Whether `path` names a shared or legacy project config, or an editor's
-/// temporary sibling. `root` is the configured canonical directory; the
-/// event's containing root is canonicalized if needed, while filenames stay literal.
-pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
-    if !is_config_file_name(path) {
-        return false;
-    }
-    let Some(dir) = path.parent() else {
-        return false;
-    };
-    if !matches!(
-        dir.file_name().and_then(|name| name.to_str()),
-        Some(".cortexkit" | ".opencode" | ".pi")
-    ) {
-        return false;
-    }
-    let Some(dir_root) = dir.parent() else {
-        return false;
-    };
-    // Raw watcher events may spell the root differently from the configured
-    // canonical root (macOS reports `/private/var` for `/var`); resolve only
-    // the root directory, never the config file name itself.
-    dir_root == root || std::fs::canonicalize(dir_root).is_ok_and(|resolved| resolved == root)
-}
-
-fn is_config_file_name(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name.starts_with("aft.json") || name.starts_with(".aft.json"))
-}
-
-static PROCESS_USER_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
-
-/// The daemon watches the user config file once for the whole process and
-/// records its path here, so root contexts do not each start a watch.
-pub fn set_process_user_config_path(path: PathBuf) {
-    let _ = PROCESS_USER_CONFIG_PATH.set(path);
-}
-
-fn process_user_config_path() -> Option<PathBuf> {
-    PROCESS_USER_CONFIG_PATH.get().cloned()
 }
 
 thread_local! {
@@ -896,12 +715,12 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
             max_depth: after
                 .backup
                 .max_depth
-                .unwrap_or(crate::backup::DEFAULT_MAX_UNDO_DEPTH),
+                .unwrap_or(crate::config::DEFAULT_MAX_UNDO_DEPTH),
             max_file_size: Some(
                 after
                     .backup
                     .max_file_size
-                    .unwrap_or(crate::backup::DEFAULT_MAX_BACKUP_FILE_SIZE),
+                    .unwrap_or(crate::config::DEFAULT_MAX_BACKUP_FILE_SIZE),
             ),
         });
     }
@@ -920,7 +739,7 @@ fn push_live_setters(ctx: &AppContext, before: &Config, after: &Config) {
         ctx.reset_tier2_refresh_scheduler();
     }
     if before.git.co_author == "off" && after.git.co_author != "off" {
-        let storage_root = crate::bash_background::storage_dir(after.storage_dir.as_deref());
+        let storage_root = crate::storage_path::storage_dir(after.storage_dir.as_deref());
         if let Err(error) = crate::agent_child_env::ensure_git_hooks(&storage_root) {
             crate::slog_warn!("config reload: could not install git hooks: {}", error);
         }
@@ -1814,75 +1633,7 @@ impl DirAttachment {
     }
 }
 
-/// A directory's device and inode (on Windows, volume serial number and
-/// file index), which change when it is replaced.
-type DirIdentity = (u64, u64);
-
-#[cfg(unix)]
-pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path)
-        .ok()
-        .map(|metadata| (metadata.dev(), metadata.ino()))
-}
-
-/// On Windows, the volume serial number and the 64-bit file index, which is
-/// what an inode is on Unix. Creation time would not do: NTFS file-name
-/// tunneling gives a name reused within about 15 s the creation time of the
-/// entry that last had it, so a directory renamed aside and recreated looks
-/// unchanged by that measure.
-#[cfg(windows)]
-pub(crate) fn dir_identity(path: &Path) -> Option<DirIdentity> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, OPEN_EXISTING,
-    };
-
-    // A deep storage or cache path is past the plain-path limit of CreateFileW.
-    let path = crate::windows_path::win32_call_path(path);
-    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // SAFETY: `wide` is a NUL-terminated UTF-16 path that outlives the call;
-    // the remaining arguments are plain flags and null pointers, and the
-    // returned handle is checked before use and closed below.
-    let handle = unsafe {
-        CreateFileW(
-            wide.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            // Required to open a directory handle.
-            FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return None;
-    }
-    // SAFETY: an all-zero BY_HANDLE_FILE_INFORMATION is a valid value (plain
-    // integers and FILETIME structs); the call only writes into it.
-    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    // SAFETY: `handle` is a valid open handle and `info` a valid out pointer.
-    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) } != 0;
-    // SAFETY: `handle` came from CreateFileW above and is closed exactly once.
-    unsafe {
-        CloseHandle(handle);
-    }
-    ok.then(|| {
-        (
-            u64::from(info.dwVolumeSerialNumber),
-            (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-        )
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-pub(crate) fn dir_identity(_path: &Path) -> Option<DirIdentity> {
-    None
-}
+use crate::dir_identity::{dir_identity, DirIdentity};
 
 /// Process-level watch on the user config file for the daemon. On a change it
 /// asks every live root to reload; roots that are not bound pick the edit up

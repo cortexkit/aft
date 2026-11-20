@@ -451,6 +451,7 @@ pub(crate) mod tests {
     use serde_json::json;
 
     pub(crate) fn context(root: &Path, storage: &Path) -> Arc<AppContext> {
+        crate::subc::lower_hooks::register();
         let ctx = Arc::new(AppContext::new(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {

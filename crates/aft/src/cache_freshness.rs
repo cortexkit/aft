@@ -1,576 +1,62 @@
+pub use aft_base::cache_freshness::*;
+
+#[cfg(test)]
+#[allow(unused_imports)]
 use rayon::prelude::*;
+#[cfg(test)]
+#[allow(unused_imports)]
 #[cfg(debug_assertions)]
 use std::cell::Cell;
+#[cfg(test)]
+#[allow(unused_imports)]
 use std::collections::BTreeMap;
+#[cfg(test)]
+#[allow(unused_imports)]
 #[cfg(debug_assertions)]
 use std::collections::VecDeque;
+#[cfg(test)]
+#[allow(unused_imports)]
 use std::fs;
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::PathBuf;
+#[cfg(test)]
+#[allow(unused_imports)]
 #[cfg(any(debug_assertions, test))]
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-
-pub const CONTENT_HASH_SIZE_CAP: u64 = 4 * 1024 * 1024;
-#[cfg(debug_assertions)]
-const MAX_STRICT_VERIFY_DEBUG_PATHS: usize = 4096;
+use std::sync::atomic::AtomicUsize;
+#[cfg(test)]
+#[allow(unused_imports)]
+#[cfg(any(debug_assertions, test))]
+use std::sync::atomic::Ordering;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Mutex;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::OnceLock;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::Duration;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::Instant;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::SystemTime;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::time::UNIX_EPOCH;
 
 #[cfg(test)]
-static STRICT_VERIFY_POOL_BUILDS: AtomicUsize = AtomicUsize::new(0);
-
-#[cfg(debug_assertions)]
-static STRICT_VERIFY_FILE_CALLS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(debug_assertions)]
-thread_local! {
-    static HASH_FILE_IF_SMALL_CALLS: Cell<usize> = const { Cell::new(0) };
-}
-#[cfg(any(debug_assertions, test))]
-static WATCHED_HASH_FILE: OnceLock<Mutex<Option<(PathBuf, usize)>>> = OnceLock::new();
-
-const VERIFY_MEMO_TTL: Duration = Duration::from_secs(10 * 60);
-static VERIFY_MEMO: OnceLock<Mutex<VerifyMemo>> = OnceLock::new();
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum VerifyArtifact {
-    Search,
-    #[cfg(test)]
-    Semantic,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WarmVerifyPlan {
-    Skip,
-    StatFirst,
-    Strict,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum VerifyStrategy {
-    StatFirst,
-    Strict,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ArtifactGeneration {
-    size: u64,
-    modified_nanos: Option<u128>,
-}
-
-#[derive(Debug, Clone)]
-struct VerifyMemoEntry {
-    verify_completed_at: Instant,
-    generation: ArtifactGeneration,
-    invalidated: bool,
-}
-
-#[derive(Default)]
-struct VerifyMemo {
-    entries: BTreeMap<(PathBuf, VerifyArtifact), VerifyMemoEntry>,
-    invalidation_tickets: BTreeMap<PathBuf, u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FileFreshness {
-    pub mtime: SystemTime,
-    pub size: u64,
-    pub content_hash: blake3::Hash,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FreshnessVerdict {
-    HotFresh,
-    ContentFresh {
-        new_mtime: SystemTime,
-        new_size: u64,
-    },
-    Stale,
-    Deleted,
-}
-
-pub fn hash_bytes(bytes: &[u8]) -> blake3::Hash {
-    crate::io_accounting::source_hash(bytes)
-}
-
-pub fn hash_file_if_small(path: &Path, size: u64) -> std::io::Result<Option<blake3::Hash>> {
-    if size > CONTENT_HASH_SIZE_CAP {
-        return Ok(None);
-    }
-    #[cfg(debug_assertions)]
-    HASH_FILE_IF_SMALL_CALLS.with(|calls| calls.set(calls.get() + 1));
-    #[cfg(any(debug_assertions, test))]
-    {
-        let mut watched = WATCHED_HASH_FILE
-            .get_or_init(|| Mutex::new(None))
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some((watched_path, count)) = watched.as_mut() {
-            if watched_path == path {
-                *count += 1;
-            }
-        }
-    }
-    // The same read-policy gate as `project_content::read`, but streamed.
-    // The work counters match what that read and `hash_bytes` record.
-    let (hash, bytes_read) = hash_small_reader(crate::project_content::open(path)?)?;
-    let work = &crate::io_accounting::WORK;
-    work.content_read_bytes
-        .fetch_add(bytes_read, std::sync::atomic::Ordering::Relaxed);
-    if hash.is_some() {
-        work.source_hashes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        work.source_hash_bytes
-            .fetch_add(bytes_read, std::sync::atomic::Ordering::Relaxed);
-    }
-    Ok(hash)
-}
-
-/// Hashes `reader` with a fixed 8 KiB buffer and returns the hash with the
-/// number of bytes consumed. Stat metadata may predate a growing file, so at
-/// most one byte beyond the admission cap is read: growth past the cap yields
-/// no hash, rather than an unbounded read or a hash of a truncated prefix.
-fn hash_small_reader(reader: impl std::io::Read) -> std::io::Result<(Option<blake3::Hash>, u64)> {
-    use std::io::Read;
-    let mut reader = reader.take(CONTENT_HASH_SIZE_CAP + 1);
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = [0u8; 8192];
-    let mut total = 0u64;
-    loop {
-        let read = match reader.read(&mut buffer) {
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            result => result?,
-        };
-        if read == 0 {
-            return Ok((Some(hasher.finalize()), total));
-        }
-        total += read as u64;
-        if total > CONTENT_HASH_SIZE_CAP {
-            return Ok((None, total));
-        }
-        hasher.update(&buffer[..read]);
-    }
-}
-
-pub fn metadata_matches(path: &Path, cached: &FileFreshness) -> std::io::Result<bool> {
-    let metadata = fs::metadata(path)?;
-    let new_size = metadata.len();
-    let new_mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
-    Ok(new_size == cached.size && new_mtime == cached.mtime)
-}
-
-pub fn zero_hash() -> blake3::Hash {
-    blake3::Hash::from_bytes([0u8; 32])
-}
-
-pub(crate) fn artifact_generation(path: &Path) -> Option<ArtifactGeneration> {
-    let metadata = fs::metadata(path).ok()?;
-    let modified_nanos = metadata
-        .modified()
-        .ok()
-        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_nanos());
-    Some(ArtifactGeneration {
-        size: metadata.len(),
-        modified_nanos,
-    })
-}
-
-fn verify_memo() -> &'static Mutex<VerifyMemo> {
-    VERIFY_MEMO.get_or_init(|| Mutex::new(VerifyMemo::default()))
-}
-
-pub(crate) fn warm_verify_plan(
-    root: &Path,
-    artifact: VerifyArtifact,
-    generation: Option<ArtifactGeneration>,
-) -> WarmVerifyPlan {
-    let Some(generation) = generation else {
-        return WarmVerifyPlan::Strict;
-    };
-    let memo = verify_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let Some(entry) = memo.entries.get(&(root.to_path_buf(), artifact)) else {
-        return WarmVerifyPlan::Strict;
-    };
-    if entry.generation != generation {
-        return WarmVerifyPlan::Strict;
-    }
-    if entry.invalidated || entry.verify_completed_at.elapsed() >= VERIFY_MEMO_TTL {
-        WarmVerifyPlan::StatFirst
-    } else {
-        WarmVerifyPlan::Skip
-    }
-}
-
-pub(crate) fn capture_verify_ticket(root: &Path) -> u64 {
-    verify_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .invalidation_tickets
-        .get(root)
-        .copied()
-        .unwrap_or(0)
-}
-
-pub(crate) fn record_verify_completed_if_unchanged(
-    root: &Path,
-    artifact: VerifyArtifact,
-    generation: Option<ArtifactGeneration>,
-    ticket: u64,
-) -> bool {
-    let Some(generation) = generation else {
-        return false;
-    };
-    let mut memo = verify_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let current_ticket = memo.invalidation_tickets.get(root).copied().unwrap_or(0);
-    if current_ticket != ticket {
-        return false;
-    }
-    memo.entries.insert(
-        (root.to_path_buf(), artifact),
-        VerifyMemoEntry {
-            verify_completed_at: Instant::now(),
-            generation,
-            invalidated: false,
-        },
-    );
-    true
-}
-
-/// Seed the search-index verification memo for integration lifecycle tests.
-#[doc(hidden)]
-pub fn seed_search_verify_memo_for_test(root: &Path, artifact_path: &Path) -> bool {
-    let ticket = capture_verify_ticket(root);
-    record_verify_completed_if_unchanged(
-        root,
-        VerifyArtifact::Search,
-        artifact_generation(artifact_path),
-        ticket,
-    )
-}
-
-/// Return the current search warm-verify plan as a stable test label.
-#[doc(hidden)]
-pub fn search_warm_verify_plan_for_test(root: &Path, artifact_path: &Path) -> &'static str {
-    match warm_verify_plan(
-        root,
-        VerifyArtifact::Search,
-        artifact_generation(artifact_path),
-    ) {
-        WarmVerifyPlan::Skip => "skip",
-        WarmVerifyPlan::StatFirst => "stat_first",
-        WarmVerifyPlan::Strict => "strict",
-    }
-}
-
-#[cfg(test)]
-pub(crate) fn record_verify_completed(
-    root: &Path,
-    artifact: VerifyArtifact,
-    generation: Option<ArtifactGeneration>,
-) {
-    let ticket = capture_verify_ticket(root);
-    let _ = record_verify_completed_if_unchanged(root, artifact, generation, ticket);
-}
-
-pub(crate) fn invalidate_verify_memo(root: &Path) {
-    let mut memo = verify_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let ticket = memo
-        .invalidation_tickets
-        .entry(root.to_path_buf())
-        .or_insert(0);
-    *ticket = ticket.wrapping_add(1);
-    for ((memo_root, _), entry) in &mut memo.entries {
-        if memo_root == root {
-            entry.invalidated = true;
-        }
-    }
-}
-
-/// Forget all completed verification for a root after an interval in which its
-/// filesystem watcher was stopped. A normal watcher invalidation can use
-/// stat-first verification, but an unobserved interval must hash content because
-/// size and mtime may both have been preserved by an external writer.
-pub(crate) fn invalidate_verify_memo_strict(root: &Path) {
-    let mut memo = verify_memo()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let ticket = memo
-        .invalidation_tickets
-        .entry(root.to_path_buf())
-        .or_insert(0);
-    *ticket = ticket.wrapping_add(1);
-    memo.entries.retain(|(memo_root, _), _| memo_root != root);
-}
-
-pub fn collect(path: &Path) -> std::io::Result<FileFreshness> {
-    let metadata = fs::metadata(path)?;
-    let mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
-    let size = metadata.len();
-    let content_hash = hash_file_if_small(path, size)?.unwrap_or_else(zero_hash);
-    Ok(FileFreshness {
-        mtime,
-        size,
-        content_hash,
-    })
-}
-
-pub fn verify_file(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
-    verify_file_inner(path, cached, false)
-}
-
-pub fn verify_file_strict(path: &Path, cached: &FileFreshness) -> FreshnessVerdict {
-    #[cfg(debug_assertions)]
-    {
-        STRICT_VERIFY_FILE_CALLS.fetch_add(1, Ordering::Relaxed);
-        let mut paths = strict_verify_paths_for_debug()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        paths.push_back(path.to_path_buf());
-        while paths.len() > MAX_STRICT_VERIFY_DEBUG_PATHS {
-            paths.pop_front();
-        }
-    }
-    verify_file_inner(path, cached, true)
-}
-
-/// Verify semantic cache file freshness in a private bounded Rayon pool.
-///
-/// Do not use the global pool here: load-time strict verification can hash every
-/// indexed file, and the semantic load/build already runs beside the bridge's
-/// single dispatch thread. Match the half-cores/cap-8 policy used by the search
-/// and callgraph cold-build pools.
-pub(crate) fn verify_files_strict_bounded<K: Send>(
-    files: Vec<(K, PathBuf, FileFreshness)>,
-) -> Vec<(K, PathBuf, FreshnessVerdict)> {
-    verify_files_bounded(files, VerifyStrategy::Strict)
-}
-
-pub(crate) fn verify_files_bounded<K: Send>(
-    files: Vec<(K, PathBuf, FileFreshness)>,
-    strategy: VerifyStrategy,
-) -> Vec<(K, PathBuf, FreshnessVerdict)> {
-    map_files_bounded(files, |(key, path, cached)| {
-        let verdict = match strategy {
-            VerifyStrategy::StatFirst => verify_file(&path, &cached),
-            VerifyStrategy::Strict => verify_file_strict(&path, &cached),
-        };
-        (key, path, verdict)
-    })
-}
-
-fn map_files_bounded<K: Send, V: Send>(
-    files: Vec<(K, PathBuf, FileFreshness)>,
-    map: impl Fn((K, PathBuf, FileFreshness)) -> V + Send + Sync,
-) -> Vec<V> {
-    if files.len() <= 1 {
-        return files.into_iter().map(map).collect();
-    }
-
-    let pool = strict_verify_pool();
-    match pool {
-        Some(pool) => pool.install(|| {
-            let files = files.into_par_iter();
-            files.map(map).collect()
-        }),
-        None => files.into_iter().map(map).collect(),
-    }
-}
-
-fn strict_verify_pool() -> Option<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<Option<rayon::ThreadPool>> = OnceLock::new();
-    POOL.get_or_init(build_strict_verify_pool).as_ref()
-}
-
-fn build_strict_verify_pool() -> Option<rayon::ThreadPool> {
-    #[cfg(test)]
-    STRICT_VERIFY_POOL_BUILDS.fetch_add(1, Ordering::Relaxed);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(strict_verify_pool_size())
-        .thread_name(|index| format!("aft-rayon-semantic-verify-{index}"))
-        .build()
-        .ok()
-}
-
-pub(crate) fn strict_verify_pool_size() -> usize {
-    std::thread::available_parallelism()
-        .map(|parallelism| parallelism.get())
-        .unwrap_or(1)
-        .div_ceil(2)
-        .clamp(1, 8)
-}
-
-#[cfg(debug_assertions)]
-fn strict_verify_paths_for_debug() -> &'static std::sync::Mutex<VecDeque<PathBuf>> {
-    static STRICT_VERIFY_FILE_PATHS: OnceLock<std::sync::Mutex<VecDeque<PathBuf>>> =
-        OnceLock::new();
-    STRICT_VERIFY_FILE_PATHS.get_or_init(|| std::sync::Mutex::new(VecDeque::new()))
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn reset_verify_file_strict_count_for_debug() {
-    STRICT_VERIFY_FILE_CALLS.store(0, Ordering::Relaxed);
-    strict_verify_paths_for_debug()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .clear();
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn verify_file_strict_count_for_debug() -> usize {
-    STRICT_VERIFY_FILE_CALLS.load(Ordering::Relaxed)
-}
-
-/// Strict-verification count attributed to one root. The bare process-global
-/// count is meaningless under parallel tests (any concurrent semantic or
-/// search load increments it); tests asserting "MY operation ran no strict
-/// verification" must count only paths under their own fixture root.
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn verify_file_strict_count_under_for_debug(root: &Path) -> usize {
-    strict_verify_paths_for_debug()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .iter()
-        .filter(|path| path.starts_with(root))
-        .count()
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn reset_hash_file_if_small_count_for_debug() {
-    HASH_FILE_IF_SMALL_CALLS.with(|calls| calls.set(0));
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn hash_file_if_small_count_for_debug() -> usize {
-    HASH_FILE_IF_SMALL_CALLS.with(Cell::get)
-}
-
-#[cfg(any(debug_assertions, test))]
-#[doc(hidden)]
-pub fn watch_hash_file_for_debug(path: &Path) {
-    *WATCHED_HASH_FILE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((path.to_path_buf(), 0));
-}
-
-#[cfg(any(debug_assertions, test))]
-#[doc(hidden)]
-pub fn watched_hash_file_count_for_debug() -> usize {
-    WATCHED_HASH_FILE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .as_ref()
-        .map_or(0, |(_, count)| *count)
-}
-
-fn verify_file_inner(
-    path: &Path,
-    cached: &FileFreshness,
-    hash_matching_metadata: bool,
-) -> FreshnessVerdict {
-    let Ok(metadata) = fs::metadata(path) else {
-        return FreshnessVerdict::Deleted;
-    };
-    let new_size = metadata.len();
-    let new_mtime = metadata.modified().unwrap_or(UNIX_EPOCH);
-    if new_size == cached.size && new_mtime == cached.mtime {
-        if hash_matching_metadata {
-            if new_size > CONTENT_HASH_SIZE_CAP || cached.content_hash == zero_hash() {
-                return FreshnessVerdict::Stale;
-            }
-            return match hash_file_if_small(path, new_size) {
-                Ok(Some(hash)) if hash == cached.content_hash => FreshnessVerdict::HotFresh,
-                _ => FreshnessVerdict::Stale,
-            };
-        }
-        return FreshnessVerdict::HotFresh;
-    }
-    if new_size != cached.size || new_size > CONTENT_HASH_SIZE_CAP {
-        return FreshnessVerdict::Stale;
-    }
-    match hash_file_if_small(path, new_size) {
-        Ok(Some(hash)) if hash == cached.content_hash => FreshnessVerdict::ContentFresh {
-            new_mtime,
-            new_size,
-        },
-        _ => FreshnessVerdict::Stale,
-    }
-}
-
-#[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
     use super::*;
-    use std::io::Write;
 
-    #[test]
-    fn audit10_freshness_hash_streams_bounded_buffers() {
-        struct MeasuredReader<'a> {
-            bytes: std::io::Cursor<Vec<u8>>,
-            largest: &'a mut usize,
-            consumed: &'a mut usize,
-        }
-        impl std::io::Read for MeasuredReader<'_> {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                *self.largest = (*self.largest).max(buffer.len());
-                let read = self.bytes.read(buffer)?;
-                *self.consumed += read;
-                Ok(read)
-            }
-        }
-        let data = vec![b'x'; 64 * 1024];
-        let mut largest = 0;
-        let mut consumed = 0;
-        let (hash, bytes_read) = hash_small_reader(MeasuredReader {
-            bytes: std::io::Cursor::new(data.clone()),
-            largest: &mut largest,
-            consumed: &mut consumed,
-        })
-        .unwrap();
-        assert_eq!(hash, Some(blake3::hash(&data)));
-        assert_eq!(bytes_read, data.len() as u64);
-        assert_eq!(consumed, data.len());
-        assert!(largest <= 8192, "read buffer grew to {largest}");
-        let data = vec![b'x'; CONTENT_HASH_SIZE_CAP as usize + 16384];
-        let mut largest = 0;
-        let mut consumed = 0;
-        let (hash, _) = hash_small_reader(MeasuredReader {
-            bytes: std::io::Cursor::new(data),
-            largest: &mut largest,
-            consumed: &mut consumed,
-        })
-        .unwrap();
-        assert!(hash.is_none());
-        assert_eq!(consumed as u64, CONTENT_HASH_SIZE_CAP + 1);
-    }
-
-    #[test]
-    fn audit10_file_growing_past_the_cap_has_no_hash() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("grown.rs");
-        fs::write(&path, vec![b'x'; CONTENT_HASH_SIZE_CAP as usize + 1]).unwrap();
-        // The caller's stat said the file was small; it grew afterwards.
-        assert!(hash_file_if_small(&path, 1).unwrap().is_none());
-        fs::write(&path, b"small").unwrap();
-        assert_eq!(
-            hash_file_if_small(&path, 5).unwrap(),
-            Some(blake3::hash(b"small"))
-        );
-    }
-
-    fn write(path: &Path, bytes: &[u8]) {
-        fs::write(path, bytes).unwrap();
-    }
+    #[allow(unused_imports)]
+    pub(crate) use aft_base::cache_freshness::tests::*;
 
     /// Phase-3 gating benchmark: stat-all (non-strict verify_file) vs hash-all
     /// (strict verify_file_strict) cost across a real repo's file set, with NO
@@ -590,7 +76,15 @@ mod tests {
             return;
         };
         let root = std::path::PathBuf::from(&repo);
-        let files: Vec<std::path::PathBuf> = crate::callgraph::walk_project_files(&root).collect();
+        let files: Vec<std::path::PathBuf> = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect();
 
         // Cold pass: collect freshness records (this is the cold-build cost, not
         // what we're optimizing — just needed to seed the warm comparison).
@@ -645,258 +139,15 @@ mod tests {
             hash_med / stat_med.max(0.001)
         );
     }
-
-    #[test]
-    fn hot_fresh_when_mtime_size_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        write(&path, b"same");
-        let fresh = collect(&path).unwrap();
-        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
-    }
-
-    #[test]
-    fn strict_hashes_small_file_when_metadata_matches() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
-        write(&path, b"alpha");
-        filetime::set_file_mtime(&path, original_mtime).unwrap();
-        let fresh = collect(&path).unwrap();
-
-        assert_eq!(
-            verify_file_strict(&path, &fresh),
-            FreshnessVerdict::HotFresh
-        );
-
-        write(&path, b"bravo");
-        filetime::set_file_mtime(&path, original_mtime).unwrap();
-
-        // Stat-diff freshness intentionally treats same-size, same-mtime edits as
-        // fresh; Tier-2's staleness ceiling heals this accepted residual with a
-        // periodic strict pass instead of hashing every file on each edit.
-        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
-        assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
-    }
-
-    #[test]
-    fn strict_stale_when_large_file_hash_was_not_cached() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.bin");
-        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
-        let file = fs::File::create(&path).unwrap();
-        file.set_len(CONTENT_HASH_SIZE_CAP + 1).unwrap();
-        filetime::set_file_mtime(&path, original_mtime).unwrap();
-        let fresh = collect(&path).unwrap();
-
-        assert_eq!(fresh.size, CONTENT_HASH_SIZE_CAP + 1);
-        assert_eq!(fresh.content_hash, zero_hash());
-        // Non-strict stat-diff trusts unchanged metadata for over-cap files and
-        // avoids strict's needless rescan of large unchanged files.
-        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::HotFresh);
-        assert_eq!(verify_file_strict(&path, &fresh), FreshnessVerdict::Stale);
-    }
-
-    #[test]
-    fn content_fresh_when_only_mtime_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        write(&path, b"same");
-        let fresh = collect(&path).unwrap();
-        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
-        file.write_all(b"").unwrap();
-        aft_store::sync::sync_all(&file, &path).unwrap();
-        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
-        assert!(matches!(
-            verify_file(&path, &fresh),
-            FreshnessVerdict::ContentFresh { .. }
-        ));
-    }
-
-    #[test]
-    fn stale_when_size_changes() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        write(&path, b"same");
-        let fresh = collect(&path).unwrap();
-        write(&path, b"different");
-        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::Stale);
-    }
-
-    #[test]
-    fn deleted_when_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("a.txt");
-        write(&path, b"same");
-        let fresh = collect(&path).unwrap();
-        fs::remove_file(&path).unwrap();
-        assert_eq!(verify_file(&path, &fresh), FreshnessVerdict::Deleted);
-    }
-
-    #[test]
-    fn over_cap_hash_is_not_computed() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("big.bin");
-        fs::write(&path, vec![0u8; CONTENT_HASH_SIZE_CAP as usize + 1]).unwrap();
-        assert!(hash_file_if_small(&path, CONTENT_HASH_SIZE_CAP + 1)
-            .unwrap()
-            .is_none());
-    }
-
-    #[test]
-    fn audit_growth_repeated_bulk_verification_builds_only_one_pool() {
-        let dir = tempfile::tempdir().unwrap();
-        let mut files = Vec::new();
-        for index in 0..2 {
-            let path = dir.path().join(format!("pool-{index}.rs"));
-            write(&path, b"fn pool() {}\n");
-            files.push((index, path.clone(), collect(&path).unwrap()));
-        }
-        let before = STRICT_VERIFY_POOL_BUILDS.load(Ordering::Relaxed);
-        for _ in 0..2 {
-            let results = verify_files_bounded(files.clone(), VerifyStrategy::StatFirst);
-            assert_eq!(results.len(), 2);
-        }
-        let builds = STRICT_VERIFY_POOL_BUILDS.load(Ordering::Relaxed) - before;
-        assert_eq!(builds, 1, "two calls share one Rayon pool construction");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn audit_growth_debug_strict_verify_path_history_is_bounded() {
-        const MAX_PATH_HISTORY: usize = 4096;
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("debug-history.rs");
-        write(&path, b"");
-        let freshness = collect(&path).unwrap();
-        for _ in 0..(MAX_PATH_HISTORY + 8) {
-            let _ = verify_file_strict(&path, &freshness);
-        }
-        assert!(
-            verify_file_strict_count_under_for_debug(dir.path()) <= MAX_PATH_HISTORY,
-            "debug path history exceeded {MAX_PATH_HISTORY} entries"
-        );
-    }
 }
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod warm_reload_tests {
-    use super::*;
-
-    #[test]
-    fn stat_first_hashes_only_files_with_changed_metadata_while_cold_verify_is_strict() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("warm.rs");
-        fs::write(&path, b"fn warm() {}\n").unwrap();
-        let original_mtime = filetime::FileTime::from_unix_time(1_700_000_000, 0);
-        filetime::set_file_mtime(&path, original_mtime).unwrap();
-        let freshness = collect(&path).unwrap();
-
-        watch_hash_file_for_debug(&path);
-        let unchanged = verify_files_bounded(
-            vec![((), path.clone(), freshness)],
-            VerifyStrategy::StatFirst,
-        );
-        assert_eq!(unchanged[0].2, FreshnessVerdict::HotFresh);
-        assert_eq!(watched_hash_file_count_for_debug(), 0);
-
-        watch_hash_file_for_debug(&path);
-        let cold = verify_files_strict_bounded(vec![((), path.clone(), freshness)]);
-        assert_eq!(cold[0].2, FreshnessVerdict::HotFresh);
-        assert_eq!(watched_hash_file_count_for_debug(), 1);
-
-        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1, 0)).unwrap();
-        watch_hash_file_for_debug(&path);
-        let changed_stat = verify_files_bounded(
-            vec![((), path.clone(), freshness)],
-            VerifyStrategy::StatFirst,
-        );
-        assert!(matches!(
-            changed_stat[0].2,
-            FreshnessVerdict::ContentFresh { .. }
-        ));
-        assert_eq!(watched_hash_file_count_for_debug(), 1);
-    }
-
-    #[test]
-    fn verify_memo_skips_hits_and_invalidates_on_watcher_or_generation_change() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("root");
-        let artifact = dir.path().join("cache.bin");
-        fs::create_dir(&root).unwrap();
-        fs::write(&artifact, b"generation-one").unwrap();
-        let generation_one = artifact_generation(&artifact).unwrap();
-
-        assert_eq!(
-            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_one)),
-            WarmVerifyPlan::Strict
-        );
-        record_verify_completed(&root, VerifyArtifact::Search, Some(generation_one));
-        assert_eq!(
-            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_one)),
-            WarmVerifyPlan::Skip
-        );
-
-        invalidate_verify_memo(&root);
-        assert_eq!(
-            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_one)),
-            WarmVerifyPlan::StatFirst
-        );
-
-        fs::write(&artifact, b"generation-two-is-different").unwrap();
-        let generation_two = artifact_generation(&artifact).unwrap();
-        assert_ne!(generation_one, generation_two);
-        assert_eq!(
-            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation_two)),
-            WarmVerifyPlan::Strict
-        );
-    }
-
-    #[test]
-    fn invalidation_between_verify_and_record_prevents_false_fresh_memo() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path().join("root");
-        let artifact = dir.path().join("cache.bin");
-        fs::create_dir(&root).unwrap();
-        fs::write(&artifact, b"stable-generation").unwrap();
-        let generation = artifact_generation(&artifact).unwrap();
-
-        let stale_ticket = capture_verify_ticket(&root);
-        invalidate_verify_memo(&root);
-        assert!(!record_verify_completed_if_unchanged(
-            &root,
-            VerifyArtifact::Search,
-            Some(generation),
-            stale_ticket,
-        ));
-        assert_eq!(
-            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation)),
-            WarmVerifyPlan::Strict
-        );
-
-        let current_ticket = capture_verify_ticket(&root);
-        assert!(record_verify_completed_if_unchanged(
-            &root,
-            VerifyArtifact::Search,
-            Some(generation),
-            current_ticket,
-        ));
-        assert_eq!(
-            warm_verify_plan(&root, VerifyArtifact::Search, Some(generation)),
-            WarmVerifyPlan::Skip
-        );
-    }
-
     #[cfg(unix)]
-    fn process_cpu_time() -> Duration {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
-        assert_eq!(result, 0, "getrusage should report process CPU time");
-        let usage = unsafe { usage.assume_init() };
-        let seconds = (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as u64;
-        let micros = (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as u64;
-        Duration::from_secs(seconds) + Duration::from_micros(micros)
-    }
+    use super::*;
+    #[allow(unused_imports)]
+    pub(crate) use aft_base::cache_freshness::warm_reload_tests::*;
 
     /// Measures the configure -> eviction -> rebind freshness component against
     /// a real repository. The first pass models a cold strict verification; the
@@ -908,9 +159,16 @@ mod warm_reload_tests {
         let root = PathBuf::from(
             std::env::var("AFT_BENCH_REPO").expect("AFT_BENCH_REPO must name a repository"),
         );
-        let records = crate::callgraph::walk_project_files(&root)
-            .filter_map(|path| collect(&path).ok().map(|freshness| (path, freshness)))
-            .collect::<Vec<_>>();
+        let records = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .filter_map(|path| collect(&path).ok().map(|freshness| (path, freshness)))
+        .collect::<Vec<_>>();
         let artifact_dir = tempfile::tempdir().unwrap();
         let artifact = artifact_dir.path().join("cache.bin");
         fs::write(&artifact, b"stable-generation").unwrap();

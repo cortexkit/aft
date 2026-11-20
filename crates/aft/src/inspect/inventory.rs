@@ -49,7 +49,15 @@ mod tests {
             "export const internal = 1;\n",
         );
         crate::project_content::register_storage_root(&root.join("storage"));
-        let mut sources = crate::callgraph::walk_project_files(&root).collect::<Vec<_>>();
+        let mut sources = crate::callgraph::walk_project_files(
+            &root,
+            if crate::data_layer::read_fence::active() {
+                crate::project_walk::IgnoreFileAccess::Fenced
+            } else {
+                crate::project_walk::IgnoreFileAccess::Allowed
+            },
+        )
+        .collect::<Vec<_>>();
         sources.sort();
         let manifests = entry_points::collect_entry_point_manifests(&root);
         let inventory = Arc::new(InspectInventory::collect(&root, || true));
@@ -244,7 +252,7 @@ mod tests {
         write(&root, "pkg/package.json", "{\"main\":\"one.js\"}");
         let cache =
             crate::inspect::InspectCache::open(storage.path().to_path_buf(), root.clone()).unwrap();
-        let category = crate::inspect::InspectCategory::Duplicates;
+        let category = crate::inspect_category::InspectCategory::Duplicates;
         let original = cache.contribution_set_hash(category).unwrap();
         let inventory = Arc::new(InspectInventory::collect(&root, || true));
         let guard = inventory.install();
@@ -406,8 +414,16 @@ impl InspectInventory {
         let budget = Arc::new(keep_walking);
         let (mut sources, mut manifests) = if walks_use_other_ignore_settings(root) {
             let walk_budget = Arc::clone(&budget);
-            let sources =
-                crate::callgraph::walk_project_files_while(root, move || walk_budget()).collect();
+            let sources = crate::callgraph::walk_project_files_while(
+                root,
+                if crate::data_layer::read_fence::active() {
+                    crate::project_walk::IgnoreFileAccess::Fenced
+                } else {
+                    crate::project_walk::IgnoreFileAccess::Allowed
+                },
+                move || walk_budget(),
+            )
+            .collect();
             let entry_budget = Arc::clone(&budget);
             let entries =
                 entry_points::uncached_entry_point_files_while(&normalized_root, move || {
@@ -490,7 +506,7 @@ impl InspectInventory {
             });
             let mut walker = builder.build();
             while budget() && walker.next().is_some() {
-                crate::run_tool_call::progress::report();
+                crate::tool_progress::report();
             }
             drop(walker);
             let mut state = census.lock().unwrap();

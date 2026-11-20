@@ -7,8 +7,8 @@ use std::time::Duration;
 
 use aft::commands::semantic_search::comparator::CandidateResult;
 use aft::commands::semantic_search::evidence_descriptor::EvidenceDescriptor;
+use aft::commands::semantic_search::exact_lane::ExactLane;
 use aft::commands::semantic_search::generation_token::GenerationToken;
-use aft::search_index::exact_lane::ExactLane;
 use aft::search_index::memo::{
     compute_file_content_digest, ExactMemoStore, MemoError, MemoKey, VerifiedExactSet,
 };

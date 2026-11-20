@@ -1,3 +1,4 @@
+use crate::grep_executor::git_exclude::git_info_exclude_for_target;
 const LINE_COUNT_BYTES: u64 = 1024 * 1024;
 const ENTRY_BUDGET: usize = 10_000;
 
@@ -15,7 +16,7 @@ use crate::commands::read::{handle_github_outline, is_github_read_target};
 use crate::context::AppContext;
 use crate::edit;
 use crate::error::AftError;
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 use crate::parser::{
     node_range_with_decorators, node_text, FileParser, LangId, ParsedFile, RustModule,
     TreeSitterProvider,
@@ -39,20 +40,8 @@ thread_local! {
     static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// A single entry in the outline tree.
-///
-/// Top-level symbols have an empty `members` vec. Classes/structs contain
-/// their methods and nested types in `members`, forming a recursive tree.
-#[derive(Debug, Clone, Serialize)]
-pub struct OutlineEntry {
-    pub name: String,
-    pub kind: String,
-    pub range: Range,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub signature: Option<String>,
-    pub exported: bool,
-    pub members: Vec<OutlineEntry>,
-}
+pub(crate) use crate::parser::outline_facts::symbol_to_entry;
+pub use crate::parser::outline_facts::OutlineEntry;
 
 /// Handle an `outline` request.
 ///
@@ -70,7 +59,7 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = crate::bounded_io::command(req, ctx, handle_outline_inner);
+    let mut response = crate::bounded_io_command::command(req, ctx, handle_outline_inner);
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
     super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
     response
@@ -465,7 +454,7 @@ fn excluded_read_paths(req: &RawRequest, ctx: &AppContext) -> HashSet<PathBuf> {
         // Restricted reads can use a canonical path internally even when the
         // host denied the file using the project-root path supplied by the caller.
         if let Ok(canonical) = std::fs::canonicalize(ctx.resolve_relative_path(&path)) {
-            excluded.insert(crate::inspect::job::normalize_path(&canonical));
+            excluded.insert(crate::path_identity::normalize_path(&canonical));
         }
     }
     excluded
@@ -482,7 +471,7 @@ fn is_read_excluded(excluded: &HashSet<PathBuf>, path: &Path) -> bool {
     }
     excluded.contains(path)
         || std::fs::canonicalize(path).is_ok_and(|canonical| {
-            excluded.contains(&crate::inspect::job::normalize_path(&canonical))
+            excluded.contains(&crate::path_identity::normalize_path(&canonical))
         })
 }
 
@@ -631,67 +620,7 @@ struct FileOutline {
     language: Option<LangId>,
 }
 
-#[derive(Clone)]
-struct TestSummary {
-    name: String,
-    range: Range,
-    items: usize,
-    unknown_reason: Option<&'static str>,
-}
-
-#[derive(Clone)]
-struct TestRegion {
-    summary: TestSummary,
-    included_path: Option<String>,
-    implicit_include: bool,
-    module_scope: Vec<String>,
-    standalone: bool,
-}
-
-/// What the multi-file structure map needs from one parse of a file beyond
-/// its symbols: the test regions it collapses and, for Rust, the methods
-/// declared in each trait it previews. Both depend only on the file's own
-/// text, so they are stored next to the symbols in the shared symbol cache
-/// under the same freshness key, and a warm outline renders the file without
-/// reading or parsing it. Test includes are resolved at render time, because
-/// they depend on other files and on the caller's read policy.
-pub(crate) struct OutlineParseFacts {
-    test_regions: Vec<TestRegion>,
-    trait_previews: Vec<(Range, Vec<OutlineEntry>)>,
-}
-
-impl OutlineParseFacts {
-    /// Rough resident size, for the symbol cache's memory estimate.
-    pub(crate) fn estimated_bytes(&self) -> u64 {
-        fn entry_bytes(entry: &OutlineEntry) -> u64 {
-            (std::mem::size_of::<OutlineEntry>()
-                + entry.name.len()
-                + entry.kind.len()
-                + entry.signature.as_ref().map_or(0, String::len)) as u64
-                + entry.members.iter().map(entry_bytes).sum::<u64>()
-        }
-        let regions = self
-            .test_regions
-            .iter()
-            .map(|region| {
-                (std::mem::size_of::<TestRegion>()
-                    + region.summary.name.len()
-                    + region.included_path.as_ref().map_or(0, String::len)
-                    + region.module_scope.iter().map(String::len).sum::<usize>())
-                    as u64
-            })
-            .sum::<u64>();
-        let previews = self
-            .trait_previews
-            .iter()
-            .map(|(_, methods)| {
-                std::mem::size_of::<(Range, Vec<OutlineEntry>)>() as u64
-                    + methods.iter().map(entry_bytes).sum::<u64>()
-            })
-            .sum::<u64>();
-        std::mem::size_of::<Self>() as u64 + regions + previews
-    }
-}
+use crate::parser::outline_facts::{OutlineParseFacts, TestRegion, TestSummary};
 
 /// Languages whose structure map collapses test code into summary rows.
 fn structure_language(path: &Path) -> Option<LangId> {
@@ -1537,7 +1466,11 @@ fn build_outline_gitignore(
     if !ignore_file.is_file() {
         return None;
     }
-    if crate::project_content::storage_root_for_path(ignore_file).is_some()
+    if crate::project_content::storage_root_for_path(
+        ignore_file,
+        &crate::access_policy::StoragePaths,
+    )
+    .is_some()
         || crate::db::file_identity::is_live_sqlite_file(ignore_file)
     {
         return None;
@@ -1545,46 +1478,6 @@ fn build_outline_gitignore(
     let mut builder = ignore::gitignore::GitignoreBuilder::new(root);
     let _ = builder.add(ignore_file);
     builder.build().ok().map(Arc::new)
-}
-
-pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
-    for repository_root in target.ancestors() {
-        let git_entry = repository_root.join(".git");
-        let Ok(metadata) = crate::bounded_io::metadata(&git_entry) else {
-            continue;
-        };
-        let git_dir = if metadata.is_dir() {
-            git_entry
-        } else if metadata.is_file() {
-            let contents = crate::bounded_io::read_to_string(&git_entry).ok()?;
-            let git_dir = contents.trim().strip_prefix("gitdir:")?.trim();
-            let git_dir = PathBuf::from(git_dir);
-            if git_dir.is_absolute() {
-                git_dir
-            } else {
-                repository_root.join(git_dir)
-            }
-        } else {
-            continue;
-        };
-        let git_dir = std::fs::canonicalize(&git_dir).unwrap_or(git_dir);
-        let common_dir = git_dir.join("commondir");
-        let git_common_dir = if let Ok(common) = crate::bounded_io::read_to_string(&common_dir) {
-            let common = PathBuf::from(common.trim());
-            if common.is_absolute() {
-                common
-            } else {
-                git_dir.join(common)
-            }
-        } else {
-            git_dir
-        };
-        return Some((
-            repository_root.to_path_buf(),
-            git_common_dir.join("info/exclude"),
-        ));
-    }
-    None
 }
 
 fn handle_outline_files_mode(
@@ -2709,7 +2602,7 @@ fn requested_outline_files(files: &[serde_json::Value]) -> (Vec<&str>, bool) {
 /// The `files` entries an outline request examines: none for a revision,
 /// files-mode or directory outline (those branches never read the list),
 /// otherwise the entries [`requested_outline_files`] keeps. The pre-handler
-/// access probe in [`crate::bounded_io::command`] uses this so that it never
+/// access probe in [`crate::bounded_io_command::command`] uses this so that it never
 /// probes an entry the handler skips.
 pub(crate) fn outline_examined_files(req: &RawRequest) -> Vec<&str> {
     if crate::revision_read::requested_ref(req).is_some()
@@ -2918,7 +2811,7 @@ fn outline_many_files(
         };
         match structure {
             Ok(entries) => {
-                crate::run_tool_call::progress::report();
+                crate::tool_progress::report();
                 let outline = FileOutline {
                     absolute_path: path.clone(),
                     path: rel_path,
@@ -4147,20 +4040,6 @@ impl MultiFileTreeWriter {
     }
 }
 
-pub(crate) fn symbol_to_entry(sym: &Symbol) -> OutlineEntry {
-    OutlineEntry {
-        name: sym.name.clone(),
-        kind: serde_json::to_value(&sym.kind)
-            .ok()
-            .and_then(|v| v.as_str().map(String::from))
-            .unwrap_or_else(|| format!("{:?}", sym.kind).to_lowercase()),
-        range: sym.range.clone(),
-        signature: sym.signature.clone(),
-        exported: sym.exported,
-        members: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     thread_local! {
@@ -4568,12 +4447,12 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 assert!(response.success);
                 let paths = response.data["content_files"].as_array().unwrap();
                 assert!(
-                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                    paths.contains(&serde_json::json!(crate::path_identity::normalize_path(
                         &allowed
                     )))
                 );
                 assert_eq!(
-                    paths.contains(&serde_json::json!(crate::inspect::job::normalize_path(
+                    paths.contains(&serde_json::json!(crate::path_identity::normalize_path(
                         &denied
                     ))),
                     !exclude
@@ -4740,7 +4619,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             assert!(!text.contains("z.ts"));
             assert_eq!(
                 response.data["content_files"],
-                serde_json::json!([crate::inspect::job::normalize_path(&shown)])
+                serde_json::json!([crate::path_identity::normalize_path(&shown)])
             );
         }
     }
@@ -4794,13 +4673,13 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|path| crate::inspect::job::normalize_path(Path::new(path.as_str().unwrap())))
+                .map(|path| crate::path_identity::normalize_path(Path::new(path.as_str().unwrap())))
                 .collect()
         };
-        let root = crate::inspect::job::normalize_path(&root);
+        let root = crate::path_identity::normalize_path(&root);
         let expected: Vec<_> = ["a/b.rs", "a-b.rs", "z.rs"]
             .into_iter()
-            .map(|file| crate::inspect::job::normalize_path(&root.join(file)))
+            .map(|file| crate::path_identity::normalize_path(&root.join(file)))
             .collect();
         let ctx = AppContext::new(
             Box::new(TreeSitterProvider::new()),
@@ -5137,7 +5016,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let (_temp, files, ctx) = navigation_fixture();
         for (path, leaves) in files.iter().zip(cases) {
             // Without a project root the manifest names the canonical file.
-            let manifest_path = crate::inspect::job::canonicalize_normalized(path);
+            let manifest_path = crate::path_identity::canonicalize_normalized(path);
             let symbols = ["alpha", "beta"].into_iter().zip(leaves).map(|(name, (range, content, before, after))| serde_json::json!({
                 "name":name, "response":{
                     "id":"zoom-golden", "success":true, "name":name, "kind":"function",
@@ -6467,11 +6346,11 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             params["id"] = serde_json::json!("probe-bound");
             params["command"] = serde_json::json!("outline");
             let request: RawRequest = serde_json::from_value(params).unwrap();
-            crate::bounded_io::COMMAND_INPUT_PROBES.with(|probes| probes.set(0));
+            crate::bounded_io_command::COMMAND_INPUT_PROBES.with(|probes| probes.set(0));
             let response = handle_outline(&request, &ctx);
             assert!(response.success, "{response:?}");
             assert_eq!(
-                crate::bounded_io::COMMAND_INPUT_PROBES.with(std::cell::Cell::get),
+                crate::bounded_io_command::COMMAND_INPUT_PROBES.with(std::cell::Cell::get),
                 expected
             );
         }

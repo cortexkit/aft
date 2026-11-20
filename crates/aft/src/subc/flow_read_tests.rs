@@ -840,7 +840,7 @@ fn flow_read_revoked_between_snapshot_and_recheck() {
     // normalizes its argument the same way before deleting. A raw
     // canonicalize() result differs on Windows (a \\?\ verbatim prefix), so
     // the revocation below would match no row there.
-    let path = crate::access_policy::policy_path(&parent.project_root.join("script"));
+    let path = crate::policy_path::policy_path(&parent.project_root.join("script"));
     {
         let db = ctx.db().unwrap();
         let conn = db.lock().unwrap();

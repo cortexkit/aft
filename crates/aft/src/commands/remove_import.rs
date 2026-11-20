@@ -103,13 +103,13 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
     let module = module_owned.as_str();
 
     // --- Parse file and imports ---
-    let (source, tree, block, observation) = match imports::parse_file_imports_observed(&path, lang)
-    {
-        Ok(result) => result,
-        Err(e) => {
-            return Response::error(&req.id, e.code(), e.to_string());
-        }
-    };
+    let (source, tree, block, observation) =
+        match crate::edit::parse_file_imports_observed(&path, lang) {
+            Ok(result) => result,
+            Err(e) => {
+                return Response::error(&req.id, e.code(), e.to_string());
+            }
+        };
 
     if lang == LangId::Vue {
         if let Err(err) = imports::vue_single_script_content_range(&tree) {

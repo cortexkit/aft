@@ -3,11 +3,12 @@
 //! stored records.
 
 pub mod callgraph;
+pub mod callgraph_roots;
+pub mod callgraph_store_adapter;
 pub mod checkout;
 pub mod checkout_gate;
 pub mod content;
 pub(crate) mod dead_code;
-pub mod dead_code_gate;
 pub mod dead_code_graph;
 pub mod edit_gate;
 pub mod extract_gate;
@@ -25,6 +26,8 @@ pub(crate) mod grammar;
 mod grammar_tests;
 pub(crate) mod graph_rows;
 pub(crate) mod graph_store;
+pub mod host;
+pub(crate) mod ignore_rules;
 pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
@@ -33,10 +36,13 @@ pub mod old_index;
 pub(crate) mod outline;
 pub(crate) mod overlay;
 pub(crate) mod parent;
+pub(crate) mod parent_query;
 pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
 pub(crate) mod query;
+#[doc(hidden)]
+pub mod read_fence;
 mod refresh_budget;
 mod refresh_memory;
 #[cfg(feature = "test-hooks")]
@@ -52,6 +58,7 @@ mod site_records_tests;
 pub(crate) mod slice;
 pub(crate) mod slice_cache;
 pub mod standing;
+pub mod status;
 pub(crate) mod subjects;
 pub mod surfaces;
 pub mod symbol_prewarm_measure;
@@ -62,6 +69,12 @@ pub mod symbol_prewarm_measure;
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
 mod test_gates;
-pub(crate) mod tools;
 pub mod trace_measure;
 pub mod vectors;
+
+pub(crate) mod bound_checkouts;
+pub(crate) mod meaning_query;
+pub(crate) mod text_scope;
+
+pub(crate) mod dead_code_reads;
+pub mod dead_code_snapshot;

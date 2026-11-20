@@ -390,7 +390,7 @@ fn access_policy_preserved_location_resolves_parent_before_dotdot() {
 
 fn artifact_read_context() -> (tempfile::TempDir, AppContext, PathBuf) {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
 
     let directory = tempfile::tempdir().unwrap();
     let resolved = directory.path().canonicalize().unwrap();
@@ -725,7 +725,7 @@ fn artifact_read_search_symlinked_storage_matches_main_bytes() {
             .strip_prefix(original.config().storage_dir.as_ref().unwrap())
             .unwrap(),
     );
-    assert_ne!(storage, crate::access_policy::policy_path(&storage));
+    assert_ne!(storage, crate::policy_path::policy_path(&storage));
     assert_eq!(
         ctx.validate_read_path("policy-test", "policy-session", artifact.parent().unwrap())
             .unwrap_err()

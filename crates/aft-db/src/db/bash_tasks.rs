@@ -1,0 +1,1127 @@
+use std::path::{Path, PathBuf};
+
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row};
+
+static STORE_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn store_revision() -> u64 {
+    STORE_REVISION.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn record_store_write(result: rusqlite::Result<usize>) -> rusqlite::Result<usize> {
+    if matches!(result, Ok(changed) if changed > 0) {
+        // Transaction callers hold their connection until commit. A rollback
+        // can advance the generation too: one extra rescan is safer than a
+        // missed write. data_version also detects commits on other connections.
+        STORE_REVISION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        changed();
+    }
+    result
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "retention_query_plan_tests.rs"]
+#[cfg_attr(not(test), allow(dead_code, unused_imports))]
+pub mod query_plan_tests;
+
+pub const TERMINAL_ROW_RETENTION_AGE_MS: i64 = 30 * 24 * 60 * 60 * 1000;
+const MAX_TERMINAL_PRUNE_ROWS: usize = 500;
+
+const TERMINAL_ROW_PREDICATE: &str = "
+    status IN ('completed', 'failed', 'killed', 'timed_out')
+    AND completed_at IS NOT NULL
+    AND completed_at < ?1
+    AND completion_delivered = 1";
+
+const TERMINAL_PRUNE_PREDICATE: &str = "
+    status IN ('completed', 'failed', 'killed', 'timed_out')
+    AND completed_at IS NOT NULL
+    AND completed_at < ?1
+    AND completion_delivered = 1
+    AND NOT EXISTS (
+        SELECT 1 FROM bash_pattern_watches AS watch
+        WHERE watch.harness = bash_tasks.harness
+          AND watch.session_id = bash_tasks.session_id
+          AND watch.task_id = bash_tasks.task_id
+    )";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalRowsPrune {
+    pub removed: usize,
+    /// Rows left in the bounded `limit + 1` probe. Reaching the probe limit
+    /// means additional SQL candidates may remain beyond this count.
+    pub remaining_candidates: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalPruneCandidate {
+    pub(crate) harness: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub(crate) pid: Option<i64>,
+    pub(crate) pgid: Option<i64>,
+    pub(crate) started_at: i64,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+}
+
+/// Shell facts checked outside the database lock before deleting terminal rows.
+#[derive(Clone, Copy)]
+pub struct RetentionHooks {
+    pub write_order_is_live: fn(&str, &str) -> bool,
+    pub process_alive: fn(u32, u64) -> bool,
+    pub layout_is_gone: fn(Option<&Path>, &TerminalPruneCandidate) -> bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct TerminalPrunePlan {
+    storage_root: Option<PathBuf>,
+    candidates: Vec<TerminalPruneCandidate>,
+    probed_candidates: usize,
+    cutoff: i64,
+}
+
+/// Cloned per attempt when a retention transaction retries after finding
+/// another process's write lock, since each attempt consumes its copy.
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedTerminalPrune {
+    identities: Vec<TerminalPruneCandidate>,
+    probed_candidates: usize,
+    cutoff: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashTaskRow {
+    pub harness: String,
+    pub session_id: String,
+    pub task_id: String,
+    pub project_key: String,
+    pub command: String,
+    pub cwd: String,
+    pub status: String,
+    pub exit_code: Option<i64>,
+    pub pid: Option<i64>,
+    pub pgid: Option<i64>,
+    pub started_at: i64,
+    pub completed_at: Option<i64>,
+    pub stdout_path: Option<String>,
+    pub stderr_path: Option<String>,
+    pub compressed: bool,
+    pub timeout_ms: Option<i64>,
+    pub completion_delivered: bool,
+    pub output_bytes: Option<i64>,
+    /// Includes the remote job ID, contiguous delivered seq and committed
+    /// output lengths. Replay prefers the atomic task file if this mirror lags.
+    pub metadata: String,
+}
+
+pub fn upsert_bash_task(conn: &Connection, row: &BashTaskRow) -> rusqlite::Result<()> {
+    // Acknowledgement can arrive through a different registry or connection
+    // while this snapshot is queued. Snapshots cannot undo it. Only promotion
+    // may reset completion_delivered to false under the task DB fence, creating
+    // a new completion notification.
+    record_store_write(conn.execute(
+        "INSERT INTO bash_tasks (
+            harness, session_id, task_id, project_key, command, cwd, status,
+            exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+            compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19
+         )
+         ON CONFLICT(harness, session_id, task_id) DO UPDATE SET
+            project_key = excluded.project_key,
+            command = excluded.command,
+            cwd = excluded.cwd,
+            status = excluded.status,
+            exit_code = excluded.exit_code,
+            pid = excluded.pid,
+            pgid = excluded.pgid,
+            started_at = excluded.started_at,
+            completed_at = excluded.completed_at,
+            stdout_path = excluded.stdout_path,
+            stderr_path = excluded.stderr_path,
+            compressed = excluded.compressed,
+            timeout_ms = excluded.timeout_ms,
+            completion_delivered = bash_tasks.completion_delivered OR excluded.completion_delivered,
+            output_bytes = excluded.output_bytes,
+            metadata = excluded.metadata",
+        params![
+            row.harness,
+            row.session_id,
+            row.task_id,
+            row.project_key,
+            row.command,
+            row.cwd,
+            row.status,
+            row.exit_code,
+            row.pid,
+            row.pgid,
+            row.started_at,
+            row.completed_at,
+            row.stdout_path,
+            row.stderr_path,
+            row.compressed,
+            row.timeout_ms,
+            row.completion_delivered,
+            row.output_bytes,
+            row.metadata,
+        ],
+    ))?;
+    Ok(())
+}
+
+/// Backfill a disk-only task without replacing a row committed after discovery.
+pub fn insert_bash_task_if_missing(conn: &Connection, row: &BashTaskRow) -> rusqlite::Result<()> {
+    record_store_write(conn.execute(
+        "INSERT INTO bash_tasks (
+            harness, session_id, task_id, project_key, command, cwd, status,
+            exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+            compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7,
+            ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+            ?15, ?16, ?17, ?18, ?19
+         ) ON CONFLICT(harness, session_id, task_id) DO NOTHING",
+        params![
+            row.harness,
+            row.session_id,
+            row.task_id,
+            row.project_key,
+            row.command,
+            row.cwd,
+            row.status,
+            row.exit_code,
+            row.pid,
+            row.pgid,
+            row.started_at,
+            row.completed_at,
+            row.stdout_path,
+            row.stderr_path,
+            row.compressed,
+            row.timeout_ms,
+            row.completion_delivered,
+            row.output_bytes,
+            row.metadata,
+        ],
+    ))?;
+    Ok(())
+}
+
+/// IDs of all persisted rows for one session, across harnesses. No project,
+/// status or delivery filter: replay uses this set to skip metadata files
+/// already represented by authoritative database rows, without decoding them.
+pub fn list_bash_task_ids_for_session(
+    conn: &Connection,
+    session_id: &str,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut ids = std::collections::HashSet::new();
+    let mut stmt =
+        conn.prepare("SELECT task_id FROM bash_tasks WHERE harness = ?1 AND session_id = ?2")?;
+    for harness in bash_task_harnesses(conn)? {
+        let rows = stmt.query_map(params![harness, session_id], |row| row.get::<_, String>(0))?;
+        for id in rows {
+            ids.insert(id?);
+        }
+    }
+    Ok(ids)
+}
+
+pub fn delete_delivered_terminal_bash_task(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+    reason: &str,
+) -> rusqlite::Result<usize> {
+    let deleted = record_store_write(conn.execute(
+        "DELETE FROM bash_tasks
+         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
+           AND completion_delivered = 1
+           AND status IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')",
+        params![harness, session_id, task_id],
+    ))?;
+    // Retries affect zero rows after the first successful DELETE.
+    if deleted > 0 {
+        crate::slog_debug!("bash task row deleted: task_id={task_id} reason={reason}");
+    }
+    Ok(deleted)
+}
+
+pub fn delete_bash_task(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+) -> rusqlite::Result<usize> {
+    record_store_write(conn.execute(
+        "DELETE FROM bash_tasks
+         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+        params![harness, session_id, task_id],
+    ))
+}
+
+/// Remove acknowledged terminal rows only after the retention age has passed
+/// and the task layout is absent. The filesystem check uses the same lookup and
+/// initialization grace as persisted-task garbage collection, so a task being
+/// created concurrently is not mistaken for a missing task.
+pub fn prune_terminal_rows(
+    conn: &Connection,
+    now_ms: i64,
+    limit: usize,
+    hooks: RetentionHooks,
+) -> rusqlite::Result<TerminalRowsPrune> {
+    prune_terminal_rows_guarded(conn, now_ms, limit, hooks, |_| false)
+}
+
+pub(crate) fn prune_terminal_rows_guarded(
+    conn: &Connection,
+    now_ms: i64,
+    limit: usize,
+    hooks: RetentionHooks,
+    is_registered_in_process: impl Fn(&str) -> bool,
+) -> rusqlite::Result<TerminalRowsPrune> {
+    let plan = select_terminal_prune_candidates(conn, now_ms, limit)?;
+    let prepared = prepare_terminal_prune(plan, hooks, is_registered_in_process);
+    delete_prepared_terminal_rows(conn, prepared)
+}
+
+/// Count rows that meet the SQL retention predicate without filesystem or PID checks.
+pub fn terminal_rows_eligible_count(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
+    let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
+    let terminal_rows = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
+             WHERE {TERMINAL_ROW_PREDICATE}"
+        ),
+        [cutoff],
+        |row| row.get::<_, i64>(0),
+    )?;
+    // Start from the normally tiny watch table instead of visiting every retained
+    // task row. A plain JOIN leaves the order to the planner, which prefers the
+    // `status` index on `bash_tasks` and then reads every terminal row's table
+    // page to test `completed_at`: on a machine with 160k retained tasks that is
+    // a read of the whole table on every health report. SQLite never reorders a
+    // CROSS JOIN, so the watch table stays the outer loop and each watch costs
+    // one primary-key lookup.
+    let watched_terminal_rows = conn.query_row(
+        &format!(
+            "SELECT COUNT(*) FROM (
+                SELECT task.harness, task.session_id, task.task_id
+                FROM bash_pattern_watches AS watch
+                CROSS JOIN bash_tasks AS task
+                  ON task.harness = watch.harness
+                 AND task.session_id = watch.session_id
+                 AND task.task_id = watch.task_id
+                WHERE {TERMINAL_ROW_PREDICATE}
+                GROUP BY task.harness, task.session_id, task.task_id
+             )"
+        ),
+        [cutoff],
+        |row| row.get::<_, i64>(0),
+    )?;
+    let eligible = terminal_rows.saturating_sub(watched_terminal_rows);
+    Ok(usize::try_from(eligible).unwrap_or(usize::MAX))
+}
+
+pub(crate) fn select_terminal_prune_candidates(
+    conn: &Connection,
+    now_ms: i64,
+    limit: usize,
+) -> rusqlite::Result<TerminalPrunePlan> {
+    let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
+    let bounded_limit = limit.min(MAX_TERMINAL_PRUNE_ROWS);
+    let probe_limit = bounded_limit.saturating_add(1);
+    let mut candidates = conn
+        .prepare(&format!(
+            "SELECT harness, session_id, task_id, pid, pgid, started_at,
+                    stdout_path, stderr_path
+             FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
+             WHERE {TERMINAL_PRUNE_PREDICATE}
+             LIMIT ?2"
+        ))?
+        .query_map(
+            params![cutoff, i64::try_from(probe_limit).unwrap_or(501)],
+            |row| {
+                Ok(TerminalPruneCandidate {
+                    harness: row.get(0)?,
+                    session_id: row.get(1)?,
+                    task_id: row.get(2)?,
+                    pid: row.get(3)?,
+                    pgid: row.get(4)?,
+                    started_at: row.get(5)?,
+                    stdout_path: row.get(6)?,
+                    stderr_path: row.get(7)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let probed_candidates = candidates.len();
+    candidates.truncate(bounded_limit);
+    let storage_root = conn
+        .path()
+        .and_then(|path| Path::new(path).parent())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf);
+    Ok(TerminalPrunePlan {
+        storage_root,
+        candidates,
+        probed_candidates,
+        cutoff,
+    })
+}
+
+pub(crate) fn prepare_terminal_prune(
+    plan: TerminalPrunePlan,
+    hooks: RetentionHooks,
+    is_registered_in_process: impl Fn(&str) -> bool,
+) -> PreparedTerminalPrune {
+    prepare_terminal_prune_observed(plan, hooks, is_registered_in_process, || {})
+}
+
+pub(crate) fn prepare_terminal_prune_observed(
+    plan: TerminalPrunePlan,
+    hooks: RetentionHooks,
+    is_registered_in_process: impl Fn(&str) -> bool,
+    observe_stat_phase: impl FnOnce(),
+) -> PreparedTerminalPrune {
+    observe_stat_phase();
+    let identities = plan
+        .candidates
+        .into_iter()
+        .filter(|candidate| {
+            // A task some registry still holds may have a row snapshot queued
+            // behind the aft.db mutex, which would re-insert a pruned row.
+            !is_registered_in_process(&candidate.task_id)
+                && !(hooks.write_order_is_live)(&candidate.session_id, &candidate.task_id)
+                && !candidate_process_is_alive(candidate, hooks.process_alive)
+                && (hooks.layout_is_gone)(plan.storage_root.as_deref(), candidate)
+        })
+        .collect();
+    PreparedTerminalPrune {
+        identities,
+        probed_candidates: plan.probed_candidates,
+        cutoff: plan.cutoff,
+    }
+}
+
+pub(crate) fn cap_prepared_terminal_rows(prepared: &mut PreparedTerminalPrune, limit: usize) {
+    prepared.identities.truncate(limit);
+}
+
+pub(crate) fn delete_prepared_terminal_rows(
+    conn: &Connection,
+    prepared: PreparedTerminalPrune,
+) -> rusqlite::Result<TerminalRowsPrune> {
+    let removed = if prepared.identities.is_empty() {
+        0
+    } else {
+        // Full key equality forces one identity lookup even without ANALYZE.
+        // A composite IN list lets SQLite scan every terminal row by status
+        // while holding the shared database mutex. Recheck eligibility here
+        // because watches and delivery state can change after preparation.
+        let mut delete = conn.prepare_cached(&format!(
+            "DELETE FROM bash_tasks
+             WHERE harness = ?2 AND session_id = ?3 AND task_id = ?4
+               AND {TERMINAL_PRUNE_PREDICATE}"
+        ))?;
+        let mut removed = 0;
+        for candidate in prepared.identities {
+            removed += record_store_write(delete.execute(params![
+                prepared.cutoff,
+                candidate.harness,
+                candidate.session_id,
+                candidate.task_id,
+            ]))?;
+        }
+        removed
+    };
+
+    Ok(TerminalRowsPrune {
+        removed,
+        remaining_candidates: prepared.probed_candidates.saturating_sub(removed),
+    })
+}
+
+fn candidate_process_is_alive(
+    candidate: &TerminalPruneCandidate,
+    process_alive: fn(u32, u64) -> bool,
+) -> bool {
+    let started_at = u64::try_from(candidate.started_at).unwrap_or_default();
+    candidate
+        .pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .into_iter()
+        .chain(candidate.pgid.and_then(|pid| u32::try_from(pid).ok()))
+        .any(|pid| process_alive(pid, started_at))
+}
+
+pub fn get_bash_task(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+) -> rusqlite::Result<Option<BashTaskRow>> {
+    conn.query_row(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3",
+        params![harness, session_id, task_id],
+        map_bash_task_row,
+    )
+    .optional()
+}
+
+const TASK_OWNER_SQL: &str =
+    "SELECT session_id FROM bash_tasks WHERE task_id = ?1 AND harness = ?2 LIMIT 1";
+
+pub fn find_bash_task_session(
+    conn: &Connection,
+    harness: &str,
+    task_id: &str,
+) -> rusqlite::Result<Option<String>> {
+    conn.query_row(TASK_OWNER_SQL, params![task_id, harness], |row| row.get(0))
+        .optional()
+}
+
+/// Task IDs remain unique across the harnesses and sessions of a project root.
+pub fn bash_task_by_id(conn: &Connection, task_id: &str) -> rusqlite::Result<Option<BashTaskRow>> {
+    conn.query_row(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE task_id = ?1 LIMIT 1",
+        params![task_id],
+        map_bash_task_row,
+    )
+    .optional()
+}
+
+const SESSION_TASKS_SQL: &str =
+    "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND session_id = ?2";
+
+pub fn list_bash_tasks_for_session(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+) -> rusqlite::Result<Vec<BashTaskRow>> {
+    let mut stmt = conn.prepare(SESSION_TASKS_SQL)?;
+    let mut rows = stmt
+        .query_map(params![harness, session_id], map_bash_task_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    // Task rows carry large command/metadata payloads. Sorting them in SQLite
+    // spills entire rows to a temporary file for long-lived sessions. Keep the
+    // legacy integer/BINARY order, but sort the already-required result vector.
+    rows.sort_by(|a, b| (a.started_at, &a.task_id).cmp(&(b.started_at, &b.task_id)));
+    Ok(rows)
+}
+
+/// The recorded process identity of one `bash_tasks` row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BashTaskProcessIds {
+    pub task_id: String,
+    pub pid: Option<i64>,
+    pub pgid: Option<i64>,
+    pub started_at: i64,
+}
+
+/// SQLite's default host-parameter limit is 999 on older builds; stay well
+/// under it with room for the harness parameter.
+const PROCESS_ID_LOOKUP_CHUNK: usize = 500;
+
+/// Every distinct harness with a `bash_tasks` row, found by one index seek
+/// per harness rather than by reading the table.
+pub(crate) fn bash_task_harnesses(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT MIN(harness) FROM bash_tasks WHERE harness > ?1")?;
+    let mut harnesses = Vec::new();
+    let mut after = String::new();
+    while let Some(next) = stmt.query_row(params![after], |row| row.get::<_, Option<String>>(0))? {
+        harnesses.push(next.clone());
+        after = next;
+    }
+    Ok(harnesses)
+}
+
+/// Recorded pids for every row of `task_ids`, under any harness and session.
+///
+/// The persisted-task GC asks this once per session directory instead of
+/// once per task, so a sweep takes the shared aft.db mutex a handful of times
+/// rather than once for every task on the machine. Only rows with a recorded
+/// pid or pgid are returned. Task ids are unique across harnesses, and routes
+/// from several harnesses share one project root, so a caller asking whether
+/// a task directory still belongs to a live process must not restrict the
+/// lookup to one harness.
+///
+/// The task-owner index seeks each requested task id within its harness;
+/// the project-lookup index would scan every project in that harness.
+pub fn list_bash_task_process_ids(
+    conn: &Connection,
+    task_ids: &[String],
+) -> rusqlite::Result<Vec<BashTaskProcessIds>> {
+    let mut found = Vec::new();
+    if task_ids.is_empty() {
+        return Ok(found);
+    }
+    for harness in bash_task_harnesses(conn)? {
+        for chunk in task_ids.chunks(PROCESS_ID_LOOKUP_CHUNK) {
+            let placeholders = vec!["?"; chunk.len()].join(", ");
+            let sql = format!(
+                "SELECT task_id, pid, pgid, started_at
+                 FROM bash_tasks INDEXED BY idx_bash_tasks_task_owner
+                 WHERE harness = ? AND task_id IN ({placeholders})
+                   AND (pid IS NOT NULL OR pgid IS NOT NULL)"
+            );
+            let mut stmt = conn.prepare(&sql)?;
+            let params = std::iter::once(harness.as_str()).chain(chunk.iter().map(String::as_str));
+            let rows = stmt.query_map(params_from_iter(params), |row| {
+                Ok(BashTaskProcessIds {
+                    task_id: row.get(0)?,
+                    pid: row.get(1)?,
+                    pgid: row.get(2)?,
+                    started_at: row.get(3)?,
+                })
+            })?;
+            for row in rows {
+                found.push(row?);
+            }
+        }
+    }
+    Ok(found)
+}
+
+pub fn list_replayable_bash_tasks_for_project(
+    conn: &Connection,
+    harness: &str,
+    project_key: &str,
+) -> rusqlite::Result<Vec<BashTaskRow>> {
+    // Another registry can acknowledge delivery without rewriting the metadata
+    // snapshot. Recover that disagreement once to checkpoint the acknowledged
+    // state, but continue excluding fully checkpointed terminal tasks.
+    // Keep this predicate identical to idx_bash_tasks_project_replay's WHERE:
+    // the partial index evaluates metadata at writes, not on each history scan.
+    let mut stmt = conn.prepare(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND project_key = ?2
+            AND (status NOT IN ('completed', 'failed', 'killed', 'timed_out', 'fate_unknown')
+                 OR completion_delivered = 0
+                 OR CASE WHEN json_valid(metadata)
+                         THEN json_type(metadata, '$.completion_delivered') = 'false'
+                         ELSE 0 END)
+         ORDER BY started_at ASC, task_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(params![harness, project_key], map_bash_task_row)?
+        .collect();
+    rows
+}
+
+/// Reconcile only the snapshot's delivery bit; a recovery snapshot must not
+/// replace newer status, output, or metadata committed by the task's owner.
+pub fn checkpoint_bash_task_acknowledgement(
+    conn: &Connection,
+    harness: &str,
+    session_id: &str,
+    task_id: &str,
+) -> rusqlite::Result<()> {
+    record_store_write(conn.execute(
+        "UPDATE bash_tasks
+         SET metadata = json_set(metadata, '$.completion_delivered', json('true'))
+         WHERE harness = ?1 AND session_id = ?2 AND task_id = ?3
+           AND completion_delivered = 1
+           AND CASE WHEN json_valid(metadata)
+                    THEN json_type(metadata, '$.completion_delivered') = 'false'
+                    ELSE 0 END",
+        params![harness, session_id, task_id],
+    ))?;
+    Ok(())
+}
+
+pub fn find_bash_task_for_project(
+    conn: &Connection,
+    harness: &str,
+    project_key: &str,
+    task_id: &str,
+) -> rusqlite::Result<Option<BashTaskRow>> {
+    conn.query_row(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+                exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+                compressed, timeout_ms, completion_delivered, output_bytes, metadata
+         FROM bash_tasks
+         WHERE harness = ?1 AND project_key = ?2 AND task_id = ?3
+         ORDER BY started_at DESC
+         LIMIT 1",
+        params![harness, project_key, task_id],
+        map_bash_task_row,
+    )
+    .optional()
+}
+
+fn map_bash_task_row(row: &Row<'_>) -> rusqlite::Result<BashTaskRow> {
+    Ok(BashTaskRow {
+        harness: row.get(0)?,
+        session_id: row.get(1)?,
+        task_id: row.get(2)?,
+        project_key: row.get(3)?,
+        command: row.get(4)?,
+        cwd: row.get(5)?,
+        status: row.get(6)?,
+        exit_code: row.get(7)?,
+        pid: row.get(8)?,
+        pgid: row.get(9)?,
+        started_at: row.get(10)?,
+        completed_at: row.get(11)?,
+        stdout_path: row.get(12)?,
+        stderr_path: row.get(13)?,
+        compressed: row.get::<_, i64>(14)? != 0,
+        timeout_ms: row.get(15)?,
+        completion_delivered: row.get::<_, i64>(16)? != 0,
+        output_bytes: row.get(17)?,
+        metadata: row.get::<_, Option<String>>(18)?.unwrap_or_default(),
+    })
+}
+
+/// Operator inventory includes acknowledged terminal tasks until its shorter
+/// display retention expires, as well as every task whose outcome is pending.
+pub fn operator_shell_rows(
+    conn: &Connection,
+    cutoff_ms: u64,
+) -> rusqlite::Result<Vec<BashTaskRow>> {
+    conn.prepare(
+        "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+        exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+        compressed, timeout_ms, completion_delivered, output_bytes, metadata
+        FROM bash_tasks WHERE completed_at IS NULL OR completed_at > ?1",
+    )?
+    .query_map(params![cutoff_ms as i64], map_bash_task_row)?
+    .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_replay_includes_only_uncheckpointed_terminal_acknowledgements() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        for (index, metadata) in [
+            r#"{"completion_delivered":false}"#,
+            r#"{"completion_delivered":true}"#,
+            "invalid JSON",
+            "{}",
+            r#"{"completion_delivered":0}"#,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let row = BashTaskRow {
+                harness: "opencode".into(),
+                session_id: "session".into(),
+                task_id: format!("bash-{index:016x}"),
+                project_key: "project".into(),
+                command: "true".into(),
+                cwd: ".".into(),
+                status: "completed".into(),
+                exit_code: Some(0),
+                pid: None,
+                pgid: None,
+                started_at: 1,
+                completed_at: Some(1),
+                stdout_path: None,
+                stderr_path: None,
+                compressed: false,
+                timeout_ms: None,
+                completion_delivered: true,
+                output_bytes: None,
+                metadata: metadata.into(),
+            };
+            upsert_bash_task(&conn, &row).unwrap();
+        }
+        let rows = list_replayable_bash_tasks_for_project(&conn, "opencode", "project").unwrap();
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["bash-0000000000000000"],
+            "only the DB acknowledgement missing from the serialized snapshot needs recovery"
+        );
+        conn.execute(
+            "UPDATE bash_tasks SET status = 'failed', exit_code = 42,
+                 command = 'newer owner command',
+                 metadata = json_set(metadata, '$.owner_revision', 17)
+             WHERE task_id = 'bash-0000000000000000'",
+            [],
+        )
+        .unwrap();
+        checkpoint_bash_task_acknowledgement(&conn, "opencode", "session", "bash-0000000000000000")
+            .unwrap();
+        let checkpoint = get_bash_task(&conn, "opencode", "session", "bash-0000000000000000")
+            .unwrap()
+            .unwrap();
+        assert_eq!(checkpoint.status, "failed");
+        assert_eq!(checkpoint.exit_code, Some(42));
+        assert_eq!(checkpoint.command, "newer owner command");
+        let snapshot: serde_json::Value = serde_json::from_str(&checkpoint.metadata).unwrap();
+        assert_eq!(snapshot["owner_revision"], 17);
+        assert_eq!(snapshot["completion_delivered"], true);
+        assert!(
+            list_replayable_bash_tasks_for_project(&conn, "opencode", "project")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn persisted_gc_row_deletion_is_debug_logged_not_a_warning() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        let row = BashTaskRow {
+            harness: "opencode".into(),
+            session_id: "session".into(),
+            task_id: "bash-0000000000000100".into(),
+            project_key: "project".into(),
+            command: "true".into(),
+            cwd: ".".into(),
+            status: "completed".into(),
+            exit_code: Some(0),
+            pid: None,
+            pgid: None,
+            started_at: 1,
+            completed_at: Some(1),
+            stdout_path: None,
+            stderr_path: None,
+            compressed: false,
+            timeout_ms: None,
+            completion_delivered: true,
+            output_bytes: None,
+            metadata: String::new(),
+        };
+        upsert_bash_task(&conn, &row).unwrap();
+
+        let (deleted, lines) = crate::logging::capture_log_lines(|| {
+            delete_delivered_terminal_bash_task(
+                &conn,
+                "opencode",
+                "session",
+                &row.task_id,
+                "persisted_gc_delivered_terminal",
+            )
+            .unwrap()
+        });
+
+        assert_eq!(deleted, 1);
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with("DEBUG ") && line.contains("persisted_gc_delivered_terminal")
+            }),
+            "routine persisted GC deletion was not debug-logged: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|line| line.starts_with("WARN ")),
+            "routine persisted GC deletion was warning-logged: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn session_history_preserves_sqlite_order_without_a_temp_sort() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        for (task, started, status) in [
+            ("é", 4, "running"),
+            ("a", 4, "completed"),
+            ("z", -1, "failed"),
+            ("A", 4, "failed"),
+            ("aa", 4, "running"),
+            ("first", i64::MIN, "completed"),
+        ] {
+            conn.execute("INSERT INTO bash_tasks
+                (harness, session_id, task_id, project_key, command, cwd, status, started_at, metadata)
+                VALUES ('opencode', 'session', ?1, 'project', ?2, '.', ?3, ?4, ?5)",
+                params![task, "command".repeat(8192), status, started, format!("metadata-{task}")]).unwrap();
+        }
+        let legacy = conn
+            .prepare(
+                "SELECT harness, session_id, task_id, project_key, command, cwd, status,
+            exit_code, pid, pgid, started_at, completed_at, stdout_path, stderr_path,
+            compressed, timeout_ms, completion_delivered, output_bytes, metadata
+            FROM bash_tasks WHERE harness = ?1 AND session_id = ?2
+            ORDER BY started_at ASC, task_id ASC",
+            )
+            .unwrap()
+            .query_map(params!["opencode", "session"], map_bash_task_row)
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let actual = list_bash_tasks_for_session(&conn, "opencode", "session").unwrap();
+        assert_eq!(format!("{actual:?}"), format!("{legacy:?}"));
+        assert_eq!(
+            actual
+                .iter()
+                .map(|r| r.task_id.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "z", "A", "a", "aa", "é"]
+        );
+        assert!(list_bash_tasks_for_session(&conn, "other", "session")
+            .unwrap()
+            .is_empty());
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {SESSION_TASKS_SQL}"))
+            .unwrap()
+            .query_map(params!["opencode", "session"], |r| r.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "session history must not spill task rows: {plan}"
+        );
+    }
+
+    #[test]
+    fn terminal_retention_count_uses_the_age_index() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&temp.path().join("aft.db")).unwrap();
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*)
+                 FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
+                 WHERE {TERMINAL_ROW_PREDICATE}"
+            ))
+            .unwrap()
+            .query_map([i64::MAX], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+
+        assert!(
+            plan.contains("idx_bash_tasks_terminal_retention"),
+            "terminal retention count did not use its age index: {plan}"
+        );
+    }
+
+    /// Pages a cold connection pulls from the database file while counting.
+    fn cold_count_page_reads(path: &Path, now_ms: i64) -> (usize, i32) {
+        let conn = crate::db::open_readonly(path).unwrap();
+        let mut current = 0;
+        let mut highwater = 0;
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut highwater,
+                1,
+            )
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        let eligible = terminal_rows_eligible_count(&conn, now_ms).unwrap();
+        let status = unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                conn.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut current,
+                &mut highwater,
+                0,
+            )
+        };
+        assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+        (eligible, current)
+    }
+
+    // Health reports call this count every few seconds. Its cost must follow
+    // the handful of watched tasks and old rows, not the whole task history:
+    // a join order that walks every terminal row reads the entire table.
+    #[test]
+    fn terminal_retention_count_reads_pages_for_watches_not_history() {
+        const RECENT_TERMINAL_ROWS: i64 = 2_000;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("aft.db");
+        let now_ms = 100 * TERMINAL_ROW_RETENTION_AGE_MS;
+        let old = now_ms - TERMINAL_ROW_RETENTION_AGE_MS - 1;
+        let recent = now_ms - 1;
+        let mut conn = crate::db::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let insert = |task: &str, completed_at: i64| {
+            tx.execute(
+                "INSERT INTO bash_tasks
+                    (harness, session_id, task_id, project_key, command, cwd, status,
+                     started_at, completed_at, completion_delivered)
+                 VALUES ('opencode', 'session', ?1, 'project', ?2, '.', 'completed', 0, ?3, 1)",
+                params![task, "x".repeat(2_000), completed_at],
+            )
+            .unwrap();
+        };
+        // Recent history: retained, so never eligible, but it dominates the table.
+        for index in 0..RECENT_TERMINAL_ROWS {
+            insert(&format!("recent-{index}"), recent);
+        }
+        for task in ["old-watched", "old-plain-1", "old-plain-2"] {
+            insert(task, old);
+        }
+        for (task, watch) in [("old-watched", "w1"), ("recent-7", "w2")] {
+            tx.execute(
+                "INSERT INTO bash_pattern_watches
+                    (harness, session_id, task_id, watch_id, pattern_kind, pattern, created_at)
+                 VALUES ('opencode', 'session', ?1, ?2, 'literal', 'x', 0)",
+                params![task, watch],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+        let table_pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(
+            table_pages > RECENT_TERMINAL_ROWS / 2,
+            "fixture too small to tell a history walk apart: {table_pages} pages"
+        );
+
+        let (eligible, page_reads) = cold_count_page_reads(&path, now_ms);
+
+        // The watched old row stays; the two unwatched old rows are eligible.
+        assert_eq!(eligible, 2);
+        assert!(
+            page_reads < 64,
+            "counting two watches and three old rows read {page_reads} of {table_pages} pages"
+        );
+    }
+
+    /// The persisted-task GC asks for recorded pids once per session
+    /// directory. The lookup covers every harness but must stay on the
+    /// task-keyed index: reading the whole task history per directory is
+    /// the cost it exists to avoid.
+    #[test]
+    fn process_id_lookup_reads_pages_for_requested_tasks_not_history() {
+        const HISTORY_ROWS: i64 = 2_000;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("aft.db");
+        let mut conn = crate::db::open(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        let insert = |harness: &str, task: &str, pid: i64| {
+            tx.execute(
+                "INSERT INTO bash_tasks
+                    (harness, session_id, task_id, project_key, command, cwd, status,
+                     pid, pgid, started_at)
+                 VALUES (?1, 'session', ?2, 'project', ?3, '.', 'completed', ?4, ?4, 0)",
+                params![harness, task, "x".repeat(2_000), pid],
+            )
+            .unwrap();
+        };
+        for index in 0..HISTORY_ROWS {
+            let harness = if index % 4 == 0 { "runner" } else { "opencode" };
+            insert(harness, &format!("history-{index}"), 1_000 + index);
+        }
+        insert("opencode", "wanted-opencode", 7);
+        insert("runner", "wanted-runner", 8);
+        tx.commit().unwrap();
+        let table_pages: i64 = conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        drop(conn);
+        assert!(
+            table_pages > HISTORY_ROWS / 2,
+            "fixture too small to tell a history walk apart: {table_pages} pages"
+        );
+
+        let conn = crate::db::open_readonly(&path).unwrap();
+        let cache_misses = |reset: i32| {
+            let (mut current, mut highwater) = (0, 0);
+            let status = unsafe {
+                rusqlite::ffi::sqlite3_db_status(
+                    conn.handle(),
+                    rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                    &mut current,
+                    &mut highwater,
+                    reset,
+                )
+            };
+            assert_eq!(status, rusqlite::ffi::SQLITE_OK);
+            current
+        };
+        cache_misses(1);
+        let mut found = list_bash_task_process_ids(
+            &conn,
+            &[
+                "wanted-opencode".to_string(),
+                "wanted-runner".to_string(),
+                "never-written".to_string(),
+            ],
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.task_id, row.pid))
+        .collect::<Vec<_>>();
+        let page_reads = cache_misses(0);
+        found.sort();
+
+        assert_eq!(
+            found,
+            [
+                ("wanted-opencode".to_string(), Some(7)),
+                ("wanted-runner".to_string(), Some(8)),
+            ],
+            "the lookup must find the tasks under every harness"
+        );
+        assert!(
+            i64::from(page_reads) < table_pages / 10,
+            "looking up three task ids read {page_reads} of {table_pages} pages"
+        );
+    }
+    #[test]
+    fn task_owner_lookup_uses_task_id_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let plan = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {TASK_OWNER_SQL}"))
+            .unwrap()
+            .query_map(params!["bash-0123456789abcdef", "opencode"], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_bash_tasks_task_owner")
+                    && detail.contains("SEARCH")
+                    && detail.contains("task_id=?")),
+            "{plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|detail| detail.contains("SCAN")),
+            "{plan:?}"
+        );
+        assert_eq!(
+            find_bash_task_session(&conn, "opencode", "bash-0123456789abcdef").unwrap(),
+            None
+        );
+    }
+}
+
+fn changes() -> &'static tokio::sync::watch::Sender<u64> {
+    static CHANGES: std::sync::OnceLock<tokio::sync::watch::Sender<u64>> =
+        std::sync::OnceLock::new();
+    CHANGES.get_or_init(|| tokio::sync::watch::channel(0).0)
+}
+
+pub fn changed() {
+    changes().send_modify(|revision| *revision = revision.wrapping_add(1));
+}
+
+pub fn subscribe() -> tokio::sync::watch::Receiver<u64> {
+    changes().subscribe()
+}

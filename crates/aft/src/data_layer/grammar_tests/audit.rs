@@ -285,7 +285,7 @@ fn missing_outlines() {
     assert!(!response.data["semantic_gap"]
         .to_string()
         .contains("binary.luau"));
-    let coverage = crate::data_layer::tools::search::DataSemantic::current(&f.ctx)
+    let coverage = crate::data_layer::meaning_query::DataSemantic::current(&f.ctx)
         .unwrap()
         .serving()
         .unwrap()

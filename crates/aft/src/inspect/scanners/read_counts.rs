@@ -16,7 +16,7 @@ mod tests {
     #[test]
     fn registered_roots_count_equivalent_path_spellings_only() {
         let fixture = tempfile::tempdir().unwrap();
-        let base = crate::inspect::job::canonicalize_normalized(fixture.path());
+        let base = crate::path_identity::canonicalize_normalized(fixture.path());
         let root = base.join("tracked");
         std::fs::create_dir(&root).unwrap();
         let counts = FileReadCounts::new();
@@ -35,7 +35,7 @@ mod tests {
         std::fs::write(root.join("file.rs"), "fn f() {}\n").unwrap();
         let alias = fixture.path().join("alias");
         std::os::unix::fs::symlink(&root, &alias).unwrap();
-        let root = crate::inspect::job::canonicalize_normalized(&root);
+        let root = crate::path_identity::canonicalize_normalized(&root);
         let counts = FileReadCounts::new();
         counts.reset(root.clone());
         counts.record(&alias.join("file.rs"));
@@ -57,7 +57,7 @@ impl FileReadCounts {
         // Match canonical fixture roots even when a read uses a symlinked
         // temporary directory or a Windows short name. Unregistered scans
         // return above without doing this filesystem lookup.
-        let path = crate::inspect::job::canonicalize_normalized(path);
+        let path = crate::path_identity::canonicalize_normalized(path);
         if let Ok(mut roots) = roots.lock() {
             for (root, counts) in roots.iter_mut() {
                 if path.starts_with(root) {

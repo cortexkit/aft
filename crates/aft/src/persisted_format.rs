@@ -24,6 +24,28 @@ use std::sync::{Mutex, OnceLock};
 /// consumer can recognise the refusal without parsing the rest of the text.
 pub const CODE: &str = "storage_requires_newer_reader";
 
+/// Current on-disk backup metadata schema version.
+///
+/// Bump this when the `meta.json` shape changes. Readers check the field and
+/// refuse or migrate older versions instead of misinterpreting them.
+///
+/// Version 5 adds the `directory` and `hardlink` entry kinds and the
+/// per-entry fields `link_to`, `hardlink_detached`, `post_state`,
+/// `external_change_before` and `external_change_checkpoint`. The new kinds
+/// never carry a `content_path`, so a version-4 reader, which reads an
+/// unknown kind as content and then requires its content file, fails closed
+/// on them; the new fields are optional, and readers treat them as unset when
+/// absent, so version-4 stacks load unchanged.
+// Version 6 marks disk metadata that can contain the `imported_guard` field,
+// which protects restored history imported from another store. Older disk
+// readers enforcing this version gate reject it; the SQLite mirror needs
+// separate downgrade protection before imported history can be exposed.
+pub const BACKUP_SCHEMA_VERSION: u32 = 6;
+/// Ordinary local history must remain readable by the current main daemon.
+/// Only a stack containing the `imported_guard` metadata field needs the newer reader format.
+pub(crate) const ORDINARY_BACKUP_SCHEMA_VERSION: u32 = 5;
+pub const BASH_TASK_SCHEMA_VERSION: u32 = 7;
+
 /// One independently versioned on-disk format.
 ///
 /// The name of each store is the key used in the reader floor file and in
@@ -114,8 +136,8 @@ impl PersistedStore {
             PersistedStore::SymbolCache => 3,
             PersistedStore::SymbolExtraction => 6,
             PersistedStore::ArtifactOwner => 1,
-            PersistedStore::BackupMeta => crate::backup::SCHEMA_VERSION,
-            PersistedStore::BashTask => crate::bash_background::persistence::SCHEMA_VERSION,
+            PersistedStore::BackupMeta => BACKUP_SCHEMA_VERSION,
+            PersistedStore::BashTask => BASH_TASK_SCHEMA_VERSION,
             PersistedStore::ViewsV3Registry => 3,
             PersistedStore::ViewsV3Store => 1,
         }
@@ -126,7 +148,7 @@ impl PersistedStore {
     /// ordinary history must not raise that reader floor merely on startup.
     pub fn written(self) -> u32 {
         match self {
-            Self::BackupMeta => crate::backup::ORDINARY_SCHEMA_VERSION,
+            Self::BackupMeta => ORDINARY_BACKUP_SCHEMA_VERSION,
             _ => self.supported(),
         }
     }
@@ -365,7 +387,7 @@ fn absolute_route(path: &Path) -> PathBuf {
     // storage root that owns the cache root, as if the cache were linked
     // under it. Spell it that way so it is routed, listed and cleared there,
     // and so the cache root never becomes a storage owner of its own.
-    match crate::root_cache::durable_route(&absolute) {
+    match crate::cache_location::durable_route(&absolute) {
         #[cfg(windows)]
         Some(route) => crate::windows_path::normalize_windows_path(&route),
         #[cfg(not(windows))]
@@ -381,7 +403,7 @@ fn canonical_scope(path: &Path) -> PathBuf {
     let resolved = crate::production_storage::canonicalized_with(&absolute, &|path| {
         std::fs::canonicalize(path).ok()
     });
-    crate::inspect::job::normalize_path(&resolved)
+    crate::path_identity::normalize_path(&resolved)
 }
 
 fn storage_roots() -> &'static std::sync::RwLock<Vec<std::sync::Arc<StorageRoot>>> {
@@ -463,15 +485,15 @@ fn registered_boundary(spelling: &Path, canonical: &Path) -> std::io::Result<Reg
         (Some(parent), Some(leaf)) => std::fs::canonicalize(parent).map(|parent| parent.join(leaf)),
         _ => std::fs::canonicalize(spelling),
     };
-    let path = crate::inspect::job::normalize_path(&observed?);
-    let normalized = crate::inspect::job::normalize_path(spelling);
+    let path = crate::path_identity::normalize_path(&observed?);
+    let normalized = crate::path_identity::normalize_path(spelling);
     // Lexical '..' cancellation is a direct spelling only when registration
     // proves it still reaches this root, rather than crossing a symlink parent.
     let normalized_spelling = if normalized != spelling {
         #[cfg(test)]
         ALIAS_VERIFICATIONS.with(|count| count.set(count.get() + 1));
         std::fs::canonicalize(&normalized)
-            .is_ok_and(|path| crate::inspect::job::normalize_path(&path) == canonical)
+            .is_ok_and(|path| crate::path_identity::normalize_path(&path) == canonical)
             .then_some(normalized)
     } else {
         None
@@ -513,7 +535,7 @@ impl RouteProbe {
 
     fn finish(&self, root: &StorageRoot, prefix: &Path) -> Option<PathBuf> {
         let relative = self.path.strip_prefix(prefix).ok()?;
-        let key = crate::inspect::job::normalize_path(&root.canonical.join(relative));
+        let key = crate::path_identity::normalize_path(&root.canonical.join(relative));
         key.starts_with(&root.canonical).then_some(key)
     }
 
@@ -545,8 +567,8 @@ impl RouteProbe {
         let Some(boundary) = root.boundary.as_ref() else {
             return false;
         };
-        let normalized = crate::inspect::job::normalize_path(&self.path);
-        let spelling = crate::inspect::job::normalize_path(&root.spelling);
+        let normalized = crate::path_identity::normalize_path(&self.path);
+        let spelling = crate::path_identity::normalize_path(&root.spelling);
         let could_outrank = [normalized.as_path(), selected_key]
             .into_iter()
             .any(|route| {
@@ -1067,6 +1089,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn backup_and_bash_persisted_versions_stay_compatible() {
+        assert_eq!(BACKUP_SCHEMA_VERSION, 6);
+        assert_eq!(ORDINARY_BACKUP_SCHEMA_VERSION, 5);
+        assert_eq!(BASH_TASK_SCHEMA_VERSION, 7);
+        assert_eq!(PersistedStore::BackupMeta.supported(), 6);
+        assert_eq!(PersistedStore::BackupMeta.written(), 5);
+        assert_eq!(PersistedStore::BashTask.supported(), 7);
+        assert_eq!(PersistedStore::BashTask.written(), 7);
+        assert_eq!(crate::backup::SCHEMA_VERSION, 6);
+        assert_eq!(crate::backup::ORDINARY_SCHEMA_VERSION, 5);
+        assert_eq!(crate::bash_background::persistence::SCHEMA_VERSION, 7);
+    }
+
+    #[test]
     fn diagnostics_findings_floor_snapshot_is_nonblocking_and_counts_only_floors() {
         if !isolated_owner_probe("persisted_format::tests::diagnostics_findings_floor_snapshot_is_nonblocking_and_counts_only_floors") { return; }
         let path = PathBuf::from("seeded-floor.json");
@@ -1294,7 +1330,7 @@ mod tests {
                     .unwrap()
                     .normalized_spelling
                     .as_ref(),
-                Some(&crate::inspect::job::normalize_path(&through_parent))
+                Some(&crate::path_identity::normalize_path(&through_parent))
             );
             let floor = UnsupportedPersistedFormat::floor(
                 store,
@@ -1755,7 +1791,7 @@ mod tests {
         assert_eq!(comparison_scope(&artifact), canonical_scope(&artifact));
         assert_eq!(
             comparison_scope(&artifact),
-            crate::inspect::job::normalize_path(&std::fs::canonicalize(&artifact).unwrap())
+            crate::path_identity::normalize_path(&std::fs::canonicalize(&artifact).unwrap())
         );
     }
 

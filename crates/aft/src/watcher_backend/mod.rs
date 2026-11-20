@@ -4,6 +4,7 @@ use std::sync::{mpsc, Arc};
 
 use crate::watcher_filter::SharedGitignore;
 pub(crate) mod cookie;
+pub(crate) mod counters;
 pub(crate) mod flush;
 
 // Directories inotify could not watch when it started. Recursive-handle
@@ -412,3 +413,5 @@ mod tests {
         );
     }
 }
+#[cfg(windows)]
+pub(crate) mod readiness;

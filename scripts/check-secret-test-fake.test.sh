@@ -1,77 +1,118 @@
 #!/usr/bin/env bash
-# Proves the release guard fails when either test-only feature would ship.
-#
-# Runs the guard against a throwaway copy of the workspace manifests, with one
-# change each time: a dependency edge that requests the feature, a `default`
-# feature that names it, and another crate declaring its own. A guard that
-# never fails proves nothing, so this test is what makes the CI step above it
-# meaningful.
+# Prove the guard admits explicit test opt-ins but rejects release activation.
 set -euo pipefail
 
 repo_root="$(git rev-parse --show-toplevel)"
-cd "$repo_root"
-
 guard="$repo_root/scripts/check-secret-test-fake.sh"
+fixtures="$repo_root/scripts/fixtures/check-secret-test-fake"
 
-work="$(mktemp -d "${TMPDIR:-/tmp}/secret-fake-guard.XXXXXX")"
-cleanup() { rm -rf "$work"; }
-trap cleanup EXIT
+mkdir -p "$repo_root/target/scratch"
+work="$(mktemp -d "$repo_root/target/scratch/secret-fake-guard.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
 
-# The guard asks git for the repository root; give the copy its own.
-copy_manifests() {
-  local into="$1"
-  rm -rf "$into"
-  mkdir -p "$into"
-  git -C "$repo_root" init -q "$into"
-  # Only the manifests matter; keep their directory shape.
-  ( cd "$repo_root" && git ls-files '*Cargo.toml' | while IFS= read -r file; do
-      mkdir -p "$into/$(dirname "$file")"
-      cp "$file" "$into/$file"
-    done )
+write_package() {
+  local directory="$1" package="$2"
+  mkdir -p "$directory/src"
+  printf '[package]\nname = "%s"\nversion = "0.1.0"\nedition = "2021"\n' "$package" >"$directory/Cargo.toml"
+  touch "$directory/src/lib.rs"
 }
 
+make_workspace() {
+  local directory="$1"
+  mkdir -p "$directory"
+  git init -q "$directory"
+  printf '%s\n' '[workspace]' 'resolver = "2"' \
+    'members = ["aft", "aft-base", "aft-tokenizer", "candidate"]' \
+    '[workspace.dependencies]' 'base = { package = "aft-base", path = "aft-base" }' \
+    >"$directory/Cargo.toml"
+  write_package "$directory/aft" agent-file-tools
+  write_package "$directory/aft-base" aft-base
+  write_package "$directory/aft-tokenizer" aft-tokenizer
+  write_package "$directory/candidate" candidate
+  printf '\n[features]\nsecret-test-fake = []\ntest-hooks = []\ntest-support = []\n' \
+    >>"$directory/aft-base/Cargo.toml"
+  printf '\n[features]\nsecret-test-fake = []\ntest-hooks = []\n' >>"$directory/aft/Cargo.toml"
+}
+
+passed=0
+rejected=0
 expect_ok() {
-  local label="$1" dir="$2"
-  if ! ( cd "$dir" && bash "$guard" >/dev/null 2>&1 ); then
-    printf 'self-test: %s should pass the guard but failed\n' "$label" >&2
+  local label="$1" directory="$2" output
+  if ! output=$(cd "$directory" && bash "$guard" 2>&1); then
+    printf 'self-test: %s should pass the guard but failed:\n%s\n' "$label" "$output" >&2
     exit 1
   fi
+  passed=$((passed + 1))
 }
 
 expect_fail() {
-  local label="$1" dir="$2"
-  if ( cd "$dir" && bash "$guard" >/dev/null 2>&1 ); then
+  local label="$1" directory="$2" expected="$3" output
+  if output=$(cd "$directory" && bash "$guard" 2>&1); then
     printf 'self-test: %s should fail the guard but passed\n' "$label" >&2
     exit 1
   fi
+  if [[ "$output" != *"$expected"* ]]; then
+    printf 'self-test: %s failed for the wrong reason; expected %s:\n%s\n' "$label" "$expected" "$output" >&2
+    exit 1
+  fi
+  rejected=$((rejected + 1))
 }
 
-clean="$work/clean"
-copy_manifests "$clean"
-expect_ok "the committed manifests" "$clean"
+expect_ok 'the committed manifests' "$repo_root"
 
-# Check both features independently so protecting the fake cannot mask a missing
-# fixture-hook guard.
+# Check dev-only requests, default sets, and declarations by another member
+# for both original flags. Only the default and normal dependency may leak.
 for feature in secret-test-fake test-hooks; do
-# 1. A dependency edge in another crate requests the feature.
-edge="$work/edge"
-copy_manifests "$edge"
-printf '\n[dev-dependencies]\nagent-file-tools = { path = "../aft", features = ["%s"] }\n' "$feature" \
-  >>"$edge/crates/aft-tokenizer/Cargo.toml"
-expect_fail "a dependency edge requesting $feature" "$edge"
+  edge="$work/dev-$feature"
+  make_workspace "$edge"
+  printf '\n[dev-dependencies]\nagent-file-tools = { path = "../aft", features = ["%s"] }\n' "$feature" \
+    >>"$edge/aft-tokenizer/Cargo.toml"
+  expect_ok "a dev dependency requesting $feature" "$edge"
 
-# 2. A default feature set names the test-only feature.
-default="$work/default"
-copy_manifests "$default"
-FEATURE="$feature" perl -0pi -e 's/\[features\]\n/[features]\ndefault = ["$ENV{FEATURE}"]\n/' \
-  "$default/crates/aft/Cargo.toml"
-expect_fail "a default feature naming $feature" "$default"
+  edge="$work/normal-$feature"
+  make_workspace "$edge"
+  printf '\n[dependencies]\nagent-file-tools = { path = "../aft", features = ["%s"] }\n' "$feature" \
+    >>"$edge/aft-tokenizer/Cargo.toml"
+  expect_fail "a normal dependency requesting $feature" "$edge" \
+    "non-dev dependency agent-file-tools requests protected feature $feature"
 
-# 3. Another crate declares its own feature of the same name.
-impostor="$work/impostor"
-copy_manifests "$impostor"
-printf '\n[features]\n%s = []\n' "$feature" >>"$impostor/crates/aft-tokenizer/Cargo.toml"
-expect_fail "an impostor $feature in another crate" "$impostor"
+  default="$work/default-$feature"
+  make_workspace "$default"
+  printf 'default = ["%s"]\n' "$feature" >>"$default/aft/Cargo.toml"
+  expect_fail "a default naming $feature" "$default" "default enables a protected feature: $feature"
+
+  declaration="$work/declaration-$feature"
+  make_workspace "$declaration"
+  printf '\n[features]\n%s = []\n' "$feature" >>"$declaration/aft-tokenizer/Cargo.toml"
+  expect_ok "an opt-in declaration of $feature on another workspace crate" "$declaration"
 done
 
-printf 'secret-test-fake guard self-test: ok (1 pass, 6 failures)\n'
+allowed="$work/allowed-forwards"
+make_workspace "$allowed"
+printf '%s\n' '[dependencies]' 'base = { workspace = true, optional = true }' \
+  '[features]' 'test-hooks = ["base?/test-support"]' 'test-support = ["dep:base", "base/test-hooks"]' \
+  >>"$allowed/candidate/Cargo.toml"
+expect_ok 'cross-feature forwarding to an optional, renamed workspace sibling' "$allowed"
+
+bad_manifest() {
+  local fixture="$1" diagnostic="$2" directory="$work/$1"
+  make_workspace "$directory"
+  cp "$fixtures/$fixture.toml" "$directory/candidate/Cargo.toml"
+  expect_fail "$fixture" "$directory" "$diagnostic"
+}
+
+bad_manifest default-test-support 'default enables a protected feature: test-support'
+bad_manifest default-forward 'default enables a protected feature: base/test-hooks'
+bad_manifest non-dev-edge 'non-dev dependency base requests protected feature test-support'
+bad_manifest external-forward 'test-hooks must forward aft-base/test-hooks to a declared protected feature of a workspace sibling'
+bad_manifest ordinary-forward 'ordinary feature release-ready enables a protected feature: aft-base?/test-support'
+bad_manifest strict-prerequisite 'test-hooks may only forward to a protected workspace feature: dep:base'
+
+outside="$work/outside"
+make_workspace "$outside"
+write_package "$outside/outside" outside
+cp "$fixtures/non-member.toml" "$outside/outside/Cargo.toml"
+expect_fail 'a protected declaration in a non-member crate' "$outside" \
+  'non-workspace crate declares protected feature test-hooks'
+
+printf 'secret-test-fake guard self-test: ok (%d pass, %d expected rejections)\n' "$passed" "$rejected"

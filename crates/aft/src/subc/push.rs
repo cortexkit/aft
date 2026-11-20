@@ -637,8 +637,8 @@ pub(super) fn routed_progress_job(
     route: RouteChannel,
     corr: u64,
     request_id: &str,
-    job: crate::executor::ExecutorJob,
-) -> crate::executor::ExecutorJob {
+    job: crate::context::ExecutorJob,
+) -> crate::context::ExecutorJob {
     let request_id = request_id.to_owned();
     Box::new(move |ctx| {
         let _progress =

@@ -26,9 +26,7 @@ mod status_inventory_tests;
 
 pub(crate) use status_inventory::StatusInventory;
 
-pub const DEFAULT_MAX_UNDO_DEPTH: usize = 20;
-/// Default upper bound for one automatic undo snapshot (64 MiB).
-pub const DEFAULT_MAX_BACKUP_FILE_SIZE: u64 = 64 * 1024 * 1024;
+pub use crate::config::{DEFAULT_MAX_BACKUP_FILE_SIZE, DEFAULT_MAX_UNDO_DEPTH};
 /// Most files one recursive delete may copy into the undo store.
 ///
 /// A recursive delete snapshots every file before it removes anything, and the
@@ -336,25 +334,8 @@ fn run_restore_before_lock_hook_for_tests(session: &str, attempt: usize) {
 #[cfg(not(test))]
 fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 
-/// Current on-disk backup metadata schema version.
-///
-/// Bump this when the `meta.json` shape changes. Readers check the field and
-/// refuse or migrate older versions instead of misinterpreting them.
-///
-/// Version 5 adds the `directory` and `hardlink` entry kinds and the
-/// per-entry fields `link_to`, `hardlink_detached`, `post_state`,
-/// `external_change_before` and `external_change_checkpoint`. The new kinds
-/// never carry a `content_path`, so a version-4 reader, which reads an
-/// unknown kind as content and then requires its content file, fails closed
-/// on them; the new fields are optional, and readers treat them as unset when
-/// absent, so version-4 stacks load unchanged.
-// Version 6 marks disk metadata that can contain imported guards. Older disk
-// readers enforcing this version gate reject it; the SQLite mirror needs
-// separate downgrade protection before imported history can be exposed.
-pub const SCHEMA_VERSION: u32 = 6;
-/// Ordinary local history must remain readable by the current main daemon.
-/// Only a stack containing imported guards needs the newer reader format.
-pub(crate) const ORDINARY_SCHEMA_VERSION: u32 = 5;
+pub use crate::persisted_format::BACKUP_SCHEMA_VERSION as SCHEMA_VERSION;
+pub(crate) use crate::persisted_format::ORDINARY_BACKUP_SCHEMA_VERSION as ORDINARY_SCHEMA_VERSION;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
@@ -4432,9 +4413,7 @@ impl BackupStore {
             Ok(metadata) if metadata.file_type().is_symlink() => path.parent().unwrap_or(path),
             _ => path,
         };
-        if self.temp_path_policy_applies()
-            && crate::bash_permissions::is_system_temp_path(temp_probe)
-        {
+        if self.temp_path_policy_applies() && crate::system_temp::is_system_temp_path(temp_probe) {
             return Ok(SnapshotDecision::Skip(BackupSkippedReason::TempPath));
         }
         let Some(max_file_size) = self.policy.max_file_size else {
@@ -4469,7 +4448,7 @@ impl BackupStore {
         if !self.policy.enabled || self.policy.max_file_size == Some(0) {
             return Some(BackupSkippedReason::Disabled);
         }
-        if self.temp_path_policy_applies() && crate::bash_permissions::is_system_temp_path(root) {
+        if self.temp_path_policy_applies() && crate::system_temp::is_system_temp_path(root) {
             return Some(BackupSkippedReason::TempPath);
         }
         None
@@ -5946,7 +5925,8 @@ fn refuse_storage_path_with_metadata(
     path: &Path,
     metadata: Option<&std::fs::Metadata>,
 ) -> Result<(), AftError> {
-    if crate::project_content::storage_root_for_path(path).is_some()
+    if crate::project_content::storage_root_for_path(path, &crate::access_policy::StoragePaths)
+        .is_some()
         || match metadata {
             Some(metadata) => {
                 crate::db::file_identity::is_live_sqlite_file_with_metadata(path, Some(metadata))
@@ -6810,35 +6790,7 @@ pub(crate) fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
     crate::private_storage::create_dir_all(path)
 }
 
-/// Publish a new durable store directory and any missing ancestors into their
-/// parents before committing records inside it. Existing directories cost no sync.
-pub(crate) fn create_private_durable_dir(path: &Path) -> std::io::Result<()> {
-    crate::production_storage::refuse_write(path)?;
-    if path.is_dir() {
-        return Ok(());
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        // A durable child entry is insufficient when an ancestor can vanish.
-        // Existing ancestors cost nothing; each new one publishes into its own
-        // parent before any records can be committed under this namespace.
-        create_private_durable_dir(parent)?;
-    }
-    let created = crate::private_storage::create_dir(path);
-    match created {
-        Ok(()) => {
-            crate::durability::record(crate::durability::EventKind::DirectoryCreated, path);
-            if let Some(parent) = path.parent() {
-                crate::durability::sync_dir(parent)?;
-            }
-            Ok(())
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && path.is_dir() => Ok(()),
-        Err(error) => Err(error),
-    }
-}
+pub(crate) use crate::durable_dir::create_private_durable_dir;
 
 fn write_temp_fsync_rename(dir: &Path, final_name: &str, content: &[u8]) -> std::io::Result<()> {
     write_temp_atomic_rename(dir, final_name, content, true)

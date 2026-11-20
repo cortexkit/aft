@@ -325,7 +325,7 @@ fn audit2_every_once_route_rechecks_file_kind_for_read_and_recursive_delete() {
 #[test]
 fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let f = Fixture::new();
     let storage = f.ctx.storage_dir();
     let paths = task_paths(&storage, "foreign-session", "bash-a2f0123456789012").unwrap();
@@ -658,7 +658,7 @@ impl Drop for ScratchCleanup {
 #[cfg(unix)]
 fn registered_scratch(f: &Fixture, session: &str, task: &str) -> (PathBuf, ScratchCleanup) {
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     let storage = f.ctx.storage_dir();
     let paths = task_paths(&storage, session, task).unwrap();
     std::fs::create_dir_all(&paths.dir).unwrap();
@@ -1419,7 +1419,7 @@ fn junction(link: &Path, target: &Path) {
 fn audit5_windows_location_names_the_opened_entry() {
     use crate::commands::delete_tree::win::{location, open_entry};
     let f = Fixture::new();
-    let root = crate::inspect::job::normalize_path(&std::fs::canonicalize(&f.root).unwrap());
+    let root = crate::path_identity::normalize_path(&std::fs::canonicalize(&f.root).unwrap());
     let target = f.root.join("target");
     std::fs::create_dir(&target).unwrap();
     let link = f.root.join("link");
@@ -2502,3 +2502,5 @@ fn outside_retry_cannot_override_a_floor_and_logs_the_refusal() {
     assert_eq!(refused.data["code"], "denied_floor", "{:?}", refused.data);
     assert_outside_retry_log(&lines, "denied_floor", &target, &token);
 }
+
+use crate::native_route::with_native_route;

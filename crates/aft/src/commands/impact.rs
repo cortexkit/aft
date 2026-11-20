@@ -70,7 +70,7 @@ fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     }
 
-    let (snapshot, data_view) = match crate::data_layer::tools::callgraph::ops_graph(
+    let (snapshot, data_view) = match crate::commands::data_callgraph::ops_graph(
         &req.id,
         "impact",
         ctx,
@@ -87,7 +87,7 @@ fn answer_impact(req: &RawRequest, ctx: &AppContext) -> Response {
         include_tests_param(req),
     );
     if let Some(response) =
-        crate::data_layer::tools::callgraph::failed_reads(&req.id, "impact", data_view.as_ref())
+        crate::commands::data_callgraph::failed_reads(&req.id, "impact", data_view.as_ref())
     {
         return response;
     }

@@ -9,6 +9,7 @@ pub(crate) mod partner;
 pub(crate) mod scope;
 pub(crate) mod service;
 pub(crate) mod start_view;
+pub(crate) mod store;
 
 pub(crate) const REFUSAL_STAGE: &str = "task_authority";
 

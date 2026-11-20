@@ -18,8 +18,8 @@ pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(1500);
 #[cfg(not(windows))]
 pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(300);
 const MIN_MARKER_BUDGET: Duration = Duration::from_millis(100);
-const MARKER_PREFIX: &str = ".aft-flush-";
-const GIT_MARKER_PREFIX: &str = "aft-flush-";
+pub(crate) use crate::watcher_markers::is_marker_path;
+use crate::watcher_markers::{is_flush_marker_path, GIT_MARKER_PREFIX, MARKER_PREFIX};
 
 #[derive(Debug)]
 struct Pending {
@@ -250,32 +250,6 @@ impl FlushControl {
         }
         true
     }
-}
-
-pub(crate) fn is_marker_path(path: &Path) -> bool {
-    // Corpus admission excludes both protocols, but command-report intake must
-    // not consume a views cookie before it reaches the driver's ordered queue.
-    super::cookie::is_cookie_path(path) || is_flush_marker_path(path)
-}
-
-fn is_flush_marker_path(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let suffix = name.strip_prefix(MARKER_PREFIX).or_else(|| {
-        path.parent()
-            .and_then(Path::file_name)
-            .filter(|parent| *parent == ".git")
-            .and_then(|_| name.strip_prefix(GIT_MARKER_PREFIX))
-    });
-    suffix
-        .and_then(|suffix| suffix.split_once('-'))
-        .is_some_and(|(pid, number)| {
-            !pid.is_empty()
-                && !number.is_empty()
-                && pid.bytes().all(|byte| byte.is_ascii_digit())
-                && number.bytes().all(|byte| byte.is_ascii_digit())
-        })
 }
 
 #[cfg(test)]

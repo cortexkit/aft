@@ -23,7 +23,9 @@ fn fixture_root() -> (tempfile::TempDir, PathBuf) {
 }
 
 fn duplicates_job(root: &Path) -> InspectJob {
-    let mut scope_files = aft::callgraph::walk_project_files(root).collect::<Vec<_>>();
+    let mut scope_files =
+        aft::callgraph::walk_project_files(root, aft::project_walk::IgnoreFileAccess::Allowed)
+            .collect::<Vec<_>>();
     scope_files.sort();
     let config = Config {
         project_root: Some(root.to_path_buf()),

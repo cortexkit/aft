@@ -131,7 +131,7 @@ fn assert_contract_row(row: &Value) {
 fn permissions_list_rows_for_agent_and_worker_grants() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(dir.path());
-    let home = crate::access_policy::policy_path(dir.path()).join("home");
+    let home = crate::policy_path::policy_path(dir.path()).join("home");
     let site = home.join("Work").join("site");
     let notes = home.join("Work").join("notes");
     {
@@ -207,7 +207,7 @@ fn permissions_list_rows_for_agent_and_worker_grants() {
 fn permissions_list_drops_grants_whose_scope_ended() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(dir.path());
-    let notes = crate::access_policy::policy_path(dir.path()).join("notes");
+    let notes = crate::policy_path::policy_path(dir.path()).join("notes");
     store::insert(
         &db.lock().unwrap(),
         &worker(),
@@ -348,7 +348,7 @@ fn permissions_revoke_makes_the_scope_ask_again_and_answers_not_found_twice() {
     let outside = dir.path().join("outside");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&outside).unwrap();
-    let outside = crate::access_policy::policy_path(&outside);
+    let outside = crate::policy_path::policy_path(&outside);
     store::insert_from_card(
         &db.lock().unwrap(),
         &worker(),
@@ -360,7 +360,7 @@ fn permissions_revoke_makes_the_scope_ask_again_and_answers_not_found_twice() {
         let mut policy = crate::access_policy::AccessPolicy::from_config(
             &Config::default(),
             &dir.path().join("store"),
-            vec![crate::access_policy::policy_path(&root)],
+            vec![crate::policy_path::policy_path(&root)],
             &dir.path().join("home"),
         );
         policy.grants = store::list(&db.lock().unwrap(), &worker()).unwrap();
@@ -391,7 +391,7 @@ fn permissions_revoke_makes_the_scope_ask_again_and_answers_not_found_twice() {
 fn permissions_revoke_reports_stopping_only_when_running_work_lost_access() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(dir.path());
-    let folder = crate::access_policy::policy_path(dir.path()).join("a");
+    let folder = crate::policy_path::policy_path(dir.path()).join("a");
     for scope in [head(), worker()] {
         store::insert(
             &db.lock().unwrap(),
@@ -839,7 +839,7 @@ async fn permissions_cingulate_route_serves_only_permissions_operations() {
     // path returns the one shared handle, whichever side opens it first.
     std::fs::create_dir_all(&storage).unwrap();
     let db = app.open_db(&storage.join("aft.db")).unwrap();
-    let folder = crate::access_policy::policy_path(dir.path()).join("notes");
+    let folder = crate::policy_path::policy_path(dir.path()).join("notes");
     {
         let conn = db.lock().unwrap();
         store::register_scope(&conn, &head(), None, &Config::default()).unwrap();

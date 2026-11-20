@@ -17,6 +17,10 @@ const DAEMON_SEMANTIC_INDEX_SOURCE = join(
   import.meta.dir,
   "../../../../../crates/aft/src/semantic_index.rs",
 );
+const ONNX_RUNTIME_PIN_SOURCE = join(
+  import.meta.dir,
+  "../../../../../crates/aft-base/src/ort_pin.rs",
+);
 
 function readDaemonSource(): string {
   const source = readFileSync(DAEMON_SEMANTIC_INDEX_SOURCE, "utf8");
@@ -47,7 +51,9 @@ export function daemonSemanticStatusWords(): string[] {
 
 /** Opening words of every missing-runtime message the daemon produces. */
 export function daemonMissingRuntimePrefix(): string {
-  const match = readDaemonSource().match(/ONNX_RUNTIME_MISSING_PREFIX: &str = "([^"]+)"/);
+  const match = readFileSync(ONNX_RUNTIME_PIN_SOURCE, "utf8").match(
+    /ONNX_RUNTIME_MISSING_PREFIX: &str = "([^"]+)"/,
+  );
   if (!match) {
     throw new Error("ONNX_RUNTIME_MISSING_PREFIX not found in the daemon source");
   }

@@ -1,3 +1,5 @@
+use self::remote::RemoteOomKillText;
+use crate::bash_background::{runner_notice_scheduler, scoped_tasks, TaskIdentityAuth};
 #[cfg(unix)]
 use crate::posix_spawn::Child;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -78,6 +80,8 @@ use super::watches::{
 use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
+mod saved_delivery;
+use saved_delivery::list_delivery_gaps;
 
 #[path = "lifecycle_scope.rs"]
 mod lifecycle_scope;
@@ -800,7 +804,7 @@ pub struct BgCompletion {
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
     )]
-    pub changed_files: Option<crate::bash_changed_files::Report>,
+    pub changed_files: Option<crate::protocol::Report>,
     pub task_id: String,
     /// Intentionally omitted from serialized completion payloads: push frames
     /// carry `session_id` at the BashCompletedFrame envelope level for routing.
@@ -970,7 +974,7 @@ pub struct BgTaskSnapshot {
         rename = "_bash_changed_files",
         skip_serializing_if = "Option::is_none"
     )]
-    pub changed_files: Option<crate::bash_changed_files::Report>,
+    pub changed_files: Option<crate::protocol::Report>,
     #[serde(flatten)]
     pub info: BgTaskInfo,
     pub exit_code: Option<i64>,
@@ -1340,7 +1344,7 @@ pub(crate) struct DuplicateRunningTask {
 #[path = "task_access.rs"]
 mod task_access;
 pub use scratch_retention::{RetainedScratchHealth, SCRATCH_RETENTION};
-pub(crate) use task_access::{is_task_environment, safe_task_entry};
+pub(crate) use task_access::safe_task_entry;
 
 /// What woke the watchdog pass in which a task was observed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1663,9 +1667,9 @@ pub(crate) struct BashDrainReplyState {
     /// loop can name the build-server job without reading task state.
     pub(crate) remote: Option<remote::RemoteProgress>,
     /// Artifact-free terminal diagnostics, published with the metadata before
-    /// the full output renderer can finish the canonical response below.
-    pub(crate) uncaptured_terminal_facts: Option<Arc<crate::protocol::Response>>,
-    pub(crate) uncaptured_terminal: Option<Arc<crate::protocol::Response>>,
+    /// the full output renderer can finish the canonical snapshot below.
+    pub(crate) uncaptured_terminal_facts: Option<Arc<BgTaskSnapshot>>,
+    pub(crate) uncaptured_terminal: Option<Arc<BgTaskSnapshot>>,
 }
 
 impl BashDrainReplyCache {
@@ -1685,9 +1689,7 @@ impl BashDrainReplyCache {
                     snapshot.output_preview = format!("{note}\n");
                 }
                 append_remote_report(&mut snapshot.output_preview, metadata);
-                Arc::new(
-                    crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
-                )
+                Arc::new(snapshot)
             });
         let mut published = self
             .0
@@ -2196,7 +2198,7 @@ impl BgTaskRegistry {
     ) -> Option<crate::bash_changed_files::BudgetGuard> {
         Some(self.task(task_id)?.changed_files.as_ref()?.budget(deadline))
     }
-    fn changed_files_report(&self, task_id: &str) -> Option<crate::bash_changed_files::Report> {
+    fn changed_files_report(&self, task_id: &str) -> Option<crate::protocol::Report> {
         let task = self.task(task_id)?;
         let mut report = task.changed_files.as_ref()?.finish().clone();
         self.mask_completion_text(task_id, &mut report.text);
@@ -2335,7 +2337,7 @@ impl BgTaskRegistry {
         #[cfg(unix)]
         if let Some(job) = self.db_hint_job(task_id) {
             if let Some(hint) = job.hint() {
-                crate::response_finalize::append_db_schema_hint(text, hint);
+                crate::shell_format::append_db_schema_hint(text, hint);
             }
         }
         #[cfg(not(unix))]
@@ -2668,7 +2670,7 @@ impl BgTaskRegistry {
         let mut queued = 0_u64;
         for path in paths {
             queued = queued.saturating_add(
-                crate::db::gh_speech::Store::new(path)
+                crate::gh_shim_speech::store::Store::new(path)
                     .pending_legacy_for_identity(session, task)
                     .ok()?,
             );
@@ -3505,7 +3507,7 @@ impl BgTaskRegistry {
         if !survivors_at_exit {
             let result = self.finish_terminal_transition(task, emit_frame, token_policy);
             self.inner.terminal_transition.notify_waiters();
-            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+            aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
             return result;
         }
 
@@ -3529,7 +3531,7 @@ impl BgTaskRegistry {
                     );
                 }
                 registry.inner.terminal_transition.notify_waiters();
-                crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+                aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
                 if settled.as_ref().is_some_and(|listing| !listing.is_clean()) {
                     std::thread::sleep(Duration::from_millis(1_700));
                     let _ = registry.sample_task_process_group(&task);
@@ -3684,7 +3686,8 @@ impl BgTaskRegistry {
                 };
                 Some((mask(&stdout)?, mask(&stderr)?))
             });
-        let mut bodies = crate::subc::rich_ui::display::bash_bodies(metadata, Some(bytes), streams);
+        let mut bodies =
+            crate::bash_background::frames::bash_bodies(metadata, Some(bytes), streams);
         if let Some(refusal) = (!metadata.local_fallback_started)
             .then(|| remote::remote_refusal(metadata))
             .flatten()
@@ -3737,7 +3740,7 @@ impl BgTaskRegistry {
             }
             display
         };
-        crate::subc::rich_ui::display::bash_terminal(
+        crate::bash_background::frames::bash_terminal(
             &display,
             bodies,
             &metadata.task_id,
@@ -3751,7 +3754,7 @@ impl BgTaskRegistry {
     /// `bash_watch` calls for the same task don't, so they can't attach the
     /// task to their own call's display records.
     pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
-        if !crate::subc::rich_ui::display::enabled() {
+        if !crate::bash_background::frames::enabled() {
             return;
         }
         let Some(task_id) = response.get("task_id").and_then(serde_json::Value::as_str) else {
@@ -3781,7 +3784,7 @@ impl BgTaskRegistry {
         let Some(display) = metadata.display.as_mut() else {
             return;
         };
-        crate::subc::rich_ui::display::bash_reply(display, bodies, deferred);
+        crate::bash_background::frames::bash_reply(display, bodies, deferred);
         let terminal = {
             let mut db = DeferredDbWrites::new(self, &task);
             let Ok(mut state) = task.lock_state() else {
@@ -3814,13 +3817,12 @@ impl BgTaskRegistry {
             .as_ref()
             .is_some_and(|remote| remote.explicit_runon && !remote.accepted)
         {
-            // Use the same canonical terminal rendering as a state-reading
-            // capture reply, including diagnostics, hints and list envelopes.
+            // Publish the terminal diagnostics, hints and bounded-output metadata
+            // in the snapshot. The caller renders the reply without taking
+            // task-state locks.
             let snapshot = self
                 .snapshot_with_terminal_cache(task, super::output::RUNNING_OUTPUT_PREVIEW_BYTES);
-            let reply = Arc::new(
-                crate::commands::bash_orchestrate::foreground_result_response("", snapshot),
-            );
+            let reply = Arc::new(snapshot);
             task.drain_reply
                 .0
                 .lock()
@@ -4100,7 +4102,7 @@ impl BgTaskRegistry {
             .unwrap_or_else(|e| e.into_inner());
         if delivery.is_some() {
             if *delivery == Some(RecoveredDelivery::Notice) {
-                crate::subc::retry_held_notice_fallback(
+                runner_notice_scheduler::retry_held_notice_fallback(
                     self.clone(),
                     metadata.task_id.clone(),
                     crate::db::call_ledger::Key {
@@ -4159,19 +4161,21 @@ impl BgTaskRegistry {
             call_key: key.key.clone(),
         };
         let mut fallback_error = Some("recovered result projection unavailable".to_string());
-        if let Some((frame, outcome, tool_result_body)) = crate::subc::recovered_bash_frame(
-            snapshot,
-            &ledger_key,
-            metadata
-                .project_root
-                .as_deref()
-                .unwrap_or(&metadata.workdir),
-            crate::tool_output::OutputScope::for_task(
-                &paths.session_dir,
-                &metadata.session_id,
-                self.clone(),
-            ),
-        ) {
+        if let Some((frame, outcome, tool_result_body)) =
+            crate::bash_background::frames::recovered_bash_frame(
+                snapshot,
+                &ledger_key,
+                metadata
+                    .project_root
+                    .as_deref()
+                    .unwrap_or(&metadata.workdir),
+                crate::output_store::OutputScope::for_task(
+                    &paths.session_dir,
+                    &metadata.session_id,
+                    self.clone(),
+                ),
+            )
+        {
             crate::slog_info!(
                 "recovered bash reply phase=settle task={} reply_bytes={} outcome={outcome}",
                 metadata.task_id,
@@ -4215,7 +4219,7 @@ impl BgTaskRegistry {
         if let Some(error) = fallback_error {
             crate::slog_warn!("recovered bash notice fallback chosen task={} call_key={} settlement_error={error}", metadata.task_id, key.key);
             if !self.retry_held_notice_fallback(&metadata.task_id, &ledger_key) {
-                crate::subc::retry_held_notice_fallback(
+                runner_notice_scheduler::retry_held_notice_fallback(
                     self.clone(),
                     metadata.task_id.clone(),
                     ledger_key,
@@ -4720,11 +4724,7 @@ impl BgTaskRegistry {
                     &conn, &harness, session_id,
                 ) {
                     Ok(mut rows) => {
-                        match crate::db::bash_watches::list_delivery_gaps(
-                            &conn,
-                            &harness,
-                            Some(session_id),
-                        ) {
+                        match list_delivery_gaps(&conn, &harness, Some(session_id)) {
                             Ok(gaps) => rows.extend(gaps),
                             Err(error) => crate::slog_warn!(
                             "failed to load retained watch gaps for session {session_id}: {error}"
@@ -5049,7 +5049,7 @@ impl BgTaskRegistry {
     pub(crate) fn retain_retry_gap(
         &self,
         harness: &str,
-        candidate: &crate::subc::watch_delivery::Candidate,
+        candidate: &crate::task_watch_lines::Candidate,
     ) -> Result<(), String> {
         use super::watch_lines::{LineBatch, RetryGap, WatchLine};
         let frame = &candidate.frame;
@@ -5092,12 +5092,10 @@ impl BgTaskRegistry {
         let registered = found.is_some();
         let found = match found {
             Some(row) => Some(row),
-            None => {
-                crate::db::bash_watches::list_delivery_gaps(&conn, harness, Some(&frame.session_id))
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|row| row.task_id == frame.task_id && row.watch_id == frame.watch_id)
-            }
+            None => list_delivery_gaps(&conn, harness, Some(&frame.session_id))
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|row| row.task_id == frame.task_id && row.watch_id == frame.watch_id),
         };
         let mut row =
             found
@@ -5253,7 +5251,7 @@ impl BgTaskRegistry {
         row.match_offset = Some(version as i64);
         row.match_text
             .get_or_insert_with(|| "watch delivery gap".to_string());
-        row.match_context = Some(crate::subc_format::format_watch_line_batch(
+        row.match_context = Some(crate::task_watch_lines::format_watch_line_batch(
             &frame.task_id,
             &batch,
         ));
@@ -5363,7 +5361,8 @@ impl BgTaskRegistry {
                 batch.pending_id = Some(format!("{}:{version}", pattern_match.watch_id));
             }
             pattern_match.match_offset = version;
-            pattern_match.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+            pattern_match.context =
+                crate::task_watch_lines::format_watch_line_batch(task_id, batch);
         }
         row.stdout_offset = stdout_offset as i64;
         row.stderr_offset = stderr_offset as i64;
@@ -5510,12 +5509,10 @@ impl BgTaskRegistry {
             let retained = registered.is_none();
             let Some(mut row) = (match registered {
                 Some(row) => Some(row),
-                None => {
-                    crate::db::bash_watches::list_delivery_gaps(&conn, &harness, Some(session_id))
-                        .map_err(|e| e.to_string())?
-                        .into_iter()
-                        .find(|row| row.task_id == task_id && row.watch_id == watch_id)
-                }
+                None => list_delivery_gaps(&conn, &harness, Some(session_id))
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|row| row.task_id == task_id && row.watch_id == watch_id),
             }) else {
                 return Ok(None);
             };
@@ -5576,7 +5573,7 @@ impl BgTaskRegistry {
                 .map_err(|error| error.to_string())?
                 .iter()
                 .any(|row| row.pending_match)
-                && !crate::db::bash_watches::list_delivery_gaps(&conn, &harness, Some(session_id))
+                && !list_delivery_gaps(&conn, &harness, Some(session_id))
                     .map_err(|e| e.to_string())?
                     .iter()
                     .any(|row| row.task_id == task_id);
@@ -6116,7 +6113,7 @@ impl BgTaskRegistry {
         // recoverable PID checkpoint in the existing record format.
         metadata.child_pid = Some(child_pid);
         metadata.pgid = Some(child_pid as i32);
-        metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(child_pid);
+        metadata.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);
         #[cfg(target_os = "linux")]
         {
             metadata.task_scope_runtime_ms = scope.as_ref().map(|scope| scope.runtime_ms());
@@ -6241,7 +6238,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         #[cfg(all(test, unix))]
         self.wait_before_watchdog_registration_for_test(&task_id);
         self.inner
@@ -6547,7 +6544,7 @@ impl BgTaskRegistry {
             if let Some(pid) = runtime.child_pid {
                 metadata.child_pid = Some(pid);
                 metadata.pgid = Some(pid as i32);
-                metadata.child_start_time_ms = crate::root_cache::process_start_time_ms(pid);
+                metadata.child_start_time_ms = crate::process_identity::process_start_time_ms(pid);
             }
             if let Err(error) = self.persist_task(&paths, &metadata) {
                 let _ = crate::gh_shim_speech::service::revoke_task_records(&session_id, &task_id);
@@ -6691,7 +6688,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -7049,7 +7046,7 @@ impl BgTaskRegistry {
             .lock()
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -9326,15 +9323,9 @@ impl BgTaskRegistry {
 
     pub(crate) fn try_scope_background_tasks(
         &self,
-        scope: &crate::subc::scope_background_tasks::Selector,
+        scope: &scoped_tasks::Selector,
         remaining: &mut usize,
-    ) -> Result<
-        (
-            HashSet<String>,
-            Vec<crate::subc::scope_background_tasks::Running>,
-        ),
-        String,
-    > {
+    ) -> Result<(HashSet<String>, Vec<scoped_tasks::Running>), String> {
         let tasks = self.inner.tasks.try_lock().map_err(|_| "registry_busy")?;
         let mut known = HashSet::new();
         let mut running = Vec::new();
@@ -9351,7 +9342,7 @@ impl BgTaskRegistry {
                 .is_some_and(|stamp| scope.matches(stamp))
                 && !metadata.is_terminal()
             {
-                running.push(crate::subc::scope_background_tasks::running(metadata));
+                running.push(scoped_tasks::running(metadata));
             }
         }
         Ok((known, running))
@@ -9763,7 +9754,7 @@ impl BgTaskRegistry {
                         Err(unavailable) => line.text = unavailable.reason.to_string(),
                     }
                 }
-                matched.context = crate::subc_format::format_watch_line_batch(task_id, batch);
+                matched.context = crate::task_watch_lines::format_watch_line_batch(task_id, batch);
             }
         }
         batches
@@ -10556,7 +10547,7 @@ impl BgTaskRegistry {
         super::watchdog::record_cleanup_work(|work| work.gc_requests += requested.len());
         for (root, registry) in requested.into_values() {
             let report =
-                crate::tool_output::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
+                crate::output_store::cleanup_expired(&root, super::watchdog::FINISHED_RETENTION);
             super::watchdog::record_cleanup_work(|work| {
                 work.tool_output_walks += 1;
                 work.tool_output_read_dirs += report.read_dirs;
@@ -12132,7 +12123,7 @@ impl BgTaskRegistry {
                     )
                 }));
             }
-            if let Ok(rows) = crate::db::bash_watches::list_delivery_gaps(&conn, harness, None) {
+            if let Ok(rows) = list_delivery_gaps(&conn, harness, None) {
                 keys.extend(rows.into_iter().map(|row| {
                     format!(
                         "match\0{}\0{}\0{}",
@@ -13332,7 +13323,7 @@ impl BgTaskRegistry {
                 runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
             }
             if removed_proxy {
-                crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+                aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
             }
         }
         if let Err(error) = self.stop_scope_tasks(scope, false, None, None) {
@@ -13379,7 +13370,7 @@ impl BgTaskRegistry {
         for runtime in stopped {
             runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
         }
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
     }
 
     #[cfg(unix)]
@@ -13422,7 +13413,7 @@ impl BgTaskRegistry {
             proxy.arm(pid)?;
         }
         proxies.insert(task_id.to_owned(), runtime);
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         Ok(())
     }
 
@@ -13436,7 +13427,7 @@ impl BgTaskRegistry {
             .remove(task_id);
         if let Some(runtime) = runtime {
             runtime.lock().unwrap_or_else(|p| p.into_inner()).stop();
-            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+            aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         }
     }
 
@@ -13819,7 +13810,7 @@ impl BgTaskRegistry {
             }
             tasks.insert(task.task_id.clone(), Arc::clone(task));
         }
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -14130,7 +14121,7 @@ impl BgTaskRegistry {
     pub(crate) fn retire_watchdog_task(&self, task_id: &str) {
         if let Ok(mut tasks) = self.inner.watchdog_tasks.lock() {
             if tasks.remove(task_id).is_some() {
-                crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+                aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
             }
         }
     }
@@ -14303,7 +14294,7 @@ impl BgTaskRegistry {
             tasks.insert(task_id.clone(), Arc::clone(&task));
             task
         };
-        crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+        aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         self.inner
             .cleanup_queue
             .lock()
@@ -15055,7 +15046,7 @@ impl BgTaskRegistry {
             // terminal status stays Completed or Failed.
             self.finish_terminal_transition(&task, true, CompletionTokenPolicy::Skip)?;
             self.inner.terminal_transition.notify_waiters();
-            crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Shell);
+            aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
         }
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;
@@ -15814,7 +15805,10 @@ impl BgTaskRegistry {
                     &pattern_match.watch_id,
                     &pattern_match.match_text,
                     pattern_match.match_offset,
-                    crate::subc_format::format_watch_line_batch(&pattern_match.task_id, &summary),
+                    crate::task_watch_lines::format_watch_line_batch(
+                        &pattern_match.task_id,
+                        &summary,
+                    ),
                     pattern_match.once,
                 );
                 frame.batch = Some(summary);
@@ -18123,7 +18117,7 @@ fn task_bundle_is_absent(storage_dir: &Path, session_id: &str, task_id: &str) ->
 
 /// A task killed by its hard kill, named by the limit that killed it.
 pub(crate) fn hard_kill_reason(deadline: HardKillDeadline) -> String {
-    let limit = crate::commands::bash_orchestrate::format_wait_limit(deadline.limit_ms);
+    let limit = crate::shell_format::format_wait_limit(deadline.limit_ms);
     let default_ms = DEFAULT_BG_TIMEOUT.as_millis() as u64;
     match deadline.source {
         HardKillSource::Default if deadline.limit_ms > default_ms => format!(
@@ -19049,6 +19043,78 @@ mod memory_limit_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bash_background_saved_render_golden() {
+        let dir = tempfile::tempdir().unwrap();
+        let (registry, db, _frames) = registry_with_db_and_frames(dir.path());
+        let task_id = "bash-aaaaaaaaaaaaaaa1";
+        let paths =
+            install_delivered_terminal_with_pending_watch(&registry, &db, dir.path(), task_id);
+
+        let reason = hard_kill_reason(HardKillDeadline {
+            limit_ms: 90_000,
+            source: HardKillSource::Timeout,
+        });
+        let mut metadata = read_task(&paths.json).unwrap();
+        metadata.status_reason = Some(reason);
+        write_task(&paths.json, &metadata).unwrap();
+        assert_eq!(
+            read_task(&paths.json)
+                .unwrap()
+                .status_reason
+                .unwrap()
+                .as_bytes(),
+            b"killed by the `timeout` of 90s you passed (exit 124)"
+        );
+
+        let mut matched = PatternMatch {
+            watch_id: "watch-00000001".into(),
+            task_id: task_id.into(),
+            match_text: "ERROR".into(),
+            match_offset: 16,
+            context: String::new(),
+            once: true,
+            literal_pattern: true,
+            batch: Some(super::super::watch_lines::LineBatch {
+                lines: vec![super::super::watch_lines::WatchLine {
+                    stream: "stderr".into(),
+                    offset: 16,
+                    end_offset: 30,
+                    text: "ERROR missing".into(),
+                    count: 2,
+                    unavailable: false,
+                }],
+                ..Default::default()
+            }),
+        };
+        registry.persist_watch_match("session", task_id, &mut matched, 0, 30, 0);
+        let saved = crate::db::bash_watches::get_bash_pattern_watch(
+            &db.lock().unwrap(),
+            "opencode",
+            "session",
+            task_id,
+            "watch-00000001",
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            saved.match_context.unwrap().as_bytes(),
+            "stderr byte 16 ×2: ERROR missing".as_bytes()
+        );
+
+        #[cfg(unix)]
+        {
+            let mut preview = "Error: no such table: widgets".to_string();
+            crate::shell_format::append_db_schema_hint(&mut preview, "Schema: widget(id)");
+            registry.save_completion_preview(task_id, &preview, false, &None);
+            let saved = read_task(&paths.json).unwrap().completion_preview.unwrap();
+            assert_eq!(
+                saved.output_preview.as_bytes(),
+                b"Error: no such table: widgets\n\nSchema: widget(id)"
+            );
+        }
+    }
+
     #[test]
     fn persisted_gc_removes_existing_empty_task_and_quarantine_sessions() {
         let storage = tempfile::tempdir().unwrap();
@@ -22994,6 +23060,7 @@ mod tests {
 
     #[test]
     fn recovered_terminal_reply_matches_live_status_text() {
+        crate::subc::lower_hooks::register();
         use crate::commands::bash_orchestrate::{decide_bash_step, BashStep};
         for (status, exit, reason, expected) in [
             (BgTaskStatus::Failed, None, Some("spawn aborted"), "failed"),
@@ -23046,9 +23113,13 @@ mod tests {
                 carrier: "reserved:carrier".into(),
                 call_key: "terminal".into(),
             };
-            let (frame, _, retained_body) =
-                crate::subc::recovered_bash_frame(snapshot, &key, dir.path(), None)
-                    .expect("terminal recovered frame");
+            let (frame, _, retained_body) = crate::bash_background::frames::recovered_bash_frame(
+                snapshot,
+                &key,
+                dir.path(),
+                None,
+            )
+            .expect("terminal recovered frame");
             let retained = retained_body
                 .as_deref()
                 .expect("recovered native result is retained");
@@ -26826,7 +26897,7 @@ mod tests {
                 .with_delegates(true),
         )
         .with_owner_authorized(true);
-        let store = crate::db::gh_speech::Store::new(&path);
+        let store = crate::gh_shim_speech::store::Store::new(&path);
         store
             .capture(&AuthorityRecord {
                 incarnation: "cancel-inc".into(),
@@ -28935,7 +29006,7 @@ mod tests {
         let pending = crate::gh_shim_ticket::PendingTicket::issue(session, "/project");
         let ticket = pending.value().unwrap().to_string();
         let env = HashMap::from([(
-            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.to_string(),
+            crate::gh_shim_paths::GH_SHIM_TICKET_ENV.to_string(),
             ticket.clone(),
         )]);
         let seen = project.path().join("seen-ticket");
@@ -31826,8 +31897,8 @@ mod a02_tests {
             .find(|pin| pin.starts_with("tp1:bash:"))
             .unwrap()
             .clone();
-        let display = crate::subc::rich_ui::display::TaskDisplay {
-            identity: crate::subc::rich_ui::outbox::Identity {
+        let display = crate::bash_background::frames::TaskDisplay {
+            identity: crate::bash_background::frames::Identity {
                 runner: subc_protocol::Principal::Reserved {
                     module_id: "broca".into(),
                 },

@@ -210,10 +210,33 @@ mod rayon_thread_tests {
     }
 }
 
+#[cfg(test)]
+mod db_unit_test_fence {
+    extern "C" fn enable() {
+        aft::db::enable_binary_unit_test_fence();
+    }
+
+    // The bin unit harness replaces main and links the library without cfg(test).
+    #[used]
+    #[cfg_attr(target_os = "linux", link_section = ".init_array")]
+    #[cfg_attr(target_os = "macos", link_section = "__DATA,__mod_init_func")]
+    #[cfg_attr(windows, link_section = ".CRT$XCU")]
+    static ENABLE_DB_FENCE: extern "C" fn() = enable;
+
+    #[test]
+    #[should_panic(expected = "test context cannot use the live default AFT storage root")]
+    fn bin_database_test_fence_rejects_live_storage_before_open() {
+        let live = aft_base::test_storage::live_storage_roots();
+        let _ = aft::db::open(&live[0].join("aft.db"));
+    }
+}
+
 fn main() {
     aft::memory::profile::publish(None);
     #[cfg(feature = "test-hooks")]
     aft::grammar::initialize_test_identity();
+    aft::commands::policy_environment::register();
+    aft::reader_floor::register_cache_hooks();
     // Take the daemon handoff before any threads or children start. Standalone
     // mode never touches the inherited descriptors.
     let subc_connection_file = parse_subc_arg(std::env::args_os().skip(1));
@@ -233,6 +256,12 @@ fn main() {
             );
         }
     };
+    #[cfg(feature = "test-hooks")]
+    startup_phase(if aft::db::binary_unit_test_fence_enabled() {
+        "unit_test_db_fence_enabled"
+    } else {
+        "unit_test_db_fence_disabled"
+    });
     let registration = if subc_connection_file.is_some() {
         startup_phase("nonce_capture_start");
         let registration = match aft::subc::AdoptedRegistration::adopt() {
@@ -495,6 +524,8 @@ fn main() {
         // A single AppContext serves the attached routes (N=1); subc tool calls
         // are routed through the per-actor executor once the first route binds.
         startup_phase("context_start");
+        aft::commands::configure::register_runtime_hooks();
+        aft::commands::register_shell_handlers();
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
@@ -504,7 +535,7 @@ fn main() {
         if !aft::subc::settings_gate_requested() {
             aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
         }
-        let executor = Arc::new(aft::executor::Executor::new());
+        let executor = Arc::new(aft::context::Executor::new());
         install_subc_signal_handler(
             Arc::clone(&executor),
             Arc::clone(&ctx),
@@ -620,6 +651,8 @@ fn main() {
 
     aft::slog_info!("started, pid {}", std::process::id());
 
+    aft::commands::configure::register_runtime_hooks();
+    aft::commands::register_shell_handlers();
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
     // Same catalog as in subc mode, written before the first request.
@@ -1063,7 +1096,7 @@ fn drain_runtime_events(registry: &RuntimeRegistry) {
         aft::runtime_drain::drain_lsp_events(runtime);
         aft::runtime_drain::shutdown_idle_lsp(runtime);
     }
-    aft::logging::perf_tick(None);
+    aft::logging::perf_tick::<AppContext>(None);
 }
 
 fn drain_runtime_events_cooperatively(
@@ -1100,10 +1133,10 @@ fn drain_non_configure_runtime_events(registry: &RuntimeRegistry) {
     aft::runtime_drain::drain_on_demand_callgraph_build(runtime);
     aft::runtime_drain::drain_lsp_events(runtime);
     aft::runtime_drain::shutdown_idle_lsp(runtime);
-    aft::logging::perf_tick(None);
+    aft::logging::perf_tick::<AppContext>(None);
     aft::runtime_drain::spawn_standalone_log_maintenance();
     aft::db::write_ledger::maybe_spawn_fold(runtime.db());
-    aft::db::compression_events::maybe_spawn_retention(
+    aft::bash_background::persistence::retention::maybe_spawn_retention(
         runtime.db(),
         Some(signal_bg_registries(registry)),
     );
@@ -1314,7 +1347,7 @@ fn install_signal_handler(bg_registries: Vec<BgTaskRegistry>, lsp_children: LspC
 
 #[cfg(unix)]
 fn install_subc_signal_handler(
-    executor: Arc<aft::executor::Executor>,
+    executor: Arc<aft::context::Executor>,
     initial_ctx: Arc<AppContext>,
     lsp_children: LspChildRegistry,
 ) {
@@ -1358,7 +1391,7 @@ fn install_subc_signal_handler(
 
 #[cfg(not(unix))]
 fn install_subc_signal_handler(
-    _executor: Arc<aft::executor::Executor>,
+    _executor: Arc<aft::context::Executor>,
     initial_ctx: Arc<AppContext>,
     lsp_children: LspChildRegistry,
 ) {
@@ -1492,7 +1525,7 @@ fn dispatch_config_probe_for_test(ctx: &AppContext) {
 }
 
 fn dispatch(req: RawRequest, ctx: &AppContext) -> Response {
-    aft::access_policy::with_native_route(req, ctx, dispatch_on_route)
+    aft::native_route::with_native_route(req, ctx, dispatch_on_route)
 }
 
 fn dispatch_on_route(req: RawRequest, ctx: &AppContext) -> Response {
@@ -1532,7 +1565,7 @@ fn dispatch_command(req: RawRequest, ctx: &AppContext) -> Response {
     aft::commands::tool_call::register_dispatch(dispatch);
     // A parent folder session answers index-backed commands from its child
     // repositories' own indexes (grep and glob fan out inside their handlers).
-    if let Some(response) = aft::data_layer::parent_session::route(&req, ctx) {
+    if let Some(response) = aft::commands::parent_query::route(&req, ctx) {
         return response;
     }
     match req.command.as_str() {
@@ -1858,7 +1891,7 @@ fn handle_cancel_request(req: &RawRequest, pending: &mut PendingResponses) -> Re
 
 fn dispatch_outcome(req: RawRequest, ctx: &Arc<AppContext>) -> DispatchOutcome {
     let mut deferred = None;
-    let response = aft::access_policy::with_native_route(req, ctx, |req, _| {
+    let response = aft::native_route::with_native_route(req, ctx, |req, _| {
         match dispatch_outcome_on_route(req, ctx) {
             DispatchOutcome::Immediate(response) => response,
             DispatchOutcome::Deferred(pending) => {
@@ -4823,5 +4856,34 @@ mod config_pin_tests {
         assert_eq!(*seen.lock().unwrap(), vec![false, false]);
         // The next request sees the publication.
         assert!(ctx.config().restrict_to_project_root);
+    }
+}
+
+#[cfg(test)]
+mod policy_environment_startup_tests {
+    #[test]
+    fn both_entry_modes_register_policy_environment_before_config_or_context() {
+        // A Windows checkout may convert line endings to CRLF, so search a
+        // copy with LF endings.
+        let source = include_str!("main.rs").replace("\r\n", "\n");
+        let (_, main) = source.split_once("\nfn main() {\n").unwrap();
+        let (main, _) = main.split_once("\n}\n").unwrap();
+        let registration = main
+            .find("aft::commands::policy_environment::register();")
+            .expect("main registers worker policy");
+        for (call, expected_count) in [
+            ("parse_subc_arg(", 1),
+            ("cli::fix_config::run(", 1),
+            ("aft::subc_config::cortexkit_user_config_path(", 1),
+            ("AppContext::from_app(", 2),
+            ("Config::default(", 2),
+        ] {
+            let sites: Vec<_> = main.match_indices(call).collect();
+            assert_eq!(sites.len(), expected_count, "startup sites for {call}");
+            assert!(
+                sites.iter().all(|(site, _)| registration < *site),
+                "worker policy must be registered before {call}"
+            );
+        }
     }
 }

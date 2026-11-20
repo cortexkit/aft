@@ -4,10 +4,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use aft::commands::semantic_search::generation_token::GenerationToken;
-use aft::search_index::exact_lane::{
+use aft::commands::semantic_search::exact_lane::{
     format_trailer, ExactLane, FallbackExactOptions, TrailerReason,
 };
+use aft::commands::semantic_search::generation_token::GenerationToken;
 use aft::search_index::memo::ExactMemoStore;
 
 fn create_temp_corpus_with_files(count: usize) -> (tempfile::TempDir, Vec<String>) {
@@ -308,8 +308,10 @@ fn test_bounded_exhaustion_c4() {
     assert_eq!(retrieval_depth, 400);
 
     // Both trailer and bounded disclosure present in reply
-    let reply_text =
-        aft::search_index::exact_lane::assemble_bounded_reply(Some(&bounded_line), &trailer);
+    let reply_text = aft::commands::semantic_search::exact_lane::assemble_bounded_reply(
+        Some(&bounded_line),
+        &trailer,
+    );
     assert!(reply_text.contains("exact pass: bounded (15 files, file limit)"));
     assert!(reply_text.contains("(exhausted)"));
 }

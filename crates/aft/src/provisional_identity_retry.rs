@@ -228,7 +228,7 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
     let reasons = ctx.degraded_reasons();
     let kind = if reasons
         .iter()
-        .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+        .any(|reason| reason == crate::cache_location::CACHE_DIR_BUSY)
     {
         Some(RetryKind::CacheCoordination)
     } else if reasons
@@ -336,7 +336,7 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
             if !ctx
                 .degraded_reasons()
                 .iter()
-                .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+                .any(|reason| reason == crate::cache_location::CACHE_DIR_BUSY)
             {
                 return Some("settled");
             }
@@ -402,7 +402,7 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
     }
     let root = retry.root.clone();
     if retry.kind == RetryKind::Identity {
-        let storage = crate::bash_background::storage_dir(ctx.config().storage_dir.as_deref());
+        let storage = crate::storage_path::storage_dir(ctx.config().storage_dir.as_deref());
         if !crate::root_identity::legacy_pins_readable(&root, &storage) {
             reschedule(ctx, &root, retry, timing());
             return None;
@@ -500,16 +500,27 @@ impl PreparedReplay {
         if retry.kind == RetryKind::CacheCoordination {
             retry.attempts = retry.attempts.saturating_add(1);
         }
+        let Some(hooks) = crate::runtime_drain::configure::command_hooks() else {
+            return crate::protocol::Response::error(
+                id,
+                "internal_error",
+                crate::runtime_drain::configure::MISSING_CONFIGURE_REGISTRATION,
+            );
+        };
         let run = || match retry.kind {
-            RetryKind::Identity => {
-                crate::commands::configure::handle_configure(&retry.request, ctx)
-            }
+            RetryKind::Identity => (hooks
+                .identity_retry
+                .expect("command_hooks requires the identity callback"))(
+                &retry.request, ctx
+            ),
             RetryKind::CacheCoordination => {
                 // Cache recovery must preserve the running configuration,
                 // including edits deferred until the next real connect.
                 let mut prepared = (*ctx.config()).clone();
-                crate::root_cache::prepare_cache_root(&mut prepared);
-                crate::commands::configure::handle_cache_recovery(
+                crate::cache_location::prepare_cache_root(&mut prepared);
+                (hooks
+                    .cache_retry
+                    .expect("command_hooks requires the cache callback"))(
                     &retry.request,
                     retry.connect_generation,
                     ctx,
@@ -625,7 +636,7 @@ fn reschedule_cache_retry(ctx: &AppContext, retry: &PendingRetry) -> Option<Dura
         || !ctx
             .degraded_reasons()
             .iter()
-            .any(|reason| reason == crate::root_cache::CACHE_DIR_BUSY)
+            .any(|reason| reason == crate::cache_location::CACHE_DIR_BUSY)
     {
         return None;
     }

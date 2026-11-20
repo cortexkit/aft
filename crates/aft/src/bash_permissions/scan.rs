@@ -499,7 +499,7 @@ pub(super) fn walk_shell_commands(
     }
 
     fn literal_word(raw: &str) -> Option<String> {
-        let mut parsed = crate::bash_rewrite::parser::parse(raw)?;
+        let mut parsed = crate::bash_parse::parse(raw)?;
         (parsed.args.len() == 1 && parsed.appends_to.is_none() && parsed.heredoc.is_none())
             .then(|| parsed.args.remove(0))
     }
@@ -657,13 +657,16 @@ pub(super) fn walk_shell_commands(
             cwd?.join(text)
         };
         let (path, next_cwd) = if physical {
-            let resolved = super::resolve_with_existing_ancestors(&joined);
+            let resolved = crate::system_temp::resolve_with_existing_ancestors(&joined);
             (resolved.clone(), resolved)
         } else {
             // Default cd follows logical PWD: fold .. before resolving symlinks
             // for the containment check, and retain that logical spelling to walk.
             let logical = super::normalize_path(&joined);
-            (super::resolve_with_existing_ancestors(&logical), logical)
+            (
+                crate::system_temp::resolve_with_existing_ancestors(&logical),
+                logical,
+            )
         };
         Some((
             DirectoryTarget {
@@ -1454,7 +1457,7 @@ fn push_external_path(
         // Folder eligibility is identical for read and write approvals.
         operation: AccessOperation::Read,
     };
-    let scope = crate::subc::directory_scope(&grant);
+    let scope = crate::access_policy::directory_scope(&grant);
     let pattern = match scope.kind {
         GrantKind::File => display_path(&scope.path),
         GrantKind::Subtree => format!("{}/*", display_path(&scope.path)),

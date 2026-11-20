@@ -12,7 +12,7 @@ impl ShellSignals {
     pub(super) fn from_process() -> Self {
         Self {
             sandboxed: native_sandbox_active(),
-            worker_marked: std::env::var_os(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV).is_some(),
+            worker_marked: std::env::var_os(crate::gh_shim_paths::GH_SHIM_WORKER_ENV).is_some(),
         }
     }
 }

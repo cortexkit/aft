@@ -28,6 +28,15 @@ cargo publish --package aft-secret-rules \
   || { ec=$?; cargo publish --package aft-secret-rules --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
 cargo publish --package aft-store \
   || { ec=$?; cargo publish --package aft-store --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+sleep 30
+cargo publish --package aft-base \
+  || { ec=$?; cargo publish --package aft-base --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+sleep 30
+cargo publish --package aft-db \
+  || { ec=$?; cargo publish --package aft-db --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+sleep 30
+cargo publish --package aft-parse \
+  || { ec=$?; cargo publish --package aft-parse --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
 
 # Allow the leaf versions to propagate to crates.io's sparse index before the
 # main crate's verification resolves them.

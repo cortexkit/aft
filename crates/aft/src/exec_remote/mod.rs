@@ -5,6 +5,7 @@ pub use cortexkit_exec_remote_types as types;
 use types::{Killed, Outcome, Ran, TerminalRecord};
 
 mod client;
+pub mod persistence;
 pub mod policy;
 pub(crate) mod read_only_note;
 mod reply;

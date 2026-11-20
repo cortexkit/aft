@@ -344,7 +344,7 @@ impl Runner {
             request_id,
             Lane::MaintenanceCommit,
             cancellation,
-            Box::new(move |_| {
+            Box::new(move || {
                 // The executor gave the admitted job the root's lifecycle; a
                 // fresh token with the same root and lifecycle lets the pool
                 // job see the root unbind at its checkpoints.
@@ -1386,7 +1386,7 @@ struct CachedMemoryFigure {
     incomplete_attempt: bool,
 }
 
-pub(crate) struct DataCheckout {
+pub struct DataCheckout {
     work: Arc<Work>,
     quiet: Arc<QuietTimer>,
     /// Set once a bind has used the scan that opening the checkout made;
@@ -1605,7 +1605,7 @@ impl DataCheckout {
             memory_figure: std::sync::Mutex::new(None),
             _listener: listener,
         });
-        super::tools::inspect::note_bound(&checkout);
+        super::bound_checkouts::note_bound(&checkout);
         Ok(checkout)
     }
 
@@ -1942,7 +1942,7 @@ fn pending(checkout: &Checkout) -> bool {
 /// for what the rescan finds. The rescan job owns that state and ends it
 /// however it ends, even unrun; [`root_bound`] in the configure tail starts
 /// it again only if none is running. Binds nothing.
-pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
+pub(crate) fn rebind_configured(ctx: &dyn crate::data_layer::host::IndexHost) {
     use crate::data_layer::surfaces::DataCheckoutProbe;
     if let Some(DataCheckoutProbe::Bound(checkout)) = ctx.probe_data_checkout() {
         if checkout.bound_once.load(Ordering::Acquire) {
@@ -1961,14 +1961,20 @@ pub(crate) fn rebind_configured(ctx: &crate::context::AppContext) {
 /// bind of the same checkout compares them again: files can change while the
 /// root is unbound and nothing watches it, or just before a configure whose
 /// watcher event has not arrived yet.
-pub(crate) fn root_bound(ctx: &crate::context::AppContext) {
+pub(crate) fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
     #[cfg(feature = "wasm-grammars")]
     crate::grammar::configure(&ctx.config());
-    use super::tools::inspect::{note_root, RootKind};
+    use super::bound_checkouts::{note_root, RootKind};
     if let Some(root) = ctx.canonical_cache_root_opt() {
         // A folder of repositories is checked first: configure switches its
         // own indexes off, which alone would withhold it.
-        let kind = if crate::data_layer::parent_session::session_for(ctx).is_some() {
+        let kind = if ctx
+            .config()
+            .project_root
+            .as_deref()
+            .and_then(crate::data_layer::parent_session::session_for_root)
+            .is_some()
+        {
             RootKind::Repositories
         } else if ctx.data_layer_withheld().is_some() {
             RootKind::Withheld
@@ -3470,7 +3476,7 @@ mod tests {
             crate::config::Config::default(),
         ));
         ctx.mark_subc_bound();
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
         assert!(executor.register_actor(root_id.clone(), Arc::clone(&ctx)));
         let maintenance = ctx
@@ -3554,7 +3560,7 @@ mod tests {
             crate::config::Config::default(),
         ));
         ctx.mark_subc_bound();
-        let executor = crate::executor::Executor::new();
+        let executor = crate::context::Executor::new();
         let root_id = crate::path_identity::ProjectRootId::from_path(&root).unwrap();
         assert!(executor.register_actor(root_id, Arc::clone(&ctx)));
         let maintenance = ctx

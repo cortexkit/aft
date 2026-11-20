@@ -77,6 +77,7 @@ fn hard_kill_for(params: &BashParams) -> crate::bash_background::HardKill {
 }
 
 pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
+    super::register_shell_handlers();
     let launch_started = std::time::Instant::now();
     let raw_params = req
         .params
@@ -1077,7 +1078,7 @@ mod tests {
             .join("target/approval-scope-tests");
         std::fs::create_dir_all(&scratch).unwrap();
         let outside = tempfile::tempdir_in(&scratch).unwrap();
-        let parent = crate::access_policy::policy_path(outside.path());
+        let parent = crate::policy_path::policy_path(outside.path());
         let file = parent.join("file.txt");
         let command = format!("cat \"{}\"", file.display());
         let stall = crate::bounded_io::stall_helper(&parent);

@@ -139,31 +139,8 @@ fn runon_read_only_note_killed_job_completion() {
     }
 }
 
-#[test]
-fn runon_read_only_note_requires_lock_failure_and_in_checkout_eperm() {
-    for (locked, code, error) in [
-        (None, 1, "../src/x.rs: Operation not permitted\n"),
-        (Some(false), 1, "../src/x.rs: Operation not permitted\n"),
-        (Some(true), 0, "../src/x.rs: Operation not permitted\n"),
-        (
-            Some(true),
-            1,
-            "'$ROOT/../outside.rs': Operation not permitted\n",
-        ),
-        (Some(true), 1, "../../outside.rs: Operation not permitted\n"),
-        (Some(true), 1, "../src/x.rs: Permission denied\n"),
-        (Some(true), 1, "failed without an error path\n"),
-    ] {
-        let (foreground, completion, disk) =
-            read_only_result_case(locked, Outcome::Exit { code }, error);
-        for text in [foreground, completion, disk] {
-            assert!(
-                !text.contains("note: the build server keeps tracked files"),
-                "{text}"
-            );
-        }
-    }
-}
+#[path = "remote_tests/read_only.rs"]
+mod read_only;
 
 #[test]
 fn runon_read_only_note_ignores_stdout_and_local_tasks() {
@@ -2299,6 +2276,8 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
         .snapshot()
         .uncaptured_terminal
         .expect("replayed terminal drain reply");
+    let cached =
+        crate::commands::bash_orchestrate::foreground_result_response("", (*cached).clone());
     assert_eq!(cached.data, expected.data);
     assert_eq!(cached.success, expected.success);
 }
@@ -4519,7 +4498,7 @@ async fn runon_restart_first_watch_reattaches(
         );
         assert!(snapshot.is_some(), "relaxed lookup must find the saved job");
     }
-    let executor = crate::executor::Executor::new();
+    let executor = crate::context::Executor::new();
     let root_id = crate::path_identity::ProjectRootId::from_path(&project).unwrap();
     assert!(executor.register_actor(root_id.clone(), ctx.clone()));
     let bind_request = serde_json::from_value::<crate::protocol::RawRequest>(serde_json::json!({
@@ -11403,7 +11382,7 @@ async fn assert_saved_pause_reply(
         .unwrap_or_else(|| panic!("{reply:?}"));
     assert!(local["remote"].is_null(), "{reply:?}");
     wait_for("the saved local command must be stopped", || {
-        (!crate::bash_background::process::is_process_alive(local_pid)).then_some(())
+        (!crate::process_identity::is_process_alive(local_pid)).then_some(())
     })
     .await;
 }

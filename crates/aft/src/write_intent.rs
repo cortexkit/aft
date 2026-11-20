@@ -1,166 +1,30 @@
-//! Synchronous write intent around every AFT filesystem mutation.
-//!
-//! An intent is deliberately not cleared when a command fails: formatting,
-//! partial writes and rollback can all change bytes before the error returns.
-//! Only whoever indexes the paths may resolve it, by reading their bytes again.
-
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
-
-/// Notifications bracket an AFT mutation: Before precedes any filesystem write;
-/// After runs when the guard drops, after formatting or rollback even on error.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WritePhase {
-    Before,
-    After,
-}
-
-/// Directory operations invalidate descendants, not just one indexed path.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum WriteIntent {
-    Paths(Vec<PathBuf>),
-    Directory(PathBuf),
-}
-
-/// The runtime uses this to invalidate trigram, semantic and callgraph data
-/// under its shared revision/snapshot lock. Listeners filter paths to their
-/// owning root. Callbacks must not write files, which would recurse into intent.
-pub trait WriteIntentListener: Send + Sync {
-    fn record_change(&self, change: &WriteIntent, phase: WritePhase);
-}
-
-fn listeners() -> &'static Mutex<Vec<Weak<dyn WriteIntentListener>>> {
-    static LISTENERS: OnceLock<Mutex<Vec<Weak<dyn WriteIntentListener>>>> = OnceLock::new();
-    LISTENERS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-/// Register a weak listener reference, so dropping the driver stops callbacks.
-pub fn register_listener(listener: &Arc<dyn WriteIntentListener>) {
-    let mut registered = listeners().lock().unwrap_or_else(|e| e.into_inner());
-    registered.retain(|listener| listener.strong_count() != 0);
-    registered.push(Arc::downgrade(listener));
-}
-
-fn notify(
-    registered: &[Weak<dyn WriteIntentListener>],
-    changes: &[WriteIntent],
-    phase: WritePhase,
-) {
-    for listener in registered {
-        if let Some(listener) = listener.upgrade() {
-            for change in changes {
-                listener.record_change(change, phase);
-            }
-        }
-    }
-}
+pub use aft_base::write_intent::*;
 
 #[cfg(test)]
-thread_local! {
-    static CLASSIFICATION_STATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-fn is_directory(path: &Path) -> bool {
-    #[cfg(test)]
-    CLASSIFICATION_STATS.with(|count| count.set(count.get() + 1));
-    path.is_dir()
-}
-
-/// Called before the first possible filesystem mutation, not after success.
-/// Directory intents invalidate the whole watcher epoch: their descendants
-/// (including newly created names) cannot safely be enumerated from an index.
-pub fn record_paths<'a>(paths: impl IntoIterator<Item = &'a Path>) -> IntentGuard {
-    let listener_snapshot = {
-        let mut registered = listeners().lock().unwrap_or_else(|e| e.into_inner());
-        registered.retain(|listener| listener.strong_count() != 0);
-        registered.clone()
-    };
-    if listener_snapshot.is_empty() {
-        return IntentGuard {
-            listeners: Vec::new(),
-            changes: Vec::new(),
-        };
-    }
-    let paths = paths
-        .into_iter()
-        .map(|path| (path, is_directory(path)))
-        .collect::<Vec<_>>();
-    let mut changes = paths
-        .iter()
-        .filter(|(_, is_dir)| *is_dir)
-        .map(|(path, _)| WriteIntent::Directory(path.to_path_buf()))
-        .collect::<Vec<_>>();
-    let files = paths
-        .iter()
-        .filter(|(_, is_dir)| !*is_dir)
-        .map(|(path, _)| path.to_path_buf())
-        .collect::<Vec<_>>();
-    if !files.is_empty() {
-        changes.push(WriteIntent::Paths(files));
-    }
-    notify(&listener_snapshot, &changes, WritePhase::Before);
-    IntentGuard {
-        listeners: listener_snapshot,
-        changes,
-    }
-}
-
-/// Keeps concurrent reconciliation from resolving pending intent or marking
-/// the watcher healthy while a filesystem mutation is still running.
-#[must_use]
-pub struct IntentGuard {
-    listeners: Vec<Weak<dyn WriteIntentListener>>,
-    changes: Vec<WriteIntent>,
-}
-
-impl Drop for IntentGuard {
-    fn drop(&mut self) {
-        notify(&self.listeners, &self.changes, WritePhase::After);
-    }
-}
+#[allow(unused_imports)]
+use std::path::Path;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::path::PathBuf;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Arc;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Mutex;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::OnceLock;
+#[cfg(test)]
+#[allow(unused_imports)]
+use std::sync::Weak;
 
 #[cfg(test)]
+#[allow(hidden_glob_reexports)]
 mod tests {
     use super::*;
-
-    type Events = Arc<Mutex<Vec<(WriteIntent, WritePhase, Vec<u8>)>>>;
-    struct Listener {
-        root: PathBuf,
-        events: Events,
-    }
-    impl WriteIntentListener for Listener {
-        fn record_change(&self, change: &WriteIntent, phase: WritePhase) {
-            let paths = match change {
-                WriteIntent::Paths(paths) => paths.clone(),
-                WriteIntent::Directory(path) => vec![path.clone()],
-            };
-            if paths.iter().any(|path| path.starts_with(&self.root)) {
-                let bytes = paths
-                    .first()
-                    .and_then(|path| std::fs::read(path).ok())
-                    .unwrap_or_default();
-                self.events
-                    .lock()
-                    .unwrap()
-                    .push((change.clone(), phase, bytes));
-            }
-        }
-    }
-
-    #[test]
-    fn intent_paths_are_classified_once() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("new.rs");
-        let listener: Arc<dyn WriteIntentListener> = Arc::new(Listener {
-            root: root.path().to_path_buf(),
-            events: Arc::new(Mutex::new(Vec::new())),
-        });
-        register_listener(&listener);
-        CLASSIFICATION_STATS.with(|count| count.set(0));
-        let guard = record_paths([path.as_path()]);
-        assert_eq!(CLASSIFICATION_STATS.with(|count| count.get()), 1);
-        drop(guard);
-    }
+    #[allow(unused_imports)]
+    pub(crate) use aft_base::write_intent::tests::*;
 
     #[test]
     fn composite_listener_sees_before_after_directory_and_unregisters_on_drop() {

@@ -71,6 +71,42 @@ pub struct BashCodeSearchHint {
     pub(crate) runner_notice: Option<crate::subc::runner_notices::CodeSearchNotice>,
 }
 
+impl BashCodeSearchHint {
+    pub(crate) fn deliver(&self, response: &mut crate::protocol::Response, root: &Path) {
+        // Only foreground terminal native replies carry both status and task
+        // identity. Rewrites, background launches and replies handing a still-
+        // running foreground task back to the caller are left alone.
+        if !crate::bash_rewrite::bash_hints::is_terminal_native_reply(response) {
+            return;
+        }
+        let Some(hint) = crate::bash_rewrite::bash_hints::code_search_nudge(
+            response.data["output"].as_str().unwrap_or_default(),
+            &self.command,
+            Some(root),
+            self.workdir.as_deref(),
+            self.search_tool.as_deref(),
+            self.grep_tool.as_deref(),
+            &self.shell_tool,
+        ) else {
+            return;
+        };
+        response.notices.route = self.runner_notice.clone().map(|route| route.into_sink());
+        response
+            .notices
+            .items
+            .push(crate::bash_rewrite::notices::Notice::template(
+                crate::bash_rewrite::notices::CODE_SEARCH,
+                crate::bash_rewrite::notices::code_search_slots(
+                    self.search_tool.as_deref(),
+                    &self.shell_tool,
+                ),
+                hint,
+                crate::bash_rewrite::notices::Target::BashOutput,
+            ));
+        crate::bash_rewrite::notices::deliver(response, None);
+    }
+}
+
 impl Default for FormatContext {
     fn default() -> Self {
         Self {
@@ -4298,29 +4334,9 @@ fn hub_summary_line(response: &serde_json::Map<String, Value>) -> Option<String>
         .map(str::to_string)
 }
 
-/// Shared list-envelope rendering funnel for subcommand and search output.
-pub(crate) fn render_envelope_trailer(
-    envelope: &crate::list_envelope::ListEnvelope,
-) -> Option<String> {
-    crate::list_envelope::render_trailer(envelope)
-}
+pub(crate) use crate::list_surfaces::render_envelope_trailer;
 
-/// Count of rendered match rows in a grep response (R24).
-///
-/// `matches` holds the whole requested page; `rendered_matches` says how many
-/// of those rows fit the output byte budget and were printed. Replies without
-/// that field printed every row in `matches`.
-pub fn rendered_grep_match_count(data: &Value) -> usize {
-    let matches_len = data
-        .get("matches")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    data.get("rendered_matches")
-        .and_then(Value::as_u64)
-        .map(|rendered| (rendered as usize).min(matches_len))
-        .unwrap_or(matches_len)
-}
+pub use crate::list_surfaces::grep::rendered_grep_match_count;
 
 /// Count of rendered file rows in a glob response after applying display-only selectors (R24).
 pub fn rendered_glob_file_count(data: &Value) -> usize {
@@ -6029,70 +6045,12 @@ mod executed_outline_mode_tests {
     }
 }
 
-/// Render a bounded line batch; offsets refer to the original, unmasked stream.
-pub fn format_watch_line_batch(
-    task_id: &str,
-    batch: &crate::bash_background::watch_lines::LineBatch,
-) -> String {
-    let mut text = String::new();
-    for line in &batch.lines {
-        let body = if line.unavailable {
-            crate::bash_background::watch_lines::unavailable_match_text(
-                line.count,
-                batch
-                    .masking_limit_bytes
-                    .map(|limit| limit as usize)
-                    .unwrap_or(crate::bash_background::watch_lines::MASKING_LINE_CAP_BYTES),
-            )
-        } else {
-            line.text.clone()
-        };
-        let repeats = if line.count > 1 {
-            format!(" ×{}", line.count)
-        } else {
-            String::new()
-        };
-        text.push_str(&format!(
-            "{} byte {}{repeats}: {}\n",
-            line.stream, line.offset, body
-        ));
-    }
-    if batch.dropped_lines > 0 || batch.skipped_long_lines > 0 {
-        let incomplete = if batch.skipped_long_lines > 0 {
-            format!(
-                " {} lines longer than 64 KiB were skipped, so the scan is incomplete.",
-                batch.skipped_long_lines
-            )
-        } else {
-            String::new()
-        };
-        let cursor = if batch.first_dropped_stream.as_deref() == Some("stderr") {
-            "stderr_offset"
-        } else {
-            "output_offset"
-        };
-        text.push_str(&format!("{} matching lines dropped.{incomplete} Read them with bash_status({{ task_id: {}, {cursor}: {} }}).\n", batch.dropped_lines, serde_json::to_string(task_id).unwrap_or_default(), batch.first_dropped_offset.unwrap_or(0)));
-    }
-    if let Some(gap) = &batch.retry_gap {
-        let missing = match gap.known_missing_occurrences {
-            0 => "Some matches may be missing.".to_string(),
-            1 => "At least 1 match is missing.".to_string(),
-            count => format!("At least {count} matches are missing."),
-        };
-        let cursor = if gap.stream.as_deref() == Some("stderr") {
-            "stderr_offset"
-        } else {
-            "output_offset"
-        };
-        text.push_str(&format!("Some watch notices were lost: a stalled connection dropped {} of them, and they cannot be recovered. {missing} Read the task output with bash_status({{ task_id: {}, {cursor}: {} }}).\n", gap.dropped_notifications, serde_json::to_string(task_id).unwrap_or_default(), gap.first_offset.unwrap_or(0)));
-    }
-    text.trim_end().to_string()
-}
+pub use crate::task_watch_lines::format_watch_line_batch;
 
 #[cfg(test)]
 mod watch_line_format_tests {
     use super::format_watch_line_batch;
-    use crate::bash_background::watch_lines::{LineBatch, RetryGap, WatchLine};
+    use crate::task_watch_lines::{LineBatch, RetryGap, WatchLine};
 
     #[test]
     fn retry_gap_wording_golden() {

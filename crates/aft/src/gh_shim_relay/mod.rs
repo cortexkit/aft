@@ -1407,8 +1407,8 @@ async fn post_captured_inner(
     };
     let queued = match queued {
         Ok(queued) => queued,
-        Err(crate::db::gh_speech::GateError::BeforeSend(error)) => return Err(error),
-        Err(crate::db::gh_speech::GateError::AfterSend) => {
+        Err(crate::gh_shim_speech::store::GateError::BeforeSend(error)) => return Err(error),
+        Err(crate::gh_shim_speech::store::GateError::AfterSend) => {
             return Ok(RelayReply::refused(
                 "outcome_unknown",
                 "plexus",

@@ -1298,7 +1298,7 @@ mod tests {
         let db = ctx.db().unwrap();
         // Saved straight into aft.db, as a catalog fetch in an earlier process
         // would have left it, so memory does not know this worker is confined.
-        crate::db::remote_exec::freeze(
+        crate::exec_remote::persistence::freeze(
             &db.lock().unwrap(),
             &remote_policy::key(&worker, Some("worker")).unwrap(),
             &crate::exec_remote::FrozenParams {

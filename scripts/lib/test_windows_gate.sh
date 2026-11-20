@@ -75,6 +75,7 @@ SH
   chmod +x "$temp/uname" "$temp/git"
   output=$(PATH="$temp:$PATH" bash "$script" --plan 2>&1)
   [[ "$output" == *'--lib search_index::'* && "$output" != *'--features test-hooks'* ]] || fail "${FUNCNAME[0]}"
+  [[ "$output" == *'-p agent-file-tools -p aft-base -p aft-db --lib'* ]] || fail "${FUNCNAME[0]} library owners"
   output=$(PATH="$temp:$PATH" bash "$script" --plan --test-target integration --features test-timing-hooks 2>&1)
   [[ "$output" == *'--test integration --features test-hooks --features test-timing-hooks'* ]] || fail "${FUNCNAME[0]} integration hooks"
   rm -rf "$temp"

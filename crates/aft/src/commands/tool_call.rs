@@ -32,7 +32,8 @@ pub fn handle_with_dispatch(
     ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
 ) -> Response {
-    crate::access_policy::with_native_route(req.clone(), ctx, |req, ctx| {
+    super::configure::register_runtime_hooks();
+    crate::native_route::with_native_route(req.clone(), ctx, |req, ctx| {
         handle_on_route(&req, ctx, dispatch)
     })
 }
@@ -121,7 +122,7 @@ fn handle_on_route(req: &RawRequest, ctx: &AppContext, dispatch: &DispatchFn<'_>
 
     let sanitized_arguments = strip_agent_preview_arg_owned(arguments);
     let agent_visible =
-        !preview && !crate::subc::is_native_plumbing_call(name, &sanitized_arguments);
+        !preview && !crate::host_tool_names::is_native_plumbing_call(name, &sanitized_arguments);
     let format_context = crate::subc_format::FormatContext::from_tool_call(
         name,
         &sanitized_arguments,

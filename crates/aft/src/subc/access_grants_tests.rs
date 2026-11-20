@@ -1777,7 +1777,7 @@ fn grants_catalog_refetch_rechecks_head_grant_and_floor() {
     let (_dir, ctx, head, worker) = fixture();
     let target = worker.project_root.join("allowed");
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(&target),
+        path: crate::policy_path::policy_path(&target),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
@@ -1866,7 +1866,7 @@ fn grants_policy_reads_revocation_on_the_next_check() {
         assert_eq!(
             ctx.access_policy("check").unwrap().decide(
                 AccessOperation::Read,
-                &crate::access_policy::policy_path(&path),
+                &crate::policy_path::policy_path(&path),
                 false
             ),
             AccessDecision::Allow
@@ -1876,7 +1876,7 @@ fn grants_policy_reads_revocation_on_the_next_check() {
         assert_eq!(
             ctx.access_policy("check").unwrap().decide(
                 AccessOperation::Read,
-                &crate::access_policy::policy_path(&path),
+                &crate::policy_path::policy_path(&path),
                 false
             ),
             AccessDecision::Deny(AccessDenial::OutsideRoots)
@@ -2090,7 +2090,7 @@ fn read_policy_snapshot_nested_scope_does_not_resurrect_revoked_grants() {
 fn grants_ordinary_detach_and_reclamation_keep_standing_capabilities() {
     let (dir, ctx, _head, worker) = fixture();
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(&dir.path().join("shared")),
+        path: crate::policy_path::policy_path(&dir.path().join("shared")),
         kind: GrantKind::Subtree,
         operation: AccessOperation::Read,
     };
@@ -2185,7 +2185,7 @@ fn grants_exact_file_authority_reaches_preserved_final_write_checks() {
     let path = head.project_root.join("file");
     std::fs::write(&path, "protected").unwrap();
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(&path),
+        path: crate::policy_path::policy_path(&path),
         kind: GrantKind::File,
         operation: AccessOperation::Write,
     };
@@ -2213,7 +2213,7 @@ fn grants_codemode_run_uses_agent_policy_and_revocation_without_copying() {
     let path = head.project_root.join("shared");
     std::fs::write(&path, "protected").unwrap();
     let grant = AccessGrant {
-        path: crate::access_policy::policy_path(&path),
+        path: crate::policy_path::policy_path(&path),
         kind: GrantKind::File,
         operation: AccessOperation::Write,
     };

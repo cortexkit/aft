@@ -17,7 +17,7 @@ import { asRecord } from "./util.js";
  * The one shape a truncation trailer is allowed to take.
  *
  * The `narrow:` clause is optional because the product's own surface registry
- * has entries with nothing to suggest: `crates/aft/src/list_surfaces.rs` gives
+ * has entries with nothing to suggest: `crates/aft-base/src/list_surfaces.rs` gives
  * the bash output surface `narrow: &[]`, and a trailer for it correctly ends
  * at the reason. Requiring the clause made that surface's trailer unmatchable,
  * so a row watching it saw no trailer at all rather than the one it had. Every

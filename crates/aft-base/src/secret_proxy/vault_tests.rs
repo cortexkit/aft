@@ -1,0 +1,1274 @@
+//! Real proxy requests using routes authenticated as AFT's module identity.
+//! A consent transport double records phone cards and supplies allow or decline.
+
+use super::*;
+use crate::secret::transport::fake::FakeClaustrum;
+use crate::secret::transport::fake::Record;
+use crate::secret::transport::fake::NONCE;
+use crate::secret::ConsentOutcome;
+use crate::secret::SecretConsentRequest;
+use crate::secret::SecretConsentTransport;
+use crate::secret::SubcSecretVault;
+use std::sync::atomic::AtomicU64;
+
+pub struct Clock {
+    now: Arc<AtomicU64>,
+    ticks: tokio::sync::watch::Sender<u64>,
+}
+
+#[test]
+fn stopping_the_proxy_prevents_a_queued_vault_ask_from_spending_a_once_approval() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    daemon.state.lock().unwrap().once = true;
+    let server = runtime.block_on(Server::new("plain"));
+    let cfg = live_config(&daemon, server.address.port(), Clock::new());
+    let vault = cfg.vault.clone();
+    let scope = cfg.authorization_scope.clone();
+    let target = addressed("localhost");
+    let crate::secret::UseAnswer::ApprovalRequired(pending) =
+        vault.use_secret(&scope, "test", &target)
+    else {
+        panic!("initial approval required")
+    };
+    daemon
+        .state
+        .lock()
+        .unwrap()
+        .approve(&pending.statement_b64url);
+    let mut proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let state = proxy.state.clone();
+    let (entered, started) = std::sync::mpsc::channel();
+    let (unblock, blocked) = std::sync::mpsc::channel();
+    let blocker = runtime.spawn_blocking(move || {
+        entered.send(()).unwrap();
+        blocked.recv().unwrap();
+    });
+    started.recv_timeout(Duration::from_secs(2)).unwrap();
+    runtime.block_on(async {
+        let queued = Arc::new(tokio::sync::Notify::new());
+        let announced = queued.clone();
+        let ask = tokio::spawn(async move {
+            announced.notify_one();
+            state.approvals.ask("test", &addressed("localhost")).await
+        });
+        queued.notified().await;
+        assert!(
+            !ask.is_finished(),
+            "the vault ask is queued behind the occupied blocking worker"
+        );
+        proxy.stop();
+        unblock.send(()).unwrap();
+        blocker.await.unwrap();
+        assert!(matches!(
+            ask.await.unwrap(),
+            crate::secret::UseAnswer::Unavailable
+        ));
+    });
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        1,
+        "shutdown must not dispatch the queued ask"
+    );
+    assert!(
+        matches!(
+            vault.use_secret(&scope, "test", &target),
+            crate::secret::UseAnswer::Released(_)
+        ),
+        "the once approval remains unspent"
+    );
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_proxy_card_uses_the_exact_approved_line_and_never_sends() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Cancelled);
+    let (reply, _client) = worker.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert_eq!(
+        reply["body"],
+        "AFT's secret proxy refused the request: test (localhost). The approval request was withdrawn."
+    );
+    assert_eq!(daemon.state.lock().unwrap().calls, 1);
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unfiled_proxy_card_uses_the_exact_approved_line_and_never_sends() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let mut cfg = live_config(&daemon, server.address.port(), Clock::new());
+    cfg.consent_context = None;
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let reply = client.request(
+        "/approved",
+        json!({"authorization":format!("Bearer {MARKER}")}),
+        "",
+    );
+    assert_eq!(reply["status"], 403);
+    assert_eq!(
+        reply["body"],
+        "AFT's secret proxy refused the request: test (localhost). The approval was not granted."
+    );
+    assert!(phone.phone.state.lock().unwrap().requests.is_empty());
+    assert_eq!(daemon.state.lock().unwrap().calls, 1);
+    assert!(server.seen.lock().is_empty());
+}
+
+impl Clock {
+    pub fn new() -> Arc<Self> {
+        let (ticks, _) = tokio::sync::watch::channel(1_700_000_000_000);
+        Arc::new(Self {
+            now: Arc::new(AtomicU64::new(1_700_000_000_000)),
+            ticks,
+        })
+    }
+    fn advance(&self, ms: u64) {
+        let now = self.now.fetch_add(ms, Ordering::SeqCst) + ms;
+        self.ticks.send_replace(now);
+    }
+}
+
+impl crate::secret::requests::ApprovalClock for Clock {
+    fn now_ms(&self) -> u64 {
+        self.now.load(Ordering::SeqCst)
+    }
+    fn deadline(&self) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+        let end = self.now.load(Ordering::SeqCst) + 600_000;
+        let mut ticks = self.ticks.subscribe();
+        Box::pin(async move {
+            while *ticks.borrow_and_update() < end {
+                if ticks.changed().await.is_err() {
+                    break;
+                }
+            }
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct PhoneState {
+    pub requests: Vec<SecretConsentRequest>,
+    answers: HashMap<String, ConsentOutcome>,
+    closed: bool,
+    withdrawn: Vec<String>,
+}
+
+pub struct Phone {
+    runtime: tokio::runtime::Handle,
+    pub state: std::sync::Mutex<PhoneState>,
+    answer: std::sync::Condvar,
+    filed: tokio::sync::Notify,
+}
+
+impl Phone {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            runtime: tokio::runtime::Handle::current(),
+            state: Default::default(),
+            answer: Default::default(),
+            filed: Default::default(),
+        })
+    }
+    pub async fn card(&self, count: usize) -> SecretConsentRequest {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notified = self.filed.notified();
+                if let Some(request) = self.state.lock().unwrap().requests.get(count - 1).cloned() {
+                    return request;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .expect("the proxy filed the expected card")
+    }
+    pub fn decide(&self, daemon: &FakeClaustrum, count: usize, answer: ConsentOutcome) {
+        let mut state = self.state.lock().unwrap();
+        let request = &state.requests[count - 1];
+        if matches!(
+            answer,
+            ConsentOutcome::Answered | ConsentOutcome::AnsweredOnce
+        ) {
+            daemon
+                .state
+                .lock()
+                .unwrap()
+                .approve(&request.statement_b64url);
+        }
+        let id = request.request_id.clone();
+        state.answers.insert(id, answer);
+        self.answer.notify_all();
+    }
+    fn close(&self) {
+        self.state.lock().unwrap().closed = true;
+        self.answer.notify_all();
+    }
+}
+
+impl SecretConsentTransport for Phone {
+    fn runtime(&self) -> Option<tokio::runtime::Handle> {
+        Some(self.runtime.clone())
+    }
+    fn file(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        self.hold(request, &Default::default())
+    }
+    fn hold(
+        &self,
+        request: &SecretConsentRequest,
+        cancel: &crate::secret::consent::Cancellation,
+    ) -> ConsentOutcome {
+        let mut state = self.state.lock().unwrap();
+        assert!(
+            !state
+                .requests
+                .iter()
+                .any(|r| r.request_id == request.request_id),
+            "never file the same vault id twice"
+        );
+        state.requests.push(request.clone());
+        self.filed.notify_one();
+        loop {
+            if cancel.is_cancelled() {
+                return ConsentOutcome::Cancelled;
+            }
+            if state.closed {
+                return ConsentOutcome::Expired;
+            }
+            if let Some(answer) = state.answers.get(&request.request_id) {
+                return answer.clone();
+            }
+            state = self.answer.wait(state).unwrap();
+        }
+    }
+    fn withhold(&self, request: &SecretConsentRequest) -> ConsentOutcome {
+        let mut state = self.state.lock().unwrap();
+        state.withdrawn.push(request.request_id.clone());
+        state
+            .answers
+            .insert(request.request_id.clone(), ConsentOutcome::Expired);
+        self.answer.notify_all();
+        ConsentOutcome::Expired
+    }
+}
+
+pub struct PhoneGuard {
+    pub phone: Arc<Phone>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl PhoneGuard {
+    pub fn install() -> Self {
+        let lock = crate::secret::consent::TEST_TRANSPORT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let phone = Phone::new();
+        crate::secret::consent::install_transport(Some(phone.clone()));
+        Self { phone, _lock: lock }
+    }
+}
+impl Drop for PhoneGuard {
+    fn drop(&mut self) {
+        self.phone.close();
+        crate::secret::consent::install_transport(None);
+    }
+}
+
+pub fn record(location: &str) -> Record {
+    Record {
+        name: "test".into(),
+        host: "localhost".into(),
+        path: "/approved".into(),
+        location: location.into(),
+        key: K1.to_vec(),
+    }
+}
+
+pub fn live_config(daemon: &FakeClaustrum, port: u16, clock: Arc<Clock>) -> ProxyConfig {
+    static SEQUENCE: AtomicU64 = AtomicU64::new(1);
+    let auth = scope(&format!(
+        "live-vault-{}",
+        SEQUENCE.fetch_add(1, Ordering::SeqCst)
+    ));
+    let transport = crate::secret::transport::SubcSecretUseTransport::for_test(
+        daemon.path.clone(),
+        subc_protocol::BindIdentity::new("test", "session"),
+        Duration::from_secs(2),
+        subc_client_rs::ConsumerIdentity {
+            module_id: "aft".into(),
+            launch_nonce: NONCE.into(),
+        },
+    );
+    ProxyConfig {
+        vault: Arc::new(SubcSecretVault::new(Arc::new(transport))),
+        authorization_scope: auth,
+        lifetime_scope: scope("run"),
+        scanned_labels: vec!["test".into()],
+        consent_context: Some((std::path::PathBuf::from("project"), "session".into())),
+        test_https_port: Some(port),
+        approval_clock: Some(clock),
+        origin: "live-proxy-task".into(),
+    }
+}
+
+fn request_in_thread(
+    mut client: Client,
+    overlap: bool,
+) -> std::thread::JoinHandle<(Value, Client)> {
+    std::thread::spawn(move || {
+        let reply = if overlap {
+            client.command(json!({"op":"overlap"}))
+        } else {
+            client.request(
+                "/approved",
+                json!({"authorization":format!("Bearer {MARKER}")}),
+                "",
+            )
+        };
+        (reply, client)
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_release_injects_only_the_deposit_location_and_every_use_is_audited() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let cfg = live_config(&daemon, server.address.port(), Clock::new());
+    let expected_scope = cfg.authorization_scope.clone();
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    let card = phone.phone.card(1).await;
+    assert_eq!(card.scope, expected_scope);
+    assert!(
+        server.seen.lock().is_empty(),
+        "approval holds before any upstream request"
+    );
+    assert_eq!(
+        proxy.approval_status(),
+        vec![
+            "secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"
+        ]
+    );
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+    let (reply, mut client) = worker.join().unwrap();
+    assert_eq!(reply["status"], 200);
+    assert!(!reply.to_string().contains(std::str::from_utf8(K1).unwrap()));
+    let next = client.request(
+        &format!("/approved/next?key={MARKER}"),
+        json!({"authorization":format!("Bearer {MARKER}"), "x-literal":MARKER}),
+        "",
+    );
+    assert_eq!(next["status"], 200);
+    let seen = server.seen.lock();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1]["headers"]["authorization"],
+        format!("Bearer {}", std::str::from_utf8(K1).unwrap())
+    );
+    assert_eq!(seen[1]["headers"]["x-literal"], MARKER);
+    assert!(seen[1]["target"].as_str().unwrap().contains(MARKER));
+    let state = daemon.state.lock().unwrap();
+    assert_eq!(state.calls, 3, "initial ask, approved retry, next request");
+    assert_eq!(
+        state.connections, 1,
+        "one command owns one reused daemon consumer"
+    );
+    assert_eq!(
+        state.params[2]["target"],
+        json!({"scheme":"https", "host":"localhost", "port":443, "path":"/approved/next"})
+    );
+    assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_decline_and_expiry_answer_403_without_sending_or_retrying() {
+    for (decision, expected) in [
+        (
+            ConsentOutcome::Declined,
+            "AFT's secret proxy refused the request: test (localhost). The approval was declined.",
+        ),
+        (
+            ConsentOutcome::Expired,
+            "AFT's secret proxy refused the request: test (localhost). The approval request expired.",
+        ),
+    ] {
+        let daemon = FakeClaustrum::start();
+        daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+        let phone = PhoneGuard::install();
+        let server = Server::new("echo-request").await;
+        let proxy = SecretProxy::start_with_tls(
+            live_config(&daemon, server.address.port(), Clock::new()),
+            server.client_tls.clone(),
+        )
+        .unwrap();
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        client.connect(false);
+        let worker = request_in_thread(client, false);
+        phone.phone.card(1).await;
+        phone.phone.decide(&daemon, 1, decision);
+        let (reply, mut client) = worker.join().unwrap();
+        assert_eq!(reply["status"], 403);
+        assert_eq!(reply["body"], expected);
+        assert!(server.seen.lock().is_empty());
+        assert_eq!(
+            daemon.state.lock().unwrap().calls,
+            1,
+            "an answered decline/expiry never retries"
+        );
+        let next = client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            "",
+        );
+        assert_eq!(
+            next["status"], 403,
+            "a matching retry sees the same unanswered vault id"
+        );
+        assert_eq!(
+            phone.phone.state.lock().unwrap().requests.len(),
+            1,
+            "the same request_id is never refiled"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_injected_ten_minute_deadline_answers_403_locally() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let clock = Clock::new();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), clock.clone()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    proxy
+        .state
+        .test_idle_timeout_ms
+        .store(100, Ordering::Release);
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    let card = phone.phone.card(1).await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert!(
+        !worker.is_finished(),
+        "a held approval outlives the socket idle timeout"
+    );
+    clock.advance(599_999);
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        !worker.is_finished(),
+        "the full ten-minute window remains available"
+    );
+    clock.advance(1);
+    let (reply, _client) = worker.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert_eq!(
+        reply["body"],
+        "AFT's secret proxy refused the request: test (localhost). No answer to the approval arrived in time."
+    );
+    assert!(server.seen.lock().is_empty());
+    assert!(proxy.approval_status().is_empty());
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("reason=approval_pending_at_deadline"));
+    assert!(lines[0].contains(&format!("request_id={:?}", card.request_id)));
+    phone.phone.close();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_concurrent_requests_share_one_card_and_once_queues_cards_serially() {
+    for once in [false, true] {
+        let daemon = FakeClaustrum::start();
+        {
+            let mut state = daemon.state.lock().unwrap();
+            state.record = Some(record("authorization_bearer"));
+            state.once = once;
+        }
+        let phone = PhoneGuard::install();
+        let server = Server::new("echo-request").await;
+        let proxy = SecretProxy::start_with_tls(
+            live_config(&daemon, server.address.port(), Clock::new()),
+            server.client_tls.clone(),
+        )
+        .unwrap();
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        client.connect(true);
+        let worker = request_in_thread(client, true);
+        let first = phone.phone.card(1).await;
+        // The card is filed on the first stream's vault call. Answering it
+        // before the second stream has asked would let that stream be
+        // released directly, so it would never share the card and the call
+        // counts below would depend on thread timing.
+        condition(|| daemon.state.lock().unwrap().calls >= 2).await;
+        assert!(server.seen.lock().is_empty());
+        assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
+        phone.phone.decide(
+            &daemon,
+            1,
+            if once {
+                ConsentOutcome::AnsweredOnce
+            } else {
+                ConsentOutcome::Answered
+            },
+        );
+        if once {
+            let second = phone.phone.card(2).await;
+            assert_ne!(first.request_id, second.request_id);
+            assert!(!worker.is_finished());
+            assert!(proxy.approval_status().iter().any(|line| line
+                == "secret test: the approval covered one request; another card was sent"));
+            phone.phone.decide(&daemon, 2, ConsentOutcome::AnsweredOnce);
+        }
+        let (reply, _client) = worker.join().unwrap();
+        assert!(
+            reply.get("a").is_some(),
+            "both HTTP/2 requests completed: {reply}"
+        );
+        assert!(!reply.to_string().contains(std::str::from_utf8(K1).unwrap()));
+        assert_eq!(server.seen.lock().len(), 2);
+        assert_eq!(
+            phone.phone.state.lock().unwrap().requests.len(),
+            if once { 2 } else { 1 }
+        );
+        assert_eq!(daemon.state.lock().unwrap().calls, if once { 5 } else { 4 });
+        assert_eq!(daemon.state.lock().unwrap().connections, 1);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_wrong_host_is_literal_and_never_files_a_card() {
+    let daemon = FakeClaustrum::start();
+    let mut other = record("authorization_bearer");
+    other.host = "other.test".into();
+    daemon.state.lock().unwrap().record = Some(other);
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    assert_eq!(
+        client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}")}),
+            ""
+        )["status"],
+        200
+    );
+    assert_eq!(
+        server.seen.lock()[0]["headers"]["authorization"],
+        format!("Bearer {MARKER}")
+    );
+    assert_eq!(daemon.state.lock().unwrap().calls, 1);
+    assert!(phone.phone.state.lock().unwrap().requests.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_redirect_to_another_host_asks_again_and_sends_no_key() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("redirect").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+    let (first, mut client) = worker.join().unwrap();
+    assert_eq!(first["status"], 302);
+    let location = url::Url::parse(first["headers"]["location"].as_str().unwrap()).unwrap();
+    assert_eq!(location.host_str(), Some("other.test"));
+    proxy
+        .state
+        .test_upstream
+        .lock()
+        .insert("other.test".into(), server.address);
+    assert_eq!(
+        client.command(
+            json!({"op":"connect", "authority":format!("other.test:{}", server.address.port())})
+        )["ok"],
+        true
+    );
+    let second = client.command(json!({"op":"request", "authority":format!("other.test:{}", server.address.port()), "path":location.path(), "headers":{"authorization":format!("Bearer {MARKER}")}}));
+    assert_eq!(second["status"], 200);
+    assert_eq!(
+        server.seen.lock()[1]["headers"]["authorization"],
+        format!("Bearer {MARKER}")
+    );
+    assert_eq!(daemon.state.lock().unwrap().calls, 3);
+    assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_new_card_after_longer_approval_does_not_claim_it_was_once() {
+    let daemon = FakeClaustrum::start();
+    {
+        let mut state = daemon.state.lock().unwrap();
+        state.record = Some(record("authorization_bearer"));
+        state.once = true;
+    }
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let first = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+    let (reply, client) = first.join().unwrap();
+    assert_eq!(reply["status"], 200);
+    // The fixture expires coverage after one request despite the longer phone
+    // answer, standing in for a revoked grant before another request arrives.
+    let second = request_in_thread(client, false);
+    phone.phone.card(2).await;
+    assert_eq!(
+        proxy.approval_status(),
+        vec![
+            "secret test: waiting for your approval for localhost (requests wait up to 10 minutes)"
+        ]
+    );
+    phone.phone.decide(&daemon, 2, ConsentOutcome::Declined);
+    let (reply, _client) = second.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert_eq!(server.seen.lock().len(), 1);
+}
+
+pub async fn condition(mut check: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+fn addressed(host: &str) -> crate::secret::ApiKeyTarget {
+    crate::secret::ApiKeyTarget {
+        scheme: "https".into(),
+        host: host.into(),
+        port: Some(443),
+        path: "/approved".into(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_label_does_not_block_an_immediate_vault_answer_for_another_target() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let cfg = live_config(&daemon, 443, Clock::new());
+    let secrets = Arc::new(crate::secret::requests::RequestSecrets::new(
+        cfg.vault,
+        cfg.authorization_scope,
+        cfg.consent_context,
+    ));
+    let held = secrets.clone();
+    let first = tokio::spawn(async move {
+        held.use_in_request("test", &addressed("localhost"), u64::MAX, || async {
+            Ok(())
+        })
+        .await
+    });
+    phone.phone.card(1).await;
+    let answer = tokio::time::timeout(
+        Duration::from_millis(500),
+        secrets.use_in_request("test", &addressed("other.test"), u64::MAX, || async {
+            Ok(())
+        }),
+    )
+    .await
+    .expect("a pending card must not lock another vault lookup")
+    .unwrap();
+    assert!(matches!(answer, crate::secret::UseAnswer::NotFound));
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        2,
+        "count NotFound asks too"
+    );
+    let statement = phone.phone.state.lock().unwrap().requests[0]
+        .statement_b64url
+        .clone();
+    daemon.state.lock().unwrap().approve(&statement);
+    let released = tokio::time::timeout(
+        Duration::from_millis(500),
+        secrets.use_in_request("test", &addressed("localhost"), u64::MAX, || async {
+            Ok(())
+        }),
+    )
+    .await
+    .expect("an already-covered request must not wait on the older card")
+    .unwrap();
+    assert!(matches!(released, crate::secret::UseAnswer::Released(_)));
+    assert!(!first.is_finished());
+    first.abort();
+    let _ = first.await;
+    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
+    assert!(
+        secrets.status().is_empty(),
+        "cancelled waiter removes its waiting line in Drop"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelling_one_waiter_keeps_the_pending_card_and_a_retry_joins_until_the_last_waiter_leaves(
+) {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let cfg = live_config(&daemon, 443, Clock::new());
+    let secrets = Arc::new(crate::secret::requests::RequestSecrets::new(
+        cfg.vault,
+        cfg.authorization_scope,
+        cfg.consent_context,
+    ));
+    let spawn = || {
+        let secrets = secrets.clone();
+        tokio::spawn(async move {
+            secrets
+                .use_in_request("test", &addressed("localhost"), u64::MAX, || async {
+                    Ok(())
+                })
+                .await
+        })
+    };
+    let first = spawn();
+    phone.phone.card(1).await;
+    let second = spawn();
+    condition(|| secrets.status().len() == 2).await;
+    first.abort();
+    let _ = first.await;
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
+    let retry = spawn();
+    condition(|| secrets.status().len() == 2).await;
+    assert!(
+        !second.is_finished() && !retry.is_finished(),
+        "a cancelled peer is not a declined card"
+    );
+    assert_eq!(phone.phone.state.lock().unwrap().requests.len(), 1);
+    second.abort();
+    let _ = second.await;
+    assert!(phone.phone.state.lock().unwrap().withdrawn.is_empty());
+    retry.abort();
+    let _ = retry.await;
+    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
+    assert!(secrets.status().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_labels_file_concurrently_and_share_one_absolute_deadline() {
+    let daemon = FakeClaustrum::start();
+    let mut second = record("header:x-second");
+    second.name = "second".into();
+    second.key = K2.to_vec();
+    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
+    let phone = PhoneGuard::install();
+    let clock = Clock::new();
+    let server = Server::new("echo-request").await;
+    let mut cfg = live_config(&daemon, server.address.port(), clock.clone());
+    cfg.scanned_labels.push("second".into());
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = std::thread::spawn(move || {
+        let reply = client.request(
+            "/approved",
+            json!({"authorization":format!("Bearer {MARKER}"),"x-second":"{{ck-secret:second}}"}),
+            "",
+        );
+        (reply, client)
+    });
+    phone.phone.card(2).await;
+    let requests = phone.phone.state.lock().unwrap().requests.clone();
+    assert!(
+        requests
+            .iter()
+            .all(|r| r.expires_at_ms == Some(1_700_000_600_000)),
+        "each filed card expires by the request's one deadline"
+    );
+    clock.advance(599_999);
+    tokio::task::yield_now().await;
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!worker.is_finished());
+    let first_index = requests.iter().position(|r| r.label == "test").unwrap() + 1;
+    phone
+        .phone
+        .decide(&daemon, first_index, ConsentOutcome::AnsweredOnce);
+    condition(|| daemon.state.lock().unwrap().calls >= 3).await;
+    assert!(server.seen.lock().is_empty());
+    clock.advance(1);
+    let (reply, _client) = worker.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert!(
+        server.seen.lock().is_empty(),
+        "the earlier release is spent, not sent or reused when another label times out"
+    );
+    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
+    assert!(proxy.approval_status().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_status_and_denial_scrub_a_label_that_equals_an_earlier_released_key() {
+    let daemon = FakeClaustrum::start();
+    let name = std::str::from_utf8(K1).unwrap();
+    let mut second = record("header:x-second");
+    second.name = name.into();
+    second.key = K2.to_vec();
+    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let mut cfg = live_config(&daemon, server.address.port(), Clock::new());
+    cfg.scanned_labels.push(name.into());
+    let proxy = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let first = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    phone.phone.decide(&daemon, 1, ConsentOutcome::Answered);
+    let (reply, mut client) = first.join().unwrap();
+    assert_eq!(reply["status"], 200);
+    let marker = format!("{{{{ck-secret:{name}}}}}");
+    let second = std::thread::spawn(move || {
+        let reply = client.request("/approved", json!({"x-second":marker}), "");
+        (reply, client)
+    });
+    phone.phone.card(2).await;
+    assert!(!proxy.approval_status().is_empty());
+    assert!(proxy
+        .approval_status()
+        .iter()
+        .all(|line| !line.contains(name)));
+    phone.phone.decide(&daemon, 2, ConsentOutcome::Declined);
+    let (reply, _client) = second.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert!(
+        !reply.to_string().contains(name),
+        "a local denial must use the command's released-key scrubber"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn malformed_json_structure_refuses_before_any_vault_ask_or_phone_card() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("json_pointer:/key"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    for body in [
+        "{not json {{ck-secret:test}}",
+        "{\"key\":\"{{ck-secret:test}}\",\"ke\\u0079\":\"other\"}",
+    ] {
+        let reply = client.request(
+            "/approved",
+            json!({"content-type":"application/json"}),
+            body,
+        );
+        assert_eq!(reply["status"], 403);
+    }
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        0,
+        "structure checks must precede releasing secret.use"
+    );
+    assert!(phone.phone.state.lock().unwrap().requests.is_empty());
+    assert!(server.seen.lock().is_empty());
+}
+
+async fn approval_log_case(
+    answer: ConsentOutcome,
+    raw_code: Option<&str>,
+    expected_reason: &str,
+    expected_body: &str,
+    expected_code: Option<&str>,
+) {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    let card = phone.phone.card(1).await;
+    if let Some(code) = raw_code {
+        crate::secret::consent::record_outcome_code(&card.scope, &card.request_id, code);
+    }
+    phone.phone.decide(&daemon, 1, answer);
+    let (reply, _client) = worker.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    assert_eq!(reply["body"], expected_body);
+    let lines = proxy.state.test_refusals.lock();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let line = &lines[0];
+    assert!(
+        line.contains(&format!("reason={expected_reason} ")),
+        "{line}"
+    );
+    assert!(line.contains("label=\"test\" host=\"localhost\""), "{line}");
+    let outcome = match expected_reason {
+        "approval_declined" => "declined",
+        "approval_expired" => "expired",
+        "approval_withdrawn" => "withdrawn",
+        _ => "not_granted",
+    };
+    assert!(line.contains(&format!("outcome={outcome}")), "{line}");
+    assert!(
+        line.contains(&format!("request_id={:?}", card.request_id)),
+        "{line}"
+    );
+    if let Some(code) = expected_code {
+        assert!(line.contains(&format!("code={code}")), "{line}");
+    }
+    if expected_code == Some("unlisted") {
+        assert!(!line.contains(raw_code.unwrap()), "{line}");
+    }
+    assert!(!line.contains(std::str::from_utf8(K1).unwrap()), "{line}");
+    assert_eq!(line.lines().count(), 1);
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_declined() {
+    approval_log_case(
+        ConsentOutcome::Declined,
+        None,
+        "approval_declined",
+        "AFT's secret proxy refused the request: test (localhost). The approval was declined.",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_expired() {
+    approval_log_case(
+        ConsentOutcome::Expired,
+        None,
+        "approval_expired",
+        "AFT's secret proxy refused the request: test (localhost). The approval request expired.",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_withdrawn() {
+    approval_log_case(
+        ConsentOutcome::Cancelled,
+        None,
+        "approval_withdrawn",
+        "AFT's secret proxy refused the request: test (localhost). The approval request was withdrawn.",
+        None,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_unknown_allowlisted() {
+    approval_log_case(
+        ConsentOutcome::Indeterminate,
+        Some("transient"),
+        "approval_not_granted",
+        "AFT's secret proxy refused the request: test (localhost). The approval was not granted.",
+        Some("transient"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_unknown_secret_shaped() {
+    let secret_code = "secret-shaped-outcome-must-not-be-logged";
+    approval_log_case(
+        ConsentOutcome::Indeterminate,
+        Some(secret_code),
+        "approval_not_granted",
+        "AFT's secret proxy refused the request: test (localhost). The approval was not granted.",
+        Some("unlisted"),
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn approval_log_concurrent_decline_and_deadline_have_distinct_ids() {
+    let daemon = FakeClaustrum::start();
+    let mut second = record("header:x-second");
+    second.name = "second".into();
+    second.key = K2.to_vec();
+    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
+    let phone = PhoneGuard::install();
+    let clock = Clock::new();
+    let server = Server::new("echo-request").await;
+    let proxy_one = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), clock.clone()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut cfg = live_config(&daemon, server.address.port(), clock.clone());
+    cfg.scanned_labels = vec!["second".into()];
+    let proxy_two = SecretProxy::start_with_tls(cfg, server.client_tls.clone()).unwrap();
+    let mut one = Client::spawn(&proxy_one, &server);
+    let mut two = Client::spawn(&proxy_two, &server);
+    proxy_one.arm_command(one.process.id()).unwrap();
+    proxy_two.arm_command(two.process.id()).unwrap();
+    one.connect(false);
+    two.connect(false);
+    let first = request_in_thread(one, false);
+    let second = std::thread::spawn(move || {
+        two.request("/approved", json!({"x-second":"{{ck-secret:second}}"}), "")
+    });
+    phone.phone.card(2).await;
+    let cards = phone.phone.state.lock().unwrap().requests.clone();
+    let first_card = cards.iter().find(|card| card.label == "test").unwrap();
+    let second_card = cards.iter().find(|card| card.label == "second").unwrap();
+    let index = cards.iter().position(|card| card.label == "test").unwrap() + 1;
+    phone.phone.decide(&daemon, index, ConsentOutcome::Declined);
+    let (reply, _one) = first.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    clock.advance(600_000);
+    let reply = second.join().unwrap();
+    assert_eq!(reply["status"], 403);
+    let first_lines = proxy_one.state.test_refusals.lock();
+    let second_lines = proxy_two.state.test_refusals.lock();
+    assert_eq!(first_lines.len(), 1, "{first_lines:?}");
+    assert_eq!(second_lines.len(), 1, "{second_lines:?}");
+    assert!(first_lines[0].contains("reason=approval_declined"));
+    assert!(first_lines[0].contains(&format!("request_id={:?}", first_card.request_id)));
+    assert!(second_lines[0].contains("reason=approval_pending_at_deadline"));
+    assert!(second_lines[0].contains(&format!("request_id={:?}", second_card.request_id)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stopping_a_proxy_with_a_held_request_withdraws_the_card_and_removes_status() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let mut proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let worker = request_in_thread(client, false);
+    phone.phone.card(1).await;
+    assert!(!proxy.approval_status().is_empty());
+    proxy.stop();
+    condition(|| phone.phone.state.lock().unwrap().withdrawn.len() == 1).await;
+    assert!(proxy.approval_status().is_empty());
+    assert!(server.seen.lock().is_empty());
+    let _ = worker.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_statement_location_is_planned_before_filing_or_consuming_a_release() {
+    let daemon = FakeClaustrum::start();
+    daemon.state.lock().unwrap().record = Some(record("json_pointer:/key"));
+    let phone = PhoneGuard::install();
+    let server = Server::new("echo-request").await;
+    let proxy = SecretProxy::start_with_tls(
+        live_config(&daemon, server.address.port(), Clock::new()),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    client.connect(false);
+    let reply = client.request(
+        "/approved",
+        json!({"content-type":"application/json"}),
+        "{\"key\":42,\"other\":\"{{ck-secret:test}}\"}",
+    );
+    assert_eq!(reply["status"], 403);
+    assert_eq!(
+        daemon.state.lock().unwrap().calls,
+        1,
+        "read location from approval_required, without a releasing retry"
+    );
+    assert!(phone.phone.state.lock().unwrap().requests.is_empty());
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_vault_negotiated_h2_client_holds_then_returns_clean_responses() {
+    for (mode, decision, refusal) in [
+        ("echo-request", Some(ConsentOutcome::Answered), ""),
+        ("no-content", Some(ConsentOutcome::Answered), ""),
+        (
+            "echo-request",
+            Some(ConsentOutcome::Declined),
+            "AFT's secret proxy refused the request: test (localhost). The approval was declined.",
+        ),
+        (
+            "echo-request",
+            Some(ConsentOutcome::Expired),
+            "AFT's secret proxy refused the request: test (localhost). The approval request expired.",
+        ),
+        (
+            "echo-request",
+            Some(ConsentOutcome::Cancelled),
+            "AFT's secret proxy refused the request: test (localhost). The approval request was withdrawn.",
+        ),
+        (
+            "echo-request",
+            None,
+            "AFT's secret proxy refused the request: test (localhost). No answer to the approval arrived in time.",
+        ),
+    ] {
+        let daemon = FakeClaustrum::start();
+        daemon.state.lock().unwrap().record = Some(record("authorization_bearer"));
+        let phone = PhoneGuard::install();
+        let server = Server::new(mode).await;
+        let clock = Clock::new();
+        let proxy = SecretProxy::start_with_tls(
+            live_config(&daemon, server.address.port(), clock.clone()),
+            server.client_tls.clone(),
+        )
+        .unwrap();
+        proxy
+            .state
+            .test_idle_timeout_ms
+            .store(100, Ordering::Release);
+        let mut client = Client::spawn(&proxy, &server);
+        proxy.arm_command(client.process.id()).unwrap();
+        let curl = client.command(json!({"op":"curl_available"}))["available"] == true;
+        if !curl {
+            let negotiated = client.command(json!({"op":"connect", "negotiate":true}));
+            assert_eq!(negotiated["alpn"], "h2", "{negotiated}");
+        }
+        let worker = std::thread::spawn(move || {
+            let reply = client.command(if curl { json!({"op":"curl"}) } else {
+                json!({"op":"request", "method":"DELETE", "headers":{"authorization":format!("Bearer {MARKER}")}})
+            });
+            (reply, client)
+        });
+        phone.phone.card(1).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        assert!(
+            !worker.is_finished(),
+            "the h2 approval hold must outlive several socket idle intervals"
+        );
+        assert!(
+            server.seen.lock().is_empty(),
+            "approval must precede upstream dispatch"
+        );
+        if let Some(decision) = decision {
+            phone.phone.decide(&daemon, 1, decision);
+        } else {
+            clock.advance(600_000);
+        }
+        let (reply, _client) = worker.join().unwrap();
+        let expected_status = if !refusal.is_empty() {
+            403
+        } else if mode == "no-content" {
+            204
+        } else {
+            200
+        };
+        if curl {
+            assert_eq!(reply["ok"], true, "{reply}");
+            assert!(
+                reply["wire"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&format!("AFT_CURL_RESULT 2 {expected_status}")),
+                "{reply}"
+            );
+            assert!(
+                reply["wire"]
+                    .as_str()
+                    .unwrap()
+                    .contains(if refusal.is_empty() { MARKER } else { refusal }),
+                "{reply}"
+            );
+        } else {
+            assert_eq!(reply["status"], expected_status, "{reply}");
+            if refusal.is_empty() {
+                assert_eq!(reply["headers"]["x-echo"], MARKER, "{reply}");
+            } else {
+                assert_eq!(reply["body"], refusal, "{reply}");
+            }
+        }
+        if refusal.is_empty() {
+            assert_eq!(
+                server.seen.lock().last().unwrap()["headers"]["authorization"],
+                "Bearer test-key-12345678"
+            );
+        } else {
+            assert!(
+                server.seen.lock().is_empty(),
+                "a refusal must not send upstream"
+            );
+        }
+        assert!(
+            !reply.to_string().contains(std::str::from_utf8(K1).unwrap()),
+            "{reply}"
+        );
+    }
+}

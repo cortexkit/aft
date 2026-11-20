@@ -42,7 +42,7 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let _pin = false.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
         crate::context::confinement::with_floor_disclosure(|| {
-            crate::bounded_io::command(req, ctx, handle_glob_inner)
+            crate::bounded_io_command::command(req, ctx, handle_glob_inner)
         })
     })
 }
@@ -149,7 +149,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         None
     } else {
-        crate::data_layer::parent_session::glob_fan_out(ctx, &search_roots, pattern)
+        crate::parent_search::glob_fan_out(ctx, &search_roots, pattern)
     };
     let (
         mut files,
@@ -398,7 +398,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         serde_json::Value::String("filesystem".to_string())
     };
-    crate::data_layer::parent_session::attach_search_gaps(&mut body, parent_gaps);
+    crate::parent_search::attach_search_gaps(&mut body, parent_gaps);
     crate::context::confinement::disclose_denied(&mut body);
 
     let rendered_count =
@@ -616,7 +616,7 @@ fn glob_root(
     let search_root_text = search_root.to_string_lossy();
     let search_scope = resolve_search_scope(project_root, Some(search_root_text.as_ref()));
     if search_scope.use_index && !ignored_target {
-        if let Some(view) = crate::data_layer::tools::grep::ready_view(ctx) {
+        if let Some(view) = crate::data_layer::text_scope::ready_view(ctx) {
             if let Some(discovery) = glob_from_view(view, project_root, &search_scope.root, pattern)
             {
                 return Ok(discovery);
@@ -661,7 +661,7 @@ fn glob_from_view(
     search_root: &Path,
     pattern: &str,
 ) -> Option<GlobDiscovery> {
-    let scope = crate::data_layer::tools::grep::ViewScope::of(view, search_root)?;
+    let scope = crate::data_layer::text_scope::ViewScope::of(view, search_root)?;
     if !scope.is_whole_checkout() && !scope.has_files() {
         // The checkout holds no file under this explicitly named directory,
         // so walk it, as today's path does when its index lacks the directory.

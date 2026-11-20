@@ -27,8 +27,9 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::config::Config;
+use crate::context::Executor;
 use crate::context::{App, AppContext, ProgressSender, RootHealthSnapshot};
-use crate::executor::{Executor, JobCancellation, Lane, PreExecutionCancelOutcome};
+use crate::executor::{JobCancellation, Lane, PreExecutionCancelOutcome};
 use crate::fleet_status::{spawn_fleet_status_dial, FleetStatusClient};
 use crate::log_ctx;
 use crate::path_identity::ProjectRootId;
@@ -42,9 +43,9 @@ use crate::runtime_drain;
 use crate::sandbox_spawn::{AuthenticatedPrincipal, PrincipalTrust};
 
 use subc_protocol::manifest::{
-    Bindings, Concurrency, ConsumerRole, ExecutionMode, IdentityBinding, IdentityScope,
-    ManagementOperation, ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding,
-    StorageKind, StorageScope, Tool, TrustTier,
+    Bindings, Concurrency, ConsumerRole, IdentityBinding, IdentityScope, ManagementOperation,
+    ManagementOperationKind, ModuleManifest, ProviderRole, StorageBinding, StorageKind,
+    StorageScope, Tool, TrustTier,
 };
 use subc_protocol::session::{
     HealthReport, HealthStatus, ModuleControlCommand, ModuleControlRequest, ModuleControlResponse,
@@ -210,6 +211,7 @@ mod bind_log;
 mod call_policy;
 pub(crate) mod call_yield;
 mod carrier_read_only;
+pub(crate) mod lower_hooks;
 #[cfg(test)]
 mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.
@@ -219,7 +221,6 @@ mod bash_grant_tests;
 mod bash_selector_tests;
 mod codemode;
 mod consent;
-pub(crate) use consent::directory_scope;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
 mod diagnostics_findings;
@@ -234,7 +235,6 @@ use installed_routes::{insert_route_channel, remove_route_channel};
 mod legacy_root;
 use legacy_root::*;
 pub(crate) mod held_task_recovery;
-pub(crate) use runner_notices::retry_held_notice_fallback;
 #[cfg(test)]
 mod idle_reap_frame_loop_tests;
 #[cfg(test)]
@@ -252,10 +252,6 @@ mod views_idle_checkout_tests;
 pub(crate) use secret_consent::with_secret_bound_identity_for_test;
 #[cfg(test)]
 pub(crate) use secret_consent::with_secret_identity_for_test;
-pub(crate) use secret_consent::{
-    current_call_scopes, current_fetch_reply_deadline, current_secret_audit_scope,
-    current_secret_consent_context, use_current_secret_labels, LaunchDecision,
-};
 mod standalone;
 #[doc(hidden)]
 pub use self::health::SubcTestHealthRollupProbe;
@@ -309,16 +305,12 @@ mod tool_provider;
 mod wire;
 mod work_step;
 
-pub(crate) use self::tool_provider::WORKER_REPLY_MARGIN_MS;
-
 use self::health::{
     build_health_report, route_bind_deadline_refusal, warn_slow_pending_binds,
     warn_slow_running_interactive_jobs, DeferredBashWaitGuard, DispatchPathMetrics,
     HealthRollupCache, HealthRollupWorker, ReapBlockerCensus, ResponseTaskGuard, UnboundRetention,
 };
-pub(crate) use self::manifest::is_native_plumbing_call;
 pub(crate) use self::manifest::is_subc_native_plumbing_tool;
-pub(crate) use self::manifest::tool_call_is_mutating;
 use self::manifest::{
     build_manifest_without, command_lane, control_flags, control_ops, is_bash_family_tool,
     is_subc_agent_core_tool,
@@ -1034,7 +1026,7 @@ fn submit_active_tool_call(
     detach_policy: RouteDetachPolicy,
     tool: &str,
     request: RequestFrameMeta,
-    job: crate::executor::ExecutorJob,
+    job: crate::context::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let job = queued_call::guard(request.deadline, tool, request_id.clone(), job);
     let job = push::routed_progress_job(route, corr, &request_id, job);
@@ -1078,7 +1070,7 @@ fn resubmit_active_tool_call(
     lane: Lane,
     request_id: String,
     tool: &str,
-    job: crate::executor::ExecutorJob,
+    job: crate::context::ExecutorJob,
 ) -> oneshot::Receiver<Response> {
     let mut calls = active
         .lock()
@@ -1452,7 +1444,7 @@ pub(crate) fn recovered_bash_frame(
     String,
     Option<Vec<u8>>,
 )> {
-    if snapshot.info.status == crate::bash_background::BgTaskStatus::FateUnknown {
+    if snapshot.info.status == crate::protocol::BgTaskStatus::FateUnknown {
         return Some((
             crate::db::call_ledger::not_retained(key, "unknown"),
             "unknown".into(),
@@ -2333,7 +2325,7 @@ fn quiesce_unbound_root_with(
         // Parent folders have no local build progress to retain. Their watcher
         // owns exclusion retries independently of the child-reader session, so
         // release both lifetimes when the final route closes.
-        if crate::data_layer::parent_session::release_context(ctx) || ctx.root_too_broad() {
+        if crate::parent_search::release_context(ctx) || ctx.root_too_broad() {
             ctx.stop_watcher_runtime();
             ctx.invalidate_artifacts_after_watcher_gap();
         }
@@ -2505,7 +2497,7 @@ fn submit_ignore_rule_load(executor: &Executor, root_id: &ProjectRootId) {
         root_id.as_path().to_string_lossy()
     );
     let response_id = request_id.clone();
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let published = crate::commands::configure::load_ignore_rules_if_unpublished(ctx);
         Response::success(response_id, json!({ "published": published }))
     });
@@ -2532,7 +2524,7 @@ fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId)
         root_id.as_path().to_string_lossy()
     );
     let response_id = request_id.clone();
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let persisted = ctx.persist_unbound_artifacts_for_teardown();
         Response::success(response_id, json!({ "persisted": persisted }))
     });
@@ -6866,7 +6858,7 @@ where
                 // only spawn their work, and only when it is due.
                 if let Some(db) = shared_app.try_db() {
                     crate::db::write_ledger::maybe_spawn_fold(db.clone());
-                    crate::db::compression_events::maybe_spawn_retention(
+                    crate::bash_background::persistence::retention::maybe_spawn_retention(
                         db,
                         retention_registries,
                     );
@@ -10494,7 +10486,7 @@ pub(super) static PLAIN_RUN_IO_BUDGET_FOR_TEST: std::sync::LazyLock<
 /// held for a consent answer can run again with the approved capabilities.
 #[derive(Clone)]
 struct PlainToolRun {
-    progress: Option<crate::run_tool_call::progress::Progress>,
+    progress: Option<crate::tool_progress::Progress>,
     speech_seed: Option<crate::gh_shim_speech::service::LaunchSeed>,
     bare_name: String,
     arguments: Value,
@@ -10523,7 +10515,7 @@ impl PlainToolRun {
         ask_route: crate::access_policy::AskRoute,
         mut phase_trace: PhaseTrace,
         done: oneshot::Sender<ToolCallCompletion>,
-    ) -> crate::executor::ExecutorJob {
+    ) -> crate::context::ExecutorJob {
         if self.approved_io_window.is_some() {
             if let Some(key) = &self.ledger_key {
                 rich_ui::display::person_answered(key);
@@ -12108,7 +12100,7 @@ async fn handle_tool_call_with_capabilities(
         // them for its whole life.
         let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let fetch_reply_deadline = reply_budget.deadline;
-        let job: crate::executor::ExecutorJob = Box::new(move |ctx| {
+        let job: crate::context::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(fetch_reply_deadline);
             let _deferred_wake_scope = completion_wake.install();
@@ -12682,7 +12674,7 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
     runtime_drain::drain_configure_warning_events(ctx);
     if !stepped_aside {
         crate::data_layer::runtime::root_bound(ctx);
-        crate::data_layer::outline::root_bound(ctx);
+        crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
     }
     let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
         .then(|| crate::provisional_identity_retry::poll(ctx))
@@ -12811,7 +12803,7 @@ fn submit_maintenance_job(
     // Keeping every drain on MaintenanceCommit lets interactive reads and lazy
     // HeavyInit queries run while maintenance converges after the bind ack.
     let lane = Lane::MaintenanceCommit;
-    let job: crate::executor::ExecutorJob = Box::new(move |ctx: &AppContext| {
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
         let outcome = match kind {
             MaintenanceDrainKind::Watcher => {
                 let drained = runtime_drain::drain_watcher_events_bounded(
@@ -13351,7 +13343,7 @@ pub(crate) mod test_support {
         path
     }
     use super::*;
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
     use crate::protocol::{
         BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, ConfigureWarningsFrame,
         ProgressFrame, StatusChangedFrame,
@@ -13993,7 +13985,7 @@ pub(crate) mod test_support {
         use crate::bash_background::persistence::{
             create_task_layout, write_task_at, PersistedTask,
         };
-        use crate::bash_background::BgTaskStatus;
+        use crate::protocol::BgTaskStatus;
 
         let (dir, _) = test_root("bash-watch-producer-wake");
         let session = "watch-session";
@@ -14086,7 +14078,7 @@ pub(crate) mod test_support {
             false,
         );
         metadata.harness = Some("runner".into());
-        metadata.mark_terminal(crate::bash_background::BgTaskStatus::Failed, Some(1), None);
+        metadata.mark_terminal(crate::protocol::BgTaskStatus::Failed, Some(1), None);
         write_task_at(&task, &metadata).unwrap();
         std::fs::write(&task.paths.stdout, "scoped durable output\n").unwrap();
         std::fs::write(&task.paths.stderr, "").unwrap();
@@ -14549,7 +14541,7 @@ pub(crate) mod test_support {
                     .unwrap()
                     .info
                     .status,
-                crate::bash_background::BgTaskStatus::Running,
+                crate::protocol::BgTaskStatus::Running,
                 "hand-back must not kill the task"
             );
         }
@@ -15607,7 +15599,7 @@ mod tests {
             );
         }
     }
-    use crate::bash_background::BgTaskStatus;
+    use crate::protocol::BgTaskStatus;
 
     #[tokio::test]
     async fn standing_tick_skips_busy_lifecycle_and_acks_another_root_bind() {
@@ -16996,7 +16988,7 @@ mod tests {
 
     fn wait_for_background_exit(pid: u32) {
         let deadline = Instant::now() + Duration::from_secs(5);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::process_identity::is_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
                 "background task process survived kill"
@@ -17011,7 +17003,7 @@ mod tests {
         let storage = tempfile::tempdir().expect("task storage");
         let ctx = test_ctx();
         let (task_id, pid) = spawn_background_for_root(&ctx, &root, &storage, "reclaim-session");
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
@@ -17031,7 +17023,7 @@ mod tests {
             &metrics,
         );
         assert!(first.forgotten_deleted_roots.is_empty());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         let outcome = reap_until_forgotten(
             &root,
@@ -17107,7 +17099,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(root_dir.path().exists());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
         let snapshot = ctx
             .bash_background()
             .status(
@@ -17157,7 +17149,7 @@ mod tests {
             &metrics,
         );
         assert!(second.forgotten_deleted_roots.is_empty());
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
         let _ = ctx.bash_background().kill(&task_id, "restored-session");
         wait_for_background_exit(pid);
         // The test recreated the root after its TempDir was closed, so nothing
@@ -17693,7 +17685,7 @@ mod tests {
         // Retiring the actor must stop its server without either the watcher
         // drain or the process-wide orphan sweep assisting the teardown.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while crate::bash_background::process::is_process_alive(pid) {
+        while crate::process_identity::is_process_alive(pid) {
             assert!(
                 Instant::now() < deadline,
                 "retired root left LSP child {pid} running"
@@ -17739,7 +17731,7 @@ mod tests {
             1,
             "the exit sweep, not a background reap, must own the running server"
         );
-        assert!(crate::bash_background::process::is_process_alive(pid));
+        assert!(crate::process_identity::is_process_alive(pid));
 
         // The exit phase of `run_subc_mode_inner`: take every client and stop
         // them under one budget, killing the server that ignores Shutdown.
@@ -17755,7 +17747,7 @@ mod tests {
         // deadline. Require eventual process exit and registry cleanup instead;
         // neither a live leaked server nor a stale registry entry may remain.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid)
+        while crate::process_identity::is_process_alive(pid)
             || ctx.lsp_child_registry().pids().contains(&pid)
         {
             assert!(
@@ -17789,7 +17781,7 @@ mod tests {
         assert_eq!(ctx.lsp().active_client_count(), 0);
         // Hang guard only: the reap waits 25 ms for Shutdown, then terminates.
         let deadline = Instant::now() + Duration::from_secs(30);
-        while crate::bash_background::process::is_process_alive(pid)
+        while crate::process_identity::is_process_alive(pid)
             || ctx.lsp_child_registry().pids().contains(&pid)
         {
             assert!(
@@ -17973,7 +17965,7 @@ mod tests {
         let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let parent = crate::data_layer::parent_session::session_for(&ctx).expect("parent session");
+        let parent = crate::parent_search::session_for(&ctx).expect("parent session");
         assert!(parent.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
         let counters = crate::context::watcher_counters_for_root(root.as_path());
@@ -18016,7 +18008,7 @@ mod tests {
             parent.stopped(),
             "last parent route must release its child readers"
         );
-        assert!(crate::data_layer::parent_session::session_for_root(root.as_path()).is_none());
+        assert!(crate::parent_search::session_for_root(root.as_path()).is_none());
         assert!(ctx.watcher_rx().lock().is_none());
         crate::commands::configure::ensure_project_watcher(&ctx);
         assert!(
@@ -18027,8 +18019,7 @@ mod tests {
         roots.get_mut(&root).unwrap().reactivate_bound();
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
-        let rebound =
-            crate::data_layer::parent_session::session_for(&ctx).expect("rebound parent session");
+        let rebound = crate::parent_search::session_for(&ctx).expect("rebound parent session");
         assert!(!Arc::ptr_eq(&parent, &rebound));
         assert!(rebound.wait_rounds(1, Duration::from_secs(5)));
         wait_for_watcher_count(&ctx, 1);
@@ -22918,8 +22909,8 @@ mod compile_fence_tests {
     fn subc_delay_and_ttl_hooks_require_explicit_test_hooks() {
         let source = compact(include_str!("mod.rs"));
         assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]{ifletOk(raw)=std::env::var(\"AFT_TEST_SUBC_BASH_ELICITATION_TTL_MS\")"));
-        let source = compact(include_str!("../subc_config.rs"));
-        assert!(source.contains("#[cfg(any(test,feature=\"test-timing-hooks\"))]ifletSome(delay_ms)=std::env::var(\"AFT_TEST_SUBC_CONFIG_READ_DELAY_MS\")"));
+        let source = compact(include_str!("../../../aft-base/src/subc_config.rs"));
+        assert!(source.contains("#[cfg(any(any(test,feature=\"test-support\"),feature=\"test-timing-hooks\"))]ifletSome(delay_ms)=std::env::var(\"AFT_TEST_SUBC_CONFIG_READ_DELAY_MS\")"));
     }
 }
 

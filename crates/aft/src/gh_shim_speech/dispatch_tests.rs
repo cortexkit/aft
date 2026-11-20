@@ -593,10 +593,8 @@ impl Fixture {
                     let _guard = crate::gh_shim_ticket::spawn_ticket_guard(Some(&raw));
                     crate::gh_shim_ticket::mark_spawn_background(background);
                     let mut environment = HashMap::new();
-                    environment.insert(
-                        crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
-                        raw.clone(),
-                    );
+                    environment
+                        .insert(crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(), raw.clone());
                     let task =
                         crate::bash_background::registry::with_scope_spawn(lifecycle, || {
                             if pty {
@@ -797,7 +795,9 @@ async fn captured_dispatch_reaches_the_real_gate_with_a_precommitted_pinned_nonc
             let slot = reserve(project, session, scope, body)?;
             let path = path.clone();
             Ok(ReservedBotRequest::for_test(move || {
-                let conn = crate::db::gh_speech::Store::new(path).connect().unwrap();
+                let conn = crate::gh_shim_speech::store::Store::new(path)
+                    .connect()
+                    .unwrap();
                 let expect: String = conn
                     .query_row(
                         "SELECT expect_json FROM gh_speech_requests WHERE request_nonce=?1",
@@ -918,7 +918,7 @@ fn cancel_child() {
     };
     let stamp: ScopeStamp =
         serde_json::from_str(&std::env::var("AFT_TEST_DISPATCH_CANCEL_SCOPE").unwrap()).unwrap();
-    assert!(crate::root_cache::acquire_speech_serving_lease(Path::new(&root)).is_err());
+    assert!(crate::cache_location::acquire_speech_serving_lease(Path::new(&root)).is_err());
     let saved = saved_task_summary(Path::new(&root));
     let reply = crate::commands::bash_kill_scope::handle_bash_kill_scope_with_saved_tasks(
         json!({"scope":stamp}),
@@ -1003,7 +1003,7 @@ async fn bound_background_cancel_committed_before_sdk_send_is_refused() {
                 1,
                 "{receipt:?}"
             );
-            let marker = crate::db::gh_speech::Store::new(root.join("aft.db"))
+            let marker = crate::gh_shim_speech::store::Store::new(root.join("aft.db"))
                 .get(&incarnation)
                 .err()
                 .map(|error| error.reason);
@@ -1095,7 +1095,7 @@ async fn historical_legacy_dispatch_cannot_be_resent_by_the_relay() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     seed_historical_dispatch(&fixture, "lost-consumer");
-    let recovered = crate::db::gh_speech::Store::new(fixture.service.store.path());
+    let recovered = crate::gh_shim_speech::store::Store::new(fixture.service.store.path());
     assert_eq!(
         recovered
             .pending_legacy_for_identity(&fixture.session, &fixture.task)

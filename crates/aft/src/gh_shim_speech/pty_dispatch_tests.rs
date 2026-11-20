@@ -1,5 +1,5 @@
 use super::*;
-use crate::bash_background::BgTaskStatus;
+use crate::protocol::BgTaskStatus;
 
 fn checkpoint(
     task: &str,
@@ -161,7 +161,7 @@ async fn pty_seal_failure_revokes_speech_durably_but_runs_the_command_normally()
         .write_pty(&fixture.task, &fixture.session, b"finish\n")
         .unwrap();
     completed(&fixture).await;
-    let restarted = crate::db::gh_speech::Store::new(fixture.service.store.path());
+    let restarted = crate::gh_shim_speech::store::Store::new(fixture.service.store.path());
     let error = restarted
         .seal(
             &fixture.incarnation,
@@ -205,13 +205,13 @@ async fn pty_revocation_commit_failure_aborts_and_reaps_without_running_user_cod
     .unwrap();
     let (_speech, metadata) = checkpoint(&task);
     let pid = metadata.child_pid.expect("gated child identity checkpoint");
-    assert!(crate::bash_background::process::is_process_alive(pid));
+    assert!(crate::process_identity::is_process_alive(pid));
     release_tx.send(()).unwrap();
     let fixture = launch.await.unwrap();
     assert_eq!(fixture.startup_error.as_deref(),Some("task_gh_authority_unavailable: this command's bot-write permission cannot be verified (snapshot_invalid); start the command again from a live session, and tell the operator if it repeats."));
     assert!(!ran.exists());
     assert!(
-        !crate::bash_background::process::is_process_alive(pid),
+        !crate::process_identity::is_process_alive(pid),
         "an aborted PTY launch left its child alive"
     );
     fixture
@@ -243,7 +243,7 @@ fn revoked_probe_child() {
     };
     let incarnation = std::env::var("AFT_TEST_REVOKED_PTY_INCARNATION").unwrap();
     let ticket = std::env::var("AFT_TEST_REVOKED_PTY_TICKET").unwrap();
-    let store = crate::db::gh_speech::Store::new(Path::new(&root).join("aft.db"));
+    let store = crate::gh_shim_speech::store::Store::new(Path::new(&root).join("aft.db"));
     assert_eq!(
         store
             .seal(

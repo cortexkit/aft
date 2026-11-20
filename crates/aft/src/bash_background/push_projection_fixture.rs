@@ -61,7 +61,7 @@ fn build() -> BusyRoot {
             .unwrap();
     }
     ctx.inspect_manager()
-        .set_tier2_in_flight_for_test(crate::inspect::InspectCategory::DeadCode, true);
+        .set_tier2_in_flight_for_test(crate::inspect_category::InspectCategory::DeadCode, true);
     *ctx.semantic_index_status().write().unwrap() = crate::context::SemanticIndexStatus::Building {
         stage: "embedding".into(),
         files: Some(6200),
@@ -101,7 +101,7 @@ fn build() -> BusyRoot {
         app.register_memory_context(path, &other);
         contexts.push(other);
     }
-    app.publish_lifecycle_census(crate::lifecycle_census::collect(&app, &contexts));
+    app.collect_and_publish_lifecycle_census_for_test(&contexts);
     assert_eq!(ctx.bash_background().inner.tasks.lock().unwrap().len(), 256);
     assert_eq!(ctx.lsp_server_count(), 5);
     BusyRoot {

@@ -1,6 +1,7 @@
 use super::*;
 use crate::bash_background::{persistence, BgTaskStatus};
-use crate::db::{access_grants as grants, remote_exec};
+use crate::db::access_grants as grants;
+use crate::exec_remote::persistence as remote_exec;
 use subc_protocol::scope::{ScopeKind, ScopeStatus};
 
 fn named(module: &str) -> ScopeStamp {
@@ -246,7 +247,7 @@ async fn prefrontal_scope_watch_holds_rename_gap_through_rollback_until_confirme
         preset: "worker".into(),
     };
     let grant = crate::access_policy::AccessGrant {
-        path: crate::access_policy::policy_path(f.root.as_path()),
+        path: crate::policy_path::policy_path(f.root.as_path()),
         kind: crate::access_policy::GrantKind::Subtree,
         operation: crate::access_policy::AccessOperation::Read,
     };

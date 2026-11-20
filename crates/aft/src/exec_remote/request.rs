@@ -99,7 +99,7 @@ impl FrozenParams {
                             let shown = if crate::context::confinement::for_request(request_id) {
                                 given.to_path_buf()
                             } else {
-                                crate::inspect::job::normalize_path(&path)
+                                crate::path_identity::normalize_path(&path)
                             };
                             return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown).into());
                         }
@@ -178,7 +178,7 @@ fn preflight_covers(grants: &[crate::access_policy::AccessGrant], path: &Path) -
     if grants.is_empty() {
         return false;
     }
-    let path = crate::access_policy::policy_path(path);
+    let path = crate::policy_path::policy_path(path);
     grants
         .iter()
         .any(|grant| grant.covers(crate::access_policy::AccessOperation::Read, &path))

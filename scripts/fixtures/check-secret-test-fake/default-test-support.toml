@@ -1,0 +1,10 @@
+[package]
+name = "candidate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = [
+    "test-support",
+]
+test-support = []

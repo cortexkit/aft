@@ -44,8 +44,8 @@ pub(super) fn guard(
     deadline: Option<Deadline>,
     tool: &str,
     request_id: String,
-    job: crate::executor::ExecutorJob,
-) -> crate::executor::ExecutorJob {
+    job: crate::context::ExecutorJob,
+) -> crate::context::ExecutorJob {
     let tool = tool.to_owned();
     Box::new(move |ctx| {
         if let Some(deadline) = deadline.filter(|deadline| deadline.expired()) {

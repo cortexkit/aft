@@ -28,10 +28,11 @@ use super::{carrier_read_only, flow_read, tool_provider, RouteIdentity};
 use crate::secret::consent::CancellationReason;
 use crate::secret::eligibility::{alfonso_of_kind, COMMAND_SCOPE_KINDS};
 #[cfg(test)]
+use crate::secret::LabelOutcome;
+#[cfg(test)]
 use crate::secret::{file_consent, withhold_consent};
 use crate::secret::{
-    CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, LabelOutcome, SecretConsentRequest,
-    SecretScope,
+    CallScopes, ConsentOutcome, EligibilityForm, Ineligibility, SecretConsentRequest, SecretScope,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -44,25 +45,7 @@ const SECRET_CONSENT_TIMEOUT: Duration = Duration::from_secs(10);
 const SECRET_AWAIT_CAP: Duration = Duration::from_secs(120);
 const SECRET_PENDING_BACKOFF: Duration = Duration::from_millis(50);
 
-thread_local! {
-    static FETCH_REPLY_DEADLINE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
-}
-
-/// The caller's reply deadline is independent of a fetch's network budget.
-pub(super) struct FetchReplyDeadline(Option<std::time::Instant>);
-impl FetchReplyDeadline {
-    pub(super) fn enter(deadline: std::time::Instant) -> Self {
-        Self(FETCH_REPLY_DEADLINE.with(|slot| slot.replace(Some(deadline))))
-    }
-}
-impl Drop for FetchReplyDeadline {
-    fn drop(&mut self) {
-        FETCH_REPLY_DEADLINE.with(|slot| slot.set(self.0));
-    }
-}
-pub(crate) fn current_fetch_reply_deadline() -> Option<std::time::Instant> {
-    FETCH_REPLY_DEADLINE.with(std::cell::Cell::get)
-}
+pub(super) use crate::secret::call_context::FetchReplyDeadline;
 
 /// Use the daemon connection that files filesystem-access questions with
 /// Cingulate as its reserved AFT module principal. Retain each secret card's id
@@ -788,39 +771,18 @@ pub(super) fn withdraw_secret_consent(pending: &PendingSecretConsent) {
     let _ = withhold_consent(&pending.request);
 }
 
-/// Result of the fetch's addressed vault call, before sending upstream.
+/// Test-only result of the addressed vault call before sending upstream.
+#[cfg(test)]
 #[derive(Debug)]
 pub(crate) enum LaunchDecision {
     Proceed(crate::secret::UseAnswer),
     #[cfg(test)]
     Pending(PendingSecretConsent),
     Refuse(LabelOutcome),
-    InvalidPlan(&'static str),
 }
 
-fn fetch_consent_refusal(
-    label: &str,
-    host: &str,
-    reason: crate::secret::requests::UseError,
-    held: &crate::url_fetch::HeldKeys,
-) -> LabelOutcome {
-    use crate::secret::requests::UseError;
-    if matches!(reason, UseError::Indeterminate) {
-        let outcome = crate::secret::outcome_for(label, &crate::secret::UseAnswer::Unavailable);
-        return match outcome {
-            LabelOutcome::Refuse { code, message } => LabelOutcome::Refuse {
-                code,
-                message: held.sanitize_detail(&message),
-            },
-            other => other,
-        };
-    }
-    let message = crate::secret::requests::consent_failure_message(label, host, reason);
-    LabelOutcome::Refuse {
-        code: crate::secret::SECRET_ACCESS_UNAVAILABLE,
-        message: held.sanitize_detail(&message),
-    }
-}
+#[cfg(test)]
+use crate::secret::fetch::fetch_consent_refusal;
 
 /// Fetch tools already know the target. Check eligibility before asking once,
 /// then use the existing held-call consent path if approval is required.
@@ -879,41 +841,16 @@ pub(crate) fn use_label_for_fetch(
     }
 }
 
-/// The eligibility answer for the tool call executing on this thread.
-///
-/// The dispatch path installs it once per call, before the call runs, so a
-/// launch reads the answer without seeing the route identity. A launch that
-/// finds nothing installed refuses: a scope that was never resolved is not an
-/// eligible one.
-pub(crate) fn current_call_scopes() -> Result<(CallScopes, EligibilityForm), Ineligibility> {
-    CURRENT_SCOPES
-        .with(|slot| slot.borrow().clone())
-        .unwrap_or(Err(Ineligibility::NoScope))
-}
+#[cfg(test)]
+use crate::context::call_context::current_call_scopes;
+pub(crate) use crate::context::call_context::SecretScopeGuard;
 
 thread_local! {
     static CURRENT_IDENTITY: std::cell::RefCell<Option<RouteIdentity>> = const { std::cell::RefCell::new(None) };
-    /// `None` while no call is being dispatched on this thread.
-    static CURRENT_SCOPES: std::cell::RefCell<Option<Result<(CallScopes, EligibilityForm), Ineligibility>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-pub(crate) fn current_secret_consent_context() -> Option<(std::path::PathBuf, String)> {
-    current_identity().map(|identity| (identity.project_root.clone(), identity.session.clone()))
 }
 
 pub(super) fn current_identity() -> Option<RouteIdentity> {
     CURRENT_IDENTITY.with(|slot| slot.borrow().clone())
-}
-
-pub(crate) fn current_secret_audit_scope() -> Option<SecretScope> {
-    current_call_scopes()
-        .ok()
-        .map(|(scopes, _)| scopes.authorization)
-        .or_else(|| {
-            current_identity()
-                .and_then(|identity| identity.scope.as_ref().map(SecretScope::from_stamp))
-        })
 }
 
 #[cfg(test)]
@@ -948,7 +885,10 @@ impl Drop for SecretContextRestoreCheck {
     }
 }
 
-pub(super) struct SecretIdentityGuard(Option<RouteIdentity>);
+pub(super) struct SecretIdentityGuard {
+    previous: Option<RouteIdentity>,
+    _context: crate::context::call_context::IdentityGuard,
+}
 
 impl SecretIdentityGuard {
     pub(super) fn install(identity: RouteIdentity) -> Self {
@@ -956,13 +896,22 @@ impl SecretIdentityGuard {
     }
 
     pub(super) fn install_optional(identity: Option<RouteIdentity>) -> Self {
-        Self(CURRENT_IDENTITY.with(|slot| slot.replace(identity)))
+        let audit_scope = identity
+            .as_ref()
+            .and_then(|identity| identity.scope.as_ref().map(SecretScope::from_stamp));
+        let consent_context = identity
+            .as_ref()
+            .map(|identity| (identity.project_root.clone(), identity.session.clone()));
+        Self {
+            previous: CURRENT_IDENTITY.with(|slot| slot.replace(identity)),
+            _context: crate::context::call_context::install_identity(consent_context, audit_scope),
+        }
     }
 }
 
 impl Drop for SecretIdentityGuard {
     fn drop(&mut self) {
-        CURRENT_IDENTITY.with(|slot| slot.replace(self.0.take()));
+        CURRENT_IDENTITY.with(|slot| slot.replace(self.previous.take()));
     }
 }
 
@@ -1037,241 +986,9 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
     run()
 }
 
-/// Installs the eligibility answer for one call and restores the previous one
-/// when it drops, so the executor lane never carries a stale answer into the
-/// next call.
-pub(super) struct SecretScopeGuard(Option<Result<(CallScopes, EligibilityForm), Ineligibility>>);
-
-impl SecretScopeGuard {
-    pub(super) fn install(
-        scopes: Option<Result<(CallScopes, EligibilityForm), Ineligibility>>,
-    ) -> Self {
-        SecretScopeGuard(CURRENT_SCOPES.with(|slot| slot.replace(scopes)))
-    }
-}
-
-impl Drop for SecretScopeGuard {
-    fn drop(&mut self) {
-        CURRENT_SCOPES.with(|slot| slot.replace(self.0.take()));
-    }
-}
-
 #[cfg(test)]
 #[path = "secret_consent_tests.rs"]
 mod tests;
-
-/// Fetch and proxy requests join the same scope/request-id cards, each with
-/// one person-wait deadline shared by every concurrently requested label.
-pub(crate) fn use_current_secret_labels(
-    vault: Arc<dyn crate::secret::SecretVault>,
-    labels: &[String],
-    target: &crate::secret::ApiKeyTarget,
-    request_target: &str,
-    cancellation: &crate::url_fetch::SecretFetchCancellation,
-) -> Vec<LaunchDecision> {
-    if labels.is_empty() {
-        return Vec::new();
-    }
-    let redactions = Arc::new(std::sync::Mutex::new(crate::url_fetch::HeldKeys::default()));
-    let refuse = |index: usize, reason| {
-        labels
-            .iter()
-            .map(|_| {
-                LaunchDecision::Refuse(fetch_consent_refusal(
-                    &labels[index],
-                    &target.host,
-                    reason,
-                    &redactions
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ))
-            })
-            .collect()
-    };
-    if let Some(reason) = cancellation.reason() {
-        return refuse(0, reason);
-    }
-    let scopes = match current_call_scopes() {
-        Ok((scopes, _)) => scopes,
-        Err(reason) => {
-            return labels
-                .iter()
-                .map(|label| {
-                    LaunchDecision::Refuse(crate::secret::refuse_ineligible(label, reason))
-                })
-                .collect()
-        }
-    };
-    #[cfg(unix)]
-    if vault.can_release_material() && crate::secret_proxy::protect_secret_process().is_err() {
-        return refuse(0, crate::secret::requests::UseError::Unavailable);
-    }
-    let checkpoint = cancellation.clone();
-    let coordinator = crate::secret::requests::RequestSecrets::new(
-        vault,
-        scopes.authorization,
-        current_secret_consent_context(),
-    )
-    .with_request_cancellation(move || checkpoint.is_cancelled());
-    let labels = labels.to_vec();
-    let target = target.clone();
-    let request_target = request_target.to_owned();
-    let cancellation = cancellation.clone();
-    let observed = redactions.clone();
-    let future = async move {
-        use futures_util::StreamExt;
-        let mut budget = coordinator.budget();
-        if let Some(expires) = cancellation.expires_at_ms() {
-            budget.expires_at_ms = budget.expires_at_ms.min(expires);
-        }
-        let mut pending = futures_util::stream::FuturesUnordered::new();
-        for (index, label) in labels.iter().enumerate() {
-            let target = &target;
-            let request_target = &request_target;
-            let coordinator = &coordinator;
-            let expires = budget.expires_at_ms;
-            let observed = &observed;
-            pending.push(async move {
-                (
-                    index,
-                    coordinator
-                        .use_planned_in_request(
-                            label,
-                            target,
-                            expires,
-                            |location| {
-                                let location =
-                                    secret_rules::location::parse_vault_location(location).ok_or(
-                                        crate::secret::requests::UseError::InvalidPlan(
-                                            "missing_material",
-                                        ),
-                                    )?;
-                                if !matches!(location, secret_rules::location::Location::Query(_)) {
-                                    // A covered deposit reveals its location only with the key, so the vault already recorded one release for that first ask.
-                                    return Err(crate::secret::requests::UseError::InvalidPlan(
-                                        "missing_material",
-                                    ));
-                                }
-                                let authority = secret_rules::target::ConnectAuthority {
-                                    host: target.host.clone(),
-                                    port: target.port.unwrap_or(443),
-                                };
-                                let rule = secret_rules::location::LabelRule {
-                                    label: label.clone(),
-                                    host: target.host.clone(),
-                                    port: 443,
-                                    path_prefix: target.path.clone(),
-                                    location,
-                                };
-                                let view = secret_rules::location::RequestView::new(
-                                    request_target,
-                                    Vec::new(),
-                                );
-                                let dummy =
-                                    [(label.clone(), b"proxy-planning-value-0000".to_vec())];
-                                // Without a pending card, the vault reveals a deposit location only when releasing its key, so location-dependent refusals can follow that release.
-                                if let Some(refusal) =
-                                    secret_rules::location::evaluate_request_with_connect(
-                                        &view,
-                                        &authority,
-                                        &[rule],
-                                        &dummy,
-                                    )
-                                    .refusal
-                                {
-                                    Err(crate::secret::requests::UseError::InvalidPlan(
-                                        refusal.reason(),
-                                    ))
-                                } else {
-                                    Ok(())
-                                }
-                            },
-                            |key| {
-                                secret_rules::material::check_admissible(
-                                    key,
-                                    label,
-                                    &secret_rules::location::Location::Query("_".into()),
-                                )
-                                .map_err(|_| {
-                                    crate::secret::requests::UseError::InvalidPlan(
-                                        "material_not_admissible",
-                                    )
-                                })?;
-                                observed
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                    .hold(label, key)
-                                    .map_err(|_| {
-                                        crate::secret::requests::UseError::InvalidPlan(
-                                            "replacement_discloses_key",
-                                        )
-                                    })
-                            },
-                            || async { Ok(()) },
-                        )
-                        .await,
-                )
-            });
-        }
-        let mut answers: Vec<Option<crate::secret::UseAnswer>> =
-            (0..labels.len()).map(|_| None).collect();
-        while !pending.is_empty() {
-            let index = answers.iter().position(Option::is_none).unwrap_or(0);
-            let (index, answer) = tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err((index, cancellation.reason().unwrap_or(crate::secret::requests::UseError::Cancelled))),
-                () = budget.expired() => return Err((index, crate::secret::requests::UseError::Expired)),
-                result = pending.next() => result.ok_or((index, crate::secret::requests::UseError::Unavailable))?,
-            };
-            if let Some(reason) = cancellation.reason() {
-                return Err((index, reason));
-            }
-            match answer {
-                Ok(answer) => answers[index] = Some(answer),
-                Err(crate::secret::requests::UseError::InvalidPlan(reason)) => {
-                    return Ok(labels
-                        .iter()
-                        .map(|_| LaunchDecision::InvalidPlan(reason))
-                        .collect())
-                }
-                Err(reason) => return Err((index, reason)),
-            }
-        }
-        Ok(labels
-            .iter()
-            .zip(answers)
-            .map(|(label, answer)| {
-                let answer = answer.unwrap_or(crate::secret::UseAnswer::Unavailable);
-                let outcome = crate::secret::outcome_for(label, &answer);
-                if outcome.proceeds() {
-                    LaunchDecision::Proceed(answer)
-                } else {
-                    LaunchDecision::Refuse(outcome)
-                }
-            })
-            .collect())
-    };
-    // Blocking fetches run on tool worker threads. A local runtime drives only
-    // their coordinator; production card workers stay on the daemon runtime.
-    let result = match tokio::runtime::Handle::try_current() {
-        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-            tokio::task::block_in_place(|| handle.block_on(future))
-        }
-        Ok(_) => Err((0, crate::secret::requests::UseError::Unavailable)),
-        Err(_) => tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|_| (0, crate::secret::requests::UseError::Unavailable))
-            .and_then(|runtime| {
-                let result = runtime.block_on(future);
-                // An already-started blocking vault call cannot be aborted; do
-                // not make cancellation wait for its transport timeout.
-                runtime.shutdown_background();
-                result
-            }),
-    };
-    result.unwrap_or_else(|(index, reason)| refuse(index, reason))
-}
 
 #[cfg(test)]
 pub(crate) fn use_current_secret_label(

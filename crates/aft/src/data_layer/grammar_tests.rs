@@ -92,7 +92,7 @@ fn enable_meaning(ctx: &AppContext, root: &Path) -> impl Drop {
 fn wait_meaning(ctx: &AppContext) {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if crate::data_layer::tools::search::DataSemantic::current(ctx)
+        if crate::data_layer::meaning_query::DataSemantic::current(ctx)
             .and_then(|data| data.serving().cloned())
             .is_some_and(|meaning| meaning.coverage().pending.is_empty())
         {
@@ -120,7 +120,7 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
         .unwrap()
         .wait_for_memory_profile_idle_for_test();
     wait_meaning(&ctx);
-    let plane = crate::data_layer::tools::search::DataSemantic::current(&ctx).unwrap();
+    let plane = crate::data_layer::meaning_query::DataSemantic::current(&ctx).unwrap();
     let coverage = plane.serving().unwrap().coverage();
     assert_eq!(coverage.files, 2, "{coverage:?}");
     assert_eq!(coverage.files_embedded, 1, "{coverage:?}");
@@ -145,7 +145,7 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
 #[cfg(feature = "wasm-grammars")]
 fn callers(view: &CheckoutView, file: &str) -> Value {
     serde_json::to_value(
-        crate::commands::callgraph_store_adapter::callers_result(
+        crate::data_layer::callgraph_store_adapter::callers_result(
             &view.callgraph(),
             &view.root().join(file),
             "target",
@@ -494,7 +494,7 @@ fn scenario(phase: &str) {
     );
     assert!(!view.callgraph_has_file("a.luau"));
     assert_eq!(view.current_state().skipped_parses().len(), 1);
-    let response = crate::commands::callgraph_store_adapter::serialized_response_with_view(
+    let response = crate::data_layer::callgraph_store_adapter::serialized_response_with_view(
         "gap",
         "callers",
         &callers(&view, "b.luau"),
@@ -513,10 +513,10 @@ fn scenario(phase: &str) {
         .unwrap()
         .contains("The Luau grammar"));
     let builtin = json!({"file": "plain.ts", "symbol": "builtin", "total_callers": 0});
-    let old = crate::commands::callgraph_store_adapter::serialized_response(
+    let old = crate::data_layer::callgraph_store_adapter::serialized_response(
         "builtin", "callers", &builtin,
     );
-    let new = crate::commands::callgraph_store_adapter::serialized_response_with_view(
+    let new = crate::data_layer::callgraph_store_adapter::serialized_response_with_view(
         "builtin",
         "callers",
         &builtin,

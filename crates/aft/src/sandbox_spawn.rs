@@ -3020,7 +3020,7 @@ fn jail_target_allowed(
     if !target.is_absolute() || target.parent().is_none() {
         return false;
     }
-    let target = crate::access_policy::policy_path(target);
+    let target = crate::policy_path::policy_path(target);
     !home.starts_with(&target)
         && !project_roots.iter().any(|root| root.starts_with(&target))
         && policy.decide_tree_write(&target) != AccessDecision::Deny(AccessDenial::Floor)
@@ -5852,15 +5852,7 @@ exec /usr/bin/mktemp "$@" "${TMPDIR:?}/tmp.XXXXXXXX"
     })
 }
 
-pub(crate) fn is_managed_task_temp_dir(path: &Path) -> bool {
-    #[cfg(unix)]
-    if task_temp::is_managed(path) {
-        return true;
-    }
-    path.file_name()
-        .and_then(OsStr::to_str)
-        .is_some_and(|name| name.starts_with(".sandbox-tmp-"))
-}
+pub(crate) use crate::task_temp_reads::is_managed_task_temp_dir;
 
 pub(crate) fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
@@ -6438,7 +6430,7 @@ pub(crate) fn completion_secrets(
             .iter()
             .filter(|(key, _)| {
                 !key.to_str().is_some_and(|key| {
-                    key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+                    key.eq_ignore_ascii_case(crate::gh_shim_paths::GH_SHIM_TICKET_ENV)
                 })
             })
             .map(|(key, value)| (key.as_os_str(), value.as_os_str())),
@@ -6446,13 +6438,13 @@ pub(crate) fn completion_secrets(
     .is_empty();
     environment.retain(|key, _| {
         !key.to_str()
-            .is_some_and(|key| key.eq_ignore_ascii_case(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV))
+            .is_some_and(|key| key.eq_ignore_ascii_case(crate::gh_shim_paths::GH_SHIM_TICKET_ENV))
     });
     let ticket = memory_only_ticket(request_environment);
     let ticket_digest = ticket.map(|ticket| blake3::hash(ticket.as_bytes()).to_hex().to_string());
     if let Some(ticket) = ticket {
         environment.insert(
-            crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+            crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(),
             ticket.into(),
         );
     }
@@ -6492,7 +6484,7 @@ fn sandboxed_child_environment(
             || key == crate::bash_background::registry::LINUX_SCOPE_ENV
             || key == crate::privacy_spawn::CONTROL_ENV
             || crate::agent_child_env::is_subc_credential_env_key(key)
-            || key == crate::gh_shim_ticket::GH_SHIM_TICKET_ENV
+            || key == crate::gh_shim_paths::GH_SHIM_TICKET_ENV
             || key == crate::gh_shim_worker_broker::SOCKET_ENV
             || key == crate::gh_shim_worker_broker::CAPABILITY_FILE_ENV
             || (worker_jail_active() && key == "DBUS_SESSION_BUS_ADDRESS")
@@ -6554,7 +6546,7 @@ pub(crate) fn apply_sandbox_environment(
         // shell startup hooks, and cloud credentials cannot leak around them.
         command.env_clear().envs(environment);
         if let Some(ticket) = memory_only_ticket(request_environment) {
-            command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
+            command.env(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, ticket);
         }
         for key in [
             crate::gh_shim_worker_broker::SOCKET_ENV,
@@ -6595,7 +6587,7 @@ pub(crate) fn disclaim_command_for_plan(
 /// ticket must exist only in memory. It is added back here, at exec time.
 fn memory_only_ticket(request_environment: &HashMap<String, String>) -> Option<&str> {
     request_environment
-        .get(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV)
+        .get(crate::gh_shim_paths::GH_SHIM_TICKET_ENV)
         .map(String::as_str)
 }
 
@@ -6633,7 +6625,7 @@ pub(crate) fn pty_command_for_plan(
             command.env(key, value);
         }
         if let Some(ticket) = memory_only_ticket(env) {
-            command.env(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV, ticket);
+            command.env(crate::gh_shim_paths::GH_SHIM_TICKET_ENV, ticket);
         }
         for key in [
             crate::gh_shim_worker_broker::SOCKET_ENV,
@@ -6648,8 +6640,8 @@ pub(crate) fn pty_command_for_plan(
         // only request overrides. An inherited gh shim ticket is removed first:
         // it belongs to whatever started this process, and the request map
         // re-adds the child's own ticket when one was issued.
-        command.env_remove(crate::gh_shim_ticket::GH_SHIM_TICKET_ENV);
-        command.env_remove(crate::gh_shim_ticket::GH_SHIM_WORKER_ENV);
+        command.env_remove(crate::gh_shim_paths::GH_SHIM_TICKET_ENV);
+        command.env_remove(crate::gh_shim_paths::GH_SHIM_WORKER_ENV);
         for (key, value) in env {
             command.env(key, value);
         }
@@ -6827,27 +6819,9 @@ impl RequestToolLaunch {
     }
 }
 
-impl<'ctx> ToolLaunchPolicy<'ctx> {
-    /// Direct tools carry only their formatter-and-checker launch policy across
-    /// dispatch. General sandbox scopes must not cover dispatch: it can start
-    /// shared LSP servers.
-    pub(crate) fn with_current<R>(
-        policy: Option<std::rc::Rc<RequestToolLaunch>>,
-        run: impl FnOnce() -> R,
-    ) -> R {
-        struct Restore(Option<std::rc::Rc<RequestToolLaunch>>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                CURRENT_TOOL_POLICY.with(|slot| {
-                    slot.replace(self.0.take());
-                });
-            }
-        }
-        let previous = CURRENT_TOOL_POLICY.with(|slot| slot.replace(policy));
-        let _restore = Restore(previous);
-        run()
-    }
+mod edit_tool_launcher;
 
+impl<'ctx> ToolLaunchPolicy<'ctx> {
     /// The policy for a command's tools: the tool call's policy installed by
     /// [`Self::with_current`], or else one resolved now from the current
     /// principal and worker-jail scope.
@@ -7243,7 +7217,7 @@ pub(crate) mod environment_tests {
                 "private-control".into(),
             ),
             (
-                crate::gh_shim_ticket::GH_SHIM_TICKET_ENV.into(),
+                crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(),
                 "private-ticket".into(),
             ),
         ]);

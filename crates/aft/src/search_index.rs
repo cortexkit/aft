@@ -25,19 +25,18 @@ use regex::bytes::Regex;
 use regex_syntax::hir::{Hir, HirKind};
 
 use crate::cache_freshness;
-use crate::commands::semantic_search::request_files::{
-    Fetched, FileStat, RequestFile, RequestFiles,
-};
 use crate::pattern_compile::{self, CompileOpts, CompileResult, CompiledPattern, LiteralSearch};
 use crate::root_identity::key::{artifact_cache_key_for_build, canonicalize_or_normalize};
+use crate::search_state::request_files::{Fetched, FileStat, RequestFile, RequestFiles};
 
-pub use crate::commands::semantic_search::{exact_lane, memo};
+pub mod exact_lane;
+pub use crate::search_state::memo;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactPassMatch {
     pub path: PathBuf,
-    pub symbol_range: Option<crate::commands::semantic_search::comparator::SymbolOffsetRange>,
-    pub evidence: crate::commands::semantic_search::evidence_descriptor::EvidenceDescriptor,
+    pub symbol_range: Option<crate::search_state::candidate::SymbolOffsetRange>,
+    pub evidence: crate::search_state::evidence_descriptor::EvidenceDescriptor,
     pub content_digest: String,
 }
 
@@ -52,8 +51,6 @@ pub struct ExactPassMatch {
 /// corpus. Files that are read are verified exactly as under [`Self::All`], so
 /// the evidence a caller keeps is the same under any scope that keeps it.
 ///
-/// Defined here rather than in the exact lane module because that module is
-/// compiled at two paths, and both must name the same type.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub enum ExactEvidenceScope {
     /// Declarations named after a query word, verbatim phrase evidence (E1)
@@ -72,6 +69,10 @@ pub enum ExactEvidenceScope {
 }
 
 pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+/// Longest matching line, in characters, before appending the truncation marker.
+pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
+/// Marks a matching line cut at `GREP_MAX_LINE_CHARS` characters.
+pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 const EOF_SENTINEL: u8 = 0;
 #[cfg(debug_assertions)]
 thread_local! {
@@ -561,7 +562,7 @@ impl SearchIndexSnapshot {
         let mut files_hashed = 0usize;
         let mut matches = Vec::new();
         let search_root_canon = canonicalize_for_search_membership(search_root);
-        let request_files = crate::commands::semantic_search::request_files::current();
+        let request_files = crate::search_state::request_files::current();
 
         for file_id in candidate_file_ids {
             let Some(file_entry) = self.files.get(file_id as usize) else {
@@ -2046,7 +2047,7 @@ impl SearchIndexSnapshot {
         let missing_on_disk = AtomicUsize::new(0);
         // Rayon tasks run on other threads, where the request's file set is
         // not current: take it here and hand it to them.
-        let request_files = crate::commands::semantic_search::request_files::current();
+        let request_files = crate::search_state::request_files::current();
         let request_files = request_files.as_deref();
         let files: Vec<GrepFileMatches> = examined_slice
             .par_iter()
@@ -2073,7 +2074,7 @@ impl SearchIndexSnapshot {
                     // MiB that a whole read would have left there is now
                     // read again by any later phase that wants it.
                     let mut large = None;
-                    let fetched = crate::commands::semantic_search::request_files::read_through(
+                    let fetched = crate::search_state::request_files::read_through(
                         request_files,
                         &file.path,
                         |path| match open_grep_file(
@@ -3087,7 +3088,7 @@ pub(crate) fn read_request_corpus_file(
     }
     let Some(files) = files else {
         #[cfg(test)]
-        crate::commands::semantic_search::request_files::record_disk_read(path);
+        crate::search_state::request_files::record_disk_read(path);
         return match read_search_corpus_file(path, max_file_size) {
             SearchCorpusEligibility::Eligible(file) => RequestCorpusFile::Eligible {
                 generated: file.generated,
@@ -3164,7 +3165,7 @@ pub(crate) fn read_request_corpus_file(
         }
         return RequestCorpusFile::Unindexed;
     }
-    // As `crate::inspect::is_generated_file(path, path)`, from the bytes in
+    // As `crate::file_kind::generated::is_generated_file(path, path)`, from the bytes in
     // hand rather than a second read of the file's head.
     let generated = crate::file_kind::relative_shape_is_generated(path, path)
         || crate::file_kind::head_has_generated_marker(bytes);
@@ -3248,7 +3249,7 @@ fn read_search_corpus_file_with_metadata(
     }
     SearchCorpusEligibility::Eligible(SearchCorpusFile {
         metadata,
-        generated: classify_generated && crate::inspect::is_generated_file(path, path),
+        generated: classify_generated && crate::file_kind::generated::is_generated_file(path, path),
         bytes,
     })
 }
@@ -3631,31 +3632,24 @@ fn project_walk_builder_pruned(
     // The named root itself is always admitted (depth 0), so an explicitly
     // targeted walk inside a worktree still reads it.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
-    crate::context::apply_project_ignore_rules(&mut builder, search_root).filter_entry(
-        move |entry| {
-            project_walk_admits_entry(entry, excludes)
-                && descend(entry.path())
-                && !is_nested_worktree_entry(entry, &worktrees)
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        search_root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
         },
-    );
+    )
+    .filter_entry(move |entry| {
+        project_walk_admits_entry(entry, excludes)
+            && descend(entry.path())
+            && !is_nested_worktree_entry(entry, &worktrees)
+    });
     builder
 }
 
-/// True when `entry` is a directory below the walk root that is itself a
-/// nested linked worktree of this repository, which the walk must prune.
-/// Shared by every walker built on the project walk; the depth check keeps
-/// an explicitly named root (depth 0) admitted.
-pub(crate) fn is_nested_worktree_entry(
-    entry: &ignore::DirEntry,
-    worktrees: &crate::project_content::NestedWorktreeBoundary,
-) -> bool {
-    entry.depth() > 0
-        && entry
-            .file_type()
-            .as_ref()
-            .is_some_and(std::fs::FileType::is_dir)
-        && worktrees.is_nested_worktree_root(entry.path())
-}
+pub(crate) use crate::project_walk::is_nested_worktree_entry;
 
 /// The membership rule the project walk applies to each entry on top of the
 /// ignore rules: content exclusions, skipped directory names and OS metadata
@@ -4291,7 +4285,7 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
     cached_mtimes: Option<&HashMap<PathBuf, SystemTime>>,
 ) {
     use std::collections::HashMap;
-    let stable_root = crate::inspect::job::canonicalize_normalized(stable_root);
+    let stable_root = crate::path_identity::canonicalize_normalized(stable_root);
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::with_capacity(paths.len());
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(paths.len());
     for path in paths.iter() {
@@ -4312,9 +4306,9 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
             {
                 #[cfg(test)]
                 audit_record(|work| work.sort_canonicalizes += 1);
-                crate::inspect::job::canonicalize_normalized(&resolved)
+                crate::path_identity::canonicalize_normalized(&resolved)
             } else {
-                crate::inspect::job::normalize_path(&resolved)
+                crate::path_identity::normalize_path(&resolved)
             };
             normalized_display_sort_key(Some(&stable_root), &comparison_path)
         });
@@ -4545,7 +4539,16 @@ fn collect_ignore_rule_files(
     builder.same_file_system(true).hidden(false);
     // Same rules as the project walk, so rule files inside ignored trees
     // (which cannot change what is indexed) are not discovered.
-    crate::context::apply_project_ignore_rules(&mut builder, root).filter_entry(|entry| {
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    )
+    .filter_entry(|entry| {
         let name = entry.file_name().to_string_lossy();
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             return !matches!(
@@ -4595,7 +4598,15 @@ pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     let mut dirs = 0usize;
     let mut builder = WalkBuilder::new(root);
     builder.same_file_system(true).hidden(false);
-    crate::context::apply_project_ignore_rules(&mut builder, root);
+    crate::context::apply_project_ignore_rules(
+        &mut builder,
+        root,
+        if crate::data_layer::read_fence::active() {
+            crate::project_walk::IgnoreFileAccess::Fenced
+        } else {
+            crate::project_walk::IgnoreFileAccess::Allowed
+        },
+    );
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         if entry.file_type().map_or(false, |ft| ft.is_dir()) {
             dirs += 1;
@@ -4687,9 +4698,9 @@ fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
     // lexical fallback does not, so the two success/failure forms would silently
     // miss each other without this shared non-verbatim normalizer.
     crate::bounded_io::run(path, None, |path| {
-        Ok(crate::inspect::job::canonicalize_normalized(&path))
+        Ok(crate::path_identity::canonicalize_normalized(&path))
     })
-    .unwrap_or_else(|_| crate::inspect::job::normalize_path(path))
+    .unwrap_or_else(|_| crate::path_identity::normalize_path(path))
 }
 
 fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
@@ -4762,8 +4773,8 @@ where
 }
 
 fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
-    crate::inspect::job::normalize_path(path)
-        .starts_with(crate::inspect::job::normalize_path(search_root))
+    crate::path_identity::normalize_path(path)
+        .starts_with(crate::path_identity::normalize_path(search_root))
 }
 
 impl QueryBuild {
@@ -5064,7 +5075,6 @@ pub(crate) fn line_details_bytes_with_cr_policy(
 /// the whole line, while a match on a multi-megabyte minified line no longer
 /// decodes and copies the whole line.
 pub(crate) fn bounded_grep_line_text(line: &str) -> String {
-    use crate::commands::grep::{GREP_LINE_TRUNCATED_MARKER, GREP_MAX_LINE_CHARS};
     match line.char_indices().nth(GREP_MAX_LINE_CHARS) {
         None => line.to_string(),
         Some((cut, _)) => format!("{}{}", &line[..cut], GREP_LINE_TRUNCATED_MARKER),
@@ -5080,7 +5090,7 @@ pub(crate) fn bounded_grep_line_text(line: &str) -> String {
 /// 3 bytes, can decode differently). A line longer than that prefix therefore
 /// always has more than `GREP_MAX_LINE_CHARS` characters and is cut.
 pub(crate) fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
-    const PREFIX_BYTES: usize = (crate::commands::grep::GREP_MAX_LINE_CHARS + 2) * 4;
+    const PREFIX_BYTES: usize = (GREP_MAX_LINE_CHARS + 2) * 4;
     let prefix = &line[..line.len().min(PREFIX_BYTES)];
     bounded_grep_line_text(&String::from_utf8_lossy(prefix))
 }
@@ -5089,70 +5099,8 @@ fn to_glob_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-// Thread-local operation counters keep concurrent tests from charging each
-// other's filesystem work. They observe the call sites, not elapsed time.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct AuditWork {
-    pub cancel_probes: usize,
-    pub corpus_opens: usize,
-    pub sort_stats: usize,
-    pub sort_canonicalizes: usize,
-    pub watcher_global: usize,
-    pub watcher_head: usize,
-    pub filter_keys: usize,
-    pub presence_checks: usize,
-}
-
-#[cfg(test)]
-thread_local! {
-    static AUDIT_WORK: std::cell::Cell<AuditWork> = std::cell::Cell::new(AuditWork::default());
-    pub(crate) static AUDIT_IO_PROBE: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
-    pub(crate) static AUDIT_CANCEL_ELAPSED: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) struct HelperStateScope(AuditWork, Option<Box<dyn FnMut()>>, Option<Duration>);
-#[cfg(test)]
-impl Drop for HelperStateScope {
-    fn drop(&mut self) {
-        AUDIT_WORK.with(|work| work.set(self.0));
-        AUDIT_IO_PROBE.with(|probe| *probe.borrow_mut() = self.1.take());
-        AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.set(self.2));
-    }
-}
-#[cfg(test)]
-pub(crate) fn helper_state_scope() -> HelperStateScope {
-    HelperStateScope(
-        AUDIT_WORK.with(|work| work.replace(AuditWork::default())),
-        AUDIT_IO_PROBE.with(|probe| probe.replace(None)),
-        AUDIT_CANCEL_ELAPSED.with(|elapsed| elapsed.replace(None)),
-    )
-}
-
-#[cfg(test)]
-pub(crate) fn audit_cancel_elapsed(started: Instant) -> Duration {
-    AUDIT_CANCEL_ELAPSED.with(|slot| slot.get().unwrap_or_else(|| started.elapsed()))
-}
-
-#[cfg(test)]
-pub(crate) fn audit_record(record: impl FnOnce(&mut AuditWork)) {
-    AUDIT_WORK.with(|slot| {
-        let mut work = slot.get();
-        record(&mut work);
-        slot.set(work);
-    });
-}
-
-#[cfg(test)]
-pub(crate) fn audit_work_reset() {
-    AUDIT_WORK.with(|slot| slot.set(AuditWork::default()));
-}
-
-#[cfg(test)]
-pub(crate) fn audit_work() -> AuditWork {
-    AUDIT_WORK.with(std::cell::Cell::get)
-}
+pub(crate) use crate::executor::audit::*;
 
 #[cfg(test)]
 mod tests {
@@ -5205,8 +5153,8 @@ mod tests {
     fn semantic_namespaces_share_type_identity() {
         use std::any::TypeId;
         assert_eq!(
-            TypeId::of::<super::exact_lane::ExactLane>(),
-            TypeId::of::<crate::commands::semantic_search::exact_lane::ExactLane>()
+            TypeId::of::<super::exact_lane::QualifiedMember>(),
+            TypeId::of::<crate::commands::semantic_search::exact_lane::QualifiedMember>()
         );
         assert_eq!(
             TypeId::of::<super::memo::ExactMemoStore>(),
@@ -5355,7 +5303,7 @@ mod tests {
             b"\xff\n// generated by fixture\n",
         ] {
             fs::write(&path, bytes).unwrap();
-            let expected_generated = crate::inspect::is_generated_file(&path, &path);
+            let expected_generated = crate::file_kind::generated::is_generated_file(&path, &path);
             match read_search_corpus_file(&path, DEFAULT_MAX_FILE_SIZE) {
                 SearchCorpusEligibility::Eligible(file) => {
                     assert_eq!(file.bytes, bytes);

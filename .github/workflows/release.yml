@@ -1070,7 +1070,7 @@ jobs:
       # Cargo's local registry overlay, without needing unpublished siblings on
       # crates.io. Stable Cargo >=1.90 supports this selection mode.
       - name: Rehearse crates.io publishing
-        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p agent-file-tools
+        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p agent-file-tools
 
       # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
       # sizes). A publish dry run does not enforce the registry's upload limit.
@@ -1088,7 +1088,7 @@ jobs:
           # Multi-package publish stages archives in tmp-crate and tmp-registry;
           # single-package packaging leaves them directly in the package folder.
           crates = sorted(crate_dir.rglob("*.crate"))
-          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools"}
+          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools"}
           filenames = {crate.name for crate in crates}
           found = {
               package["name"] for package in metadata["packages"]

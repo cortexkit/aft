@@ -33,16 +33,14 @@ fn gate_resolves_every_user_config_and_state_path_under_the_gate_homes() {
             "user-tier aft.jsonc",
             crate::subc_config::cortexkit_user_config_path().expect("user config path resolves"),
         ),
-        ("storage root", crate::bash_background::storage_dir(None)),
+        ("storage root", crate::storage_path::storage_dir(None)),
         (
             "fastembed model cache",
             crate::local_embed::embedding_cache_dir().expect("model cache resolves"),
         ),
         (
             "shared managed Git hooks",
-            crate::agent_child_env::managed_git_hooks_dir(&crate::bash_background::storage_dir(
-                None,
-            )),
+            crate::agent_child_env::managed_git_hooks_dir(&crate::storage_path::storage_dir(None)),
         ),
         (
             "gh credential wrapper config dirs",
