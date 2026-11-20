@@ -1000,7 +1000,7 @@ impl Harness for Subject {
                 command.env("AFT_TEST_CONFORMANCE_STATUS_SNAPSHOT", snapshot.to_string());
             }
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
         crate::test_helpers::subc_pin::prepare(&command).map_err(harness_error)?;
         let child = command.spawn().map_err(|error| {
             HarnessError::new(format!(

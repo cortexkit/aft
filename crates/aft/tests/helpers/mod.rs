@@ -3,7 +3,8 @@
 #[allow(dead_code)]
 pub mod executable_cache;
 pub mod fake_lsp;
-#[cfg(target_os = "linux")]
+// The seeding hook is exported by aft-base only with test-hooks.
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
 pub(crate) mod subc_pin;
 #[path = "../../src/test_gate.rs"]
 pub mod test_gate;

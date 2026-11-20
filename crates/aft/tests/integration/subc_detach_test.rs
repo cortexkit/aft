@@ -1341,7 +1341,7 @@ impl ModuleProcess {
                 ),
             );
         }
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
         crate::test_helpers::subc_pin::prepare(&command).expect("prepare module fixture pin");
         unsafe {
             command.pre_exec(|| {
