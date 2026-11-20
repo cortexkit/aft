@@ -76,7 +76,7 @@ async fn native() {
     fs::create_dir_all(&shims).unwrap();
     symlink(executable, shims.join("gh")).unwrap();
     fs::write(project.join("inside"), "project contents").unwrap();
-    for dir in ["src", ".cortexkit", "tools/git-hooks"] {
+    for dir in ["src", "dst", ".cortexkit", "tools/git-hooks"] {
         fs::create_dir_all(project.join(dir)).unwrap();
     }
     let git = |args: &[&str]| {
@@ -150,8 +150,23 @@ printf writable > top-existing
 for protected in .git/config .git/hooks/pre-commit .cortexkit/aft.jsonc hook-link/pre-commit src/config-link tools/git-hooks/pre-commit tools/ordinary ordinary-link project-write; do
   if (printf refused > "$protected"); then echo "unexpected write: $protected"; exit 16; fi
 done
-if ln top-existing src/top-link || mv top-existing src/top-moved; then exit 17; fi
-if ln src/x "$TMPDIR/cross-link" || mv src/x "$TMPDIR/cross-move"; then exit 18; fi
+/usr/bin/python3 - <<'PY'
+import errno, os
+for op, args in (
+    (os.unlink, ('top-existing',)),
+    (os.link, ('top-existing', 'src/top-link')),
+    (os.rename, ('top-existing', 'src/top-moved')),
+    (os.link, ('src/x', 'dst/cross-link')),
+    (os.rename, ('src/x', 'dst/cross-move')),
+):
+    try:
+        op(*args)
+    except OSError as error:
+        if error.errno not in (errno.EACCES, errno.EPERM, errno.EXDEV):
+            raise
+    else:
+        raise AssertionError((op, args))
+PY
 printf scratch > "$TMPDIR/scratch-write"
 if cat '{}' || cat '{}' || printf nope > '{}/unregistered'; then exit 11; fi
 test -z "${{GH_TOKEN-}}${{GITHUB_TOKEN-}}${{GH_ENTERPRISE_TOKEN-}}"
@@ -195,6 +210,8 @@ printf 'native confinement checked\n'
         "project-write",
         "src/top-link",
         "src/top-moved",
+        "dst/cross-link",
+        "dst/cross-move",
     ] {
         assert!(!project.join(path).exists(), "unexpected {path}");
     }
