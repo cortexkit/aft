@@ -3,9 +3,8 @@ use super::{
 };
 use crate::cli::sandbox_launch::{paths_overlap, REMOTE_PROTECTED_GRANT};
 use aft::sandbox_profile::SandboxProfile;
-use std::os::unix::fs::MetadataExt;
+use aft::sandbox_spawn::checkout_controls::protected_paths;
 use std::{
-    collections::HashSet,
     ffi::OsStr,
     fs, io,
     os::fd::AsRawFd,
@@ -82,41 +81,4 @@ fn directory_entries(fd: std::os::fd::RawFd) -> io::Result<fs::ReadDir> {
     // Enumerate the pinned directory. Child opens use the same descriptor and
     // O_NOFOLLOW; a swapped symlink cannot turn into a grant on its target.
     fs::read_dir(format!("/proc/self/fd/{fd}"))
-}
-
-fn protected_paths(denies: &[PathBuf]) -> Result<HashSet<PathBuf>, String> {
-    let mut protected = HashSet::new();
-    let mut pending = denies.to_vec();
-    let mut budget = MAX_ENTRIES;
-    while let Some(path) = pending.pop() {
-        budget = budget.checked_sub(1).ok_or(REMOTE_PROTECTED_GRANT)?;
-        if !protected.insert(path.clone()) {
-            continue;
-        }
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.to_string()),
-        };
-        if metadata.is_symlink() {
-            pending.extend(
-                aft::sandbox_profile::resolve_env_deny_paths(path, "write_deny_nested")
-                    .map_err(|error| error.to_string())?,
-            );
-        } else if metadata.is_file() && metadata.nlink() != 1 {
-            // An alias can be anywhere under a writable child. Checking the
-            // protected inodes avoids walking unrelated project subtrees.
-            // Privileged bind mounts are outside this filesystem threat model.
-            return Err(REMOTE_PROTECTED_GRANT.into());
-        } else if metadata.is_dir() {
-            let dir = open_directory_no_symlinks(&path).map_err(|error| error.to_string())?;
-            for entry in directory_entries(dir.as_raw_fd()).map_err(|error| error.to_string())? {
-                if pending.len() >= budget {
-                    return Err(REMOTE_PROTECTED_GRANT.into());
-                }
-                pending.push(path.join(entry.map_err(|error| error.to_string())?.file_name()));
-            }
-        }
-    }
-    Ok(protected)
 }

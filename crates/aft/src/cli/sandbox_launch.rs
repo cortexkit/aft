@@ -439,7 +439,7 @@ fn apply_remote_sandbox(_: &SandboxProfile) -> Result<(), SandboxLaunchError> {
 }
 
 #[cfg(target_os = "linux")]
-const REMOTE_PROTECTED_GRANT: &str = "remote shell grant overlaps a protected path";
+use aft::sandbox_spawn::checkout_controls::REMOTE_PROTECTED_GRANT;
 
 #[cfg(target_os = "linux")]
 fn apply_remote_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {

@@ -28,6 +28,8 @@ pub(crate) fn report_file(
 
 use std::path::Path;
 
+pub(crate) mod remote_links;
+
 use crate::config::Config;
 use crate::context::AppContext;
 use crate::error::AftError;
@@ -137,7 +139,9 @@ fn atomic_write_source_with(
     if let Some(metadata) = original.as_ref() {
         // Preserve the existing file's write-access checks even when its parent
         // directory would permit replacing a read-only file by rename.
-        OpenOptions::new().write(true).open(&destination)?;
+        let file = OpenOptions::new().write(true).open(&destination)?;
+        remote_links::check_open(&file, &destination)?;
+        drop(file);
         warnings.extend(source_recovery::leftover_copy_warnings(&destination));
         if !source_replacement::may_keep_access(&destination, metadata) {
             return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
@@ -191,6 +195,7 @@ fn atomic_write_source_with(
             return write_source_in_place(&destination, metadata, bytes, &mut writer, warnings);
         }
     }
+    remote_links::check_open(file, &temporary)?;
     writer(file, bytes)?;
     if let Some(metadata) = original.as_ref() {
         // Writing can clear set-id bits; restore the exact original mode.
@@ -202,6 +207,7 @@ fn atomic_write_source_with(
         .map_err(|error| io::Error::new(error.kind(), format!("durability: {error}")))?;
     drop(write_sync);
     cleanup.file.take();
+    remote_links::check_path(&destination)?;
     #[cfg(windows)]
     if let Some(metadata) = original.as_ref() {
         if source_replacement::replace_keeping_identity(&destination, &temporary)? {
@@ -262,6 +268,7 @@ fn write_source_in_place(
         .open(destination)
     {
         Ok(mut file) => {
+            remote_links::check_open(&file, destination)?;
             let mut saved = Vec::new();
             file.read_to_end(&mut saved)?;
             (file, Some(saved))
@@ -273,6 +280,9 @@ fn write_source_in_place(
         ),
         Err(error) => return Err(error),
     };
+    if saved.is_none() {
+        remote_links::check_open(&file, destination)?;
+    }
     let copy = match saved.as_deref() {
         Some(saved) => match source_recovery::save(destination, saved) {
             Ok(copy) => Some(copy),
@@ -298,6 +308,7 @@ fn write_source_in_place(
         content: &[u8],
         writer: &mut dyn FnMut(&mut std::fs::File, &[u8]) -> io::Result<()>,
     ) -> io::Result<()> {
+        remote_links::check_open(file, destination)?;
         file.set_len(0)?;
         file.seek(SeekFrom::Start(0))?;
         writer(file, content)?;

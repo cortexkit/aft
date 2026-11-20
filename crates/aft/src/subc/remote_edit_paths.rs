@@ -80,6 +80,16 @@ pub(super) fn check(
                 ),
             ));
         }
+        for path in [&location, &target] {
+            if let Err(error) = crate::edit::remote_links::check_path(path) {
+                log::debug!("remote edit target could not be admitted: {error}");
+                return Err(Response::error(
+                    id,
+                    "denied_floor",
+                    crate::edit::remote_links::refused(input).to_string(),
+                ));
+            }
+        }
     }
     Ok(())
 }

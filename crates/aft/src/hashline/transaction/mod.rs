@@ -641,7 +641,7 @@ fn execute_mutate(
     }
 
     if file.remove_file {
-        if let Err(error) = fs::remove_file(&file.canonical_path) {
+        if let Err(error) = crate::edit::remote_links::unlink(&file.canonical_path) {
             if error.kind() != io::ErrorKind::NotFound {
                 return StepExec::Stopped {
                     outcomes: vec![failed_outcome(
@@ -925,7 +925,7 @@ fn execute_mv(
     let dest_on_disk = fs::read(&mv.dest_canonical).unwrap_or_else(|_| mv.final_bytes.clone());
 
     if fault_is(ctx, ExecuteFault::SourceUnlink { step: step_index })
-        || fs::remove_file(&mv.source_canonical).is_err()
+        || crate::edit::remote_links::unlink(&mv.source_canonical).is_err()
     {
         // Destination stands; source intact. Shared op_id remains for recovery.
         let (final_tag, tag_notice, dest_class) =

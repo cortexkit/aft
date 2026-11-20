@@ -57,7 +57,7 @@ use crate::sandbox_profile::SandboxProfile;
 
 #[cfg(unix)]
 mod build_slots;
-mod checkout_controls;
+pub mod checkout_controls;
 #[cfg(unix)]
 use checkout_controls::checkout_control_denies;
 pub(crate) use checkout_controls::remote_control_denies;

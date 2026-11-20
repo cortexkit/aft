@@ -69,6 +69,29 @@ impl FileIdentity {
     }
 }
 
+/// Count links on the same open file that will be modified.
+pub fn link_count(file: &File) -> io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(file.metadata()?.nlink())
+    }
+    #[cfg(windows)]
+    {
+        let (identity, links) = windows_identity(file);
+        if identity == FileIdentity::Unavailable {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(links)
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = file;
+        Err(io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// Like `std::fs::metadata` (follows symlinks), plus the identity of the same
 /// file.
 pub fn metadata(path: &Path) -> io::Result<(Metadata, FileIdentity)> {

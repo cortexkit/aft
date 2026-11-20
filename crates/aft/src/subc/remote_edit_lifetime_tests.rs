@@ -171,6 +171,7 @@ fn edit_dispatch(request: RawRequest, ctx: &AppContext) -> Response {
         "batch" => crate::commands::batch::handle_batch(&request, ctx),
         "apply_patch" => crate::commands::apply_patch::handle_apply_patch(&request, ctx),
         "move_file" => crate::commands::move_file::handle_move_file(&request, ctx),
+        "delete_file" => crate::commands::delete_file::handle_delete_file(&request, ctx),
         _ => panic!("unexpected dispatch: {}", request.command),
     }
 }
@@ -336,6 +337,105 @@ async fn refuses_checkout_control_edits(peer: &mut Peer, root: &Path) {
         std::fs::read_to_string(root.join(".cortexkit/aft.jsonc")).unwrap(),
         "original\n"
     );
+}
+
+#[cfg(unix)]
+async fn refuses_hard_link_alias_edits(peer: &mut Peer, root: &Path) {
+    let config = root.join(".git/config");
+    let alias = root.join("config-alias.txt");
+    let original = std::fs::read(&config).unwrap();
+    std::fs::hard_link(&config, &alias).unwrap();
+    // The checkout scan must also refuse an otherwise safe target while a
+    // protected inode has an alias, even if the edit never names that alias.
+    let ordinary = root.join("ordinary-hardlink.txt");
+    std::fs::write(&ordinary, "original\n").unwrap();
+    refusal(
+        peer.call(
+            3,
+            1599,
+            tool(
+                "write",
+                json!({"path":"ordinary-hardlink.txt","content":"changed\n"}),
+                1599,
+            ),
+        )
+        .await,
+        "remote_call_not_admitted",
+    );
+    assert_eq!(std::fs::read(&ordinary).unwrap(), b"original\n");
+    for (corr, name, args) in [
+        (
+            1600,
+            "write",
+            json!({"path":"config-alias.txt","content":"changed"}),
+        ),
+        (1601, "delete", json!({"files":["config-alias.txt"]})),
+        (
+            1602,
+            "move",
+            json!({"path":"config-alias.txt","destination":"moved.txt"}),
+        ),
+    ] {
+        let frame = peer.call(3, corr, tool(name, args, corr)).await;
+        assert_eq!(frame.header.ty, FrameType::Error, "{name}: {frame:?}");
+        let error: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        assert!(
+            matches!(
+                error.code.as_str(),
+                "path_outside_root" | "remote_call_not_admitted" | "denied_floor"
+            ),
+            "{name}: {error:?}"
+        );
+        assert_eq!(std::fs::read(&config).unwrap(), original);
+        assert_eq!(std::fs::read(&alias).unwrap(), original);
+        assert!(!root.join("moved.txt").exists());
+    }
+    std::fs::remove_file(alias).unwrap();
+
+    let other = root.join("ordinary-other.txt");
+    std::fs::hard_link(&ordinary, &other).unwrap();
+    for (corr, name, args) in [
+        (
+            1603,
+            "write",
+            json!({"path":"ordinary-hardlink.txt","content":"changed\n"}),
+        ),
+        (
+            1604,
+            "edit",
+            json!({"path":"ordinary-hardlink.txt","edits":[{"oldString":"original","newString":"changed"}]}),
+        ),
+        (
+            1605,
+            "apply_patch",
+            json!({"patchText":"*** Begin Patch\n*** Update File: ordinary-hardlink.txt\n@@\n-original\n+changed\n*** End Patch"}),
+        ),
+    ] {
+        let frame = peer.call(3, corr, tool(name, args, corr)).await;
+        assert_eq!(frame.header.ty, FrameType::Error, "{name}: {frame:?}");
+        let error: ErrorBody = serde_json::from_slice(&frame.body).unwrap();
+        // The temporary-directory floor may reject before the remote guard.
+        assert!(
+            matches!(error.code.as_str(), "path_outside_root" | "denied_floor"),
+            "{name}: {error:?}"
+        );
+        assert_eq!(std::fs::read(&ordinary).unwrap(), b"original\n");
+        assert_eq!(std::fs::read(&other).unwrap(), b"original\n");
+    }
+    std::fs::remove_file(other).unwrap();
+    reply(
+        peer.call(
+            3,
+            1606,
+            tool(
+                "write",
+                json!({"path":"ordinary-hardlink.txt","content":"allowed\n"}),
+                1606,
+            ),
+        )
+        .await,
+    );
+    assert_eq!(std::fs::read(ordinary).unwrap(), b"allowed\n");
 }
 
 #[test]
@@ -757,6 +857,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         {
             exercise_external_tools(&mut peer, &mut cards, &ctx, root.as_path()).await;
             refuses_checkout_control_edits(&mut peer, root.as_path()).await;
+            refuses_hard_link_alias_edits(&mut peer, root.as_path()).await;
         }
         cancel_and_revoke_queued_edits(&mut peer, &executor, &root, &saved_edit).await;
         write_frame(

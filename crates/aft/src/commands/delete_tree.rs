@@ -800,6 +800,8 @@ mod platform {
             } else {
                 // unlinkat does not follow a leaf symlink, and without
                 // AT_REMOVEDIR refuses a directory swapped in since the check.
+                crate::edit::remote_links::check_at(dir_fd.as_raw_fd(), &name, &entry.path)
+                    .map_err(|e| stopped(&entry.path, e))?;
                 match unlink(dir_fd, &name, false) {
                     Ok(()) => progress.removed(false),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -1104,6 +1106,8 @@ mod platform {
                 NodeKind::Directory => return Err(replaced(&entry.path)),
                 _ if metadata.is_dir() && !is_link => return Err(replaced(&entry.path)),
                 _ => {
+                    crate::edit::remote_links::check_open(&handle, &entry.path)
+                        .map_err(|e| stopped(&entry.path, e))?;
                     #[cfg(test)]
                     crate::commands::delete_file::count_unlink_for_test();
                     dispose(&handle).map_err(|e| stopped(&entry.path, e))?;
