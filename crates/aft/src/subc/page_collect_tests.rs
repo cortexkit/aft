@@ -384,6 +384,40 @@ fn page_collect_session_routes_skip_other_sessions_and_codemode_runs() {
 }
 
 #[test]
+fn page_collect_ignores_scope_owner_even_when_harness_and_session_match() {
+    let (_dir, root) = test_root("page-collect-owner-filter");
+    let runner = identity(&root, BindTrust::FirstParty);
+    for owner_principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
+        let mut lease = identity(&root, BindTrust::Untrusted);
+        let data = Arc::get_mut(&mut lease.0).unwrap();
+        data.scope = Some(
+            serde_json::from_value(json!({
+                "owner": {"kind": "reserved", "module_id": "prefrontal"},
+                "ref": "head-a", "scope_epoch": 1, "kind": "head",
+                "attributes": {"agent_id": "agent-a"},
+                "owner_authorized": true,
+            }))
+            .unwrap(),
+        );
+        let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal
+        else {
+            panic!("expected a route bind principal");
+        };
+        *principal_id = Some(owner_principal.into());
+
+        let mut routes = HashMap::from([(channel(1), lease), (channel(2), runner.clone())]);
+        let candidates = session_routes(&routes, HARNESS, SESSION);
+        let chosen = choose_route(candidates, Path::new("index.html"), no_policy).unwrap();
+        assert!(Arc::ptr_eq(&chosen.0, &runner.0));
+
+        routes.remove(&channel(2));
+        let candidates = session_routes(&routes, HARNESS, SESSION);
+        let error = choose_route(candidates, Path::new("index.html"), no_policy).unwrap_err();
+        assert_eq!(error.code, SESSION_NOT_BOUND);
+    }
+}
+
+#[test]
 fn page_collect_snapshot_round_trip_through_the_handlers() {
     let f = fixture(BindTrust::FirstParty);
     let store = Arc::new(SnapshotStore::open(&f.ctx.storage_dir()));

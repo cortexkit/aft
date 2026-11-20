@@ -62,8 +62,10 @@ fn invalid(operation: &str, message: impl Into<String>) -> Response {
 }
 
 /// The live classic tool routes of `{harness, session}`, ordered by channel.
-/// Codemode run routes are left out: their session is configuration, never
-/// authority (see `codemode`).
+/// The owner of a head scope can open routes under the same session for its
+/// own work. Exclude those routes so the collection uses the runner's read policy.
+/// A codemode run uses its parent scope's runner, not the session named when
+/// its run route was opened.
 pub(super) fn session_routes(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     harness: &str,
@@ -76,6 +78,10 @@ pub(super) fn session_routes(
                 && identity.session == session
                 && identity.run_owner.is_none()
                 && identity.call_mode == subc_protocol::call_mode::CallMode::Classic
+                && !identity.scope.as_ref().is_some_and(|scope| {
+                    scope.kind == subc_protocol::scope::ScopeKind::Head
+                        && codemode::is_scope_owner_route(identity)
+                })
         })
         .map(|(channel, identity)| (*channel, identity.clone()))
         .collect::<Vec<_>>();

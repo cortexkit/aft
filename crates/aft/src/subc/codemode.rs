@@ -26,6 +26,7 @@
 //! bind.
 
 use super::*;
+use crate::access_policy::prefrontal::counterpart_owner;
 
 /// Refusal for a codemode call whose owning route can't be located.
 pub(super) const RUN_OWNER_NOT_BOUND: &str = "run_owner_not_bound";
@@ -255,9 +256,24 @@ fn same_owner(
     route_owner: &subc_protocol::Principal,
     parent_owner: &subc_protocol::Principal,
 ) -> bool {
-    route_owner == parent_owner
-        || crate::access_policy::prefrontal::counterpart_owner(route_owner).as_ref()
-            == Some(parent_owner)
+    route_owner == parent_owner || counterpart_owner(route_owner).as_ref() == Some(parent_owner)
+}
+
+/// Scope owners can bind routes to keep a scope live or make their own calls.
+/// Those binds must not lend the owner's grants or sandbox settings to the runner.
+pub(super) fn is_scope_owner_route(identity: &RouteIdentity) -> bool {
+    let Some(scope) = &identity.scope else {
+        return false;
+    };
+    let AuthenticatedPrincipal::RouteBind {
+        principal_id: Some(id),
+        ..
+    } = &identity.spawn_principal
+    else {
+        return false;
+    };
+    let matches_id = |owner| principal_id(&owner).as_deref() == Some(id.as_str());
+    matches_id(Some(scope.owner.clone())) || matches_id(counterpart_owner(&scope.owner))
 }
 
 fn resolve_owner(
@@ -358,7 +374,10 @@ fn resolve_owner(
     };
     let mut owners: Vec<(&RouteChannel, &RouteIdentity)> = match &kind {
         RunKind::Agent { agent_id } => {
-            let heads: Vec<_> = under_parent.filter(of_kind(ScopeKind::Head)).collect();
+            let heads: Vec<_> = under_parent
+                .filter(of_kind(ScopeKind::Head))
+                .filter(|(_, identity)| !is_scope_owner_route(identity))
+                .collect();
             if heads.is_empty() {
                 return Err(refuse(
                     "head_route_not_bound",
@@ -396,17 +415,7 @@ fn resolve_owner(
                     "the worker run's parent scope is not a worker's scope",
                 ));
             }
-            // The scope owner's routes keep the worker scope leased; only runner
-            // routes carry the worker's saved tool settings, keyed by runner principal.
-            // Exclude owner-principal routes regardless of tool-call history.
-            let scope_owner = super::principal_id(&Some(parent.owner.clone()));
-            workers.retain(|(_, identity)| {
-                !matches!(
-                    &identity.spawn_principal,
-                    AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
-                        if Some(id.as_str()) == scope_owner.as_deref()
-                )
-            });
+            workers.retain(|(_, identity)| !is_scope_owner_route(identity));
             if workers.is_empty() {
                 return Err(refuse(
                     "worker_route_not_bound",

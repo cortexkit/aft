@@ -687,6 +687,60 @@ fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: Bind
     f.routes.insert(channel(3), identity);
 }
 
+fn head_with_scope_owner_route(owner_principal: &str) -> Fixture {
+    let scope_owner = Principal::Reserved {
+        module_id: "prefrontal".into(),
+    };
+    let mut run = run_stamp("agent-a", "head-a", Some("linked"));
+    run.parent.as_mut().unwrap().owner = scope_owner.clone();
+    let mut f = fixture(run);
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    for (ch, principal_id, raw_harness) in [
+        (1, "reserved:broca", "broca"),
+        (3, owner_principal, "runner"),
+    ] {
+        let data = Arc::get_mut(&mut f.routes.get_mut(&channel(ch)).unwrap().0).unwrap();
+        data.scope.as_mut().unwrap().owner = scope_owner.clone();
+        // Binds canonicalize the route label but preserve the principal's raw label.
+        data.harness = "runner".into();
+        let AuthenticatedPrincipal::RouteBind {
+            harness,
+            principal_id: id,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            panic!("expected a route bind principal");
+        };
+        *harness = raw_harness.into();
+        *id = Some(principal_id.into());
+    }
+    f
+}
+
+#[test]
+fn codemode_head_inherits_runner_route_instead_of_scope_owner() {
+    for owner_principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
+        let f = head_with_scope_owner_route(owner_principal);
+        let body = call("edit", json!({"path": "notes.txt"}));
+        let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+        let runner = &f.routes[&channel(1)];
+        assert_eq!(effective.spawn_principal, runner.spawn_principal);
+        let run_owner = effective.run_owner.as_ref().unwrap();
+        assert_eq!(run_owner.owner_route_channel, channel(1));
+        assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
+    }
+}
+
+#[test]
+fn codemode_head_with_only_scope_owner_route_refuses() {
+    for owner_principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
+        let mut f = head_with_scope_owner_route(owner_principal);
+        f.routes.remove(&channel(1));
+        assert_eq!(refusal_reason(&f), "head_route_not_bound");
+    }
+}
+
 fn assert_ambiguous_field(f: &Fixture, field: &str) {
     let body = call("read", json!({"path": "notes.txt"}));
     let error = refusal(admit(&f.routes, channel(9), Some(&body)));
@@ -758,10 +812,7 @@ fn codemode_head_routes_that_disagree_on_spawn_principal_are_ambiguous() {
 
 #[test]
 fn codemode_head_routes_with_equivalent_first_party_principals_are_served() {
-    for (first, second) in [
-        ("direct", "reserved:prefrontal-core"),
-        ("reserved:prefrontal-core", "direct"),
-    ] {
+    for (first, second) in [("direct", "reserved:broca"), ("reserved:broca", "direct")] {
         let mut f = linked_fixture();
         let root = f.head_root.clone();
         second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
@@ -789,7 +840,7 @@ fn saved_policy_fixture() -> (Fixture, tempfile::TempDir, Arc<AppContext>) {
     let root = f.head_root.clone();
     second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
     with_principal_id(&mut f.routes, channel(1), "direct");
-    with_principal_id(&mut f.routes, channel(3), "reserved:prefrontal-core");
+    with_principal_id(&mut f.routes, channel(3), "reserved:broca");
     let storage = tempfile::tempdir().unwrap();
     let ctx = AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
@@ -890,7 +941,7 @@ fn codemode_head_routes_ignore_preexisting_worker_policies() {
                 project_root: head.project_root.display().to_string(),
                 harness: head.harness.clone(),
                 session: head.session.clone(),
-                principal: "reserved:prefrontal-core".into(),
+                principal: "reserved:broca".into(),
                 owner: serde_json::to_string(&scope.owner).unwrap(),
                 scope_ref: scope.scope_ref.clone(),
                 epoch: scope.scope_epoch - u64::from(older_epoch),
