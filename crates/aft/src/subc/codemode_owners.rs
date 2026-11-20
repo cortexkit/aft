@@ -338,8 +338,20 @@ fn load(ctx: &AppContext, key: &ScopeKey) -> Result<Candidates, Box<dyn std::err
 
 /// Cache the parent proof, not the identities. On the next call a confirmed
 /// end, a newer bind, or eviction must still be visible in the database.
+/// Only definite daemon answers are kept for the run. A timeout, a lost
+/// connection or an owner that hasn't synced yet may change, so the next call
+/// asks again; callers that arrive while one lookup is running still share it.
 #[derive(Debug, Default)]
-pub(super) struct Proofs(StdMutex<HashMap<ScopeKey, tokio::sync::watch::Receiver<Option<bool>>>>);
+pub(super) struct Proofs(
+    Arc<StdMutex<HashMap<ScopeKey, tokio::sync::watch::Receiver<Option<Proof>>>>>,
+);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Proof {
+    Live,
+    Gone,
+    Unknown,
+}
 
 impl Proofs {
     pub(super) async fn confirm(
@@ -347,33 +359,75 @@ impl Proofs {
         control: &Arc<readiness::DaemonControl>,
         parent: ScopeParent,
     ) -> bool {
+        let scope = key(&parent);
         let mut proof = self
             .0
             .lock()
             .unwrap()
-            .entry(key(&parent))
+            .entry(scope.clone())
             .or_insert_with(|| {
                 let (tx, rx) = tokio::sync::watch::channel(None);
                 let control = control.clone();
-                // A withdrawn call must not cancel the run's shared describe.
+                let proofs = self.0.clone();
+                // Cancelling one call must not cancel the shared lookup,
+                // so the lookup task removes its own unknown answer.
                 tokio::spawn(async move {
-                    tx.send_replace(Some(describe(&control, &parent).await));
+                    let answer = describe(&control, &parent).await;
+                    if answer == Proof::Unknown {
+                        let mut proofs = proofs.lock().unwrap();
+                        if proofs
+                            .get(&scope)
+                            .is_some_and(|cached| cached.same_channel(&tx.subscribe()))
+                        {
+                            proofs.remove(&scope);
+                        }
+                    }
+                    tx.send_replace(Some(answer));
                 });
                 rx
             })
             .clone();
-        let result = proof.wait_for(Option::is_some).await;
-        result.is_ok_and(|confirmed| *confirmed == Some(true))
+        proof
+            .wait_for(Option::is_some)
+            .await
+            .is_ok_and(|answer| *answer == Some(Proof::Live))
     }
 }
 
-async fn describe(control: &readiness::DaemonControl, parent: &ScopeParent) -> bool {
+async fn describe(control: &readiness::DaemonControl, parent: &ScopeParent) -> Proof {
     use subc_protocol::session::ModuleControlResponseToModule;
     // Include time spent waiting for capacity to send the describe request.
-    matches!(tokio::time::timeout(scope_describe::describe_timeout(), control.describe_parent(parent)).await,
+    match tokio::time::timeout(
+        scope_describe::describe_timeout(),
+        control.describe_parent(parent),
+    )
+    .await
+    {
         Ok(Ok(ModuleControlResponseToModule::ScopeDescribe {
-            status: ScopeStatus::Live, scope_epoch: Some(epoch), ..
-        })) if epoch == parent.scope_epoch)
+            status: ScopeStatus::Live,
+            scope_epoch: Some(epoch),
+            ..
+        })) if epoch == parent.scope_epoch => Proof::Live,
+        // A different epoch, a confirmed end, or not live under a synced owner
+        // can't turn back into this parent.
+        Ok(Ok(
+            ModuleControlResponseToModule::ScopeDescribe {
+                status: ScopeStatus::Live,
+                scope_epoch: Some(_),
+                ..
+            }
+            | ModuleControlResponseToModule::ScopeDescribe {
+                status: ScopeStatus::Ended,
+                ..
+            }
+            | ModuleControlResponseToModule::ScopeDescribe {
+                status: ScopeStatus::NotLive,
+                owner_synced: true,
+                ..
+            },
+        )) => Proof::Gone,
+        _ => Proof::Unknown,
+    }
 }
 
 pub(super) async fn read(

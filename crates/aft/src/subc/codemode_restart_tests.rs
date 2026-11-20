@@ -119,7 +119,9 @@ impl Restart {
                 serde_json::to_vec(&call("read", json!({"path":"notes.txt"}))).unwrap(),
             )
             .unwrap(),
-            phase_trace: PhaseTrace::new(Instant::now()),
+            // Admission arms a Tokio timer from this timestamp. Keep it on
+            // the runtime clock even after a test advances and resumes time.
+            phase_trace: PhaseTrace::new(tokio::time::Instant::now().into_std()),
             parsed_body: Default::default(),
             confinement: None,
             launch_restore: None,
@@ -156,11 +158,21 @@ impl Restart {
     }
 
     fn answer(&self, request: WriterFrame, status: ScopeStatus, epoch: Option<u64>) {
+        self.answer_with_sync(request, status, epoch, true);
+    }
+
+    fn answer_with_sync(
+        &self,
+        request: WriterFrame,
+        status: ScopeStatus,
+        epoch: Option<u64>,
+        owner_synced: bool,
+    ) {
         let reply = ModuleControlResponseToModule::ScopeDescribe {
             status,
             scope_epoch: epoch,
             daemon_incarnation: "restart".into(),
-            owner_synced: true,
+            owner_synced,
             owner_configured: true,
             scope: (status == ScopeStatus::Live).then(|| {
                 let mut scope = self.runner.scope.clone().unwrap();
@@ -294,31 +306,66 @@ async fn codemode_restart_inherits_exact_runner_access_and_describes_once() {
 }
 
 #[tokio::test]
-async fn codemode_restart_refuses_ended_not_live_new_epoch_and_timeout_without_new_text() {
-    for answer in [
-        Some((ScopeStatus::Ended, Some(3))),
-        Some((ScopeStatus::NotLive, None)),
-        Some((ScopeStatus::Live, Some(4))),
-        None,
+async fn codemode_restart_caches_definite_negative_parent_answers() {
+    for (status, epoch) in [
+        (ScopeStatus::Ended, Some(3)),
+        (ScopeStatus::NotLive, None),
+        (ScopeStatus::Live, Some(4)),
     ] {
         let mut f = Restart::new(false, true, |_, _| {});
         let pending = f.start();
         let request = f.request().await;
-        if let Some((status, epoch)) = answer {
-            f.answer(request, status, epoch);
-        } else {
-            tokio::time::pause();
-            tokio::time::advance(Duration::from_secs(11)).await;
-            tokio::time::resume();
-        }
+        f.answer(request, status, epoch);
         assert_no_head(f.finish(pending).await);
         let pending = f.start();
         assert_no_head(f.finish(pending).await);
         assert!(
             f.daemon.try_recv().is_err(),
-            "negative proof is cached for the run"
+            "a definite negative answer is cached for the run"
         );
     }
+}
+
+#[tokio::test]
+async fn codemode_restart_retries_the_parent_lookup_after_a_timeout() {
+    let mut f = Restart::new(false, true, |_, _| {});
+    let pending = f.start();
+    let _unanswered = f.request().await;
+    assert_eq!(f.replies.len(), 1);
+    tokio::time::pause();
+    // Let the daemon request expire even if the admission wait ends first.
+    tokio::time::sleep(scope_describe::describe_timeout() + Duration::from_secs(1)).await;
+    tokio::time::resume();
+    assert_eq!(f.replies.len(), 0);
+    assert_no_head(f.finish(pending).await);
+    // The daemon is reachable again: the next call asks once more and is
+    // admitted, instead of reusing the timed-out answer for the whole run.
+    let recovered = effective(f.live().await);
+    assert_eq!(
+        recovered.run_owner.as_ref().unwrap().owner_route.scope,
+        f.runner.scope
+    );
+    let pending = f.start();
+    effective(f.finish(pending).await);
+    assert!(
+        f.daemon.try_recv().is_err(),
+        "a confirmed parent is still reused after the retry"
+    );
+}
+
+#[tokio::test]
+async fn codemode_restart_retries_the_parent_lookup_after_an_unsynced_answer() {
+    let mut f = Restart::new(false, true, |_, _| {});
+    let pending = f.start();
+    let request = f.request().await;
+    f.answer_with_sync(request, ScopeStatus::NotLive, None, false);
+    assert_no_head(f.finish(pending).await);
+
+    let recovered = effective(f.live().await);
+    assert_eq!(
+        recovered.run_owner.as_ref().unwrap().owner_route.scope,
+        f.runner.scope
+    );
 }
 
 #[tokio::test]
