@@ -59,12 +59,16 @@ const runtime = (sessionID: string) => ({
 });
 
 describe("caller role on every bridge request", () => {
-  test("a subagent's requests carry worker_session", async () => {
+  test("a subagent's requests carry worker_session except for TUI status reads", async () => {
     _resetSubagentCacheForTest();
     const { ctx, sends, toolCalls } = harness("ses_parent");
-    await callBridge(ctx, runtime("ses_role_worker"), "bash_status", { task_id: "t" });
-    await callToolCall(ctx, runtime("ses_role_worker"), "read", { filePath: "a.ts" });
+    const worker = runtime("ses_role_worker");
+    await callBridge(ctx, worker, "bash_status", { task_id: "t" });
+    await callBridge(ctx, { ...worker, observeBashStatus: true }, "bash_status", { task_id: "t" });
+    await callToolCall(ctx, worker, "read", { filePath: "a.ts" });
     expect(sends[0]).toMatchObject({ session_id: "ses_role_worker", worker_session: true });
+    expect(sends[1]).toMatchObject({ session_id: "ses_role_worker", task_id: "t" });
+    expect(sends[1]).not.toHaveProperty("worker_session");
     expect(toolCalls[0]?.workerSession).toBe(true);
   });
 
