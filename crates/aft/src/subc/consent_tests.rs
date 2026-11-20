@@ -139,9 +139,9 @@ mod program_approvals {
 
     fn stamp_scope(name: &str, parent: &str) -> subc_protocol::scope::ScopeStamp {
         serde_json::from_value(json!({
-            "owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,
+            "owner":{"kind":"reserved","module_id":"prefrontal"},"ref":name,"scope_epoch":7,
             "kind":"ephemeral","owner_authorized":true,"parent_state":"linked",
-            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":parent,"scope_epoch":7}
+            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":parent,"scope_epoch":7}
         })).unwrap()
     }
 
@@ -839,12 +839,12 @@ impl ConsentTransport for SharedFake {
 
 fn stamp(name: &str, kind: &str, parent: Option<&str>) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": name,
         "scope_epoch": 7,
         "kind": kind,
         "parent": parent.map(|parent| json!({
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": parent,
             "scope_epoch": 7,
         })),
@@ -2536,11 +2536,11 @@ async fn consent_folder_grant_leaves_uncovered_asks_pending() {
         std::fs::write(&a, "a contents\n").unwrap();
         std::fs::write(&b, "b contents\n").unwrap();
         let epoch8: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": "worker",
             "scope_epoch": 8,
             "kind": "worker",
-            "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head", "scope_epoch": 7},
+            "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal"}, "ref": "head", "scope_epoch": 7},
             "owner_authorized": true,
         }))
         .unwrap();
@@ -6424,15 +6424,9 @@ fn consent_vectors_folder_grant_withdraw() {
     assert_eq!(notice["asker"]["scope_ref"], json!("worker"));
     assert_eq!(notice["asker"]["scope_epoch"], json!(3));
     let stamps = vector_json("withdraw-bind-stamps.json");
-    assert_eq!(
-        stamps["scope-owner-withdraw"],
-        json!("reserved:prefrontal-core")
-    );
+    assert_eq!(stamps["scope-owner-withdraw"], json!("reserved:prefrontal"));
     assert_eq!(stamps["non-owner-withdraw"], json!("reserved:basal"));
-    assert_eq!(
-        stamps["settled-withdraw"],
-        json!("reserved:prefrontal-core")
-    );
+    assert_eq!(stamps["settled-withdraw"], json!("reserved:prefrontal"));
 }
 
 #[cfg(unix)]

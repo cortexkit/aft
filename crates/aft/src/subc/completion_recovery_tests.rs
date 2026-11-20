@@ -133,7 +133,7 @@ fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
     let (_dir, root) = test_root("opencode2-completion-churn");
     let storage = tempfile::tempdir().unwrap();
     let owner = tests::caller_route(&root, "direct", "opencode");
-    let core = tests::caller_route(&root, "reserved:prefrontal-core", "opencode");
+    let core = tests::caller_route(&root, "reserved:prefrontal", "opencode");
     let wrong_harness = tests::caller_route(&root, "direct", "pi");
     persisted_completion(storage.path(), &root, &owner);
     let registry = BgTaskRegistry::default();
@@ -230,7 +230,7 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
     let (_dir, root) = test_root("opencode2-completion-restart");
     let storage = tempfile::tempdir().unwrap();
     let owner = tests::caller_route(&root, "direct", "opencode");
-    let core = tests::caller_route(&root, "reserved:prefrontal-core", "opencode2");
+    let core = tests::caller_route(&root, "reserved:prefrontal", "opencode2");
     persisted_completion(storage.path(), &root, &owner);
     {
         let registry = BgTaskRegistry::default();

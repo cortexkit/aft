@@ -15,8 +15,14 @@ fn fixture() -> (tempfile::TempDir, Db) {
 }
 
 fn save(db: &Db, path: &Path, name: &str, epoch: u64) -> store::ScopeKey {
+    save_for(db, path, name, epoch, "prefrontal")
+}
+
+fn save_for(db: &Db, path: &Path, name: &str, epoch: u64, module: &str) -> store::ScopeKey {
     let key = store::ScopeKey {
-        owner: r#"{"kind":"reserved","module_id":"prefrontal-core"}"#.into(),
+        owner: store::owner_key(&subc_protocol::Principal::Reserved {
+            module_id: module.into(),
+        }),
         scope_ref: name.into(),
         epoch,
     };
@@ -52,130 +58,39 @@ fn listed(db: &Db) -> Value {
 }
 
 #[tokio::test]
-async fn prefrontal_scope_sweep_pre_window_end_sends_only_original_describe() {
-    let (dir, db) = fixture();
-    let key = save(&db, dir.path(), "pre-window", 1);
-    let calls = Mutex::new(Vec::new());
-    let stats = tick(db.clone(), &mut None, |stamp| {
-        calls.lock().unwrap().push(stamp.owner);
-        std::future::ready(Ok(reply(ScopeStatus::Ended, true)))
-    })
-    .await;
-    assert_eq!(
-        *calls.lock().unwrap(),
-        [subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into()
-        }]
-    );
-    assert_eq!(stats.deleted_grants, 1);
-    assert!(store::scope_ended(&db.lock().unwrap(), &key).unwrap());
-}
-
-#[tokio::test]
-async fn prefrontal_scope_sweep_holds_retired_source_until_definitive_reply() {
-    let (dir, db) = fixture();
-    let key = save(&db, dir.path(), "rename-gap", 1);
-    let retired = ModuleControlResponseToModule::ScopeDescribe {
-        status: ScopeStatus::Live,
-        scope_epoch: Some(1),
-        daemon_incarnation: "test".into(),
-        owner_synced: true,
-        owner_configured: false,
-        scope: None,
-    };
-    let held = tick(db.clone(), &mut None, |_| {
-        std::future::ready(Ok(retired.clone()))
-    })
-    .await;
-    assert_eq!(held.ended, 0, "catalog absence is not a scope end");
-    assert_eq!(held.deleted_grants, 0);
-
-    let unavailable = ModuleControlResponseToModule::ScopeDescribe {
-        status: ScopeStatus::NotLive,
-        scope_epoch: None,
-        daemon_incarnation: "test".into(),
-        owner_synced: false,
-        owner_configured: false,
-        scope: None,
-    };
-    for (counterpart, expected_end) in [
-        (Ok(unavailable), false),
-        (Ok(reply(ScopeStatus::NotLive, false)), false),
-        (Err(readiness::ControlError::ConnectionClosed), false),
-        (Ok(reply(ScopeStatus::Ended, true)), true),
-    ] {
-        let stats = tick_unwatched(
-            db.clone(),
-            &mut None,
-            |stamp| {
-                std::future::ready(if matches!(&stamp.owner, subc_protocol::Principal::Reserved { module_id } if module_id == "prefrontal") {
-                    counterpart.clone()
-                } else {
-                    Ok(retired.clone())
-                })
-            },
-            |_| false,
-            |_| true,
-        ).await;
-        assert_eq!(stats.deleted_grants, u64::from(expected_end));
-        let conn = db.lock().unwrap();
-        assert_eq!(store::scope_ended(&conn, &key).unwrap(), expected_end);
-        assert_eq!(store::list(&conn, &key).unwrap().is_empty(), expected_end);
-    }
-}
-
-#[tokio::test]
-async fn prefrontal_scope_sweep_retains_continuations_and_holds_but_revokes_absence() {
-    for (status, configured, synced, absent) in [
-        (ScopeStatus::Live, true, true, false),
-        (ScopeStatus::NotLive, true, false, false),
-        (ScopeStatus::NotLive, false, false, true),
-        (ScopeStatus::Live, false, true, true),
-        (ScopeStatus::Ended, true, true, true),
-    ] {
+async fn saved_grant_sweep_only_uses_the_registered_owner_and_holds_inferred_ends() {
+    for module in ["prefrontal", "prefrontal-core", "other"] {
         let (dir, db) = fixture();
-        let key = save(&db, dir.path(), "rename-agent", 1);
-        let calls = Mutex::new(Vec::new());
-        let configured_modules = vec!["prefrontal".into()];
-        let stats = tick_unwatched(
-            db.clone(),
-            &mut None,
-            |stamp| {
-                calls.lock().unwrap().push(stamp.owner.clone());
-                let mut answer = reply(ScopeStatus::Ended, true);
-                if stamp.owner
-                    == (subc_protocol::Principal::Reserved {
-                        module_id: "prefrontal".into(),
-                    })
-                {
-                    answer = ModuleControlResponseToModule::ScopeDescribe {
-                        status,
-                        scope_epoch: Some(1),
-                        daemon_incarnation: "test".into(),
-                        owner_synced: synced,
-                        owner_configured: configured,
-                        scope: None,
-                    };
-                }
-                std::future::ready(Ok(answer))
-            },
-            |_| false,
-            |stamp| {
-                crate::access_policy::prefrontal::counterpart_in_catalog(stamp, &configured_modules)
-            },
-        )
-        .await;
-        assert_eq!(calls.lock().unwrap().len(), 2);
-        assert_eq!(
-            calls.lock().unwrap()[1],
-            subc_protocol::Principal::Reserved {
-                module_id: "prefrontal".into()
-            }
-        );
-        assert_eq!(stats.deleted_grants, u64::from(absent));
-        let conn = db.lock().unwrap();
-        assert_eq!(store::list(&conn, &key).unwrap().is_empty(), absent);
-        assert_eq!(store::scope_ended(&conn, &key).unwrap(), absent);
+        let key = save_for(&db, dir.path(), "agent", 1, module);
+        for (status, configured, synced, ends) in [
+            (ScopeStatus::Live, false, true, false),
+            (ScopeStatus::Ended, false, true, false),
+            (ScopeStatus::NotLive, true, false, false),
+            (ScopeStatus::Ended, true, true, true),
+        ] {
+            let stats = tick(db.clone(), &mut None, |stamp| {
+                assert_eq!(
+                    stamp.owner,
+                    subc_protocol::Principal::Reserved {
+                        module_id: module.into()
+                    }
+                );
+                std::future::ready(Ok(ModuleControlResponseToModule::ScopeDescribe {
+                    status,
+                    scope_epoch: Some(1),
+                    daemon_incarnation: "test".into(),
+                    owner_synced: synced,
+                    owner_configured: configured,
+                    scope: None,
+                }))
+            })
+            .await;
+            assert_eq!(stats.described, 1);
+            assert_eq!(stats.deleted_grants, u64::from(ends));
+            let conn = db.lock().unwrap();
+            assert_eq!(store::scope_ended(&conn, &key).unwrap(), ends);
+            assert_eq!(store::list(&conn, &key).unwrap().is_empty(), ends);
+        }
     }
 }
 
@@ -196,7 +111,6 @@ async fn saved_grant_sweep_rechecks_coverage_before_each_describe() {
             std::future::ready(Ok(reply(ScopeStatus::Live, true)))
         },
         |_| protected.load(Ordering::Relaxed),
-        |_| false,
     )
     .await;
     assert_eq!(calls.load(Ordering::Relaxed), 1);
@@ -219,7 +133,6 @@ async fn saved_grant_sweep_older_epoch_is_covered_and_watch_loss_restores_pollin
         &mut None,
         |_| async { panic!("a watched ref must not be described for an older grant epoch") },
         |stamp| covered.covers_reference(stamp),
-        |_| false,
     )
     .await;
     assert_eq!(stats.described, 0);
@@ -229,7 +142,6 @@ async fn saved_grant_sweep_older_epoch_is_covered_and_watch_loss_restores_pollin
         &mut None,
         |_| std::future::ready(Ok(reply(ScopeStatus::Ended, true))),
         |stamp| Coverage::default().covers_reference(stamp),
-        |_| false,
     )
     .await;
     assert_eq!(stats.described, 1);
@@ -274,7 +186,6 @@ async fn saved_grant_sweep_live_table_shape_describe_counts() {
                     std::future::ready(Ok(reply(ScopeStatus::Live, true)))
                 },
                 |stamp| coverage.covers_reference(stamp),
-                |_| false,
             )
             .await;
             per_tick.push(calls.load(Ordering::Relaxed) - before);

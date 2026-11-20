@@ -18614,13 +18614,7 @@ mod tests {
         // single entry (the rename hazard) reddens exactly the missing name.
         // Both halves of each transitional rename pair stay listed until the
         // flip settles (see the allowlist comment).
-        for module_id in [
-            "llm-runner",
-            "aft",
-            "broca",
-            "prefrontal",
-            "prefrontal-core",
-        ] {
+        for module_id in ["llm-runner", "aft", "broca", "prefrontal"] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string(),
@@ -18641,12 +18635,14 @@ mod tests {
             })),
             BindTrust::Untrusted
         );
-        assert_eq!(
-            trust_for_principal(&Some(Principal::Reserved {
-                module_id: "anything-unknown".to_string(),
-            })),
-            BindTrust::Untrusted
-        );
+        for module_id in ["anything-unknown", "prefrontal-core"] {
+            assert_eq!(
+                trust_for_principal(&Some(Principal::Reserved {
+                    module_id: module_id.into()
+                })),
+                BindTrust::Untrusted
+            );
+        }
         assert_eq!(
             trust_for_principal(&Some(Principal::Unverified)),
             BindTrust::Untrusted
@@ -19009,24 +19005,19 @@ mod tests {
                 BindTrust::FirstParty,
                 "direct must stay first-party on {harness}"
             );
-            for module_id in [
-                "llm-runner",
-                "aft",
-                "broca",
-                "prefrontal",
-                "prefrontal-core",
-            ] {
+            for module_id in ["llm-runner", "aft", "broca", "prefrontal"] {
                 assert_eq!(
                     trust_for_bind(harness, &reserved(module_id)),
                     BindTrust::FirstParty,
                     "reserved module id {module_id:?} must stay first-party on {harness}"
                 );
             }
-            assert_eq!(
-                trust_for_bind(harness, &reserved("alfonso-core")),
-                BindTrust::Untrusted,
-                "retired module id alfonso-core must not be first-party on {harness}"
-            );
+            for module_id in ["alfonso-core", "prefrontal-core", "anything-unknown"] {
+                assert_eq!(
+                    trust_for_bind(harness, &reserved(module_id)),
+                    BindTrust::Untrusted
+                );
+            }
         }
     }
 

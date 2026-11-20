@@ -153,7 +153,7 @@ use subc_protocol::scope::ScopeStamp;
 
 fn stamp(name: &str, kind: &str) -> ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": name,
         "scope_epoch": 7,
         "kind": kind,
@@ -164,13 +164,13 @@ fn stamp(name: &str, kind: &str) -> ScopeStamp {
 
 fn parented_stamp(name: &str, kind: &str, parent: &str) -> ScopeStamp {
     let value = json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": name,
         "scope_epoch": 7,
         "kind": kind,
         "owner_authorized": true,
         "parent": {
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": parent,
             "scope_epoch": 7,
         },
@@ -198,13 +198,13 @@ fn run_stamp(
     state: Option<subc_protocol::scope::ParentState>,
 ) -> ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": name,
         "scope_epoch": 7,
         "kind": "ephemeral",
         "owner_authorized": true,
         "parent": {
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": parent,
             "scope_epoch": parent_epoch,
         },
@@ -451,7 +451,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
         ),
         (
             "run bound to a head of another owner",
-            // The run's parent link names prefrontal-core's head, but the
+            // The run's parent link names prefrontal's head, but the
             // route the daemon bound is another owner's head: the link and the
             // bound head disagree, so the run is refused as a worker's run.
             bound(
@@ -467,7 +467,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
             Ineligibility::WorkerRunSession,
         ),
         (
-            // A run linked to a head whose owner is not prefrontal-core at all.
+            // A run linked to a head whose owner is not prefrontal at all.
             "run linked to a non-prefrontal head",
             bound(
                 &classic(Some({
@@ -478,7 +478,7 @@ fn ineligible_cases() -> Vec<(&'static str, RouteIdentity, Ineligibility)> {
                     other
                 })),
                 serde_json::from_value(serde_json::json!({
-                    "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                    "owner": {"kind": "reserved", "module_id": "prefrontal"},
                     "ref": "run-3",
                     "scope_epoch": 7,
                     "kind": "ephemeral",
@@ -1290,7 +1290,7 @@ fn a_run_parented_at_another_epoch_than_its_bound_head_is_ineligible() {
 #[test]
 fn a_run_bound_to_a_head_stamp_of_the_wrong_kind_is_ineligible() {
     use subc_protocol::scope::ParentState;
-    // The bound head route's stamp is owned by prefrontal-core but has kind worker:
+    // The bound head route's stamp is owned by prefrontal but has kind worker:
     // only a Head stamp makes a codemode run's head an agent's head.
     let worker_headed = classic(Some(parented_stamp("head", "worker", "head")));
     let run = bound(

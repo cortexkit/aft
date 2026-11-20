@@ -567,7 +567,7 @@ async fn audit_carrier_feed_contains_tagged_result_and_excludes_other_principals
     let entries = feed["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 1, "{feed}");
     assert_eq!(entries[0]["call_key"], "program-9407");
-    assert_eq!(entries[0]["owner"], "reserved:prefrontal-core");
+    assert_eq!(entries[0]["owner"], "reserved:prefrontal");
     assert_eq!(entries[0]["custodian"], "reserved:basal");
     assert_eq!(entries[0]["ref"], "run:audit-feed");
     assert_eq!(entries[0]["scope_epoch"], 7);
@@ -575,7 +575,7 @@ async fn audit_carrier_feed_contains_tagged_result_and_excludes_other_principals
     if let AuthenticatedPrincipal::RouteBind { principal_id, .. } =
         &mut Arc::get_mut(&mut owner.0).unwrap().spawn_principal
     {
-        *principal_id = Some("reserved:prefrontal-core".into());
+        *principal_id = Some("reserved:prefrontal".into());
     }
     let owner_feed =
         audit_keyed_reply(&f, &owner, "late_results", json!({}), "unused-provider-key").await;
@@ -610,7 +610,7 @@ fn audit_restart_wait_is_not_started_and_changed_scope_or_digest_conflicts() {
         call_key: "audit-restart".into(),
     };
     let scope = ledger::ScopeIdentity {
-        owner: "reserved:prefrontal-core".into(),
+        owner: "reserved:prefrontal".into(),
         scope_ref: "run:audit-restart".into(),
         scope_epoch: 7,
     };
@@ -1218,7 +1218,7 @@ fn audit_schema25_additive_migration_preserves_all_ledger_columns_and_refuses_fu
         call_key: "migration".into(),
     };
     let scope = ledger::ScopeIdentity {
-        owner: "reserved:prefrontal-core".into(),
+        owner: "reserved:prefrontal".into(),
         scope_ref: "run:audit".into(),
         scope_epoch: 7,
     };

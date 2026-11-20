@@ -26,7 +26,6 @@
 //! bind.
 
 use super::*;
-use crate::access_policy::prefrontal::counterpart_owner;
 
 /// Refusal for a codemode call whose owning route can't be located.
 pub(super) const RUN_OWNER_NOT_BOUND: &str = "run_owner_not_bound";
@@ -247,18 +246,6 @@ pub(super) fn run_kind(
     })
 }
 
-/// Whether a head route's scope owner is the run parent's owner. A runner that
-/// adopted its head before the prefrontal module rename keeps binding that
-/// head's routes under the old owner name, with the same scope ref and epoch
-/// the new owner registered. Both names are the same module, so either one
-/// owns the head.
-fn same_owner(
-    route_owner: &subc_protocol::Principal,
-    parent_owner: &subc_protocol::Principal,
-) -> bool {
-    route_owner == parent_owner || counterpart_owner(route_owner).as_ref() == Some(parent_owner)
-}
-
 /// Scope owners can bind routes to keep a scope live or make their own calls.
 /// Those binds must not lend the owner's grants or sandbox settings to the runner.
 pub(super) fn is_scope_owner_route(identity: &RouteIdentity) -> bool {
@@ -272,8 +259,7 @@ pub(super) fn is_scope_owner_route(identity: &RouteIdentity) -> bool {
     else {
         return false;
     };
-    let matches_id = |owner| principal_id(&owner).as_deref() == Some(id.as_str());
-    matches_id(Some(scope.owner.clone())) || matches_id(counterpart_owner(&scope.owner))
+    principal_id(&Some(scope.owner.clone())).as_deref() == Some(id.as_str())
 }
 
 fn resolve_owner(
@@ -359,7 +345,7 @@ fn resolve_owner(
             && identity.call_mode == subc_protocol::call_mode::CallMode::Classic
             && identity.scope.as_ref().is_some_and(|scope| {
                 scope.owner_authorized
-                    && same_owner(&scope.owner, &parent.owner)
+                    && scope.owner == parent.owner
                     && scope.scope_ref == parent.scope_ref
                     && scope.scope_epoch == parent.scope_epoch
             })

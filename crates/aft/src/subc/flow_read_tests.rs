@@ -41,18 +41,21 @@ fn identity(root: &Path, scope: Value, principal: &str) -> RouteIdentity {
     }))
 }
 fn stamp() -> Value {
-    json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"flow-read/call", "scope_epoch":7,"kind":"ephemeral", "owner_authorized":true,
+    json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"flow-read/call", "scope_epoch":7,"kind":"ephemeral", "owner_authorized":true,
         "expires_at_ms":crate::db::call_ledger::now_ms() + 60000,
-        "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head","scope_epoch":7}})
+        "parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"head","scope_epoch":7}})
 }
 
 #[test]
-fn prefrontal_rename_flow_read_admits_both_owners() {
+fn flow_read_admits_only_prefrontal_owner() {
     let dir = tempfile::tempdir().unwrap();
-    for module in crate::access_policy::prefrontal::MODULE_IDS {
-        let mut scope = stamp();
-        scope["owner"]["module_id"] = json!(module);
-        assert!(route_checks(&identity(dir.path(), scope, "reserved:basal")).is_ok());
+    assert!(route_checks(&identity(dir.path(), stamp(), "reserved:basal")).is_ok());
+    for module in ["prefrontal-core", "other"] {
+        check(
+            |s| s["owner"]["module_id"] = json!(module),
+            "reserved:basal",
+            "owner",
+        );
     }
 }
 fn check(mut change: impl FnMut(&mut Value), principal: &str, expected: &'static str) {

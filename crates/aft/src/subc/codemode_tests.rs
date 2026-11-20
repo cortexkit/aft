@@ -7,7 +7,7 @@ use crate::subc::test_support::{route_identity, test_root};
 use subc_protocol::call_mode::CallMode;
 use subc_protocol::scope::ScopeStamp;
 
-const OWNER: &str = "prefrontal-core";
+const OWNER: &str = "prefrontal";
 
 fn head_stamp(scope_ref: &str, agent: &str) -> ScopeStamp {
     serde_json::from_value(json!({
@@ -561,10 +561,7 @@ fn codemode_head_with_another_scope_owner_is_not_the_runs_head() {
 }
 
 #[test]
-fn codemode_head_bound_under_the_other_prefrontal_name_is_the_runs_head() {
-    // The run's parent names one prefrontal module name and the head route
-    // carries the other, with the same ref and epoch: the case of a head that a
-    // runner adopted before the prefrontal-core -> prefrontal rename.
+fn codemode_head_and_parent_must_match_even_if_one_uses_the_legacy_name() {
     for (route_owner, parent_owner) in [
         ("prefrontal-core", "prefrontal"),
         ("prefrontal", "prefrontal-core"),
@@ -579,13 +576,6 @@ fn codemode_head_bound_under_the_other_prefrontal_name_is_the_runs_head() {
                 module_id: route_owner.into(),
             };
         });
-        let body = call("read", json!({"path": "notes.txt"}));
-        let session = owner(admit(&f.routes, channel(9), Some(&body)))
-            .session
-            .clone();
-        assert_eq!(session, "head-a-session", "{route_owner} -> {parent_owner}");
-        // Ref and epoch must still match exactly across the two names.
-        edit_head_stamp(&mut f, |stamp| stamp.scope_epoch += 1);
         assert_eq!(refusal_reason(&f), "head_route_not_bound");
     }
 }
@@ -687,7 +677,7 @@ fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: Bind
     f.routes.insert(channel(3), identity);
 }
 
-fn head_with_scope_owner_route(owner_principal: &str) -> Fixture {
+fn head_with_scope_owner_route() -> Fixture {
     let scope_owner = Principal::Reserved {
         module_id: "prefrontal".into(),
     };
@@ -698,7 +688,7 @@ fn head_with_scope_owner_route(owner_principal: &str) -> Fixture {
     second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
     for (ch, principal_id, raw_harness) in [
         (1, "reserved:broca", "broca"),
-        (3, owner_principal, "runner"),
+        (3, "reserved:prefrontal", "runner"),
     ] {
         let data = Arc::get_mut(&mut f.routes.get_mut(&channel(ch)).unwrap().0).unwrap();
         data.scope.as_mut().unwrap().owner = scope_owner.clone();
@@ -720,25 +710,21 @@ fn head_with_scope_owner_route(owner_principal: &str) -> Fixture {
 
 #[test]
 fn codemode_head_inherits_runner_route_instead_of_scope_owner() {
-    for owner_principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
-        let f = head_with_scope_owner_route(owner_principal);
-        let body = call("edit", json!({"path": "notes.txt"}));
-        let effective = owner(admit(&f.routes, channel(9), Some(&body)));
-        let runner = &f.routes[&channel(1)];
-        assert_eq!(effective.spawn_principal, runner.spawn_principal);
-        let run_owner = effective.run_owner.as_ref().unwrap();
-        assert_eq!(run_owner.owner_route_channel, channel(1));
-        assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
-    }
+    let f = head_with_scope_owner_route();
+    let body = call("edit", json!({"path": "notes.txt"}));
+    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+    let runner = &f.routes[&channel(1)];
+    assert_eq!(effective.spawn_principal, runner.spawn_principal);
+    let run_owner = effective.run_owner.as_ref().unwrap();
+    assert_eq!(run_owner.owner_route_channel, channel(1));
+    assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
 }
 
 #[test]
 fn codemode_head_with_only_scope_owner_route_refuses() {
-    for owner_principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
-        let mut f = head_with_scope_owner_route(owner_principal);
-        f.routes.remove(&channel(1));
-        assert_eq!(refusal_reason(&f), "head_route_not_bound");
-    }
+    let mut f = head_with_scope_owner_route();
+    f.routes.remove(&channel(1));
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
 }
 
 fn assert_ambiguous_field(f: &Fixture, field: &str) {

@@ -8701,7 +8701,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
                 "op": "catalog.list",
                 "generation": 7,
                 "modules": [{
-                    "module_id": "prefrontal-core",
+                    "module_id": "prefrontal",
                     "roles": [{
                         "role": "management_surface",
                         "operations": [{ "name": "status.line", "kind": "query" }],
@@ -8725,7 +8725,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(route_open_body["op"], "route.open");
     assert_eq!(
         route_open_body["target"],
-        json!({ "kind": "management_surface", "module_id": "prefrontal-core" })
+        json!({ "kind": "management_surface", "module_id": "prefrontal" })
     );
     assert_eq!(
         route_open_body["consumer_identity"],
@@ -8890,7 +8890,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
-/// A fleet status holder (`prefrontal-core`) played by the test. It answers the
+/// A fleet status holder (`prefrontal`) played by the test. It answers the
 /// module's consumer connection: catalog discovery, the status route bind, and
 /// each `status.publish` with an ack whose `last_read_at_ms` says how recently
 /// something read this project's fleet line.
@@ -8916,7 +8916,7 @@ impl FakeStatusHolder {
         assert_eq!(route_open_body["op"], "route.open");
         assert_eq!(
             route_open_body["target"],
-            json!({ "kind": "management_surface", "module_id": "prefrontal-core" })
+            json!({ "kind": "management_surface", "module_id": "prefrontal" })
         );
         assert_eq!(
             route_open_body["identity"],
@@ -8985,7 +8985,7 @@ fn holder_catalog() -> Value {
         "op": "catalog.list",
         "generation": 7,
         "modules": [{
-            "module_id": "prefrontal-core",
+            "module_id": "prefrontal",
             "roles": [{
                 "role": "management_surface",
                 "operations": [{ "name": "status.line", "kind": "query" }],

@@ -713,6 +713,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
         ensure_additive_indexes(&conn)?;
         display_records::install(&conn)?;
         clear_stored_compression_commands(&mut conn)?;
+        access_grants::migrate_prefrontal_owner(&mut conn)?;
         conn.busy_timeout(Duration::from_secs(5))?;
         return Ok(conn);
     }
@@ -746,6 +747,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
             ensure_additive_indexes(&conn)?;
             display_records::install(&conn)?;
             clear_stored_compression_commands(&mut conn)?;
+            access_grants::migrate_prefrontal_owner(&mut conn)?;
             Ok::<(), OpenError>(())
         })();
         match result {

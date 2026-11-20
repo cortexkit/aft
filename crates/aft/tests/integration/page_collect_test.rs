@@ -262,7 +262,7 @@ async fn drive_page_collect_daemon(input: FakeDaemonInput) {
         20,
         &root1,
         Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
     )
     .await;

@@ -1,7 +1,7 @@
 //! `page.collect`, `page.read` and `page.release`: core's management
 //! operations for sealed HTML page bundles (see `crate::page_collect`).
 //!
-//! Only core (`prefrontal-core`) may call them. A collection reads under
+//! Only Prefrontal may call them. A collection reads under
 //! the read policy of one agent session's live tool route: the same bind
 //! root, trust class, config read_deny and protected paths, AFT storage
 //! floor, saved grants and confinement its `read` tool applies right now:

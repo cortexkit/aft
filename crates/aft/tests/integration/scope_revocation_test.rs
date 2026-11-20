@@ -124,7 +124,7 @@ async fn assert_scope_kill_settled_as(marker: &Path, session: &str, reason: &str
     }
 }
 
-const PREFRONTAL: &str = "prefrontal-core";
+const PREFRONTAL: &str = "prefrontal";
 
 /// The head scope a run is opened under: core opens runs only for heads, and
 /// a head's scope carries its agent's id.

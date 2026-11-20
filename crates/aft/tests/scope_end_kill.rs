@@ -904,9 +904,9 @@ async fn first_party_worker_bash_runs_with_default_relaxed_and_reports_unenforce
     .unwrap();
     std::fs::write(root.join("project/worker-proof.txt"), "relaxed-worker-ran").unwrap();
     let scope = serde_json::from_value(json!({
-        "owner": {"kind":"reserved","module_id":"prefrontal-core"},
+        "owner": {"kind":"reserved","module_id":"prefrontal"},
         "ref":"worker-scope", "scope_epoch":1, "kind":"worker",
-        "parent": {"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head-scope","scope_epoch":1},
+        "parent": {"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"head-scope","scope_epoch":1},
         "owner_authorized":true
     })).unwrap();
     daemon.bind(1, 1, "broca", Some(scope), false).await;
@@ -1602,7 +1602,7 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
 // than a `{name, arguments, call_key}` tool-call envelope.
 fn flow_owner() -> Principal {
     Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     }
 }
 fn flow_head_stamp() -> subc_protocol::scope::ScopeStamp {

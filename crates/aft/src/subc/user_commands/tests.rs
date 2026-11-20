@@ -52,13 +52,16 @@ fn route(root: &ProjectRootId, principal: &str) -> RouteIdentity {
 }
 
 #[test]
-fn prefrontal_rename_runner_matching_keeps_other_principals_scoped() {
+fn prefrontal_runner_matching_keeps_other_principals_scoped() {
     let dir = tempfile::tempdir().unwrap();
     let root = ProjectRootId::from_path(dir.path()).unwrap();
-    for principal in ["reserved:prefrontal", "reserved:prefrontal-core"] {
-        assert!(runner_matches(&route(&root, principal), "broca"));
+    assert!(runner_matches(
+        &route(&root, "reserved:prefrontal"),
+        "broca"
+    ));
+    for principal in ["reserved:prefrontal-core", "reserved:other"] {
+        assert!(!runner_matches(&route(&root, principal), "broca"));
     }
-    assert!(!runner_matches(&route(&root, "reserved:other"), "broca"));
 }
 
 fn session_route(
@@ -86,7 +89,7 @@ fn session_route(
     *raw = harness.into();
     data.scope = Some(
         serde_json::from_value(json!({
-            "owner":{"kind":"reserved", "module_id":"prefrontal-core"},
+            "owner":{"kind":"reserved", "module_id":"prefrontal"},
             "ref":format!("{scope_kind}-scope"), "scope_epoch":1, "kind":scope_kind,
             "owner_authorized":true,
             "attributes": if scope_kind == "ephemeral" {
@@ -273,11 +276,7 @@ fn user_commands_session_lookup_core_and_runner_routes_preserve_project_status()
             let mut routes = HashMap::new();
             let mut channel = 1;
             for (principal, raw_harness, count) in [
-                (
-                    "reserved:prefrontal-core".to_string(),
-                    core_harness,
-                    core_count,
-                ),
+                ("reserved:prefrontal".to_string(), core_harness, core_count),
                 (format!("reserved:{runner}"), harness, runner_count),
             ] {
                 for _ in 0..count {
@@ -330,7 +329,7 @@ fn user_commands_thalamus_runner_alias_requires_unique_live_concrete_evidence() 
     let subject = contract::SessionRef::new("thalamus-harness", "opencode2", "chat");
     let mut routes = HashMap::from([(
         route_key(1, 1),
-        session_route(&root, "reserved:prefrontal-core", "runner", "chat", "head"),
+        session_route(&root, "reserved:prefrontal", "runner", "chat", "head"),
     )]);
     let mut body = request("commands.preview");
     body["params"]["subject"]["session"] = encode(&subject);
@@ -359,7 +358,7 @@ fn user_commands_thalamus_runner_alias_requires_unique_live_concrete_evidence() 
     // Harness evidence is independent of whether the route has a project actor.
     let evidence_dir = tempfile::tempdir().unwrap();
     let evidence_root = ProjectRootId::from_path(evidence_dir.path()).unwrap();
-    for principal in ["reserved:thalamus-harness", "reserved:prefrontal-core"] {
+    for principal in ["reserved:thalamus-harness", "reserved:prefrontal"] {
         routes.insert(
             route_key(5, 1),
             session_route(&evidence_root, principal, "opencode2", "chat", "head"),
@@ -394,14 +393,14 @@ fn user_commands_session_lookup_scopes_only_conflict_for_another_project_root() 
     for (channel, kind) in [(1, "head"), (2, "worker"), (3, "ephemeral")] {
         routes.insert(
             route_key(channel, 1),
-            session_route(&root, "reserved:prefrontal-core", "opencode2", "chat", kind),
+            session_route(&root, "reserved:prefrontal", "opencode2", "chat", kind),
         );
     }
     for (channel, principal, harness, session) in [
-        (4, "reserved:prefrontal-core", "opencode2", "other-chat"),
+        (4, "reserved:prefrontal", "opencode2", "other-chat"),
         (5, "direct", "opencode2", "chat"),
         (6, "reserved:broca", "opencode2", "chat"),
-        (7, "reserved:prefrontal-core", "claude-code", "chat"),
+        (7, "reserved:prefrontal", "claude-code", "chat"),
     ] {
         routes.insert(
             route_key(channel, 1),
@@ -421,7 +420,7 @@ fn user_commands_session_lookup_scopes_only_conflict_for_another_project_root() 
             route_key(8, 1),
             session_route(
                 &other_root,
-                "reserved:prefrontal-core",
+                "reserved:prefrontal",
                 "opencode2",
                 "chat",
                 kind,

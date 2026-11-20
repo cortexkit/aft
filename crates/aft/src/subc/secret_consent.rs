@@ -717,7 +717,7 @@ fn bound_codemode(
     // `resolve_owner` only compares the bound head's owner with the run's
     // parent owner, so another authorized owner could otherwise bind a route
     // that reaches a non-prefrontal head stamp. Authorization re-checks the
-    // head here; that is what makes the run prefrontal-core.
+    // head here; that is what makes the run Prefrontal-owned.
     if !alfonso_of_kind(head_stamp, &[ScopeKind::Head]) {
         return Err(Ineligibility::HeadScopeNotAlfonso);
     }

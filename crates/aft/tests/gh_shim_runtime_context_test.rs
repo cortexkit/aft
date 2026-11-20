@@ -235,7 +235,7 @@ fn write_fresh_ambient_credentials_r2_cache(state_home: &Path, now: u64) {
             "inputs": {
                 "connection_file": "ready",
                 "agent_credentials_present": "env:GH_TOKEN",
-                "catalog_holder": "prefrontal-core"
+                "catalog_holder": "prefrontal"
             },
             "manifest_version": 1
         }))

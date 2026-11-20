@@ -43,7 +43,7 @@ async fn the_default_wait_passes_cancellation_to_hold_and_withdraws_a_failed_awa
             fail,
         });
         let cancel = Cancellation::default();
-        let stamp = serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"kind":"head","ref":"default-hold","scope_epoch":1,"owner_authorized":true})).unwrap();
+        let stamp = serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"kind":"head","ref":"default-hold","scope_epoch":1,"owner_authorized":true})).unwrap();
         let request = SecretConsentRequest {
             scope: crate::secret::SecretScope::from_stamp(&stamp),
             project_root: "scope".into(),
@@ -155,7 +155,7 @@ impl Drop for Fixture {
 
 fn request(index: usize, ttl_ms: u64) -> SecretConsentRequest {
     let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(serde_json::json!({
-        "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+        "owner":{"kind":"reserved","module_id":"prefrontal"},
         "kind":"head", "ref":"cancel-cache", "scope_epoch":1, "owner_authorized":true
     }))
     .unwrap();

@@ -824,7 +824,7 @@ async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
 }
 
 fn identity(root: &Path, session: &str, epoch: u64, scoped: bool) -> RouteIdentity {
-    let scope=serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"worker","scope_epoch":epoch,"kind":"worker","owner_authorized":true})).unwrap();
+    let scope=serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"worker","scope_epoch":epoch,"kind":"worker","owner_authorized":true})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
@@ -912,7 +912,7 @@ mod catalog_preset_tests {
                     "owner": {"kind": "reserved", "module_id": "basal"},
                     "ref": "catalog-scope", "scope_epoch": 7, "kind": kind,
                     "attributes": attributes, "owner_authorized": true,
-                    "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                    "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal"},
                         "ref": "invoking-scope", "scope_epoch": 3},
                     "parent_state": "linked",
                 }))
@@ -1977,7 +1977,7 @@ fn stamped_host_heads_keep_role_tools_and_user_remote_runner() {
         data.spawn_principal = plain.spawn_principal.clone();
         data.scope = Some(
             serde_json::from_value(json!({
-                "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+                "owner": {"kind": "reserved", "module_id": "prefrontal"},
                 "ref": "host-head", "scope_epoch": 7, "kind": "head",
                 "owner_authorized": true,
                 "attributes": {"agent_id": "head-agent", "delegates": true}
@@ -3022,7 +3022,7 @@ fn siblings_catalog_uses_head_grants_and_worker_allow_paths() {
 }
 
 /// The head's checks of a worker plan arrive over the orchestrator's own
-/// connection (module `prefrontal-core`) rather than the head's session host,
+/// connection (module `prefrontal`) rather than the head's session host,
 /// so the route's principal is not a session host. The head's saved grants
 /// then decide what it may delegate through allow_paths, but not what the
 /// route's own file tools may read.
@@ -3033,7 +3033,7 @@ fn core_head(root: &Path, scope_ref: &str) -> RouteIdentity {
     stamp.kind = subc_protocol::scope::ScopeKind::Head;
     stamp.scope_ref = scope_ref.into();
     if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
-        *principal_id = Some("reserved:prefrontal-core".into());
+        *principal_id = Some("reserved:prefrontal".into());
     }
     head
 }
@@ -3247,9 +3247,9 @@ fn siblings_worker_fetch_counts_only_saved_grants() {
 /// Who carries a worker's catalog fetch. Broca, the worker's session host,
 /// binds as `reserved:broca`. Core reads the worker's shell schema before the
 /// worker starts over its own connection, so that route's principal is
-/// `reserved:prefrontal-core`, the scope's owner, and not a session host.
+/// `reserved:prefrontal`, the scope's owner, and not a session host.
 const BROCA: &str = "reserved:broca";
-const CORE: &str = "reserved:prefrontal-core";
+const CORE: &str = "reserved:prefrontal";
 
 /// A worker scope `scope_ref` of the fixture's head, carried by `principal`.
 fn fixture_worker(

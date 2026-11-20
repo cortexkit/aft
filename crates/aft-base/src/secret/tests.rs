@@ -10,7 +10,7 @@ use secret_rules::location::Location;
 fn production_scope() -> SecretScope {
     SecretScope::from_stamp(
         &serde_json::from_value(serde_json::json!({
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": "head",
             "scope_epoch": 7,
             "kind": "head",

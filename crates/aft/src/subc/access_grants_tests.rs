@@ -22,7 +22,7 @@ fn operation(
 mod slow_restore;
 
 fn identity(root: &Path, name: &str, kind: &str, parent: Option<&str>) -> RouteIdentity {
-    let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
+    let stamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":name,"scope_epoch":7,"kind":kind,"parent":parent.map(|name|json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":name,"scope_epoch":7})),"owner_authorized":true,"attributes":{"agent_id":match kind {"head"=>Some(name),"ephemeral" if parent.is_none()=>Some("head"),_=>None}}})).unwrap();
     RouteIdentity(Arc::new(RouteIdentityData {
         output_scope: Default::default(),
         root: ProjectRootId::from_path(root).unwrap(),
@@ -66,7 +66,7 @@ fn context(root: &Path, storage: &Path) -> AppContext {
 }
 
 #[test]
-fn prefrontal_rename_access_scope_admission_preserves_authorization_and_kind() {
+fn prefrontal_access_scope_admission_preserves_authorization_and_kind() {
     let dir = tempfile::tempdir().unwrap();
     for module in ["prefrontal", "prefrontal-core", "other"] {
         let mut route = identity(dir.path(), "head", "head", None);
@@ -74,21 +74,17 @@ fn prefrontal_rename_access_scope_admission_preserves_authorization_and_kind() {
         stamp.owner = Principal::Reserved {
             module_id: module.into(),
         };
-        assert_eq!(alfonso(stamp), module != "other");
+        assert_eq!(alfonso(stamp), module == "prefrontal");
         stamp.owner_authorized = false;
         assert!(!alfonso(stamp));
     }
 }
 
 #[test]
-fn prefrontal_rename_parent_grant_keys_are_canonical_but_history_identity_is_not() {
+fn prefrontal_parent_grant_keys_use_the_exact_wire_owner() {
     let dir = tempfile::tempdir().unwrap();
     let mut route = identity(dir.path(), "run", "ephemeral", Some("head"));
     let stamp = Arc::get_mut(&mut route.0).unwrap().scope.as_mut().unwrap();
-    stamp.owner = Principal::Reserved {
-        module_id: "prefrontal".into(),
-    };
-    stamp.parent.as_mut().unwrap().owner = stamp.owner.clone();
     let wire = serde_json::to_string(stamp).unwrap();
     assert_eq!(
         super::super::tool_provider::ledger_scope(stamp).owner,
@@ -100,7 +96,7 @@ fn prefrontal_rename_parent_grant_keys_are_canonical_but_history_identity_is_not
     );
     assert_eq!(
         head_scope(&route).unwrap().owner,
-        r#"{"kind":"reserved","module_id":"prefrontal-core"}"#
+        r#"{"kind":"reserved","module_id":"prefrontal"}"#
     );
     assert_eq!(
         policy_scope_key(&route).owner,

@@ -167,7 +167,7 @@ mod tests {
 
     #[test]
     fn bus_refusal_preserves_correlation_and_does_not_hide_other_route_opens() {
-        for module in ["ckbus", "claustrum", "prefrontal-core"] {
+        for module in ["ckbus", "claustrum", "prefrontal"] {
             let request = Frame::build(
                 FrameType::Request,
                 subc_protocol::Flags::new(false, subc_protocol::Priority::Interactive, false),

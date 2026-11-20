@@ -192,7 +192,7 @@ pub enum AskRoute {
     /// No permission UI is available on this route.
     Deny,
     /// An Alfonso agent or its codemode program, identified by a scope stamp
-    /// authenticated by prefrontal-core:
+    /// authenticated by Prefrontal:
     /// an `ask` refuses with `access_ask_required`
     /// so the subc layer can put the question to Cingulate. `once` holds the
     /// capabilities an `allow_once` answer approved for this one dispatch.

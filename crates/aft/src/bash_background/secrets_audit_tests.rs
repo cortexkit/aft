@@ -157,7 +157,7 @@ impl Fixture {
         if !bound {
             return stamp("worker");
         }
-        serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"audit-run","kind":"ephemeral","scope_epoch":1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap()
+        serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"audit-run","kind":"ephemeral","scope_epoch":1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap()
     }
     fn launch(&self, command: &str, bound: bool, extra: serde_json::Value) -> Response {
         self.launch_with_vault(self.vault.clone(), command, bound, extra)

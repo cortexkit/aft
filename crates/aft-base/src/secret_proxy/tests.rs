@@ -113,7 +113,7 @@ impl SecretVault for Vault {
 fn scope(reference: &str) -> SecretScope {
     SecretScope::from_stamp(
         &serde_json::from_value(json!({
-            "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+            "owner": {"kind":"reserved", "module_id":"prefrontal"},
         "owner_authorized":true, "kind":if reference == "run" {"ephemeral"} else {"head"}, "ref":reference, "scope_epoch":1
         }))
         .unwrap(),

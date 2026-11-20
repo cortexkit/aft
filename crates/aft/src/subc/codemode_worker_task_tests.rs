@@ -16,9 +16,9 @@ struct Fixture {
 fn fixture() -> Fixture {
     let (root_dir, root) = test_root("codemode-worker-background");
     let storage = tempfile::tempdir().unwrap();
-    let mut carrier = caller_route(&root, "reserved:prefrontal-core", "runner");
+    let mut carrier = caller_route(&root, "reserved:prefrontal", "runner");
     let mut worker = caller_route(&root, "reserved:broca", "runner");
-    let mut run = caller_route(&root, "reserved:prefrontal-core", "runner");
+    let mut run = caller_route(&root, "reserved:prefrontal", "runner");
     for (route, session) in [
         (&mut carrier, "worker-session"),
         (&mut worker, "worker-session"),
@@ -31,7 +31,7 @@ fn fixture() -> Fixture {
         }
     }
     let scope = serde_json::from_value(json!({
-        "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+        "owner":{"kind":"reserved","module_id":"prefrontal"},
         "ref":"worker-a", "scope_epoch":3, "kind":"worker", "owner_authorized":true,
     }))
     .unwrap();
@@ -42,10 +42,10 @@ fn fixture() -> Fixture {
     data.held_reply = true;
     data.tool_result_body = true;
     data.scope = Some(serde_json::from_value(json!({
-        "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+        "owner":{"kind":"reserved","module_id":"prefrontal"},
         "ref":"program", "scope_epoch":1, "kind":"ephemeral", "owner_authorized":true,
         "attributes":{"on_behalf_of_agent":"head-agent","run_id":"worker-program"},
-        "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"worker-a","scope_epoch":3},
+        "parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"worker-a","scope_epoch":3},
         "parent_state":"linked",
     })).unwrap());
     let ctx = test_ctx();
@@ -256,7 +256,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
                 run_scope: None,
                 scope: effective.scope.clone(),
                 late_results: true,
-                ledger_carrier: Some("reserved:prefrontal-core".into()),
+                ledger_carrier: Some("reserved:prefrontal".into()),
                 connection: PersistentCancelSignal::new(),
                 route: PersistentCancelSignal::new(),
                 drain: drain::ModuleDrainWindow::default(),
@@ -317,10 +317,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
     assert_eq!(metadata.launching_identity, Some(expected.clone()));
     assert_eq!(metadata.scope, f.worker.scope);
     assert_ne!(metadata.scope, effective.scope);
-    assert_eq!(
-        metadata.call_key.unwrap().requester,
-        "reserved:prefrontal-core"
-    );
+    assert_eq!(metadata.call_key.unwrap().requester, "reserved:prefrontal");
 
     let codemode::Admission::Owner(program_observer) = admit_tool(&f, "bash_status") else {
         panic!("the same program must be able to observe the task it launched");

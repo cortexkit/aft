@@ -1277,7 +1277,7 @@ async function sendPeer(findings: Finding[]): Promise<string> {
   const client = await SubcClient.connect({ connectionFile: CONNECTION, identity });
   try {
     const response = await client.call(
-      "prefrontal-core",
+      "prefrontal",
       "peer.enqueue_message",
       delivery.params,
       { timeoutMs: 10_000, identity },
