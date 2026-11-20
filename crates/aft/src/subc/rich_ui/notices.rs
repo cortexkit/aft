@@ -11,7 +11,8 @@ use crate::protocol::PushFrame;
 mod views;
 pub(in crate::subc) use views::{view, view_pins};
 
-pub(crate) const WRITER_CAPABILITY: Option<&str> = None;
+pub(crate) const WRITER_CAPABILITY: Option<&str> =
+    Some(cortexkit_role_tool_display::NOTICE_RECORD_WRITER_CAPABILITY);
 const RECORD_ID_PREFIX: &str = "notice:";
 
 pub(crate) fn is_notice_id(id: &str) -> bool {
