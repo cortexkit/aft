@@ -442,6 +442,7 @@ pub enum SpawnPlan {
     Launcher {
         profile: SandboxProfile,
         launcher_path: PathBuf,
+        task_launcher: Option<PathBuf>,
     },
     #[cfg(unix)]
     Prepared {
@@ -679,6 +680,7 @@ impl SpawnPlan {
         Self::Launcher {
             profile,
             launcher_path,
+            task_launcher: None,
         }
     }
 
@@ -1659,6 +1661,8 @@ fn resolve_sandbox_spawn_with_mode(
             SpawnPlan::Launcher {
                 profile,
                 launcher_path,
+                task_launcher: cfg!(target_os = "linux")
+                    .then(|| crate::pinned_executable::task_executable(task_bundle_dir)),
             }
         });
         match resolved {
@@ -6230,10 +6234,14 @@ fn isolated_environment_for_plan(
         SpawnPlan::Launcher {
             profile,
             launcher_path,
+            task_launcher,
         } => {
             let mut environment =
                 sandboxed_child_environment(request_environment, &profile.temp_dir);
-            launcher_image::task_environment(profile, launcher_path, &mut environment);
+            crate::pinned_executable::task_environment(
+                task_launcher.as_deref().unwrap_or(launcher_path),
+                &mut environment,
+            );
             #[cfg(target_os = "macos")]
             if profile.temp_dir.join(".worker-bin/mktemp").is_file() {
                 let mut paths = vec![profile.temp_dir.join(".worker-bin")];
@@ -6637,6 +6645,7 @@ fn command_argv_for_plan(
         SpawnPlan::Launcher {
             profile,
             launcher_path,
+            ..
         } => {
             #[cfg(unix)]
             {
@@ -10983,6 +10992,7 @@ mod policy_tests {
             SpawnPlan::Launcher {
                 profile,
                 launcher_path,
+                ..
             } => {
                 *launcher_path = launcher;
                 profile.temp_dir.clone()

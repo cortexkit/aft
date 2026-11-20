@@ -10,6 +10,9 @@ enum SavedSpawnPolicy {
     Launcher {
         profile: SandboxProfile,
         launcher_path: PathBuf,
+        #[cfg(target_os = "linux")]
+        #[serde(default)]
+        launcher_identity: Option<super::launcher_image::LauncherIdentity>,
     },
 }
 
@@ -38,6 +41,9 @@ struct SavedLocalLaunch {
 
 #[cfg(unix)]
 pub(crate) const REMOTE_LOCAL_LAUNCH: &str = "remote-local-launch";
+
+#[cfg(unix)]
+const SNAPSHOT_DIGEST_MISMATCH: &str = "local fallback snapshot digest mismatch";
 
 #[cfg(unix)]
 fn default_scope_max_runtime_secs() -> u64 {
@@ -69,9 +75,15 @@ pub(crate) fn save_local_launch(
         SpawnPlan::Launcher {
             profile,
             launcher_path,
+            ..
         } => SavedSpawnPolicy::Launcher {
             profile: profile.clone(),
             launcher_path: launcher_path.clone(),
+            #[cfg(target_os = "linux")]
+            launcher_identity: Some(
+                super::launcher_image::LauncherIdentity::capture(launcher_path)
+                    .ok_or(SNAPSHOT_DIGEST_MISMATCH)?,
+            ),
         },
         _ => return Err("refused local launch cannot be saved".into()),
     };
@@ -137,7 +149,7 @@ pub(crate) fn restore_local_launch(
     hash.update(task.paths.task_id.as_bytes());
     hash.update(&bytes);
     if hash.finalize().to_hex().as_str() != expected {
-        return Err("local fallback snapshot digest mismatch".into());
+        return Err(SNAPSHOT_DIGEST_MISMATCH.into());
     }
     let snapshot: SavedLocalLaunch = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
     let environment: ChildEnvironment = snapshot.environment.into_iter().collect();
@@ -147,12 +159,37 @@ pub(crate) fn restore_local_launch(
             shell_path,
             environment: environment.clone(),
         },
+        #[cfg(target_os = "linux")]
+        SavedSpawnPolicy::Launcher {
+            profile,
+            launcher_path,
+            launcher_identity,
+        } => {
+            super::launcher_image::LauncherIdentity::validate_saved(
+                launcher_identity,
+                &launcher_path,
+            )
+            .map_err(|reason| {
+                log::warn!(
+                    "refusing Linux local fallback for {}: {reason}",
+                    task.paths.task_id
+                );
+                SNAPSHOT_DIGEST_MISMATCH
+            })?;
+            SpawnPlan::Launcher {
+                profile,
+                launcher_path,
+                task_launcher: None,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
         SavedSpawnPolicy::Launcher {
             profile,
             launcher_path,
         } => SpawnPlan::Launcher {
             profile,
             launcher_path,
+            task_launcher: None,
         },
     };
     let prepared = verify_payload(
@@ -189,3 +226,7 @@ pub(crate) fn restore_local_launch(
         snapshot.linux_scope_max_runtime_secs,
     ))
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "local_launch_pin_tests.rs"]
+mod pin_tests;

@@ -1,22 +1,32 @@
-use super::{ChildEnvironment, SandboxProfile};
+#![cfg(target_os = "linux")]
+
+use super::SandboxProfile;
 use std::path::Path;
 
-pub(super) fn task_environment(
-    _profile: &SandboxProfile,
-    launcher: &Path,
-    environment: &mut ChildEnvironment,
-) {
-    #[cfg(target_os = "linux")]
-    let task_launcher = _profile
-        .temp_dir
-        .parent()
-        .map(crate::pinned_executable::task_executable);
-    #[cfg(target_os = "linux")]
-    let launcher = task_launcher.as_deref().unwrap_or(launcher);
-    crate::pinned_executable::task_environment(launcher, environment);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub(super) struct LauncherIdentity(u64, u64);
+
+impl LauncherIdentity {
+    pub(super) fn capture(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = path.symlink_metadata().ok()?;
+        // A task can replace this name after launch. A private snapshot may
+        // record only the direct regular file, never the task's symlink.
+        metadata
+            .is_file()
+            .then(|| Self(metadata.dev(), metadata.ino()))
+    }
+
+    pub(super) fn validate_saved(expected: Option<Self>, path: &Path) -> Result<(), &'static str> {
+        let expected = expected.ok_or("snapshot has no launcher identity")?;
+        if Self::capture(path) == Some(expected) {
+            Ok(())
+        } else {
+            Err("saved launcher identity no longer matches")
+        }
+    }
 }
 
-#[cfg(target_os = "linux")]
 pub(super) fn finish_linux_profile(
     mut profile: SandboxProfile,
     home: &Path,

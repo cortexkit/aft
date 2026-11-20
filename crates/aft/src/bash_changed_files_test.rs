@@ -1344,6 +1344,7 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
     let plan = crate::sandbox_spawn::SpawnPlan::Launcher {
         profile,
         launcher_path: PathBuf::from("unused-test-launcher"),
+        task_launcher: None,
     };
     let capture = Capture::start_for_spawn(&ctx, "read-floor-test", &plan).unwrap();
     std::fs::write(
