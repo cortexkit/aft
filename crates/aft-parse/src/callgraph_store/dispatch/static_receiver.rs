@@ -4,6 +4,9 @@
 mod bindings;
 #[path = "static_receiver/codec.rs"]
 mod codec;
+#[path = "static_receiver/csharp_projects.rs"]
+mod csharp_projects;
+pub use csharp_projects::CSharpProjects;
 #[path = "static_receiver/extract.rs"]
 mod extract;
 #[path = "static_receiver/resolve.rs"]

@@ -3,15 +3,25 @@ use std::collections::{BTreeMap, BTreeSet};
 use aft_store::content::ContentRecord;
 
 use super::callgraph::FileResolution;
-use super::incremental_tests::{checkout, update_checked_bytes};
+use super::incremental_tests::{checkout as project_checkout, update_checked_bytes};
 use super::site_records_tests::records_match_files;
-use crate::callgraph_store::join::dispatch::{Resolution, Resolver};
+use crate::callgraph_store::join::dispatch::{CSharpProjects, Resolution, Resolver};
 use crate::callgraph_store::join::{BlobRefKind, CallgraphBlob, ParseBlob};
 
 #[path = "static_receiver_tests/bindings.rs"]
 mod bindings;
+#[path = "static_receiver_tests/projects.rs"]
+mod projects;
 #[path = "static_receiver_tests/visibility.rs"]
 mod visibility;
+
+fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> super::callgraph::CheckoutInputs {
+    let mut files = files.to_vec();
+    if files.iter().any(|(path, _)| path.ends_with(".cs")) {
+        files.push(("Fixture.csproj", "<Project />"));
+    }
+    project_checkout(&files, links)
+}
 
 fn round_trip(source: &str, language: &str) -> ParseBlob {
     let extracted = super::content::extract(source.as_bytes(), language).unwrap();
@@ -77,7 +87,9 @@ fn duplicate_static_receiver_ordinals_round_trip_csharp_yield_body() {
     let path = "InputData.cs";
     let parse = round_trip(source, "csharp");
     assert!(retained_static_call(&parse, "Tuple", "Create").contains("GetData"));
-    let resolver = Resolver::new(BTreeMap::from([(path.to_string(), &parse)]));
+    let projects = CSharpProjects::new([b"Fixture.csproj".as_slice()]);
+    let resolver =
+        Resolver::new(BTreeMap::from([(path.to_string(), &parse)])).with_csharp_projects(&projects);
     let site = parse
         .dispatch
         .sites

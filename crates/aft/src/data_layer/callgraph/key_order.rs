@@ -43,7 +43,7 @@ use rayon::prelude::*;
 
 use crate::callgraph_store::join::dispatch::projected::FileRecord;
 use crate::callgraph_store::join::dispatch::{
-    dependency, Resolution, ResolutionKey, Resolver, SharedMethods,
+    dependency, CSharpProjects, Resolution, ResolutionKey, Resolver, SharedMethods,
 };
 use crate::callgraph_store::join::ManifestJoinError;
 
@@ -901,6 +901,7 @@ impl GroupStats {
 
 /// What the threads resolving keys share.
 struct Context<'s> {
+    projects: &'s CSharpProjects,
     source: &'s RecordSource,
     paths: &'s [String],
     answers: Interner<Resolution>,
@@ -1017,7 +1018,7 @@ impl<'s> Context<'s> {
                 site_records::start_touches();
             }
             let pinned = Pinned::cached(self.source);
-            let resolver = Resolver::over(&pinned);
+            let resolver = Resolver::over(&pinned).with_csharp_projects(self.projects);
             if let Some(shared) = shared {
                 resolver.use_shared_methods(shared);
             }
@@ -1269,6 +1270,7 @@ impl Flusher<'_, '_> {
 pub(super) fn resolve(
     source: &RecordSource,
     paths: &[String],
+    projects: &CSharpProjects,
     runs: &ScratchDir<DataError>,
     budget: Budget,
     memory: Option<&mut Vec<(String, usize)>>,
@@ -1283,6 +1285,7 @@ pub(super) fn resolve(
         WriteGuard::new(move || workspace.check_space(bytes).map_err(std::io::Error::other))
     };
     let context = Context {
+        projects,
         source,
         paths,
         answers: Interner::new(),

@@ -69,6 +69,16 @@ pub(crate) struct CheckoutInputs {
     pub(crate) configs: HashMap<Vec<u8>, Arc<[u8]>>,
 }
 
+impl CheckoutInputs {
+    fn csharp_projects(&self) -> crate::callgraph_store::join::dispatch::CSharpProjects {
+        crate::callgraph_store::join::dispatch::CSharpProjects::new(
+            self.state
+                .directory_records(b"")
+                .map(|record| record.path.as_slice()),
+        )
+    }
+}
+
 /// Every parsed file's record key and parse output, by path, in path order.
 ///
 /// Built in memory, every entry holds its parse. Read from a publication,
@@ -1951,8 +1961,14 @@ pub(crate) fn resolve_checkout_into(
         // member name first, with each site's result going to a sorted run
         // (see `key_order`).
         let started = std::time::Instant::now();
-        let (answers, mut results) =
-            key_order::resolve(&source, &paths, spool.dir(), budget, memory.as_deref_mut())?;
+        let (answers, mut results) = key_order::resolve(
+            &source,
+            &paths,
+            &inputs.csharp_projects(),
+            spool.dir(),
+            budget,
+            memory.as_deref_mut(),
+        )?;
         let sites_ms = started.elapsed().as_millis();
         // Assembly reads each file's record once, from disk, in path order;
         // the records the cache kept are let go.
@@ -2760,9 +2776,10 @@ impl MethodCallInputs {
             return Ok(Vec::new());
         }
         let source = SiteSource::new(inputs, resolved, self, guard)?;
+        let projects = inputs.csharp_projects();
         let results = if paths.len() <= SMALL_SITE_RUN {
             source.load_declarers(paths, guard)?;
-            let resolver = Resolver::over(&source);
+            let resolver = Resolver::over(&source).with_csharp_projects(&projects);
             resolve_chunk(inputs, &source, &resolver, paths, guard)
         } else {
             let chunk = paths
@@ -2776,7 +2793,7 @@ impl MethodCallInputs {
                     let _label = carry.enter();
                     // The resolver and its memo are single-threaded caches
                     // over the shared source: one per chunk of files.
-                    let resolver = Resolver::over(&source);
+                    let resolver = Resolver::over(&source).with_csharp_projects(&projects);
                     resolve_chunk(inputs, &source, &resolver, chunk, guard)
                 })
                 .collect::<Result<Vec<_>, _>>()

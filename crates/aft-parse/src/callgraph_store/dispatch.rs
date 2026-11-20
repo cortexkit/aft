@@ -40,7 +40,7 @@ mod static_receiver;
 #[path = "dispatch/typescript.rs"]
 mod typescript;
 pub(super) use static_receiver::STATIC_IMPORT_PREFIX;
-pub use static_receiver::{StaticFacts, StaticSiteEvidence};
+pub use static_receiver::{CSharpProjects, StaticFacts, StaticSiteEvidence};
 test_support_visibility! {
 #[path = "dispatch/view.rs"]
 mod view;
@@ -2138,6 +2138,7 @@ pub struct Resolver<'a> {
     /// When set, every file's facts come from here instead of the maps above,
     /// which stay empty.
     source: Option<&'a (dyn DispatchFiles<'a> + 'a)>,
+    csharp_projects: Option<&'a CSharpProjects>,
     /// Every method of every file, grouped by method name and in file order,
     /// built on first use. An open or interface receiver then checks only the
     /// same-named methods instead of rescanning the whole manifest per site.
@@ -2221,6 +2222,7 @@ impl<'a> Resolver<'a> {
             type_targets: BTreeMap::new(),
             associated_sites,
             source: None,
+            csharp_projects: None,
             methods_by_name: std::cell::OnceCell::new(),
             methods_loaded: Default::default(),
             dependencies: Default::default(),
@@ -2248,6 +2250,7 @@ impl<'a> Resolver<'a> {
             type_targets,
             associated_sites,
             source: None,
+            csharp_projects: None,
             methods_by_name: std::cell::OnceCell::new(),
             methods_loaded: Default::default(),
             dependencies: Default::default(),
@@ -2267,6 +2270,11 @@ impl<'a> Resolver<'a> {
         );
         resolver.source = Some(source);
         resolver
+    }
+
+    pub fn with_csharp_projects(mut self, projects: &'a CSharpProjects) -> Self {
+        self.csharp_projects = Some(projects);
+        self
     }
     /// The import targets, type targets and associated-function sites given
     /// to [`Resolver::with_parts`].
