@@ -353,6 +353,9 @@ impl WatchRegistry {
     /// `task_id`. `at_end` says the stream ends with them: the task finished
     /// and nothing more will be written. Until then a regex match reaching the
     /// end of the bytes is held back; an `at_end` scan of no bytes reports it.
+    /// Each match comes with the number of further matches of the same watch
+    /// in these bytes, which its one notification stands for (always 0 for a
+    /// `once` watch, which ends at its first match).
     pub fn scan_chunk(
         &mut self,
         cursor_key: &str,
@@ -361,7 +364,7 @@ impl WatchRegistry {
         start: u64,
         at_end: bool,
         render: &mut dyn FnMut(&str, usize, usize, u64, u64) -> (String, String),
-    ) -> Vec<PatternMatch> {
+    ) -> Vec<(PatternMatch, u64)> {
         if bytes.is_empty() && !self.held_ends.contains(cursor_key) {
             return Vec::new();
         }
@@ -389,6 +392,9 @@ impl WatchRegistry {
                 )
             },
         )
+        .into_iter()
+        .map(|(found, _)| found)
+        .collect()
     }
 
     fn scan_new_bytes_at(
@@ -399,7 +405,7 @@ impl WatchRegistry {
         base_offset: u64,
         at_end: bool,
         render: &mut dyn FnMut(&str, usize, usize, u64, u64) -> (String, String),
-    ) -> Vec<PatternMatch> {
+    ) -> Vec<(PatternMatch, u64)> {
         let Some(watches) = self.watches.get(task_id).cloned() else {
             return Vec::new();
         };
@@ -424,13 +430,14 @@ impl WatchRegistry {
                 delivery.scan(stream, bytes, base_offset, &watch.pattern);
                 continue;
             }
-            if let Some((text_start, text_end, source_start, source_end)) = find_match(
+            if let Some(((text_start, text_end, source_start, source_end), more)) = find_match(
                 &watch.pattern,
                 &text,
                 &scan_bytes,
                 prefix_len,
                 end_held,
                 at_end,
+                !watch.once,
                 &mut held,
             ) {
                 self.matched_tasks.insert(task_id.to_string());
@@ -448,16 +455,19 @@ impl WatchRegistry {
                     WatchPattern::Substring(needle) => (needle.clone(), true),
                     WatchPattern::Regex(_) => (rendered_match, false),
                 };
-                matches.push(PatternMatch {
-                    watch_id: watch.watch_id.clone(),
-                    task_id: watch.task_id.clone(),
-                    match_text,
-                    match_offset: scan_base_offset.saturating_add(source_start as u64),
-                    context,
-                    once: watch.once,
-                    batch: None,
-                    literal_pattern,
-                });
+                matches.push((
+                    PatternMatch {
+                        watch_id: watch.watch_id.clone(),
+                        task_id: watch.task_id.clone(),
+                        match_text,
+                        match_offset: scan_base_offset.saturating_add(source_start as u64),
+                        context,
+                        once: watch.once,
+                        batch: None,
+                        literal_pattern,
+                    },
+                    more,
+                ));
                 if watch.once {
                     remove_once.push(watch.watch_id);
                 }
@@ -479,13 +489,15 @@ impl WatchRegistry {
 }
 
 /// The first match of `pattern` in `text` (`source` decoded) that ends past
-/// the `prefix_len` overlap bytes an earlier scan already searched.
+/// the `prefix_len` overlap bytes an earlier scan already searched, and, when
+/// `count_more`, how many further matches follow it in `text`.
 ///
 /// A regex match that reaches the end of `text` before the stream ends may
 /// depend on what follows (`$`, `\b`, a greedy repeat such as `\d+`), so it is
 /// held back: `held` is set and the match is skipped. The overlap keeps its
 /// bytes, and the next scan finds it again ending exactly at `prefix_len`,
 /// which `end_held` then admits. A literal is complete once its bytes are in.
+#[allow(clippy::too_many_arguments)]
 fn find_match(
     pattern: &WatchPattern,
     text: &str,
@@ -493,16 +505,30 @@ fn find_match(
     prefix_len: usize,
     end_held: bool,
     at_end: bool,
+    count_more: bool,
     held: &mut bool,
-) -> Option<(usize, usize, usize, usize)> {
+) -> Option<((usize, usize, usize, usize), u64)> {
     let regex = matches!(pattern, WatchPattern::Regex(_));
     let min_source_end_exclusive = if regex && end_held {
         prefix_len.saturating_sub(1)
     } else {
         prefix_len
     };
-    let mut make_match = |start: usize, end: usize| {
-        if regex && !at_end && end == text.len() {
+    let still_written = |end: usize| regex && !at_end && end == text.len();
+    let mut candidates: Box<dyn Iterator<Item = (usize, usize)>> = match pattern {
+        WatchPattern::Substring(needle) if needle.is_empty() => return None,
+        WatchPattern::Substring(needle) => Box::new(
+            text.match_indices(needle.as_str())
+                .map(|(start, matched)| (start, start + matched.len())),
+        ),
+        WatchPattern::Regex(regex) => Box::new(
+            regex
+                .find_iter(text)
+                .map(|found| (found.start(), found.end())),
+        ),
+    };
+    let first = candidates.by_ref().find_map(|(start, end)| {
+        if still_written(end) {
             *held = true;
             return None;
         }
@@ -515,19 +541,22 @@ fn find_match(
                 source_end,
             )
         })
+    })?;
+    // Matches do not overlap, so every later one ends after the first and so
+    // past the overlap. A later regex match still being written is held for
+    // the next scan instead of counted.
+    let more = if count_more {
+        candidates
+            .filter(|&(_, end)| {
+                let written = !still_written(end);
+                *held |= !written;
+                written
+            })
+            .count() as u64
+    } else {
+        0
     };
-    match pattern {
-        WatchPattern::Substring(needle) => {
-            if needle.is_empty() {
-                return None;
-            }
-            text.match_indices(needle)
-                .find_map(|(start, matched)| make_match(start, start + matched.len()))
-        }
-        WatchPattern::Regex(regex) => regex
-            .find_iter(text)
-            .find_map(|matched| make_match(matched.start(), matched.end())),
-    }
+    Some((first, more))
 }
 
 fn source_offset_for_lossy_utf8(source: &[u8], lossy_offset: usize) -> usize {
@@ -813,14 +842,71 @@ mod tests {
         assert!(registry
             .scan_chunk(key, "bash-1", b"boot\nREADY", 0, false, &mut render)
             .is_empty());
-        let hits = registry.scan_chunk(key, "bash-1", b"", 10, true, &mut render);
+        let hits = found(registry.scan_chunk(key, "bash-1", b"", 10, true, &mut render));
         assert_eq!(texts(&hits), vec![("READY".to_string(), 5)]);
         assert!(registry
             .scan_chunk(key, "bash-1", b"", 10, true, &mut render)
             .is_empty());
         // A match ending where a finished stream ends is reported at once.
         let mut registry = regex_watch(r"READY$", false);
-        let hits = registry.scan_chunk(key, "bash-1", b"boot\nREADY", 0, true, &mut render);
+        let hits = found(registry.scan_chunk(key, "bash-1", b"boot\nREADY", 0, true, &mut render));
         assert_eq!(texts(&hits), vec![("READY".to_string(), 5)]);
+    }
+
+    fn found(hits: Vec<(PatternMatch, u64)>) -> Vec<PatternMatch> {
+        hits.into_iter().map(|(hit, _)| hit).collect()
+    }
+
+    fn chunk(registry: &mut WatchRegistry, bytes: &[u8], start: u64) -> Vec<(String, u64)> {
+        let mut render = |text: &str, start: usize, end: usize, _: u64, _: u64| {
+            (text[start..end].to_string(), String::new())
+        };
+        registry
+            .scan_chunk("bash-1:stdout", "bash-1", bytes, start, false, &mut render)
+            .into_iter()
+            .map(|(hit, more)| (hit.match_text, more))
+            .collect()
+    }
+
+    #[test]
+    fn sticky_watch_counts_the_matches_its_notification_stands_for() {
+        let mut registry = WatchRegistry::default();
+        registry
+            .register(
+                "bash-1".into(),
+                WatchPattern::Substring("READY".into()),
+                false,
+            )
+            .unwrap();
+        let three = b"READY 1\nREADY 2\nREADY 3\n";
+        assert_eq!(
+            chunk(&mut registry, three, 0),
+            vec![("READY".to_string(), 2)]
+        );
+        assert_eq!(
+            chunk(&mut registry, b"READY 4\n", three.len() as u64),
+            vec![("READY".to_string(), 0)]
+        );
+        // A once watch ends with its first match; nothing is left unreported.
+        let mut registry = regex_watch(r"READY \d", true);
+        assert_eq!(
+            chunk(&mut registry, three, 0),
+            vec![("READY 1".to_string(), 0)]
+        );
+    }
+
+    #[test]
+    fn sticky_regex_holds_a_later_match_still_being_written() {
+        let mut registry = regex_watch(r"port \d+", false);
+        // The second value may still grow, so it is neither counted nor lost.
+        let first = b"port 80\nport 44";
+        assert_eq!(
+            chunk(&mut registry, first, 0),
+            vec![("port 80".to_string(), 0)]
+        );
+        assert_eq!(
+            chunk(&mut registry, b"3\n", first.len() as u64),
+            vec![("port 443".to_string(), 0)]
+        );
     }
 }
