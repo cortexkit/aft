@@ -113,13 +113,13 @@ impl Sessions {
                 Some((session.clone(), live.segment.as_ref()?.clone()))
             }));
         }
+    }
 
-        #[cfg(any(test, feature = "test-support"))]
-        fn snapshot(&self) -> Snapshot {
-            let mut values = Snapshot::new();
-            self.snapshot_into(&mut values);
-            values
-        }
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn snapshot(&self) -> Snapshot {
+        let mut values = Snapshot::new();
+        self.snapshot_into(&mut values);
+        values
     }
 }
 
