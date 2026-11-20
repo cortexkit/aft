@@ -58,6 +58,8 @@ mod site_records_tests;
 pub(crate) mod slice;
 pub(crate) mod slice_cache;
 pub mod standing;
+#[cfg(test)]
+mod static_receiver_tests;
 pub mod status;
 pub(crate) mod subjects;
 pub mod surfaces;

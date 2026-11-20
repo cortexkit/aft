@@ -156,6 +156,13 @@ fn method_terms(parse: &crate::callgraph_store::join::ParseBlob) -> Vec<(TermKin
     for method in &parse.dispatch.methods {
         terms.push((TermKind::MethodName, method.name.as_bytes().to_vec()));
     }
+    if let Some(facts) = &parse.dispatch.static_facts {
+        terms.extend(
+            facts
+                .type_keys(&parse.language)
+                .map(|key| (TermKind::StaticType, key.into_bytes())),
+        );
+    }
     if parse.language == "go" {
         for method in &parse.dispatch.methods {
             if parse

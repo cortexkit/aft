@@ -35,8 +35,12 @@ pub fn python_reexports(parse: &ParseBlob) -> Vec<(String, Vec<String>)> {
 pub mod projected;
 #[path = "dispatch/smart_pointer.rs"]
 pub(super) mod smart_pointer;
+#[path = "dispatch/static_receiver.rs"]
+mod static_receiver;
 #[path = "dispatch/typescript.rs"]
 mod typescript;
+pub(super) use static_receiver::STATIC_IMPORT_PREFIX;
+pub use static_receiver::{StaticFacts, StaticSiteEvidence};
 test_support_visibility! {
 #[path = "dispatch/view.rs"]
 mod view;
@@ -207,6 +211,8 @@ pub fn typescript_objects_from_data(
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DispatchFacts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_facts: Option<Box<StaticFacts>>,
     /// The package clause distinguishes co-located external test packages.
     /// Older facts omit it; absence must not authorize a concrete binding.
     #[serde(default)]
@@ -1084,6 +1090,7 @@ pub fn extract_with<'tree>(
     } else {
         parse.reference_keys()
     };
+    let mut static_receivers = static_receiver::Index::new(&all, source, parse, &functions, nav);
     for ((position, reference), target) in references.into_iter().zip(targets) {
         let Some(call) = target.map(|i| calls[i]) else {
             if let Some(site) = template_self_site(
@@ -1218,6 +1225,18 @@ pub fn extract_with<'tree>(
                 )
             })
         };
+        if !dynamic && receiver.is_none() {
+            if let (Some(index), Some(written)) = (&mut static_receivers, receiver_node) {
+                index.site(reference.ordinal, written, call, |identifier| {
+                    ts_objects.as_ref().map_or((None, None), |objects| {
+                        (
+                            objects.binding(identifier),
+                            objects.binding_scope(identifier),
+                        )
+                    })
+                });
+            }
+        }
         facts.sites.push(SiteHint {
             ordinal: reference.ordinal,
             caller: if language == "python" {
@@ -1262,6 +1281,7 @@ pub fn extract_with<'tree>(
             dynamic,
         });
     }
+    facts.static_facts = static_receivers.and_then(static_receiver::Index::finish);
     // Computed calls may have no extracted callee name and hence no BlobRef.
     let mut site_ordinals = facts
         .sites
@@ -2083,6 +2103,8 @@ pub trait DispatchFiles<'a> {
     /// Every file with a method named `name`, in path order. May list a few
     /// that have none; the resolver checks each file's facts.
     fn files_with_method(&self, name: &str) -> Vec<String>;
+    /// Files declaring a type at the exact qualified name denoted by `key`.
+    fn files_with_static_type(&self, key: &str) -> Vec<String>;
     /// Every file with facts directly in `directory` (`""` for the root), in
     /// path order.
     fn files_in(&self, directory: &str) -> Vec<String>;
@@ -2265,13 +2287,6 @@ impl<'a> Resolver<'a> {
             Some(source) => source.associated_site(file, ordinal),
             None => self.associated_sites.contains(&(file.to_string(), ordinal)),
         }
-    }
-    /// The language of `file`, a file being resolved.
-    fn caller_language(&self, file: &str) -> String {
-        self.lookup(file)
-            .expect("resolved file has facts")
-            .language
-            .clone()
     }
     /// `path`'s facts without recording a dependency.
     fn lookup(&self, path: &str) -> Option<&'a ParseBlob> {
@@ -2941,6 +2956,37 @@ impl<'a> Resolver<'a> {
     /// not depend on them beyond the language, and [`MemoizedResolver`] shares
     /// that answer across files. Owners treat every file as depending on itself.
     pub fn resolve(&self, file: &str, site: &SiteHint) -> Resolution {
+        self.resolve_static(file, site)
+            .unwrap_or_else(|| self.resolve_nonstatic(file, site))
+    }
+
+    /// Resolve a possible static call and record the facts consulted, even if
+    /// the evidence is insufficient and the caller must use the old fallback.
+    pub fn resolve_static(&self, file: &str, site: &SiteHint) -> Option<Resolution> {
+        if site.dynamic || site.receiver.is_some() {
+            return None;
+        }
+        let parse = self.lookup(file)?;
+        let facts = parse.dispatch.static_facts.as_deref()?;
+        let answer = self.static_call(
+            file,
+            &parse.language,
+            facts,
+            facts.site_key(site.ordinal)?,
+            site.member.as_deref()?,
+        )?;
+        #[cfg(feature = "callgraph-shape-census")]
+        self.census_exit.set(if answer.external == 0 {
+            "exact"
+        } else {
+            "missing_type"
+        });
+        Some(answer)
+    }
+
+    /// Resolve with the existing receiver rules, after checking static
+    /// evidence separately. Unknown answers can then be shared across files.
+    pub fn resolve_nonstatic(&self, file: &str, site: &SiteHint) -> Resolution {
         let parse = self.lookup(file).expect("resolved file has facts");
         if site.dynamic {
             return census_exit!(
@@ -3196,13 +3242,14 @@ struct MemoizedResolution {
 /// What a site's resolution depends on besides the checkout's facts: two
 /// sites with equal keys get the same answer and record the same
 /// dependency keys, wherever they are.
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ResolutionKey {
     /// The caller's language when the site has no receiver; otherwise the
     /// calling file, whose imports and directory the receiver's lookup
     /// reads.
     pub scope: String,
     pub receiver: Option<String>,
+    pub static_receiver: Option<u32>,
     pub member: Option<String>,
     pub dynamic: bool,
     pub associated: bool,
@@ -3214,17 +3261,24 @@ impl Resolver<'_> {
     /// every site with an equal key the same answer, recording the same
     /// dependency keys.
     pub fn resolution_key(&self, file: &str, site: &SiteHint) -> ResolutionKey {
-        let language = self.caller_language(file);
+        let parse = self.lookup(file).expect("resolved file has facts");
+        let language = &parse.language;
+        let static_receiver = parse
+            .dispatch
+            .static_facts
+            .as_deref()
+            .and_then(|facts| facts.site_key(site.ordinal));
         ResolutionKey {
             // An unknown receiver consults only language membership, so callers
             // in different files can reuse the same conservative answer. Typed
             // receiver lookup also depends on the caller's imports and directory.
-            scope: if site.receiver.is_none() {
+            scope: if site.receiver.is_none() && static_receiver.is_none() {
                 language.clone()
             } else {
                 file.to_string()
             },
             receiver: site.receiver.clone(),
+            static_receiver,
             member: site.member.clone(),
             dynamic: site.dynamic,
             associated: language == "rust" && self.associated_site(file, site.ordinal),
@@ -3252,6 +3306,15 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
 
     pub fn resolve(&self, file: &str, site: &SiteHint) -> std::sync::Arc<Resolution> {
         let key = self.resolver.resolution_key(file, site);
+        self.resolve_key(file, site, key)
+    }
+
+    fn resolve_key(
+        &self,
+        file: &str,
+        site: &SiteHint,
+        key: ResolutionKey,
+    ) -> std::sync::Arc<Resolution> {
         if let Some(answer) = self.resolved.borrow().get(&key) {
             self.resolver
                 .dependencies
@@ -3263,7 +3326,23 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
             return answer.resolved.clone();
         }
         let outer = self.resolver.take_dependencies();
-        let resolved = std::sync::Arc::new(self.resolver.resolve(file, site));
+        let resolved = if key.static_receiver.is_some() {
+            if let Some(answer) = self.resolver.resolve_static(file, site) {
+                std::sync::Arc::new(answer)
+            } else {
+                let mut fallback = key.clone();
+                fallback.static_receiver = None;
+                fallback.scope = self
+                    .resolver
+                    .lookup(file)
+                    .expect("resolved file has facts")
+                    .language
+                    .clone();
+                self.resolve_key(file, site, fallback)
+            }
+        } else {
+            std::sync::Arc::new(self.resolver.resolve_nonstatic(file, site))
+        };
         let dependencies = self.resolver.take_dependencies();
         {
             let mut recorded = self.resolver.dependencies.borrow_mut();
@@ -3288,6 +3367,7 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
 }
 
 aft_store::heap_bytes_of_fields!(DispatchFacts {
+    static_facts,
     go_package,
     types,
     methods,

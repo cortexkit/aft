@@ -141,6 +141,29 @@ fn update_checked(
     super::incremental::UpdateStats,
     BTreeMap<String, super::callgraph::FileResolution>,
 ) {
+    update_checked_inner(before, after, changed, false)
+}
+
+pub(super) fn update_checked_bytes(
+    before: CheckoutInputs,
+    after: CheckoutInputs,
+    changed: &[&str],
+) -> (
+    super::incremental::UpdateStats,
+    BTreeMap<String, super::callgraph::FileResolution>,
+) {
+    update_checked_inner(before, after, changed, true)
+}
+
+fn update_checked_inner(
+    before: CheckoutInputs,
+    after: CheckoutInputs,
+    changed: &[&str],
+    compare_bytes: bool,
+) -> (
+    super::incremental::UpdateStats,
+    BTreeMap<String, super::callgraph::FileResolution>,
+) {
     let mut live = LiveCheckout::cold(before).unwrap();
     let changed = changed
         .iter()
@@ -166,6 +189,13 @@ fn update_checked(
             ours.site_dependencies, theirs.site_dependencies,
             "{path}: site dependencies"
         );
+        if compare_bytes {
+            assert_eq!(
+                super::fragment::encode(&ours),
+                super::fragment::encode(theirs),
+                "{path}: stored fragment"
+            );
+        }
     }
     (stats, cold)
 }

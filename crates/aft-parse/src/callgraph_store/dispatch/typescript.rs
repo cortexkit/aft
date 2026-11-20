@@ -640,7 +640,7 @@ impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
         facts.returns.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     }
 
-    fn binding(&self, identifier: Node<'tree>) -> Option<Node<'tree>> {
+    pub(super) fn binding(&self, identifier: Node<'tree>) -> Option<Node<'tree>> {
         let name = text(identifier, self.source);
         let start = *self.identifier_scopes.get(&identifier.id())?;
         if let Some(selected) = self.selected_bindings.borrow().get(&(start, name)) {
@@ -659,6 +659,19 @@ impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
             .borrow_mut()
             .insert((start, name), selected);
         selected
+    }
+
+    /// The nearest scope that binds this identifier, including an ambiguous
+    /// binding such as a class merged with a namespace.
+    pub(super) fn binding_scope(&self, identifier: Node<'tree>) -> Option<usize> {
+        let name = text(identifier, self.source);
+        let mut scope = *self.identifier_scopes.get(&identifier.id())?;
+        loop {
+            if self.bindings.contains_key(&(scope, name)) {
+                return Some(scope);
+            }
+            scope = self.scope_parents.get(&scope).copied().flatten()?;
+        }
     }
 
     fn written(&self, binding: Node<'tree>, name: &str) -> bool {

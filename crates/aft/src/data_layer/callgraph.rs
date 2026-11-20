@@ -2530,6 +2530,7 @@ pub(crate) struct MethodCallInputs {
     methods: HashMap<String, BTreeSet<String>>,
     /// Method name to the Go files of `own` whose interfaces require it.
     go_required: HashMap<String, BTreeSet<String>>,
+    static_types: HashMap<String, BTreeSet<String>>,
     /// Every file whose method-call inputs the resolver computed itself, on
     /// its own thread, the first time it read the file.
     computed_while_resolving: FirstReads,
@@ -2634,6 +2635,14 @@ impl MethodCallInputs {
     /// Files `path` in memory as declaring `file`'s methods.
     fn file(&mut self, path: &str, file: &SiteFile) {
         self.own.insert(path.to_string());
+        if let Some(facts) = &file.parse.dispatch.static_facts {
+            for key in facts.type_keys(&file.parse.language) {
+                self.static_types
+                    .entry(key)
+                    .or_default()
+                    .insert(path.to_string());
+            }
+        }
         for name in file.method_names() {
             self.methods
                 .entry(name.to_string())
@@ -2649,6 +2658,13 @@ impl MethodCallInputs {
     }
 
     fn unfile(&mut self, path: &str, file: &SiteFile) {
+        if let Some(facts) = &file.parse.dispatch.static_facts {
+            for key in facts.type_keys(&file.parse.language) {
+                if let Some(files) = self.static_types.get_mut(&key) {
+                    files.remove(path);
+                }
+            }
+        }
         for name in file.method_names() {
             if let Some(files) = self.methods.get_mut(name) {
                 files.remove(path);
@@ -2955,6 +2971,14 @@ impl<'a, 's: 'a> DispatchFiles<'a> for SiteSource<'s> {
     fn files_with_method(&self, name: &str) -> Vec<String> {
         let mut files = self.stored_files(aft_store::graph::TermKind::MethodName, name);
         if let Some(own) = self.calls.methods.get(name) {
+            files.extend(own.iter().cloned());
+        }
+        files.into_iter().collect()
+    }
+
+    fn files_with_static_type(&self, key: &str) -> Vec<String> {
+        let mut files = self.stored_files(aft_store::graph::TermKind::StaticType, key);
+        if let Some(own) = self.calls.static_types.get(key) {
             files.extend(own.iter().cloned());
         }
         files.into_iter().collect()
@@ -3339,6 +3363,7 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
     own,
     methods,
     go_required,
+    static_types,
     computed_while_resolving,
 });
 #[cfg(not(feature = "callgraph-shape-census"))]
@@ -3348,5 +3373,6 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
     own,
     methods,
     go_required,
+    static_types,
     computed_while_resolving,
 });

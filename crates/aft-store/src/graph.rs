@@ -141,10 +141,12 @@ pub enum TermKind {
     MethodName,
     /// The name of a method a Go interface of the file requires.
     GoRequired,
+    /// The qualified name of a possible static receiver type.
+    StaticType,
 }
 
 impl TermKind {
-    const ALL: [Self; 11] = [
+    const ALL: [Self; 12] = [
         Self::CallTarget,
         Self::ReferenceName,
         Self::SymbolName,
@@ -156,6 +158,7 @@ impl TermKind {
         Self::FactSubject,
         Self::MethodName,
         Self::GoRequired,
+        Self::StaticType,
     ];
 
     const fn key_space(self) -> KeySpace {
@@ -171,6 +174,7 @@ impl TermKind {
             Self::FactSubject => 9,
             Self::MethodName => 10,
             Self::GoRequired => 11,
+            Self::StaticType => 12,
         })
     }
 }
@@ -405,18 +409,14 @@ pub fn write_folded(
         let postings = sources
             .iter()
             .zip(&renumbered)
-            .map(|(source, renumbered)| {
-                let (_, lookup, postings) = source
-                    .terms
-                    .iter()
-                    .find(|(each, ..)| *each == kind)
-                    .expect("every term kind has its sections");
-                crate::fold::PostingSource {
+            .filter_map(|(source, renumbered)| {
+                let (_, lookup, postings) = source.terms.iter().find(|(each, ..)| *each == kind)?;
+                Some(crate::fold::PostingSource {
                     segment: source.segment,
                     lookup: LookupTable::reopen(source.segment, lookup.section()),
                     postings: *postings,
                     renumbered,
-                }
+                })
             })
             .collect::<Vec<_>>();
         crate::fold::write_postings(
@@ -455,11 +455,19 @@ impl<'s> GraphSegment<'s> {
             section(DATA, UNIT_KEY_SPACE),
             section(INDEX, UNIT_KEY_SPACE),
         ];
-        for kind in TermKind::ALL {
+        for kind in TermKind::ALL
+            .into_iter()
+            .filter(|kind| *kind != TermKind::StaticType)
+        {
             handles.push(section(TERM_LOOKUP, kind.key_space()));
             handles.push(section(TERM_POSTINGS, kind.key_space()));
         }
-        if handles.iter().all(Option::is_none) {
+        let static_space = TermKind::StaticType.key_space();
+        let static_pair = (
+            section(TERM_LOOKUP, static_space),
+            section(TERM_POSTINGS, static_space),
+        );
+        if handles.iter().all(Option::is_none) && static_pair == (None, None) {
             return Ok(None);
         }
         let Some(handles) = handles.into_iter().collect::<Option<Vec<_>>>() else {
@@ -476,6 +484,21 @@ impl<'s> GraphSegment<'s> {
         let (pairs, _) = handles[3..].as_chunks::<2>();
         for (kind, [lookup, postings]) in TermKind::ALL.into_iter().zip(pairs) {
             terms.push((kind, LookupTable::open(segment, *lookup)?, *postings));
+        }
+        match static_pair {
+            (Some(lookup), Some(postings)) => terms.push((
+                TermKind::StaticType,
+                LookupTable::open(segment, lookup)?,
+                postings,
+            )),
+            // Existing graph segments can still be opened while the checkout rebuilds.
+            (None, None) => {}
+            _ => {
+                return Err(malformed(
+                    segment,
+                    "a segment has only one static type section",
+                ));
+            }
         }
         let slices = match (
             section(SLICE_DATA, UNIT_KEY_SPACE),
@@ -576,11 +599,9 @@ impl<'s> GraphSegment<'s> {
     ///
     /// When a read fails or a posting block is malformed.
     pub fn candidates(&self, kind: TermKind, term: &[u8]) -> Result<Vec<u32>, SegmentError> {
-        let (_, lookup, postings) = self
-            .terms
-            .iter()
-            .find(|(each, ..)| *each == kind)
-            .expect("every term kind has its sections");
+        let Some((_, lookup, postings)) = self.terms.iter().find(|(each, ..)| *each == kind) else {
+            return Ok(Vec::new());
+        };
         let Some(list) = lookup.get(term_hash(term))? else {
             return Ok(Vec::new());
         };

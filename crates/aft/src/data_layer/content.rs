@@ -583,6 +583,11 @@ pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
                         .collect(),
                     outline: None,
                     dead_code: None,
+                    static_dispatch: parse
+                        .dispatch
+                        .static_facts
+                        .as_deref()
+                        .map(|facts| facts.encode()),
                 }),
             },
             todos: None,
@@ -615,6 +620,15 @@ pub fn blob_from_record(record: &ContentRecord) -> Result<CallgraphBlob, Manifes
         RecordBody::Parsed { surface, body } => CallgraphBlob::Parse(ParseBlob {
             entry_point_symbols: surface.entry_point_symbols.clone(),
             dispatch: DispatchFacts {
+                static_facts: body
+                    .static_dispatch
+                    .as_deref()
+                    .map(|bytes| {
+                        crate::callgraph_store::join::dispatch::StaticFacts::decode(bytes)
+                            .map(Box::new)
+                            .map_err(|error| ManifestJoinError::InvalidBlob(error.to_string()))
+                    })
+                    .transpose()?,
                 go_package: surface.go_package.clone(),
                 types: surface
                     .types
