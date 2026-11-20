@@ -1274,7 +1274,7 @@ impl SecretValues {
         self.0.is_empty()
     }
     /// Whether a value contains a newline, so it can cross a cut made at one.
-    pub(crate) fn has_multiline_value(&self) -> bool {
+    pub fn has_multiline_value(&self) -> bool {
         self.0.iter().any(|value| value.contains('\n'))
     }
 
@@ -1489,7 +1489,7 @@ static SECRET_JSON_LABEL_AT_END: LazyLock<Regex> =
 /// Whether `text` ends after a JSON secret field's label (and possibly its
 /// colon) but before the opening quote of its value. The value, and so the
 /// [`SECRET_JSON_FIELD`] match, would start past the end of `text`.
-pub(crate) fn json_secret_label_open_at_end(text: &str) -> bool {
+pub fn json_secret_label_open_at_end(text: &str) -> bool {
     text.contains('"') && SECRET_JSON_LABEL_AT_END.is_match(text)
 }
 

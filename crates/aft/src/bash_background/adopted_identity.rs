@@ -3,7 +3,8 @@
 //! that command, so a recorded pid can be reused once the command exits.
 
 use super::*;
-use crate::bash_background::process::{recorded_process_liveness, ProcessLiveness};
+use crate::bash_background::process::recorded_process_liveness;
+use crate::process_identity::ProcessLiveness;
 
 /// Whether the task's recorded child is gone: not running, or running with a
 /// start time after the task began, so the pid now names another process.
