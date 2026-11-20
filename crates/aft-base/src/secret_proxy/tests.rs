@@ -655,6 +655,17 @@ fn client_child() {
                     let socket: &mut tokio_rustls::client::TlsStream<TcpStream> = raw_sockets.last_mut().ok_or(())?;
                     socket.write_all(value["wire"].as_str().ok_or(())?.as_bytes()).await.map_err(|_| ())?;
                     let mut response = Vec::new(); socket.read_to_end(&mut response).await.map_err(|_| ())?;
+                    if let Some(length) = value["tail_bytes"].as_u64() {
+                        if length < 2 { return Err(()); }
+                        let mut tail = vec![b'x'; length as usize];
+                        let end = tail.len();
+                        tail[end - 2..].copy_from_slice(b"\"}");
+                        let tail_error = async {
+                            socket.write_all(&tail).await?;
+                            socket.shutdown().await
+                        }.await.err().map(|error| error.to_string());
+                        return Ok(json!({"wire":String::from_utf8_lossy(&response), "tail_error":tail_error}));
+                    }
                     return Ok(json!({"wire":String::from_utf8_lossy(&response)}));
                 }
                 if value["op"] == "idle" {
@@ -1099,6 +1110,47 @@ async fn proxy_refuses_a_json_only_placeholder_in_the_first_mib_before_sending_l
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("reason=location_mismatch "), "{lines:?}");
     // This origin records request headers without waiting for the body.
+    assert!(server.seen.lock().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_refuses_a_json_only_placeholder_and_half_closes_before_draining_upload() {
+    let server = Server::new("raw-transfer-h1").await;
+    let vault = Vault::new();
+    let proxy = SecretProxy::start_with_tls(
+        config(
+            vault,
+            server.address.port(),
+            &[("json", Location::Json("/key".into()))],
+        ),
+        server.client_tls.clone(),
+    )
+    .unwrap();
+    let mut client = Client::spawn(&proxy, &server);
+    proxy.arm_command(client.process.id()).unwrap();
+    assert_eq!(
+        client.command(json!({"op":"connect", "raw":true}))["ok"],
+        true
+    );
+    let total = 3 * 1024 * 1024;
+    let prefix = padded_json(
+        1024 * 1024 + 1,
+        r#"{"key":"{{ck-secret:json}}","padding":""#,
+        "",
+    );
+    let authority = format!("localhost:{}", server.address.port());
+    // The client holds the tail until it can read the refusal and the server's
+    // TLS close-notify. A full socket close would reset the remaining writes.
+    let reply = client.command(json!({
+        "op":"raw",
+        "wire":format!("PUT /approved HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\nContent-Length: {total}\r\n\r\n{prefix}"),
+        "tail_bytes":total - prefix.len(),
+    }));
+    let wire = reply["wire"].as_str().unwrap_or_default();
+    assert!(wire.starts_with("HTTP/1.1 403 "), "{reply}");
+    assert!(reply["tail_error"].is_null(), "{reply}");
+    assert!(wire.contains("AFT's secret proxy refused the request: json (localhost). The placeholder is not in a place where this secret may go."), "{reply}");
+    assert!(wire.contains("\r\nconnection: close\r\n"), "{reply}");
     assert!(server.seen.lock().is_empty());
 }
 

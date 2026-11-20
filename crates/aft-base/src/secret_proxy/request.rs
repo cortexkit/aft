@@ -1,10 +1,10 @@
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures_util::StreamExt;
 use http_body_util::{BodyExt, BodyStream, StreamBody};
-use hyper::body::{Frame, Incoming};
+use hyper::body::{Body as _, Frame, Incoming};
 use hyper::{Request, Response, Version};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use secret_rules::location::{
@@ -23,6 +23,7 @@ pub(super) async fn forward(
     request: Request<Incoming>,
     authority: ConnectAuthority,
     state: Arc<State>,
+    refused_upload: Arc<AtomicBool>,
 ) -> Result<Response<Body>, std::convert::Infallible> {
     let mut audit = super::audit::RequestAudit::new(&state, &authority, &request);
     let lease = state
@@ -35,6 +36,8 @@ pub(super) async fn forward(
         .headers()
         .get("upgrade")
         .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"));
+    let http1 = matches!(request.version(), Version::HTTP_10 | Version::HTTP_11);
+    let mut unread_body = !request.body().is_end_stream();
     let fallback = state
         .config
         .scanned_labels
@@ -42,7 +45,15 @@ pub(super) async fn forward(
         .map(String::as_str)
         .unwrap_or("");
     let result = if let Some(lease) = &lease {
-        prepare_and_send(request, &authority, &state, lease.clone(), &mut audit).await
+        prepare_and_send(
+            request,
+            &authority,
+            &state,
+            lease.clone(),
+            &mut audit,
+            &mut unread_body,
+        )
+        .await
     } else {
         Err(Refusal::new(Reason::RequestLimit))
     };
@@ -72,7 +83,8 @@ pub(super) async fn forward(
             audit.refused_for(&error.label);
         }
     }
-    let response = result.unwrap_or_else(|error| {
+    let close_upload = http1 && unread_body && diagnostic.is_some();
+    let mut response = result.unwrap_or_else(|error| {
         let label = if error.label.is_empty() {
             fallback
         } else {
@@ -90,6 +102,13 @@ pub(super) async fn forward(
         }
         response
     });
+    if close_upload {
+        refused_upload.store(true, Ordering::Release);
+        response.headers_mut().insert(
+            "connection",
+            hyper::header::HeaderValue::from_static("close"),
+        );
+    }
     let (parts, body) = response.into_parts();
     Ok(Response::from_parts(
         parts,
@@ -107,6 +126,7 @@ async fn prepare_and_send(
     state: &Arc<State>,
     lease: Arc<tokio::sync::OwnedSemaphorePermit>,
     audit: &mut super::audit::RequestAudit<'_>,
+    unread_body: &mut bool,
 ) -> Result<Response<Body>, Refusal> {
     let fail = || Refusal::new(Reason::InvalidRequest);
     if state.stopped.load(Ordering::Acquire) {
@@ -191,6 +211,7 @@ async fn prepare_and_send(
     } else {
         (body_buffer(false), None)
     };
+    *unread_body = !incoming.is_end_stream();
     let opaque_body = opaque_body || overflow.is_some();
     let has_json = inspect_json && !opaque_body;
     let location_body = (!opaque_body).then_some(body.as_slice());
