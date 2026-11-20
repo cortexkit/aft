@@ -15270,19 +15270,11 @@ impl BgTaskRegistry {
 
         // Push-frame queue dedupe stays per-task to prevent duplicate
         // user-visible completion notifications.
-        let pushed = if let Ok(mut completions) = self.inner.completions.lock() {
-            if completions
-                .iter()
-                .any(|existing| existing.task_id == metadata.task_id)
-            {
-                false
-            } else {
-                completions.push_back(completion.clone());
-                true
-            }
-        } else {
-            false
-        };
+        let pushed = self
+            .inner
+            .completions
+            .lock()
+            .is_ok_and(|mut queue| completion_queue::push(&mut queue, completion.clone()));
 
         drop(ack_state);
         if pushed && emit_frame {
@@ -18579,6 +18571,9 @@ mod pty_replay;
 
 #[path = "adopted_identity.rs"]
 mod adopted_identity;
+
+#[path = "completion_queue.rs"]
+mod completion_queue;
 
 fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     let warning = metadata
