@@ -503,6 +503,7 @@ where
             let routed_now = routed
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .keys
                 .clone();
             // A reopened watch can report a retired owner's stale scope as
             // live. Keep describing held scopes even after watch coverage resumes.
