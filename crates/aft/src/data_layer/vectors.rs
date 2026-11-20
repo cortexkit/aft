@@ -1932,7 +1932,7 @@ impl VectorPlane {
                 due
             }
         };
-        unix_ms() >= due
+        merge_now_ms() >= due
     }
 
     /// Publishes `builder` as one new segment, in a generation that
@@ -2033,6 +2033,14 @@ fn vector_only(segment: &Segment) -> bool {
     })
 }
 
+fn merge_now_ms() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = MERGE_NOW_MS.with(std::cell::Cell::get) {
+        return now;
+    }
+    unix_ms()
+}
+
 /// Merges vector segments of `model` into one new segment, when the
 /// newest generation holds more than `limits.merge_at` of them.
 ///
@@ -2097,7 +2105,7 @@ pub(crate) fn merge_vector_segments(
     if ours.len() <= limits.merge_at {
         return Ok(None);
     }
-    let now = unix_ms();
+    let now = merge_now_ms();
     let eligible = ours
         .iter()
         .copied()
@@ -2254,6 +2262,7 @@ pub(crate) fn merge_vector_segments(
 #[cfg(test)]
 thread_local! {
     static MERGE_WRITER_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static MERGE_NOW_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 /// Which of `segments` (one generation's, in manifest order) hold vector
@@ -3047,6 +3056,84 @@ mod tests {
             .iter()
             .map(|query| rows(&plane.search(&view, query, 10, &|_| true).unwrap().results))
             .collect()
+    }
+
+    #[test]
+    fn a_fill_round_waits_for_the_second_eligible_vector_segment() {
+        let store = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        extra_file(root.path(), 0, "value + 1");
+        extra_file(root.path(), 1, "value + 2");
+        let checkout = bind(store.path(), root.path());
+        let mut plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        plane.merge.merge_at = 1;
+        let grace = plane.merge.grace_ms();
+        let round = || {
+            plane
+                .fill_rounds(
+                    &mut |texts| Recorder::default().embed(texts),
+                    FillBudget {
+                        max_batch: 5,
+                        files_per_round: 1,
+                    },
+                    1,
+                    &mut |_| {},
+                )
+                .unwrap()
+        };
+        assert_eq!(round().segments_published, 1);
+        let first = plane.load().unwrap();
+        assert_eq!(first.open.len(), 1);
+        let first_created = first.open.values().next().unwrap().created_unix_ms();
+        drop(first);
+
+        // Write the second segment on a different millisecond. Only the
+        // eligibility clock advances by the grace period, not the disk clock.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unix_ms() <= first_created {
+            assert!(Instant::now() < deadline, "segment clock did not advance");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let now = first_created + grace;
+        MERGE_NOW_MS.with(|clock| clock.set(Some(now)));
+        MERGE_WRITER_ATTEMPTS.with(|attempts| attempts.set(0));
+        let young = round();
+        assert_eq!(young.segments_published, 1);
+        assert_eq!(young.merges, 0);
+        assert_eq!(MERGE_WRITER_ATTEMPTS.with(std::cell::Cell::get), 0);
+        let loaded = plane.load().unwrap();
+        assert_eq!(loaded.open.len(), 2);
+        assert_eq!(
+            loaded
+                .open
+                .values()
+                .filter(|segment| now.saturating_sub(segment.created_unix_ms()) >= grace)
+                .count(),
+            1,
+        );
+        let due = loaded
+            .open
+            .values()
+            .map(|segment| segment.created_unix_ms())
+            .max()
+            .unwrap()
+            + grace;
+        drop(loaded);
+
+        // The next fill sees that the second segment is old enough even
+        // though no other writer has published a new manifest.
+        MERGE_NOW_MS.with(|clock| clock.set(Some(due)));
+        let aged = round();
+        MERGE_NOW_MS.with(|clock| clock.set(None));
+        assert_eq!(MERGE_WRITER_ATTEMPTS.with(std::cell::Cell::get), 1);
+        assert_eq!(aged.segments_published, 0);
+        assert_eq!(aged.merges, 1);
+        assert_eq!(aged.merged_segments, 2);
+        assert_eq!(vector_segment_count(&checkout), 1);
+        assert!(plane
+            .coverage(&checkout.view().unwrap())
+            .unwrap()
+            .complete());
     }
 
     /// Merging vector segments keeps exactly what a reader reaches in them:
