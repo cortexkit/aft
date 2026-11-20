@@ -40,11 +40,11 @@ tokio::task_local! {
     static TEST_REGISTRY: Arc<dyn Fn() -> EnumerateReply + Send + Sync>;
 }
 
+const REMOTE_CALL_NOT_ADMITTED_MESSAGE: &str =
+    "This computer's AFT can't take calls from other computers.";
+
 fn admission_refusal() -> ErrorBody {
-    ErrorBody::new(
-        "remote_call_not_admitted",
-        "This computer's AFT can't take calls from other computers.",
-    )
+    ErrorBody::new("remote_call_not_admitted", REMOTE_CALL_NOT_ADMITTED_MESSAGE)
 }
 
 fn not_registered() -> ErrorBody {
@@ -96,6 +96,10 @@ pub(super) fn classify_tool_bind(
                 crate::harness::BAD_FED_FINGERPRINT,
             ));
         }
+    } else if harness.starts_with("fed-") {
+        // Peer-class labels are not tool-provider fingerprints. Paired phones
+        // and apps use management routes to view shells, not tool routes.
+        return Err(admission_refusal());
     } else if remote {
         return Err(project_folder_refusal(
             "invalid_workdir",

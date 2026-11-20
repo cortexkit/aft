@@ -1551,6 +1551,7 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
         (43, "fed-computer:person", false),
         (44, "fed-unknown:person", false),
         (45, "callosum-self", false),
+        (48, "fed-app:person", true),
     ] {
         let ack = request(
             &mut daemon,
@@ -1678,6 +1679,51 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
     write(&mut daemon, FrameType::Cancel, 41, 3, json!({})).await;
     assert_eq!(
         receive(&mut daemon, 41, 3).await.header.ty,
+        FrameType::StreamEnd
+    );
+    for channel in [41, 48] {
+        let output = request(
+            &mut daemon,
+            channel,
+            5,
+            json!({"method":"shells.output","params":{"task_id":"bash-0123456789abcdef"}}),
+        )
+        .await;
+        // This fixture has no shell. The service must reach the lookup, not
+        // reject the operator at the route or method gate.
+        assert_eq!(output.header.ty, FrameType::Error);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&output.body).unwrap()["code"],
+            "shell_not_found"
+        );
+    }
+    let app_list = request(
+        &mut daemon,
+        48,
+        6,
+        json!({"method":"shells.list","params":{}}),
+    )
+    .await;
+    assert_eq!(app_list.header.ty, FrameType::Response);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&app_list.body).unwrap()["result"]["rows"],
+        json!([])
+    );
+    let app_watch = request(
+        &mut daemon,
+        48,
+        7,
+        json!({"method":"shells.watch","params":{}}),
+    )
+    .await;
+    assert_eq!(app_watch.header.ty, FrameType::StreamData);
+    assert_eq!(
+        serde_json::from_slice::<Value>(&app_watch.body).unwrap()["type"],
+        "resync"
+    );
+    write(&mut daemon, FrameType::Cancel, 48, 7, json!({})).await;
+    assert_eq!(
+        receive(&mut daemon, 48, 7).await.header.ty,
         FrameType::StreamEnd
     );
     let initial = request(
