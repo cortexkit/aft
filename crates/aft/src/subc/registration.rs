@@ -16,12 +16,11 @@ use super::readiness::{ControlError, DaemonControl};
 use super::{SubcError, AUTH_DEADLINE};
 
 use aft_base::registration::claim_cause;
-pub(crate) use aft_base::registration::{
-    connect_consumer, count_live, identity_ready, log_claim_connect_failure, module_consumer_allowed,
-    module_id, track_consumer,
-};
 #[cfg(test)]
 pub(crate) use aft_base::registration::live_consumers;
+pub(crate) use aft_base::registration::{
+    connect_consumer, count_live, identity_ready, module_consumer_allowed, module_id,
+};
 
 const MINT_BUDGET: Duration = Duration::from_secs(5);
 

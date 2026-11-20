@@ -161,6 +161,7 @@ impl RequestSecrets {
             local_approval_cancel: None,
         }
     }
+    }
 
     pub(crate) fn with_local_approval_cancel(
         mut self,

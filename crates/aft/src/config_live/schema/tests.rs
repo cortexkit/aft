@@ -18,7 +18,7 @@ fn user_fixture(value: Value) -> crate::config_resolve::ConfigTier {
 fn config_settings_editor_output_is_unchanged() {
     let mut bytes = serde_json::to_vec_pretty(&editor_schema()).unwrap();
     bytes.push(b'\n');
-    assert!(bytes == include_bytes!("../../../../assets/aft.schema.json"));
+    assert!(bytes == include_bytes!("../../../../../assets/aft.schema.json"));
 }
 
 fn annotations(node: &Value, path: &str, found: &mut BTreeSet<(String, String)>) {
@@ -285,13 +285,13 @@ fn config_settings_shell_provider_keeps_its_existing_file_shapes() {
     }
     for text in [
         include_str!(
-            "../../tests/fixtures/config_parity/shell_env_provider_user_opencode/user.jsonc"
+            "../../../tests/fixtures/config_parity/shell_env_provider_user_opencode/user.jsonc"
         ),
         include_str!(
-            "../../tests/fixtures/config_parity/shell_env_provider_custom_opencode/user.jsonc"
+            "../../../tests/fixtures/config_parity/shell_env_provider_custom_opencode/user.jsonc"
         ),
         include_str!(
-            "../../tests/fixtures/config_parity/shell_env_provider_harness_watch_pi/user.jsonc"
+            "../../../tests/fixtures/config_parity/shell_env_provider_harness_watch_pi/user.jsonc"
         ),
     ] {
         let value: Value = serde_json::from_str(text).unwrap();

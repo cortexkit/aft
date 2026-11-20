@@ -24,6 +24,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod schema;
+
 use crate::watcher_filter::config_events::is_config_file_name;
 pub use crate::watcher_filter::config_events::{
     is_project_config_event_path, ConfigReloadSignal, CONFIG_RELOAD_DEBOUNCE,

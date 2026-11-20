@@ -5,7 +5,7 @@ use serde::de::DeserializeOwned;
 fn settings_declaration_leaves_a_missing_synapse_model_for_review_to_refuse() {
     use ::subc_config::{Layer, LayerValue, Schema, ValidationContext};
 
-    let schema = Schema::new(crate::config_schema::settings_declaration()).unwrap();
+    let schema = Schema::new(crate::config_live::schema::settings_declaration()).unwrap();
     let tuple = schema
         .review_tuple(
             &[LayerValue::new(

@@ -808,7 +808,12 @@ async fn two_labels_file_concurrently_and_share_one_absolute_deadline() {
     let mut second = record("header:x-second");
     second.name = "second".into();
     second.key = K2.to_vec();
-    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
+    let vault_expiry = crate::secret::vault::now_ms() + 540_000;
+    {
+        let mut state = daemon.state.lock().unwrap();
+        state.records = vec![record("authorization_bearer"), second];
+        state.pending_expires_at_ms = Some(vault_expiry);
+    }
     let phone = PhoneGuard::install();
     let clock = Clock::new();
     let server = Server::new("echo-request").await;
@@ -1055,12 +1060,7 @@ async fn approval_log_concurrent_decline_and_deadline_have_distinct_ids() {
     let mut second = record("header:x-second");
     second.name = "second".into();
     second.key = K2.to_vec();
-    let vault_expiry = crate::secret::vault::now_ms() + 540_000;
-    {
-        let mut state = daemon.state.lock().unwrap();
-        state.records = vec![record("authorization_bearer"), second];
-        state.pending_expires_at_ms = Some(vault_expiry);
-    }
+    daemon.state.lock().unwrap().records = vec![record("authorization_bearer"), second];
     let phone = PhoneGuard::install();
     let clock = Clock::new();
     let server = Server::new("echo-request").await;

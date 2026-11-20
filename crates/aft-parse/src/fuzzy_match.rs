@@ -255,7 +255,7 @@ fn append_diagnostic_line(
 
 /// `line` as is when it has at most [`NEAREST_MISS_LINE_CHARS`] characters,
 /// otherwise its first and last halves of that many characters around `…`.
-pub(crate) fn shorten_diagnostic_line(line: &str) -> String {
+pub fn shorten_diagnostic_line(line: &str) -> String {
     let count = line.chars().count();
     if count <= NEAREST_MISS_LINE_CHARS {
         return line.to_string();

@@ -46,9 +46,9 @@ impl BgTaskRegistry {
             .then(|| buffer.read_complete_for_notice())
             .flatten()
             .and_then(|(stdout, stderr)| Some((mask(&stdout)?, mask(&stderr)?)));
-        let tail = streams.as_ref().and_then(|(stdout, stderr)| {
-            bash_tail(metadata, stdout, stderr, &mask)
-        });
+        let tail = streams
+            .as_ref()
+            .and_then(|(stdout, stderr)| bash_tail(metadata, stdout, stderr, &mask));
         let mut bodies = bash_bodies(metadata, Some(bytes), streams);
         bodies.tail = tail;
         if let Some(refusal) = (!metadata.local_fallback_started)

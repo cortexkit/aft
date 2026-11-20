@@ -3020,7 +3020,7 @@ fn apply_allow(
             // The database key uses the policy's canonical path spelling.
             // Leave relative paths invalid, as on the ordinary insert path.
             if saved.path.is_absolute() {
-                saved.path = crate::access_policy::policy_path(&saved.path);
+                saved.path = crate::policy_path::policy_path(&saved.path);
             }
             saved
         });

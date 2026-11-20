@@ -9,11 +9,11 @@ use super::{
     outbox::{self, Identity, Outbox},
     records,
 };
+use crate::bash_background::frames::BashBodies;
 use cortexkit_role_tool_display::{
     schema::{validate_completion, validate_record},
     DisplayKind,
 };
-use crate::bash_background::frames::BashBodies;
 use serde_json::{json, Value};
 use subc_protocol::Principal;
 

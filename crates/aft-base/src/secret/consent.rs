@@ -442,7 +442,7 @@ impl Drop for Waiter<'_> {
 }
 
 fn scope_inventory_changed() {
-    crate::subc::scope_watch::changed(crate::subc::scope_watch::Source::Parked);
+    crate::scope_watch_events::changed(crate::scope_watch_events::Source::Parked);
 }
 
 async fn run_card(
@@ -482,10 +482,10 @@ async fn run_card(
     }
 }
 
-/// Every HTTP request joins the same recorded card outcome without locking
-/// another request's vault lookup or charging it another waiter's queue time.
 #[rustfmt::skip]
 test_support_visibility! {
+/// Every HTTP request joins the same recorded card outcome without locking
+/// another request's vault lookup or charging it another waiter's queue time.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn wait_consent(request: SecretConsentRequest) -> ConsentOutcome {
     wait_consent_with_code(request, None).await.0
