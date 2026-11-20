@@ -121,6 +121,7 @@ pub(super) async fn process_route_bind_completion(
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+    delivery: &Arc<RouteDeliverySessions>,
 ) -> Result<(), SubcError> {
     decrement_counted_channel(&metrics.control_completion_queued);
     let (completion, ack_written) = match completion {
@@ -173,6 +174,7 @@ pub(super) async fn process_route_bind_completion(
         shutdown,
         metrics,
         lifecycle_probe,
+        delivery,
     )
     .await
 }

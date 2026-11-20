@@ -82,6 +82,9 @@ use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
 mod saved_delivery;
 use saved_delivery::list_delivery_gaps;
+mod live_delivery;
+use live_delivery::LiveDelivery;
+pub(crate) use live_delivery::RouteDeliverySessions;
 
 #[path = "display_bodies.rs"]
 mod display_bodies;
@@ -1644,11 +1647,7 @@ pub(crate) struct RegistryInner {
     pub(crate) completion_pass_cause: Mutex<HashMap<String, WatchdogPassCause>>,
     pub(crate) watch_registry: Mutex<WatchRegistry>,
     persisted_watch_cursors: Mutex<HashMap<String, (u64, u64, u64)>>,
-    /// Session identities with an installed route for this root in subc mode.
-    /// The loop-owned route table refreshes this snapshot before replay and on
-    /// bind/unbind transitions; standalone replay relies on its binding-session
-    /// exception instead.
-    live_delivery_sessions: Mutex<HashSet<String>>,
+    live_delivery_sessions: Mutex<LiveDelivery>,
     completion_delivery_listener: Mutex<Option<completion_listener::Listener>>,
     live_delivery_lock_diagnostics: Arc<crate::lock_diagnostics::LockDiagnostics>,
     wait_detach: Mutex<WaitDetachState>,
@@ -2327,7 +2326,7 @@ impl BgTaskRegistry {
                 completion_pass_cause: Mutex::new(HashMap::new()),
                 watch_registry: Mutex::new(WatchRegistry::default()),
                 persisted_watch_cursors: Mutex::new(HashMap::new()),
-                live_delivery_sessions: Mutex::new(HashSet::new()),
+                live_delivery_sessions: Mutex::new(LiveDelivery::default()),
                 completion_delivery_listener: Mutex::default(),
                 live_delivery_lock_diagnostics: crate::lock_diagnostics::LockDiagnostics::new(
                     file!(),
@@ -2815,51 +2814,11 @@ impl BgTaskRegistry {
         self.inner.compression_aggregates.clear();
     }
 
-    pub(crate) fn record_live_delivery_session(&self, session_id: &str) {
-        if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
-            let _hold = self.inner.live_delivery_lock_diagnostics.hold();
-            live_sessions.insert(session_id.to_string());
-        }
-    }
-
     pub(crate) fn claim_bash_env_disclosure(&self, session_id: &str) -> bool {
         self.inner
             .bash_env_disclosed_sessions
             .lock()
             .is_ok_and(|mut sessions| sessions.insert(session_id.to_string()))
-    }
-
-    pub(crate) fn replace_live_delivery_sessions(&self, sessions: HashSet<String>) {
-        if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
-            let _hold = self.inner.live_delivery_lock_diagnostics.hold();
-            *live_sessions = sessions;
-        }
-    }
-
-    pub(crate) fn live_delivery_lock_diagnostics(
-        &self,
-    ) -> Arc<crate::lock_diagnostics::LockDiagnostics> {
-        Arc::clone(&self.inner.live_delivery_lock_diagnostics)
-    }
-
-    fn originating_session_has_live_route(&self, session_id: &str) -> bool {
-        self.inner
-            .live_delivery_sessions
-            .lock()
-            .map(|sessions| {
-                let _hold = self.inner.live_delivery_lock_diagnostics.hold();
-                sessions.contains(session_id)
-            })
-            .unwrap_or(true)
-    }
-
-    fn should_retire_foreign_delivery(
-        &self,
-        originating_session_id: &str,
-        binding_session_id: &str,
-    ) -> bool {
-        originating_session_id != binding_session_id
-            && !self.originating_session_has_live_route(originating_session_id)
     }
 
     pub(crate) fn compression_aggregate_cache(&self) -> Arc<CompressionAggregateCache> {
@@ -7605,7 +7564,7 @@ impl BgTaskRegistry {
         let mut recovering = vec![self.begin_session_recovery(storage_dir, session_id)];
         // Standalone NDJSON: every session for a project replays through the same
         // bridge, so replay unions this session into live delivery routes.
-        // Only subc route synchronization (subc/mod.rs:2120) replaces the whole set.
+        // A daemon registry instead reads the installed-route snapshot.
         if !continuation {
             self.record_live_delivery_session(session_id);
             self.retire_orphaned_watch_tombstones(session_id)?;
@@ -28121,7 +28080,7 @@ mod tests {
         restarted
             .insert_rehydrated_task(persisted.clone(), task.paths.clone(), true)
             .unwrap();
-        restarted.replace_live_delivery_sessions(HashSet::new());
+        restarted.clear_live_delivery_sessions();
         restarted.enqueue_completion_if_needed(&persisted, Some(&task.paths), true);
         assert!(frames.lock().unwrap().iter().any(|frame| matches!(frame, PushFrame::BashCompleted(frame) if frame.launching_identity == recorded_identity)));
         let other = task_caller(dir.path(), "direct", "opencode", 2);
@@ -29496,6 +29455,29 @@ mod tests {
         assert!(restarted
             .pending_pattern_matches_for_session("session")
             .is_empty());
+    }
+
+    #[test]
+    fn daemon_configure_replay_delivers_binding_session_without_an_installed_route() {
+        let storage = tempfile::tempdir().unwrap();
+        let (task_id, _) = insert_terminal_piped_task(
+            &BgTaskRegistry::default(),
+            &storage,
+            "true",
+            "recovered\n",
+            "",
+            false,
+        );
+        let registry = BgTaskRegistry::default();
+        let delivery = Arc::new(RouteDeliverySessions::default());
+        delivery.publish(HashSet::from(["another-session"]));
+        registry.use_route_delivery_sessions(&delivery);
+        registry.replay_session(storage.path(), "session").unwrap();
+
+        assert!(!registry.originating_session_has_live_route("session"));
+        let completions = registry.drain_completions_for_session(Some("session"));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].task_id, task_id);
     }
 
     #[test]

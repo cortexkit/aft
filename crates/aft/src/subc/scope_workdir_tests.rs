@@ -252,6 +252,7 @@ fn bind_observed(
                 &Arc::new(Notify::new()),
                 &metrics,
                 None,
+                &Arc::default(),
             )
             .await
             .unwrap();
@@ -279,6 +280,7 @@ fn bind_observed(
                 &Arc::new(Notify::new()),
                 &metrics,
                 None,
+                &Arc::default(),
             )
             .await
             .unwrap();

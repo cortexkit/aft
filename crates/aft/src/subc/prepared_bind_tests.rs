@@ -56,6 +56,7 @@ async fn bind_publication_rejects_missing_or_mismatched_applied_snapshot() {
             &Arc::new(Notify::new()),
             &Arc::new(DispatchPathMetrics::new()),
             None,
+            &Arc::default(),
         )
         .await
         .unwrap();

@@ -914,6 +914,7 @@ mod fixup_tests {
             &Arc::new(Notify::new()),
             &metrics,
             None,
+            &Arc::default(),
         )
         .await
         .expect("a valid retraction receipt must not close the connection");
@@ -1254,6 +1255,7 @@ mod ordering_tests {
             &shutdown,
             &metrics,
             None,
+            &Arc::default(),
         )
         .await
         .unwrap();
@@ -1325,6 +1327,7 @@ mod ordering_tests {
             &shutdown,
             &metrics,
             None,
+            &Arc::default(),
         )
         .await
         .unwrap();
