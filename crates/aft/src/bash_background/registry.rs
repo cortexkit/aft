@@ -20341,7 +20341,17 @@ mod tests {
             .replay_session(storage.path(), "session")
             .unwrap();
         let metadata = read_task(&paths.json).unwrap();
-        let exited = survivor.try_wait().unwrap();
+        // Replay records Killed once it has signalled the group, without
+        // waiting for the kernel to finish the process off. This test is the
+        // command's parent, so wait for it to exit and reap it, bounded.
+        let started = std::time::Instant::now();
+        let exited = loop {
+            let exited = survivor.try_wait().unwrap();
+            if exited.is_some() || started.elapsed() >= Duration::from_secs(5) {
+                break exited;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
         if exited.is_none() {
             let _ = survivor.kill();
             let _ = survivor.wait();
