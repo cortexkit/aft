@@ -1,4 +1,4 @@
-//! Keep the scope worker's route inventory current without rekeying steady frames.
+//! Keep scoped route keys current without rebuilding them when route identities are unchanged.
 
 use super::{stamp_key, RouteChannel, RouteIdentity, RouteIdentityData, ScopeStamp};
 use std::{

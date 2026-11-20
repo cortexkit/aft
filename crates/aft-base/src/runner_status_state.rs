@@ -28,12 +28,12 @@ pub struct Segment {
 }
 
 impl Segment {
-    /// Cache the writer's encoded key across updates to the same session.
+    /// Cache the rendered key across updates to the same session.
     pub fn key(&self, render: impl FnOnce() -> String) -> &str {
         self.key.get_or_init(render)
     }
 
-    /// Cache the writer's encoded value or its decision to omit this generation.
+    /// Cache the rendered value, or its omission, for this segment.
     pub fn value(&self, render: impl FnOnce() -> Option<Bytes>) -> Option<&Bytes> {
         self.value.get_or_init(render).as_ref()
     }
