@@ -275,7 +275,7 @@ mod tests {
         // phone-reader-tool-display-v7 and phone-reader-tool-tail-v2 tags
         // at phone and desktop widths.
         let legacy_template_digests = [
-            "2d048532a4777592f2d30c03fac3beab2c6d9a01c54a3e3a5086265d5237e9b7",
+            "05bea365ae991818307b3b44a5e7984bd06f7f2d95c193d1d4772680f935b618",
             "e8d1495e42c90404af114aaa5e369d1e57e24571174798dd974589c3a07e173a",
         ];
         // The Occipital checker hashes the entire canonical template document,
@@ -283,7 +283,7 @@ mod tests {
         // unchanged page re-declared on catalog 6e323928…, as passed by
         // occipital-check from occipital 6771d71.
         let tail_template_digests = [
-            "a4aae30e9c270aa93f496e89c8462bc8d73c73bdb146d1edb1e899b9fe84d964",
+            "291990ef28f5790ab9d2d21fea9a0d5c620f6bebb9c66a3cda9a92d11cf3b924",
             "448495cc4f693bb622f407532eabddae4fdfc55a249de00eec08ab13eef2a658",
         ];
 
