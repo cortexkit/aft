@@ -30,6 +30,7 @@ Unit / MSRV check (rustc 1.92)
 Unit / Release storm (Linux)
 Unit / Sandbox real-kernel Landlock probes
 Unit / Worker GitHub reads (required Landlock)
+Linux background task scopes (systemd user manager)
 E2E / E2E (Linux Docker)
 E2E / E2E (Pi RPC)
 E2E / E2E (Windows native)
