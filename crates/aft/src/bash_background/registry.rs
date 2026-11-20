@@ -12527,10 +12527,7 @@ impl BgTaskRegistry {
                         }
                         {
                             let child_known_dead = state.child_exit_observed
-                                || state
-                                    .metadata
-                                    .child_pid
-                                    .is_some_and(|pid| !is_process_alive(pid));
+                                || adopted_identity::child_gone(&state.metadata);
                             if child_known_dead {
                                 needs_completion = self
                                     .fail_without_exit_marker_if_needed(task, &mut state, &mut db);
@@ -12563,11 +12560,7 @@ impl BgTaskRegistry {
         };
         if state.detached
             && matches!(state.runtime, TaskRuntime::Piped(None))
-            && (state.child_exit_observed
-                || state
-                    .metadata
-                    .child_pid
-                    .is_some_and(|pid| !is_process_alive(pid)))
+            && (state.child_exit_observed || adopted_identity::child_gone(&state.metadata))
         {
             let completed = self.fail_without_exit_marker_if_needed(task, &mut state, &mut db);
             drop(state);
@@ -14452,8 +14445,7 @@ impl BgTaskRegistry {
                     state.pending_terminal_override = Some(terminal_status.clone());
                 }
 
-                let pgid = state.metadata.pgid;
-                let child_pid = state.metadata.child_pid;
+                let (pgid, child_pid) = adopted_identity::signal_targets(&state);
                 let plan = match &mut state.runtime {
                     // The child handle leaves the slot for the unlocked wait.
                     // With the slot empty and the task not yet detached, the
@@ -18585,6 +18577,9 @@ mod watch_scan;
 #[path = "pty_replay.rs"]
 mod pty_replay;
 
+#[path = "adopted_identity.rs"]
+mod adopted_identity;
+
 fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
     let warning = metadata
         .remote
@@ -20252,6 +20247,90 @@ mod tests {
         metadata.started_at = unix_millis();
         write_task(&layout.paths.json, &metadata).unwrap();
         layout.paths
+    }
+
+    #[cfg(unix)]
+    fn adopted_task_recording(
+        registry: &BgTaskRegistry,
+        dir: &tempfile::TempDir,
+        pid: u32,
+        started_at: u64,
+    ) -> Arc<BgTask> {
+        let task = lifecycle_running_fixture(registry, dir);
+        {
+            let mut state = task.lock_state().unwrap();
+            state.runtime = TaskRuntime::Piped(None);
+            state.detached = true;
+            state.metadata.child_pid = Some(pid);
+            state.metadata.pgid = Some(pid as i32);
+            state.metadata.started_at = started_at;
+        }
+        task
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn adopted_task_ids_are_signalled_only_while_they_name_its_processes() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = other.id();
+        // The task began two minutes before this process: the pid was reused.
+        let reused = adopted_task_recording(&registry, &dir, pid, unix_millis() - 120_000);
+        assert_eq!(
+            adopted_identity::signal_targets(&reused.lock_state().unwrap()),
+            (None, None)
+        );
+        assert!(adopted_identity::child_gone(
+            &reused.lock_state().unwrap().metadata
+        ));
+        // Recorded after the process started: these ids are the task's.
+        let own = adopted_task_recording(&registry, &dir, pid, unix_millis());
+        assert_eq!(
+            adopted_identity::signal_targets(&own.lock_state().unwrap()),
+            (Some(pid as i32), Some(pid))
+        );
+        assert!(!adopted_identity::child_gone(
+            &own.lock_state().unwrap().metadata
+        ));
+        other.kill().unwrap();
+        other.wait().unwrap();
+        // No process holds the leader's pid, so the group can only hold the
+        // task's own remaining members; the child itself is gone.
+        assert_eq!(
+            adopted_identity::signal_targets(&own.lock_state().unwrap()),
+            (Some(pid as i32), None)
+        );
+        assert!(adopted_identity::child_gone(
+            &own.lock_state().unwrap().metadata
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn killing_an_adopted_task_spares_a_process_that_reused_its_pid() {
+        use std::os::unix::process::CommandExt;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let mut other = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let task = adopted_task_recording(&registry, &dir, other.id(), unix_millis() - 120_000);
+        let _ = registry.kill(&task.task_id, &task.session_id);
+        let survived = other.try_wait().unwrap().is_none();
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(
+            survived,
+            "the kill signalled a process group that is not the task's"
+        );
     }
 
     #[cfg(unix)]
