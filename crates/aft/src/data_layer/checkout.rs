@@ -32,9 +32,9 @@ use aft_store::text::{
 };
 
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
+use super::content::language_for;
 #[cfg(test)]
 use super::content::EXTRACTOR_VERSION;
-use super::content::{blob_from_record, language_for};
 use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
@@ -42,9 +42,11 @@ use super::query::{SliceReader, SliceSource};
 use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
 use super::refresh_memory::{ColdGrowth, MemoryLimit, RefreshChecks, RefreshMemory, RefreshStop};
 use super::slice::FileSlice;
-use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
+use crate::callgraph_store::join::ParseBlob;
+use conversion::{extract_recorded, parse_record, staged_failure, warn_conversion_failure};
 use staged_records::StagedKind;
 
+mod conversion;
 mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
@@ -719,10 +721,9 @@ impl Change {
     /// ran and failed. Until a refresh extracts it, a changed file is
     /// pending in the call graph, not unparsed.
     fn failed(&self) -> bool {
-        self.content
-            .peek()
-            .is_some_and(|extracted| matches!(extracted, Extracted::Nothing))
-            && self.record.as_ref().is_some_and(is_unparsed)
+        self.content.peek().is_some_and(|extracted| {
+            matches!(extracted, Extracted::Nothing | Extracted::ConversionFailed)
+        }) && self.record.as_ref().is_some_and(is_unparsed)
     }
 }
 
@@ -805,6 +806,8 @@ impl ChangeContent {
 enum Extracted {
     /// Nothing: not a parsed language, not text, or gone.
     Nothing,
+    /// Source extraction returned a record that could not become a parse.
+    ConversionFailed,
     /// Text is available, but the dynamic parse has a typed, rebuildable gap.
     GrammarGap(String),
     /// A parsed file: its parse key and parse, and the content record
@@ -1747,7 +1750,6 @@ impl Checkout {
         }
         report.files = scanned.state.paths().len();
         report.text_units = collected.text.len();
-        report.extract_failures = collected.failures;
         report.stored_records = collected.reused;
         report.resumed_records = collected.resumed;
         report.scan_ms = elapsed_ms(started);
@@ -1823,7 +1825,7 @@ impl Checkout {
         // decoded size, and the resolver decodes each parse from them when it
         // reads it; the decoded records go before resolving.
         let taking = Instant::now();
-        let (mut inputs, content) = collected.take_inputs(&state);
+        let (mut inputs, content) = collected.take_inputs(&state, &mut report);
         report.parsed_files = inputs.parses.len();
         // What resolution reads is now fixed: an earlier attempt's passes 2-3
         // are reused only when they were resolved from exactly these inputs.
@@ -3182,7 +3184,7 @@ impl Checkout {
                 | Extracted::Markers(stored) => {
                     records.add_encoded(key, Arc::clone(stored));
                 }
-                Extracted::GrammarGap(_) | Extracted::Nothing => {}
+                Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {}
             }
             if !seen.insert(record.content) {
                 continue;
@@ -4717,7 +4719,8 @@ fn next_inputs(
             Some(Extracted::GrammarGap(reason)) => {
                 gaps.insert(path.clone(), reason.clone());
             }
-            Some(Extracted::Markers(_) | Extracted::Nothing) | None => {}
+            Some(Extracted::Markers(_) | Extracted::Nothing | Extracted::ConversionFailed)
+            | None => {}
         }
     }
     Ok(CheckoutInputs {
@@ -4798,40 +4801,6 @@ fn changed_language(record: &PathRecord, bytes: &[u8]) -> String {
         .ok()
         .and_then(|path| language_for(path, bytes))
         .unwrap_or_default()
-}
-
-/// What the call graph reads from a changed file recorded as `source`. As
-/// in a build, a file the extractor fails on is not parsed.
-fn extract_recorded(source: &RecordedSource) -> Extracted {
-    let language = &source.language;
-    let mut extracted = match super::grammar::extract(&source.bytes, language) {
-        Ok(record) => record,
-        Err(error) => {
-            return super::grammar::reason(&error).map_or(Extracted::Nothing, Extracted::GrammarGap)
-        }
-    };
-    if let Ok(path) = std::str::from_utf8(&source.path) {
-        // Without them a configuration file's TODOs are reported unread.
-        let _ = super::content::add_config_markers(&mut extracted, path, &source.bytes);
-    }
-    match &extracted.data {
-        RecordBody::Config { source } => {
-            let source = Arc::from(source.as_slice());
-            Extracted::Config(source, Arc::new(EncodedRecord::of(&extracted)))
-        }
-        RecordBody::Markers => Extracted::Markers(Arc::new(EncodedRecord::of(&extracted))),
-        RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
-            Ok(CallgraphBlob::Parse(parse)) => {
-                let key = crate::data_layer::content::record_key(source.content, language);
-                Extracted::Parse(
-                    key.digest().to_string(),
-                    Arc::new(parse),
-                    Arc::new(EncodedRecord::of(&extracted)),
-                )
-            }
-            _ => Extracted::Nothing,
-        },
-    }
 }
 
 /// The index of the newest segment `find` locates a key in.
@@ -5311,14 +5280,19 @@ impl Collected {
     /// encoded record and decoded when the resolver reads it (see
     /// [`super::callgraph::Parses::encoded`]), so the build never holds the
     /// decoded records and every decoded parse at once.
-    fn take_inputs(&mut self, state: &CheckoutState) -> (CheckoutInputs, InputsContent) {
+    fn take_inputs(
+        &mut self,
+        state: &CheckoutState,
+        report: &mut BuildReport,
+    ) -> (CheckoutInputs, InputsContent) {
+        report.extract_failures = self.failures;
         if let Some((records, entries)) = self.staged.take() {
-            return Self::staged_inputs(state, records, entries);
+            return Self::staged_inputs(state, records, entries, &mut report.extract_failures);
         }
         let mut configs = HashMap::new();
         // A record whose parse does not convert is left out, as reading it
         // decoded would leave it out; checked once while it is at hand.
-        let mut converts = HashMap::<String, bool>::new();
+        let mut converts = HashMap::<String, Result<(), String>>::new();
         for record in state.paths() {
             if record.language.is_empty() {
                 continue;
@@ -5334,9 +5308,9 @@ impl Collected {
                     configs.insert(record.path.clone(), Arc::from(source.as_slice()));
                 }
                 RecordBody::Parsed { .. } => {
-                    converts.entry(parse_key).or_insert_with(|| {
-                        matches!(blob_from_record(stored), Ok(CallgraphBlob::Parse(_)))
-                    });
+                    converts
+                        .entry(parse_key)
+                        .or_insert_with(|| parse_record(stored).map(drop));
                 }
                 RecordBody::Markers => {}
             }
@@ -5353,8 +5327,14 @@ impl Collected {
             let record_key =
                 crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
-            if converts.get(&parse_key) != Some(&true) {
-                continue;
+            match converts.get(&parse_key) {
+                Some(Ok(())) => {}
+                Some(Err(reason)) => {
+                    report.extract_failures += 1;
+                    warn_conversion_failure(path, reason);
+                    continue;
+                }
+                None => continue,
             }
             let Some(stored) = encoded.get(&record_key) else {
                 continue;
@@ -5378,6 +5358,7 @@ impl Collected {
         state: &CheckoutState,
         records: Arc<staged_records::StagedRecords>,
         entries: HashMap<String, StagedEntry>,
+        failures: &mut usize,
     ) -> (CheckoutInputs, InputsContent) {
         let mut configs = HashMap::new();
         let mut parses = Vec::new();
@@ -5413,8 +5394,12 @@ impl Collected {
                 }
                 StagedKind::Parsed {
                     converts: false, ..
+                } => {
+                    *failures += 1;
+                    let path = String::from_utf8_lossy(&record.path);
+                    warn_conversion_failure(&path, &staged_failure(&records, entry.at, &path));
                 }
-                | StagedKind::Markers => {}
+                StagedKind::Markers => {}
             }
         }
         let units = entries
@@ -5579,7 +5564,7 @@ aft_store::heap_bytes_of_fields!(RecordedSource {
 impl aft_store::heap::HeapBytes for Extracted {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
         match self {
-            Self::Nothing => 0,
+            Self::Nothing | Self::ConversionFailed => 0,
             Self::GrammarGap(reason) => reason.heap_bytes(seen),
             Self::Parse(key, parse, record) => {
                 key.heap_bytes(seen) + parse.heap_bytes(seen) + record.heap_bytes(seen)
@@ -6233,7 +6218,9 @@ impl Checkout {
                         note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
-                    Extracted::GrammarGap(_) | Extracted::Nothing => PathTodos::Unextracted,
+                    Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {
+                        PathTodos::Unextracted
+                    }
                 })
             })
             .collect()
