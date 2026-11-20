@@ -26,6 +26,7 @@ struct Lookup {
 }
 
 impl CSharpProjects {
+    pub const PROJECT_READ_LIMIT: u64 = 64 * 1024;
     /// The supplied checkout paths include project files that are not parsed.
     /// Index the project filenames in one pass instead of reading directories
     /// from disk and accidentally looking beyond the checkout snapshot.

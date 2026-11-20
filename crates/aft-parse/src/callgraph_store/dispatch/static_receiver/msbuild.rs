@@ -8,9 +8,8 @@ use quick_xml::{
 use super::csharp_projects::{AGGREGATOR, COMPILES, UNKNOWN};
 
 pub(super) fn classify(source: &[u8]) -> Option<u8> {
-    const PROJECT_LIMIT: usize = 64 * 1024;
     // Do not trust a prefix of a project: a later property could disable defaults.
-    if source.len() > PROJECT_LIMIT {
+    if source.len() as u64 > super::CSharpProjects::PROJECT_READ_LIMIT {
         return None;
     }
     let source = std::str::from_utf8(source).ok()?;

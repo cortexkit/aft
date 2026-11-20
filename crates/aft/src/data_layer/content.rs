@@ -156,6 +156,11 @@ pub fn is_parsed_language(language: &str) -> bool {
 pub fn scan_policy() -> aft_store::scan::ScanPolicy {
     aft_store::scan::ScanPolicy {
         read_large: Some(parsed_or_embedded_path),
+        read_limit: Some(|path| {
+            path.ends_with(b".csproj").then_some(
+                crate::callgraph_store::join::dispatch::CSharpProjects::PROJECT_READ_LIMIT,
+            )
+        }),
         ..aft_store::scan::ScanPolicy::default()
     }
 }
