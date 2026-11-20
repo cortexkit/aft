@@ -1,6 +1,6 @@
 pub use aft_base::executor::*;
 
-/// Stable AFT executor path used by application callers and parity fixtures.
+/// Stable AFT executor path used by application callers and test fixtures.
 pub type Executor<C = crate::context::AppContext> = aft_base::executor::Executor<C>;
 
 #[cfg(test)]
