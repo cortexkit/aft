@@ -1937,7 +1937,9 @@ mod tests {
             }))
         });
         let response = crate::bounded_io::with_budget(Some(budget), || {
-            grep_executor::with_walk_limit(1, || handle_grep(&req, &ctx))
+            aft_engine::test_bridge::search_misc::grep_executor::with_walk_limit(1, || {
+                handle_grep(&req, &ctx)
+            })
         });
         assert!(
             response.success,
@@ -1972,7 +1974,8 @@ mod tests {
             },
         );
         // The index store binds the root and its first build waits here.
-        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let _hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
         aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let req = serde_json::from_value(serde_json::json!({
             "id": "grep-while-building", "command": "grep",

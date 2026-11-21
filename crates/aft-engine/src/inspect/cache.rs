@@ -255,13 +255,14 @@ pub struct ContributionRecord {
     pub type_ref_names: BTreeSet<String>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static AGGREGATE_MEMORY_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
     static UNCACHED_AGGREGATE_MEMORY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn aggregate_memory_walks_for_test() -> usize {
     AGGREGATE_MEMORY_WALKS.with(std::cell::Cell::get)
 }
@@ -325,7 +326,7 @@ impl MemoryAggregates {
     }
 
     fn rebuild_estimated_bytes(&self) -> u64 {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         AGGREGATE_MEMORY_WALKS.with(|walks| walks.set(walks.get() + 1));
         self.entries.iter().fold(0u64, |bytes, (key, aggregate)| {
             bytes

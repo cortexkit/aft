@@ -730,7 +730,7 @@ impl WatcherExclusionPaths {
 
     // Only the Linux and macOS watcher backends, plus tests on all platforms,
     // read the combined exclusion list.
-    #[cfg(any(unix, test))]
+    #[cfg(any(unix, test, feature = "test-support"))]
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
         self.lasting
             .iter()
@@ -1083,7 +1083,12 @@ impl WatcherWalkBoundary {
         self.classify_with(path, |path| self.component_kind(path))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos", test))]
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        test,
+        feature = "test-support"
+    ))]
     fn classify_cached(
         &self,
         path: &Path,
@@ -1518,7 +1523,7 @@ pub(crate) fn derive_watcher_exclusion_plan(
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
 ) -> ExclusionPlanOutcome {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if forced_exclusion_failures()
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -1549,17 +1554,23 @@ pub(crate) fn derive_watcher_exclusion_plan(
     result
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn forced_exclusion_failures() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
     static ROOTS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
     ROOTS.get_or_init(Default::default)
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(target_os = "linux", target_os = "macos")
+))]
 pub(crate) struct ForcedExclusionFailure(PathBuf);
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(target_os = "linux", target_os = "macos")
+))]
 impl Drop for ForcedExclusionFailure {
     fn drop(&mut self) {
         forced_exclusion_failures()
@@ -1569,7 +1580,10 @@ impl Drop for ForcedExclusionFailure {
     }
 }
 
-#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(
+    any(test, feature = "test-support"),
+    any(target_os = "linux", target_os = "macos")
+))]
 pub(crate) fn force_exclusion_failure_for_test(root: &Path) -> ForcedExclusionFailure {
     let root = root.canonicalize().unwrap();
     forced_exclusion_failures()
