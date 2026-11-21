@@ -4285,7 +4285,9 @@ fn admit_arguments_for(
             return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
         }
         let semantics = head_watch.map_or(semantics, |entry| entry.semantics);
-        if pin.semantics != semantics {
+        if pin.semantics != semantics
+            && !super::tool_views::runs_under_newer_semantics(&call.name, pin.semantics, semantics)
+        {
             return Err(
                 ErrorBody::new(errors::TOOL_SEMANTICS_CHANGED, "semantics pin is stale")
                     .with_detail(
@@ -5129,15 +5131,29 @@ mod tests {
     }
 
     #[test]
-    fn head_bash_calls_with_old_semantics_pins_are_refused() {
+    fn head_bash_runs_record_only_older_semantics_and_refuses_older_behavior() {
         let tool = tools_for_session(CatalogPreset::Head, &[], true, false, false)
             .into_iter()
             .find(|tool| tool.name == "bash")
             .unwrap();
         let mut request = call("bash", json!({"command":"echo"}));
         request.preset = Some("head".into());
+        // Version 2 differs from 3 only in the app record's `tail` field, so a
+        // session whose plan still names 2 keeps its shell.
+        for runs in [2, 3] {
+            request.schema_pin = Some(
+                SchemaPin::new("bash", &tool.schema_digest, runs)
+                    .encode()
+                    .unwrap(),
+            );
+            assert_eq!(
+                admit(&request, false, &[], true, "session", true).unwrap(),
+                CallerRole::Head,
+                "semantics {runs}"
+            );
+        }
         request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 2)
+            SchemaPin::new("bash", &tool.schema_digest, 1)
                 .encode()
                 .unwrap(),
         );
@@ -5145,16 +5161,7 @@ mod tests {
         assert_eq!(refusal.code, "tool_semantics_changed");
         assert_eq!(
             refusal.detail.unwrap(),
-            json!({"tool":"bash","expected":2,"current":3})
-        );
-        request.schema_pin = Some(
-            SchemaPin::new("bash", &tool.schema_digest, 3)
-                .encode()
-                .unwrap(),
-        );
-        assert_eq!(
-            admit(&request, false, &[], true, "session", true).unwrap(),
-            CallerRole::Head
+            json!({"tool":"bash","expected":1,"current":3})
         );
         request.schema_pin = None;
         assert_eq!(
@@ -5166,7 +5173,9 @@ mod tests {
     #[test]
     fn worker_shell_calls_with_old_semantics_pins_are_refused() {
         for name in ["bash", "bash_watch"] {
-            let (old, current) = if name == "bash" { (2, 3) } else { (1, 2) };
+            // Worker `bash` version 2 still runs (record-only change, see the
+            // head test above); version 1 is an older behavior and is refused.
+            let (old, current) = if name == "bash" { (1, 3) } else { (1, 2) };
             let tool = tools_for_session(CatalogPreset::Worker, &[], true, false, false)
                 .into_iter()
                 .find(|tool| tool.name == name)
@@ -5198,6 +5207,18 @@ mod tests {
                 admit(&request, false, &[], true, "session", true).unwrap(),
                 CallerRole::Worker
             );
+            if name == "bash" {
+                request.schema_pin = Some(
+                    SchemaPin::new(name, &tool.schema_digest, 2)
+                        .encode()
+                        .unwrap(),
+                );
+                assert_eq!(
+                    admit(&request, false, &[], true, "session", true).unwrap(),
+                    CallerRole::Worker,
+                    "a worker whose tool list predates bash version 3 keeps its shell"
+                );
+            }
             request.schema_pin = None;
             assert_eq!(
                 admit(&request, false, &[], true, "session", true).unwrap(),
@@ -7252,9 +7273,13 @@ mod tests {
             ),
             (
                 schema.schema_digest.as_str(),
-                2,
+                1,
                 Some("tool_semantics_changed"),
             ),
+            // Version 2 differs from 3 only in the display record the apps draw
+            // (3 adds the `tail` field); the command runs the same, so a version-2
+            // pin is still admitted (see `tool_views::runs_under_newer_semantics`).
+            (schema.schema_digest.as_str(), 2, None),
         ] {
             let mut request = call("bash", json!({"command": "echo"}));
             request.schema_pin = Some(SchemaPin::new("bash", digest, semantics).encode().unwrap());

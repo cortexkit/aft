@@ -18,6 +18,21 @@ use super::rich_ui::notices;
 
 pub(crate) const BASH_SEMANTICS: u64 = 3;
 
+/// Earlier `bash` behavior versions whose calls still run. Version 3 only added
+/// the `tail` completion field to the app record; the command's input and
+/// behavior are the same as version 2. A session keeps the version its plan
+/// named, and a worker keeps its tool list for its whole run, so refusing
+/// version 2 would take `bash` away from every running session until its
+/// tool list refreshed. A call pinned to version 2 runs as before, and its
+/// record is drawn with the version-2 view, which has no `tail`.
+const BASH_RECORD_ONLY_PREDECESSORS: &[u64] = &[2];
+
+/// Whether a call pinned to `pinned` may run against the current `semantics`
+/// of `tool` because the versions differ only in what the app record carries.
+pub(crate) fn runs_under_newer_semantics(tool: &str, pinned: u64, semantics: u64) -> bool {
+    tool == "bash" && semantics == BASH_SEMANTICS && BASH_RECORD_ONLY_PREDECESSORS.contains(&pinned)
+}
+
 #[derive(Clone, Deserialize, serde::Serialize)]
 pub(crate) struct Definition {
     pub name: String,

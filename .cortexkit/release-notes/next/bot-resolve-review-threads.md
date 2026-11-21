@@ -1,1 +1,0 @@
-- The bot can resolve and unresolve review threads on its own pull requests again: `gh api graphql` with a `resolveReviewThread` or `unresolveReviewThread` mutation is no longer refused with `task_gh_policy_denied (classification_changed)`.
