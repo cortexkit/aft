@@ -9,6 +9,7 @@ mod callgraph_store_for_ops_tests {
         callgraph_test_support::cold_build_fixture, install_pending_capture_hook_for_test,
         PendingCaptureBoundary,
     };
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     use serde_json::json;
     use std::path::Path;
     use std::sync::Arc;

@@ -10550,6 +10550,7 @@ fn degraded_warning(ctx: &AppContext) -> String {
 mod tests {
     use super::first_text_wait::test_signals::{Exit as FirstTextWaitExit, EXITED, STARTED};
     use super::*;
+    use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
 
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;

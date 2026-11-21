@@ -265,10 +265,12 @@ pub fn keep_request_file(
 
 pub mod output;
 pub mod search;
-pub use crate::edit::{
-    A03_DIFF_CONSTRUCTIONS, A03_LINE_INDEX_PASSES, FORCE_MODE_RESTORE_FAILURE,
-    LINE_OFFSET_BYTES_SCANNED,
-};
+pub mod edit {
+    pub use crate::edit::{
+        A03_DIFF_CONSTRUCTIONS, A03_LINE_INDEX_PASSES, FORCE_MODE_RESTORE_FAILURE,
+        LINE_OFFSET_BYTES_SCANNED,
+    };
+}
 
 pub fn session_call_counts(
     breaker: &crate::repeat_state::RepeatBreaker,
