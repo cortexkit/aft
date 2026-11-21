@@ -2793,10 +2793,13 @@ mod tests {
 
     #[cfg(unix)]
     fn busy_status(error_bytes: usize, done: usize) -> StatusChangedFrame {
-        let fixture = crate::bash_background::push_projection_fixture::busy_root();
+        use aft_engine::test_bridge::bash_remote::{
+            bash_background::push_projection_fixture::busy_root, BusyRootTestExt as _,
+        };
+        let fixture = busy_root();
         let mut snapshot = aft_engine::test_bridge::display_data::project_status(
-            &fixture.ctx,
-            fixture.ctx.build_status_snapshot(),
+            fixture.ctx(),
+            fixture.ctx().build_status_snapshot(),
         );
         snapshot["semantic_index"]["error"] = json!("e".repeat(error_bytes));
         snapshot["semantic_index"]["entries_done"] = json!(done);
