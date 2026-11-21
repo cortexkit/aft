@@ -6193,3 +6193,6 @@ mod callgraph_roots_tests;
 
 #[cfg(test)]
 mod callgraph_regression_tests;
+
+#[cfg(test)]
+mod trace_adapter_tests;

@@ -143,3 +143,7 @@ mod tests {
 #[cfg(test)]
 #[path = "call_ledger_recovery_tests.rs"]
 mod call_ledger_recovery_tests;
+
+#[cfg(test)]
+#[path = "context_database_tests.rs"]
+mod context_database_tests;
