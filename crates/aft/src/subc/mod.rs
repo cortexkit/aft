@@ -10957,24 +10957,23 @@ async fn handle_tool_call_with_capabilities(
         ) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        if carrier_read_only::restricted(&identity) {
-            call.name = carrier_read_only::internal_name(&call.name).to_owned();
-        }
-        tool_provider::route_head_call_name(&mut call, identity.scope.is_some());
-        if let Err(error) =
-            admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
-        {
-            return send_provider_error(tx, metrics, frame, error).await;
-        }
+        let sent_pin = match tool_provider::versions::route_call(
+            &mut call,
+            executor,
+            &identity,
+            confinement.as_ref(),
+        ) {
+            Ok(pin) => pin,
+            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        };
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = rich_ui::admission::reject_non_carrier(&call.arguments) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        // Plugin approvals are host transport metadata, not model-facing tool
-        // arguments. Keep the served schema closed and never accept these IDs
-        // as authority on an untrusted or stamped route.
+        // Plugin approvals are host metadata, not model arguments. Scoped
+        // runner calls and untrusted calls cannot carry plugin approval IDs.
         let plugin_grants = if matches!(
             access_grants::ask_route(&identity),
             crate::access_policy::AskRoute::Plugin { .. }
@@ -10985,16 +10984,11 @@ async fn handle_tool_call_with_capabilities(
         } else {
             None
         };
-        let role = match tool_provider::admit_on_route(
+        let role = match tool_provider::versions::admit_routed_call(
             &call,
-            identity.scope.is_some(),
-            &identity.disabled_tools,
-            crate::bash_background::powershell_available(),
-            &identity.session,
-            tool_provider::admission_trusted(&identity, &call),
-            &identity.project_root,
+            &identity,
             frame.header.channel,
-            tool_provider::head_catalog_key(&identity).is_some(),
+            sent_pin.as_deref(),
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -11025,7 +11019,7 @@ async fn handle_tool_call_with_capabilities(
             preset: call.preset,
             v1_role: Some(role),
             call_key: call.call_key,
-            schema_pin: call.schema_pin,
+            schema_pin: tool_provider::versions::record_pin(sent_pin, call.schema_pin),
         })
     } else {
         match decode_legacy_route_request(envelope) {
