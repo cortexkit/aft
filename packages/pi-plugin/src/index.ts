@@ -207,12 +207,12 @@ const PLUGIN_VERSION: string = (() => {
   }
 })();
 
-const ANNOUNCEMENT_VERSION = "0.66.0";
+const ANNOUNCEMENT_VERSION = "0.67.0";
 const ANNOUNCEMENT_FEATURES: string[] = [
-  "Large projects' first index build now fits in a few gigabytes of memory, and resumes after an interruption.",
-  "Luau support: outlines, navigation, call graphs and search for Luau and Roblox projects.",
-  "Opt-in per-project shell environments: set `shell.env_provider` to `mise`, `direnv` or your own command.",
-  "Existing call graphs rebuild once after this upgrade; on macOS, set `durability.macos_full_sync: true` to restore full drive flushes.",
+  "More precise call graphs for C#, Java and TypeScript, and much less memory for large call-graph builds and refreshes.",
+  "Status and version keep answering while an index builds, and new installs can download ONNX Runtime again.",
+  "New `memory` setting: `lean` uses less memory, and computers with less than 8 GiB pick it automatically.",
+  "Existing call graphs rebuild once after this upgrade; your user config is updated to current setting names, with the old copy kept.",
 ];
 
 /**

@@ -1,1 +1,0 @@
-- JSON uploads larger than 1 MiB now pass through the secret proxy unchanged, with secret substitution still available in headers and query parameters.

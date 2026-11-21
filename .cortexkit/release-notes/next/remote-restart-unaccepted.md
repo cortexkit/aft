@@ -1,1 +1,0 @@
-Show queued or waiting-on-runner status for remote jobs reattached after restart without an acceptance record, and settle interrupted submissions without a job id instead of automatically resubmitting them.
