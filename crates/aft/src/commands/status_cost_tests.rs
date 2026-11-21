@@ -219,6 +219,81 @@ fn status_does_not_wait_for_checkout_publication() {
 }
 
 #[test]
+fn status_and_push_rebuild_missing_meaning_coverage_without_a_fill() {
+    for push_first in [false, true] {
+        let fixture = Fixture::new(2);
+        let baseline = fixture.ctx.build_status_snapshot();
+        let baseline = &baseline["semantic_index"];
+        assert_eq!(baseline["status"], "ready", "{baseline}");
+        assert_eq!(baseline["files_pending"], 0, "{baseline}");
+        let embedded_before_edit = baseline["files_embedded"].as_u64().unwrap();
+        fixture.checkout.pause_meaning_summary_for_test();
+        std::fs::write(
+            fixture.checkout.root().join("file_0.rs"),
+            "pub fn changed_since_fill() {}\n",
+        )
+        .unwrap();
+        fixture
+            .checkout
+            .checkout()
+            .record_paths(&[b"file_0.rs".to_vec()])
+            .unwrap();
+
+        let (published, coverage) = std::sync::mpsc::channel();
+        fixture.checkout.on_status_change(Arc::new(move || {
+            let builds = crate::data_layer::vectors::status_member_builds_for_test();
+            if builds > 0 {
+                let _ = published.send(builds);
+            }
+        }));
+        let plane = fixture.checkout.meaning_plane_for_test();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        std::thread::scope(|scope| {
+            let mut reply = None;
+            plane.with_members_lock_for_test(|| {
+                let ctx = &fixture.ctx;
+                scope.spawn(move || {
+                    for _ in 0..8 {
+                        let status = if push_first {
+                            ctx.try_build_status_push_snapshot().unwrap()
+                        } else {
+                            ctx.build_status_snapshot()
+                        };
+                        let semantic = &status["semantic_index"];
+                        assert_eq!(semantic["status"], "building", "{semantic}");
+                        assert_eq!(semantic["filling"], false, "{semantic}");
+                        assert!(semantic["files"].is_null(), "{semantic}");
+                    }
+                    assert_eq!(
+                        crate::data_layer::vectors::status_member_builds_for_test(),
+                        0
+                    );
+                    tx.send(()).unwrap();
+                });
+                reply = Some(rx.recv_timeout(Duration::from_secs(5)));
+            });
+            reply.unwrap().expect("status waited for vector members");
+        });
+
+        assert_eq!(coverage.recv_timeout(Duration::from_secs(5)).unwrap(), 1);
+        for status in [
+            fixture.ctx.build_status_snapshot(),
+            fixture.ctx.try_build_status_push_snapshot().unwrap(),
+        ] {
+            let semantic = &status["semantic_index"];
+            assert_eq!(semantic["files"], baseline["files"], "{semantic}");
+            assert_eq!(
+                semantic["files_embedded"],
+                embedded_before_edit - 1,
+                "{semantic}"
+            );
+            assert_eq!(semantic["files_pending"], 1, "{semantic}");
+            assert_eq!(semantic["filling"], false, "{semantic}");
+        }
+    }
+}
+
+#[test]
 fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_without_store_reads()
 {
     let fixture = Fixture::new(32);
@@ -334,8 +409,8 @@ fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_wi
     );
 
     // Record a new text view without running its producer. The previous
-    // coverage is no longer a certificate for this view: a push must report
-    // unknown counts rather than rebuild or borrow the previous coverage.
+    // coverage is no longer valid for this view: the push must report unknown
+    // counts in this reply without surveying files on the push thread.
     fixture.checkout.pause_meaning_summary_for_test();
     std::fs::write(
         fixture.checkout.root().join("file_0.rs"),

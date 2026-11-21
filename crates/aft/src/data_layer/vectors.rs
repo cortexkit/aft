@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -1164,12 +1165,67 @@ pub struct VectorPlane {
     max_files: usize,
     loaded: Mutex<Arc<Loaded>>,
     members: Mutex<Option<Arc<Members>>>,
+    coverage_rebuild: AtomicU8,
     fill_queue: Mutex<Option<FillQueue>>,
     /// The old meaning index whose vectors fills take where they match.
     old: Option<OldIndex>,
     /// When a fill round merges the family's vector segments.
     merge: MergeLimits,
     merge_due: Mutex<Option<(Generation, u64)>>,
+}
+
+const REBUILD_IDLE: u8 = 0;
+const REBUILD_RUNNING: u8 = 1;
+const REBUILD_DIRTY: u8 = 2;
+
+/// Owns the plane's single queued or running status rebuild. Dropping the
+/// job without running it (for example, on executor refusal) makes it idle.
+pub(super) struct CoverageRebuild {
+    plane: Arc<VectorPlane>,
+    active: bool,
+}
+
+impl CoverageRebuild {
+    pub(super) fn run(mut self, cancelled: impl Fn(&Arc<VectorPlane>) -> bool) -> bool {
+        let mut surveyed = false;
+        loop {
+            // Pick up requests made while queued by reading the latest view.
+            // Requests arriving after this point get one more cache check.
+            self.plane
+                .coverage_rebuild
+                .store(REBUILD_RUNNING, Ordering::Release);
+            if cancelled(&self.plane) {
+                return false;
+            }
+            if let Some(view) = self.plane.checkout.view() {
+                surveyed |= self.plane.snapshot(&view).is_ok();
+            }
+            if self
+                .plane
+                .coverage_rebuild
+                .compare_exchange(
+                    REBUILD_RUNNING,
+                    REBUILD_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.active = false;
+                return surveyed && !cancelled(&self.plane);
+            }
+        }
+    }
+}
+
+impl Drop for CoverageRebuild {
+    fn drop(&mut self) {
+        if self.active {
+            self.plane
+                .coverage_rebuild
+                .store(REBUILD_IDLE, Ordering::Release);
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -1187,6 +1243,7 @@ impl VectorPlane {
             max_files,
             loaded: Mutex::new(Arc::new(Loaded::empty())),
             members: Mutex::new(None),
+            coverage_rebuild: AtomicU8::new(REBUILD_IDLE),
             fill_queue: Mutex::new(None),
             old: None,
             merge: MergeLimits::default(),
@@ -1354,9 +1411,8 @@ impl VectorPlane {
         })
     }
 
-    /// A snapshot only if a producer already surveyed this exact text view and
-    /// vector generation. Status must not rebuild members on the request or
-    /// push thread.
+    /// A snapshot only if this exact text view and vector generation were
+    /// already surveyed. Status must not rebuild members on its own thread.
     pub(crate) fn cached_snapshot(&self, view: &CheckoutView) -> Option<MeaningSnapshot> {
         let key = view.text_generation();
         let parse_gaps = view.parse_gaps_identity();
@@ -1374,6 +1430,20 @@ impl VectorPlane {
             root: view.root().to_path_buf(),
             dimensions: self.producer.model.dimensions as usize,
         })
+    }
+
+    pub(super) fn request_coverage_rebuild(self: &Arc<Self>) -> Option<CoverageRebuild> {
+        let previous = self.coverage_rebuild.swap(REBUILD_DIRTY, Ordering::AcqRel);
+        (previous == REBUILD_IDLE).then(|| CoverageRebuild {
+            plane: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_members_lock_for_test(&self, run: impl FnOnce()) {
+        let _members = self.members.lock().unwrap();
+        run();
     }
 
     #[cfg(feature = "test-hooks")]
@@ -2497,6 +2567,7 @@ impl VectorPlane {
             max_files: _,
             loaded,
             members,
+            coverage_rebuild: _,
             fill_queue,
             old,
             merge: _,

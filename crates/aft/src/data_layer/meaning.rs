@@ -328,11 +328,26 @@ impl Meaning {
     /// How meaning search stands for `view`, the checkout's current view
     /// (`None` before anything is published).
     pub(crate) fn state(&self, view: Option<&CheckoutView>) -> MeaningState {
-        self.state_inner(view, false)
+        self.state_inner(view, None)
     }
 
-    pub(crate) fn cached_state(&self, view: Option<&CheckoutView>) -> MeaningState {
-        self.state_inner(view, true)
+    pub(super) fn cached_state(
+        &self,
+        view: Option<&CheckoutView>,
+        on_cache_miss: impl Fn(&Arc<VectorPlane>),
+    ) -> MeaningState {
+        self.state_inner(view, Some(&on_cache_miss))
+    }
+
+    pub(super) fn is_current_plane(&self, plane: &Arc<VectorPlane>) -> bool {
+        lock(&self.plane)
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(&current.plane, plane))
+    }
+
+    #[cfg(test)]
+    pub(super) fn plane_for_test(&self) -> Arc<VectorPlane> {
+        Arc::clone(&lock(&self.plane).as_ref().unwrap().plane)
     }
 
     #[cfg(test)]
@@ -342,7 +357,11 @@ impl Meaning {
         self.state(view);
     }
 
-    fn state_inner(&self, view: Option<&CheckoutView>, cached_only: bool) -> MeaningState {
+    fn state_inner(
+        &self,
+        view: Option<&CheckoutView>,
+        on_cache_miss: Option<&dyn Fn(&Arc<VectorPlane>)>,
+    ) -> MeaningState {
         if !self.enabled() {
             return MeaningState::Off;
         }
@@ -350,7 +369,7 @@ impl Meaning {
             return MeaningState::Unpublished;
         };
         let plane = {
-            let slot = if cached_only {
+            let slot = if on_cache_miss.is_some() {
                 // The fill can hold the slot while probing the model's dimensions.
                 let Ok(slot) = self.plane.try_lock() else {
                     return MeaningState::Starting;
@@ -369,12 +388,15 @@ impl Meaning {
                 None => MeaningState::Starting,
             };
         };
-        let snapshot = if cached_only {
+        let snapshot = if let Some(on_cache_miss) = on_cache_miss {
             match plane.cached_snapshot(view) {
                 Some(snapshot) => Ok(snapshot),
                 // No counts are certified for this view yet; never label an
                 // older view's coverage as current during refresh.
-                None => return MeaningState::Starting,
+                None => {
+                    on_cache_miss(&plane);
+                    return MeaningState::Starting;
+                }
             }
         } else {
             plane.snapshot(view)
