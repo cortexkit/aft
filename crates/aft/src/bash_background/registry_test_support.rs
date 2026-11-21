@@ -54,28 +54,135 @@ pub(crate) fn wait_fixture(
 
 pub(crate) use super::tests::insert_terminal_piped_task;
 
-    pub(crate) fn register_unpersisted_watch(registry: &BgTaskRegistry, id: String, pattern: WatchPattern, once: bool) {
-        registry.inner.watch_registry.lock().unwrap().register(id, pattern, once).unwrap();
-    }
+pub(crate) fn register_unpersisted_watch(
+    registry: &BgTaskRegistry,
+    id: String,
+    pattern: WatchPattern,
+    once: bool,
+) {
+    registry
+        .inner
+        .watch_registry
+        .lock()
+        .unwrap()
+        .register(id, pattern, once)
+        .unwrap();
+}
 
-pub(crate) use super::completion_preview::capture_reads::tests::{filler, terminal_task, with_secret};
-    pub(crate) use super::completion_preview::capture_reads::tests::DISPLAY_LINE_FINISH_BYTES;
+pub(crate) use super::completion_preview::capture_reads::tests::DISPLAY_LINE_FINISH_BYTES;
+pub(crate) use super::completion_preview::capture_reads::tests::{
+    filler, terminal_task, with_secret,
+};
 
-    pub(crate) fn display_bodies(registry: &BgTaskRegistry, task: &Arc<BgTask>, metadata: &PersistedTask, buffer: &BgBuffer) -> crate::bash_background::frames::BashBodies {
-        registry.display_bodies(task, metadata, buffer)
-    }
+pub(crate) fn display_bodies(
+    registry: &BgTaskRegistry,
+    task: &Arc<BgTask>,
+    metadata: &PersistedTask,
+    buffer: &BgBuffer,
+) -> crate::bash_background::frames::BashBodies {
+    registry.display_bodies(task, metadata, buffer)
+}
 
 #[cfg(unix)]
-    pub(crate) mod ordering {
-        pub(crate) use super::super::completion_replay_ordering_tests::{capture_live_ordering_frames, completion_frames, live_secret_task, pause_ordering_publication, registry, MASKED, SESSION};
-    }
+pub(crate) mod ordering {
+    pub(crate) use super::super::completion_replay_ordering_tests::{
+        capture_live_ordering_frames, completion_frames, live_secret_task,
+        pause_ordering_publication, registry, MASKED, SESSION,
+    };
+}
 
 pub(crate) use super::a02_tests::terminal_fixture;
 
-    pub(crate) fn set_completion_secrets(task: &BgTask, values: crate::log_redact::SecretValues) {
-        *task.completion_secrets.lock().unwrap() = Some(values);
-    }
+pub(crate) fn set_completion_secrets(task: &BgTask, values: crate::log_redact::SecretValues) {
+    *task.completion_secrets.lock().unwrap() = Some(values);
+}
 
-    pub(crate) fn capture_display_terminal(registry: &BgTaskRegistry, task: &Arc<BgTask>, stale: &PersistedTask, buffer: &BgBuffer) {
-        registry.capture_display_terminal(task, stale, buffer);
+pub(crate) fn capture_display_terminal(
+    registry: &BgTaskRegistry,
+    task: &Arc<BgTask>,
+    stale: &PersistedTask,
+    buffer: &BgBuffer,
+) {
+    registry.capture_display_terminal(task, stale, buffer);
+}
+
+pub(crate) use super::pty_completion_tests::Fixture as ConPtyFixture;
+
+#[cfg(target_os = "linux")]
+pub(crate) mod scopes {
+    pub(crate) use super::super::task_scope_tests::{
+        require_manager, scope_stopped, until, StopOnDrop,
+    };
+}
+
+pub(crate) use super::watchdog_cost_tests::fixture as watchdog_fixture;
+
+pub(crate) fn cleanup_finished_at(registry: &BgTaskRegistry, retention: Duration, now: Instant) {
+    registry.cleanup_finished_at(retention, now);
+}
+
+pub(crate) fn enqueue_counted_completion(
+    registry: &BgTaskRegistry,
+    metadata: &PersistedTask,
+    paths: &TaskPaths,
+) {
+    registry.enqueue_completion_from_parts(
+        metadata,
+        None,
+        Some(paths),
+        false,
+        None,
+        CompletionTokenPolicy::Count,
+    );
+}
+
+pub(crate) mod registry_cases {
+    pub(crate) use super::super::tests::{
+        append_each_line_output, each_line_running_fixture, each_line_running_fixture_with_once,
+        lifecycle_running_fixture, registry_with_db_and_frames, KillTasksOnDrop,
+    };
+    pub(crate) use super::insert_terminal_piped_task;
+    use super::*;
+
+    pub(crate) fn reset_full_artifact_read_calls() {
+        ARTIFACT_READ_ALL_CALLS.with(|calls| calls.set(0));
     }
+    pub(crate) fn full_artifact_read_calls() -> usize {
+        ARTIFACT_READ_ALL_CALLS.with(std::cell::Cell::get)
+    }
+    pub(crate) fn random_slug() -> String {
+        super::super::random_slug()
+    }
+    pub(crate) fn terminal_metadata_from_marker(
+        metadata: PersistedTask,
+        marker: ExitMarker,
+        reason: Option<String>,
+    ) -> PersistedTask {
+        super::super::terminal_metadata_from_marker(metadata, marker, reason)
+    }
+    pub(crate) fn terminal_db_row_snapshot(
+        row: BashTaskRow,
+        metadata: PersistedTask,
+    ) -> BgTaskSnapshot {
+        super::super::terminal_db_row_snapshot(row, metadata)
+    }
+    pub(crate) fn persist_watch_match(
+        registry: &BgTaskRegistry,
+        session: &str,
+        task: &str,
+        matched: &mut PatternMatch,
+        stdout: u64,
+        stderr: u64,
+        pty: u64,
+    ) {
+        registry.persist_watch_match(session, task, matched, stdout, stderr, pty);
+    }
+    pub(crate) fn ack_persisted_watches_for_task(
+        registry: &BgTaskRegistry,
+        session: &str,
+        task: &str,
+        terminal: bool,
+    ) {
+        registry.ack_persisted_watches_for_task(session, task, terminal);
+    }
+}

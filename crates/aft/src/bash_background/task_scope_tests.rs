@@ -156,7 +156,7 @@ fn task_scope_placement_refuses_a_live_unplaced_child() {
     );
 }
 
-struct StopOnDrop(String);
+pub(crate) struct StopOnDrop(pub(crate) String);
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
         if let Ok(Some(scope)) = super::super::task_scope::lookup(&self.0) {
@@ -423,60 +423,6 @@ fn task_scope_deadline_survives_durable_starting_checkpoint() {
     registry.kill(&id, "task-scope").unwrap();
 }
 
-#[test]
-#[ignore = "requires a systemd user manager"]
-fn task_scope_fixed_backstop_works_without_registry() {
-    require_manager();
-    let root = tempfile::tempdir().unwrap();
-    let registry = BgTaskRegistry::default();
-    registry.configure_task_scope_runtime(true, Duration::from_secs(1));
-    let id = registry
-        .spawn_with_shell_in_slot_typed(
-            SpawnPlan::Unsandboxed,
-            "echo alive > alive; sleep 60",
-            super::super::BashShell::Bash,
-            PathBuf::from("/bin/bash"),
-            "task-scope".into(),
-            root.path().into(),
-            HashMap::new(),
-            super::super::HardKill::Default,
-            None,
-            root.path().into(),
-            super::super::TaskSlot::Background { max: 4 },
-            true,
-            false,
-            Some(root.path().into()),
-            true,
-        )
-        .unwrap();
-    let _stop = StopOnDrop(id.clone());
-    let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
-    until(|| root.path().join("alive").exists());
-    assert_eq!(
-        registry
-            .hard_kill_deadline(&id, "task-scope")
-            .unwrap()
-            .limit_ms,
-        1000,
-        "reply ignored the earlier scope deadline"
-    );
-    let note =
-        crate::commands::bash_orchestrate::kill_deadline_note(&registry, &id, "task-scope", true);
-    assert!(
-        !note.contains("so it is not killed while you keep waiting"),
-        "{note}"
-    );
-    registry.detach();
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !scope_stopped(&scope.cgroup().join("cgroup.events")) {
-        assert!(
-            Instant::now() < deadline,
-            "fixed scope backstop did not stop the detached task"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
 fn scope_spawn(
     r: &BgTaskRegistry,
     root: &Path,
@@ -505,12 +451,12 @@ fn scope_spawn(
     .unwrap()
 }
 
-fn require_manager() {
+pub(crate) fn require_manager() {
     super::super::task_scope::probe_user_manager(Duration::from_secs(1))
         .expect("requires a systemd user manager");
 }
 
-fn scope_stopped(events: &Path) -> bool {
+pub(crate) fn scope_stopped(events: &Path) -> bool {
     match std::fs::read_to_string(events) {
         Ok(text) => text.lines().any(|line| line == "populated 0"),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
@@ -530,7 +476,7 @@ fn task_scope_stopped_requires_empty_or_missing_events() {
     assert!(std::panic::catch_unwind(|| scope_stopped(root.path())).is_err());
 }
 
-fn until(mut condition: impl FnMut() -> bool) {
+pub(crate) fn until(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(15);
     while !condition() {
         assert!(Instant::now() < deadline, "task scope condition timed out");
