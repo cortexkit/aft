@@ -992,3 +992,7 @@ mod tests {
         assert_eq!(unchecked.len(), DIRECTORY_FILE_CAP);
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "lsp_startup_regression_tests.rs"]
+mod startup_regression_tests;

@@ -414,3 +414,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tool_views_bus_tests.rs"]
+mod bus_tests;

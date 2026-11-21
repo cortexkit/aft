@@ -76,6 +76,15 @@ pub(crate) struct Publication {
 }
 
 impl Publication {
+    #[cfg(test)]
+    pub(crate) async fn sync_for_test(
+        &mut self,
+        writer: &mut impl Writer,
+        values: Vec<(String, Vec<u8>)>,
+    ) -> Result<(), &'static str> {
+        self.sync(writer, values).await
+    }
+
     pub(crate) async fn sync_with_hooks(
         &mut self,
         writer: &mut impl Writer,
