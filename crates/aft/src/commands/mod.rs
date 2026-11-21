@@ -93,7 +93,7 @@ pub(crate) mod read_manifest;
 pub mod remove_import;
 pub mod restore_checkpoint;
 #[cfg(test)]
-mod rewrite_tests;
+pub(crate) mod rewrite_tests;
 mod rollback_outcome;
 pub mod safety_purge;
 pub mod semantic_search;

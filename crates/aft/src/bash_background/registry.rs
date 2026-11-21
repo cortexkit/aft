@@ -2090,7 +2090,7 @@ pub(crate) enum TaskRuntime {
 pub(crate) struct BgTaskState {
     pub(crate) metadata: PersistedTask,
     /// Only the latest pre-acceptance line, never written to task metadata.
-    remote_admission_note: Option<String>,
+    pub(crate) remote_admission_note: Option<String>,
     /// The path stays in persisted metadata until this worker result succeeds,
     /// so a crash or a full queue leaves enough information for the stale sweep.
     temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
@@ -3822,7 +3822,7 @@ impl BgTaskRegistry {
         }
     }
 
-    fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
+    pub(crate) fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
         self.dual_write_task_tracked(paths, metadata, self.task_row_ticket(paths, metadata));
     }
 
@@ -10116,7 +10116,7 @@ impl BgTaskRegistry {
         )
     }
 
-    pub(super) fn status_relaxed(
+    pub(crate) fn status_relaxed(
         &self,
         task_id: &str,
         session_id: &str,
@@ -12221,7 +12221,7 @@ impl BgTaskRegistry {
         completions.remove(idx)
     }
 
-    fn completion_snapshot_for_task(&self, task: &Arc<BgTask>) -> Option<BgCompletion> {
+    pub(crate) fn completion_snapshot_for_task(&self, task: &Arc<BgTask>) -> Option<BgCompletion> {
         let snapshot = self.snapshot_with_terminal_cache(task, RUNNING_OUTPUT_PREVIEW_BYTES);
         if !snapshot.info.status.is_terminal() {
             return None;
@@ -13715,7 +13715,7 @@ impl BgTaskRegistry {
         }
     }
 
-    fn insert_rehydrated_task(
+    pub(crate) fn insert_rehydrated_task(
         &self,
         metadata: PersistedTask,
         paths: TaskPaths,
@@ -15672,7 +15672,7 @@ impl BgTaskRegistry {
         }
     }
 
-    fn task(&self, task_id: &str) -> Option<Arc<BgTask>> {
+    pub(crate) fn task(&self, task_id: &str) -> Option<Arc<BgTask>> {
         validate_task_id(task_id).ok()?;
         self.inner
             .tasks

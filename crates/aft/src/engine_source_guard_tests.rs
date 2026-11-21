@@ -167,6 +167,24 @@ fn ignored_file(path: &Path) -> bool {
     name == "tests.rs" || name.ends_with("_tests.rs") || path.iter().any(|part| part == "tests")
 }
 
+fn included_rust(node: Node<'_>, source: &str) -> Option<String> {
+    if node.kind() != "macro_invocation"
+        || text(node.child_by_field_name("macro")?, source) != "include"
+    {
+        return None;
+    }
+    let args = children(node)
+        .into_iter()
+        .find(|child| child.kind() == "token_tree")?;
+    let arg = args.named_child(0)?;
+    if arg.kind() != "string_literal" {
+        return None;
+    }
+    serde_json::from_str::<String>(text(arg, source))
+        .ok()
+        .filter(|path| path.ends_with(".rs"))
+}
+
 fn context_aliases<'a>(node: Node<'_>, source: &'a str, aliases: &mut Vec<&'a str>) {
     match node.kind() {
         "use_declaration" | "use_list" | "scoped_use_list" => {
@@ -314,6 +332,10 @@ impl Guard {
                 child_scope.upper |= scope.root && child_scope.test;
                 child_scope.root = false;
                 if self.visits(child_scope) {
+                    if let Some(included) = included_rust(child, source) {
+                        let file = path.parent().unwrap().join(included);
+                        self.file(&file, module_dir, child_scope);
+                    }
                     match self.scan {
                         Scan::EngineProduction => self.check(child, path, source),
                         Scan::UpperRegistration if child_scope.test => {

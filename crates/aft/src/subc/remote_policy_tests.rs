@@ -3332,7 +3332,8 @@ async fn siblings_pass_cores_launch_fetches_then_brocas_fetch_and_submit() {
             launch: access_grants::launch_key(&broca, "worker"),
         }));
     let run =
-        crate::bash_background::registry::remote::submit_runon_for_test(ctx, launch, &daemon).await;
+        crate::commands::rewrite_tests::remote::tests::submit_runon_for_test(ctx, launch, &daemon)
+            .await;
     assert_eq!(run["siblings"], json!([sibling]));
 }
 
@@ -3626,7 +3627,7 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
         .unwrap_err();
     assert_eq!(read.data["code"], crate::access_policy::ACCESS_ASK_REQUIRED);
     let asks_before_submit = crate::context::confinement::ask_calls();
-    crate::bash_background::registry::remote::assert_siblings_submit_refused_before_connect(
+    crate::commands::rewrite_tests::remote::tests::assert_siblings_submit_refused_before_connect(
         &ctx,
         launch,
         &daemon,
