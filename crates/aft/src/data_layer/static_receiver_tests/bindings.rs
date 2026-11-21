@@ -122,3 +122,29 @@ js! {
     js_destructuring_declaration: "function run() { const { field: [Receiver] } = get(); Receiver.probe(); }",
     js_class_field: "class Caller { Receiver = get(); run() { Receiver.probe(); } }",
 }
+
+#[test]
+fn csharp_type_parameters_hide_a_project_type_at_static_sites() {
+    let inputs = checkout(&[
+        ("src/Api.cs", "namespace App; interface I { static abstract void M(); } class T { public static void M() {} }"),
+        ("src/Method.cs", "namespace App; class Method { void Use<T>() where T : I { T.M(); } }"),
+        ("src/Owner.cs", "namespace App; class Owner<T> where T : I { class Nested { void Use() { T.M(); } } }"),
+        ("src/Other.cs", "namespace App; class Other { void Generic<T>() {} void Use() { T.M(); } }"),
+    ], &[]);
+    let rows = records_match_files(&inputs);
+    for path in ["src/Method.cs", "src/Owner.cs"] {
+        let answer = answer(&rows[path], "M");
+        assert_eq!(
+            (answer.unresolved, answer.external),
+            (1, 0),
+            "{path}: {answer:?}"
+        );
+        assert!(
+            answer
+                .protected
+                .contains(&("src/Api.cs".into(), "T::M".into())),
+            "{path}: {answer:?}"
+        );
+    }
+    exact(answer(&rows["src/Other.cs"], "M"), "src/Api.cs", &["T::M"]);
+}

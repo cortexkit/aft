@@ -50,6 +50,10 @@ pub(super) fn names<'tree>(node: Node<'tree>, language: &str) -> Vec<Node<'tree>
             | "var_pattern"
             | "from_clause"
             | "catch_declaration" => collect(field(node, &["name"]), &mut names),
+            "type_parameter" => collect(
+                field(node, &["name"]).or_else(|| child(node, "identifier")),
+                &mut names,
+            ),
             "foreach_statement" => collect(field(node, &["left"]), &mut names),
             "lambda_expression" => collect(
                 field(node, &["parameters"]).filter(|node| node.kind() == "implicit_parameter"),
@@ -160,6 +164,12 @@ pub(super) fn scope<'tree>(
     nav: impl Nav<'tree>,
 ) -> Option<Node<'tree>> {
     match node.kind() {
+        // Generic parameter names are visible in their own declaration,
+        // including nested types and callables.
+        "type_parameter" if language == "csharp" => nav
+            .parent(node)
+            .filter(|parent| parent.kind() == "type_parameter_list")
+            .and_then(|list| nav.parent(list)),
         "local_function_statement" => enclosing_function(nav.parent(node)?, nav),
         "resource" => nav.enclosing(node, &["try_with_resources_statement"]),
         "catch_formal_parameter" | "catch_declaration" => nav.enclosing(node, &["catch_clause"]),
