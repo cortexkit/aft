@@ -459,11 +459,9 @@ impl AppContext {
         // build wrote as today's stores refuse theirs, and is listed the
         // same way, after them. Push projection adds it itself, with this
         // project's other refusals.
-        let data_store_report = if kind != StatusSnapshotKind::Explicit {
-            crate::data_layer::surfaces::report_for_push(self)
-        } else {
-            crate::data_layer::surfaces::report(self)
-        };
+        // Explicit status runs on the standalone request loop. Like a push,
+        // it reports pending coverage instead of waiting for a background fill.
+        let data_store_report = crate::data_layer::surfaces::report_for_push(self);
         #[cfg(test)]
         cost.mark("data_report");
         let data_store_refusal = data_store_report

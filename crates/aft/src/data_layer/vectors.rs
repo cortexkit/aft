@@ -1337,6 +1337,22 @@ impl VectorPlane {
         })
     }
 
+    #[cfg(feature = "test-hooks")]
+    fn hold_members_for_status_test(&self) {
+        let Some(gate) = std::env::var_os("AFT_TEST_VECTOR_MEMBERS_GATE").map(PathBuf::from) else {
+            return;
+        };
+        if !gate.exists() {
+            return;
+        }
+        let _owner = self.members.lock().expect("no panics while holding it");
+        std::fs::write(gate.with_extension("waiting"), b"").expect("signal vector members gate");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while gate.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Reads the family's newest generation, if it is newer than the one
     /// the plane read last. When nothing newer was published this lists the
     /// family's directory and does nothing else (see [`Self::load`]).
@@ -1540,6 +1556,8 @@ impl VectorPlane {
         let Some(view) = self.checkout.view() else {
             return Ok(report);
         };
+        #[cfg(feature = "test-hooks")]
+        self.hold_members_for_status_test();
         let parts = self.checkout.vector_parts();
         let model = &self.producer.model;
         let dimensions = model.dimensions as usize;

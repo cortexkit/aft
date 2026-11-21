@@ -349,9 +349,19 @@ impl Meaning {
         let Some(view) = view else {
             return MeaningState::Unpublished;
         };
-        let plane = lock(&self.plane)
-            .as_ref()
-            .map(|configured| Arc::clone(&configured.plane));
+        let plane = {
+            let slot = if cached_only {
+                // The fill can hold the slot while probing the model's dimensions.
+                let Ok(slot) = self.plane.try_lock() else {
+                    return MeaningState::Starting;
+                };
+                slot
+            } else {
+                lock(&self.plane)
+            };
+            slot.as_ref()
+                .map(|configured| Arc::clone(&configured.plane))
+        };
         let failure = lock(&self.failure).clone();
         let Some(plane) = plane else {
             return match failure {

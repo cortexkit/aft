@@ -57,6 +57,7 @@ mod refresh;
 pub(crate) use refresh::RefreshCounts;
 pub(crate) mod resume;
 pub(crate) mod staged_records;
+mod status_view;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
@@ -1105,93 +1106,6 @@ impl Checkout {
 
     fn write_live(&self) -> std::sync::RwLockWriteGuard<'_, Live> {
         self.live.write().expect("no panics while holding it")
-    }
-
-    /// The checkout's data as queries see it now: the last publication with
-    /// the changes made since laid over it. `None` until the first build
-    /// publishes.
-    #[must_use]
-    pub fn view(&self) -> Option<CheckoutView> {
-        let live = self.live.read().expect("no panics while holding it");
-        let published = Arc::clone(live.published.as_ref()?);
-        let graph = live.graph.clone().unwrap_or_else(|| {
-            let graph: Arc<dyn SliceSource + Send + Sync> = published.graph.clone();
-            graph
-        });
-        Some(CheckoutView {
-            memory_epoch: Arc::clone(&self.memory_epoch),
-            published,
-            planes: self.planes,
-            text: Arc::clone(&live.text),
-            text_members: Arc::clone(&live.text_members),
-            callgraph_pending: Arc::clone(&live.callgraph_pending),
-            rescanning: live.rescanning,
-            graph,
-            refreshed: live.refreshed.clone(),
-            sequence: live.sequence,
-            unparsed: Arc::clone(&live.unparsed),
-            current: live.state.clone(),
-        })
-    }
-
-    /// How each plane stands, for status and for replies that disclose
-    /// what they could not cover.
-    #[must_use]
-    pub fn status(&self) -> CheckoutStatus {
-        let building = self
-            .live
-            .read()
-            .expect("no panics while holding it")
-            .building;
-        let failed = self
-            .live
-            .read()
-            .expect("no panics while holding it")
-            .failure
-            .is_some();
-        if let Some(view) = self.view() {
-            return CheckoutStatus {
-                building,
-                failed,
-                ..view.status()
-            };
-        }
-        let plane = |on: bool| {
-            if building && on {
-                PlaneStatus::Building {
-                    done: 0,
-                    total: None,
-                }
-            } else {
-                PlaneStatus::Off
-            }
-        };
-        CheckoutStatus {
-            text: plane(self.planes.text),
-            callgraph: plane(self.planes.callgraph),
-            callgraph_published: false,
-            planes: self.planes,
-            callgraph_pending: 0,
-            building,
-            unparsed: 0,
-            failed,
-        }
-    }
-
-    /// Why the last build or call-graph refresh failed, until one succeeds.
-    #[must_use]
-    pub fn failure(&self) -> Option<String> {
-        self.last_failure().map(|failure| failure.error)
-    }
-
-    /// The last failed build or call-graph refresh, until one succeeds.
-    #[must_use]
-    pub fn last_failure(&self) -> Option<Failure> {
-        self.live
-            .read()
-            .expect("no panics while holding it")
-            .failure
-            .clone()
     }
 
     /// Records how a build or refresh (`stage`) ended. A failure replaces

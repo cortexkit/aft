@@ -2225,8 +2225,8 @@ impl DataCheckout {
         self.work.meaning.state(self.view().as_ref())
     }
 
-    pub(crate) fn cached_meaning_status(&self) -> MeaningState {
-        self.work.meaning.cached_state(self.view().as_ref())
+    pub(crate) fn cached_meaning_status(&self, view: Option<&CheckoutView>) -> MeaningState {
+        self.work.meaning.cached_state(view)
     }
 
     #[cfg(test)]

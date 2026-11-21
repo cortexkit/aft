@@ -673,6 +673,81 @@ fn standalone_read_answers_while_scoped_inspect_waits_for_a_diagnostics_pull() {
     assert!(aft.shutdown().success());
 }
 
+#[cfg(feature = "test-hooks")]
+#[test]
+fn standalone_control_replies_while_meaning_fill_holds_members() {
+    let project = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let gate = storage.path().join("vector-members");
+    fs::write(&gate, "").unwrap();
+    fs::write(project.path().join("lib.rs"), "pub fn project_item() {}\n").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base_url = format!("http://{}", listener.local_addr().unwrap());
+    listener.set_nonblocking(true).unwrap();
+    let (stop, stopped) = mpsc::channel::<()>();
+    let embedder = thread::spawn(move || loop {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                read_http_request(&mut stream);
+                write_embedding_response(&mut stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if stopped.recv_timeout(Duration::from_millis(10))
+                    != Err(mpsc::RecvTimeoutError::Timeout)
+                {
+                    break;
+                }
+            }
+            Err(error) => panic!("accept embedding request: {error}"),
+        }
+    });
+    let mut aft = AftProcess::spawn_with_env(&[("AFT_TEST_VECTOR_MEMBERS_GATE", gate.as_os_str())]);
+    let configure = aft.send(
+        &json!({
+            "id": "configure-meaning-fill",
+            "command": "configure",
+            "harness": "opencode",
+            "project_root": project.path(),
+            "storage_dir": storage.path(),
+            "config": user_config(json!({
+                "indexes": { "semantic": true },
+                "semantic": {
+                    "backend": "openai_compatible",
+                    "model": "test-embedding",
+                    "base_url": base_url
+                }
+            }))
+        })
+        .to_string(),
+    );
+    assert_eq!(configure["success"], true, "{configure:#}");
+    wait_for_signal_file(&gate.with_extension("waiting"), "meaning fill members hold");
+
+    let deadline = Instant::now() + Duration::from_secs(1);
+    for command in ["status", "version", "ping"] {
+        aft.send_silent(&json!({"id": command, "command": command}).to_string());
+    }
+    let [status, version, ping] = ["status", "version", "ping"].map(|id| {
+        let (reply, _) = read_response(
+            &mut aft,
+            id,
+            deadline.saturating_duration_since(Instant::now()),
+        );
+        assert_eq!(reply["success"], true, "{reply:#}");
+        reply
+    });
+    assert_eq!(status["semantic_index"]["status"], "building", "{status:#}");
+    assert!(status["semantic_index"]["files"].is_null(), "{status:#}");
+    assert_eq!(status["semantic_index"]["filling"], true, "{status:#}");
+    assert!(version["version"].is_string(), "{version:#}");
+    assert_eq!(ping["command"], "pong", "{ping:#}");
+
+    fs::remove_file(gate).unwrap();
+    assert!(aft.shutdown().success());
+    drop(stop);
+    embedder.join().unwrap();
+}
+
 #[test]
 fn standalone_ndjson_status_and_cancel_proceed_while_search_is_pending() {
     let project = tempfile::tempdir().expect("create standalone project");

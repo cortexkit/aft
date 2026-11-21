@@ -191,12 +191,40 @@ impl Fixture {
 }
 
 #[test]
+fn status_does_not_wait_for_checkout_publication() {
+    let fixture = Fixture::new(1);
+    let checkout = fixture.checkout.checkout();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let mut reply = None;
+        checkout.with_live_write_lock_for_test(|| {
+            let ctx = Arc::clone(&fixture.ctx);
+            scope.spawn(move || {
+                let explicit = ctx.build_status_snapshot();
+                let push = ctx.try_build_status_push_snapshot().unwrap();
+                tx.send([explicit, push]).unwrap();
+            });
+            reply = Some(rx.recv_timeout(Duration::from_secs(1)));
+        });
+        for status in reply
+            .unwrap()
+            .expect("status waited for checkout publication")
+        {
+            assert_eq!(status["search_index"]["status"], "building", "{status}");
+            assert_eq!(status["callgraph_store"]["status"], "building", "{status}");
+            assert_eq!(status["semantic_index"]["status"], "building", "{status}");
+            assert!(status["semantic_index"]["files"].is_null(), "{status}");
+        }
+    });
+}
+
+#[test]
 fn status_push_matches_legacy_after_fill_refresh_checkpoint_create_and_delete_without_store_reads()
 {
     let fixture = Fixture::new(32);
     fixture.ctx.bind_status_context();
     let assert_parity = || {
-        // Explicit status retains the old hydration/report/disk-walk function.
+        // Explicit status still hydrates checkpoints and measures disk use.
         // Disk bytes on pushes are now a timestamped sample, so take a fresh
         // sample while the fixture is idle before comparing that measurement.
         fixture.checkout.disk_measurement().expire_for_test();

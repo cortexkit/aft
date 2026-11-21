@@ -592,7 +592,7 @@ fn report_inner(ctx: &dyn IndexHost, cached_only: bool) -> Option<DataStoreRepor
 pub(crate) fn storage_refusal(ctx: &dyn IndexHost) -> Option<NewerFormat> {
     match ctx.probe_data_checkout()? {
         DataCheckoutProbe::BindFailed(error) => error.refusal().cloned(),
-        DataCheckoutProbe::Bound(checkout) => checkout.last_failure()?.refusal,
+        DataCheckoutProbe::Bound(checkout) => checkout.checkout().try_last_failure()?.refusal,
         _ => None,
     }
 }
@@ -622,19 +622,26 @@ pub(crate) fn report_of(checkout: &DataCheckout) -> DataStoreReport {
 }
 
 fn report_of_inner(checkout: &DataCheckout, cached_only: bool) -> DataStoreReport {
-    let status = checkout.checkout().status();
-    let files = checkout.view().map(|view| view.state().paths().len());
+    let (status, view, failure) = if cached_only {
+        checkout.checkout().try_status_view()
+    } else {
+        (
+            checkout.checkout().status(),
+            checkout.view(),
+            checkout.last_failure(),
+        )
+    };
+    let files = view.as_ref().map(|view| view.state().paths().len());
     let mut report = report_from(
         &status,
         files,
-        checkout.last_failure(),
+        failure,
         Some(checkout.checkout().family_dir().to_path_buf()),
     );
-    report.meaning = meaning_report(checkout, cached_only);
+    report.meaning = meaning_report(checkout, cached_only, view.as_ref());
     report.disk_measurement = Some(Arc::clone(checkout.disk_measurement()));
-    report.skipped_folders = checkout
-        .view()
-        .map_or(0, |view| view.current_state().skipped_directories().len());
+    report.skipped_folders =
+        view.map_or(0, |view| view.current_state().skipped_directories().len());
     if report.skipped_folders > 0 {
         report.skipped_folder_note = Some(skipped_folder_health_note(
             checkout.checkout().root(),
@@ -883,11 +890,15 @@ impl MeaningReport {
 
 /// How `checkout`'s meaning plane stands; `None` while semantic search is
 /// off for the checkout.
-fn meaning_report(checkout: &DataCheckout, cached_only: bool) -> Option<MeaningReport> {
+fn meaning_report(
+    checkout: &DataCheckout,
+    cached_only: bool,
+    view: Option<&super::checkout::CheckoutView>,
+) -> Option<MeaningReport> {
     use crate::commands::data_search::DataSemantic;
     use crate::data_layer::status::SemanticIndexStatus;
     let semantic = if cached_only {
-        DataSemantic::from_state(checkout.cached_meaning_status())?
+        DataSemantic::from_state(checkout.cached_meaning_status(view))?
     } else {
         DataSemantic::of_checkout(checkout)?
     };
