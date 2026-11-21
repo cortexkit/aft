@@ -42,7 +42,7 @@ use super::{RerankBackend, RerankDoc, RerankError, RerankFingerprint};
 /// One file of a pinned model: its path inside the repository and the sha256
 /// of its content at the pinned commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PinnedFile {
+pub struct PinnedFile {
     pub(crate) path: &'static str,
     pub(crate) sha256: &'static str,
 }
@@ -53,7 +53,7 @@ pub(crate) struct PinnedFile {
 /// `main` branch can never change the model behind a fingerprint, a recorded
 /// fixture pack or a committed order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AllowedModel {
+pub struct AllowedModel {
     pub(crate) name: &'static str,
     pub(crate) repo: &'static str,
     /// Hugging Face commit the files are downloaded from; also the
@@ -65,12 +65,12 @@ pub(crate) struct AllowedModel {
     pub(crate) tokenizer_file: PinnedFile,
 }
 
-pub(crate) const DEFAULT_MODEL: &str = "bge-reranker-base";
+pub const DEFAULT_MODEL: &str = "bge-reranker-base";
 
 // Commits and hashes were read from the Hugging Face API
 // (`/api/models/<repo>/revision/main?blobs=true`, LFS sha256) and, for the
 // non-LFS tokenizer files, from downloads at the pinned commit.
-pub(crate) const ALLOWED_MODELS: &[AllowedModel] = &[
+pub const ALLOWED_MODELS: &[AllowedModel] = &[
     AllowedModel {
         name: "bge-reranker-base",
         repo: "BAAI/bge-reranker-base",
@@ -162,7 +162,7 @@ const MAX_LOAD_WAIT: Duration = Duration::from_secs(3_600);
 /// unused, with a floor of one thread. The two sessions together therefore
 /// stay within the available cores whenever there are at least two; on a
 /// single core the floor makes it two threads.
-pub(crate) fn rerank_intra_threads() -> usize {
+pub fn rerank_intra_threads() -> usize {
     let derivation = crate::local_embed::intra_thread_derivation();
     joint_rerank_threads(
         derivation.threads,
@@ -171,7 +171,7 @@ pub(crate) fn rerank_intra_threads() -> usize {
     )
 }
 
-pub(crate) fn joint_rerank_threads(
+pub fn joint_rerank_threads(
     embedder_threads: usize,
     available_parallelism: usize,
     quota_threads: Option<usize>,
@@ -186,7 +186,7 @@ pub(crate) fn joint_rerank_threads(
         .max(1)
 }
 
-pub(crate) fn find_allowed_model(name: &str) -> Option<&'static AllowedModel> {
+pub fn find_allowed_model(name: &str) -> Option<&'static AllowedModel> {
     let name = name.trim();
     ALLOWED_MODELS
         .iter()
@@ -194,7 +194,7 @@ pub(crate) fn find_allowed_model(name: &str) -> Option<&'static AllowedModel> {
 }
 
 /// Scores query/document pairs. The worker owns one; tests substitute a fake.
-pub(crate) trait PairScorer: Send {
+pub trait PairScorer: Send {
     fn score_pairs(
         &mut self,
         query: &str,
@@ -204,7 +204,7 @@ pub(crate) trait PairScorer: Send {
 }
 
 /// Builds the scorer on the worker thread (download, then session creation).
-pub(crate) type ScorerLoader = Arc<dyn Fn() -> Result<Box<dyn PairScorer>, String> + Send + Sync>;
+pub type ScorerLoader = Arc<dyn Fn() -> Result<Box<dyn PairScorer>, String> + Send + Sync>;
 
 struct Job {
     query: String,
@@ -228,7 +228,7 @@ struct Shared {
 }
 
 /// The ONNX backend for one allowed model.
-pub(crate) struct OnnxReranker {
+pub struct OnnxReranker {
     fingerprint: RerankFingerprint,
     shared: Arc<Shared>,
     loader: ScorerLoader,
@@ -236,7 +236,7 @@ pub(crate) struct OnnxReranker {
 }
 
 impl OnnxReranker {
-    pub(crate) fn with_loader(fingerprint: RerankFingerprint, loader: ScorerLoader) -> Self {
+    pub fn with_loader(fingerprint: RerankFingerprint, loader: ScorerLoader) -> Self {
         Self {
             fingerprint,
             shared: Arc::new(Shared {
@@ -373,7 +373,7 @@ fn worker_main(shared: Arc<Shared>, loader: ScorerLoader, keep_alive: Option<Arc
 }
 
 impl OnnxReranker {
-    pub(crate) fn enqueue(
+    pub fn enqueue(
         &self,
         query: &str,
         docs: &[RerankDoc<'_>],
@@ -451,15 +451,15 @@ pub(crate) fn fingerprint_for(model: &AllowedModel) -> RerankFingerprint {
     }
 }
 
-#[cfg(test)]
-pub(crate) fn shared_onnx_reranker(model: Option<&str>) -> Result<Arc<OnnxReranker>, String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn shared_onnx_reranker(model: Option<&str>) -> Result<Arc<OnnxReranker>, String> {
     shared_onnx_reranker_in(model, None, None)
 }
 
 /// Keep the legacy process-wide model when no cache location is configured.
 /// Configured namespaces share only with the same path and directory identity;
 /// weak entries let their workers retire after the last context stops using them.
-pub(crate) fn shared_onnx_reranker_in(
+pub fn shared_onnx_reranker_in(
     model: Option<&str>,
     cache_dir: Option<PathBuf>,
     lease: Option<std::sync::Weak<crate::root_cache::CacheLease>>,
@@ -509,7 +509,7 @@ pub(crate) fn shared_onnx_reranker_in(
 
 /// Local paths of one model's files.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ModelFiles {
+pub struct ModelFiles {
     pub(crate) model: PathBuf,
     /// External weight files loaded beside the graph.
     pub(crate) extras: Vec<PathBuf>,
@@ -525,7 +525,7 @@ fn provision_model_files(model: &AllowedModel) -> Result<ModelFiles, String> {
 /// Use the pinned snapshot under `cache_dir` when every file is present and
 /// matches its pinned sha256; otherwise download the pinned commit and verify
 /// it. A file whose hash does not match is deleted and the model refused.
-pub(crate) fn provision_model_files_in(
+pub fn provision_model_files_in(
     model: &AllowedModel,
     cache_dir: &Path,
 ) -> Result<ModelFiles, String> {
@@ -587,15 +587,12 @@ pub(crate) fn provision_model_files_in(
     Ok(local)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type ProvisionProbe = (&'static str, Arc<Mutex<Vec<PathBuf>>>);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static PROVISION_PROBE: OnceLock<Mutex<Option<ProvisionProbe>>> = OnceLock::new();
-#[cfg(test)]
-pub(crate) fn with_provision_probe<T>(
-    model: &'static str,
-    work: impl FnOnce() -> T,
-) -> (T, Vec<PathBuf>) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_provision_probe<T>(model: &'static str, work: impl FnOnce() -> T) -> (T, Vec<PathBuf>) {
     struct Reset(Option<ProvisionProbe>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -626,7 +623,7 @@ fn pinned_files(model: &AllowedModel) -> Vec<PinnedFile> {
 }
 
 /// hf-hub keeps a repo at `<cache>/models--<org>--<repo>/snapshots/<commit>/`.
-pub(crate) fn pinned_snapshot_dir(cache_dir: &Path, model: &AllowedModel) -> PathBuf {
+pub fn pinned_snapshot_dir(cache_dir: &Path, model: &AllowedModel) -> PathBuf {
     cache_dir
         .join(format!("models--{}", model.repo.replace('/', "--")))
         .join("snapshots")
@@ -648,7 +645,7 @@ fn files_in_snapshot(snapshot: &Path, model: &AllowedModel) -> ModelFiles {
 /// Check every file of the snapshot against its pinned sha256. A missing or
 /// mismatching file is deleted (the snapshot entry and, when it is a link into
 /// hf-hub's blob store, the blob it points to), so no later load can use it.
-pub(crate) fn verify_pinned_files(snapshot: &Path, model: &AllowedModel) -> Result<(), String> {
+pub fn verify_pinned_files(snapshot: &Path, model: &AllowedModel) -> Result<(), String> {
     for file in pinned_files(model) {
         let path = snapshot.join(file.path);
         let actual =
@@ -698,7 +695,7 @@ fn model_bytes(files: &ModelFiles) -> u64 {
 /// Session options that decide the reranker's CPU and memory cost. The cost
 /// profiling test varies them; production uses `SessionTuning::default()`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SessionTuning {
+pub struct SessionTuning {
     /// Whether idle intra-op threads busy-wait for work. ONNX Runtime spins by
     /// default; on a loaded machine the spinning threads compete with the
     /// threads doing the work, and measured on gte-reranker-modernbert-base it
@@ -759,7 +756,7 @@ impl Default for SessionTuning {
 }
 
 /// A loaded cross-encoder session and its tokenizer.
-pub(crate) struct OnnxPairScorer {
+pub struct OnnxPairScorer {
     /// Released explicitly in `Drop` under the ORT exit gate.
     session: ManuallyDrop<Session>,
     tokenizer: Tokenizer,
@@ -774,11 +771,11 @@ pub(crate) struct OnnxPairScorer {
 }
 
 impl OnnxPairScorer {
-    pub(crate) fn load(name: &str, files: &ModelFiles, threads: usize) -> Result<Self, String> {
+    pub fn load(name: &str, files: &ModelFiles, threads: usize) -> Result<Self, String> {
         Self::load_with(name, files, threads, SessionTuning::default())
     }
 
-    pub(crate) fn load_with(
+    pub fn load_with(
         name: &str,
         files: &ModelFiles,
         threads: usize,
@@ -977,21 +974,17 @@ impl OnnxPairScorer {
 // Only the Unix-only tests that measure scoring cost and run the hardware
 // experiment use these: token counts of each truncated (query, document)
 // pair, and the runtime profile.
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 impl OnnxPairScorer {
     /// Write the ONNX Runtime profile now and return its path.
-    pub(crate) fn end_profiling(&mut self) -> Result<String, String> {
+    pub fn end_profiling(&mut self) -> Result<String, String> {
         self.session
             .end_profiling()
             .map_err(|error| format!("end ONNX profiling: {error}"))
     }
 
     /// Tokens in each (query, doc) pair after truncation, as scoring sees them.
-    pub(crate) fn pair_token_lengths(
-        &self,
-        query: &str,
-        docs: &[String],
-    ) -> Result<Vec<usize>, String> {
+    pub fn pair_token_lengths(&self, query: &str, docs: &[String]) -> Result<Vec<usize>, String> {
         let pairs = docs
             .iter()
             .map(|doc| (query, doc.as_str()))
@@ -1078,7 +1071,7 @@ pub(crate) fn attention_batches(
     attention_batches_for_lengths(&lengths, budget)
 }
 
-pub(crate) fn attention_batches_for_lengths(
+pub fn attention_batches_for_lengths(
     lengths: &[usize],
     budget: usize,
 ) -> Vec<std::ops::Range<usize>> {
@@ -1103,4 +1096,36 @@ pub(crate) fn attention_batches_for_lengths(
         batches.push(start..lengths.len());
     }
     batches
+}
+
+#[cfg(feature = "test-support")]
+impl AllowedModel {
+    pub fn name(&self) -> &'static str {
+        self.name
+    }
+    pub fn commit(&self) -> &'static str {
+        self.commit
+    }
+    pub fn repo(&self) -> &'static str {
+        self.repo
+    }
+    pub fn model_file(&self) -> &PinnedFile {
+        &self.model_file
+    }
+    pub fn extra_files(&self) -> &[PinnedFile] {
+        self.extra_files
+    }
+    pub fn tokenizer_file(&self) -> &PinnedFile {
+        &self.tokenizer_file
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl PinnedFile {
+    pub fn sha256(&self) -> &'static str {
+        self.sha256
+    }
+    pub fn path(&self) -> &'static str {
+        self.path
+    }
 }

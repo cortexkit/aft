@@ -223,25 +223,25 @@ impl Default for Tier2ReuseOptions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum InspectBuilderState {
+pub enum InspectBuilderState {
     Building,
     WaitingForCacheWriterLease,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     Suspended,
     BuildDenied,
     Absent,
 }
 
 impl InspectBuilderState {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Building => "building",
             Self::WaitingForCacheWriterLease => "waiting_for_inspect_cache_writer_lease",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             Self::Suspended => "suspended",
             Self::BuildDenied => "build_denied (borrow-only)",
             Self::Absent => "absent",
@@ -663,7 +663,7 @@ pub struct InspectManager {
     callgraph_projection: Arc<ProjectionSlot>,
     oxc_facts_cache: Mutex<OxcFactsCache>,
     soft_deadline: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     metrics_wait_for_test: Arc<Mutex<Option<Arc<MetricsWaitControlForTest>>>>,
     next_job_id: AtomicU64,
     heavy_root_work_allowed: Arc<AtomicBool>,
@@ -704,7 +704,7 @@ pub struct InspectManager {
     dead_code_callgraph_waits: AtomicUsize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct MetricsWaitControlForTest {
     non_expiring: bool,
     worker_held: AtomicBool,
@@ -712,17 +712,17 @@ struct MetricsWaitControlForTest {
     release_rx: Receiver<()>,
 }
 
-#[cfg(test)]
-pub(crate) struct MetricsWaitForTest(Arc<MetricsWaitControlForTest>);
+#[cfg(any(test, feature = "test-support"))]
+pub struct MetricsWaitForTest(Arc<MetricsWaitControlForTest>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl MetricsWaitForTest {
-    pub(crate) fn worker_was_held(&self) -> bool {
+    pub fn worker_was_held(&self) -> bool {
         self.0.worker_held.load(Ordering::SeqCst)
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for MetricsWaitForTest {
     fn drop(&mut self) {
         // A failed assertion must not leave the metrics worker parked forever.
@@ -778,9 +778,9 @@ impl InspectManager {
     ) -> Self {
         let root_work_cancellation = Arc::new(Mutex::new(crate::executor::JobCancellation::new()));
         let worker_cancellation = Arc::clone(&root_work_cancellation);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let metrics_wait_for_test = Arc::new(Mutex::new(None::<Arc<MetricsWaitControlForTest>>));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let metrics_worker_control = metrics_wait_for_test.clone();
         let caches = Arc::new(Mutex::new(HashMap::new()));
         let cache_writer_waits = Arc::new(Mutex::new(HashMap::new()));
@@ -799,7 +799,7 @@ impl InspectManager {
             let _files = worker_file_progress
                 .get(&job.category)
                 .map(|progress| progress.enter());
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if job.category == InspectCategory::Metrics {
                 let control = metrics_worker_control.lock().unwrap().clone();
                 if let Some(control) = control {
@@ -852,7 +852,7 @@ impl InspectManager {
             callgraph_projection: Arc::new(Mutex::new(None)),
             oxc_facts_cache: Mutex::new(OxcFactsCache::new()),
             soft_deadline,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             metrics_wait_for_test,
             next_job_id: AtomicU64::new(1),
             heavy_root_work_allowed,
@@ -878,7 +878,7 @@ impl InspectManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn non_expiring_metrics_wait_for_test(&self) -> MetricsWaitForTest {
         let (release_tx, release_rx) = bounded(1);
         let control = Arc::new(MetricsWaitControlForTest {
@@ -1224,7 +1224,7 @@ impl InspectManager {
     }
 
     /// Marks a dead-code pass as waiting for its call graph, or no longer.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
         if waiting {
             self.dead_code_callgraph_waits
@@ -1571,7 +1571,7 @@ impl InspectManager {
 
     /// Hold the in-flight job map for the duration of `while_held`, so a test
     /// can prove a caller does not wait for it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
         let _held = self
             .in_flight
@@ -1580,7 +1580,7 @@ impl InspectManager {
         while_held();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
         let key = JobKey::for_project_category(category);
         let mut jobs = self
@@ -1598,7 +1598,7 @@ impl InspectManager {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_tier2_attempt_outcome_for_test(
         &self,
         category: InspectCategory,
@@ -3741,7 +3741,7 @@ impl InspectManager {
         wait_budget: Duration,
     ) -> JobOutcome {
         let timeout = after(deadline.saturating_duration_since(Instant::now()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let timeout = match self.metrics_wait_for_test.lock().unwrap().clone() {
             Some(control) if key.category == InspectCategory::Metrics => {
                 if control.non_expiring {
@@ -5605,8 +5605,8 @@ fn filter_outcome_for_scope(outcome: JobOutcome, scope: &JobScope) -> JobOutcome
     }
 }
 
-#[cfg(test)]
-pub(crate) fn filter_payload_for_scope_for_test(payload: Value, scope: &JobScope) -> Value {
+#[cfg(any(test, feature = "test-support"))]
+pub fn filter_payload_for_scope_for_test(payload: Value, scope: &JobScope) -> Value {
     filter_payload_for_scope(payload, scope)
 }
 

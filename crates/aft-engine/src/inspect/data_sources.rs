@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use crate::data_layer::bound_checkouts::note_root;
 pub(crate) use crate::data_layer::bound_checkouts::RootKind;
 use crate::data_layer::bound_checkouts::{root_kind, BOUND};
@@ -361,7 +361,7 @@ fn stored_todos_now(
     stored_todos_read(project_root, config, scope_files, true)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn stored_todos_uncached_for_test(
     project_root: &Path,
     config: &crate::config::Config,

@@ -115,7 +115,9 @@ fn grep_fallback_walk_skips_nested_worktrees() {
     let (_dir, fixture) = fixture();
     let root = &fixture.root;
     let filters = crate::search_index::PathFilters::default();
-    let outcome = crate::grep_executor::bounded_fallback_walk_files(root, root, &filters, "grep");
+    let outcome = aft_engine::test_bridge::search_misc::bounded_fallback_walk_files(
+        root, root, &filters, "grep",
+    );
     assert!(!outcome.walk_truncated, "fixture walk must complete");
     let walked = relative_set(root, outcome.files);
     assert!(
@@ -143,7 +145,7 @@ fn explicitly_named_worktree_target_still_walks_like_an_ignored_target() {
     // A directory explicitly named inside the worktree is walked: the boundary
     // only prunes entries below the walk's own root, never the root itself,
     // the same rule explicitly named gitignored directories follow.
-    let outcome = crate::grep_executor::bounded_fallback_walk_files(
+    let outcome = aft_engine::test_bridge::search_misc::bounded_fallback_walk_files(
         &fixture.worktree,
         &fixture.worktree,
         &filters,
@@ -227,16 +229,19 @@ fn watcher_drops_events_under_nested_worktrees() {
     let independent_file = fixture.independent.join("inner.rs");
     let submodule_file = fixture.submodule.join("code.rs");
     assert!(
-        crate::watcher_filter::watcher_path_is_infra_skip_under(root, &linked_file),
+        aft_engine::test_bridge::search_misc::watcher_path_is_infra_skip_under(root, &linked_file),
         "events under a nested linked worktree must be dropped"
     );
     assert!(
-        crate::watcher_filter::watcher_path_is_infra_skip_under(root, &fixture.worktree),
+        aft_engine::test_bridge::search_misc::watcher_path_is_infra_skip_under(
+            root,
+            &fixture.worktree
+        ),
         "the worktree root itself must be dropped"
     );
     for path in [&main_file, &independent_file, &submodule_file] {
         assert!(
-            !crate::watcher_filter::watcher_path_is_infra_skip_under(root, path),
+            !aft_engine::test_bridge::search_misc::watcher_path_is_infra_skip_under(root, path),
             "{} must still be watched",
             path.display()
         );

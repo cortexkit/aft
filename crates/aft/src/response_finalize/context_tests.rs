@@ -1,13 +1,14 @@
 mod callgraph_store_for_ops_tests {
     use crate::config::Config;
-    use crate::context::{
-        callgraph_test_support::cold_build_fixture, install_pending_capture_hook_for_test,
-        AppContext, PendingCaptureBoundary,
-    };
+    use crate::context::AppContext;
     use crate::inspect::{InspectCategory, InspectSnapshot, JobOutcome, JobScope};
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
     use crate::watcher_filter::WatcherDispatchEvent;
+    use aft_engine::test_bridge::display_data::context::{
+        callgraph_test_support::cold_build_fixture, install_pending_capture_hook_for_test,
+        PendingCaptureBoundary,
+    };
     use serde_json::json;
     use std::path::Path;
     use std::sync::Arc;

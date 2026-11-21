@@ -333,7 +333,7 @@ fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
     let paths = task_paths(&storage, "foreign-session", "bash-a2f0123456789012").unwrap();
     std::fs::create_dir_all(&paths.dir).unwrap();
     #[cfg(unix)]
-    let scratch = crate::sandbox_spawn::create_task_temp_dir(&paths.dir).unwrap();
+    let scratch = aft_engine::test_bridge::bash_remote::create_task_temp_dir(&paths.dir).unwrap();
     #[cfg(not(unix))]
     let scratch_dir = tempfile::Builder::new()
         .prefix(".sandbox-tmp-audit2-")
@@ -344,7 +344,7 @@ fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = crate::sandbox_spawn::cleanup_task_temp_dir(&self.0);
+            let _ = aft_engine::test_bridge::bash_remote::cleanup_task_temp_dir(&self.0);
         }
     }
     let _cleanup = Cleanup(scratch.clone());
@@ -651,7 +651,7 @@ struct ScratchCleanup(PathBuf);
 #[cfg(unix)]
 impl Drop for ScratchCleanup {
     fn drop(&mut self) {
-        let _ = crate::sandbox_spawn::cleanup_task_temp_dir(&self.0);
+        let _ = aft_engine::test_bridge::bash_remote::cleanup_task_temp_dir(&self.0);
     }
 }
 
@@ -664,7 +664,7 @@ fn registered_scratch(f: &Fixture, session: &str, task: &str) -> (PathBuf, Scrat
     let storage = f.ctx.storage_dir();
     let paths = task_paths(&storage, session, task).unwrap();
     std::fs::create_dir_all(&paths.dir).unwrap();
-    let scratch = crate::sandbox_spawn::create_task_temp_dir(&paths.dir).unwrap();
+    let scratch = aft_engine::test_bridge::bash_remote::create_task_temp_dir(&paths.dir).unwrap();
     let mut metadata = PersistedTask::starting(
         task.into(),
         session.into(),

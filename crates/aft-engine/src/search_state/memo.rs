@@ -105,7 +105,7 @@ fn read_digest_after_open(
     super::waits::timed(super::waits::SearchWait::FileRead, || {
         let mut file = fs::File::open(path)?;
         let (digest, bytes, stat) = digest_open_file_after_stat(&mut file, after_open)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         super::request_files::record_disk_read(path);
         if let (Some(files), Some(bytes)) = (request_files, bytes) {
             files.keep_read(path, bytes, Some(stat));
@@ -913,7 +913,7 @@ impl ExactMemoStore {
         let (digest, bytes, read_stat) =
             digest_open_file(&mut file).map_err(|_| path.to_path_buf())?;
         drop(read_wait);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         super::request_files::record_disk_read(path);
         after_read();
         // Later phases of this request (snippets, matching lines) read the

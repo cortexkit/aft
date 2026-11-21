@@ -42,7 +42,7 @@ fn with_parse_timeout<T>(timeout: Duration, f: impl FnOnce() -> T) -> T {
 }
 
 #[derive(Debug)]
-pub(crate) enum ParseOutcome {
+pub enum ParseOutcome {
     Exited(Option<i32>),
     Missing,
     TimedOut,
@@ -50,10 +50,10 @@ pub(crate) enum ParseOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum LookupOutcome {
+pub enum LookupOutcome {
     Found(PathBuf),
     Missing,
-    #[cfg(any(test, target_os = "macos"))]
+    #[cfg(any(test, feature = "test-support", target_os = "macos"))]
     TimedOut,
     Unavailable(String),
 }
@@ -140,7 +140,7 @@ fn compiler_verdict(
     }
 }
 
-pub(crate) fn cached_lookup(
+pub fn cached_lookup(
     cache: &OnceLock<LookupOutcome>,
     lookup: impl FnOnce() -> LookupOutcome,
 ) -> LookupOutcome {
@@ -249,7 +249,7 @@ pub(super) fn with_native_swiftc<T>(f: impl FnOnce() -> T) -> Option<T> {
 }
 
 fn parse(tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher, source: &str) -> ParseOutcome {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(outcome) =
         RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|runner| runner(source)))
     {
@@ -260,7 +260,7 @@ fn parse(tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher, source: &st
     })
 }
 
-pub(crate) fn parse_with_lookup(
+pub fn parse_with_lookup(
     source: &str,
     lookup: impl FnOnce() -> LookupOutcome,
     checker: impl FnOnce(&Path, &str) -> ParseOutcome,
@@ -268,7 +268,7 @@ pub(crate) fn parse_with_lookup(
     match lookup() {
         LookupOutcome::Found(path) => checker(&path, source),
         LookupOutcome::Missing => ParseOutcome::Missing,
-        #[cfg(any(test, target_os = "macos"))]
+        #[cfg(any(test, feature = "test-support", target_os = "macos"))]
         LookupOutcome::TimedOut => ParseOutcome::TimedOut,
         LookupOutcome::Unavailable(reason) => ParseOutcome::Unavailable(reason),
     }
@@ -298,7 +298,7 @@ fn run_swiftc(
     }
 }
 
-pub(crate) fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome {
+pub fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> ParseOutcome {
     match result {
         Ok(result) => ParseOutcome::Exited(result.status.code()),
         Err(FormatError::NotFound { .. }) => ParseOutcome::Missing,
@@ -314,7 +314,7 @@ pub(crate) fn parse_outcome(result: Result<SubprocessOutcome, FormatError>) -> P
 /// With `may_stop_reading`, a checker that exits before reading all of its
 /// input (bash stops at the first syntax error) is judged by its exit status;
 /// otherwise the failed write makes the run fail.
-pub(crate) fn run_command(
+pub fn run_command(
     mut command: Command,
     tool: &str,
     source: &str,
@@ -366,16 +366,16 @@ pub(crate) fn run_command(
     }
     result
 }
-#[cfg(test)]
-pub(crate) type Runner = Box<dyn FnMut(&str) -> ParseOutcome>;
+#[cfg(any(test, feature = "test-support"))]
+pub type Runner = Box<dyn FnMut(&str) -> ParseOutcome>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static RUNNER: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) fn with_runner<T>(runner: Runner, f: impl FnOnce() -> T) -> T {
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_runner<T>(runner: Runner, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Runner>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -386,10 +386,10 @@ pub(crate) fn with_runner<T>(runner: Runner, f: impl FnOnce() -> T) -> T {
     f()
 }
 
-#[cfg(test)]
-pub(crate) const TUPLE: &str = "_ = (Int, Result<String, Error>).self\n";
-#[cfg(test)]
-pub(crate) const BROKEN: &str = "_ = (Int, Result<String, Error>.self\n";
+#[cfg(any(test, feature = "test-support"))]
+pub const TUPLE: &str = "_ = (Int, Result<String, Error>).self\n";
+#[cfg(any(test, feature = "test-support"))]
+pub const BROKEN: &str = "_ = (Int, Result<String, Error>.self\n";
 
 #[cfg(test)]
 mod tests {

@@ -21,13 +21,15 @@
 
 pub(crate) use crate::search_state::rerank::slot;
 #[cfg(test)]
-pub(crate) use crate::search_state::rerank::{
-    fixture, note_io, onnx, remote, synapse, NoopRerankBackend, RerankBackend, DEFAULT_TIMEOUT_MS,
-    DEFAULT_TOP_N, MAX_TIMEOUT_MS, MAX_TOP_N, MIN_TIMEOUT_MS,
-};
+pub(crate) use crate::search_state::rerank::RerankBackend;
 pub(crate) use crate::search_state::rerank::{
     short_reason, RerankDoc, RerankError, RerankFingerprint, RerankSettings, SelectedBackend,
     FIXTURE_PACK_ENV, TEXT_POLICY_REVISION,
+};
+#[cfg(test)]
+pub(crate) use aft_engine::test_bridge::search_misc::rerank::{
+    fixture, note_io, onnx, remote, synapse, NoopRerankBackend, DEFAULT_TIMEOUT_MS, DEFAULT_TOP_N,
+    MAX_TIMEOUT_MS, MAX_TOP_N, MIN_TIMEOUT_MS,
 };
 pub(crate) mod pool_export;
 

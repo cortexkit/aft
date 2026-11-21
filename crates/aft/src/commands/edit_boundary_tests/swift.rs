@@ -1,14 +1,14 @@
 mod tests {
     use crate::config::Config;
-    use crate::edit::swift::{
+    use crate::edit::validate_syntax_str;
+    use aft_engine::test_bridge::search_misc::edit_swift::{
         cached_lookup, parse_with_lookup, with_runner, LookupOutcome, ParseOutcome, Runner, BROKEN,
         TUPLE,
     };
-    use crate::edit::validate_syntax_str;
     use std::sync::OnceLock;
     #[cfg(unix)]
     use {
-        crate::edit::swift::{parse_outcome, run_command},
+        aft_engine::test_bridge::search_misc::edit_swift::{parse_outcome, run_command},
         std::process::Command,
         std::time::{Duration, Instant},
     };
