@@ -37,7 +37,6 @@ pub(crate) use crate::reader_floor::prepare_cache_root_for_test;
 use crate::cache_location as location;
 pub use crate::cache_location::CACHE_DOMAINS;
 pub use crate::process_identity::process_start_time_ms;
-#[cfg(test)]
 pub(crate) use location::canonical_root;
 #[cfg(test)]
 pub(crate) use location::markers::sweep_all_read_markers;
