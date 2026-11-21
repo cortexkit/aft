@@ -16640,7 +16640,7 @@ mod tests {
         ctx.rerank_slot().set_constructor_for_test(
             Arc::new(|inputs| {
                 let backend = synapse::SynapseReranker::connect(
-                    &inputs.semantic,
+                    &inputs.semantic(),
                     "test-reranker".into(),
                     Some("test-pin".into()),
                     100,
@@ -17341,7 +17341,7 @@ mod tests {
         while counters
             .snapshot()
             .exclusion_planning()
-            .is_none_or(|plan| plan.attempts < 2)
+            .is_none_or(|plan| plan.attempts() < 2)
         {
             assert!(
                 Instant::now() < deadline,
@@ -21960,6 +21960,9 @@ mod tests {
     use aft_engine::test_bridge::search_misc::LspEventWaitTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::WatcherExclusionPlanningSnapshotTestExt as _;
 }
 
 #[cfg(test)]

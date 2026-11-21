@@ -11538,7 +11538,7 @@ mod tests {
         assert_eq!(
             watcher
                 .begin_rescan(crate::watcher_filter::RescanReason::UserDropped)
-                .raw_events,
+                .raw_events(),
             2
         );
         watcher.finish_rescan(42, Some(-4096));
@@ -12026,6 +12026,9 @@ mod tests {
     use aft_engine::test_bridge::search_misc::InspectManagerTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::WatcherRescanIntervalTestExt as _;
 }
 
 #[derive(Clone)]

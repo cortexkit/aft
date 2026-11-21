@@ -86,6 +86,7 @@ test_methods! { DataCheckoutTestExt for DataCheckout {
     fn root(&self) -> &Path;
     fn note_outcome_for_test<T>(&self, stage: &'static str, result: &Result<T, DataError>);
     fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>);
+    fn filling(&self) -> bool;
     #[cfg(all(feature = "wasm-grammars", feature = "test-hooks", not(all(target_os = "windows", target_arch = "aarch64"))))]
     fn grammar_driver_running_for_test(&self) -> bool;
 } associated {
