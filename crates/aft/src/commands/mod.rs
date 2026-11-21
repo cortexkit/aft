@@ -49,6 +49,8 @@ mod configure_test_env;
 pub mod conflicts;
 pub mod delete_file;
 pub(crate) mod delete_tree;
+#[cfg(test)]
+mod edit_boundary_tests;
 pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
