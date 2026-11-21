@@ -61,7 +61,7 @@ fn bash_permissions_unknown_cwd_reason_in_consent() {
 }
 
 fn grant_test_context(root: &ProjectRootId, storage: &Path) -> Arc<AppContext> {
-    Arc::new(AppContext::new(
+    Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.as_path().into()),

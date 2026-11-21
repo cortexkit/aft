@@ -13,8 +13,15 @@ const UPPER: &[&str] = &[
     "bounded_io_command",
     "tool_output",
     "trace_measure_run",
+    "access_policy_tests",
+    "nested_worktree_tests",
+    "daemon_heap_probe",
+    "search_hot_path_measurements",
+    "engine_source_guard_tests",
+    "upper_test_context",
 ];
 const TRACE_FACADE: &str = "pub use crate::trace_measure_run::run;";
+const REGISTERING_HELPER: &str = "upper_test_context.rs";
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
@@ -84,7 +91,8 @@ fn is_test_item(attrs: &[Node<'_>], node: Node<'_>, source: &str) -> bool {
         it.kind() == "attribute_item"
             && attribute(*it).is_some_and(|attr| {
                 test_cfg(attr, source)
-                    || (node.kind() == "function_item" && text(attr, source) == "test")
+                    || (node.kind() == "function_item"
+                        && matches!(text(attr, source), "test" | "tokio::test"))
             })
     })
 }
@@ -158,15 +166,85 @@ fn ignored_file(path: &Path) -> bool {
     name == "tests.rs" || name.ends_with("_tests.rs") || path.iter().any(|part| part == "tests")
 }
 
+fn context_aliases<'a>(node: Node<'_>, source: &'a str, aliases: &mut Vec<&'a str>) {
+    match node.kind() {
+        "use_declaration" | "use_list" | "scoped_use_list" => {
+            for child in children(node) {
+                context_aliases(child, source, aliases);
+            }
+        }
+        "use_as_clause" => {
+            let path = text(node.child_by_field_name("path").unwrap(), source);
+            if path.rsplit("::").next().unwrap().trim() == "AppContext" {
+                let alias = text(node.child_by_field_name("alias").unwrap(), source);
+                aliases.push(alias);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn constructs_context(node: Node<'_>, source: &str, aliases: &[&str]) -> bool {
+    if node.kind() == "call_expression" {
+        let Some(function) = node.child_by_field_name("function") else {
+            return false;
+        };
+        let function = if function.kind() == "generic_function" {
+            function.child_by_field_name("function").unwrap_or(function)
+        } else {
+            function
+        };
+        let mut path = text(function, source)
+            .rsplit("::")
+            .map(|word| word.trim().trim_start_matches("r#"));
+        return path.next() == Some("new")
+            && path
+                .next()
+                .is_some_and(|owner| owner == "AppContext" || aliases.contains(&owner));
+    }
+    if node.kind() == "token_tree" {
+        let mut cursor = node.walk();
+        let tokens: Vec<_> = node
+            .children(&mut cursor)
+            .filter(|token| !matches!(token.kind(), "line_comment" | "block_comment"))
+            .collect();
+        return tokens.windows(4).any(|group| {
+            let owner = text(group[0], source).trim_start_matches("r#");
+            (owner == "AppContext" || aliases.contains(&owner))
+                && group[1].kind() == "::"
+                && text(group[2], source).trim_start_matches("r#") == "new"
+                && group[3].kind() == "token_tree"
+                && text(group[3], source).starts_with('(')
+        });
+    }
+    false
+}
+
+#[derive(Clone, Copy)]
+enum Scan {
+    EngineProduction,
+    UpperRegistration,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Scope {
+    inline: bool,
+    root: bool,
+    upper: bool,
+    test: bool,
+}
+
 struct Guard {
     root: PathBuf,
     parser: Parser,
     findings: Vec<String>,
     facade: usize,
+    scan: Scan,
+    helper_calls: usize,
 }
 
 impl Guard {
-    fn new(root: &Path) -> Self {
+    fn new(root: &Path, scan: Scan) -> Self {
         let mut parser = Parser::new();
         parser
             .set_language(&tree_sitter_rust::LANGUAGE.into())
@@ -176,23 +254,22 @@ impl Guard {
             parser,
             findings: Vec::new(),
             facade: 0,
+            scan,
+            helper_calls: 0,
         }
     }
 
-    fn file(&mut self, path: &Path, module_dir: &Path, root: bool) {
-        // Match the library package's exclusions without treating inline test
-        // modules as production merely because their parent file is shipped.
-        if ignored_file(path.strip_prefix(&self.root).unwrap_or(path)) {
-            return;
-        }
+    fn file(&mut self, path: &Path, module_dir: &Path, scope: Scope) {
         let source =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        self.source(path, module_dir, root, &source);
+        self.source(path, module_dir, scope, &source);
     }
 
-    fn source(&mut self, path: &Path, module_dir: &Path, root: bool, source: &str) {
+    fn source(&mut self, path: &Path, module_dir: &Path, mut scope: Scope, source: &str) {
+        scope.test |= ignored_file(path.strip_prefix(&self.root).unwrap_or(path));
+        scope.inline = false;
         let syntax = self.parser.parse(source, None).unwrap();
-        self.walk(syntax.root_node(), path, module_dir, false, root, source);
+        self.walk(syntax.root_node(), path, module_dir, scope, source, &[]);
     }
 
     fn walk(
@@ -200,16 +277,23 @@ impl Guard {
         node: Node<'_>,
         path: &Path,
         module_dir: &Path,
-        inline: bool,
-        root: bool,
+        mut scope: Scope,
         source: &str,
+        outer_aliases: &[&str],
     ) {
         let kids = children(node);
-        if kids.iter().any(|child| {
+        scope.test |= kids.iter().any(|child| {
             child.kind() == "inner_attribute_item"
                 && attribute(*child).is_some_and(|attr| test_cfg(attr, source))
-        }) {
+        });
+        if !self.visits(scope) {
             return;
+        }
+        let mut aliases = outer_aliases.to_vec();
+        if matches!(self.scan, Scan::UpperRegistration) {
+            for child in &kids {
+                context_aliases(*child, source, &mut aliases);
+            }
         }
         let mut attrs = Vec::new();
         for child in kids {
@@ -221,12 +305,22 @@ impl Guard {
                 "line_comment" | "block_comment" | "inner_attribute_item" => continue,
                 _ => {}
             }
-            if !is_test_item(&attrs, child, source) {
-                if child.kind() == "mod_item" {
-                    self.module(child, path, module_dir, inline, root, source, &attrs);
-                } else {
-                    self.check(child, path, source);
-                    self.walk(child, path, module_dir, inline, false, source);
+            let mut child_scope = scope;
+            child_scope.test |= is_test_item(&attrs, child, source);
+            if child.kind() == "mod_item" {
+                self.module(child, path, module_dir, child_scope, source, &attrs);
+            } else {
+                child_scope.upper |= scope.root && child_scope.test;
+                child_scope.root = false;
+                if self.visits(child_scope) {
+                    match self.scan {
+                        Scan::EngineProduction => self.check(child, path, source),
+                        Scan::UpperRegistration if child_scope.test => {
+                            self.check_registration(child, path, source, &aliases);
+                        }
+                        Scan::UpperRegistration => {}
+                    }
+                    self.walk(child, path, module_dir, child_scope, source, &aliases);
                 }
             }
             attrs.clear();
@@ -238,13 +332,14 @@ impl Guard {
         node: Node<'_>,
         path: &Path,
         module_dir: &Path,
-        inline: bool,
-        root: bool,
+        mut scope: Scope,
         source: &str,
         attrs: &[Node<'_>],
     ) {
         let name = text(node.child_by_field_name("name").unwrap(), source);
-        if root && UPPER.contains(&name) {
+        scope.upper |= scope.root && UPPER.contains(&name);
+        scope.root = false;
+        if !self.visits(scope) {
             return;
         }
         let override_path = attrs
@@ -258,17 +353,18 @@ impl Guard {
                 Some(text(attr.child_by_field_name("value").unwrap(), source).trim_matches('"'))
             });
         let default_dir = module_dir.join(name);
-        let override_base = if inline {
+        let override_base = if scope.inline {
             module_dir
         } else {
             path.parent().unwrap()
         };
         if let Some(body) = node.child_by_field_name("body") {
             let nested = override_path.map_or(default_dir, |name| override_base.join(name));
-            self.walk(body, path, &nested, true, false, source);
+            scope.inline = true;
+            self.walk(body, path, &nested, scope, source, &[]);
         } else if let Some(value) = override_path {
             let file = override_base.join(value);
-            self.file(&file, file.parent().unwrap(), false);
+            self.file(&file, file.parent().unwrap(), scope);
         } else {
             let flat = module_dir.join(format!("{name}.rs"));
             let file = if flat.is_file() {
@@ -276,8 +372,26 @@ impl Guard {
             } else {
                 default_dir.join("mod.rs")
             };
-            self.file(&file, &default_dir, false);
+            self.file(&file, &default_dir, scope);
         }
+    }
+
+    fn visits(&self, scope: Scope) -> bool {
+        match self.scan {
+            Scan::EngineProduction => !scope.test && !scope.upper,
+            Scan::UpperRegistration => scope.root || scope.upper,
+        }
+    }
+
+    fn check_registration(&mut self, node: Node<'_>, path: &Path, source: &str, aliases: &[&str]) {
+        if !constructs_context(node, source, aliases) {
+            return;
+        }
+        if path == self.root.join(REGISTERING_HELPER) {
+            self.helper_calls += 1;
+            return;
+        }
+        self.report(node, path, source);
     }
 
     fn check(&mut self, node: Node<'_>, path: &Path, source: &str) {
@@ -318,24 +432,45 @@ impl Guard {
             _ => false,
         };
         if found {
-            let line = node.start_position().row + 1;
-            self.findings.push(format!(
-                "{}:{line}: {spelling}",
-                path.strip_prefix(&self.root).unwrap_or(path).display()
-            ));
+            self.report(node, path, source);
         }
+    }
+
+    fn report(&mut self, node: Node<'_>, path: &Path, source: &str) {
+        let line = node.start_position().row + 1;
+        let spelling = text(node, source);
+        self.findings.push(format!(
+            "{}:{line}: {spelling}",
+            path.strip_prefix(&self.root).unwrap_or(path).display()
+        ));
     }
 }
 
 #[test]
 fn production_engine_sources_do_not_reach_the_upper_crate() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let mut guard = Guard::new(&root);
-    guard.file(&root.join("lib.rs"), &root, true);
+    let scope = Scope {
+        root: true,
+        ..Scope::default()
+    };
+    let mut guard = Guard::new(&root, Scan::EngineProduction);
+    guard.file(&root.join("lib.rs"), &root, scope);
     assert!(guard.findings.is_empty(), "{}", guard.findings.join("\n"));
     assert_eq!(
         guard.facade, 1,
         "the only exception is the public trace facade"
+    );
+
+    let mut registration = Guard::new(&root, Scan::UpperRegistration);
+    registration.file(&root.join("lib.rs"), &root, scope);
+    assert!(
+        registration.findings.is_empty(),
+        "use crate::test_context in upper library tests:\n{}",
+        registration.findings.join("\n")
+    );
+    assert_eq!(
+        registration.helper_calls, 1,
+        "the helper builds one context"
     );
 }
 
@@ -361,8 +496,12 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
     "#;
     std::fs::write(root.join("test_only.rs"), "use crate::commands::test_only;").unwrap();
     std::fs::write(root.join("sibling.rs"), "use crate::{commands::sibling};").unwrap();
-    let mut guard = Guard::new(root);
-    guard.source(&root.join("lib.rs"), root, true, source);
+    let scope = Scope {
+        root: true,
+        ..Scope::default()
+    };
+    let mut guard = Guard::new(root, Scan::EngineProduction);
+    guard.source(&root.join("lib.rs"), root, scope, source);
     assert_eq!(guard.findings.len(), 4, "{:?}", guard.findings);
     for (finding, expected) in guard.findings.iter().zip([
         "commands::sibling",
@@ -373,14 +512,50 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
         assert!(finding.contains(expected), "{finding}");
     }
 
-    let mut guard = Guard::new(root);
+    let mut guard = Guard::new(root, Scan::EngineProduction);
     guard.source(
         &root.join("data_layer/trace_measure.rs"),
         root,
-        false,
+        Scope::default(),
         "pub use crate::trace_measure_run::run;\nuse crate::{trace_measure_run::{run as again}};",
     );
     assert_eq!(guard.facade, 1);
     assert_eq!(guard.findings.len(), 1, "{:?}", guard.findings);
     assert!(guard.findings[0].contains("run as again"));
+
+    let mut registration = Guard::new(root, Scan::UpperRegistration);
+    registration.source(
+        &root.join("lib.rs"),
+        root,
+        scope,
+        r#"
+        mod commands {
+            fn production() { AppContext::new(); }
+            #[cfg(test)]
+            mod tests {
+                use crate::{context::AppContext as Alias};
+                fn direct() { crate::context::AppContext::new(); }
+                fn alias() { Alias::new(); }
+                fn helper() { crate::test_context(); }
+            }
+            #[test]
+            fn standalone() { aft::context::AppContext::new(); }
+        }
+        #[cfg(test)]
+        mod engine_tests { fn keep() { AppContext::new(); } }
+        "#,
+    );
+    assert_eq!(
+        registration.findings.len(),
+        3,
+        "{:?}",
+        registration.findings
+    );
+    for (finding, expected) in registration.findings.iter().zip([
+        "crate::context::AppContext::new()",
+        "Alias::new()",
+        "aft::context::AppContext::new()",
+    ]) {
+        assert!(finding.contains(expected), "{finding}");
+    }
 }

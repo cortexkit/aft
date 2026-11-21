@@ -258,7 +258,7 @@ mod tests {
         let unrelated = project.join("unrelated.env");
         fs::write(&secret, "saved").unwrap();
         fs::write(&unrelated, "unrelated saved").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(StubProvider),
             Config {
                 project_root: Some(project.clone()),
@@ -333,7 +333,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let secret = project.path().join("secret.env");
         fs::write(&secret, "saved-secret").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(StubProvider),
             Config {
                 project_root: Some(project.path().to_path_buf()),

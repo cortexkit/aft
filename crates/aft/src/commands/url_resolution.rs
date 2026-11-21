@@ -389,7 +389,7 @@ mod url_tests {
     /// A context whose cache location is unknown because the user config was
     /// unreadable; `cache_dir()` then names the durable storage root.
     fn cache_unavailable_ctx(storage: &Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.to_path_buf()),
@@ -425,7 +425,7 @@ mod url_tests {
             ..Default::default()
         };
         assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         assert!(ctx.cache_unavailable_reason().is_none());
         let cache_root = ctx.cache_dir();
         assert_ne!(cache_root, storage);
@@ -504,7 +504,7 @@ mod url_tests {
     #[test]
     fn private_fetch_permission_cannot_widen_trusted_ceiling() {
         for trusted in [false, true] {
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     url_fetch_allow_private: trusted,
@@ -535,7 +535,7 @@ mod url_tests {
     fn a_fetched_document_is_read_back_without_using_the_reply_margin() {
         let storage = tempfile::tempdir().unwrap();
         let document = storage.path().join("fetched.md");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -578,7 +578,7 @@ mod url_tests {
     #[test]
     fn untrusted_private_flag_is_refused_by_outline_and_zoom() {
         for (trusted, requested) in [(false, true), (true, false)] {
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     url_fetch_allow_private: trusted,
@@ -869,7 +869,10 @@ mod url_tests {
                 ..config
             };
             Fixture {
-                ctx: AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config),
+                ctx: crate::test_context(
+                    Box::new(crate::parser::TreeSitterProvider::new()),
+                    config,
+                ),
                 root,
                 _temp: temp,
                 tls: tls(),

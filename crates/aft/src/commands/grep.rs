@@ -30,7 +30,7 @@ mod contract_tests {
 
     #[test]
     fn grep_rejects_excessive_offset_before_pattern_compile() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -1945,7 +1945,7 @@ mod tests {
         for name in ["a.rs", "b.rs"] {
             std::fs::write(dir.path().join(name), "needle\n").unwrap();
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
@@ -1991,7 +1991,7 @@ mod tests {
         ] {
             std::fs::write(root.join("src").join(name), body).unwrap();
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -2161,7 +2161,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("matches.txt");
         std::fs::write(&file, "needle\n".repeat(100003)).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
@@ -2256,7 +2256,7 @@ mod tests {
         // 120 matches against a store cap of 50: which 50 are kept must not
         // depend on the order the files reach the search.
         work_probe::set_store_cap(&root, 50);
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -2474,7 +2474,7 @@ mod tests {
         let file = root.join("wide.txt");
         let line = format!("{}needle{}\n", "x".repeat(600), "y".repeat(400));
         std::fs::write(&file, line.repeat(200)).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),

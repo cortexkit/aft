@@ -1121,7 +1121,7 @@ mod tests {
     const TASK: &str = "bash-0123456789abcdef";
 
     fn context(project: &std::path::Path, storage: &std::path::Path) -> Arc<AppContext> {
-        Arc::new(AppContext::new(
+        Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
                 project_root: Some(project.into()),

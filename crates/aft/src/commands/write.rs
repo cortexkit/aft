@@ -389,7 +389,7 @@ mod audit_regressions {
             let original = "const value = 0;\n";
             let successful = "const value = 1;\n";
             std::fs::write(&path, original).unwrap();
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     format_on_edit: false,
@@ -499,7 +499,7 @@ mod audit_regressions {
         let original = "const value = 0;\n";
         let successful = "const value = 1;\n";
         std::fs::write(&path, original).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,
@@ -544,7 +544,7 @@ mod audit_regressions {
         let path = dir.path().join("binary.txt");
         let original = [0xff, 0xfe, b'\n'];
         std::fs::write(&path, original).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,
@@ -575,7 +575,7 @@ mod audit_regressions {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("binary.txt");
         std::fs::write(&path, [0xff, 0xfe]).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,

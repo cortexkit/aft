@@ -100,7 +100,7 @@ fn daemon_startup_hooks_publish_display_and_shipped_views() {
         },
     )
     .unwrap();
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             storage_dir: Some(storage.clone()),

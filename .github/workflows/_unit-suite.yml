@@ -90,6 +90,10 @@ jobs:
         run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
+      - name: Shell handler registration in upper unit tests
+        run: python3 scripts/check-shell-registration.py --archive-file "$LINUX_NEXTEST_ARCHIVE"
+        env:
+          LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
 
       - name: Run the serial TLS probe
         run: cargo nextest run --archive-file "$LINUX_NEXTEST_ARCHIVE" --profile gate -E 'kind(lib)' -- platform_verifier_tls_client_subprocess

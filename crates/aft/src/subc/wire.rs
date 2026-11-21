@@ -2197,7 +2197,7 @@ pub(super) mod tests {
     fn tool_output_cap_codemode_keeps_full_structured_content() {
         use subc_protocol::call_mode::CallMode;
         let storage = tempfile::tempdir().unwrap();
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.path().into()),
@@ -2239,7 +2239,7 @@ pub(super) mod tests {
     fn tool_output_cap_last_writer_bounds_prepared_retained_text() {
         use subc_protocol::call_mode::CallMode;
         let storage = tempfile::tempdir().unwrap();
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.path().into()),
@@ -2749,7 +2749,7 @@ pub(super) mod tests {
             "*** Begin Patch\n*** Delete File: {}\n*** Update File: {}\n*** Move to: {}\n@@\n-old move\n+new move\n*** Update File: {}\n@@\n-old edit\n+new edit\n*** End Patch",
             deleted.display(), source.display(), moved.display(), edited.display()
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),

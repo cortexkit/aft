@@ -553,7 +553,7 @@ mod tests {
     use serde_json::{json, Value};
 
     fn context(root: &Path, storage: &Path) -> AppContext {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.to_path_buf()),

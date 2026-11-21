@@ -1022,7 +1022,7 @@ mod tests {
     }
 
     fn standalone_ctx() -> AppContext {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(PathBuf::from("/tmp/project")),
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn pre_discovery_publish_does_not_trip_the_holder_ownership_gate() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(PathBuf::from("/tmp/project")),
@@ -1167,7 +1167,7 @@ mod tests {
 
     #[test]
     fn shutdown_delivery_emits_terminal_before_removing_entry() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let mut pending = PendingResponses::default();
         pending
             .register(

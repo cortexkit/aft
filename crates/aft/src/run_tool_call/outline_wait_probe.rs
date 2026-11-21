@@ -79,7 +79,7 @@ fn outline_off_cpu_wait_probe() {
     .unwrap();
     let scratch = root.parent().unwrap().join("probe-state");
     std::fs::create_dir_all(&scratch).unwrap();
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.clone()),

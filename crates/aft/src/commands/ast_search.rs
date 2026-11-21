@@ -384,7 +384,7 @@ mod tests {
             project_root: Some(root.clone()),
             ..crate::config::Config::default()
         };
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let request: RawRequest = serde_json::from_value(serde_json::json!({
             "id": "search",
             "command": "ast_search",
@@ -403,7 +403,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         std::fs::write(root.join("large.js"), "console.log(1);\n".repeat(24_000)).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root),

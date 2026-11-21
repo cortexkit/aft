@@ -10604,7 +10604,7 @@ mod tests {
     }
 
     fn test_context(project_root: &Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(project_root.to_path_buf()),
@@ -10619,7 +10619,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let root = std::fs::canonicalize(root).unwrap();
         std::fs::write(root.join("main.rs"), "pub fn first_index_needle() {}\n").unwrap();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.clone()),
@@ -11601,7 +11601,7 @@ mod tests {
     #[test]
     fn embed_query_construction_error_leaves_slot_empty_for_retry() {
         let project = tempfile::tempdir().expect("create project dir");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(project.path().to_path_buf()),
@@ -13686,7 +13686,7 @@ mod tests {
     fn empty_semantic_index_skips_query_dimension_check() {
         let project = tempfile::tempdir().expect("create project dir");
         let (base_url, handle) = start_mock_embedding_server();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(project.path().to_path_buf()),
@@ -13735,7 +13735,7 @@ mod tests {
     fn mass_refresh_discloses_a_partial_semantic_lane_until_it_finishes() {
         let project = tempfile::tempdir().expect("create project dir");
         let (base_url, handle) = start_mock_embedding_server();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(project.path().to_path_buf()),
@@ -15870,7 +15870,7 @@ mod split_request_tests {
     use crate::parser::TreeSitterProvider;
 
     fn context(root: &Path) -> AppContext {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.to_path_buf()),
@@ -15974,7 +15974,7 @@ mod split_request_tests {
     }
 
     fn external_context(session: &Path, storage: &Path, restricted: bool) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(session.to_path_buf()),

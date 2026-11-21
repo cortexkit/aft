@@ -537,7 +537,7 @@ fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
         let source = format!("pub fn {PROBE}_{number:02}() {{ /* rerank probe */ }}\n");
         std::fs::write(&file, &source).unwrap();
     }
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(TreeSitterProvider::new()),
         Config {
             project_root: Some(project.path().to_path_buf()),

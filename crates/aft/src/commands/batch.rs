@@ -268,7 +268,7 @@ mod audit_regressions {
         let path = dir.path().join("original.ts");
         let original = "export function ok() { return 1; }\n";
         std::fs::write(&path, original).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,
@@ -291,7 +291,7 @@ mod audit_regressions {
     fn batch_rollback_discard_is_scoped_to_its_operation() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,
@@ -894,7 +894,7 @@ mod a03_tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small.rs");
         std::fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         let needle: String = (0..400)
             .map(|index| format!("    let absent_{index} = 0;\n"))
             .collect();
@@ -926,7 +926,7 @@ mod a03_tests {
     fn a03_batch_output_allocation_bound() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large.txt");
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         let mut observed = Vec::new();
         for count in [1, 100, 2_000] {
             let source = format!("{}{}", "TARGET\n".repeat(count), "z".repeat(1024 * 1024));
@@ -1033,7 +1033,7 @@ mod a03_tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("fuzzy.txt");
         std::fs::write(&path, "  TARGET  \r\nsecond\n").unwrap();
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         let response = handle_batch(
             &request(
                 &path,
@@ -1077,7 +1077,7 @@ mod a03_tests {
     fn a03_single_match_ambiguity_payload_golden() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("long.txt");
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         let source = format!(
             "α\r\n{}\r\nTARGET TARGET\nlast",
             "TARGET".to_owned() + &"中".repeat(10_000)
@@ -1116,7 +1116,7 @@ mod a03_tests {
                         }
                         let mut config = Config::default();
                         config.backup.enabled = Some(false);
-                        let ctx = AppContext::new(Box::new(StubProvider), config);
+                        let ctx = crate::test_context(Box::new(StubProvider), config);
                         let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "counts", "command": "write", "file": path, "content": "const value = 2;\n", "preview": preview, "include_diff": include_diff})).unwrap();
                         edit::A03_HANDLER_READS.with(|count| count.set(0));
                         edit::A03_SYNTAX_PARSES.with(|count| count.set(0));
@@ -1161,7 +1161,7 @@ mod a03_tests {
     fn a03_live_fingerprint_and_undo_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("live.txt");
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         std::fs::write(&path, "é before\r\n").unwrap();
         crate::backup::A03_FINGERPRINT_HASHES.with(|count| count.set(0));
         crate::backup::A03_LIVE_FINGERPRINT_READS.with(|count| count.set(0));
@@ -1209,7 +1209,7 @@ mod a03_tests {
     fn a03_handler_buffer_read_bound() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large.ts");
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         for preview in [true, false] {
             std::fs::write(&path, "const value = 1;\n").unwrap();
             crate::backup::reset_capture_read_count(&path);
@@ -1250,7 +1250,7 @@ mod a03_measurements {
     fn a03_release_measurements() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("large.txt");
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         for bytes in [10 * 1024, 1024 * 1024, 10 * 1024 * 1024] {
             let source = "x".repeat(bytes) + "TARGET\n";
             std::fs::write(&path, &source).unwrap();

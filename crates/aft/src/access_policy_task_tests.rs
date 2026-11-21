@@ -88,7 +88,7 @@ fn fixture() -> Fixture {
     let storage = resolved.join("store");
     std::fs::create_dir_all(&root).unwrap();
     std::fs::create_dir_all(&storage).unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(StubProvider),
         Config {
             project_root: Some(root),

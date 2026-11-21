@@ -577,7 +577,7 @@ mod audit_regressions {
             (restored.clone(), "before".to_string()),
             (failed.clone(), "before".to_string()),
         ];
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -633,7 +633,7 @@ mod lsp_tests {
         let file = dir.path().join("src/main.rs");
         std::fs::write(&file, "fn main() {}\n").unwrap();
         let file = std::fs::canonicalize(file).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),

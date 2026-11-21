@@ -3,7 +3,7 @@ use super::*;
 #[tokio::test]
 async fn exec_remote_v1_bash_runs_through_real_route_without_invalid_selector() {
     let (dir, root) = test_support::test_root("v1-bash-selector");
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.as_path().into()),
@@ -140,7 +140,7 @@ const CANCEL_SESSION: &str = "cancelled-call-session";
 
 #[cfg(unix)]
 fn cancel_test_context(root: &ProjectRootId, storage: &Path) -> Arc<AppContext> {
-    Arc::new(AppContext::new(
+    Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.as_path().into()),
@@ -716,7 +716,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     config.storage_dir = Some(dir.path().join("storage"));
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.bash.worker_wait_max_ms = 1_000;
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

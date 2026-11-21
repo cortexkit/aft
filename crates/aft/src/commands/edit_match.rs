@@ -1304,7 +1304,6 @@ mod tests {
     use std::fs;
 
     use crate::config::Config;
-    use crate::context::AppContext;
     use crate::language::StubProvider;
     use crate::protocol::RawRequest;
 
@@ -1371,7 +1370,7 @@ mod tests {
             .unwrap()
             .execute_batch("CREATE TABLE checkpoint_probe (payload BLOB NOT NULL)")
             .unwrap();
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         {
             let mut backup = ctx.backup().lock();
             backup.set_storage_dir(storage.path().to_path_buf(), 72);
@@ -1480,7 +1479,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("small.rs");
         fs::write(&path, "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         let needle: String = (0..400)
             .map(|index| format!("    let absent_{index} = 0;\n"))
             .collect();
@@ -1532,7 +1531,7 @@ mod tests {
             .join(" ")
             .len();
         fs::write(&path, &source).unwrap();
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         let request = |id: &str, needle: &str, replacement: &str| -> RawRequest {
             serde_json::from_value(serde_json::json!({
                 "id": id,
@@ -1642,7 +1641,7 @@ mod tests {
         crate::backup::reset_capture_read_count(&first);
         crate::backup::reset_capture_read_count(&second);
 
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         ctx.checkpoint()
             .lock()
             .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
@@ -1707,7 +1706,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside_file, project.path().join("z.txt")).unwrap();
         let outside_modified = fs::metadata(&outside_file).unwrap().modified().unwrap();
 
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(StubProvider),
             Config {
                 project_root: Some(project.path().to_path_buf()),
@@ -1763,7 +1762,7 @@ mod tests {
         let b = root.join("b.ts");
         fs::write(&a, "const a = TARGET;\n").unwrap();
 
-        let ctx = AppContext::new(Box::new(StubProvider), Config::default());
+        let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         ctx.checkpoint()
             .lock()
             .set_lock_path_for_test(cache.path().join("checkpoint.lock"));
@@ -2435,7 +2434,7 @@ mod audit_regressions {
             ..Default::default()
         };
         config.backup.enabled = Some(false);
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         // Direct handler fixtures must apply configure's backup-store policy.
         ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
             enabled: false,
@@ -2494,7 +2493,7 @@ mod audit_regressions {
             if existed {
                 std::fs::write(&path, "before").unwrap();
             }
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     format_on_edit: false,
@@ -2533,7 +2532,7 @@ mod audit_regressions {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("append.txt");
         std::fs::write(&path, "before").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,
@@ -2675,7 +2674,7 @@ mod audit_regressions {
         let path = dir.path().join("long.txt");
         let length = 8192;
         std::fs::write(&path, "x".repeat(length)).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::language::StubProvider),
             crate::config::Config::default(),
         );
@@ -2708,7 +2707,7 @@ mod audit_regressions {
     fn edit_file(dir: &Path, name: &str, source: &str, needle: &str, replacement: &str) -> String {
         let path = dir.join(name);
         std::fs::write(&path, source).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::language::StubProvider),
             crate::config::Config {
                 storage_dir: Some(dir.join(format!("state-{name}"))),
@@ -2778,7 +2777,7 @@ mod audit_regressions {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("many.txt");
         std::fs::write(&path, "a\n".repeat(20)).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::language::StubProvider),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("state")),

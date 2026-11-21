@@ -428,7 +428,7 @@ mod contract_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("source.ts");
         std::fs::write(&file, "function outer() { return 1; }\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -572,7 +572,7 @@ mod tests {
     #[test]
     fn extract_function_missing_file() {
         let req = make_request("1", "extract_function", serde_json::json!({}));
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -595,7 +595,7 @@ mod tests {
             "extract_function",
             serde_json::json!({"file": "/tmp/test.ts"}),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -618,7 +618,7 @@ mod tests {
             "extract_function",
             serde_json::json!({"file": "/tmp/test.ts", "name": "foo"}),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -646,7 +646,7 @@ mod tests {
                 "end_line": 2,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -675,7 +675,7 @@ mod tests {
                 "end_line": 4,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -706,7 +706,7 @@ mod tests {
                 "end_line": u64::from(u32::MAX) + 5,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -733,7 +733,7 @@ mod tests {
                 "end_line": 8,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -794,7 +794,7 @@ mod approved_audit11 {
             format_on_edit: false,
             ..Default::default()
         };
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let req = RawRequest {
             id: "guard".into(),
             command: "extract_function".into(),

@@ -151,7 +151,7 @@ fn edit_translate_timing_probe() {
     fixture_file(&project_root, "one.ts", 400, "TOKEN_A");
     fixture_file(&project_root, "two.ts", 400, "TOKEN_A");
     fixture_file(&project_root, "three.ts", 400, "TOKEN_C");
-    let app_ctx = crate::context::AppContext::new(
+    let app_ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config::default(),
     );

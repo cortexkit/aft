@@ -571,7 +571,7 @@ mod tests {
             let project = root.path().join("project");
             fs::create_dir(&project).unwrap();
             let storage = root.path().join("storage");
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(TreeSitterProvider::new()),
                 Config {
                     storage_dir: Some(storage.clone()),

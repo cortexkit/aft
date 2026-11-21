@@ -292,7 +292,7 @@ mod tests {
     fn borrowed_input_budget_is_checked_before_deserializing_params() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(project.path().into()),
@@ -336,7 +336,7 @@ mod tests {
     fn bash_write_unknown_id_reply_is_one_line_naming_bash() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(project.path().into()),

@@ -23,7 +23,7 @@ impl Fixture {
         let neighbor = root.path().join("neighbor.txt");
         std::fs::write(&store, "original\n").unwrap();
         std::fs::write(&neighbor, "original\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(StubProvider),
             Config {
                 project_root: Some(root.path().to_path_buf()),
@@ -475,7 +475,7 @@ fn storage_floor_outline_lists_skip_protected_leaves_without_opening_them() {
         json!({"target": f._root.path(), "files": true}),
         json!({"files": [protected, ordinary]}),
     ] {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             (*f.ctx.config()).clone(),
         );
@@ -551,7 +551,7 @@ fn storage_floor_revision_zoom_batch_keeps_floor_refusal_target_local() {
     }
     let mut config = (*f.ctx.config()).clone();
     config.revision_reads = true;
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let response = super::zoom::handle_zoom(
         &request(
             "zoom",
@@ -664,7 +664,7 @@ fn storage_floor_zoom_single_target_refuses_but_two_target_batch_continues() {
     }
     let mut config = (*f.ctx.config()).clone();
     config.revision_reads = true;
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     for reference in [None, Some("HEAD")] {
         let mut params = json!({"targets": [{"file": protected, "symbols": "secret"}]});
         if let Some(reference) = reference {

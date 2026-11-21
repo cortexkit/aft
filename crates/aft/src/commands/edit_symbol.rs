@@ -492,7 +492,7 @@ mod audit_regressions {
         let path = dir.path().join("original.ts");
         let original = "export function ok() { return 1; }\n";
         std::fs::write(&path, original).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 format_on_edit: false,

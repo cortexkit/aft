@@ -601,7 +601,7 @@ mod audit_regressions {
         let source = dir.path().join("Foo.txt");
         let destination = dir.path().join("foo.txt");
         std::fs::write(&source, "contents").unwrap();
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),

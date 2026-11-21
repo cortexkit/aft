@@ -608,7 +608,7 @@ mod tests {
     fn memory_census_measures_allocator_once_per_call() {
         let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
         crate::memory::reset_allocator_observation_for_test();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );

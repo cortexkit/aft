@@ -244,7 +244,7 @@ mod tests {
             storage_dir: Some(storage.path().to_path_buf()),
             ..crate::config::Config::default()
         };
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.clone());
 
         let first = settled(|| callers(&ctx, &util, "callee"));

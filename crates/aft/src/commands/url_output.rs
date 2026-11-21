@@ -363,7 +363,7 @@ mod tests {
     }
 
     fn assert_zoom_cap_preserves_metadata(mixed: bool) {
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -433,7 +433,7 @@ mod tests {
     fn outline_url_array_errors_redact_cached_document_paths() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("private-storage");
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.clone()),
@@ -474,7 +474,7 @@ mod tests {
     fn url_responses_replace_cached_document_paths_with_the_requested_url() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("private-storage");
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.clone()),
@@ -509,7 +509,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("private-storage");
         let cache_parent = temp.path().join("cache-volume");
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.clone()),
@@ -554,7 +554,7 @@ mod tests {
     fn url_responses_redact_placeholder_fetch_document_paths() {
         let temp = tempfile::tempdir().unwrap();
         let storage = temp.path().join("private-storage");
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.clone()),

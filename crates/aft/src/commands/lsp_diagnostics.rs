@@ -1033,7 +1033,7 @@ mod tests {
             project_root: Some(root),
             ..Config::default()
         };
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), config);
 
         let (unchecked, truncated) = compute_unchecked_files(&ctx, &src);
 

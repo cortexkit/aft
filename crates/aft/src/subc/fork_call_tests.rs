@@ -169,7 +169,7 @@ fn a_fork_route_refuses_what_would_ask_and_allows_the_rest() {
     config.project_root = Some(root.clone());
     config.storage_dir = Some(base.join("store"));
     config.backup.enabled = Some(false);
-    let ctx = crate::context::AppContext::new(Box::new(crate::language::StubProvider), config);
+    let ctx = crate::test_context(Box::new(crate::language::StubProvider), config);
     let outside_read = |ctx: &crate::context::AppContext| {
         ctx.validate_read_path("fork", "head", &outside.join("protected.txt"))
     };

@@ -2015,7 +2015,7 @@ fn context(root: &Path) -> AppContext {
     config.experimental_bash_background = true;
     config.restrict_to_project_root = true;
     config.disabled_tools.clear();
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_harness(crate::harness::Harness::Opencode);
     ctx
 }

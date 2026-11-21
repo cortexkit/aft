@@ -337,7 +337,7 @@ mod tests {
             project_root: Some(root.clone()),
             ..Config::default()
         };
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), config);
         let lang = AstGrepLang::from_str("typescript").unwrap();
         let globs = vec!["src/**".to_string(), "missing/**".to_string()];
 

@@ -11,7 +11,7 @@ async fn fenced_end_retries_one_failed_read_and_kills_tasks_with_scope_revoked_r
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

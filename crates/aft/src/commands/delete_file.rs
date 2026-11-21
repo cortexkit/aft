@@ -83,7 +83,7 @@ mod incident_tests {
         config.project_root = Some(root.to_path_buf());
         // Keep fixtures unbacked independently of the integration-only temp override.
         config.backup.enabled = Some(false);
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
             enabled: false,
             ..Default::default()

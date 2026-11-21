@@ -15,7 +15,7 @@ fn context(root: &Path, denied: &Path) -> AppContext {
         ..Config::default()
     };
     config.sandbox.read_deny = vec![denied.to_path_buf()];
-    AppContext::new(Box::new(StubProvider), config)
+    crate::test_context(Box::new(StubProvider), config)
 }
 
 fn request(command: &str, params: serde_json::Value) -> RawRequest {
@@ -207,7 +207,7 @@ fn access_policy_storage_floor_has_no_own_root_carve_out() {
         ..Config::default()
     };
     config.sandbox.write_allow = vec![store.path().to_path_buf()];
-    let ctx = AppContext::new(Box::new(StubProvider), config);
+    let ctx = crate::test_context(Box::new(StubProvider), config);
     for result in [
         ctx.validate_path("own", &own),
         ctx.validate_read_path("own-read", "policy-session", &own),
@@ -242,7 +242,7 @@ fn access_policy_legacy_outcomes_are_byte_identical() {
     let outside_path = outside.path().canonicalize().unwrap().join("missing.txt");
     for configured_root in [None, Some(root_path.clone())] {
         for restrict in [false, true] {
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(StubProvider),
                 Config {
                     project_root: configured_root.clone(),
@@ -337,7 +337,7 @@ fn access_policy_restricted_floor_refusal_keeps_legacy_bytes() {
         ..Config::default()
     };
     config.sandbox.read_deny = vec![path.clone()];
-    let ctx = AppContext::new(Box::new(StubProvider), config);
+    let ctx = crate::test_context(Box::new(StubProvider), config);
     let expected = crate::protocol::Response::error(
         "parity-floor",
         "path_outside_root",
@@ -404,7 +404,7 @@ fn artifact_read_context() -> (tempfile::TempDir, AppContext, PathBuf) {
         restrict_to_project_root: false,
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let paths = task_paths(&storage, "policy-session", "bash-0123456789abcdef").unwrap();
     let mut metadata = PersistedTask::starting(
         "bash-0123456789abcdef".into(),
@@ -715,7 +715,7 @@ fn artifact_read_search_symlinked_storage_matches_main_bytes() {
     config.storage_dir = Some(storage.clone());
     // Even a project-root carve-out must not turn AFT storage into a plain scan.
     config.project_root = Some(storage.clone());
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.bash_background()
         .replay_session(&storage, "policy-session")
         .unwrap();
@@ -1313,7 +1313,7 @@ fn assert_scratch_read_unregistered_path(path: &Path, project_root: &Path) {
         restrict_to_project_root: false,
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(StubProvider), config);
+    let ctx = crate::test_context(Box::new(StubProvider), config);
     let validated = ctx
         .validate_read_path("policy-test", "policy-session", path)
         .unwrap();

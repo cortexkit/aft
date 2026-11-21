@@ -46,7 +46,7 @@ mod audit_regressions {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.txt");
         let second = dir.path().join("second.txt");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );

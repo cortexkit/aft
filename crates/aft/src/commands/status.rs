@@ -241,7 +241,7 @@ mod tests {
             ..request()
         };
 
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let response = handle_status(&request, &ctx);
 
         assert_eq!(response.data["removal"]["available"], true);
@@ -253,7 +253,7 @@ mod tests {
 
     #[test]
     fn status_exposes_cache_role_and_canonical_root() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let response = handle_status(&request(), &ctx);
         assert_eq!(response.data["cache_role"], "not_initialized");
         assert!(response.data["canonical_root"].is_null());
@@ -287,7 +287,7 @@ mod tests {
         crate::memory::reset_allocator_observation_for_test();
         let _ = crate::memory_census::snapshot_uncapped("ready", std::collections::BTreeMap::new());
 
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let before = crate::memory::allocator_snapshot_calls_for_test();
         for _ in 0..50 {
             let response = handle_status(&request(), &ctx);
@@ -302,7 +302,7 @@ mod tests {
     fn status_reports_cold_allocator_observation_without_measuring() {
         let _allocator_test_lock = crate::memory::allocator_observation_test_lock();
         crate::memory::reset_allocator_observation_for_test();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let before = crate::memory::allocator_snapshot_calls_for_test();
         let memory = handle_status(&request(), &ctx).data["memory"]["process"].clone();
 
@@ -313,7 +313,7 @@ mod tests {
 
     #[test]
     fn memory_snapshot_reports_contended_subsystem_as_busy() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let _semantic_writer = ctx.semantic_index().write().unwrap();
         let status = ctx.build_status_snapshot();
         assert_eq!(status["semantic_index"]["status"], "busy");
@@ -330,7 +330,7 @@ mod tests {
 
     #[test]
     fn status_exposes_live_semantic_build_progress_only_while_building() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let progress = crate::context::SemanticBuildProgress::default();
         progress.report(3, 10, 2);
         ctx.set_semantic_build_progress(Some(progress));
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn status_reports_backend_unavailable_instead_of_loading() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         *ctx.semantic_index_status().write().unwrap() =
             crate::context::SemanticIndexStatus::Building {
                 stage: "embedding_symbols".to_string(),
@@ -388,7 +388,7 @@ mod tests {
     /// `ready` here while the sidebar and a search reply both said `failed`.
     #[test]
     fn status_reports_a_failed_semantic_index_as_failed_not_ready() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let project = std::env::current_dir().expect("current dir");
         *ctx.semantic_index().write().unwrap() =
             Some(crate::semantic_index::SemanticIndex::new(project, 384));
@@ -413,7 +413,7 @@ mod tests {
         let project = tempfile::tempdir().expect("project dir");
         let storage = tempfile::tempdir().expect("storage dir");
         let root = std::fs::canonicalize(project.path()).expect("canonical project");
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         ctx.update_config(|config| {
             config.project_root = Some(root.clone());
             config.storage_dir = Some(storage.path().to_path_buf());
@@ -456,7 +456,7 @@ mod tests {
 
     #[test]
     fn status_status_bar_is_null_until_every_independent_producer_is_populated() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let response = handle_status(&request(), &ctx);
         // No TODO scan has run yet, so the status-bar glance must be null
         // (never fabricated zeros). The key is always present so the TS
@@ -476,7 +476,7 @@ mod tests {
     // show what is known instead of reporting startup indefinitely.
     #[test]
     fn status_bar_values_report_each_category_independently() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         // Diagnostics counts stay "pending" until a project-wide applicability
         // snapshot exists. This fixture runs no server discovery, so record
         // that no language server applies to the project.
@@ -502,7 +502,7 @@ mod tests {
     /// every renderer shows as a count that is still on its way.
     #[test]
     fn status_bar_values_name_missing_language_server_instead_of_pending() {
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         // Server discovery has run and found no language server for this
         // project. Before discovery has run, the counts would read "pending".
         ctx.lsp().store_project_applicability(Default::default());

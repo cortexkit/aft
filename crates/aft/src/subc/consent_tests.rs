@@ -934,7 +934,7 @@ fn fixture_with_worker_directory(
     let mut config = crate::config::Config::default();
     config.project_root = Some(worker_root.clone());
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));
@@ -6401,7 +6401,7 @@ fn jail_context(root: &Path, sandbox: bool) -> AppContext {
     } else {
         crate::config::SandboxMode::Off
     };
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
 #[test]

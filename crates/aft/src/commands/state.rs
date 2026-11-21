@@ -459,7 +459,7 @@ mod tests {
     use crate::parser::TreeSitterProvider;
 
     fn test_context() -> AppContext {
-        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+        crate::test_context(Box::new(TreeSitterProvider::new()), Config::default())
     }
 
     fn state_request(command: &str, params: serde_json::Value) -> RawRequest {

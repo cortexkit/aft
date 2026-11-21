@@ -292,7 +292,7 @@ fn bash_kill_scope_next_agent_reply_names_cancellation_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut config = crate::config::Config::default();
     config.project_root = Some(dir.path().into());
-    let ctx = crate::context::AppContext::new(Box::new(crate::language::StubProvider), config);
+    let ctx = crate::test_context(Box::new(crate::language::StubProvider), config);
     let tasks = Tasks {
         registry: ctx.bash_background().clone(),
         dir,
