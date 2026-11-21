@@ -14,13 +14,14 @@ use crate::config::{Config, RerankConfig};
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
+use aft_engine::test_bridge::search_misc::rerank::{self as bridge, BackendSlotTest as _};
 
 thread_local! {
     static TEST_BACKEND: RefCell<Option<SelectedBackend>> = const { RefCell::new(None) };
 }
 
 fn io_on_this_thread() -> usize {
-    crate::search_state::rerank::io_on_this_thread()
+    bridge::io_on_this_thread()
 }
 
 /// The backend a test installed for its own thread, if any.
@@ -137,7 +138,7 @@ fn permutation_uses_total_order_for_signed_zero() {
 #[test]
 fn settings_default_to_off_and_clamp_depth_and_timeout() {
     let settings = RerankSettings::resolve(&SearchConfig::default());
-    assert_eq!(settings.backend, RerankBackendKind::Off);
+    assert_eq!(bridge::backend(&settings), RerankBackendKind::Off);
     assert_eq!(settings.top_n, DEFAULT_TOP_N);
     assert_eq!(settings.timeout, Duration::from_millis(DEFAULT_TIMEOUT_MS));
 
@@ -360,7 +361,7 @@ fn audit1432_candidate_windows_match_cached_whole_source_through_production_larg
         bytes.extend_from_slice(
             b"#[inline]\r\npub fn tail_identifier() {\r\n    tail_identifier();\r\n}\r\n",
         );
-        assert!(bytes.len() as u64 > crate::large_read::LARGE_READ_BYTES);
+        assert!(bytes.len() as u64 > crate::large_read_counts::LARGE_READ_BYTES);
         assert!((bytes.len() as u64) < crate::large_read::WHOLE_READ_CEILING);
         std::fs::write(&file, &bytes).unwrap();
         for range in [
@@ -382,7 +383,11 @@ fn audit1432_candidate_windows_match_cached_whole_source_through_production_larg
             ] {
                 let expected = {
                     let scope = super::super::request_files::install();
-                    scope.files().keep_read(&file, bytes.clone(), None);
+                    aft_engine::test_bridge::search_misc::request_files(&scope).keep_read(
+                        &file,
+                        bytes.clone(),
+                        None,
+                    );
                     candidate_text(project.path(), &candidate, prose)
                 };
                 assert!(super::super::request_files::current().is_none());
@@ -391,7 +396,7 @@ fn audit1432_candidate_windows_match_cached_whole_source_through_production_larg
                         candidate_text(project.path(), &candidate, prose)
                     });
                 assert!(
-                    (largest as u64) < crate::large_read::LARGE_READ_BYTES,
+                    (largest as u64) < crate::large_read_counts::LARGE_READ_BYTES,
                     "production dispatch retained a whole large file: largest allocation={largest}"
                 );
                 assert_eq!(
@@ -485,7 +490,7 @@ fn stage2_candidate_text_skips_an_oversized_line_outside_symbol_range() {
     );
     assert_eq!(
         reply.data["skipped_files"][0]["reason"],
-        crate::large_read::WHOLE_READ_SKIP_REASON
+        crate::large_read_counts::WHOLE_READ_SKIP_REASON
     );
 }
 
@@ -1168,7 +1173,7 @@ fn score_pools_with_local_onnx_when_asked() {
     let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
     let started = Instant::now();
     let mut scorer =
-        onnx::OnnxPairScorer::load_with(model.name, &files, onnx::rerank_intra_threads(), tuning)
+        onnx::OnnxPairScorer::load_with(model.name(), &files, onnx::rerank_intra_threads(), tuning)
             .expect("load model");
     let build_ms = started.elapsed().as_secs_f64() * 1000.0;
     let mut scores = Vec::new();
@@ -1523,9 +1528,9 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
     .unwrap();
 
     let pack = fixture::FixturePack::load(&pack_path).unwrap();
-    assert_eq!(pack.scores.len(), 5);
-    assert_eq!(pack.fingerprint.backend, "numbered");
-    assert_eq!(pack.text_policy, TEXT_POLICY_REVISION);
+    assert_eq!(fixture::scores(&pack).len(), 5);
+    assert_eq!(fixture::fingerprint_backend(&pack), "numbered");
+    assert_eq!(fixture::text_policy(&pack), TEXT_POLICY_REVISION);
 
     // Replaying the recorded scores from the pack gives the same order without
     // calling the live backend.
@@ -1572,19 +1577,19 @@ fn invalid_backend_configuration_fails_build_with_a_reason() {
             "synapse rerank model is required",
         ),
     ] {
-        let built = slot::build_backend(&inputs(RerankConfig {
+        let built = bridge::build_backend(&inputs(RerankConfig {
             backend: Some(backend),
             ..RerankConfig::default()
         }));
         assert_eq!(built.err().as_deref(), Some(reason));
     }
-    let built = slot::build_backend(&inputs(RerankConfig {
+    let built = bridge::build_backend(&inputs(RerankConfig {
         backend: Some(RerankBackendKind::Onnx),
         model: Some("some-other-model".to_string()),
         ..RerankConfig::default()
     }));
     assert!(built.err().unwrap().contains("unsupported rerank model"));
-    assert!(slot::build_backend(&inputs(RerankConfig::default()))
+    assert!(bridge::build_backend(&inputs(RerankConfig::default()))
         .unwrap()
         .is_none());
 }
@@ -1635,7 +1640,7 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
     let search_thread = std::thread::current().id();
     let built_on_search_thread = Arc::new(AtomicUsize::new(0));
     let builds = Arc::new(AtomicUsize::new(0));
-    let constructor: slot::Constructor = {
+    let constructor: bridge::Constructor = {
         let built_on_search_thread = built_on_search_thread.clone();
         let builds = builds.clone();
         Arc::new(move |inputs: &slot::BuildInputs| {
@@ -1645,7 +1650,7 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
             }
             // Stands in for real construction, which does I/O.
             note_io();
-            match RerankSettings::resolve(&inputs.search).backend {
+            match bridge::backend(&RerankSettings::resolve(bridge::search(inputs))) {
                 RerankBackendKind::Off => Ok(None),
                 _ => Ok(Some(numbered_selected())),
             }
@@ -1681,14 +1686,15 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
             });
         }
     }
-    for model in onnx::ALLOWED_MODELS.iter().map(|model| model.name) {
+    for model in onnx::ALLOWED_MODELS.iter().map(|model| model.name()) {
         all_inputs.push(onnx_inputs(Some(model)));
     }
 
     let before = io_on_this_thread();
     for inputs in all_inputs {
-        let slot = slot::BackendSlot::with_constructor(constructor.clone());
-        let off = RerankSettings::resolve(&inputs.search).backend == RerankBackendKind::Off;
+        let slot = bridge::slot_with_constructor(constructor.clone());
+        let off = bridge::backend(&RerankSettings::resolve(bridge::search(&inputs)))
+            == RerankBackendKind::Off;
         // First read: an unseen config starts a build and reads as not ready
         // (or off). The build runs on another thread and can finish before
         // `read` re-reads the slot, so `Ready` is also correct here, but only
@@ -1721,7 +1727,7 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
 #[test]
 fn a_failed_build_is_retried_with_backoff_and_a_success_installs_a_new_instance() {
     let attempts = Arc::new(AtomicUsize::new(0));
-    let constructor: slot::Constructor = {
+    let constructor: bridge::Constructor = {
         let attempts = attempts.clone();
         Arc::new(move |_: &slot::BuildInputs| {
             if attempts.fetch_add(1, Ordering::SeqCst) < 2 {
@@ -1741,7 +1747,7 @@ fn a_failed_build_is_retried_with_backoff_and_a_success_installs_a_new_instance(
     // A constructor that always fails is tried a bounded number of times and
     // leaves the slot not ready, with the last reason.
     let attempts = Arc::new(AtomicUsize::new(0));
-    let constructor: slot::Constructor = {
+    let constructor: bridge::Constructor = {
         let attempts = attempts.clone();
         Arc::new(move |_: &slot::BuildInputs| {
             attempts.fetch_add(1, Ordering::SeqCst);
@@ -1751,11 +1757,11 @@ fn a_failed_build_is_retried_with_backoff_and_a_success_installs_a_new_instance(
     let slot = slot::BackendSlot::default();
     slot.set_constructor_for_test(constructor, Duration::from_millis(1));
     slot.reconcile(inputs.clone());
-    wait_for(|| attempts.load(Ordering::SeqCst) == slot::MAX_BUILD_ATTEMPTS as usize);
+    wait_for(|| attempts.load(Ordering::SeqCst) == bridge::MAX_BUILD_ATTEMPTS as usize);
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(
         attempts.load(Ordering::SeqCst),
-        slot::MAX_BUILD_ATTEMPTS as usize
+        bridge::MAX_BUILD_ATTEMPTS as usize
     );
     match slot.read(inputs) {
         slot::Installed::NotReady(reason) => assert_eq!(reason, "still down"),
@@ -1766,10 +1772,10 @@ fn a_failed_build_is_retried_with_backoff_and_a_success_installs_a_new_instance(
 #[test]
 fn a_build_for_superseded_inputs_is_discarded() {
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
-    let constructor: slot::Constructor = {
+    let constructor: bridge::Constructor = {
         let gate = gate.clone();
         Arc::new(move |inputs: &slot::BuildInputs| {
-            if RerankSettings::resolve(&inputs.search).model.as_deref() == Some("slow") {
+            if bridge::model(&RerankSettings::resolve(bridge::search(inputs))) == Some("slow") {
                 let (open, changed) = &*gate;
                 let mut open = open.lock().unwrap();
                 while !*open {
@@ -1779,7 +1785,7 @@ fn a_build_for_superseded_inputs_is_discarded() {
             Ok(Some(numbered_selected()))
         })
     };
-    let slot = slot::BackendSlot::with_constructor(constructor);
+    let slot = bridge::slot_with_constructor(constructor);
     slot.reconcile(onnx_inputs(Some("slow")));
     let current = onnx_inputs(Some("fast"));
     slot.reconcile(current.clone());
@@ -1798,7 +1804,7 @@ fn a_slow_build_never_delays_a_search_and_searches_skip_until_it_is_installed() 
 
     let gate = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
     let backend = NumberedBackend::new(Vec::new());
-    let constructor: slot::Constructor = {
+    let constructor: bridge::Constructor = {
         let gate = gate.clone();
         let backend = backend.clone();
         Arc::new(move |_: &slot::BuildInputs| {
@@ -1861,20 +1867,29 @@ fn onnx_fingerprints_carry_the_pinned_commit() {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
     };
     for model in onnx::ALLOWED_MODELS {
-        assert!(names.insert(model.name), "duplicate model {}", model.name);
-        assert!(is_hex(model.commit, 40), "{} commit", model.name);
-        for file in std::iter::once(&model.model_file)
-            .chain(model.extra_files)
-            .chain([&model.tokenizer_file])
+        assert!(
+            names.insert(model.name()),
+            "duplicate model {}",
+            model.name()
+        );
+        assert!(is_hex(model.commit(), 40), "{} commit", model.name());
+        for file in std::iter::once(model.model_file())
+            .chain(model.extra_files())
+            .chain([model.tokenizer_file()])
         {
-            assert!(is_hex(file.sha256, 64), "{} {}", model.name, file.path);
+            assert!(
+                is_hex(file.sha256(), 64),
+                "{} {}",
+                model.name(),
+                file.path()
+            );
         }
-        let fingerprint = onnx::shared_onnx_reranker(Some(model.name))
+        let fingerprint = onnx::shared_onnx_reranker(Some(model.name()))
             .unwrap()
             .fingerprint();
         assert_eq!(fingerprint.backend, "onnx");
-        assert_eq!(fingerprint.model, model.name);
-        assert_eq!(fingerprint.revision, model.commit);
+        assert_eq!(fingerprint.model, model.name());
+        assert_eq!(fingerprint.revision, model.commit());
     }
     assert!(names.contains(onnx::DEFAULT_MODEL));
 }
@@ -2079,16 +2094,14 @@ fn real_onnx_model_scores_twenty_pairs_when_available() {
     let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
     eprintln!(
         "provisioned {}@{} in {} ms",
-        model.repo,
-        model.commit,
+        model.repo(),
+        model.commit(),
         started.elapsed().as_millis()
     );
-    assert!(files
-        .model
-        .starts_with(onnx::pinned_snapshot_dir(&cache_dir, model)));
+    assert!(onnx::model_file(&files).starts_with(onnx::pinned_snapshot_dir(&cache_dir, model)));
     let threads = onnx::rerank_intra_threads();
     let mut scorer =
-        onnx::OnnxPairScorer::load(model.name, &files, threads).expect("load test model");
+        onnx::OnnxPairScorer::load(model.name(), &files, threads).expect("load test model");
     let query = "where is the session cache invalidated";
     let mut docs = (0..19)
         .map(|index| {
@@ -2206,16 +2219,22 @@ fn onnx_cost_profile_when_available() {
     };
     let defaults = onnx::SessionTuning::default();
     let tuning = onnx::SessionTuning {
-        intra_op_spinning: flag("AFT_RERANK_PROFILE_SPINNING", defaults.intra_op_spinning),
-        memory_pattern: flag("AFT_RERANK_PROFILE_MEMORY_PATTERN", defaults.memory_pattern),
-        cpu_arena: flag("AFT_RERANK_PROFILE_CPU_ARENA", defaults.cpu_arena),
+        intra_op_spinning: flag(
+            "AFT_RERANK_PROFILE_SPINNING",
+            onnx::intra_op_spinning(&defaults),
+        ),
+        memory_pattern: flag(
+            "AFT_RERANK_PROFILE_MEMORY_PATTERN",
+            onnx::memory_pattern(&defaults),
+        ),
+        cpu_arena: flag("AFT_RERANK_PROFILE_CPU_ARENA", onnx::cpu_arena(&defaults)),
         arena_shrinkage: flag(
             "AFT_RERANK_PROFILE_ARENA_SHRINKAGE",
-            defaults.arena_shrinkage,
+            onnx::arena_shrinkage(&defaults),
         ),
         attention_units: number(
             "AFT_RERANK_PROFILE_ATTENTION_UNITS",
-            defaults.attention_units,
+            onnx::attention_units(&defaults),
         ),
         ..defaults
     };
@@ -2226,7 +2245,7 @@ fn onnx_cost_profile_when_available() {
     let model = onnx::find_allowed_model("gte-reranker-modernbert-base").unwrap();
     let files = onnx::provision_model_files_in(model, &cache_dir).expect("provision pinned model");
     let rss_before_load = process_rss_mb();
-    let mut scorer = onnx::OnnxPairScorer::load_with(model.name, &files, threads, tuning)
+    let mut scorer = onnx::OnnxPairScorer::load_with(model.name(), &files, threads, tuning)
         .expect("load test model");
     let rss_loaded = process_rss_mb();
 
@@ -2275,7 +2294,7 @@ fn onnx_cost_profile_when_available() {
             })
             .collect::<Vec<_>>();
         let lengths = scorer.pair_token_lengths(query, &docs).unwrap();
-        let batches = onnx::attention_batches_for_lengths(&lengths, tuning.attention_units);
+        let batches = onnx::attention_batches_for_lengths(&lengths, onnx::attention_units(&tuning));
         let cpu = process_cpu_seconds();
         let started = Instant::now();
         scorer
@@ -2294,8 +2313,7 @@ fn onnx_cost_profile_when_available() {
 }
 #[test]
 fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
-    let (endpoint, server) =
-        remote::tests::serve(r#"[{"index":0,"score":0.7}]"#, 200, Duration::ZERO);
+    let (endpoint, server) = remote::serve(r#"[{"index":0,"score":0.7}]"#, 200, Duration::ZERO);
     let inputs = slot::BuildInputs {
         cache_unavailable: false,
         cache_lease: None,
@@ -2336,7 +2354,11 @@ fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
         serde_json::json!({"query":"q","texts":["a"]})
     );
     let mut invalid = inputs;
-    invalid.search.rerank.as_mut().unwrap().endpoint = Some("file:///tmp/model".into());
+    bridge::search_mut(&mut invalid)
+        .rerank
+        .as_mut()
+        .unwrap()
+        .endpoint = Some("file:///tmp/model".into());
     slot.reconcile(invalid.clone());
     wait_for(
         || matches!(slot.read(invalid.clone()), slot::Installed::NotReady(reason) if reason.contains("HTTP(S) base URL")),
@@ -2344,13 +2366,13 @@ fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
     // Turn reranking off after checking the failure reason, so retries for this
     // invalid endpoint cannot install a backend in the test's slot.
     let mut off = invalid;
-    off.search.rerank = None;
+    bridge::search_mut(&mut off).rerank = None;
     slot.reconcile(off);
 }
 
 #[test]
 fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
-    let (_directory, path, server) = synapse::tests::fake_daemon(
+    let (_directory, path, server) = synapse::fake_daemon(
         vec![
             Some(
                 serde_json::json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp-slot"]}]}}),
@@ -2370,7 +2392,7 @@ fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
                 ..Default::default()
             }),
         },
-        semantic: synapse::tests::config(path),
+        semantic: synapse::config(path),
         under_subc: true,
     };
     let slot = slot::BackendSlot::default();
@@ -2399,19 +2421,19 @@ fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
     let requests = server.join().unwrap();
     assert_eq!(requests[0]["method"], "models.list");
     assert_eq!(requests[1]["params"]["required_fingerprint"], "fp-slot");
-    let (_directory, path, server) = synapse::tests::fake_daemon(
+    let (_directory, path, server) = synapse::fake_daemon(
         vec![Some(serde_json::json!({"result":{"models":[]}}))],
         true,
     );
     let mut invalid = inputs;
-    invalid.semantic = synapse::tests::config(path);
+    *bridge::semantic_mut(&mut invalid) = synapse::config(path);
     slot.reconcile(invalid.clone());
     wait_for(
         || matches!(slot.read(invalid.clone()), slot::Installed::NotReady(reason) if reason.contains("does not serve reranker")),
     );
     assert_eq!(server.join().unwrap().len(), 1);
     let mut off = invalid;
-    off.search.rerank = None;
+    bridge::search_mut(&mut off).rerank = None;
     slot.reconcile(off);
 }
 
@@ -2421,7 +2443,7 @@ fn blocked_synapse_connect_never_delays_searches_reading_not_ready() {
     let fused = stream(&ctx, 100, 30);
     let (entered_tx, entered_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let (_directory, path, server) = synapse::tests::fake_daemon_gated(
+    let (_directory, path, server) = synapse::fake_daemon_gated(
         vec![Some(
             serde_json::json!({"result":{"models":[{"model_id":"reranker","fingerprints":["fp-slot"]}]}}),
         )],
@@ -2429,7 +2451,7 @@ fn blocked_synapse_connect_never_delays_searches_reading_not_ready() {
         Some((entered_tx, release_rx)),
     );
     ctx.update_config(|config| {
-        config.semantic = synapse::tests::config(path);
+        config.semantic = synapse::config(path);
         config.search.rerank = Some(RerankConfig {
             backend: Some(RerankBackendKind::Synapse),
             model: Some("reranker".into()),
@@ -2467,13 +2489,13 @@ fn cache_root_unavailable_reranker_never_activates() {
     inputs.cache_unavailable = true;
     let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = Arc::clone(&builds);
-    let slot = slot::BackendSlot::with_constructor(Arc::new(move |_| {
+    let slot = bridge::slot_with_constructor(Arc::new(move |_| {
         observed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(None)
     }));
     assert!(matches!(slot.read(inputs.clone()), slot::Installed::Off));
     assert_eq!(builds.load(std::sync::atomic::Ordering::SeqCst), 0);
-    assert!(slot::build_backend(&inputs)
+    assert!(bridge::build_backend(&inputs)
         .err()
         .unwrap()
         .contains("cache_dir_unavailable"));
@@ -2487,8 +2509,8 @@ fn cache_root_onnx_factory_passes_configured_model_cache_to_provisioner() {
     // Resolve the folder the way prepare does (on Windows, the plain spelling
     // rather than a verbatim `\\?\` path), so the simulated volume and the
     // expected model path name the folder prepare will use.
-    let parent = crate::bash_background::persistence::canonical_root_path(&parent).unwrap();
-    let model = onnx::ALLOWED_MODELS.last().unwrap().name;
+    let parent = aft_engine::test_bridge::bash_remote::canonical_root_path(&parent).unwrap();
+    let model = onnx::ALLOWED_MODELS.last().unwrap().name();
     let mut config = crate::config::Config {
         storage_dir: Some(temp.path().join("storage")),
         cache_dir: Some(parent.clone()),
@@ -2501,7 +2523,7 @@ fn cache_root_onnx_factory_passes_configured_model_cache_to_provisioner() {
     });
     assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
     let inputs = slot::BuildInputs::from_config(&config, false);
-    let (result, observed) = onnx::with_provision_probe(model, || slot::build_backend(&inputs));
+    let (result, observed) = onnx::with_provision_probe(model, || bridge::build_backend(&inputs));
     assert!(result.err().unwrap().contains("provision path observed"));
     assert_eq!(observed, vec![parent.join("aft/semantic/models")]);
     assert!(!temp.path().join("storage/semantic").exists());

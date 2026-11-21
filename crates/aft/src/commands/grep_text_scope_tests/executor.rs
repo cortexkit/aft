@@ -3,11 +3,9 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::context::AppContext;
-    use crate::grep_executor::literal;
-    use crate::grep_executor::{
-        fallback_grep_with_limits, project_root, walk_coverage_note, FALLBACK_WALK_BUDGET,
-    };
+    use crate::grep_executor::{project_root, walk_coverage_note, FALLBACK_WALK_BUDGET};
     use crate::search_index::{GrepResult, IndexStatus, PathFilters, WalkBound};
+    use aft_engine::test_bridge::search_misc::{fallback_grep_with_limits, literal};
 
     /// 100 directories of 100 files, each file holding one `needle`, and a
     /// context for it with no index of any kind, so grep walks the folder.

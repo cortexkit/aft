@@ -1182,23 +1182,23 @@ impl ReadSource {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
+    pub static SOURCE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static SOURCE_AFTER_READ: std::cell::RefCell<Option<Box<dyn FnOnce() + Send>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) struct HelperStateScope(usize, Option<Box<dyn FnOnce() + Send>>);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+pub struct HelperStateScope(usize, Option<Box<dyn FnOnce() + Send>>);
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for HelperStateScope {
     fn drop(&mut self) {
         SOURCE_READS.with(|reads| reads.set(self.0));
         SOURCE_AFTER_READ.with(|hook| *hook.borrow_mut() = self.1.take());
     }
 }
-#[cfg(test)]
-pub(crate) fn helper_state_scope() -> HelperStateScope {
+#[cfg(any(test, feature = "test-support"))]
+pub fn helper_state_scope() -> HelperStateScope {
     HelperStateScope(
         SOURCE_READS.with(|reads| reads.replace(0)),
         SOURCE_AFTER_READ.with(|hook| hook.replace(None)),
@@ -1207,15 +1207,15 @@ pub(crate) fn helper_state_scope() -> HelperStateScope {
 
 #[doc(hidden)]
 pub fn read_source(path: &Path) -> io::Result<ReadSource> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let hook = SOURCE_AFTER_READ.with(|hook| hook.borrow_mut().take());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let caller_thread = std::thread::current().id();
     let (result, _reads) = crate::bounded_io::run(path, None, move |path| {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         SOURCE_AFTER_READ.with(|slot| *slot.borrow_mut() = hook);
         let result = read_source_unbounded(&path);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let reads = if std::thread::current().id() == caller_thread {
             // Nested probes can reuse their caller's bounded helper. Its TLS
             // counter is already updated; transfer only from another thread.
@@ -1223,11 +1223,11 @@ pub fn read_source(path: &Path) -> io::Result<ReadSource> {
         } else {
             SOURCE_READS.with(|reads| reads.get())
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let reads = 0usize;
         Ok((result, reads))
     })?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     SOURCE_READS.with(|reads| reads.set(reads.get() + _reads));
     result
 }
@@ -1251,10 +1251,10 @@ fn read_source_unbounded(path: &Path) -> io::Result<ReadSource> {
     let metadata = file.metadata()?;
     let mut bytes = Vec::new();
     if metadata.is_file() && metadata.len() <= MAX_FILE_READ_BYTES {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         SOURCE_READS.with(|reads| reads.set(reads.get() + 1));
         file.read_to_end(&mut bytes)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         SOURCE_AFTER_READ.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();

@@ -112,10 +112,10 @@ pub trait RerankBackend: Send + Sync {
 /// A backend that scores every document zero, so a stable reorder keeps the
 /// prior order. Tests use it where a backend must exist but must not move
 /// anything.
-#[cfg(test)]
-pub(crate) struct NoopRerankBackend;
+#[cfg(any(test, feature = "test-support"))]
+pub struct NoopRerankBackend;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl RerankBackend for NoopRerankBackend {
     fn fingerprint(&self) -> RerankFingerprint {
         RerankFingerprint {
@@ -193,12 +193,12 @@ pub fn short_reason(reason: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static IO_ON_THIS_THREAD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn io_on_this_thread() -> usize {
     IO_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
@@ -208,6 +208,6 @@ pub(crate) fn io_on_this_thread() -> usize {
 /// selection never reaches one; in normal builds it does nothing.
 #[inline]
 pub(crate) fn note_io() {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     IO_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
 }

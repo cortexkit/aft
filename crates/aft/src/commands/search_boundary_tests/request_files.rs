@@ -9,7 +9,7 @@ mod search_read_tests {
     use crate::context::{AppContext, SemanticIndexStatus};
     use crate::parser::TreeSitterProvider;
     use crate::protocol::RawRequest;
-    use crate::search_state::request_files::{without_request_files_for_test, ReadProbe};
+    use aft_engine::test_bridge::search_misc::{without_request_files_for_test, ReadProbe};
 
     const FILES: &[(&str, &str)] = &[
         (

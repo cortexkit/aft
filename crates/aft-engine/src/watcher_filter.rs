@@ -24,26 +24,51 @@ pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
 pub const WATCHER_FLUSH_WINDOW: Duration = Duration::from_millis(250);
 pub const WATCHER_MAX_BATCH_PATHS: usize = 1024;
 pub const WATCHER_DISPATCH_CHANNEL_CAPACITY: usize = 1024;
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 pub(crate) const WATCHER_EXCLUSION_LIMIT: usize = 8;
 /// How deep below the root a bare ecosystem name is still enumerated. A
 /// gitignore pattern like `node_modules` matches at every depth, but an
 /// exclusion is one exact path, so the copies that exist have to be found. The
 /// bound keeps that search off the deep end of a monorepo: workspace layouts
 /// put the heavy directory at `packages/<name>/node_modules`, which is depth 3.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 const WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH: usize = 3;
 /// Entries read from one directory's top level when sizing it. The count only
 /// has to separate a populated copy from an empty one, so it stops early.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 const WATCHER_DIRECTORY_SIZE_SAMPLE_CAP: usize = 1024;
 /// Entries read from an observed prefix when looking for the ignored child that
 /// produced its events.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 const WATCHER_OBSERVED_CHILD_SCAN_CAP: usize = 256;
 /// Candidates named in the overflow log after the cap is reached, so a specimen
 /// says what the cap cost.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 const WATCHER_DROPPED_CANDIDATE_LOG_LIMIT: usize = 3;
 // Root remove/rename events trigger an immediate check. Five seconds is the
 // backstop for missed events (FSEvents without WatchRoot, or Windows watching
@@ -505,7 +530,12 @@ fn ignore_file_is_ignored(matcher: Option<&Gitignore>, path: &Path) -> bool {
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 17] = [
     ".git",
     "target",
@@ -526,7 +556,12 @@ const WATCHER_ECOSYSTEM_EXCLUSIONS: [&str; 17] = [
     "DerivedData",
 ];
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatcherExclusionSource {
     External,
@@ -542,7 +577,12 @@ pub(crate) enum WatcherExclusionSource {
 /// about `packages/plugin/node_modules`. Which one the running backend has is
 /// named once, in `watcher_backend`, so no rule here has to spell out a
 /// platform.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WatcherExclusionCoverage {
     /// The exclusion covers the whole subtree below the excluded directory:
@@ -554,7 +594,12 @@ pub(crate) enum WatcherExclusionCoverage {
     ExactPath,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl WatcherExclusionSource {
     /// Slot ranking between sources, best first.
     fn priority(self) -> u8 {
@@ -579,7 +624,12 @@ impl WatcherExclusionSource {
         }
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "linux",
+        test,
+        feature = "test-support"
+    ))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::External => "external",
@@ -590,14 +640,24 @@ impl WatcherExclusionSource {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WatcherExclusion {
     path: PathBuf,
     source: WatcherExclusionSource,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl WatcherExclusion {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -608,7 +668,12 @@ impl WatcherExclusion {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<PathBuf> {
     exclusions
         .iter()
@@ -620,14 +685,24 @@ pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<Pa
 /// Gitignore entries. External paths describe filesystem topology instead: a
 /// link can become source code without any ignore rule changing, so events must
 /// recheck those paths with lstat.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 pub(crate) struct WatcherExclusionPaths {
     lasting: Vec<WatcherExclusion>,
     external: BTreeSet<PathBuf>,
     boundary: Option<WatcherWalkBoundary>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl WatcherExclusionPaths {
     pub(crate) fn new(root: &Path, exclusions: &[WatcherExclusion]) -> Self {
         let mut state = Self {
@@ -789,7 +864,12 @@ thread_local! {
     pub(crate) static EXCLUSION_TEST_PATHS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct GitignoreOrder {
     source_priority: u8,
@@ -797,7 +877,12 @@ struct GitignoreOrder {
     line: usize,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl Default for GitignoreOrder {
     fn default() -> Self {
         Self {
@@ -808,7 +893,12 @@ impl Default for GitignoreOrder {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl GitignoreOrder {
     fn for_glob(root: &Path, glob: &ignore::gitignore::Glob) -> Self {
         let Some(source) = glob.from() else {
@@ -850,7 +940,12 @@ impl GitignoreOrder {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn root_has_python_manifest(root: &Path) -> bool {
     if exclusion_manifest_is_file(&root.join("pyproject.toml"))
         || exclusion_manifest_is_file(&root.join("requirements.txt"))
@@ -868,7 +963,12 @@ fn root_has_python_manifest(root: &Path) -> bool {
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn root_has_gradle_manifest(root: &Path) -> bool {
     fs::read_dir(root).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
@@ -882,7 +982,12 @@ fn root_has_gradle_manifest(root: &Path) -> bool {
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn root_has_xcode_project(root: &Path) -> bool {
     fs::read_dir(root).is_ok_and(|entries| {
         entries.flatten().any(|entry| {
@@ -893,7 +998,12 @@ fn root_has_xcode_project(root: &Path) -> bool {
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
     let priority = WATCHER_ECOSYSTEM_EXCLUSIONS
         .iter()
@@ -916,7 +1026,12 @@ fn ecosystem_exclusion_priority(root: &Path, name: &str) -> Option<usize> {
     enabled.then_some(priority)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn exclusion_manifest_is_file(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_file())
 }
@@ -1057,7 +1172,12 @@ fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
 }
 
 /// The exclusion set an OS watcher should install, plus what the cap cost.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WatcherExclusionPlan {
     /// Exclusions to install, best first.
@@ -1067,7 +1187,12 @@ pub(crate) struct WatcherExclusionPlan {
     pub(crate) dropped: Vec<WatcherExclusion>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExclusionPlanUnavailable {
     CapacityDeadline,
@@ -1076,7 +1201,12 @@ pub(crate) enum ExclusionPlanUnavailable {
     WorkerDisconnected,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl ExclusionPlanUnavailable {
     fn as_str(self) -> &'static str {
         match self {
@@ -1088,16 +1218,31 @@ impl ExclusionPlanUnavailable {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 type ExclusionPlanOutcome = Result<WatcherExclusionPlan, ExclusionPlanUnavailable>;
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 const EXCLUSION_PLAN_MAX_ATTEMPTS: u32 = 8;
 
 /// One retry budget per matcher generation, shared by the native backends.
 /// An unavailable plan must not consume a generation: roots near the end of a
 /// restart burst may not get a worker before their first deadline expires.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Default)]
 pub(crate) struct WatcherExclusionRetry {
     generation: Option<u64>,
@@ -1106,13 +1251,23 @@ pub(crate) struct WatcherExclusionRetry {
     retry_at: Option<Instant>,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 pub(crate) enum WatcherExclusionUpdate {
     Planned(WatcherExclusionPlan),
     Reduced,
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 impl WatcherExclusionRetry {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn retry_deadline(&self) -> Option<Instant> {
@@ -1261,7 +1416,12 @@ impl WatcherExclusionRetry {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn emit_exclusion_retry_log(line: String) {
     log::warn!("{line}");
     #[cfg(test)]
@@ -1280,7 +1440,12 @@ thread_local! {
 /// copy of a name from an empty one when both compete for the same slot, and a
 /// capped `read_dir` is the one way to ask that on every platform (`st_blocks`
 /// is Unix-only).
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn directory_size_signal(boundary: &WatcherWalkBoundary, path: &Path) -> usize {
     if !boundary.allows_directory(path) {
         return 0;
@@ -1308,7 +1473,12 @@ thread_local! {
 }
 
 /// Git metadata is an exclusion boundary, never a tree to enumerate.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
     path.file_name() == Some(std::ffi::OsStr::new(".git"))
 }
@@ -1355,7 +1525,12 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
 /// is seeded with its own path through `WATCHER_NESTED_ECOSYSTEM_MAX_DEPTH`
 /// when slots remain. Additional exact-path copies are ordered by a cheap size
 /// signal.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 pub(crate) fn derive_watcher_exclusion_plan(
     root: &Path,
     matcher: &SharedGitignore,
@@ -1422,7 +1597,12 @@ pub(crate) fn force_exclusion_failure_for_test(root: &Path) -> ForcedExclusionFa
     ForcedExclusionFailure(root)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn exclusion_planner_pool() -> Arc<ExclusionPlannerPool> {
     static PLANNERS: std::sync::OnceLock<Arc<ExclusionPlannerPool>> = std::sync::OnceLock::new();
     PLANNERS
@@ -1452,7 +1632,12 @@ pub(crate) fn start_watcher_rebuild<T: Send + 'static>(
     Ok(rx)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 #[derive(Default)]
 struct ExclusionPlannerPool {
     in_flight: Mutex<usize>,
@@ -1466,7 +1651,12 @@ struct ExclusionPlannerPool {
 /// a restart can re-derive many roots at once, and backends consume each matcher
 /// generation only after a successful plan. Deadline and worker failures are
 /// unavailable outcomes, not successful empty plans; the backend can retry them.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn run_bounded_exclusion_planner<T: Send + 'static>(
     timeout: Duration,
     pool: Arc<ExclusionPlannerPool>,
@@ -1543,7 +1733,12 @@ fn derive_exclusion_plan(
     derive_exclusion_plan_cancellable(root, matcher, max_paths, coverage, None)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 fn derive_exclusion_plan_cancellable(
     root: &Path,
     matcher: &SharedGitignore,

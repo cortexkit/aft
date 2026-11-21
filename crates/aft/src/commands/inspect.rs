@@ -14,8 +14,6 @@ use crate::inspect::diagnostics_category::{
     inspect_request_timeout, run_diagnostics_category, scope_walk_gap, scoped_coverage_candidates,
     start_inspect_rust_checks, InspectRustCheck, ScopeWalkBudget,
 };
-#[cfg(test)]
-use crate::inspect::InspectBuilderState;
 use crate::inspect::{
     format_wait_text, InspectCache, InspectCategory, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectSnapshot, JobOutcome, JobScope,
@@ -28,6 +26,8 @@ use crate::lsp::manager::{
 use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc::inspect::{InspectBuilderState, InspectManagerTest};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
@@ -414,7 +414,7 @@ fn capture_inspect_root_stats_while(
     timeout_detail: impl Fn() -> String,
 ) -> Result<InspectRootStatSnapshot, String> {
     #[cfg(test)]
-    let _profile = crate::inspect::walk_profile::Walk::start("freshness_listing");
+    let _profile = crate::walk_profile::Walk::start("freshness_listing");
     let mut files = Vec::new();
     let has_work_budget = Arc::new(has_work_budget);
     let walk_budget = Arc::clone(&has_work_budget);
@@ -5450,27 +5450,20 @@ mod runtime_note_tests {
 
     #[cfg(unix)]
     fn context_with_client(note: Option<&str>) -> (tempfile::TempDir, AppContext, ServerKey) {
-        use crate::lsp::child_registry::LspChildRegistry;
-        use crate::lsp::client::LspClient;
         use crate::lsp::registry::ServerKind;
 
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         let ctx = context();
-        let mut client = LspClient::spawn_with_reclaim_root(
+        aft_engine::test_bridge::search_misc::lsp_startup::install_client(
+            &ctx,
             ServerKind::TypeScript(None),
             root.clone(),
             Path::new("/bin/sh"),
             &["-c".into(), "while read line; do :; done".into()],
-            &std::collections::HashMap::new(),
-            ctx.lsp().event_sender_for_test(),
-            LspChildRegistry::new(),
-            None,
-            false,
+            note,
         )
         .unwrap();
-        client.runtime_note = note.map(str::to_owned);
-        ctx.lsp().insert_client_for_test(client);
         (
             dir,
             ctx,
@@ -5794,9 +5787,17 @@ mod render_text_tests {
                 InspectCategory::Complexity => complexity::run_complexity_scan(&job),
                 InspectCategory::Metrics => metrics::run_metrics_scan(&job),
                 InspectCategory::UnusedExports => {
-                    unused_exports::run_unused_exports_scan_with_oxc(&job, Some(&graph))
+                    aft_engine::test_bridge::search_misc::inspect::run_unused_exports_scan_with_oxc(
+                        &job,
+                        Some(&graph),
+                    )
                 }
-                InspectCategory::Cycles => cycles::run_cycles_scan_with_oxc(&job, Some(&graph)),
+                InspectCategory::Cycles => {
+                    aft_engine::test_bridge::search_misc::inspect::run_cycles_scan_with_oxc(
+                        &job,
+                        Some(&graph),
+                    )
+                }
                 _ => unreachable!(),
             };
             let payload = result.outcome.unwrap().aggregate;
@@ -5957,7 +5958,7 @@ mod render_text_tests {
         let summary = payloads
             .into_iter()
             .map(|(category, payload)| {
-                let filtered = crate::inspect::filter_payload_for_scope_for_test(payload, &scope);
+                let filtered = aft_engine::test_bridge::search_misc::inspect::filter_payload_for_scope_for_test(payload, &scope);
                 (
                     category.as_str().to_string(),
                     summary_for(category, &filtered),
@@ -8293,7 +8294,7 @@ mod deferred_terminal_tests {
     #[test]
     #[ignore = "real-checkout inspect walk and output measurement; requires AFT_INSPECT_WALK_PROFILE_ROOT"]
     fn inspect_checkout_walk_profile() {
-        use crate::inspect::walk_profile;
+        use crate::walk_profile;
         let root =
             std::fs::canonicalize(std::env::var_os("AFT_INSPECT_WALK_PROFILE_ROOT").unwrap())
                 .unwrap();
@@ -9386,10 +9387,15 @@ mod deferred_terminal_tests {
     fn inspect_builder_state_refusal_uses_locked_failed_attempt_history() {
         let manager = crate::inspect::InspectManager::new();
         let unavailable = JobOutcome::Fresh {
-            payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+            payload: aft_engine::test_bridge::search_misc::inspect::callgraph_unavailable_aggregate(
+                0,
+            ),
         };
-        manager
-            .record_tier2_attempt_outcome_for_test(InspectCategory::DeadCode, unavailable.clone());
+        aft_engine::test_bridge::search_misc::record_tier2_attempt_outcome_for_test(
+            &manager,
+            InspectCategory::DeadCode,
+            unavailable.clone(),
+        );
         let first = manager.tier2_builder_state_detail(InspectCategory::DeadCode);
         let first_at = first
             .rsplit("first at ")
@@ -9397,7 +9403,8 @@ mod deferred_terminal_tests {
             .and_then(|tail| tail.strip_suffix(')'))
             .expect("failed-attempt detail includes first-at unix time");
         for _ in 1..7 {
-            manager.record_tier2_attempt_outcome_for_test(
+            aft_engine::test_bridge::search_misc::record_tier2_attempt_outcome_for_test(
+                &manager,
                 InspectCategory::DeadCode,
                 unavailable.clone(),
             );
@@ -9421,7 +9428,10 @@ mod deferred_terminal_tests {
         ));
         finish_tier2_phases(
             &JobOutcome::Fresh {
-                payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+                payload:
+                    aft_engine::test_bridge::search_misc::inspect::callgraph_unavailable_aggregate(
+                        0,
+                    ),
             },
             Some(callgraph_phase),
             Some(tier2_phase),

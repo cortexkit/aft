@@ -180,7 +180,7 @@ fn grants_revoke_by_listed_path_does_not_follow_a_changed_identity() {
 #[cfg(unix)]
 #[test]
 fn grants_revoke_resolves_an_alias_with_database_unlocked() {
-    use crate::access_policy::path_probe;
+    use crate::policy_path::path_probe;
     let (dir, ctx, head, _) = fixture();
     let target = policy_path(&dir.path().join("target"));
     let alias = dir.path().join("alias");
@@ -268,7 +268,7 @@ fn grants_revoke_by_path_stops_only_shells_using_the_saved_grant() {
                 &head.session,
                 "sleep 30",
                 crate::bash_background::BashShell::Bash,
-                crate::bash_background::registry::resolve_posix_shell(),
+                aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                 Some(head.project_root.clone()),
                 None,
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),

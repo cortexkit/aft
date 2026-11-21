@@ -3070,7 +3070,7 @@ pub fn read_request_corpus_file(
         return RequestCorpusFile::Skipped;
     }
     let Some(files) = files else {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::search_state::request_files::record_disk_read(path);
         return match read_search_corpus_file(path, max_file_size) {
             SearchCorpusEligibility::Eligible(file) => RequestCorpusFile::Eligible {
@@ -3180,7 +3180,7 @@ fn read_search_corpus_file_with_metadata(
     classify_generated: bool,
     metadata: SearchFileMetadata,
 ) -> SearchCorpusEligibility {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     AUDIT_IO_PROBE.with(|probe| {
         if let Some(probe) = probe.borrow_mut().as_mut() {
             probe();
@@ -3198,7 +3198,7 @@ fn read_search_corpus_file_with_metadata(
     #[cfg(test)]
     crate::search_test_counts::record_file_read_path(path);
     let mut bytes = Vec::new();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     audit_record(|work| work.corpus_opens += 1);
     let read = crate::project_content::open(path).and_then(|file| {
         let size = file.metadata()?.len();
@@ -3981,7 +3981,7 @@ fn io_error_means_missing_on_disk(error: &std::io::Error) -> bool {
 /// Whether `path` is known to be absent from disk. One `stat`; an unreadable
 /// path counts as present.
 pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     audit_record(|work| work.presence_checks += 1);
     crate::bounded_io::metadata(path).is_err_and(|error| io_error_means_missing_on_disk(&error))
 }
@@ -4339,7 +4339,7 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
             let comparison_path = if canonicalize_paths
                 && !cached_mtimes.is_some_and(|times| times.contains_key(path))
             {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 audit_record(|work| work.sort_canonicalizes += 1);
                 crate::path_identity::canonicalize_normalized(&resolved)
             } else {
@@ -4704,7 +4704,7 @@ impl PathFilters {
         if self.includes.is_none() && self.excludes.is_none() {
             return true;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         audit_record(|work| work.filter_keys += 1);
         // Compare normalized copies: the search root arrives non-verbatim while
         // indexed entries may carry the Windows `\\?\` form, and a raw
@@ -4751,7 +4751,7 @@ fn resolve_match_path(project_root: &Path, path: &Path) -> PathBuf {
 }
 
 fn path_modified_time(path: &Path) -> Option<SystemTime> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     audit_record(|work| work.sort_stats += 1);
     crate::bounded_io::metadata(path)
         .and_then(|metadata| metadata.modified())
@@ -5138,7 +5138,7 @@ fn to_glob_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use crate::executor::audit::*;
 
 #[cfg(test)]

@@ -76,7 +76,7 @@ use std::time::Instant;
 #[allow(unused_imports)]
 use tokio::sync::oneshot;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support;
 
 #[cfg(test)]

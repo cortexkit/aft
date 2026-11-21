@@ -320,7 +320,7 @@ mod tests {
         REUSABLE_PARSERS.with(|parsers| {
             assert!(!parsers.borrow().contains_key(&LangId::ObjC));
         });
-        let chunks = crate::semantic_index::chunk_view_file(
+        let chunks = aft_engine::test_bridge::search_misc::semantic::chunk_view_file(
             Path::new("."),
             path,
             source.as_bytes(),
@@ -466,7 +466,7 @@ mod tests {
             };
             assert!(ast_lang.matches_path(&path));
             assert_eq!(
-                crate::lsp::manager::language_id_for_path(&path, Some(&source)),
+                aft_engine::test_bridge::search_misc::language_id_for_path(&path, Some(&source)),
                 match expected {
                     LangId::ObjC => "objective-c",
                     LangId::Cpp => "cpp",

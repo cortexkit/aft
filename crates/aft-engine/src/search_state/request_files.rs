@@ -282,7 +282,7 @@ impl RequestFiles {
                 fresh: false,
             });
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_disk_read(path);
         let (bytes, stat) = read(path)?;
         let file = self.record_read(&slot, &mut kept, bytes, stat);
@@ -424,7 +424,7 @@ pub struct Guard {
     _not_send: PhantomData<Rc<()>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Guard {
     pub(crate) fn files(&self) -> &Arc<RequestFiles> {
         &self.files
@@ -455,7 +455,7 @@ impl Drop for Guard {
 pub fn install() -> Guard {
     let execution = current_execution();
     let files = Arc::new(RequestFiles::default());
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if OFF_FOR_TEST.with(std::cell::Cell::get) {
         return Guard {
             execution,
@@ -475,7 +475,7 @@ pub fn install() -> Guard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Requests started on this thread run without a set, each phase reading
     /// on its own as before the set existed.
@@ -483,7 +483,7 @@ thread_local! {
 }
 
 /// Run `run` with requests on this thread reading without a set.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn without_request_files_for_test<R>(run: impl FnOnce() -> R) -> R {
     OFF_FOR_TEST.with(|off| off.set(true));
     let result = run();
@@ -510,7 +510,7 @@ pub fn read_through(
     match files {
         Some(files) => files.read(path, read),
         None => {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             record_disk_read(path);
             let (bytes, stat) = read(path)?;
             Ok(Fetched {
@@ -601,8 +601,8 @@ mod matching_line_completion_tests {
 /// Test probe: every read of file content a search does, by path, whether
 /// through the set or through a phase's own read. Probes are keyed by a root
 /// so tests running at once on other roots do not see each other's reads.
-#[cfg(test)]
-mod read_probe {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod read_probe {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, OnceLock};
@@ -616,13 +616,13 @@ mod read_probe {
         PROBES.get_or_init(Mutex::default)
     }
 
-    pub(crate) struct ReadProbe {
+    pub struct ReadProbe {
         root: PathBuf,
         reads: Reads,
     }
 
     impl ReadProbe {
-        pub(crate) fn new(root: &Path) -> Self {
+        pub fn new(root: &Path) -> Self {
             let reads = Reads::default();
             probes()
                 .lock()
@@ -634,7 +634,7 @@ mod read_probe {
         }
 
         /// Reads per path under the root so far.
-        pub(crate) fn reads(&self) -> BTreeMap<PathBuf, usize> {
+        pub fn reads(&self) -> BTreeMap<PathBuf, usize> {
             self.reads.lock().clone()
         }
     }
@@ -654,7 +654,7 @@ mod read_probe {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use read_probe::{record_disk_read, ReadProbe};
 
 #[cfg(test)]

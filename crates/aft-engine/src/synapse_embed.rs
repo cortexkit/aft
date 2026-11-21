@@ -418,15 +418,15 @@ impl fmt::Display for SynapseEmbeddingError {
 
 impl std::error::Error for SynapseEmbeddingError {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod pause_test_support {
     use super::*;
     use std::sync::{atomic::AtomicU64, Arc, Mutex};
 
     pub(crate) const MODEL: &str = "qwen3-embedding-0.6b-ane";
-    pub(crate) const START: u64 = 100_000;
-    pub(crate) const PAUSE_MS: u64 = 45 * 60 * 1_000;
-    pub(crate) type Requests = Arc<Mutex<Vec<(u64, Value)>>>;
+    pub const START: u64 = 100_000;
+    pub const PAUSE_MS: u64 = 45 * 60 * 1_000;
+    pub type Requests = Arc<Mutex<Vec<(u64, Value)>>>;
 
     pub(crate) fn pause_reply(retry_after_ms: Value) -> Value {
         json!({"error": {"code": "lane_paused", "transient": true,
@@ -435,7 +435,7 @@ pub(crate) mod pause_test_support {
                 "paused_until_ms": START + PAUSE_MS, "reason": "scheduled maintenance"}}})
     }
 
-    pub(crate) fn with_fake_synapse<T>(
+    pub fn with_fake_synapse<T>(
         clock: Arc<AtomicU64>,
         retry_after_ms: Option<Value>,
         run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
@@ -459,11 +459,11 @@ pub(crate) mod pause_test_support {
     /// (docs/wire-contract-v1.md, section 2) shows it: a transient refusal
     /// with a 1,000 ms retry hint.
     pub(crate) const SHAPE_COMPILING_REPLY: &str =
-        include_str!("../../aft/tests/fixtures/synapse/error-shape-compiling-transient.json");
+        include_str!("synapse_embed/fixtures/error-shape-compiling-transient.json");
 
     /// Synapse's error object while a model lane is still loading.
     pub(crate) const MODEL_LOADING_ERROR: &str =
-        include_str!("../../aft/tests/fixtures/synapse/error-model-loading-transient.json");
+        include_str!("synapse_embed/fixtures/error-model-loading-transient.json");
 
     /// A fake Synapse whose model lane needs `compile_ms` on the test clock
     /// to compile a cold input shape. Until then it answers every embedding
@@ -471,7 +471,7 @@ pub(crate) mod pause_test_support {
     /// time still left, and afterwards serves the same requests, as the real
     /// daemon does once its compile finishes. A one-second compile reproduces
     /// the fixture byte for byte on its first refusal.
-    pub(crate) fn with_compiling_synapse<T>(
+    pub fn with_compiling_synapse<T>(
         clock: Arc<AtomicU64>,
         compile_ms: u64,
         run: impl FnOnce(SemanticBackendConfig, Requests) -> T,
@@ -551,12 +551,12 @@ pub(crate) mod pause_test_support {
                     let listener = tokio::net::TcpListener::from_std(listener).unwrap();
                     let (mut stream, _) = listener.accept().await.unwrap();
                     subc_transport::authenticate_server(&mut stream, &key, &daemon_id, FAKE_DAEMON_VERSION, Duration::from_secs(2)).await.unwrap();
-                    let catalog = crate::subc_fake::read_frame(&mut stream).await.unwrap().unwrap();
+                    let catalog = aft_base::subc_fake::read_frame(&mut stream).await.unwrap().unwrap();
                     respond(&mut stream, &catalog, json!({"op":"catalog.list","generation":1,"modules":[{
                         "module_id":"synapse","module_version":"1","roles":[{"role":"management_surface",
                         "operations":[{"name":"models.list","kind":"query"},{"name":"embed.query","kind":"query"},{"name":"embed.batch","kind":"query"}],
                         "config_schema":{"type":"object"},"observability":[],"identity_scope":[]}],"control_ops":[]}],"subc_ops":["catalog.list","route.open"]})).await;
-                    let route = crate::subc_fake::read_frame(&mut stream).await.unwrap().expect("project-free Synapse route.open");
+                    let route = aft_base::subc_fake::read_frame(&mut stream).await.unwrap().expect("project-free Synapse route.open");
                     let route_body: Value = serde_json::from_slice(&route.body).unwrap();
                     assert_eq!(route_body["op"], "route.open");
                     assert!(route_body["identity"].get("project_root").is_none());

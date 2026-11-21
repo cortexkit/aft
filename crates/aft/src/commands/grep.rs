@@ -2305,7 +2305,7 @@ mod tests {
         let index = crate::search_index::SearchIndex::build(&root);
         let snapshot = index.snapshot();
         let pattern = compiled_literal("needle");
-        let query = crate::search_index::decompose_grep_pattern(&pattern);
+        let query = aft_engine::test_bridge::search_misc::decompose_grep_pattern(&pattern);
         let filters = build_path_filters(&[], &[]).unwrap();
         let every_row: Vec<(PathBuf, u32)> = (0..600)
             .flat_map(|index| {
@@ -2359,7 +2359,7 @@ mod tests {
         let index = crate::search_index::SearchIndex::build(&root);
         let snapshot = index.snapshot();
         let pattern = compiled_literal("x");
-        let query = crate::search_index::decompose_grep_pattern(&pattern);
+        let query = aft_engine::test_bridge::search_misc::decompose_grep_pattern(&pattern);
         let filters = build_path_filters(&[], &[]).unwrap();
         let max_results = 100_100;
         crate::search_index::path_order_held_rows_for_test::take(&root);
@@ -2376,7 +2376,7 @@ mod tests {
             .expect("grep over a test index");
         let peak = crate::search_index::path_order_held_rows_for_test::take(&root);
         assert!(
-            peak <= max_results + crate::search_index::PATH_ORDER_BATCH_ROW_BUDGET,
+            peak <= max_results + aft_engine::test_bridge::search_misc::PATH_ORDER_BATCH_ROW_BUDGET,
             "held {peak} rows at once"
         );
         assert!(!result.scan_deadline_reached, "{result:?}");
@@ -2421,7 +2421,7 @@ mod tests {
             let mut searched_again = Vec::new();
             let mut peak = 0;
             let mut kept = Vec::new();
-            let lines_past = crate::search_index::keep_path_ordered_batch(
+            let lines_past = aft_engine::test_bridge::search_misc::keep_path_ordered_batch(
                 &mut kept,
                 max_results,
                 allowance.min(max_results),

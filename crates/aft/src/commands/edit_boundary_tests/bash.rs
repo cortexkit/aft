@@ -1,16 +1,16 @@
 #[cfg(test)]
 mod tests {
     use crate::config::Config;
-    use crate::edit::bash::{
+    use crate::edit::{check_created_file_syntax, validate_syntax_str};
+    use aft_engine::test_bridge::search_misc::edit_bash::{
         find_bash, reported_line, with_runner, CheckOutcome, Runner, SYNTAX_ERROR_STATUS,
     };
-    use crate::edit::{check_created_file_syntax, validate_syntax_str};
     use std::path::Path;
     #[cfg(unix)]
     use std::path::PathBuf;
     #[cfg(unix)]
     use {
-        crate::edit::bash::{run_bash, CHECK_TIMEOUT},
+        aft_engine::test_bridge::search_misc::edit_bash::{run_bash, CHECK_TIMEOUT},
         std::process::Command,
         std::time::{Duration, Instant},
     };

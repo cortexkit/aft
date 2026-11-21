@@ -7657,7 +7657,7 @@ fn observe_degraded_read_step(path: &Path, read: u64) {
     if let Some(watch) = watch {
         let owner = *watch.owner.lock().unwrap();
         if Some(std::thread::current().id()) == owner {
-            if read >= crate::large_read::STEP_BYTES as u64
+            if read >= aft_engine::test_bridge::search_misc::STEP_BYTES as u64
                 && !watch.owner_paused.swap(true, Ordering::Relaxed)
             {
                 watch
@@ -7670,7 +7670,7 @@ fn observe_degraded_read_step(path: &Path, read: u64) {
             return;
         }
         watch.bytes.store(read as usize, Ordering::Relaxed);
-        if read >= crate::large_read::STEP_BYTES as u64
+        if read >= aft_engine::test_bridge::search_misc::STEP_BYTES as u64
             && !watch.paused.swap(true, Ordering::Relaxed)
         {
             *watch.worker.lock().unwrap() = Some(std::thread::current().id());
@@ -7757,7 +7757,7 @@ fn audit1432_round2_degraded_rayon_scan_observes_caller_cancellation_mid_file() 
     let read = watch.bytes.load(Ordering::Relaxed);
     assert!(read > 0);
     assert!(
-        read <= paused_at as usize + crate::large_read::STEP_BYTES,
+        read <= paused_at as usize + aft_engine::test_bridge::search_misc::STEP_BYTES,
         "worker read {read} bytes after cancellation at {paused_at}"
     );
     assert!(
@@ -10544,8 +10544,9 @@ mod tests {
     use crate::data_layer::runtime::DataCheckout;
     use crate::executor::JobCancellation;
     use crate::parser::TreeSitterProvider;
-    use crate::semantic_index::{
-        with_query_budget_for_test, LocalEmbeddingProvider, SemanticEmbeddingModel, SemanticIndex,
+    use crate::semantic_index::SemanticIndex;
+    use aft_engine::test_bridge::search_misc::semantic::{
+        from_local_provider_for_test, with_query_budget_for_test, LocalEmbeddingProvider,
     };
 
     use std::io::{Read, Write};
@@ -11683,8 +11684,8 @@ mod tests {
 
     #[test]
     fn lane_paused_query_returns_lexical_results_with_approved_gap() {
-        use crate::synapse_embed::pause_test_support::*;
-        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+        use aft_engine::test_bridge::search_misc::semantic::pause_test_support::*;
+        aft_engine::test_bridge::search_misc::semantic::with_lane_pause_clock(START, |clock| {
             with_fake_synapse(clock.clone(), None, |semantic, requests| {
                 let (_project, _storage, ctx, _model_free) = served_over_fake_synapse(semantic);
                 let before = requests.lock().unwrap().len();
@@ -11724,8 +11725,8 @@ mod tests {
 
     #[test]
     fn shape_compiling_query_falls_back_at_once_and_names_the_warm_up() {
-        use crate::synapse_embed::pause_test_support::*;
-        crate::semantic_index::with_lane_pause_clock(START, |clock| {
+        use aft_engine::test_bridge::search_misc::semantic::pause_test_support::*;
+        aft_engine::test_bridge::search_misc::semantic::with_lane_pause_clock(START, |clock| {
             with_compiling_synapse(clock.clone(), 90_000, |semantic, requests| {
                 let (_project, _storage, ctx, _model_free) = served_over_fake_synapse(semantic);
                 let before = requests.lock().unwrap().len();
@@ -11803,15 +11804,14 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        *ctx.semantic_embedding_model().lock() =
-            Some(SemanticEmbeddingModel::from_local_provider_for_test(
-                Box::new(BlockingLocalProvider {
-                    calls: Arc::clone(&calls),
-                    started: started_tx,
-                    gate: Arc::clone(&gate),
-                }),
-                project.path().to_path_buf(),
-            ));
+        *ctx.semantic_embedding_model().lock() = Some(from_local_provider_for_test(
+            Box::new(BlockingLocalProvider {
+                calls: Arc::clone(&calls),
+                started: started_tx,
+                gate: Arc::clone(&gate),
+            }),
+            project.path().to_path_buf(),
+        ));
 
         let query = "where remix panel mounted option switching handled";
         let started_at = Instant::now();
@@ -11935,15 +11935,14 @@ mod tests {
         let ctx = test_context(project);
         let calls = Arc::new(AtomicUsize::new(0));
         let (started_tx, started_rx) = std::sync::mpsc::channel();
-        *ctx.semantic_embedding_model().lock() =
-            Some(SemanticEmbeddingModel::from_local_provider_for_test(
-                Box::new(BlockingLocalProvider {
-                    calls: Arc::clone(&calls),
-                    started: started_tx,
-                    gate: Arc::clone(gate),
-                }),
-                project.to_path_buf(),
-            ));
+        *ctx.semantic_embedding_model().lock() = Some(from_local_provider_for_test(
+            Box::new(BlockingLocalProvider {
+                calls: Arc::clone(&calls),
+                started: started_tx,
+                gate: Arc::clone(gate),
+            }),
+            project.to_path_buf(),
+        ));
         (ctx, calls, started_rx)
     }
 
@@ -12167,7 +12166,7 @@ mod tests {
         // the agent sees the cause in the status line, not just the body.
         let timeout_error = format!(
             "failed to embed query: {}openai compatible request failed: operation timed out",
-            crate::semantic_index::query_embedding_timeout_marker(3_000)
+            aft_engine::test_bridge::search_misc::semantic::query_embedding_timeout_marker(3_000)
         );
         let classified = classify_embed_query_error(&timeout_error);
         assert!(
@@ -12527,7 +12526,8 @@ mod tests {
     /// must still name the URL and the failure instead of "rebuilding".
     #[test]
     fn unreachable_backend_not_yet_reached_by_the_build_is_disclosed() {
-        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let (_backend, addr) =
+            aft_engine::test_bridge::search_misc::semantic::reserved_refused_backend_for_test();
         let port = addr.port();
         let base_url = format!("http://127.0.0.1:{port}/v1");
 
@@ -12549,7 +12549,9 @@ mod tests {
             |response| response["semantic_status"] == "backend_unavailable",
         );
         let status = ctx.build_status_snapshot();
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        aft_engine::test_bridge::search_misc::semantic::clear_embedding_backend_retry_status(
+            project.path(),
+        );
 
         let text = response["text"].as_str().expect("text");
         assert!(
@@ -12631,7 +12633,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((probe_started, release_probe_rx));
         let probe_root = ctx.canonical_cache_root_opt().expect("semantic probe root");
-        crate::semantic_index::start_remote_backend_probe_for_test(
+        aft_engine::test_bridge::search_misc::semantic::start_remote_backend_probe_for_test(
             &probe_root,
             &base_url,
             block_backend_probe_for_test,
@@ -12680,14 +12682,17 @@ mod tests {
             || response_value(crate::commands::status::handle_status(&request, &ctx)),
             |status| status["semantic_index"]["stage"] != "checking_embedding_backend",
         );
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        aft_engine::test_bridge::search_misc::semantic::clear_embedding_backend_retry_status(
+            project.path(),
+        );
     }
 
     /// The sidebar polls `status` without searching; that path must find the
     /// unreachable backend on its own.
     #[test]
     fn status_names_an_unreachable_backend_before_the_build_reaches_it() {
-        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let (_backend, addr) =
+            aft_engine::test_bridge::search_misc::semantic::reserved_refused_backend_for_test();
         let port = addr.port();
         let base_url = format!("http://127.0.0.1:{port}/v1");
 
@@ -12706,7 +12711,9 @@ mod tests {
             || response_value(crate::commands::status::handle_status(&request, &ctx)),
             |status| status["semantic_index"]["status"] == "backend_unavailable",
         );
-        crate::semantic_index::clear_embedding_backend_retry_status(project.path());
+        aft_engine::test_bridge::search_misc::semantic::clear_embedding_backend_retry_status(
+            project.path(),
+        );
 
         let semantic = &status["semantic_index"];
         assert_eq!(semantic["status"], "backend_unavailable", "{semantic}");
@@ -12724,7 +12731,8 @@ mod tests {
     /// engine's reason, and status must report the backend unavailable.
     #[test]
     fn unreachable_backend_during_cold_build_is_disclosed_not_called_rebuilding() {
-        let (_backend, addr) = crate::semantic_index::reserved_refused_backend_for_test();
+        let (_backend, addr) =
+            aft_engine::test_bridge::search_misc::semantic::reserved_refused_backend_for_test();
         let base_url = format!("http://127.0.0.1:{}/v1", addr.port());
         let project = tempfile::tempdir().expect("create project dir");
         let storage = tempfile::tempdir().expect("create storage dir");
@@ -12744,7 +12752,7 @@ mod tests {
             &ctx,
         ));
         let status = ctx.build_status_snapshot();
-        crate::semantic_index::clear_embedding_backend_retry_status(&root);
+        aft_engine::test_bridge::search_misc::semantic::clear_embedding_backend_retry_status(&root);
 
         assert_eq!(response["success"], true, "{response}");
         assert_eq!(

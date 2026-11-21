@@ -7,12 +7,12 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 use crate::context::AppContext;
-#[cfg(test)]
-pub(crate) use crate::output_store::cleanup_expired;
 pub(crate) use crate::output_store::OutputScope;
 #[cfg(test)]
 use crate::output_store::SAVED_FILE_LIMIT;
 use crate::protocol::Response;
+#[cfg(test)]
+pub(crate) use aft_engine::test_bridge::search_misc::cleanup_expired;
 
 pub const TEXT_LIMIT: usize = 50 * 1024;
 /// Existing list producers reserve 10 KiB for their envelope, disclosures,

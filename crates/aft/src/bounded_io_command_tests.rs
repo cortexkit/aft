@@ -15,11 +15,11 @@ fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
     use crate::commands::read::{
         IMAGE_PROCESSING_DELAY, LEGACY_HASHLINE_READ, LEGACY_READ_RENDER_BYTES,
     };
-    use crate::hashline::snapshot::{SOURCE_AFTER_READ, SOURCE_READS};
-    use crate::path_identity::CANONICALIZE_CALLS;
-    use crate::search_index::{
+    use crate::executor::audit::{
         audit_record, audit_work, AuditWork, AUDIT_CANCEL_ELAPSED, AUDIT_IO_PROBE,
     };
+    use crate::path_identity::CANONICALIZE_CALLS;
+    use aft_engine::test_bridge::search_misc::{SOURCE_AFTER_READ, SOURCE_READS};
 
     let pool = Arc::new(IsolatedPool::with_test_scope(1, test_helper_scope));
     let nested_pool = pool.clone();
@@ -91,7 +91,7 @@ fn reused_helper_starts_each_job_with_clean_counters_and_hooks() {
 #[test]
 fn helper_job_scope_restores_state_after_unwind() {
     use crate::commands::read::LEGACY_READ_RENDER_BYTES;
-    use crate::hashline::snapshot::SOURCE_READS;
+    use aft_engine::test_bridge::search_misc::SOURCE_READS;
 
     let previous_reads = SOURCE_READS.with(|count| count.replace(11));
     let previous_render = LEGACY_READ_RENDER_BYTES.with(|count| count.replace(13));
@@ -359,7 +359,7 @@ fn audit1432_zero_result_search_keeps_no_results_and_independent_honesty_notes()
             "enumeration capped",
             "answered by a filesystem scan",
             "large.log",
-            crate::large_read::WHOLE_READ_SKIP_REASON,
+            crate::large_read_counts::WHOLE_READ_SKIP_REASON,
         ] {
             assert!(text.contains(expected), "missing {expected:?}: {text}");
         }
@@ -483,7 +483,7 @@ fn audit1432_grep_without_producer_text_still_renders_named_skips() {
         let text = crate::subc_format::format_response("grep", &response, false);
         assert!(text.contains("large.log"), "{text}");
         assert!(
-            text.contains(crate::large_read::WHOLE_READ_SKIP_REASON),
+            text.contains(crate::large_read_counts::WHOLE_READ_SKIP_REASON),
             "{text}"
         );
     });
@@ -539,7 +539,7 @@ fn audit1432_skip_collector_is_order_independent_and_deduplicates_paths_with_bot
     let reasons = files[0]["reasons"].as_array().unwrap();
     assert!(reasons.contains(&serde_json::json!("denied_floor")));
     assert!(reasons.contains(&serde_json::json!(
-        crate::large_read::WHOLE_READ_SKIP_REASON
+        crate::large_read_counts::WHOLE_READ_SKIP_REASON
     )));
     assert!(first.data["text"]
         .as_str()
