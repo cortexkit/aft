@@ -10816,7 +10816,7 @@ pub(crate) mod tests {
 
     #[cfg(unix)]
     fn rust_fixture_semantic_output_fingerprint(project_root: &Path) -> (usize, usize, String) {
-        let fixture_root = project_root.join("tests/fixtures");
+        let fixture_root = project_root.join("../aft/tests/fixtures");
         // Re-materialize the fixtures with LF bytes before collecting: Windows
         // checkouts (core.autocrlf) hand collect_chunks CRLF sources, and the
         // extra byte per line shifts snippet/embed-text cap boundaries — so

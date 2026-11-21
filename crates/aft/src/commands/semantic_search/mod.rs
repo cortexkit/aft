@@ -582,6 +582,9 @@ fn cancelled_search_response_from_id(request_id: &str) -> Response {
 }
 
 pub(crate) mod entry;
+
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc as test_bridge;
 pub use entry::handle_semantic_search;
 
 /// Parent-folder children may have no publication yet. Their reader engines
@@ -3513,7 +3516,7 @@ fn presence_check_after_unstamped_stat(
         Some(file) if file.stat().is_some() => file,
         Some(_) => {
             #[cfg(test)]
-            aft_engine::test_bridge::search_misc::record_request_file_read(path);
+            test_bridge::record_request_file_read(path);
             let stamp = file_stamp(path);
             after_stat();
             // Reopen unstamped source through the streaming reader even when
@@ -4705,10 +4708,7 @@ mod code_references {
         #[test]
         fn code_reference_cache_reuses_content_but_separates_grammar_and_edits() {
             let source = "fn CachedParseMarker(x: ExternalCacheType) { x; } // CommentCacheOnly";
-            let file = aft_engine::test_bridge::search_misc::search::unshared_request_file(
-                source.as_bytes().to_vec(),
-                None,
-            );
+            let file = test_bridge::search::unshared_request_file(source.as_bytes().to_vec(), None);
             let mut parser = crate::parser::FileParser::new();
             let before = crate::parser::work_counters::tree_parses();
             assert_eq!(
@@ -4737,10 +4737,7 @@ mod code_references {
             assert_eq!(crate::parser::work_counters::tree_parses(), after);
             // A Rust-looking name in a Python comment is not a Python identifier.
             let text = "# fn CachedGrammarMarker() {}";
-            let bytes = aft_engine::test_bridge::search_misc::search::unshared_request_file(
-                text.as_bytes().to_vec(),
-                None,
-            );
+            let bytes = test_bridge::search::unshared_request_file(text.as_bytes().to_vec(), None);
             for extension in ["rs", "py", "h", "c"] {
                 let path = PathBuf::from(format!("same.{extension}"));
                 assert_eq!(
@@ -4754,10 +4751,8 @@ mod code_references {
                 );
             }
             let changed = "// ExternalCacheType";
-            let bytes = aft_engine::test_bridge::search_misc::search::unshared_request_file(
-                changed.as_bytes().to_vec(),
-                None,
-            );
+            let bytes =
+                test_bridge::search::unshared_request_file(changed.as_bytes().to_vec(), None);
             assert_eq!(
                 cached(
                     Path::new("first.rs"),
@@ -7666,7 +7661,7 @@ fn observe_degraded_read_step(path: &Path, read: u64) {
     if let Some(watch) = watch {
         let owner = *watch.owner.lock().unwrap();
         if Some(std::thread::current().id()) == owner {
-            if read >= aft_engine::test_bridge::search_misc::STEP_BYTES as u64
+            if read >= test_bridge::STEP_BYTES as u64
                 && !watch.owner_paused.swap(true, Ordering::Relaxed)
             {
                 watch
@@ -7679,9 +7674,7 @@ fn observe_degraded_read_step(path: &Path, read: u64) {
             return;
         }
         watch.bytes.store(read as usize, Ordering::Relaxed);
-        if read >= aft_engine::test_bridge::search_misc::STEP_BYTES as u64
-            && !watch.paused.swap(true, Ordering::Relaxed)
-        {
+        if read >= test_bridge::STEP_BYTES as u64 && !watch.paused.swap(true, Ordering::Relaxed) {
             *watch.worker.lock().unwrap() = Some(std::thread::current().id());
             watch.reached.send(read).unwrap();
             watch
@@ -7766,7 +7759,7 @@ fn audit1432_round2_degraded_rayon_scan_observes_caller_cancellation_mid_file() 
     let read = watch.bytes.load(Ordering::Relaxed);
     assert!(read > 0);
     assert!(
-        read <= paused_at as usize + aft_engine::test_bridge::search_misc::STEP_BYTES,
+        read <= paused_at as usize + test_bridge::STEP_BYTES,
         "worker read {read} bytes after cancellation at {paused_at}"
     );
     assert!(
@@ -7863,12 +7856,7 @@ fn audit1432_presence_unstamped_growth_streams_without_a_false_skip() {
     let file = root.path().join("presence.txt");
     fs::write(&file, b"initial\n").unwrap();
     let files = request_files::install();
-    aft_engine::test_bridge::search_misc::keep_request_file(
-        &files,
-        &file,
-        b"old unstamped\n".to_vec(),
-        None,
-    );
+    test_bridge::keep_request_file(&files, &file, b"old unstamped\n".to_vec(), None);
     let mut grown = b"x\n".repeat((17 << 20) / 2);
     grown.extend_from_slice(b"needle_at_tail\n");
     let _scope = crate::bounded_io::enter_disclosure_if_absent();
@@ -9506,7 +9494,7 @@ fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Snip
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
     #[cfg(test)]
-    aft_engine::test_bridge::search_misc::record_request_file_read(path);
+    test_bridge::record_request_file_read(path);
     let size = file.metadata().map_or(0, |metadata| metadata.len());
     let mut reader = std::io::BufReader::new(CountedRead { file, read: 0 });
     let lines = bounded_snippet_lines_from(&mut reader, plan);

@@ -35,7 +35,7 @@ pub(crate) mod tests {
             crate::private_storage::create_dir_all(&root).unwrap();
             let manifest = crate::grammar::manifest("luau").unwrap();
             let fixture = crate::test_support::manifest_dir()
-                .join("tests/fixtures/grammars")
+                .join("../aft/tests/fixtures/grammars")
                 .join(format!("{}.wasm", manifest.sha256));
             crate::private_storage::write(
                 root.join(format!("{}.wasm", manifest.sha256)),
