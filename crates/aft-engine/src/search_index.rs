@@ -892,7 +892,8 @@ pub struct GrepFileCollection {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct GrepQueryPhaseTimings {
+#[doc(hidden)]
+pub struct GrepQueryPhaseTimings {
     pub trigram_lookup: Duration,
     pub pread_verify: Duration,
     pub post_filter: Duration,

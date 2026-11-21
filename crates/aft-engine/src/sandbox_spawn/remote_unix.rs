@@ -155,7 +155,8 @@ pub(crate) fn prepare_with_launcher(
     })
 }
 
-pub(crate) struct Running {
+#[doc(hidden)]
+pub struct Running {
     child: Child,
     scratch: Scratch,
     group: i32,

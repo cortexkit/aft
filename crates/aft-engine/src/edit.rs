@@ -1570,7 +1570,8 @@ fn log_slow_backup(started: std::time::Instant, path: &Path) {
     );
 }
 
-pub(crate) struct ObservedFinalText {
+#[doc(hidden)]
+pub struct ObservedFinalText {
     text: String,
     version: Option<crate::backup::DiskFileVersion>,
 }

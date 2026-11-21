@@ -417,7 +417,8 @@ fn active() -> &'static Mutex<Active> {
 
 /// Keeps one request's set current on its thread or task until dropped.
 #[must_use]
-pub(crate) struct Guard {
+#[doc(hidden)]
+pub struct Guard {
     execution: ExecutionId,
     files: Arc<RequestFiles>,
     _not_send: PhantomData<Rc<()>>,
