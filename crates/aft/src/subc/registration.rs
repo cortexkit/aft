@@ -17,7 +17,7 @@ use super::{SubcError, AUTH_DEADLINE};
 
 use aft_base::registration::claim_cause;
 pub(crate) use aft_base::registration::{
-    connect_consumer, identity_ready, module_consumer_allowed, module_id,
+    connect_consumer, identity_ready, module_consumer_allowed,
 };
 
 const MINT_BUDGET: Duration = Duration::from_secs(5);
