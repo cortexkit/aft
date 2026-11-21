@@ -1032,3 +1032,7 @@ pub(crate) fn use_current_secret_label(
         )),
     })
 }
+
+#[cfg(all(test, unix))]
+#[path = "secret_proxy_vault_tests.rs"]
+mod vault_tests;

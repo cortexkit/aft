@@ -1,5 +1,3 @@
-use super::*;
-
 #[allow(unused_imports)]
 pub(crate) use aft_base::secret_proxy::tests::*;
 
@@ -8,6 +6,3 @@ pub(crate) use aft_base::secret_proxy::tests::*;
 fn client_child() {
     aft_base::secret_proxy::tests::client_child();
 }
-
-#[path = "vault_tests.rs"]
-mod vault_tests;

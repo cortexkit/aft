@@ -17,10 +17,11 @@
 // spellings. On other targets only the rule test runs, so the table helpers
 // are unused there.
 #![cfg_attr(not(unix), allow(dead_code))]
-use super::*;
+use crate::access_policy::*;
 use crate::config::Config;
 use crate::config_resolve::{resolve_config, ConfigTier};
 use crate::context::AppContext;
+use std::path::{Path, PathBuf};
 
 /// The `aft.jsonc` user documents existing installations have: the key
 /// absent, explicitly off, and on.
@@ -30,7 +31,7 @@ const EXISTING_CONFIGS: [(&str, &str); 3] = [
     ("true", r#"{ "restrict_to_project_root": true }"#),
 ];
 
-const LEGACY_OUTCOMES: &str = include_str!("fixtures/outside_roots_legacy_outcomes.txt");
+const LEGACY_OUTCOMES: &str = include_str!("../fixtures/outside_roots_legacy_outcomes.txt");
 
 struct Fixture {
     dir: tempfile::TempDir,
@@ -76,7 +77,7 @@ impl Fixture {
     /// Resolve a user `aft.jsonc` document through the real config resolver,
     /// then point the resulting context at this fixture.
     fn context(&self, doc: &str, project_root: bool) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(crate::language::StubProvider),
             self.config(doc, project_root.then(|| self.root.clone())),
         )
@@ -113,7 +114,7 @@ impl Fixture {
             git(&main, &["commit", "-q", "-m", "fixture"]);
             git(&main, &["worktree", "add", "-q", "../linked"]);
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::language::StubProvider),
             self.config(doc, Some(linked.clone())),
         );
@@ -134,7 +135,7 @@ impl Fixture {
                 git(repo, &["init", "-q"]);
             }
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             self.config(doc, Some(self.root.clone())),
         );
