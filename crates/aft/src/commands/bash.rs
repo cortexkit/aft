@@ -2190,7 +2190,12 @@ mod tests {
             experimental_bash_background: true,
             ..Default::default()
         };
-        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        assert!(
+            aft_engine::test_bridge::display_data::reader_floor::prepare_cache_root_for_test(
+                &mut config
+            )
+            .is_none()
+        );
         let artifacts = crate::root_cache::cache_root(&config);
         let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         crate::sandbox_spawn::install_sandbox_spawn_test_seam(project.path().to_path_buf());
@@ -2347,7 +2352,7 @@ mod tests {
         // the watchdog's timeout kill then pauses after publishing `killing`
         // and before it signals.
         let (reached, release) =
-            crate::bash_background::registry::install_kill_signal_gate_for_test(&task_id);
+            aft_engine::test_bridge::bash_remote::bash_background::registry::install_kill_signal_gate_for_test(&task_id);
         reached
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the timeout kill reached its signal step");

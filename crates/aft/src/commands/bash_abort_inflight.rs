@@ -26,7 +26,7 @@ mod tests {
 
     #[test]
     fn abort_with_no_wait_registered_tasks_is_a_successful_noop() {
-        let app = App::default_shared();
+        let app = crate::test_app();
         let ctx = AppContext::from_app(Arc::clone(&app), Config::default());
         let req = RawRequest {
             id: "abort-inflight".to_string(),

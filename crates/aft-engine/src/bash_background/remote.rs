@@ -1354,31 +1354,7 @@ impl OutputProgress {
 }
 
 #[cfg(unix)]
-pub(crate) struct TaskSink {
-    registry: BgTaskRegistry,
-    task: Arc<BgTask>,
-    stdout: fs::File,
-    stderr: fs::File,
-    unknown: Option<fs::File>,
-    dirty: DirtyOutput,
-    // Keep newly received byte counts and sequence numbers out of shared task
-    // metadata until the files are synced. Cancellation also saves that metadata.
-    output_progress: OutputProgress,
-    last_progress_persist: Instant,
-    sent_at: Option<Instant>,
-    #[cfg(any(test, feature = "test-support"))]
-    progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
-    /// Runs between the checkpoint snapshot and its file write, so a test can
-    /// land another metadata write in that window.
-    #[cfg(any(test, feature = "test-support"))]
-    before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
-    /// Stages the job's returned-file chunks until the runner's manifest
-    /// arrives, then places the files that verify.
-    returns: Option<super::return_files::ReturnReceiver>,
-    /// A handled manifest's report whose save failed, saved when the
-    /// consumer delivers the manifest again.
-    unsaved_return_report: Option<Vec<super::return_files::ReturnedPath>>,
-}
+pub(crate) use remote_types::TaskSink;
 
 /// Longest time the saved output cursor of a running remote task may lag the
 /// output already received, unless a state change saves it sooner.

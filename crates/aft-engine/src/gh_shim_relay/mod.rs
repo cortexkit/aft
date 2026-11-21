@@ -1664,7 +1664,14 @@ struct RouteLeases {
     pause: std::sync::Mutex<Option<Arc<LeaseTestPause>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "test-support",
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
 #[derive(Default)]
 struct LeaseTestPause {
     acquired: tokio::sync::Notify,
@@ -2155,6 +2162,17 @@ impl RelayTransport for SubcRelayTransport {
 #[cfg(test)]
 #[path = "../gh_shim/plexus_bindings_contract.rs"]
 pub(crate) mod bindings_contract;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod bindings_fixture;
+#[cfg(any(
+    test,
+    all(
+        feature = "test-support",
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
+pub(crate) mod daemon_fixture;
 #[cfg(test)]
 pub(crate) mod tests;
 

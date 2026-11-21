@@ -1685,7 +1685,7 @@ pub fn spawn_with_secrets(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn(
     request_id: &str,

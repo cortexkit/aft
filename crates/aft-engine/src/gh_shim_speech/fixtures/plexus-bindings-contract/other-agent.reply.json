@@ -1,0 +1,17 @@
+{
+  "result": {
+    "bindings": [
+      {
+        "agent_id": "agent-y",
+        "app_handle_id": "app-y",
+        "repository": "o/a"
+      },
+      {
+        "agent_id": "agent-y",
+        "app_handle_id": "app-y",
+        "repository": "o/z"
+      }
+    ],
+    "repo_binding_generation": 3
+  }
+}

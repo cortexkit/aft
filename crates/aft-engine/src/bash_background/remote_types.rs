@@ -61,3 +61,30 @@ impl DrainingRetryTestExt for DrainingRetry {
         self.next_retry_at_ms
     }
 }
+
+#[cfg(unix)]
+pub struct TaskSink {
+    pub(super) registry: BgTaskRegistry,
+    pub(super) task: Arc<BgTask>,
+    pub(super) stdout: fs::File,
+    pub(super) stderr: fs::File,
+    pub(super) unknown: Option<fs::File>,
+    pub(super) dirty: DirtyOutput,
+    // Keep newly received byte counts and sequence numbers out of shared task
+    // metadata until the files are synced. Cancellation also saves that metadata.
+    pub(super) output_progress: OutputProgress,
+    pub(super) last_progress_persist: Instant,
+    pub(super) sent_at: Option<Instant>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
+    /// Runs between the checkpoint snapshot and its file write, so a test can
+    /// land another metadata write in that window.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
+    /// Stages the job's returned-file chunks until the runner's manifest
+    /// arrives, then places the files that verify.
+    pub(super) returns: Option<super::super::return_files::ReturnReceiver>,
+    /// A handled manifest's report whose save failed, saved when the
+    /// consumer delivers the manifest again.
+    pub(super) unsaved_return_report: Option<Vec<super::super::return_files::ReturnedPath>>,
+}

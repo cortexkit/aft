@@ -39,7 +39,7 @@ use crate::db::bash_tasks::BashTaskRow;
 pub mod retention;
 
 /// A terminal completed task carrying `pin`, for read-only app-server calls and persistence tests.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn terminal_task_metadata_for_test(
     pin: Option<&str>,
 ) -> crate::bash_background::persistence::PersistedTask {

@@ -27,7 +27,7 @@ fn shells_v1_operation_logs_are_once_per_event_and_content_free() {
             let dir = tempfile::tempdir().unwrap();
             let (snapshot, reader, _task) = captured(dir.path(), b"private output bytes", false, true);
             let task_id = snapshot.metadata.task_id.clone();
-            let app = App::default_shared();
+            let app = crate::test_app();
             app.open_db(&dir.path().join("aft.db")).unwrap();
             let db = app.db().unwrap();
             // A busy database makes refresh retain the seeded rows and readers.
@@ -179,7 +179,7 @@ fn status_context() -> (
     Arc<App>,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let ctx = Arc::new(crate::context::AppContext::with_app_and_provider(
         app.clone(),
         Box::new(crate::language::StubProvider),
@@ -883,7 +883,7 @@ async fn shells_v1_output_real_files_default_backfill_exact_resume_and_end_recor
     let raw = "o".repeat(70_000);
     let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), false, true);
     let row = project_row(&snapshot, None);
-    let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
+    let service = Service::new(crate::test_app(), Arc::new(Executor::new()));
     service
         .state
         .write()
@@ -1269,7 +1269,7 @@ async fn shells_v1_output_pty_screen_uses_masked_renderer_and_cursor() {
     );
     let (snapshot, reader, _task) = captured(dir.path(), raw.as_bytes(), true, true);
     let row = project_row(&snapshot, None);
-    let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
+    let service = Service::new(crate::test_app(), Arc::new(Executor::new()));
     service
         .state
         .write()
@@ -1389,7 +1389,7 @@ async fn shells_v1_list_pages_fifty_running_first_and_cursor_is_filter_bound() {
     let dir = tempfile::tempdir().unwrap();
     let (snapshot, _reader, _task) = captured(dir.path(), b"", false, true);
     let base = project_row(&snapshot, None);
-    let service = Service::new(App::default_shared(), Arc::new(Executor::new()));
+    let service = Service::new(crate::test_app(), Arc::new(Executor::new()));
     for index in 0..51 {
         let mut row = base.clone();
         row.task_id = format!("bash-{index:016x}");
@@ -1492,7 +1492,7 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
     }
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join("module-storage");
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let module_app = app.clone();
     let module_executor = executor.clone();

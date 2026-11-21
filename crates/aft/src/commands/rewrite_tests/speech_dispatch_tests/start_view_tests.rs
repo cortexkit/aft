@@ -69,7 +69,7 @@ async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::pro
                     crate::sandbox_spawn::SpawnPlan::Unsandboxed
                 };
                 aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(plan, || {
-                    crate::bash_background::spawn(
+                    aft_engine::test_bridge::bash_remote::bash_background::spawn(
                         "start-view-launch",
                         &session,
                         &format!(

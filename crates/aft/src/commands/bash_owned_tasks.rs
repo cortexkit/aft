@@ -80,7 +80,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let storage = tempfile::tempdir().unwrap();
             let ctx = AppContext::from_app(
-                App::default_shared(),
+                crate::test_app(),
                 Config {
                     project_root: Some(root.path().to_path_buf()),
                     storage_dir: Some(storage.path().to_path_buf()),

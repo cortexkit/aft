@@ -1,4 +1,4 @@
-use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::{bash_background::registry::remote::*, resolve_posix_shell, TaskSinkTestExt as _};
 use aft_engine::test_bridge::bash_remote::DrainingRetryTestExt as _;
 use aft_engine::test_bridge::bash_remote::KeyedSubmissionTestExt as _;
 #[tokio::test]

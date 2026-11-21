@@ -65,7 +65,6 @@ mod plexus_contract_judge;
 #[cfg(test)]
 #[path = "gh_shim/v19_compat_tests.rs"]
 mod v19_compat_tests;
-
 pub const SCHEMA_FLOOR: u64 = 1;
 /// Envelope version that carries the manifest as exact signed bytes. Envelope
 /// v1 re-serialized the parsed manifest at verify time; envelope v2 verifies
@@ -8356,7 +8355,8 @@ mod bypass_bot_credentials_tests;
 #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[path = "gh_shim/review_thread_tests.rs"]
 mod review_thread_tests;
-#[cfg(any(test, feature = "test-support"))]
+#[rustfmt::skip]
+#[cfg(all(any(test, feature = "test-support"), debug_assertions, any(target_os = "linux", target_os = "macos")))]
 #[path = "gh_shim_speech/dispatch_test_support.rs"]
 pub(crate) mod speech_dispatch_support;
 #[cfg(test)]
@@ -8461,9 +8461,7 @@ pub(crate) mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
 
-    pub(super) use super::speech_dispatch_support::{
-        fixture_manifest, signed, signed_with, write_signed_manifest, TEST_SEED,
-    };
+    include!("gh_shim_speech/manifest_fixture.rs");
     /// Seed for the standby-slot fixture key. Test-only material: the compiled
     /// dev trust set keeps exactly one key, and this second keypair exists so
     /// the two-slot trust-set mechanics (standby accepted, unknown refused)
@@ -15483,7 +15481,7 @@ INHERITED FLAGS
     }
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(crate::test_support::manifest_dir()).join("tests/fixtures/gh_shim")
+        PathBuf::from(crate::test_support::manifest_dir()).join("../aft/tests/fixtures/gh_shim")
     }
 
     fn canonical_manifest_bytes() -> Vec<u8> {

@@ -1,6 +1,7 @@
 use super::*;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::ScheduledTestExt as _;
 #[cfg(test)]
@@ -2437,7 +2438,7 @@ impl HeldCompletion {
             call_key: format!("held-{id}"),
         };
         let registered = task.registry.test_task(id).unwrap();
-        let mut state = registered.lock_state().unwrap();
+        let mut state = registered.test_lock_state().unwrap();
         state.metadata.call_key = Some(crate::bash_background::TaskCallKey {
             requester: key.carrier.clone(),
             key: key.call_key.clone(),
@@ -3592,10 +3593,10 @@ fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
         task.registry.configure_long_running_reminders(true, 1_000);
         let registered = task.registry.test_task(&task.task).unwrap();
         let recent = std::time::Instant::now() - Duration::from_secs(10);
-        *registered.last_reminder_at.lock().unwrap() = Some(recent);
+        *registered.last_reminder_at().lock().unwrap() = Some(recent);
         task.registry.maybe_emit_long_running_reminder(&registered);
         assert_eq!(
-            *registered.last_reminder_at.lock().unwrap(),
+            *registered.last_reminder_at().lock().unwrap(),
             Some(recent),
             "the frozen interval must also govern actual scheduling"
         );

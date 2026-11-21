@@ -1170,7 +1170,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let ctx = context(project.path(), storage.path());
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::bash_background::worker_thread::with_refusal(
+            aft_engine::test_bridge::bash_remote::bash_background::worker_thread::with_refusal(
                 crate::bash_background::worker_thread::Worker::Watch,
                 || handle_deferred(&request(TASK, SESSION), ctx),
             )
@@ -1636,7 +1636,7 @@ mod tests {
                 crate::bounded_io::Budget::after(Duration::from_secs(30))
                     .with_access_budget(duration)
             }));
-            crate::bash_background::registry::ARTIFACT_PAGE_DELAY
+            aft_engine::test_bridge::bash_remote::bash_background::registry::ARTIFACT_PAGE_DELAY
                 .with(|delay| delay.set(Some(page_delay)));
             let started = Instant::now();
             let waited = job.wait(&crate::executor::JobCancellation::new());

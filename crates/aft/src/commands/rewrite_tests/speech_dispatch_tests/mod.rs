@@ -97,7 +97,7 @@ fn wire_owner(owner: &subc_protocol::Principal) -> String {
 impl FakePlex {
     fn bindings(&self) -> Value {
         let state = self.state.lock().unwrap();
-        crate::gh_shim_relay::bindings_contract::agent_reply(
+        aft_engine::test_bridge::bash_remote::gh_shim_relay::bindings_contract::agent_reply(
             &state.repo,
             &state.agent,
             &state.handle,
@@ -108,7 +108,7 @@ impl FakePlex {
 
     fn bindings_reply(&self, arguments: &Value) -> Option<Value> {
         let state = self.state.lock().unwrap();
-        crate::gh_shim_relay::bindings_contract::stand_in_reply(
+        aft_engine::test_bridge::bash_remote::gh_shim_relay::bindings_contract::stand_in_reply(
             arguments,
             &state.repo,
             &state.agent,
@@ -309,7 +309,7 @@ impl RelayTransport for FakePlex {
 }
 
 struct Fixture {
-    _runtime: crate::gh_shim_speech::service::RuntimeGuard,
+    _runtime: aft_engine::test_bridge::bash_remote::gh_shim_speech::service::RuntimeGuard,
     _dir: tempfile::TempDir,
     _env: Vec<Env>,
     ctx: Arc<crate::context::AppContext>,
@@ -324,7 +324,7 @@ struct Fixture {
     incarnation: String,
     startup_error: Option<String>,
     _relay: Arc<crate::gh_shim_relay::GhRelay>,
-    sdk: Option<crate::gh_shim_relay::tests::FakeDaemon>,
+    sdk: Option<aft_engine::test_bridge::bash_remote::gh_shim_relay::tests::FakeDaemon>,
 }
 
 #[derive(Default)]
@@ -450,8 +450,8 @@ impl Fixture {
         let sdk = if options.sdk_daemon {
             let server = plex.clone();
             Some(
-                crate::gh_shim_relay::tests::fake_daemon_with_reply(Arc::new(
-                    move |body, scope| {
+                aft_engine::test_bridge::bash_remote::gh_shim_relay::tests::fake_daemon_with_reply(
+                    Arc::new(move |body, scope| {
                         let args = &body["arguments"];
                         if args["op"]
                             .as_str()
@@ -471,8 +471,8 @@ impl Fixture {
                             return refused("scope_unverifiable", "route");
                         }
                         server.send(&server.head, args.clone(), true)
-                    },
-                ))
+                    }),
+                )
                 .await,
             )
         } else {
