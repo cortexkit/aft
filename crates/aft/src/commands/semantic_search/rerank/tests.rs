@@ -761,7 +761,7 @@ fn audit1432_round4_middle_selection_failure_never_scores_or_commits_and_retries
         let settings = RerankSettings::resolve(&search);
         let request = head_request(&search, project.path(), Some(prose), None);
         let before = names(&list);
-        let outcome = crate::large_read::with_line_scan_failure(
+        let outcome = aft_engine::test_bridge::search_misc::large_read::with_line_scan_failure(
             crate::large_read::Site::MatchingLine,
             || rerank_block_zero(&mut list, &selected, &settings, &request),
         )
@@ -881,7 +881,7 @@ fn audit1432_round3_cancelled_candidate_scan_never_commits_and_next_request_is_f
             let mut pass = 1;
             let mut previous = 0;
             let mut paused = false;
-            let outcome = crate::large_read::with_step_tap(
+            let outcome = aft_engine::test_bridge::search_misc::large_read::with_step_tap(
                 move |read| {
                     if read < previous {
                         pass += 1;
@@ -2522,7 +2522,12 @@ fn cache_root_onnx_factory_passes_configured_model_cache_to_provisioner() {
         model: Some(model.to_string()),
         ..Default::default()
     });
-    assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+    assert!(
+        aft_engine::test_bridge::display_data::reader_floor::prepare_cache_root_for_test(
+            &mut config
+        )
+        .is_none()
+    );
     let inputs = slot::BuildInputs::from_config(&config, false);
     let (result, observed) = onnx::with_provision_probe(model, || bridge::build_backend(&inputs));
     assert!(result.err().unwrap().contains("provision path observed"));
@@ -2559,7 +2564,9 @@ fn cache_root_rerank_model_download_refuses_a_replaced_cache_root() {
         cache_dir: Some(volume.clone()),
         ..Default::default()
     };
-    let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+    let warning = aft_engine::test_bridge::display_data::reader_floor::prepare_cache_root_for_test(
+        &mut config,
+    );
     assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
     let models = config.semantic.local_cache_dir.clone().unwrap();
     // On Unix the lease stays alive, as it does for a running reranker whose

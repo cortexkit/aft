@@ -7840,8 +7840,8 @@ fn audit1432_degraded_mid_scan_cancellation_never_returns_partial_rows() {
     let token = crate::executor::JobCancellation::new();
     let cancel = token.clone();
     let _installed = crate::executor::install_job_cancellation(token);
-    let result = crate::large_read::with_test_steps(64, 0, || {
-        crate::large_read::with_step_tap(
+    let result = test_bridge::large_read::with_test_steps(64, 0, || {
+        test_bridge::large_read::with_step_tap(
             move |_| cancel.request_cancel(),
             || read_degraded_grep_file(&file, &audit1432_degraded_literal(), 10),
         )
@@ -7979,7 +7979,7 @@ fn stage2_degraded_streamed_rows_match_whole_read() {
             search_degraded_grep_file(
                 &path, content, &compiled, cap, &mut total, &mut false, &mut rows,
             );
-            let streamed = crate::large_read::with_test_steps(3, 0, || {
+            let streamed = test_bridge::large_read::with_test_steps(3, 0, || {
                 read_degraded_grep_file(&path, &compiled, cap)
             });
             assert_eq!(
@@ -7991,8 +7991,10 @@ fn stage2_degraded_streamed_rows_match_whole_read() {
     }
     fs::write(&path, b"foo\nlater\xff").unwrap();
     assert!(
-        crate::large_read::with_test_steps(3, 0, || read_degraded_grep_file(&path, &compiled, 10))
-            .is_none()
+        test_bridge::large_read::with_test_steps(3, 0, || read_degraded_grep_file(
+            &path, &compiled, 10
+        ))
+        .is_none()
     );
 }
 
@@ -8002,7 +8004,7 @@ fn collect_degraded_grep_files(
     started: Instant,
 ) -> (Vec<PathBuf>, bool, bool, usize) {
     #[cfg(test)]
-    grep_executor::note_fallback_walk_for_test();
+    test_bridge::grep_executor::note_fallback_walk_for_test();
     // Keep degraded semantic search on the root filesystem: ReadDir::drop can
     // abort the daemon if a disappearing child mount reports ENXIO.
     let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
@@ -10640,8 +10642,12 @@ mod tests {
     #[test]
     fn first_text_index_search_returns_promptly_at_text_publication() {
         let (_dir, root, ctx) = first_text_index_fixture();
-        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        let _graph_hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
+        let _hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
+        let _graph_hold =
+            aft_engine::test_bridge::display_data::data_layer::checkout::hold_call_graph_for_test(
+                &root,
+            );
         aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         assert!(first_text_index_wait_needed(&ctx));
         let (started, waiting) = std::sync::mpsc::channel();
@@ -10677,7 +10683,8 @@ mod tests {
     #[test]
     fn first_text_index_search_times_out_after_eight_seconds_with_unchanged_refusal() {
         let (_dir, root, ctx) = first_text_index_fixture();
-        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let _hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
         aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let req = semantic_request("first_index_needle", 5);
         let expected = SearchLaneStatus::observe_current(&ctx)
@@ -10701,7 +10708,10 @@ mod tests {
     fn first_text_index_search_does_not_wait_when_disabled_or_failed() {
         for failed in [false, true] {
             let (_dir, root, ctx) = first_text_index_fixture();
-            let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+            let _hold =
+                aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(
+                    &root,
+                );
             if !failed {
                 ctx.update_config(|config| config.indexes.trigram = false);
             }
@@ -10753,8 +10763,9 @@ mod tests {
         trigger: impl FnOnce(&DataCheckout, &JobCancellation),
     ) {
         let (_dir, root, ctx) = first_text_index_fixture();
-        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        let _hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let checkout = ctx.data_checkout().unwrap();
         let token = JobCancellation::new();
         let worker_token = token.clone();
@@ -10802,7 +10813,8 @@ mod tests {
     #[test]
     fn first_text_index_search_respects_request_deadline() {
         let (_dir, root, ctx) = first_text_index_fixture();
-        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let _hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
         aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let started = Instant::now();
         let _budget = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
@@ -10821,7 +10833,8 @@ mod tests {
         use crate::path_identity::ProjectRootId;
         use crate::response_finalize::{DeferredResponseWake, DispatchOutcome};
         let (_dir, root, ctx) = first_text_index_fixture();
-        let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let _hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
         aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let executor = Executor::new();
         let root_id = ProjectRootId::from_path(&root).unwrap();
@@ -10884,7 +10897,10 @@ mod tests {
         use crate::response_finalize::{DispatchOutcome, PendingResponses};
         for ending in ["cancel", "drain", "timeout"] {
             let (_dir, root, ctx) = first_text_index_fixture();
-            let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+            let _hold =
+                aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(
+                    &root,
+                );
             aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
             let req = semantic_request("first_index_needle", 5);
             let timeout = if ending == "timeout" {
@@ -11282,7 +11298,7 @@ mod tests {
         ];
         for step in [1, 3, 8, 64] {
             let (_project, ctx) = presence_project(&files);
-            let text = crate::large_read::with_test_steps(step, 0, || {
+            let text = test_bridge::large_read::with_test_steps(step, 0, || {
                 presence_search(&ctx, "bash_wait_detach(", 10, 0)
             });
             assert!(
@@ -11303,7 +11319,7 @@ mod tests {
             ONLY_NAMES_IT,
             ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
         ]);
-        let first = crate::large_read::with_test_steps(8, 0, || {
+        let first = test_bridge::large_read::with_test_steps(8, 0, || {
             PRESENCE_CLOCK_ADVANCE.with(|clock| clock.set(Some(Duration::from_secs(60))));
             let text = presence_search(&ctx, "bash_wait_detach(", 1, 0);
             PRESENCE_CLOCK_ADVANCE.with(|clock| clock.set(None));
@@ -11312,7 +11328,7 @@ mod tests {
         assert!(!first.contains("No file contains"), "{first}");
         let (reads, _) = take_literal_presence_counts();
         assert!(reads > 0, "{first}");
-        let second = crate::large_read::with_test_steps(8, 0, || {
+        let second = test_bridge::large_read::with_test_steps(8, 0, || {
             presence_search(&ctx, "bash_wait_detach(", 1, 1)
         });
         assert!(!second.contains("No file contains"), "{second}");
@@ -11329,7 +11345,7 @@ mod tests {
             ONLY_NAMES_IT,
             ("tests/near_a_test.rs", NEAR_HOLDER_TEST_FILE),
         ]);
-        let first = crate::large_read::with_test_steps(8, 0, || {
+        let first = test_bridge::large_read::with_test_steps(8, 0, || {
             PRESENCE_CANCELLED_FOR_TEST.with(|cancelled| cancelled.set(true));
             let text = presence_search(&ctx, "bash_wait_detach(", 1, 0);
             PRESENCE_CANCELLED_FOR_TEST.with(|cancelled| cancelled.set(false));
@@ -11337,7 +11353,7 @@ mod tests {
         });
         assert!(!first.contains("No file contains"), "{first}");
         take_literal_presence_counts();
-        let second = crate::large_read::with_test_steps(8, 0, || {
+        let second = test_bridge::large_read::with_test_steps(8, 0, || {
             presence_search(&ctx, "bash_wait_detach(", 10, 0)
         });
         assert!(second.starts_with(BASH_WAIT_DETACH_ABSENT), "{second}");
@@ -11373,7 +11389,7 @@ mod tests {
                     "offset": 0,
                 }))
                 .expect("request");
-                let reply = crate::large_read::with_test_steps(8, threshold, || {
+                let reply = test_bridge::large_read::with_test_steps(8, threshold, || {
                     response_value(handle_semantic_search(&request, &ctx))
                 });
                 PRESENCE_CHECK_STARTED.with(|hook| *hook.borrow_mut() = None);
@@ -11678,7 +11694,10 @@ mod tests {
         });
         ctx.set_canonical_cache_root(root.clone());
         crate::semantic_admission::note_opened("data-layer-synapse-test", &root);
-        let model_free = crate::data_layer::meaning::fill_without_model_for_test(&root, 2);
+        let model_free =
+            aft_engine::test_bridge::display_data::data_layer::meaning::fill_without_model_for_test(
+                &root, 2,
+            );
         wait_for_data_semantic(&ctx, |data| {
             data.serving().is_some_and(|meaning| meaning.complete())
         });
@@ -12459,7 +12478,7 @@ mod tests {
         let project = tempfile::tempdir().expect("create project dir");
         let storage = tempfile::tempdir().expect("create storage dir");
         let (root, ctx) = data_layer_context(project.path(), storage.path());
-        let _failing = crate::data_layer::meaning::fail_model_loads_for_test(
+        let _failing = aft_engine::test_bridge::display_data::data_layer::meaning::fail_model_loads_for_test(
             &root,
             "ONNX Runtime not found. dlopen('libonnxruntime.dylib') failed: no such file. Run `npx @cortexkit/aft doctor --fix` to install it.",
         );
@@ -12500,10 +12519,11 @@ mod tests {
             .join(".aft-onnx-installing");
         std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
         std::fs::write(&lock, format!("{}\n", std::process::id())).unwrap();
-        let _failing = crate::data_layer::meaning::fail_model_loads_for_test(
-            &root,
-            "ONNX Runtime not found. dlopen('libonnxruntime.so') failed: no such file.",
-        );
+        let _failing =
+            aft_engine::test_bridge::display_data::data_layer::meaning::fail_model_loads_for_test(
+                &root,
+                "ONNX Runtime not found. dlopen('libonnxruntime.so') failed: no such file.",
+            );
         wait_for_data_semantic(&ctx, |data| {
             matches!(data.status(), SemanticIndexStatus::Building { stage, .. }
                 if stage == crate::semantic_index::WAITING_FOR_ONNX_RUNTIME_DOWNLOAD_STAGE)
@@ -13008,7 +13028,10 @@ mod tests {
             "Failed to load ONNX Runtime shared library libonnxruntime.dylib via dlopen: no such file",
         );
         let _failing =
-            crate::data_layer::meaning::fail_model_loads_for_test(&root, &missing_runtime);
+            aft_engine::test_bridge::display_data::data_layer::meaning::fail_model_loads_for_test(
+                &root,
+                &missing_runtime,
+            );
         wait_for_data_semantic(&ctx, |data| {
             matches!(data.status(), SemanticIndexStatus::Failed(_))
         });

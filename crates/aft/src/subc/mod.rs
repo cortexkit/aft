@@ -18047,9 +18047,7 @@ mod tests {
         // Detached readers can still send final receipts during shutdown.
         // Repeated bursts must be consumed rather than retained until rebind.
         for _ in 0..4 {
-            let _reader = ctx
-                .lsp()
-                .enqueue_maintenance_backlog_for_test(root.as_path());
+            let _reader = aft_engine::test_bridge::search_misc::lsp::manager::regression_tests::enqueue_maintenance_backlog_for_test(&mut ctx.lsp(), root.as_path());
             for remaining in [1, 0] {
                 let (due, _) = due_maintenance_jobs(
                     &mut live_roots,
@@ -18134,7 +18132,7 @@ mod tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, mut rx) = mpsc::channel(4);
         let mut held = ctx.lsp();
-        let _reader = held.enqueue_maintenance_backlog_for_test(root.as_path());
+        let _reader = aft_engine::test_bridge::search_misc::lsp::manager::regression_tests::enqueue_maintenance_backlog_for_test(&mut held, root.as_path());
         let total = held.pending_event_count_for_test();
         submit_maintenance_job(
             &executor,

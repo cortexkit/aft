@@ -17,7 +17,7 @@ thread_local! {
 pub fn register_file_reporter(reporter: FileReporter) {
     let _ = FILE_REPORTER.set(reporter);
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn file_reporter_registered() -> bool {
     FILE_REPORTER.get().is_some()
 }

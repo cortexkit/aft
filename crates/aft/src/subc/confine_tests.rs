@@ -130,13 +130,13 @@ fn confined_escape_matrix() {
 #[test]
 fn confined_never_asks() {
     let f = Fixture::new();
-    let before = confinement::ask_calls();
+    let before = aft_engine::test_bridge::display_data::context::confinement::ask_calls();
     for name in ["read", "grep", "glob", "outline"] {
         let response = f.call(name, arguments(name, "../live/sentinel.rs"));
         assert_eq!(response.data["code"], "path_outside_confined_root");
     }
     assert_eq!(
-        confinement::ask_calls(),
+        aft_engine::test_bridge::display_data::context::confinement::ask_calls(),
         before,
         "confined access reached the consent ask path"
     );
@@ -692,7 +692,9 @@ fn confined_handler_golden_vectors() {
     }
     for name in ["grep", "glob"] {
         let response =
-            crate::grep_executor::with_walk_limit(0, || f.call(name, arguments(name, ".")));
+            aft_engine::test_bridge::search_misc::grep_executor::with_walk_limit(0, || {
+                f.call(name, arguments(name, "."))
+            });
         assert_eq!(response.data["complete"], false, "{name}: {response:?}");
         assert_eq!(
             response.data["walk_truncated"], true,
@@ -1052,9 +1054,12 @@ fn read_on_filesystem_helper(f: &Fixture, input: &str) -> Response {
                     "filesystem helper lost the confinement fence"
                 );
                 assert!(helper_ctx.request_force_restrict(&request.id));
-                let asks = confinement::ask_calls();
+                let asks = aft_engine::test_bridge::display_data::context::confinement::ask_calls();
                 let response = crate::commands::read::handle_read(&request, &helper_ctx);
-                assert_eq!(confinement::ask_calls(), asks);
+                assert_eq!(
+                    aft_engine::test_bridge::display_data::context::confinement::ask_calls(),
+                    asks
+                );
                 Ok(response)
             })
             .unwrap()

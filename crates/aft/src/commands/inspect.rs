@@ -27,6 +27,10 @@ use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
+#[cfg(test)]
+mod test_counters {
+    pub(super) use aft_engine::test_bridge::search_misc::lsp::document::CONTENT_HASH_READS;
+}
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
 // The remaining reasons stay in the body and structured gaps. This is a
@@ -115,7 +119,7 @@ impl InspectRequestDeadline {
     fn has_work_budget(self) -> bool {
         #[cfg(test)]
         if self.content_read_limit.is_some_and(|limit| {
-            crate::lsp::document::CONTENT_HASH_READS.with(|reads| reads.get() >= limit)
+            test_counters::CONTENT_HASH_READS.with(|reads| reads.get() >= limit)
         }) {
             return false;
         }
@@ -7945,8 +7949,10 @@ mod inspect_freshness_progress_tests {
             let mut deadline = InspectRequestDeadline::for_request(&request, &ctx.config());
             // Charge one actual content read the remaining work budget. Both
             // attempts get the same allowance; stat-only reuse spends none.
-            deadline.content_read_limit =
-                Some(crate::lsp::document::CONTENT_HASH_READS.with(|reads| reads.get() + 1));
+            deadline.content_read_limit = Some(
+                aft_engine::test_bridge::search_misc::lsp::document::CONTENT_HASH_READS
+                    .with(|reads| reads.get() + 1),
+            );
             // Seeded reports isolate verification from server startup and wire
             // timing, while exercising the normal scoped collection and fence.
             let mut response = handle_inspect_payload(

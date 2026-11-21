@@ -403,7 +403,7 @@ impl EventIngress {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn exit_pending_for_test(&self, id: ServerInstanceId) -> bool {
         self.controls
             .lock()

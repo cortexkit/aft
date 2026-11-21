@@ -297,7 +297,7 @@ pub(crate) fn read_file_content(path: &Path) -> io::Result<String> {
 
 /// Stream large regular files rather than allocating another full document buffer.
 pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     CONTENT_HASH_READS.with(|reads| reads.set(reads.get() + 1));
     let mut file = open_content_file(path).ok()?;
     #[cfg(test)]
@@ -311,12 +311,14 @@ pub(crate) fn file_content_hash(path: &Path) -> Option<[u8; 32]> {
     Some(*hasher.finalize().as_bytes())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static CONTENT_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static CONTENT_HASH_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// One-shot pause after opening a hash input, isolated to the installing test thread.
+    #[cfg(test)]
     pub(crate) static CONTENT_HASH_BEFORE_READ: std::cell::Cell<Option<Box<dyn FnOnce()>>> = const { std::cell::Cell::new(None) };
     /// Files read for a content hash on this thread.
+    #[cfg(test)]
     pub(crate) static CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 

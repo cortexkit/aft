@@ -1833,7 +1833,7 @@ pub fn query_embed_health_snapshot(root: &Path) -> QueryEmbedHealthSnapshot {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn record_query_embed_observation_for_test(
     root: &Path,
     elapsed_ms: u64,

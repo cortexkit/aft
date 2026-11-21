@@ -27,6 +27,10 @@ const CIRCUIT_COOLDOWN: Duration = Duration::from_secs(5);
 const RETRY_BACKOFF_MS: [u64; 3] = [100, 200, 400];
 static LIVE_CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "synapse_route_fixture.rs"]
+pub(crate) mod route_fixture;
+
 #[cfg(test)]
 #[path = "synapse_route_tests.rs"]
 pub(crate) mod route_tests;

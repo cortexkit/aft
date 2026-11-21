@@ -40,7 +40,7 @@ use crate::search_index::{
 /// Maximum files enumerated during filesystem search fallback walks.
 pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static WALK_LIMIT: std::cell::Cell<usize> = const { std::cell::Cell::new(MAX_FALLBACK_WALK_FILES) };
     static WALK_BUDGET: std::cell::Cell<Duration> = const { std::cell::Cell::new(Duration::from_secs(10)) };
@@ -51,6 +51,7 @@ thread_local! {
     /// a request answered without walking the project, which a reply's
     /// wall-clock time cannot show on a loaded machine.
     static FALLBACK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    #[cfg(test)]
     static TARGET_WALK_BUILDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -85,23 +86,23 @@ pub fn with_ignore_probe_state_for_test<R>(
 }
 
 /// Records that a fallback filesystem walk started on this thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
 pub(crate) fn fallback_walk_limit() -> usize {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         WALK_LIMIT.with(|limit| limit.get())
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         MAX_FALLBACK_WALK_FILES
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
@@ -117,39 +118,39 @@ pub use crate::bounded_io::FALLBACK_WALK_BUDGET;
 const FALLBACK_WALK_RETURN_MARGIN: Duration = Duration::from_millis(100);
 
 fn fallback_walk_budget() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         return WALK_BUDGET.with(std::cell::Cell::get);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         FALLBACK_WALK_BUDGET
     }
 }
 
 fn fallback_walk_entry_delay() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         return WALK_ENTRY_DELAY.with(std::cell::Cell::get);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         Duration::ZERO
     }
 }
 
 fn fallback_walk_sort_metadata_delay() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         return WALK_SORT_METADATA_DELAY.with(std::cell::Cell::get);
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         Duration::ZERO
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_fallback_walk_budget_for_test<R>(
     budget: Duration,
     run: impl FnOnce() -> R,
@@ -164,7 +165,7 @@ pub(crate) fn with_fallback_walk_budget_for_test<R>(
     run()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_fallback_walk_entry_delay_for_test<R>(
     delay: Duration,
     run: impl FnOnce() -> R,
@@ -179,7 +180,7 @@ pub(crate) fn with_fallback_walk_entry_delay_for_test<R>(
     run()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_fallback_walk_sort_metadata_delay_for_test<R>(
     delay: Duration,
     run: impl FnOnce() -> R,
@@ -2773,7 +2774,7 @@ fn fallback_grep_with_limits_counted(
     ignored_target: bool,
     order: GrepScanOrder,
 ) -> GrepResult {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_fallback_walk_for_test();
     let _io_scope = crate::bounded_io::enter_if_absent(budget);
     let total_matches = AtomicUsize::new(0);

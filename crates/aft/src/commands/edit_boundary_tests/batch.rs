@@ -81,7 +81,7 @@ mod tests {
             assert_eq!(A03_SYNTAX_PARSES.with(|count| count.get()), 2);
 
             std::fs::write(&path, "const value = 1;\n").unwrap();
-            crate::backup::reset_capture_read_count(&path);
+            aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&path);
             A03_HANDLER_READS.with(|count| count.set(0));
             A03_SYNTAX_PARSES.with(|count| count.set(0));
             let ctx = crate::test_context(Box::new(crate::language::StubProvider), config.clone());
@@ -103,7 +103,7 @@ mod tests {
                 )
             );
             let reads = A03_HANDLER_READS.with(|count| count.get())
-                + crate::backup::capture_read_count(&path);
+                + aft_engine::test_bridge::search_misc::backup::capture_read_count(&path);
             assert_eq!(
                 reads,
                 if full { 3 } else { 2 },
