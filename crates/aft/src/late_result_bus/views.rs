@@ -6,7 +6,7 @@ use cortexkit_bus_client::BusClient;
 use cortexkit_bus_naming::{AccountNames, ModuleBucket, MODULE_BUCKETS};
 use serde::Serialize;
 
-use super::{backoff, HEALTH, IO_TIMEOUT};
+use super::{backoff, Hooks, HEALTH, IO_TIMEOUT};
 
 #[derive(Default, Serialize)]
 pub(super) struct ViewsHealth {
@@ -27,7 +27,7 @@ fn declaration() -> &'static ModuleBucket {
 
 /// Pins include tool identity and semantics as well as the schema digest.
 /// Encoding the full UTF-8 pin preserves those distinctions without KV's ':'.
-fn key(pin: &str) -> String {
+pub(crate) fn key(pin: &str) -> String {
     use std::fmt::Write;
     let mut key = String::with_capacity(pin.len() * 2);
     for byte in pin.bytes() {
@@ -54,7 +54,7 @@ fn status(attached: bool, reason: Option<&'static str>) {
     health.reason = reason;
 }
 
-trait Writer {
+pub(crate) trait Writer {
     async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
 }
 
@@ -70,12 +70,23 @@ impl Writer for RealWriter {
 }
 
 #[derive(Default)]
-struct Publication {
+pub(crate) struct Publication {
     written: HashSet<(String, blake3::Hash)>,
     skipped: HashSet<(String, blake3::Hash)>,
 }
 
 impl Publication {
+    pub(crate) async fn sync_with_hooks(
+        &mut self,
+        writer: &mut impl Writer,
+        hooks: Option<&Hooks>,
+    ) -> Result<(), &'static str> {
+        match hooks {
+            Some(hooks) => self.sync(writer, (hooks.bus_snapshot)()).await,
+            None => Ok(()),
+        }
+    }
+
     async fn sync(
         &mut self,
         writer: &mut impl Writer,
@@ -126,7 +137,7 @@ pub(super) async fn run(client: Arc<BusClient>) {
                 let mut writer = RealWriter(store);
                 loop {
                     match publication
-                        .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
+                        .sync_with_hooks(&mut writer, super::hooks())
                         .await
                     {
                         Ok(()) => {

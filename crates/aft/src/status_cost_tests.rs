@@ -1,9 +1,9 @@
 //! Filled-store probe for the producer-triggered status path.
 
 use super::*;
+use crate::clock::ThreadCpuSample;
 use crate::data_layer::runtime::{DataCheckout, Fresh};
 use crate::data_layer::vectors::{FillBudget, Producer, VectorPlane};
-use crate::run_tool_call::ThreadCpuSample;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::sync::Arc;

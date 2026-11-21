@@ -1145,21 +1145,24 @@ pub(crate) fn bash_terminal(
     }
 }
 
-pub(crate) fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
-    let mut claimants: Vec<_> = modules
-        .iter()
-        .filter(|module| {
-            module.capabilities.as_ref().is_some_and(|capabilities| {
-                capabilities.provides.iter().any(|capability| {
-                    capability == cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY
-                })
-            })
-        })
-        .map(|module| module.module_id.clone())
-        .collect();
-    claimants.sort();
-    claimants.dedup();
-    (claimants.len() == 1).then(|| claimants.remove(0))
+pub(crate) use crate::late_result_bus::display::declared_display;
+
+pub(crate) fn take_due_read() -> Option<(String, Vec<u8>)> {
+    with_outbox(|outbox| {
+        let now = std::time::Instant::now();
+        let id = outbox.reads.due(now)?;
+        let bytes = outbox.reads.read(&id, now)?;
+        Some((id, bytes))
+    })
+    .flatten()
+}
+
+pub(crate) fn mark_read_published(id: &str, published: bool) {
+    with_outbox(|outbox| {
+        outbox
+            .reads
+            .published(id, published, std::time::Instant::now());
+    });
 }
 
 pub(crate) fn with_outbox<T>(f: impl FnOnce(&mut Outbox) -> T) -> Option<T> {

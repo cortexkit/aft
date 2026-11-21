@@ -10,6 +10,16 @@ impl Writer for RecordingWriter {
 }
 
 #[tokio::test]
+async fn bus_views_without_hooks_put_no_keys() {
+    let mut writer = RecordingWriter::default();
+    Publication::default()
+        .sync_with_hooks(&mut writer, None)
+        .await
+        .unwrap();
+    assert!(writer.0.is_empty());
+}
+
+#[tokio::test]
 async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     let mut writer = RecordingWriter::default();
     let mut publication = Publication::default();

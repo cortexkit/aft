@@ -8,7 +8,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, LazyLock,
+        Arc, LazyLock, OnceLock,
     },
     time::Duration,
 };
@@ -26,12 +26,32 @@ use tokio::sync::{oneshot, Notify};
 use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
-mod display;
+pub(crate) mod display;
 #[cfg(test)]
 pub(crate) use display::with_test_reader;
 pub(crate) mod readers;
 pub(crate) mod status;
-mod views;
+pub(crate) mod views;
+
+pub(crate) type DisplayPublish<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), &'static str>> + Send + 'a>>;
+
+pub(crate) struct Hooks {
+    pub(crate) take_due_read: fn() -> Option<(String, Vec<u8>)>,
+    pub(crate) mark_read_published: fn(&str, bool),
+    pub(crate) announce: for<'a> fn(String, Vec<u8>, DisplayPublish<'a>) -> DisplayPublish<'a>,
+    pub(crate) bus_snapshot: fn() -> Vec<(String, Vec<u8>)>,
+}
+
+static HOOKS: OnceLock<Hooks> = OnceLock::new();
+
+pub(crate) fn register(hooks: Hooks) {
+    let _ = HOOKS.set(hooks);
+}
+
+pub(crate) fn hooks() -> Option<&'static Hooks> {
+    HOOKS.get()
+}
 
 const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -171,7 +191,7 @@ async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: onesh
     let consumer = loop {
         let result = tokio::select! {
             _ = &mut stopped => return,
-            result = tokio::time::timeout(IO_TIMEOUT, crate::subc::registration::connect_consumer("late_result_bus", &path, ConsumerOptions::default())) => result,
+            result = tokio::time::timeout(IO_TIMEOUT, aft_base::registration::connect_consumer("late_result_bus", &path, ConsumerOptions::default())) => result,
         };
         if let Ok(Ok(consumer)) = result {
             HEALTH.lock().connects += 1;
@@ -261,7 +281,7 @@ async fn drive(
             services = Some(readers::Services::start(Arc::clone(client)));
         }
         HEALTH.lock().connected = connected;
-        display::publish_one(client).await;
+        display::publish_one(client.as_ref(), hooks()).await;
         let mut publisher = RealPublisher(client);
         let due = state.due();
         if !due.is_empty() {

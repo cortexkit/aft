@@ -59,12 +59,12 @@ impl ModuleTransport {
     }
 
     async fn request_async(self, body: Vec<u8>, timeout: Duration) -> Result<Value, DoorError> {
-        if !crate::subc::registration::module_consumer_allowed() {
+        if !aft_base::registration::module_consumer_allowed() {
             return Err(DoorError::unavailable(
                 "AFT module launch identity is unavailable",
             ));
         }
-        let consumer = crate::subc::registration::connect_consumer(
+        let consumer = aft_base::registration::connect_consumer(
             "agent_data",
             &self.connection_file,
             ConsumerOptions::default(),
