@@ -95,7 +95,7 @@ impl BgTaskRegistry {
         self.persist_task_locked(task, &state.metadata, &mut db)
             .map_err(|e| e.to_string())?;
         #[cfg(test)]
-        tests::after_local_fallback_marker(&task.task_id);
+        seams::after_local_fallback_marker(&task.task_id);
         let hard_kill = if metadata.default_hard_kill {
             super::super::super::HardKill::Default
         } else {
@@ -287,7 +287,7 @@ impl BgTaskRegistry {
                 .map_err(|error| error.to_string())?;
         }
         #[cfg(test)]
-        if tests::simulate_crash_before_local_pid(&task.task_id) {
+        if seams::simulate_crash_before_local_pid(&task.task_id) {
             return Ok(());
         }
         if let Some(capture) = capture {
@@ -298,7 +298,7 @@ impl BgTaskRegistry {
         state.detached = false;
         let persisted = (|| {
             #[cfg(test)]
-            tests::fail_running_metadata_after_spawn(&task.task_id)?;
+            seams::fail_running_metadata_after_spawn(&task.task_id)?;
             self.persist_task_locked(task, &state.metadata, &mut db)
                 .map_err(|e| e.to_string())
         })();
