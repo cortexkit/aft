@@ -10,6 +10,8 @@ mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
 mod memory_limit;
+#[cfg(feature = "test-support")]
+pub(crate) use memory_limit::MemoryPolicy as MemoryPolicyForTest;
 pub mod output;
 pub mod persistence;
 pub mod process;

@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::BgTaskStatus;
+use aft_engine::test_bridge::bash_remote::AuthorityRecordTestExt as _;
 use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 
 fn checkpoint(
@@ -84,13 +85,13 @@ async fn eligible_pty_cannot_execute_user_code_before_the_durable_seal() {
     assert_eq!(metadata.status, BgTaskStatus::Starting);
     assert!(speech
         .prepared()
-        .context
-        .service
+        .context()
+        .service()
         .store
         .get(&speech.incarnation())
         .unwrap()
-        .record
-        .seal
+        .record()
+        .seal()
         .is_none());
     tokio::time::sleep(Duration::from_millis(250)).await;
     assert!(
@@ -109,8 +110,8 @@ async fn eligible_pty_cannot_execute_user_code_before_the_durable_seal() {
         .store
         .get(&fixture.incarnation)
         .unwrap()
-        .record
-        .seal
+        .record()
+        .seal()
         .is_some());
     marker(&ran).await;
     fixture
@@ -172,11 +173,11 @@ async fn pty_seal_failure_revokes_speech_durably_but_runs_the_command_normally()
     let error = restarted
         .seal(
             &fixture.incarnation,
-            &aft_engine::test_bridge::bash_remote::ExecutionSeal {
-                child_pid: 123,
-                child_start_time_ms: 456,
-                birth_identity: "birth".into(),
-            },
+            &aft_engine::test_bridge::bash_remote::ExecutionSeal::for_test(
+                123,
+                456,
+                "birth".into(),
+            ),
         )
         .unwrap_err();
     assert_eq!(error.reason, "revoked");
@@ -255,11 +256,11 @@ fn revoked_probe_child() {
         store
             .seal(
                 &incarnation,
-                &aft_engine::test_bridge::bash_remote::ExecutionSeal {
-                    child_pid: 123,
-                    child_start_time_ms: 456,
-                    birth_identity: "new-process".into()
-                }
+                &aft_engine::test_bridge::bash_remote::ExecutionSeal::for_test(
+                    123,
+                    456,
+                    "new-process".into()
+                )
             )
             .unwrap_err()
             .reason,

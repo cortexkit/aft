@@ -2430,7 +2430,7 @@ impl HeldCompletion {
             carrier: "reserved:thalamus-harness".into(),
             call_key: format!("held-{id}"),
         };
-        let registered = task.registry.task_for_test(id).unwrap();
+        let registered = task.registry.test_task(id).unwrap();
         let mut state = registered.lock_state().unwrap();
         state.metadata.call_key = Some(crate::bash_background::TaskCallKey {
             requester: key.carrier.clone(),
@@ -3583,7 +3583,7 @@ fn runner_notices_optional_members_are_gated_and_task_choice_is_frozen() {
             Some(true)
         });
         task.registry.configure_long_running_reminders(true, 1_000);
-        let registered = task.registry.task_for_test(&task.task).unwrap();
+        let registered = task.registry.test_task(&task.task).unwrap();
         let recent = std::time::Instant::now() - Duration::from_secs(10);
         *registered.last_reminder_at.lock().unwrap() = Some(recent);
         task.registry.maybe_emit_long_running_reminder(&registered);

@@ -2417,7 +2417,7 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     assert_eq!(
         daemon
             .log()
-()            .lock()
+            .lock()
             .unwrap()
             .iter()
             .filter(|(_, body)| body["method"] == "exec.cancel")
@@ -2484,7 +2484,7 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
             .test_state()
             .lock()
             .unwrap()
-            .metadata
+            .metadata()
             .remote
             .as_ref()
             .unwrap()
@@ -2528,7 +2528,7 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
         .test_state()
         .lock()
         .unwrap()
-        .metadata
+        .metadata()
         .remote
         .as_ref()
         .unwrap()
@@ -2580,7 +2580,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
         wait_for("remote route setup must be in flight", || {
             daemon
                 .log()
-()                .lock()
+                .lock()
                 .unwrap()
                 .iter()
                 .any(|(_, body)| body["op"] == "route.open")
@@ -2668,7 +2668,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
                     .test_state()
                     .lock()
                     .unwrap()
-                    .metadata
+                    .metadata()
                     .remote
                     .as_ref()
                     .unwrap()
@@ -2720,7 +2720,7 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
             .test_state()
             .lock()
             .unwrap()
-            .metadata
+            .metadata()
             .remote
             .as_ref()
             .unwrap()

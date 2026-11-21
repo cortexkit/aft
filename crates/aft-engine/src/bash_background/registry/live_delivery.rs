@@ -90,7 +90,7 @@ impl BgTaskRegistry {
             && !self.originating_session_has_live_route(originating_session_id)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn route_delivery_snapshot(&self) -> Arc<HashSet<String>> {
         match &*self.inner.live_delivery_sessions.lock().unwrap() {
             LiveDelivery::Routes(routes) => routes.snapshot(),

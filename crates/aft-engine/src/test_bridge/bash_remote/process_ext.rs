@@ -21,6 +21,23 @@ use std::{
 };
 
 pub trait BgTaskRegistryTestExt: Sized {
+    fn reset_task_access_work(&self);
+    fn task_access_work(&self) -> (usize, usize, usize);
+    fn set_project_replay_scan_budget_for_test(&self, entries: usize, duration: Duration);
+    fn project_replay_scan_total_examined_for_test(&self) -> Option<usize>;
+    #[cfg(unix)]
+    fn expire_project_replay_backoff_for_test(&self);
+    #[cfg(unix)]
+    fn pause_watchdog_registration_for_test(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<String>, impl Drop);
+    fn scope_fence_unlocked_for_test(&self) -> bool;
+    #[cfg(unix)]
+    fn task_registration_identity_for_test(&self, task_id: &str) -> Option<usize>;
+    #[cfg(unix)]
+    fn forget_task_record_for_test(&self, task_id: &str);
+    fn route_delivery_snapshot(&self) -> Arc<std::collections::HashSet<String>>;
+    fn task_for_test(&self, task_id: &str) -> Option<Arc<BgTask>>;
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask);
 
     fn status_relaxed(
@@ -139,6 +156,45 @@ pub trait BgTaskRegistryTestExt: Sized {
 }
 
 impl BgTaskRegistryTestExt for BgTaskRegistry {
+    fn reset_task_access_work(&self) {
+        Self::reset_task_access_work(self);
+    }
+    fn task_access_work(&self) -> (usize, usize, usize) {
+        Self::task_access_work(self)
+    }
+    fn set_project_replay_scan_budget_for_test(&self, entries: usize, duration: Duration) {
+        Self::set_project_replay_scan_budget_for_test(self, entries, duration);
+    }
+    fn project_replay_scan_total_examined_for_test(&self) -> Option<usize> {
+        Self::project_replay_scan_total_examined_for_test(self)
+    }
+    #[cfg(unix)]
+    fn expire_project_replay_backoff_for_test(&self) {
+        Self::expire_project_replay_backoff_for_test(self);
+    }
+    #[cfg(unix)]
+    fn pause_watchdog_registration_for_test(
+        &self,
+    ) -> (tokio::sync::oneshot::Receiver<String>, impl Drop) {
+        Self::pause_watchdog_registration_for_test(self)
+    }
+    fn scope_fence_unlocked_for_test(&self) -> bool {
+        Self::scope_fence_unlocked_for_test(self)
+    }
+    #[cfg(unix)]
+    fn task_registration_identity_for_test(&self, task_id: &str) -> Option<usize> {
+        Self::task_registration_identity_for_test(self, task_id)
+    }
+    #[cfg(unix)]
+    fn forget_task_record_for_test(&self, task_id: &str) {
+        Self::forget_task_record_for_test(self, task_id);
+    }
+    fn route_delivery_snapshot(&self) -> Arc<std::collections::HashSet<String>> {
+        Self::route_delivery_snapshot(self)
+    }
+    fn task_for_test(&self, task_id: &str) -> Option<Arc<BgTask>> {
+        Self::task_for_test(self, task_id)
+    }
     fn dual_write_task(&self, paths: &TaskPaths, metadata: &PersistedTask) {
         BgTaskRegistry::dual_write_task(self, paths, metadata)
     }
@@ -390,6 +446,8 @@ pub trait SpawnPlanTestExt: Sized {
 
     #[cfg(unix)]
     fn protects_secret_memory(&self) -> bool;
+    #[cfg(unix)]
+    fn prepared_task(&self) -> Option<&PreparedTask>;
 }
 
 impl SpawnPlanTestExt for SpawnPlan {
@@ -411,13 +469,19 @@ impl SpawnPlanTestExt for SpawnPlan {
     fn protects_secret_memory(&self) -> bool {
         SpawnPlan::protects_secret_memory(self)
     }
+    #[cfg(unix)]
+    fn prepared_task(&self) -> Option<&PreparedTask> {
+        SpawnPlan::prepared_task(self)
+    }
 }
 
+#[cfg(unix)]
 pub trait PreparedTaskTestExt: Sized {
     #[cfg(unix)]
     fn set_secret_runtime(&self, runtime: crate::bash_background::secrets::SharedRuntime);
 }
 
+#[cfg(unix)]
 impl PreparedTaskTestExt for PreparedTask {
     #[cfg(unix)]
     fn set_secret_runtime(&self, runtime: crate::bash_background::secrets::SharedRuntime) {
@@ -498,25 +562,77 @@ impl RuntimeTestExt for crate::bash_background::secrets::Runtime {
 }
 
 pub trait PersistedTaskTestExt {
+    fn memory_policy_mut(&mut self) -> &mut Option<crate::bash_background::MemoryPolicyForTest>;
+    fn task_scope_runtime_ms_mut(&mut self) -> &mut Option<u64>;
     fn lifecycle_scope(&self) -> &Option<subc_protocol::scope::ScopeStamp>;
-    fn shell_fingerprint(&self) -> &Option<String>;
+    fn shell_fingerprint_mut(&mut self) -> &mut Option<String>;
+    fn lifecycle_scope_mut(&mut self) -> &mut Option<subc_protocol::scope::ScopeStamp>;
 }
 
 impl PersistedTaskTestExt for PersistedTask {
+    fn memory_policy_mut(&mut self) -> &mut Option<crate::bash_background::MemoryPolicyForTest> {
+        &mut self.memory_policy
+    }
+    fn task_scope_runtime_ms_mut(&mut self) -> &mut Option<u64> {
+        &mut self.task_scope_runtime_ms
+    }
     fn lifecycle_scope(&self) -> &Option<subc_protocol::scope::ScopeStamp> {
         &self.lifecycle_scope
     }
-    fn shell_fingerprint(&self) -> &Option<String> {
-        &self.shell_fingerprint
+    fn shell_fingerprint_mut(&mut self) -> &mut Option<String> {
+        &mut self.shell_fingerprint
+    }
+    fn lifecycle_scope_mut(&mut self) -> &mut Option<subc_protocol::scope::ScopeStamp> {
+        &mut self.lifecycle_scope
     }
 }
 
 pub trait BgTaskStateTestExt {
     fn remote_admission_note(&self) -> &Option<String>;
+    fn remote_admission_note_mut(&mut self) -> &mut Option<String>;
 }
 
 impl BgTaskStateTestExt for super::BgTaskState {
     fn remote_admission_note(&self) -> &Option<String> {
         &self.remote_admission_note
+    }
+    fn remote_admission_note_mut(&mut self) -> &mut Option<String> {
+        &mut self.remote_admission_note
+    }
+}
+
+pub trait ToolLaunchPolicyTestExt {
+    fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
+    fn shared(&self) -> std::rc::Rc<crate::sandbox_spawn::RequestToolLaunch>;
+}
+
+impl ToolLaunchPolicyTestExt for crate::sandbox_spawn::ToolLaunchPolicy<'_> {
+    fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static> {
+        Self::unconfined_for_test()
+    }
+    fn shared(&self) -> std::rc::Rc<crate::sandbox_spawn::RequestToolLaunch> {
+        Self::shared(self)
+    }
+}
+
+pub trait BgTaskTestExt {
+    fn task_id(&self) -> &String;
+    fn session_id(&self) -> &String;
+    fn state(&self) -> &std::sync::Mutex<super::BgTaskState>;
+    fn paths(&self) -> &TaskPaths;
+}
+
+impl BgTaskTestExt for BgTask {
+    fn task_id(&self) -> &String {
+        &self.task_id
+    }
+    fn session_id(&self) -> &String {
+        &self.session_id
+    }
+    fn state(&self) -> &std::sync::Mutex<super::BgTaskState> {
+        &self.state
+    }
+    fn paths(&self) -> &TaskPaths {
+        &self.paths
     }
 }
