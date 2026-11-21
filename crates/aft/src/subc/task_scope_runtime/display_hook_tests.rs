@@ -102,10 +102,10 @@ fn daemon_startup_hooks_publish_display_and_shipped_views() {
     .unwrap();
     let ctx = Arc::new(AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
-        crate::context_storage::isolate(crate::config::Config {
+        crate::config::Config {
             storage_dir: Some(storage.clone()),
             ..Default::default()
-        }),
+        },
     ));
     let storage = ctx.storage_dir();
     let (lifecycle, _events) = mpsc::unbounded_channel();
