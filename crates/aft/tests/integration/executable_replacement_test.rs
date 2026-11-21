@@ -24,6 +24,16 @@ struct Daemon {
 
 impl Daemon {
     async fn spawn(binary: &Path, root: &Path, home: &Path, storage: &Path) -> Self {
+        Self::spawn_with_env(binary, root, home, storage, &[]).await
+    }
+
+    async fn spawn_with_env(
+        binary: &Path,
+        root: &Path,
+        home: &Path,
+        storage: &Path,
+        env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
         use std::os::unix::process::CommandExt;
 
         let listener = write_connection_file(root).await;
@@ -40,6 +50,7 @@ impl Daemon {
             .env_remove("SUBC_MODULE_ID")
             .env_remove("SUBC_LAUNCH_NONCE")
             .env_remove("SUBC_LAUNCH_NONCE_FD")
+            .envs(env.iter().copied())
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(binary.with_extension("stderr.log")).unwrap())
@@ -93,21 +104,31 @@ fn quote(path: &Path) -> String {
 }
 
 async fn configure(aft: &mut Daemon, home: &Path, project: &Path, storage: &Path, mode: &str) {
+    configure_with_shim_binary(aft, home, project, storage, mode, None).await;
+}
+
+async fn configure_with_shim_binary(
+    aft: &mut Daemon,
+    home: &Path,
+    project: &Path,
+    storage: &Path,
+    mode: &str,
+    shim_binary: Option<&Path>,
+) {
     let config_dir = home.join("config/cortexkit");
     std::fs::create_dir_all(&config_dir).unwrap();
-    std::fs::write(
-        config_dir.join("aft.jsonc"),
-        json!({
-            "storage_dir": storage,
-            "indexes": { "trigram": false, "semantic": false, "callgraph": false },
-            "github": { "shim": true },
-            "git": { "co_author": "off" },
-            "sandbox": { "profile": { "head": mode } },
-            "bash": { "background": true, "rewrite": true, "shell": "/bin/bash" },
-        })
-        .to_string(),
-    )
-    .unwrap();
+    let mut config = json!({
+        "storage_dir": storage,
+        "indexes": { "trigram": false, "semantic": false, "callgraph": false },
+        "github": { "shim": true },
+        "git": { "co_author": "off" },
+        "sandbox": { "profile": { "head": mode } },
+        "bash": { "background": true, "rewrite": true, "shell": "/bin/bash" },
+    });
+    if let Some(binary) = shim_binary {
+        config["gh_shim"] = json!({ "binary_path": binary });
+    }
+    std::fs::write(config_dir.join("aft.jsonc"), config.to_string()).unwrap();
     aft.epoch += 1;
     bind_route_at_epoch(&mut aft.stream, project, aft.epoch).await;
 }
