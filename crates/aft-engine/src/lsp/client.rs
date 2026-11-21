@@ -2469,7 +2469,7 @@ impl LspClient {
             .map_or(true, |pending| !pending.is_empty())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_last_used_at_for_test(&mut self, at: Instant) {
         self.last_used_at = at;
     }

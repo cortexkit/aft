@@ -264,7 +264,7 @@ fn grants_revoke_by_path_stops_only_shells_using_the_saved_grant() {
         let plan = SpawnPlan::launcher_for_test(profile, "/bin/sh".into());
         let _scope = crate::access_policy::scope_guard(Some(key.clone()));
         let response = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(plan, || {
-            crate::bash_background::spawn(
+            aft_engine::test_bridge::bash_remote::bash_background::spawn(
                 "path-revoke",
                 &head.session,
                 "sleep 30",
@@ -713,7 +713,7 @@ fn linked_worktree_reads_follow_only_the_authenticated_heads_repository() {
         let req = "linked-worktree-read";
         let read = operation == AccessOperation::Read;
         #[cfg(unix)]
-        let asks = crate::context::confinement::ask_calls();
+        let asks = aft_engine::test_bridge::display_data::context::confinement::ask_calls();
         let result = call_policy::with_tool_call_policy(
             &ctx,
             route,
@@ -734,7 +734,10 @@ fn linked_worktree_reads_follow_only_the_authenticated_heads_repository() {
         match (result, expected) {
             (Ok(_), None) => {
                 #[cfg(unix)]
-                assert_eq!(asks, crate::context::confinement::ask_calls());
+                assert_eq!(
+                    asks,
+                    aft_engine::test_bridge::display_data::context::confinement::ask_calls()
+                );
             }
             (Err(error), Some(code)) => {
                 assert_eq!(
@@ -2162,7 +2165,7 @@ fn read_policy_snapshot_scope_boundary_uses_current_scope_grants() {
     let _storage_override = crate::test_env::without_storage_override();
     let (_dir, ctx, scope_a, scope_b, path_a, path_b) = read_policy_boundary_fixture();
     let id = "same-request-scope-boundary";
-    let probe = crate::context::policy_load_probe::Probe::new(id);
+    let probe = aft_engine::test_bridge::display_data::context::policy_load_probe::Probe::new(id);
     crate::access_policy::with_scope(Some(scope_key(&scope_a)), || {
         ctx.with_read_policy_snapshot(id, || {
             let policy_a = ctx.access_policy(id).unwrap();

@@ -321,7 +321,7 @@ pub(crate) fn stored_todos(
 
 /// [`TODO_STORE_WAIT`], or for a test the wait it set for `project_root`.
 fn todo_store_wait(project_root: &Path) -> std::time::Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         let root = canonicalize_normalized(project_root);
         if let Some((_, wait)) = STORE_WAITS_FOR_TEST
@@ -333,17 +333,17 @@ fn todo_store_wait(project_root: &Path) -> std::time::Duration {
             return *wait;
         }
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let _ = project_root;
     TODO_STORE_WAIT
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static STORE_WAITS_FOR_TEST: Mutex<Vec<(PathBuf, std::time::Duration)>> = Mutex::new(Vec::new());
 
 /// Makes the TODO count of `project_root` wait `wait` for a building
 /// checkout instead of [`TODO_STORE_WAIT`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn set_todo_store_wait_for_test(project_root: &Path, wait: std::time::Duration) {
     STORE_WAITS_FOR_TEST
         .lock()

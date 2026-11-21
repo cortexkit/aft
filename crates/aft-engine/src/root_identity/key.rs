@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::path_identity::lexical_normalize as normalize_path;
@@ -20,11 +20,11 @@ const LEGACY_IDENTITY_MEMO_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 const LEGACY_IDENTITY_MEMO_MAX_STORAGE_ROOTS: usize = 4;
 static ARTIFACT_CACHE_KEY_MEMO_STATE: OnceLock<Mutex<ArtifactCacheKeyMemoState>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type RootCommitProbeOverride =
     Arc<dyn Fn(&Path) -> Option<RootCommitProbe> + Send + Sync + 'static>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static GIT_ROOT_COMMIT_PROBE_OVERRIDE: OnceLock<Mutex<Option<RootCommitProbeOverride>>> =
     OnceLock::new();
 
@@ -957,7 +957,7 @@ pub(crate) fn artifact_path_identity_key(project_root: &Path) -> String {
     artifact_hash16(canonical_root.to_string_lossy().as_bytes())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn artifact_path_identity_key_for_test(project_root: &Path) -> String {
     artifact_path_identity_key(project_root)
 }
@@ -1348,7 +1348,7 @@ fn root_commit_cache() -> &'static Mutex<HashMap<PathBuf, (RootCommitStamp, Stri
 }
 
 fn cached_root_commit(project_root: &Path, stamp: &RootCommitStamp) -> Option<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if GIT_ROOT_COMMIT_PROBE_OVERRIDE
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -1813,7 +1813,7 @@ fn git_root_commit_once(
     project_root: &Path,
     timings: &mut ArtifactCacheKeyTimings,
 ) -> RootCommitProbe {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(override_probe) = GIT_ROOT_COMMIT_PROBE_OVERRIDE
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -1944,19 +1944,19 @@ fn git_root_commit_once_real(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct GitRootCommitProbeOverrideGuard {
     previous: Option<RootCommitProbeOverride>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for GitRootCommitProbeOverrideGuard {
     fn drop(&mut self) {
         set_git_root_commit_probe_override_for_test(self.previous.take());
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn git_root_commit_probe_override_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -1964,7 +1964,7 @@ pub(crate) fn git_root_commit_probe_override_lock_for_test() -> std::sync::Mutex
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
     roots: Vec<PathBuf>,
     detail: impl Into<String>,
@@ -1978,7 +1978,7 @@ pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 /// Force the git root-commit probe to return Transient for the given roots,
 /// counting the attempts it makes and holding the first attempt in flight
 /// until `release` delivers a message or its sender is dropped.
@@ -2023,7 +2023,7 @@ pub(crate) fn force_git_root_commit_probe_commits_for_test(
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn install_git_root_commit_probe_override_for_test(
     override_probe: impl Fn(&Path) -> Option<RootCommitProbe> + Send + Sync + 'static,
 ) -> GitRootCommitProbeOverrideGuard {
@@ -2031,7 +2031,7 @@ fn install_git_root_commit_probe_override_for_test(
     GitRootCommitProbeOverrideGuard { previous }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn set_git_root_commit_probe_override_for_test(
     override_probe: Option<RootCommitProbeOverride>,
 ) -> Option<RootCommitProbeOverride> {

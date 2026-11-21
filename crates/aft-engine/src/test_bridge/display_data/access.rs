@@ -214,14 +214,14 @@ impl StoredOutline {
 }
 
 pub struct PendingDatabaseOpen<'a>(&'a crate::database_open::DatabaseOpenRequest);
-impl PendingDatabaseOpen<'_> {
+impl<'a> PendingDatabaseOpen<'a> {
     pub fn epoch(&self) -> u64 {
         self.0.epoch
     }
     pub fn dispatched_at(&self) -> Option<std::time::Instant> {
         self.0.dispatched_at
     }
-    pub fn storage_root(&self) -> &PathBuf {
+    pub fn storage_root(&self) -> &'a PathBuf {
         &self.0.storage_root
     }
 }

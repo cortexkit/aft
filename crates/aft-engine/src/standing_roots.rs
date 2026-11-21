@@ -350,7 +350,7 @@ impl StandingRoots {
                 });
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         RECONCILE_DB_OPENS.with(|count| count.set(count.get() + 1));
         let mut conn = match crate::db::open(&db_path) {
             Ok(conn) => conn,
@@ -364,7 +364,7 @@ impl StandingRoots {
         // Validate the storage namespace before persisting first-bind identities.
         // A failed namespace switch must not inherit an earlier empty fast path.
         let entries = resolve_entries(config, force)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         conn.trace(Some(|sql| {
             if sql == "BEGIN IMMEDIATE" {
                 RECONCILE_IMMEDIATE.with(|count| count.set(count.get() + 1));
@@ -684,7 +684,7 @@ impl StandingRoots {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static ROOT_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static RECONCILE_DB_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -695,7 +695,7 @@ thread_local! {
     static RECONCILE_BENCH_BASELINE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reconciliation_work_for_test() -> [i64; 6] {
     use crate::db::lifecycle::{thread_counts, SqliteStore};
     let opens = thread_counts::total_opens_on_this_thread(SqliteStore::AftDb) as i64;
@@ -714,7 +714,7 @@ fn counted_resolve_standing_root(
     storage: &Path,
     force: bool,
 ) -> Result<ResolvedStandingRoot, crate::scoped_key::ScopedKeyError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     ROOT_RESOLUTIONS.with(|count| count.set(count.get() + 1));
     crate::scoped_key::resolve_standing_root_with_recheck(path, storage, true, force)
 }

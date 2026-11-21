@@ -137,9 +137,14 @@ mod tests {
         // The checkout retains configure's canonical path, including Windows's
         // `\\?\` prefix. The build hold must use that exact key, not inspect's
         // normalized outcome key, or the build can publish before we release it.
-        let hold = crate::data_layer::runtime::hold_builds_for_test(&checkout_root);
+        let hold = aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(
+            &checkout_root,
+        );
         // A refresh that finds the store building answers pending at once.
-        crate::inspect::data_sources::set_todo_store_wait_for_test(&root, Duration::ZERO);
+        aft_engine::test_bridge::search_misc::inspect::data_sources::set_todo_store_wait_for_test(
+            &root,
+            Duration::ZERO,
+        );
 
         let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
@@ -303,8 +308,11 @@ mod tests {
         let scope = crate::inspect::inventory::InspectInventory::from_checkout(&root, &view)
             .expect("the view stands in for a walk")
             .sources;
-        let parses =
-            |source: &str| crate::data_layer::content::parses_of_for_test(source.as_bytes());
+        let parses = |source: &str| {
+            aft_engine::test_bridge::display_data::data_layer::content::parses_of_for_test(
+                source.as_bytes(),
+            )
+        };
         let parsed_before = [app, notes, cargo].map(parses);
 
         let probe = crate::project_content::Probe::new(&root);
@@ -426,7 +434,7 @@ mod tests {
         checkout.checkout().refresh_callgraph().unwrap();
         checkout.checkout().publish_changes().unwrap();
         parity(&job);
-        crate::inspect::data_sources::set_todo_store_wait_for_test(
+        aft_engine::test_bridge::search_misc::inspect::data_sources::set_todo_store_wait_for_test(
             &root,
             std::time::Duration::ZERO,
         );

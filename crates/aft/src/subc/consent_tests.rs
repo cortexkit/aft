@@ -1,4 +1,5 @@
 use super::*;
+use aft_engine::test_bridge::search_misc::{CountsTestExt as _, DaemonTestExt as _};
 #[path = "consent_expiry_tests.rs"]
 mod expiry_tests;
 #[path = "consent_label_tests.rs"]
@@ -7652,7 +7653,8 @@ async fn consent_head_revocation_during_resolution_is_judged_by_the_new_policy()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consent_completed_and_failed_calls_close_scoped_routes() {
-    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let daemon =
+        aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon::start(1, false);
     let consumer = Arc::new(
         subc_client_rs::SubcConsumer::connect(
             &daemon.path,
@@ -7697,7 +7699,8 @@ async fn consent_completed_and_failed_calls_close_scoped_routes() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consent_cancelled_call_releases_route_after_last_overlapping_call() {
-    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let daemon =
+        aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon::start(1, false);
     let consumer = Arc::new(
         subc_client_rs::SubcConsumer::connect(
             &daemon.path,
@@ -7769,7 +7772,7 @@ fn transport_consent_call(worker: &str, method: &'static str) -> ConsentCall {
 }
 
 async fn authenticated_consent_transport(
-    daemon: &crate::synapse_embed::route_tests::Daemon,
+    daemon: &aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon,
 ) -> Arc<SubcConsentTransport> {
     let consumer = subc_client_rs::SubcConsumer::connect(
         &daemon.path,
@@ -7784,7 +7787,8 @@ async fn authenticated_consent_transport(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consent_real_transport_applies_receipt_before_releasing_lease() {
-    let daemon = crate::synapse_embed::route_tests::Daemon::start(1, false);
+    let daemon =
+        aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon::start(1, false);
     let transport = authenticated_consent_transport(&daemon).await;
     let call = transport_consent_call("receipt-worker", "consent.await");
     let bind = subc_protocol::BindIdentity::new("aft-consent", call.session.clone());
@@ -7823,8 +7827,8 @@ async fn consent_real_transport_applies_receipt_before_releasing_lease() {
 }
 
 async fn wait_consent_counts(
-    daemon: &crate::synapse_embed::route_tests::Daemon,
-    ready: impl Fn(&crate::synapse_embed::route_tests::Counts) -> bool,
+    daemon: &aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon,
+    ready: impl Fn(&aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Counts) -> bool,
 ) {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -7841,7 +7845,7 @@ async fn wait_consent_counts(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consent_held_open_does_not_block_another_scope_open_and_close() {
     let held_call = transport_consent_call("worker-a", "consent.request");
-    let daemon = crate::synapse_embed::route_tests::Daemon::with_held_consent_open(
+    let daemon = aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon::with_held_consent_open(
         serde_json::to_value(&held_call.scope).unwrap(),
     );
     let transport = authenticated_consent_transport(&daemon).await;
@@ -7875,7 +7879,7 @@ async fn consent_held_open_does_not_block_another_scope_open_and_close() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn consent_answered_call_returns_while_another_scope_open_is_held() {
     let held_call = transport_consent_call("worker-a", "consent.request");
-    let daemon = crate::synapse_embed::route_tests::Daemon::with_held_consent_open(
+    let daemon = aft_engine::test_bridge::search_misc::synapse_embed::route_tests::Daemon::with_held_consent_open(
         serde_json::to_value(&held_call.scope).unwrap(),
     );
     let transport = authenticated_consent_transport(&daemon).await;
