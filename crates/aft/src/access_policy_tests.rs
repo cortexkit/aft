@@ -5,6 +5,9 @@ use crate::protocol::RawRequest;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
+mod audit2_tests;
+mod outside_roots_tests;
+
 #[path = "access_policy_task_tests.rs"]
 mod task_records;
 

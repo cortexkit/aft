@@ -1,8 +1,10 @@
-use super::*;
+use crate::access_policy::*;
 use crate::config::Config;
 use crate::context::AppContext;
+use crate::policy_path::policy_path;
 use crate::protocol::{RawRequest, Response};
 use serde_json::{json, Value};
+use std::path::{Path, PathBuf};
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -36,7 +38,7 @@ impl Fixture {
             _dir: dir,
             root,
             outside,
-            ctx: AppContext::new(Box::new(crate::language::StubProvider), config),
+            ctx: crate::test_context(Box::new(crate::language::StubProvider), config),
             owner: std::sync::Arc::new(()),
         }
     }
@@ -1108,7 +1110,7 @@ fn backed_up_fixture() -> (tempfile::TempDir, PathBuf, AppContext) {
         storage_dir: Some(dir.path().join("store")),
         ..Config::default()
     };
-    let ctx = AppContext::new(Box::new(crate::language::StubProvider), config);
+    let ctx = crate::test_context(Box::new(crate::language::StubProvider), config);
     (dir, root, ctx)
 }
 
@@ -1140,7 +1142,11 @@ fn audit2_fixtures_follow_the_runtime_checkout() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "access_policy::audit2_tests::audit2_fixtures_follow_the_runtime_checkout",
+            concat!(
+                module_path!(),
+                "::audit2_fixtures_follow_the_runtime_checkout"
+            )
+            .trim_start_matches("aft::"),
             "--nocapture",
         ])
         .env(CHILD, "1")
@@ -2056,7 +2062,7 @@ fn audit10_outside_inspect_asks_then_runs_with_the_approval() {
         ..Config::default()
     };
     config.backup.enabled = Some(false);
-    let ctx = std::sync::Arc::new(AppContext::new(
+    let ctx = std::sync::Arc::new(crate::test_context(
         Box::new(crate::language::StubProvider),
         config,
     ));
@@ -2119,7 +2125,7 @@ fn audit10_deferred_inspect_renews_a_when_requesting_b() {
         ..Config::default()
     };
     config.backup.enabled = Some(false);
-    let ctx = std::sync::Arc::new(AppContext::new(
+    let ctx = std::sync::Arc::new(crate::test_context(
         Box::new(crate::language::StubProvider),
         config,
     ));
@@ -2214,7 +2220,7 @@ fn audit11_outside_zoom_batch_entry_asks_then_answers_with_the_approval() {
         ..Config::default()
     };
     config.backup.enabled = Some(false);
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let inside = f.root.join("inside.rs");
     let outside = f.outside.join("outside.rs");
     std::fs::write(&inside, "pub fn inside_fn() {}\n").unwrap();
