@@ -7691,7 +7691,7 @@ async fn consent_completed_and_failed_calls_close_scoped_routes() {
         Err(ConsentError::Unavailable(_))
     ));
     daemon.wait_closed();
-    assert_eq!(daemon.counts().0.lock().unwrap().opens, 3);
+    assert_eq!(daemon.counts().0.lock().unwrap().opens(), 3);
     assert!(transport.routes.lock().unwrap().is_empty());
     daemon.finish();
 }
@@ -7722,7 +7722,7 @@ async fn consent_cancelled_call_releases_route_after_last_overlapping_call() {
     let second = tokio::spawn(transport.clone().send(call));
     {
         let (counts, _) = daemon
-            .counts
+            .counts()
             .1
             .wait_timeout_while(
                 daemon.counts().0.lock().unwrap(),
@@ -7749,14 +7749,14 @@ async fn consent_cancelled_call_releases_route_after_last_overlapping_call() {
         timeout: Duration::from_secs(1),
     };
     transport.clone().send(sibling).await.unwrap();
-    assert_eq!(daemon.counts().0.lock().unwrap().active, 1);
+    assert_eq!(daemon.counts().0.lock().unwrap().active(), 1);
 
     assert_eq!(transport.routes.lock().unwrap().len(), 1);
     assert!(!second.is_finished());
     second.abort();
     let _ = second.await;
     daemon.wait_closed();
-    assert_eq!(daemon.counts().0.lock().unwrap().closes, 1);
+    assert_eq!(daemon.counts().0.lock().unwrap().closes(), 1);
     daemon.finish();
 }
 
@@ -7865,13 +7865,13 @@ async fn consent_held_open_does_not_block_another_scope_open_and_close() {
     assert_eq!(other.unwrap().unwrap(), json!({"ok":true}));
     wait_consent_counts(&daemon, |counts| counts.closes() == 1).await;
     assert!(!held.is_finished(), "the route.open reply was not held");
-    assert_eq!(daemon.counts().0.lock().unwrap().opens, 2);
-    assert_eq!(daemon.counts().0.lock().unwrap().active, 1);
+    assert_eq!(daemon.counts().0.lock().unwrap().opens(), 2);
+    assert_eq!(daemon.counts().0.lock().unwrap().active(), 1);
 
     daemon.release_consent_open();
     assert_eq!(held.await.unwrap().unwrap(), json!({"ok":true}));
     daemon.wait_closed();
-    assert_eq!(daemon.counts().0.lock().unwrap().closes, 2);
+    assert_eq!(daemon.counts().0.lock().unwrap().closes(), 2);
     assert!(transport.routes.lock().unwrap().is_empty());
     daemon.finish();
 }
@@ -7899,12 +7899,12 @@ async fn consent_answered_call_returns_while_another_scope_open_is_held() {
     assert_eq!(result.unwrap().unwrap(), json!({"ok":true}));
     wait_consent_counts(&daemon, |counts| counts.closes() == 1).await;
     assert!(!held.is_finished(), "the route.open reply was not held");
-    assert_eq!(daemon.counts().0.lock().unwrap().active, 1);
+    assert_eq!(daemon.counts().0.lock().unwrap().active(), 1);
 
     daemon.release_consent_open();
     held.await.unwrap().unwrap();
     daemon.wait_closed();
-    assert_eq!(daemon.counts().0.lock().unwrap().closes, 2);
+    assert_eq!(daemon.counts().0.lock().unwrap().closes(), 2);
     assert!(transport.routes.lock().unwrap().is_empty());
     daemon.finish();
 }
@@ -8483,6 +8483,6 @@ include!("consent_approval_deadline_tests.rs");
 mod secret_fetch_cancellation;
 
 #[cfg(test)]
-use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
-#[cfg(test)]
 use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, BgTaskTestExt as _};

@@ -206,7 +206,7 @@ pub fn collect_fence_rust_files(root: &Path) -> Vec<PathBuf> {
     // Audit the direct search-stage files and the shared search-state primitives.
     for relative_dir in [
         "crates/aft/src/commands/semantic_search",
-        "crates/aft/src/search_state",
+        "crates/aft-engine/src/search_state",
     ] {
         let directory = root.join(relative_dir);
         if directory.is_dir() {
@@ -221,8 +221,8 @@ pub fn collect_fence_rust_files(root: &Path) -> Vec<PathBuf> {
     }
 
     // Audit the shared plan table and query value types as well as command handlers.
-    files.push(root.join("crates/aft/src/search_b2/plan_table.rs"));
-    files.push(root.join("crates/aft/src/search_b2/contracts.rs"));
+    files.push(root.join("crates/aft-engine/src/search_b2/plan_table.rs"));
+    files.push(root.join("crates/aft-engine/src/search_b2/contracts.rs"));
 
     // 2. Every crates/aft/tests/engine_*_test.rs
     let tests_dir = root.join("crates/aft/tests");

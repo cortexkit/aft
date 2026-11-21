@@ -222,7 +222,8 @@ mod thread_inventory {
 
     #[cfg(windows)]
     pub(super) fn ids() -> Vec<u64> {
-        crate::lifecycle_census::thread_ids_for_test().unwrap_or_default()
+        aft_engine::test_bridge::search_misc::lifecycle_census::thread_ids_for_test()
+            .unwrap_or_default()
     }
 
     #[cfg(windows)]

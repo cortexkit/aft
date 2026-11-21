@@ -394,6 +394,13 @@ impl StoreTestExt for Store {
 }
 
 pub trait ServiceTestExt {
+    fn check_pending(
+        &self,
+        incarnation: Option<&str>,
+        launch: &LaunchAuthority,
+        session: &str,
+        task: &str,
+    ) -> Result<(), Refusal>;
     fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal>;
     fn invalidate(&self, scope: &ScopeStamp);
     fn register_accepted_policy(
@@ -402,6 +409,15 @@ pub trait ServiceTestExt {
 }
 
 impl ServiceTestExt for Service {
+    fn check_pending(
+        &self,
+        incarnation: Option<&str>,
+        launch: &LaunchAuthority,
+        session: &str,
+        task: &str,
+    ) -> Result<(), Refusal> {
+        self.check_pending(incarnation, launch, session, task)
+    }
     fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal> {
         Service::revoke(self, incarnation, reason)
     }

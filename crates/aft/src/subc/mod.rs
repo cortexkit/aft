@@ -17359,6 +17359,7 @@ mod tests {
         while counters
             .snapshot()
             .exclusion_planning()
+            .as_ref()
             .is_none_or(|plan| plan.attempts() < 2)
         {
             assert!(

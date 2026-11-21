@@ -21,6 +21,18 @@ use std::{
 };
 
 pub trait BgTaskRegistryTestExt: Sized {
+    fn uses_db_pool(
+        &self,
+        conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    ) -> bool;
+    fn running_tasks(&self) -> Vec<std::sync::Arc<BgTask>>;
+    fn compress_output(
+        &self,
+        command: &str,
+        output: String,
+        exit_code: Option<i64>,
+    ) -> crate::compress::CompressionResult;
+    fn try_has_running_tasks(&self) -> Option<bool>;
     fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool>;
     fn cleanup_terminal_task_temp_at(&self, task: &BgTask, now_ms: u64) -> std::io::Result<bool>;
     fn reset_task_access_work(&self);
@@ -158,6 +170,26 @@ pub trait BgTaskRegistryTestExt: Sized {
 }
 
 impl BgTaskRegistryTestExt for BgTaskRegistry {
+    fn uses_db_pool(
+        &self,
+        conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    ) -> bool {
+        self.uses_db_pool(conn)
+    }
+    fn running_tasks(&self) -> Vec<std::sync::Arc<BgTask>> {
+        self.running_tasks()
+    }
+    fn compress_output(
+        &self,
+        command: &str,
+        output: String,
+        exit_code: Option<i64>,
+    ) -> crate::compress::CompressionResult {
+        self.compress_output(command, output, exit_code)
+    }
+    fn try_has_running_tasks(&self) -> Option<bool> {
+        self.try_has_running_tasks()
+    }
     fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool> {
         Self::cleanup_terminal_task_temp(self, task)
     }
@@ -444,6 +476,7 @@ impl ReplyBudgetTestExt for ReplyBudget {
 }
 
 pub trait SpawnPlanTestExt: Sized {
+    fn is_native_launcher(&self) -> bool;
     fn refused_for_test(code: &'static str) -> Self;
 
     #[cfg(unix)]
@@ -460,6 +493,9 @@ pub trait SpawnPlanTestExt: Sized {
 }
 
 impl SpawnPlanTestExt for SpawnPlan {
+    fn is_native_launcher(&self) -> bool {
+        self.is_native_launcher()
+    }
     fn refused_for_test(code: &'static str) -> Self {
         SpawnPlan::refused_for_test(code)
     }
@@ -618,6 +654,11 @@ impl BgTaskStateTestExt for super::BgTaskState {
 }
 
 pub trait ToolLaunchPolicyTestExt {
+    fn command(
+        &self,
+        program: &std::ffi::OsStr,
+        args: &[std::ffi::OsString],
+    ) -> Result<std::process::Command, String>;
     fn resolve(ctx: &crate::context::AppContext)
         -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
     fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
@@ -626,6 +667,13 @@ pub trait ToolLaunchPolicyTestExt {
 }
 
 impl ToolLaunchPolicyTestExt for crate::sandbox_spawn::ToolLaunchPolicy<'_> {
+    fn command(
+        &self,
+        program: &std::ffi::OsStr,
+        args: &[std::ffi::OsString],
+    ) -> Result<std::process::Command, String> {
+        self.command(program, args)
+    }
     fn resolve(
         ctx: &crate::context::AppContext,
     ) -> crate::sandbox_spawn::ToolLaunchPolicy<'static> {
@@ -641,6 +689,12 @@ impl ToolLaunchPolicyTestExt for crate::sandbox_spawn::ToolLaunchPolicy<'_> {
 }
 
 pub trait BgTaskTestExt {
+    fn lock_state(
+        &self,
+    ) -> std::sync::LockResult<
+        std::sync::MutexGuard<'_, crate::bash_background::registry::BgTaskState>,
+    >;
+    fn is_running(&self) -> bool;
     fn task_id(&self) -> &String;
     fn session_id(&self) -> &String;
     fn state(&self) -> &std::sync::Mutex<super::BgTaskState>;
@@ -649,6 +703,16 @@ pub trait BgTaskTestExt {
 }
 
 impl BgTaskTestExt for BgTask {
+    fn lock_state(
+        &self,
+    ) -> std::sync::LockResult<
+        std::sync::MutexGuard<'_, crate::bash_background::registry::BgTaskState>,
+    > {
+        self.lock_state()
+    }
+    fn is_running(&self) -> bool {
+        self.is_running()
+    }
     fn task_id(&self) -> &String {
         &self.task_id
     }
