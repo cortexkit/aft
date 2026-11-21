@@ -387,14 +387,17 @@ fn with_runner<T>(runner: Runner, f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(test)]
+pub(crate) const TUPLE: &str = "_ = (Int, Result<String, Error>).self\n";
+#[cfg(test)]
+pub(crate) const BROKEN: &str = "_ = (Int, Result<String, Error>.self\n";
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Config;
     use crate::edit::{validate_syntax_str, write_format_validate, WriteResult};
 
     const ORIGINAL: &str = "let value = 1\n";
-    const TUPLE: &str = "_ = (Int, Result<String, Error>).self\n";
-    const BROKEN: &str = "_ = (Int, Result<String, Error>.self\n";
 
     #[cfg(unix)]
     #[test]

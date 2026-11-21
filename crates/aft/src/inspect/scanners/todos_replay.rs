@@ -60,7 +60,7 @@ fn todo_count_release_replay() {
     eprintln!("TODO_REPLAY fixture files={FILES}; building stored records");
     let ctx = crate::inspect::data_sources::bind_published_for_test(&root);
     let checkout = ctx.data_checkout().unwrap();
-    let job = super::tests::todos_job(&root, scope.clone());
+    let job = todos_job(&root, scope.clone());
     let relative = scope
         .iter()
         .map(|path| {

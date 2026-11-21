@@ -47,6 +47,15 @@ use tree_sitter::Parser;
 use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 
 #[cfg(test)]
+pub(crate) fn assert_symbol_memory_recount(cache: &SymbolCache, step: &str) {
+    assert_eq!(
+        cache.estimated_memory(),
+        cache.recounted_memory_for_test(),
+        "{step}"
+    );
+}
+
+#[cfg(test)]
 // Some tests here are `cfg(debug_assertions)` (they lean on debug-only seams);
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
@@ -1167,14 +1176,6 @@ pub(crate) mod outer {
         assert!(estimate.estimated_bytes.unwrap() > 0);
         assert_eq!(estimate.counts["entries"], 1);
         assert_eq!(estimate.counts["symbols"], 1);
-    }
-
-    fn assert_symbol_memory_recount(cache: &SymbolCache, step: &str) {
-        assert_eq!(
-            cache.estimated_memory(),
-            cache.recounted_memory_for_test(),
-            "{step}"
-        );
     }
 
     #[test]
