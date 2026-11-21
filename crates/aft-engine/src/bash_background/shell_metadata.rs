@@ -17,7 +17,8 @@ thread_local! {
     static CURRENT: RefCell<Option<ShellCall>> = const { RefCell::new(None) };
 }
 
-pub(crate) struct Guard(Option<ShellCall>);
+#[doc(hidden)]
+pub struct Guard(Option<ShellCall>);
 
 impl Drop for Guard {
     fn drop(&mut self) {

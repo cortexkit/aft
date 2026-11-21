@@ -30,7 +30,8 @@ struct Pending {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct FlushControl {
+#[doc(hidden)]
+pub struct FlushControl {
     next: AtomicU64,
     pending: Mutex<BTreeMap<u64, Pending>>,
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]

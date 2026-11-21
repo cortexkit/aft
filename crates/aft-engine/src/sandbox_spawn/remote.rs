@@ -7,7 +7,8 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
-pub(crate) struct Output {
+#[doc(hidden)]
+pub struct Output {
     text: String,
     code: i32,
     pub timed_out: bool,
@@ -78,7 +79,8 @@ pub fn prepare(_: &AppContext, _: &Path, _: PathBuf, _: String) -> Result<Start,
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) struct Start;
+#[doc(hidden)]
+pub struct Start;
 #[cfg(not(target_os = "linux"))]
 impl Start {
     pub(crate) fn start(self, _: Duration) -> Result<Running, String> {
@@ -86,7 +88,8 @@ impl Start {
     }
 }
 #[cfg(not(target_os = "linux"))]
-pub(crate) struct Running;
+#[doc(hidden)]
+pub struct Running;
 #[cfg(not(target_os = "linux"))]
 impl Running {
     pub(crate) async fn wait(self, _: CancellationToken) -> Result<Output, String> {

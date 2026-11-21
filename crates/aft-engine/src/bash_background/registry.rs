@@ -1317,7 +1317,7 @@ impl Drop for ProjectReplayBatch<'_> {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ScopeKilledTask {
+pub struct ScopeKilledTask {
     pub task_id: String,
     pub session_id: String,
     pub remote: Option<ScopeRemoteCancel>,

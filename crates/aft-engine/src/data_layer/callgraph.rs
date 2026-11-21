@@ -82,7 +82,8 @@ pub struct CheckoutInputs {
 /// parses go between the build's stages, so a build never holds every
 /// file's parse decoded at once.
 #[derive(Clone, Default)]
-pub(crate) struct Parses {
+#[doc(hidden)]
+pub struct Parses {
     map: BTreeMap<String, Arc<ParseSlot>>,
 }
 
@@ -473,7 +474,8 @@ impl Parses {
 }
 
 /// [`Parses::iter`].
-pub(crate) struct ParsesIter<'p> {
+#[doc(hidden)]
+pub struct ParsesIter<'p> {
     parses: &'p Parses,
     keys: std::collections::btree_map::Keys<'p, String, Arc<ParseSlot>>,
 }
