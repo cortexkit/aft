@@ -35,7 +35,8 @@ fn exercise_profile(
     service_available: bool,
 ) {
     use crate::config::SandboxMode;
-    use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail, SpawnPlan};
+    use crate::sandbox_spawn::{with_worker_jail, SpawnPlan};
+    use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
     let profile_allows_broker = match mode {
         SandboxMode::Strict => true,
         SandboxMode::Relaxed => cfg!(target_os = "macos"),

@@ -274,3 +274,25 @@ pub fn snapshots_built(registry: &registry::BgTaskRegistry) -> u64 {
         .snapshots_built
         .load(std::sync::atomic::Ordering::Relaxed)
 }
+
+#[cfg(unix)]
+pub mod remote_support {
+    pub use crate::bash_background::registry::remote::{fixture::*, seams::*};
+}
+
+#[cfg(target_os = "linux")]
+pub mod git_policy_bench_support {
+    pub use crate::sandbox_spawn::git_policy_bench_support::*;
+}
+
+#[cfg(unix)]
+pub mod git_policy_cache_support {
+    pub use crate::sandbox_spawn::git_policy_cache_fixture::{commit, git_ok, Fixture};
+}
+
+pub mod secrets_support {
+    pub use crate::bash_background::secrets::test_support::*;
+}
+
+mod speech;
+pub use speech::*;

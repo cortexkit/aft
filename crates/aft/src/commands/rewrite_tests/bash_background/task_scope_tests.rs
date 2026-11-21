@@ -36,8 +36,10 @@ fn task_scope_fixed_backstop_works_without_registry() {
             true,
         )
         .unwrap();
-    let _stop = StopOnDrop(id.clone());
-    let scope = bash_background::task_scope::lookup(&id).unwrap().unwrap();
+    let _stop = StopOnDrop::new(id.clone());
+    let scope = aft_engine::test_bridge::bash_remote::task_scope::scope_cgroup(&id)
+        .unwrap()
+        .unwrap();
     until(|| root.path().join("alive").exists());
     assert_eq!(
         registry
@@ -55,7 +57,7 @@ fn task_scope_fixed_backstop_works_without_registry() {
     );
     registry.detach();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !scope_stopped(&scope.cgroup().join("cgroup.events")) {
+    while !scope_stopped(&scope.join("cgroup.events")) {
         assert!(
             Instant::now() < deadline,
             "fixed scope backstop did not stop the detached task"

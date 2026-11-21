@@ -13,8 +13,8 @@ mod tests {
         task: &std::sync::Arc<BgTask>,
     ) -> serde_json::Value {
         let (metadata, buffer) = {
-            let state = task.lock_state().unwrap();
-            (state.metadata.clone(), state.buffer.clone())
+            let state = task.test_lock_state().unwrap();
+            (state.metadata().clone(), state.buffer().clone())
         };
         display_bodies(registry, task, &metadata, &buffer).detail
     }
@@ -51,8 +51,8 @@ mod tests {
         let task = terminal_task(&registry, &fixture, &stdout, false);
         let limit = crate::subc::rich_ui::display::detail_byte_limit();
         let (mut metadata, buffer) = {
-            let state = task.lock_state().unwrap();
-            (state.metadata.clone(), state.buffer.clone())
+            let state = task.test_lock_state().unwrap();
+            (state.metadata().clone(), state.buffer().clone())
         };
         install_tail_display(&mut metadata);
 
@@ -83,8 +83,8 @@ mod tests {
         let stdout = format!("{}\nfirst\nsecond\nthird\nlast\n", filler(limit));
         let task = terminal_task(&registry, &fixture, &stdout, false);
         let (mut metadata, buffer) = {
-            let state = task.lock_state().unwrap();
-            (state.metadata.clone(), state.buffer.clone())
+            let state = task.test_lock_state().unwrap();
+            (state.metadata().clone(), state.buffer().clone())
         };
         install_tail_display(&mut metadata);
 

@@ -2788,7 +2788,7 @@ async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_co
         );
         assert_eq!(
             report[0].outcome,
-            reg::return_files::ReturnOutcome::Returned { bytes: 5 }
+            aft_engine::test_bridge::bash_remote::ReturnOutcome::Returned { bytes: 5 }
         );
         let mut refused = return_call(&["../../outside.txt"]);
         refused["workdir"] = serde_json::json!(cwd);
@@ -2874,7 +2874,7 @@ async fn runon_return_paths_places_verified_files_and_lists_every_path() {
     let task_id = reply.data["task_id"].as_str().unwrap();
     let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
     assert!(
-        remote::remote_report(&saved).unwrap().starts_with(report),
+        aft_engine::test_bridge::bash_remote::remote_report(&saved).unwrap().starts_with(report),
         "{saved:?}"
     );
 }
@@ -3167,7 +3167,7 @@ async fn runon_return_over_cap_report_names_the_requested_cap() {
         assert!(output.contains(&report), "{output}");
         let task_id = reply.data["task_id"].as_str().unwrap();
         let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
-        assert!(remote::remote_report(&saved).unwrap().contains(&report));
+        assert!(aft_engine::test_bridge::bash_remote::remote_report(&saved).unwrap().contains(&report));
     }
 }
 

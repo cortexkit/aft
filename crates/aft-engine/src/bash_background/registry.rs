@@ -320,10 +320,10 @@ fn log_bash_spawn(task_id: &str, pid: u32, session: &str, root: &Path, command: 
 /// Bound the ConPTY close/output drain after the child has exited. A stuck
 /// conhost or reader must not keep the task running forever or claim that all
 /// output was captured.
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "test-support"))]
 const PTY_OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "test-support"))]
 enum PtyOutputDrainPoll {
     Pending,
     Ready,
@@ -350,7 +350,7 @@ enum KillSignalPlan {
     RetirePty(Option<PtyRuntime>),
     /// A Windows PTY has an exit marker, but its reader must drain before a
     /// natural completion can be published, even when observed by a kill.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, feature = "test-support"))]
     DrainPty,
     /// Signal a PTY task's process group, then close its pseudoterminal so
     /// the PTY reader reaches end-of-file.
@@ -630,7 +630,7 @@ fn close_pty_master(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
     drop(master);
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "test-support"))]
 fn close_pty_master_off_thread(master: Option<Box<dyn portable_pty::MasterPty + Send>>) {
     let Some(master) = master else {
         return;
@@ -14002,17 +14002,17 @@ impl BgTaskRegistry {
                 // A cap violation is a forced stop, not a natural exit. Polling
                 // for output here would reschedule the same cap kill before
                 // ConPTY can close, leaving the task running indefinitely.
-                #[cfg(any(windows, test))]
+                #[cfg(any(windows, test, feature = "test-support"))]
                 let needs_pty_drain = matches!(&state.runtime, TaskRuntime::Pty(Some(pty))
                     if pty.output_drain.is_some() && !pty.was_killed.load(Ordering::SeqCst) && !resource_kill);
-                #[cfg(not(any(windows, test)))]
+                #[cfg(not(any(windows, test, feature = "test-support")))]
                 let needs_pty_drain = false;
                 if needs_pty_drain {
-                    #[cfg(any(windows, test))]
+                    #[cfg(any(windows, test, feature = "test-support"))]
                     {
                         KillSignalPlan::DrainPty
                     }
-                    #[cfg(not(any(windows, test)))]
+                    #[cfg(not(any(windows, test, feature = "test-support")))]
                     {
                         unreachable!()
                     }
@@ -14155,7 +14155,7 @@ impl BgTaskRegistry {
         let mut scope_kill_attempted = false;
         match plan {
             KillSignalPlan::Nothing => {}
-            #[cfg(any(windows, test))]
+            #[cfg(any(windows, test, feature = "test-support"))]
             KillSignalPlan::DrainPty => self.poll_task(&task)?,
             KillSignalPlan::RetirePty(runtime) => {
                 if let Some(mut runtime) = runtime {
@@ -14451,7 +14451,7 @@ impl BgTaskRegistry {
     /// Start the normal-exit ConPTY close independently of terminal publication.
     /// Closing can block while conhost flushes, so retain the reader's state and
     /// let subsequent polls (or its completion wake) observe EOF or the deadline.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, feature = "test-support"))]
     fn poll_windows_pty_output_drain(
         &self,
         task: &Arc<BgTask>,
@@ -14501,13 +14501,13 @@ impl BgTaskRegistry {
         marker: ExitMarker,
         reason: Option<String>,
     ) -> Result<(), String> {
-        #[cfg(any(windows, test))]
+        #[cfg(any(windows, test, feature = "test-support"))]
         let output_incomplete = match self.poll_windows_pty_output_drain(task)? {
             PtyOutputDrainPoll::Pending => return Ok(()),
             PtyOutputDrainPoll::Ready => self.pty_capture_gap(task),
             PtyOutputDrainPoll::Incomplete(reason) => Some(reason),
         };
-        #[cfg(not(any(windows, test)))]
+        #[cfg(not(any(windows, test, feature = "test-support")))]
         let output_incomplete = self.pty_capture_gap(task);
         // The PTY runtime leaves the task under the lock and is dropped after
         // it is released: dropping it closes the pseudoterminal, which on
@@ -18034,7 +18034,7 @@ mod watch_scan_tests;
 #[path = "pty_status_tests.rs"]
 mod pty_status_tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
     // at `generate_unique_task_id`. The width is load-bearing for the subc

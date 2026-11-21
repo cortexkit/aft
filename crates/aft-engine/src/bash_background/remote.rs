@@ -323,7 +323,7 @@ fn hinted_retry_after_ms(terminal: &TerminalRecord) -> Option<u64> {
 /// it names none. Hinted resubmissions must fit inside it.
 #[cfg(unix)]
 fn hinted_retry_budget_ms(_root: &Path, request: &RunRequest) -> u64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(ms) = seams::hinted_retry_budget_ms(_root) {
         return ms;
     }
@@ -389,10 +389,10 @@ fn draining_delay_ms(
 
 #[cfg(unix)]
 fn retry_jitter_for_task(_task: &BgTask) -> impl FnOnce(u64) -> u64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let clock = seams::task_draining_clock(_task);
     move |max| {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = clock {
             return clock.retry_jitter_ms(max);
         }
@@ -417,7 +417,7 @@ fn retry_jitter_for_task(_task: &BgTask) -> impl FnOnce(u64) -> u64 {
 
 #[cfg(unix)]
 fn draining_budget_ms(_root: &Path) -> u64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(ms) = seams::draining_budget_ms(_root) {
         return ms;
     }
@@ -426,7 +426,7 @@ fn draining_budget_ms(_root: &Path) -> u64 {
 
 #[cfg(unix)]
 fn draining_now_ms(_root: &Path) -> u64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(clock) = seams::draining_clock(_root) {
         return clock.now();
     }
@@ -435,7 +435,7 @@ fn draining_now_ms(_root: &Path) -> u64 {
 
 #[cfg(unix)]
 async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(clock) = seams::draining_clock(_root) {
         clock.sleep_until(_now, _now.saturating_add(delay)).await;
         return;
@@ -573,13 +573,13 @@ struct ReattachBudget {
     /// once more, in case the first never reached the runner.
     cancel_acknowledged: Option<Uuid>,
     /// A test shortened the budget: the job's limits stay treated as passed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     budget_override: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     clock: Option<Arc<seams::ReattachClock>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     clock_job_end: Option<Duration>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     clock_deadline: Option<Duration>,
 }
 
@@ -591,9 +591,9 @@ impl ReattachBudget {
         let grace = REMOTE_REATTACH_GRACE;
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let budget_override = seams::take_reattach_budget(_root);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let (grace, until_job_end) = match budget_override {
             Some(budget) => (budget, Duration::ZERO),
             None => (grace, until_job_end),
@@ -605,7 +605,7 @@ impl ReattachBudget {
             retry_duration(duration_ms(run_timeout)),
             retry_duration(duration_ms(grace)),
         );
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let clock = seams::reattach_clock(_root);
         Self {
             grace,
@@ -615,13 +615,13 @@ impl ReattachBudget {
             attempts: 0,
             attach_attempts: 0,
             cancel_acknowledged: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             budget_override: budget_override.is_some(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             clock_job_end: clock.as_ref().map(|clock| clock.now() + until_job_end),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             clock,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             clock_deadline: None,
         }
     }
@@ -662,7 +662,7 @@ impl ReattachBudget {
     /// deadline fixed for the earlier submission no longer applies.
     fn resubmitted(&mut self, metadata: &PersistedTask) {
         let (until_job_end, _, _) = Self::until_job_end(metadata);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let until_job_end = if self.budget_override {
             Duration::ZERO
         } else {
@@ -671,7 +671,7 @@ impl ReattachBudget {
         self.job_end = tokio::time::Instant::now() + until_job_end;
         self.deadline = None;
         self.cancel_acknowledged = None;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.clock_job_end = self.clock.as_ref().map(|clock| clock.now() + until_job_end);
             self.clock_deadline = None;
@@ -688,7 +688,7 @@ impl ReattachBudget {
     fn reset(&mut self) {
         self.deadline = None;
         self.attempts = 0;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = &self.clock {
             self.clock_deadline = None;
             clock.resets.send_modify(|resets| *resets += 1);
@@ -703,7 +703,7 @@ impl ReattachBudget {
     }
 
     fn check(&self, job_id: Uuid) -> Result<(), String> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = &self.clock {
             return if self
                 .clock_deadline
@@ -739,7 +739,7 @@ impl ReattachBudget {
         attempt: impl std::future::Future<Output = T>,
     ) -> Result<T, String> {
         self.check(job_id)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = self.clock.clone() {
             let (job_end, grace) = (self.clock_job_end, self.grace);
             let deadline = *self.clock_deadline.get_or_insert_with(|| {
@@ -764,7 +764,7 @@ impl ReattachBudget {
     async fn pause(&mut self, job_id: Uuid) -> Result<(), String> {
         let delay = reattach_backoff(self.attempts);
         self.attempts = self.attempts.saturating_add(1);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self.clock.is_some() {
             // Paused-clock tests drive only the deadline; keep real pauses short
             // so a test can observe many attempts. `reattach_backoff` has its own test.
@@ -1075,10 +1075,6 @@ fn new_submission_key(task_id: &str) -> Result<String, String> {
     getrandom::fill(&mut nonce).map_err(|e| e.to_string())?;
     Ok(format!("aft:{task_id}:{}", Uuid::from_bytes(nonce)))
 }
-
-// Reattachment is recorded in metadata without adding agent-visible wording.
-#[cfg(all(test, unix))]
-const REATTACHED_RESULT_SENTENCE: Option<&str> = None;
 
 /// This session's earlier remote job that still held the workspace when the
 /// runner refused a later job in it.
@@ -1396,11 +1392,11 @@ pub(crate) struct TaskSink {
     output_progress: OutputProgress,
     last_progress_persist: Instant,
     sent_at: Option<Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     progress_clock: Option<Arc<dyn Fn() -> Instant + Send + Sync>>,
     /// Runs between the checkpoint snapshot and its file write, so a test can
     /// land another metadata write in that window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     before_checkpoint_write: Option<Box<dyn FnMut() + Send>>,
     /// Stages the job's returned-file chunks until the runner's manifest
     /// arrives, then places the files that verify.
@@ -1517,9 +1513,9 @@ impl TaskSink {
             },
             last_progress_persist: Instant::now(),
             sent_at: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             progress_clock: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             before_checkpoint_write: None,
             returns,
             unsaved_return_report: None,
@@ -1590,14 +1586,14 @@ impl TaskSink {
         Ok(sink)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn set_progress_clock_for_test(&mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) {
         self.last_progress_persist = clock();
         self.progress_clock = Some(clock);
     }
 
     fn progress_now(&self) -> Instant {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = &self.progress_clock {
             return clock();
         }
@@ -1605,7 +1601,7 @@ impl TaskSink {
     }
 
     fn progress_elapsed(&self) -> Duration {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = &self.progress_clock {
             return clock().saturating_duration_since(self.last_progress_persist);
         }
@@ -1723,7 +1719,7 @@ impl TaskSink {
                 previous,
             )
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = self.before_checkpoint_write.as_mut() {
             hook();
         }
@@ -2214,7 +2210,7 @@ impl OutputSink for TaskSink {
         result
     }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let clock = seams::task_draining_clock(&self.task);
         let jitter = retry_jitter_for_task(&self.task);
         // A job that ran but sent no manifest returned nothing. A refusal
@@ -2252,7 +2248,7 @@ impl OutputSink for TaskSink {
             if retries_draining(r, verdict) {
                 if let Some(retry) = r.retry.as_mut() {
                     let now = unix_millis();
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     let now = clock.as_ref().map_or(now, |clock| clock.now());
                     retry.first_refusal_at_ms.get_or_insert(now);
                     retry.next_retry_at_ms = Some(now.saturating_add(draining_delay_ms(
@@ -2744,7 +2740,7 @@ fn runon_cd_refusal_with_git(
 
 #[cfg(unix)]
 impl BgTaskRegistry {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn spawn_remote(
         &self,
@@ -3255,7 +3251,7 @@ impl BgTaskRegistry {
                     ));
                 }
                 let result = run_diagnosed(client, &sink.task, &request, timings).await;
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 let result = if result.is_ok() && seams::lose_submission_replies(_root) {
                     // A round trip confirms dispatch reached the fake executor
                     // before losing the caller's dispatch result.
@@ -3349,7 +3345,7 @@ impl BgTaskRegistry {
                 .entry(task.task_id.clone())
                 .or_insert(OwedCancelOwner::Worker);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         seams::note_remote_worker_start(&task);
         let registry = self.clone();
         let spawned = Arc::clone(&task);
@@ -3801,7 +3797,7 @@ impl BgTaskRegistry {
                 if let Some(point) = point {
                     // Stands in for the daemon stopping before it sent the
                     // cancellation to the runner.
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if seams::stop_draining_worker(&root) {
                         return Ok(());
                     }
@@ -3909,7 +3905,7 @@ impl BgTaskRegistry {
                     reason,
                     refusal_detail,
                 })) => {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if reason == RefusalReason::SubmissionNeverAccepted
                         && seams::stop_draining_worker(&root)
                     {
@@ -3980,7 +3976,7 @@ impl BgTaskRegistry {
                             HintedRetryStep::Surface => {}
                         }
                     }
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     seams::draining_gate(&root, seams::DrainingGate::BeforeRefusalReport).await;
                     let reason = serde_json::to_value(reason)
                         .unwrap()
@@ -4022,7 +4018,7 @@ impl BgTaskRegistry {
                     return result;
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if verdict == Verdict::OutcomeUnknown && seams::stop_draining_worker(&root) {
                         return Ok(());
                     }
@@ -4063,7 +4059,7 @@ impl BgTaskRegistry {
                     return Ok(());
                 }
                 Err(error) => {
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     if stream
                         .resume_point()
                         .is_some_and(|point| point.gap_recovery.is_some())
@@ -4185,11 +4181,11 @@ impl BgTaskRegistry {
                 self.cancel_draining_retry(task);
                 return Ok(None);
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if seams::stop_draining_worker(root) {
                 return Ok(None);
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             seams::draining_gate(root, seams::DrainingGate::BeforeBudgetCheck).await;
             let retry = remote.retry.as_ref().unwrap();
             let first = retry.first_refusal_at_ms.unwrap();
@@ -4238,7 +4234,7 @@ impl BgTaskRegistry {
         let Some(request) = self.wait_draining_retry(task, root).await? else {
             return Ok(None);
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         seams::draining_gate(root, seams::DrainingGate::BeforeResubmit).await;
         let keyed_request = self
             .key_fresh_request(client, task, request.clone(), &mut timings)
@@ -4285,7 +4281,7 @@ impl BgTaskRegistry {
                 Ok(None)
             }
             Err(error) if proves_no_start(&error) => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 seams::draining_gate(root, seams::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
                 // A pause that landed meanwhile already ended the task; the
@@ -4354,7 +4350,7 @@ impl BgTaskRegistry {
         let until = now.saturating_add(delay);
         // Stands in for the daemon stopping while it waits: the worker ends
         // and leaves only the refusal it has already saved.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if seams::stop_draining_worker(root) {
             return Ok(HintedRetryStep::Ended);
         }
@@ -4385,7 +4381,7 @@ impl BgTaskRegistry {
                 _ = draining_retry_sleep(root, now, until - now) => {},
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         seams::draining_gate(root, seams::DrainingGate::BeforeHintedResubmit).await;
         let request = self
             .key_fresh_request(client, task, retry.request.clone(), &mut timings)
@@ -4430,7 +4426,7 @@ impl BgTaskRegistry {
             }
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 seams::draining_gate(root, seams::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
                 // A pause that landed meanwhile already ended the task; the
@@ -5183,9 +5179,9 @@ fn remove_marker_file(marker: &Path) {
 /// production, from 50 ms in test builds.
 #[cfg(unix)]
 const OWED_CANCEL_ATTEMPTS: u32 = 6;
-#[cfg(all(unix, not(test)))]
+#[cfg(all(unix, not(any(test, feature = "test-support"))))]
 const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_secs(1);
-#[cfg(all(unix, test))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 const OWED_CANCEL_FIRST_BACKOFF: Duration = Duration::from_millis(50);
 
 /// What one startup pass did, for its log line and for tests.
@@ -5356,7 +5352,7 @@ async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
                 },
             );
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         seams::draining_gate(storage_root, seams::DrainingGate::OwedCancelClaimed).await;
         let sent = send_owed_cancel(&session_dir, &task_id).await;
         // Saved under the claim table's lock: a registry restoring the task
@@ -5454,7 +5450,7 @@ fn save_owed_cancel_outcome(
         let order = DbWriteOrder::for_task(&session_id, task_id);
         let mut json_writes = order.lock_json_writes();
         let mut record = read_task_at(&layout)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         seams::owed_cancel_save_gate(task_id);
         if let Some(remote) = record.remote.as_mut() {
             if cleared {
@@ -5569,7 +5565,7 @@ async fn cancel_with_backoff(
                 crate::slog_warn!(
                     "owed runner cancel for task {task_id} job {job_id}: attempt {attempt} of {OWED_CANCEL_ATTEMPTS} failed: {last_error}"
                 );
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 seams::note_owed_cancel_attempt_failed(task_id);
             }
         }
@@ -6047,14 +6043,17 @@ fn proves_no_start(error: &exec::Error) -> bool {
     )
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
+#[path = "remote_fixture.rs"]
+pub(crate) mod fixture;
+#[cfg(all(unix, any(test, feature = "test-support")))]
 #[path = "remote_test_support.rs"]
 pub(crate) mod seams;
 #[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
-#[cfg(all(test, unix))]
-pub(crate) use tests::{
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub(crate) use fixture::{
     captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
     uncaptured_unknown_before_render_for_test,
 };

@@ -1,6 +1,6 @@
 use super::*;
 use crate::bash_background::persistence::read_task_at;
-use aft_engine::test_bridge::bash_remote::ARTIFACT_OPENS;
+use aft_engine::test_bridge::bash_remote::with_artifact_opens;
 
 #[test]
 fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
@@ -86,9 +86,9 @@ fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {
             }
             _ => {}
         }
-        ARTIFACT_OPENS.with(|count| count.set(0));
+        with_artifact_opens(|count| count.set(0));
         let actual = collect_at_revision(&executor, Some(&db), true, cached, step);
-        let opens = ARTIFACT_OPENS.with(|count| count.get());
+        let opens = with_artifact_opens(|count| count.get());
         if step == 5 || step == 6 {
             let live = actual
                 .rows

@@ -109,7 +109,7 @@ impl Fixture {
         let reader_eof = Arc::new(AtomicBool::new(false));
         let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
         let (release, release_rx) = crossbeam_channel::bounded(1);
-        super::super::pty_process::spawn_reader(
+        crate::bash_background::pty_process::spawn_reader(
             Box::new(DelayedReader {
                 reached: reached_tx,
                 release: release_rx,

@@ -382,7 +382,7 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
             let mut producers = Vec::new();
             let mut cancelled = false;
             while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
-                if let Some(reply) = crate::subc_fake::server_describe_reply(&frame) {
+                if let Some(reply) = aft_base::subc_fake::server_describe_reply(&frame) {
                     if subc_transport::write_frame(&mut *writer.lock().await, &reply)
                         .await
                         .is_err()
@@ -455,7 +455,7 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                                 if let Some(maximum) = max_bytes { detail["max_bytes"] = json!(maximum); }
                                 replies.push(reply(FrameType::Error, json!({"code":code,"message":"return cap refused","detail":detail})));
                             } else {
-                                let records = super::return_vectors::return_vector_records("two-files-one-empty");
+                                let records = super::return_vector_fixture::return_vector_records("two-files-one-empty");
                                 if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
                                     replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
                                 }
@@ -483,7 +483,7 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                             // runner that still keeps the job's files does.
                             let Script::ReturnVector(name) = script else { unreachable!() };
                             let from = body["params"]["from_seq"].as_u64().unwrap();
-                            for record in super::return_vectors::return_vector_records(name) {
+                            for record in super::return_vector_fixture::return_vector_records(name) {
                                 let seq = match &record {
                                     StreamRecord::Accepted(_) => continue,
                                     StreamRecord::Started(started) => Some(started.seq),
@@ -500,8 +500,8 @@ pub async fn daemon_with_capabilities(script: Script, claims: &[&str], clients: 
                         }
                         "exec.run" if matches!(script, Script::ReturnVector(_) | Script::ReturnVectorReporting(..) | Script::GatedReturnVector(_) | Script::MotorExpiredReplay) => {
                             let records = match script {
-                                Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name) => super::return_vectors::return_vector_records(name),
-                                _ => super::return_vectors::motor_expired_replay(4, None),
+                                Script::ReturnVector(name) | Script::ReturnVectorReporting(name, _) | Script::GatedReturnVector(name) => super::return_vector_fixture::return_vector_records(name),
+                                _ => super::return_vector_fixture::motor_expired_replay(4, None),
                             };
                             if !matches!(records.first(), Some(StreamRecord::Accepted(_))) {
                                 replies.push(reply(FrameType::StreamData, serde_json::to_value(StreamRecord::Accepted(Accepted::new(id(), 1))).unwrap()));
@@ -1389,7 +1389,7 @@ async fn outage_daemon_with(
                 connects.send_modify(|count| *count += 1);
                 let (mut reader, mut writer) = tokio::io::split(socket);
                 while let Ok(Some(frame)) = subc_transport::read_frame(&mut reader).await {
-                    if let Some(reply) = crate::subc_fake::server_describe_reply(&frame) {
+                    if let Some(reply) = aft_base::subc_fake::server_describe_reply(&frame) {
                         if subc_transport::write_frame(&mut writer, &reply).await.is_err() {
                             break;
                         }

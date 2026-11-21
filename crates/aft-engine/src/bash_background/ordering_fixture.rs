@@ -7,7 +7,7 @@ const SECRET: &str = "opaque ordering credential";
 pub const MASKED: &str = "<REDACTED_SECRET>";
 
 pub fn registry(storage: &Path) -> (BgTaskRegistry, Arc<Mutex<Vec<PushFrame>>>) {
-    let (registry, _db, frames) = super::tests::registry_with_db_and_frames(storage);
+    let (registry, _db, frames) = super::registry_with_db_and_frames(storage);
     // Drive observation explicitly; a periodic watchdog tick or GC must not
     // choose the interleaving that these tests are meant to exercise.
     registry
@@ -21,7 +21,7 @@ pub fn registry(storage: &Path) -> (BgTaskRegistry, Arc<Mutex<Vec<PushFrame>>>) 
     (registry, frames)
 }
 
-pub(super) fn persisted_running(storage: &Path) -> (PersistedTask, TaskPaths) {
+pub(in crate::bash_background) fn persisted_running(storage: &Path) -> (PersistedTask, TaskPaths) {
     let paths = task_paths(storage, SESSION, &random_slug()).unwrap();
     let mut metadata = PersistedTask::starting(
         paths.task_id.clone(),

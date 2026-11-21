@@ -1,0 +1,49 @@
+{
+  "artifact_id": "gh-routing-manifest",
+  "manifest_version": 1,
+  "schema_floor": 1,
+  "issued_at_unix_secs": 1787184000,
+  "detectors": {
+    "wrapper_config_dirs": ["~/.config/gh-alfonso-*/"],
+    "credential_env_names": ["GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN"]
+  },
+  "tiers": {
+    "governed": [
+      {"tuple": "issue comment", "platform": ["macos", "linux"]},
+      {"tuple": "pr comment", "platform": ["macos", "linux"]},
+      {"tuple": "pr review", "platform": ["macos", "linux"]},
+      {"tuple": "issue reaction", "platform": ["macos", "linux"]}
+    ],
+    "admin": [
+      {"tuple": "issue close", "platform": ["macos", "linux"]},
+      {"tuple": "pr close", "platform": ["macos", "linux"]},
+      {"tuple": "pr merge", "platform": ["macos", "linux"]},
+      {"tuple": "release create", "platform": ["macos", "linux"]}
+    ],
+    "mechanical": [
+      {"tuple": "issue view", "platform": ["macos", "linux"]},
+      {"tuple": "issue list", "platform": ["macos", "linux"]},
+      {"tuple": "pr view", "platform": ["macos", "linux"]},
+      {"tuple": "pr list", "platform": ["macos", "linux"]},
+      {"tuple": "pr diff", "platform": ["macos", "linux"]},
+      {"tuple": "pr checks", "platform": ["macos", "linux"]},
+      {"tuple": "run view", "platform": ["macos", "linux"]},
+      {"tuple": "run list", "platform": ["macos", "linux"]},
+      {"tuple": "repo clone", "platform": ["macos", "linux"]},
+      {"tuple": "repo view", "platform": ["macos", "linux"]}
+    ]
+  },
+  "api_rules": [
+    {"method": "GET", "path_glob": "**", "tier": "mechanical", "platform": ["macos", "linux"]}
+  ],
+  "canonicalization": {
+    "issue comment": {"argv_forms": ["target-and-body"], "target_fields": ["number"], "body_fields": ["body"]},
+    "pr comment": {"argv_forms": ["target-and-body"], "target_fields": ["number"], "body_fields": ["body"]},
+    "pr review": {"argv_forms": ["target-and-body"], "target_fields": ["number"], "body_fields": ["body"]},
+    "issue reaction": {"argv_forms": ["target-and-reaction"], "target_fields": ["number"], "body_fields": ["reaction"]}
+  },
+  "repository_sections": {},
+  "bindings": {
+    "cortexkit/aft": "alfonso-aft"
+  }
+}

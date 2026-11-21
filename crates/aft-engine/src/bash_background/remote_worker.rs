@@ -9,7 +9,7 @@ pub(super) async fn resubmit(
     _root: &Path,
     timings: exec::LaunchTimings,
 ) -> Result<exec::RemoteStream, exec::Error> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if seams::refuse_resubmission(_root) {
         return Err(exec::Error::Protocol(
             "test: resubmission failed before it was sent".into(),

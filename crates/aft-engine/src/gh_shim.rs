@@ -8358,17 +8358,22 @@ mod review_thread_tests;
 #[cfg(test)]
 #[path = "gh_shim/bypass_bot_credentials_tests.rs"]
 mod bypass_bot_credentials_tests;
-
+#[cfg(any(
+    test,
+    all(
+        feature = "test-support",
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
+#[path = "gh_shim_speech/dispatch_test_support.rs"]
+pub(crate) mod speech_dispatch_support;
 #[cfg(test)]
 // Release-profile test builds carry no dev key in the trust set, so the tests
 // that verify under it are `cfg(debug_assertions)` and the helpers only they
 // use read as dead there; the module compiles in both profiles.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 pub(crate) mod tests {
-    #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
-    pub(crate) mod speech_dispatch_support {
-        include!("gh_shim_speech/dispatch_test_support.rs");
-    }
 
     /// Deadline for tests that expect rung discovery to finish. The product
     /// budget is 2 s; a loaded Windows runner has exceeded it, which turns the
@@ -8465,11 +8470,9 @@ pub(crate) mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
 
-    const TEST_SEED: [u8; 32] = [
-        0x9d, 0x61, 0xb1, 0x9d, 0xef, 0xfd, 0x5a, 0x60, 0xba, 0x84, 0x4a, 0xf4, 0x92, 0xec, 0x2c,
-        0xc4, 0x44, 0x49, 0xc5, 0x69, 0x7b, 0x32, 0x69, 0x19, 0x70, 0x3b, 0xac, 0x03, 0x1c, 0xae,
-        0x7f, 0x60,
-    ];
+    use super::speech_dispatch_support::{
+        fixture_manifest, signed, signed_with, write_signed_manifest, TEST_SEED,
+    };
     /// Seed for the standby-slot fixture key. Test-only material: the compiled
     /// dev trust set keeps exactly one key, and this second keypair exists so
     /// the two-slot trust-set mechanics (standby accepted, unknown refused)
@@ -8513,13 +8516,6 @@ pub(crate) mod tests {
                 None => unsafe { std::env::remove_var(self.key) },
             }
         }
-    }
-
-    pub(super) fn fixture_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/initial-manifest-v1.json"
-        ))
-        .expect("initial manifest fixture")
     }
 
     #[test]
@@ -8627,44 +8623,6 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         serde_json::from_str(&json).expect("producer edit-last vectors fixture")
-    }
-
-    fn signed_with(
-        manifest: &Manifest,
-        fetched_at_unix_secs: u64,
-        seed: &[u8; 32],
-        key_id: &str,
-    ) -> SignedManifest {
-        let key = Ed25519KeyPair::from_seed_unchecked(seed).expect("test key");
-        let bytes = serde_json::to_vec(manifest).expect("manifest bytes");
-        SignedManifest {
-            artifact_id: MANIFEST_ARTIFACT_ID.to_string(),
-            envelope_version: ENVELOPE_VERSION,
-            key_id: key_id.to_string(),
-            fetched_at_unix_secs,
-            signature: base64::engine::general_purpose::STANDARD.encode(key.sign(&bytes).as_ref()),
-            manifest_bytes: String::from_utf8(bytes).expect("manifest bytes are UTF-8"),
-        }
-    }
-
-    pub(super) fn signed(manifest: &Manifest, fetched_at_unix_secs: u64) -> SignedManifest {
-        let key = Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).expect("test key");
-        assert_eq!(key.public_key().as_ref(), DEV_MANIFEST_PUBLIC_KEY);
-        signed_with(
-            manifest,
-            fetched_at_unix_secs,
-            &TEST_SEED,
-            DEV_MANIFEST_KEY_ID,
-        )
-    }
-
-    pub(super) fn write_signed_manifest(paths: &StatePaths, manifest: Manifest, now: u64) {
-        fs::create_dir_all(&paths.root).expect("state root");
-        fs::write(
-            &paths.manifest,
-            serde_json::to_vec(&signed(&manifest, now)).expect("signed manifest"),
-        )
-        .expect("manifest cache");
     }
 
     fn write_envelope_fixture(paths: &StatePaths, envelope_json: &str) {
