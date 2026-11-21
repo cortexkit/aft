@@ -33,6 +33,18 @@ fn write(root: &Path, path: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
     path
 }
 
+/// Replaces a file that a running child AFT polls (the test clock and the
+/// test transport) through a staged sibling and a rename. `fs::write`
+/// truncates first, and a poll landing in that window reads an empty clock
+/// and panics the grammar refresh thread.
+fn replace_polled(root: &Path, path: &str, bytes: impl AsRef<[u8]>) {
+    let path = root.join(path);
+    let mut staged = path.clone().into_os_string();
+    staged.push(".staged");
+    std::fs::write(&staged, bytes).unwrap();
+    std::fs::rename(&staged, &path).unwrap();
+}
+
 fn bind(root: &Path, store: &Path) -> Arc<Checkout> {
     Arc::new(
         Checkout::bind(
@@ -577,8 +589,8 @@ fn scenario(phase: &str) {
     assert_eq!(coverage.skipped_parses.len(), 1);
     assert!(coverage.files_failed.is_empty());
     assert!(!coverage.pending.iter().any(|path| path.ends_with("a.luau")));
-    write(&dir, "transport", wasm);
-    write(&dir, "clock", "30000");
+    replace_polled(&dir, "transport", wasm);
+    replace_polled(&dir, "clock", "30000");
     let started = Instant::now();
     let ready = loop {
         if let Some(view) = runtime.view() {

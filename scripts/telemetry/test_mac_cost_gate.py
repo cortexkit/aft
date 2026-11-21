@@ -6,18 +6,23 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import call, patch
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("mac_cost_gate_test", SCRIPT_DIR / "mac-cost-gate.py")
 assert spec is not None and spec.loader is not None
 mac = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mac)
+ci_spec = importlib.util.spec_from_file_location("ci_mac_hold_test", SCRIPT_DIR.parent / "ci/macos-hold.py")
+assert ci_spec is not None and ci_spec.loader is not None
+ci = importlib.util.module_from_spec(ci_spec)
+ci_spec.loader.exec_module(ci)
 NOW = datetime(2026, 11, 20, 3, 5, tzinfo=timezone.utc)
 END = NOW.replace(hour=5, minute=0)
 
@@ -166,6 +171,154 @@ class HoldTests(unittest.TestCase):
             self.assertFalse(mac.enough_time(END, 1800))
         with patch.object(mac, "utcnow", return_value=END - timedelta(minutes=40)):
             self.assertTrue(mac.enough_time(END, 1800))
+
+
+class CIHoldTests(unittest.TestCase):
+    env = {"GITHUB_RUN_ID": "1001", "GITHUB_RUN_ATTEMPT": "2", "GITHUB_JOB": "unit-macos-libtest-shard"}
+    now = NOW.replace(hour=14)
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        self.holds, self.grants = root / "hold", root / "grant"
+        self.holds.mkdir()
+        self.grants.mkdir()
+        self.hold_path = self.holds / "hold.json"
+        self.grant_path = self.grants / "granted.json"
+        self.owner = "aft-tests-1001-2-unit-macos-libtest-shard-3"
+        self.request = {"owner": self.owner, "expires_at": "2026-11-20T14:55:00Z"}
+        self.initial_record = {"owner": self.owner, "expires_at": "2026-11-20T17:05:00Z"}
+
+    def test_job_owner_differs_across_runs_attempts_jobs_and_matrix_shards(self):
+        self.assertEqual(ci.job_owner(self.env, "3"), self.owner)
+        for key, value in (("GITHUB_RUN_ID", "1002"), ("GITHUB_RUN_ATTEMPT", "3"), ("GITHUB_JOB", "other-job")):
+            self.assertNotEqual(ci.job_owner(self.env | {key: value}, "3"), self.owner)
+        self.assertNotEqual(ci.job_owner(self.env, "4"), self.owner)
+
+    def test_acquire_refreshes_once_at_first_grant_and_waits_for_renewed_grant(self):
+        mac.write_json(self.grant_path, self.request | {"owner": "other-job"})
+        now = self.now
+        renewed = self.initial_record | {"expires_at": "2026-11-20T17:05:30Z"}
+
+        def grant_arrives(delay):
+            nonlocal now
+            now += timedelta(seconds=delay)
+            if now == self.now + timedelta(seconds=30):
+                self.assertEqual(mac.read_hold_record(self.hold_path), self.request)
+                mac.write_json(self.grant_path, self.request)
+            else:
+                self.assertEqual(mac.read_hold_record(self.hold_path), renewed)
+                self.assertEqual(mac.read_hold_record(self.grant_path), self.request)
+                mac.write_json(self.grant_path, renewed)
+
+        with patch.object(ci.protocol, "utcnow", side_effect=lambda: now), patch.object(ci.protocol.time, "sleep", side_effect=grant_arrives) as sleep:
+            ci.acquire(self.owner, self.holds, self.grants)
+        self.assertEqual(sleep.call_args_list, [call(30), call(30)])
+        self.assertEqual(mac.read_hold_record(self.hold_path), renewed)
+
+    def test_missing_or_foreign_grant_times_out_and_releases_request(self):
+        for foreign_grant in (False, True):
+            with self.subTest(foreign_grant=foreign_grant):
+                if foreign_grant:
+                    mac.write_json(self.grant_path, self.request | {"owner": "other-job"})
+                deadline = self.now + timedelta(minutes=50)
+                near_deadline = deadline - timedelta(seconds=3)
+                times = [self.now, self.now, self.now, near_deadline, near_deadline, deadline]
+                with patch.object(ci.protocol, "utcnow", side_effect=times), patch.object(ci.protocol.time, "sleep") as sleep:
+                    with self.assertRaisesRegex(RuntimeError, "Timed out waiting for MOTOR grant.*refusing to run"):
+                        ci.acquire(self.owner, self.holds, self.grants)
+                self.assertEqual(sleep.call_args_list, [call(30), call(3)])
+                self.assertFalse(self.hold_path.exists())
+                self.assertEqual(self.grant_path.exists(), foreign_grant)
+
+    def test_renewal_without_ack_times_out_at_original_deadline_and_releases(self):
+        now = self.now
+
+        def miss_renewal(_delay):
+            nonlocal now
+            if now == self.now:
+                now += timedelta(minutes=49)
+                mac.write_json(self.grant_path, self.request)
+            else:
+                self.assertEqual(mac.read_hold_record(self.hold_path), {
+                    "owner": self.owner, "expires_at": "2026-11-20T17:54:00Z",
+                })
+                now = self.now + timedelta(minutes=50)
+
+        with patch.object(ci.protocol, "utcnow", side_effect=lambda: now), patch.object(ci.protocol.time, "sleep", side_effect=miss_renewal) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "Timed out waiting for MOTOR grant.*17:54:00Z"):
+                ci.acquire(self.owner, self.holds, self.grants)
+        self.assertEqual(sleep.call_count, 2)
+        self.assertFalse(self.hold_path.exists())
+        self.assertEqual(mac.read_hold_record(self.grant_path), self.request)
+
+    def test_quick_initial_grant_allows_only_five_minutes_for_renewal_ack(self):
+        mac.write_json(self.grant_path, self.request)
+        now = self.now
+
+        def miss_renewal(delay):
+            nonlocal now
+            self.assertEqual(mac.read_hold_record(self.hold_path), self.initial_record)
+            if now == self.now:
+                now += timedelta(minutes=4, seconds=59)
+            else:
+                now += timedelta(seconds=delay)
+
+        with patch.object(ci.protocol, "utcnow", side_effect=lambda: now), patch.object(ci.protocol.time, "sleep", side_effect=miss_renewal) as sleep:
+            with self.assertRaisesRegex(RuntimeError, "Timed out waiting for MOTOR grant.*17:05:00Z"):
+                ci.acquire(self.owner, self.holds, self.grants)
+        self.assertEqual(sleep.call_args_list, [call(30), call(1)])
+        self.assertFalse(self.hold_path.exists())
+
+    def test_refresh_keeps_owner_and_waits_for_new_expiry_before_old_expires(self):
+        mac.write_json(self.hold_path, self.initial_record)
+        mac.write_json(self.grant_path, self.initial_record)
+        now = self.now + timedelta(hours=2, minutes=30)
+        renewed = self.initial_record | {"expires_at": "2026-11-20T19:35:00Z"}
+
+        def acknowledge_renewal(_delay):
+            self.assertEqual(mac.read_hold_record(self.hold_path), renewed)
+            self.assertEqual(mac.read_hold_record(self.grant_path), self.initial_record)
+            mac.write_json(self.grant_path, renewed)
+
+        with patch.object(ci.protocol, "utcnow", return_value=now), patch.object(ci.protocol.time, "sleep", side_effect=acknowledge_renewal) as sleep:
+            ci.refresh(self.owner, self.holds, self.grants)
+        sleep.assert_called_once_with(30)
+        self.assertEqual(mac.read_hold_record(self.hold_path), renewed)
+
+    def test_refresh_refuses_to_revive_expired_hold(self):
+        mac.write_json(self.hold_path, self.initial_record)
+        mac.write_json(self.grant_path, self.initial_record)
+        with patch.object(ci.protocol, "utcnow", return_value=self.now + timedelta(hours=3)):
+            with self.assertRaisesRegex(ValueError, "extend a live MOTOR hold"):
+                ci.refresh(self.owner, self.holds, self.grants)
+        self.assertEqual(mac.read_hold_record(self.hold_path), self.initial_record)
+
+    def test_release_after_job_step_failure_only_removes_this_jobs_hold(self):
+        mac.write_json(self.grant_path, self.request)
+        with (
+            patch.object(ci.protocol, "utcnow", return_value=self.now),
+            patch.object(ci.protocol.time, "sleep", side_effect=lambda _: mac.write_json(self.grant_path, self.initial_record)),
+        ):
+            ci.acquire(self.owner, self.holds, self.grants)
+        with (
+            patch.object(ci.protocol, "HOLD_DIR", self.holds),
+            patch.dict(os.environ, self.env),
+            patch.object(sys, "argv", ["macos-hold.py", "release", "--shard", "3"]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "job step failed"):
+                try:
+                    raise RuntimeError("job step failed")
+                finally:
+                    self.assertEqual(ci.main(), 0)
+            self.assertFalse(self.hold_path.exists())
+            self.assertEqual(mac.read_hold_record(self.grant_path), self.initial_record)
+
+            foreign = self.initial_record | {"owner": "other-job"}
+            mac.write_json(self.hold_path, foreign)
+            self.assertEqual(ci.main(), 0)
+            self.assertEqual(mac.read_hold_record(self.hold_path), foreign)
 
 
 class ContaminationTests(unittest.TestCase):

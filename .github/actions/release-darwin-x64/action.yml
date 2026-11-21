@@ -1,0 +1,83 @@
+name: Build macOS x64 release bytes
+description: Build, sign, and upload the macOS x64 release artifacts
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v5
+      with:
+        node-version: "24"
+        package-manager-cache: false
+
+    - uses: oven-sh/setup-bun@v2
+      with:
+        bun-version: latest
+
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-apple-darwin
+
+    - name: Check CMake for wasm-grammars
+      shell: bash
+      run: bash scripts/check-cmake.sh
+
+    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      continue-on-error: true
+    - name: Start compiler cache (fall back to uncached)
+      shell: bash
+      run: bash scripts/ci-sccache-start.sh
+
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      with:
+        shared-key: release-darwin-x64
+        cache-bin: false
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Sync versions from tag
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash -e {0}
+      run: node scripts/version-sync.mjs --from-tag
+
+    - name: Build
+      shell: bash -e {0}
+      run: cargo build --release --target x86_64-apple-darwin --features wasm-grammars
+
+    - name: Strip binary
+      shell: bash -e {0}
+      run: strip target/x86_64-apple-darwin/release/aft
+
+    # Sign after the LAST binary mutation and enforce the same policy as ARM64.
+    # x64 is cross-built on ARM64; executable ONNX/Pulley smokes run against
+    # the native shipped ARM64 binary in e2e-darwin-arm64.
+    - name: Sign and verify binary
+      shell: bash
+      run: |
+        source scripts/lib/ck-aft-signature.sh
+        ck_aft_sign_npm target/x86_64-apple-darwin/release/aft
+        ck_aft_check_npm_signature target/x86_64-apple-darwin/release/aft release
+
+    # Package the split debug info (dSYM) as a sibling release asset. The
+    # shipped binary is stripped (no symtab), so `sample`/`atos` on a deployed
+    # binary would otherwise return nameless offsets. `ditto` dereferences the
+    # `aft.dSYM` symlink cargo emits (it points at a hash-named bundle under
+    # deps/) and copies it to a canonical `aft.dSYM` before zipping, so the
+    # release asset is self-contained and keyed by the binary's UUID.
+    - name: Package dSYM
+      shell: bash -e {0}
+      run: |
+        ditto target/x86_64-apple-darwin/release/aft.dSYM release-dsym/aft.dSYM
+        ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-x64-dsym.zip
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: darwin-x64
+        retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+        path: target/x86_64-apple-darwin/release/aft
+        if-no-files-found: error
+
+    - uses: actions/upload-artifact@v4
+      with:
+        name: darwin-x64-dsym
+        retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+        path: release-dsym/aft-darwin-x64-dsym.zip
+        if-no-files-found: error

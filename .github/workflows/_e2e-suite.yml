@@ -590,10 +590,11 @@ jobs:
   e2e-macos:
     name: E2E (macOS native)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: [self-hosted, rented-mac]
+    runs-on: [self-hosted, mac-mini]
     # Landing E2E tests exercise behavior, not release-calibrated latency.
     # Publication still tests the shipped release binary in release.yml.
-    timeout-minutes: 45
+    # The timeout includes 50 minutes to acquire the MOTOR grant.
+    timeout-minutes: 95
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE: ${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}
@@ -601,12 +602,21 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -686,7 +696,13 @@ jobs:
           if-no-files-found: warn
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release

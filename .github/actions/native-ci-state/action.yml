@@ -4,6 +4,9 @@ inputs:
   phase:
     description: setup, cleanup, finalize, or python (interpreter validation only)
     default: setup
+  target-max-gib:
+    description: Clean the whole shared Cargo target during setup if it exceeds this many GiB
+    default: "50"
   rust-target:
     description: Required preinstalled target on the read-only Windows toolchain
     default: x86_64-pc-windows-msvc
@@ -75,6 +78,7 @@ runs:
       shell: bash
       env:
         AFT_CI_PHASE: ${{ inputs.phase }}
+        AFT_CI_TARGET_MAX_GIB: ${{ inputs.target-max-gib }}
       run: |
         if [[ -n "${AFT_CI_PYTHON:-}" ]]; then
           python="$AFT_CI_PYTHON"
@@ -83,7 +87,7 @@ runs:
         else
           python=python
         fi
-        "$python" scripts/ci-native-state.py "$AFT_CI_PHASE"
+        "$python" scripts/ci-native-state.py "$AFT_CI_PHASE" "$AFT_CI_TARGET_MAX_GIB"
     - name: Verify installed Windows Rust toolchain (read-only)
       if: runner.os == 'Windows' && runner.environment == 'self-hosted' && inputs.phase == 'setup'
       shell: bash

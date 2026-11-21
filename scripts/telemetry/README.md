@@ -26,7 +26,7 @@ never installs system software or uses sudo. The binary is rebuilt and any chang
 pins fetched **before** asking MOTOR to isolate the machine. Measurement uses
 `--prepared-only`, which refuses to build, fetch or generate missing inputs.
 
-MOTOR honours holds only during **03:00–05:00 UTC**. The check writes
+The nightly check keeps its fixed **03:00–05:00 UTC** isolation window. It writes
 `/Users/Shared/motor-macos-hold/hold.json` with a per-run owner
 `aft-nightly-<GitHub run id>` (lowercase letters, digits and hyphens, at most 64
 characters) and an RFC 3339 UTC expiry of 05:00. The record contains exactly
@@ -93,6 +93,22 @@ Pure contract checks (including stand-in hold/grant folders, no real MOTOR state
 python3 -m unittest discover -s scripts/telemetry -p 'test_cpu_precision.py' -v
 python3 -m unittest discover -s scripts/telemetry -p 'test_mac_cost_gate.py' -v
 ```
+
+## Mac mini holds for CI
+
+The Tests jobs and both macOS release builds need the fleet VM scheduler
+(MOTOR) to honour holds at all hours (`hold_window = "always"`). After checkout,
+each job requests a hold and waits for a grant with the same owner and expiry.
+At the first grant, it renews the hold once for three hours and waits for MOTOR to
+acknowledge the new expiry before work starts. The renewal wait stops after
+five minutes or at the original 50-minute deadline, whichever is earlier.
+Owners use `aft-tests-<run id>-<attempt>-<job>`, with the shard number
+appended when a matrix shares a job ID. An `always()` step removes only that
+job's hold, even after failure; MOTOR owns the grant file.
+
+The release jobs have a 200-minute total timeout. Each puts all build and
+packaging steps in a composite step with a separate 150-minute timeout, so a
+quick grant cannot leave them running past the renewed lease.
 
 ## Run locally
 

@@ -30,8 +30,19 @@ PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-ar
 TAG_PUBLISH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
 
 
+def release_steps(job):
+    steps = []
+    for step in job.get("steps", []):
+        action = step.get("uses", "")
+        if action in ("./.github/actions/release-darwin-arm64", "./.github/actions/release-darwin-x64"):
+            steps.extend(parser.parse_workflow(str(ROOT / action / "action.yml"))["runs"]["steps"])
+        else:
+            steps.append(step)
+    return steps
+
+
 def commands(job):
-    return "\n".join(step.get("run", "") for step in job["steps"])
+    return "\n".join(step.get("run", "") for step in release_steps(job))
 
 
 def inline_python(job, name):
@@ -57,13 +68,21 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             ("build-darwin-x64", "target/x86_64-apple-darwin/release/aft"),
         ):
             with self.subTest(job=job_name):
-                steps = jobs[job_name]["steps"]
+                steps = release_steps(jobs[job_name])
                 strip = next(i for i, step in enumerate(steps) if step.get("name") == "Strip binary")
                 sign = next(i for i, step in enumerate(steps) if f"ck_aft_sign_npm {binary}" in step.get("run", ""))
                 self.assertLess(strip, sign)
                 self.assertIn("source scripts/lib/ck-aft-signature.sh", steps[sign]["run"])
                 self.assertIn(f"ck_aft_check_npm_signature {binary} release", steps[sign]["run"])
                 self.assertNotIn("codesign -f -s -", commands(jobs[job_name]))
+
+    def test_arm64_release_composite_forwards_bundle_rust_version(self):
+        job = self.workflow("release.yml")["jobs"]["build-darwin-arm64"]
+        wrapper = next(step for step in job["steps"] if step.get("uses") == "./.github/actions/release-darwin-arm64")
+        self.assertEqual(job["outputs"]["rust_version"], f"${{{{ steps.{wrapper['id']}.outputs.rust_version }}}}")
+        action = parser.parse_workflow(str(ROOT / wrapper["uses"] / "action.yml"))
+        bundle = next(step for step in action["runs"]["steps"] if "pack-binary" in step.get("run", ""))
+        self.assertEqual(action["outputs"]["rust_version"]["value"], f"${{{{ steps.{bundle['id']}.outputs.rust_version }}}}")
 
     def test_macos_npm_smokes_share_card_checks_on_unchanged_shipped_bytes(self):
         job = self.workflow("release.yml")["jobs"]["e2e-darwin-arm64"]
@@ -93,7 +112,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                                        "build-win32-arm64", "build-win32-x64", "e2e-win32-x64"})
         for name, job in native.items():
             with self.subTest(job=name):
-                steps = job["steps"]
+                steps = release_steps(job)
                 for action, tool, version in (("actions/setup-node@v5", "node", "24"),
                                               ("actions/setup-python@v6", "python3", "3.14")):
                     pattern = r"\bpython(?:3)?\s" if tool == "python3" else r"\bnode\s"
@@ -410,7 +429,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
     def test_schedule_and_dispatch_skip_every_external_publication_step(self):
         external_jobs = set()
         for name, job in self.jobs.items():
-            for step in job.get("steps", []):
+            for step in release_steps(job):
                 run = step.get("run", "")
                 publishes = any(
                     "--dry-run" not in line
@@ -444,7 +463,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
         for job in self.jobs.values():
             if "github.event_name == 'push'" in job.get("if", ""):
                 continue
-            uploads.extend(step for step in job.get("steps", []) if step.get("uses") == "actions/upload-artifact@v4")
+            uploads.extend(step for step in release_steps(job) if step.get("uses") == "actions/upload-artifact@v4")
         self.assertGreater(len(uploads), 0)
         for step in uploads:
             with self.subTest(artifact=step["with"]["name"]):

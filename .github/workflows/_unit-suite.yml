@@ -502,7 +502,7 @@ jobs:
     name: Worker GitHub reads (required Landlock)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       AFT_REQUIRE_LANDLOCK: "1"
     steps:
@@ -736,23 +736,34 @@ jobs:
   # does not share an archive build with other tests. With five lib shards, the
   # slowest one takes about as long as its single longest test (about 4 minutes).
   # Watcher tests stay serial; conformance and Bun tests use their own lane.
+  # Each job timeout includes 50 minutes for MOTOR to drain the fleet VMs.
+  # The mini's shared Cargo target uses a smaller cap to leave room for indexes.
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 30
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 80
     env:
       SCCACHE_IDLE_TIMEOUT: "0"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -827,18 +838,24 @@ jobs:
           if-no-files-found: error
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos-libtest-archive:
     name: Cargo libtest archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     # The library test compiler peaks near 13 GB. One runner serializes builds
     # on the 16 GB machine; a cold build still gets ample time to finish.
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 90
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 140
     env:
       SCCACHE_IDLE_TIMEOUT: "0"
       CARGO_INCREMENTAL: "0"
@@ -848,12 +865,21 @@ jobs:
       LIBTEST_CARGO_CONFIG: profile.test.package.agent-file-tools.codegen-units=256
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -897,7 +923,7 @@ jobs:
         run: |
           started=$SECONDS
           report_timing() {
-            printf "### macOS libtest archive\n\nRunner: rented-mac (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+            printf "### macOS libtest archive\n\nRunner: mac-mini (%s)\n\nBuild duration: %ss\n" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
           }
           trap report_timing EXIT
           # Native time reports resident-memory and paging counters for the build.
@@ -944,27 +970,42 @@ jobs:
           if-no-files-found: error
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
 
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
+
   unit-macos-bin-archive:
     name: Cargo bin-test archive (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 25
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 75
     env:
       SCCACHE_IDLE_TIMEOUT: "0"
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1032,10 +1073,16 @@ jobs:
           if-no-files-found: error
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos-inventory-proof:
     name: Prove Rust test inventory (macOS)
@@ -1045,15 +1092,25 @@ jobs:
       - unit-macos-libtest-archive
       - unit-macos-bin-archive
       - unit-macos-watcher
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 10
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1112,10 +1169,16 @@ jobs:
           AFT_UNIT_PARTITION_COUNT: "5"
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos:
     name: Unit tests (macOS)
@@ -1163,15 +1226,25 @@ jobs:
     name: Cargo integration shard 1/3 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-macos-nextest-archive
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 20
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1187,24 +1260,40 @@ jobs:
           shard: "1"
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos-nextest-2:
     name: Cargo integration shard 2/3 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-macos-nextest-archive
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 20
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1220,24 +1309,40 @@ jobs:
           shard: "2"
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos-nextest-3:
     name: Cargo integration shard 3/3 (macOS)
     if: ${{ github.event_name != 'pull_request' || inputs.pr_platform_advisory }}
     needs: unit-macos-nextest-archive
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 20
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 70
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
+
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1253,10 +1358,16 @@ jobs:
           shard: "3"
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos-libtest-shard:
     name: Cargo libtest shard ${{ matrix.shard }}/5 (macOS)
@@ -1264,8 +1375,8 @@ jobs:
     needs:
       - unit-macos-libtest-archive
       - unit-macos-bin-archive
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 20
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 70
     env:
       CARGO_INCREMENTAL: "0"
     strategy:
@@ -1275,12 +1386,22 @@ jobs:
         shard: [1, 2, 3, 4, 5]
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
+          shard: ${{ matrix.shard }}
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1336,7 +1457,7 @@ jobs:
           unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR
           started=$SECONDS
           report_timing() {
-            printf "### macOS libtest shard %s\n\nRunner: rented-mac (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
+            printf "### macOS libtest shard %s\n\nRunner: mac-mini (%s)\n\nTest duration: %ss\n" "$AFT_NEXTEST_PARTITION" "$RUNNER_NAME" "$((SECONDS - started))" >> "$GITHUB_STEP_SUMMARY"
           }
           trap report_timing EXIT
           ./scripts/rust-test-gate.sh
@@ -1368,26 +1489,42 @@ jobs:
           if-no-files-found: warn
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
 
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
+          shard: ${{ matrix.shard }}
+
   unit-macos-watcher:
     name: Cargo watcher tests (macOS)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: [self-hosted, rented-mac]
-    timeout-minutes: 20
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 70
     env:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1466,29 +1603,44 @@ jobs:
           if-no-files-found: warn
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   unit-macos-conformance:
     name: Cargo conformance + Bun tests (macOS)
     if: ${{ github.event_name != 'pull_request' }}
     # This lane builds its own binary and consumes no test archives.
     # The summary still requires both conformance and every archive/shard lane.
-    runs-on: [self-hosted, rented-mac]
+    runs-on: [self-hosted, mac-mini]
     # Leave room for a cold Cargo build followed by conformance and Bun tests.
-    timeout-minutes: 45
+    timeout-minutes: 95
     env:
       CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v5
+        id: checkout
+
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
 
       - uses: actions/setup-python@v6
         if: runner.environment == 'github-hosted'
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1580,10 +1732,30 @@ jobs:
       - name: Install GitHub CLI for pinned helper downloads
         shell: bash
         run: |
-          if ! command -v gh >/dev/null 2>&1; then
-            brew install gh
+          set -euo pipefail
+          gh_version=2.105.0
+          gh_sha256=2a5d03103ae444927383b93d9ffd65579a26e2eb900ce1cf11f55258d5319ded
+          if command -v gh >/dev/null 2>&1 && installed=$(gh --version); then
+            case "${installed%%$'\n'*}" in
+              "gh version $gh_version"|"gh version $gh_version "*)
+                printf '%s\n' "$installed"
+                exit 0
+                ;;
+            esac
           fi
-          gh --version
+
+          dist="gh_${gh_version}_macOS_arm64"
+          install_dir="$(mktemp -d "$AFT_CI_JOB_DIR/gh.XXXXXX")"
+          archive="$install_dir/$dist.zip"
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            --proto '=https' --proto-redir '=https' --output "$archive" \
+            "https://github.com/cli/cli/releases/download/v${gh_version}/${dist}.zip"
+          printf '%s  %s\n' "$gh_sha256" "$archive" | shasum -a 256 --check
+          unzip -q "$archive" -d "$install_dir"
+          rm "$archive"
+          bin="$install_dir/$dist/bin"
+          "$bin/gh" --version
+          printf '%s\n' "$bin" >> "$GITHUB_PATH"
 
       - name: Fetch pinned subc-core
         id: subc_core
@@ -1611,10 +1783,16 @@ jobs:
           SUBC_CORE_WIRE_VERSION: ${{ steps.subc_core.outputs.wire_version }}
 
       - name: Clean native test processes
-        if: always()
+        if: always() && steps.macos-hold.outcome == 'success'
         uses: ./.github/actions/native-ci-state
         with:
           phase: cleanup
+
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release
 
   # ---------------------------------------------------------------------------
   # Rust unit and integration tests on Windows

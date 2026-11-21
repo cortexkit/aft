@@ -1,0 +1,90 @@
+name: Build macOS ARM64 release bytes
+description: Build, sign, and upload the macOS ARM64 release artifacts
+outputs:
+  rust_version:
+    description: Rust version used to build the shipped binary
+    value: ${{ steps.bundle.outputs.rust_version }}
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v5
+      with:
+        node-version: "24"
+        package-manager-cache: false
+    - uses: actions/setup-python@v6
+      if: runner.environment == 'github-hosted'
+      with:
+        python-version: "3.14"
+
+    - uses: dtolnay/rust-toolchain@stable
+
+    - name: Check CMake for wasm-grammars
+      shell: bash
+      run: bash scripts/check-cmake.sh
+
+    - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+      continue-on-error: true
+    - name: Start compiler cache (fall back to uncached)
+      shell: bash
+      run: bash scripts/ci-sccache-start.sh
+
+    # cache-bin: false keeps a cached ~/.cargo/bin from overwriting the fresh
+    # cargo shim, as in build-darwin-x64.
+    - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      with:
+        shared-key: release-darwin-arm64
+        cache-bin: false
+        cache-on-failure: true
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    - name: Sync versions from tag
+      if: startsWith(github.ref, 'refs/tags/v')
+      shell: bash -e {0}
+      run: node scripts/version-sync.mjs --from-tag
+
+    - name: Release library codegen (shipped profile)
+      shell: bash -e {0}
+      run: cargo build --release --lib -p agent-file-tools --timings --features wasm-grammars
+    - name: Build
+      shell: bash -e {0}
+      run: cargo build --release --bin aft -p agent-file-tools --timings --features wasm-grammars
+    # Strip BEFORE signing, never after: v0.51.1 shipped a SIGKILL-on-load
+    # arm64 binary (#238) because strip ran after signing, and strip's
+    # automatic re-sign produced a corrupt signature.
+    - name: Strip binary
+      shell: bash -e {0}
+      run: strip target/release/aft
+
+    # Keep the daemon's hardened runtime and ONNX exception, but use the npm
+    # identifier aft and an ad-hoc identity. Read back the signed policy, not
+    # just signature validity, before bundling the bytes that E2E will smoke.
+    - name: Sign, verify, and smoke-test binary
+      shell: bash
+      run: |
+        source scripts/lib/ck-aft-signature.sh
+        ck_aft_sign_npm target/release/aft
+        ck_aft_check_npm_signature target/release/aft release
+        target/release/aft --version
+
+    # Package the split debug info (dSYM) as a sibling release asset, so a
+    # stripped binary's samples symbolicate. `ditto` dereferences the
+    # `aft.dSYM` symlink cargo emits before zipping, so the asset is
+    # self-contained.
+    - name: Package dSYM
+      shell: bash -e {0}
+      run: |
+        mkdir -p release-dsym
+        ditto target/release/aft.dSYM release-dsym/aft.dSYM
+        ditto -c -k --keepParent release-dsym/aft.dSYM release-dsym/aft-darwin-arm64-dsym.zip
+
+    - name: Bundle shipped macOS binary and dSYM
+      id: bundle
+      shell: bash -e {0}
+      run: python3 scripts/native-release-artifact.py pack-binary --archive "$RUNNER_TEMP/release.tar" --dsym release-dsym/aft-darwin-arm64-dsym.zip
+    - uses: actions/upload-artifact@v4
+      with:
+        name: shipped-darwin-arm64-${{ github.sha }}
+        retention-days: ${{ github.event_name == 'schedule' && 2 || 90 }}
+        path: ${{ runner.temp }}/release.tar
+        compression-level: 1
+        if-no-files-found: error
