@@ -444,7 +444,7 @@ fn os_thread_ids() -> Option<Vec<u64>> {
 /// This process's thread IDs, for tests that compare which threads exist
 /// before and after some work. Linux and macOS tests read richer per-thread
 /// details themselves.
-#[cfg(all(test, windows))]
+#[cfg(all(windows, any(test, feature = "test-support")))]
 pub(crate) fn thread_ids_for_test() -> Option<Vec<u64>> {
     os_thread_ids()
 }

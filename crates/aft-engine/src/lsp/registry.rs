@@ -1303,7 +1303,7 @@ impl BiomeSelectionMemo {
         self.roots
             .entry((markers, start))
             .or_insert_with(|| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 BIOME_ROOT_WALKS.with(|walks| walks.set(walks.get() + 1));
                 server.workspace_root_with_mode(path, None, mode)
             })
@@ -1320,7 +1320,7 @@ impl BiomeSelectionMemo {
                 found = known.clone();
                 break;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             BIOME_CONFIG_DIRECTORY_PROBES.with(|probes| probes.set(probes.get() + 1));
             visited.push(dir.to_path_buf());
             let repository_root = dir.join(".git").exists();
@@ -1413,15 +1413,16 @@ fn biome_includes(config_path: &Path) -> Option<Arc<BiomeIncludes>> {
     parsed
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
+    #[cfg(test)]
     /// Biome configuration parses made by this thread.
     static BIOME_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Workspace-root walks a [`BiomeSelectionMemo`] made on this thread.
-    pub(crate) static BIOME_ROOT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static BIOME_ROOT_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Directories a [`BiomeSelectionMemo`] searched for a configuration on
     /// this thread.
-    pub(crate) static BIOME_CONFIG_DIRECTORY_PROBES: std::cell::Cell<usize> =
+    pub static BIOME_CONFIG_DIRECTORY_PROBES: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 

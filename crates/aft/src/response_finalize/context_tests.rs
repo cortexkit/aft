@@ -225,6 +225,7 @@ mod callgraph_store_for_ops_tests {
 mod status_emitter_tests {
     use crate::config::Config;
     use crate::parser::TreeSitterProvider;
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     use std::path::PathBuf;
     use std::sync::{mpsc, Arc};
     use std::time::Duration;

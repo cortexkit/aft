@@ -20,6 +20,13 @@ pub fn thread_census() -> crate::lifecycle_census::ThreadCensus {
     crate::lifecycle_census::thread_census()
 }
 
+#[cfg(windows)]
+pub mod lifecycle_census {
+    pub fn thread_ids_for_test() -> Option<Vec<u64>> {
+        crate::lifecycle_census::thread_ids_for_test()
+    }
+}
+
 pub fn cleanup_expired(
     harness: &Path,
     retention: std::time::Duration,
@@ -459,7 +466,7 @@ impl ConfigReloadSignalTestExt for crate::watcher_filter::config_events::ConfigR
 
 mod hook_extensions;
 pub use hook_extensions::{
-    backup, grep_executor, large_read, lsp, memory_census, root_cache, root_identity,
-    semantic_index, standing_roots, synapse_embed, watcher_filter, CountsTestExt, DaemonTestExt,
-    IdleLspFixtureTestExt,
+    backup, file_read_exact, grep_executor, large_read, lsp, memory_census, root_cache,
+    root_identity, semantic_index, standing_roots, synapse_embed, watcher_filter, CountsTestExt,
+    DaemonTestExt, IdleLspFixtureTestExt,
 };
