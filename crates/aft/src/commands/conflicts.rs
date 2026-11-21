@@ -643,7 +643,7 @@ line 6"#;
             .expect("run git add");
         assert!(add.success(), "git add failed: {add}");
 
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(repo),

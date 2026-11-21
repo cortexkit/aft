@@ -960,7 +960,7 @@ mod tests {
         for name in ["a.md", "b.md", "c.md"] {
             std::fs::write(project.join("ignored").join(name), "cost").unwrap();
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(project),
@@ -1005,7 +1005,7 @@ mod tests {
         let project = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(project.join("a.rs"), "a").unwrap();
         std::fs::write(project.join("b.rs"), "b").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(project.clone()),
@@ -1066,7 +1066,7 @@ mod tests {
         let outside = std::fs::canonicalize(outside_dir.path()).unwrap();
         std::fs::write(outside.join("a.rs"), "a").unwrap();
         std::fs::write(outside.join("b.rs"), "b").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(project),
@@ -1109,7 +1109,7 @@ mod tests {
         let project = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::write(project.join("a.rs"), "a").unwrap();
         std::fs::write(project.join("b.rs"), "b").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(project.clone()),

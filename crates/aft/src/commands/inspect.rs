@@ -5432,7 +5432,7 @@ mod runtime_note_tests {
     use super::*;
 
     fn context() -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         )
@@ -5555,7 +5555,7 @@ mod status_bar_refresh_tests {
     use crate::parser::TreeSitterProvider;
 
     fn ctx() -> AppContext {
-        AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+        crate::test_context(Box::new(TreeSitterProvider::new()), Default::default())
     }
 
     #[test]
@@ -5625,7 +5625,7 @@ mod status_bar_refresh_tests {
         );
         assert_eq!(
             ctx.status_bar_count_values(),
-            AppContext::new(Box::new(TreeSitterProvider::new()), Default::default())
+            crate::test_context(Box::new(TreeSitterProvider::new()), Default::default())
                 .status_bar_count_values()
         );
     }
@@ -6430,7 +6430,7 @@ mod fresh_payload_tests {
         {
             payloads.insert(*category, serde_json::json!({"unavailable":true,"complete":false,"gaps":[{"reason":"stale old cache"}]}));
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -6487,7 +6487,7 @@ mod fresh_payload_tests {
             "duplicates":false, "cycles":false, "complexity":false,
         }))
         .unwrap();
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
         let manager = ctx.inspect_manager();
         let metrics_wait = manager.non_expiring_metrics_wait_for_test();
@@ -6572,7 +6572,7 @@ mod fresh_payload_tests {
         payloads: &BTreeMap<InspectCategory, Value>,
         sections: &Sections,
     ) -> Response {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -6693,7 +6693,7 @@ mod fresh_payload_tests {
         payloads.insert(InspectCategory::DeadCode, serde_json::json!({
             "callgraph_available": false, "callgraph_unavailable_reason": "cached callgraph unavailable"
         }));
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7012,7 +7012,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn fresh_payload_is_recursive_banned_field_free_and_top_k_only_caps_rows() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7061,7 +7061,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn offset_applies_independently_to_all_detail_lists() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7114,7 +7114,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn scoped_inspect_file_accounting_survives_unfinished_metrics() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7145,7 +7145,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn scoped_inspect_file_accounting_survives_no_diagnostics_sweep() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7247,7 +7247,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn build_inspect_payload_four_capped_lists_produces_four_sibling_envelopes_and_r10_trailers() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7361,7 +7361,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn build_inspect_payload_empty_capped_list_renders_heading_then_trailer() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7474,7 +7474,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn uncovered_diagnostic_files_roll_up_by_cause_and_list_at_most_top_k_paths() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7608,7 +7608,7 @@ mod fresh_payload_tests {
     /// on its incomplete line, instead of the generic "unknown producer".
     #[test]
     fn unfinished_scanner_gap_names_its_scanner() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7698,7 +7698,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn daemon_noise_renderer_golden() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7742,7 +7742,7 @@ mod fresh_payload_tests {
     /// repeated in file groups and a footer; coverage cannot read as success.
     #[test]
     fn failed_producer_error_renders_once_and_coverage_counts_authoritative_files() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7818,7 +7818,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn uncovered_diagnostic_files_within_top_k_render_without_a_trailer() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7849,7 +7849,7 @@ mod fresh_payload_tests {
 
     #[test]
     fn build_inspect_payload_uncapped_renders_no_trailers_and_serializes_final_envelopes() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -7923,7 +7923,7 @@ mod inspect_freshness_progress_tests {
             "unused_exports":false, "duplicates":false, "cycles":false, "complexity":false,
         }))
         .unwrap();
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.lsp()
             .diagnostics_store_mut_for_test()
@@ -8228,7 +8228,7 @@ mod deferred_terminal_tests {
             config.storage_dir = Some(storage.clone());
             config.indexes.trigram = false;
             config.indexes.semantic = false;
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 config,
             ));
@@ -8308,7 +8308,7 @@ mod deferred_terminal_tests {
         config.indexes.trigram = false;
         config.indexes.semantic = false;
         config.inspect.tier2_pass_timeout_ms = 600_000;
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.isolate_cold_build_limiter_for_test(2);
         let configure = RawRequest {
@@ -8442,7 +8442,7 @@ mod deferred_terminal_tests {
     }
     #[test]
     fn root_too_broad_inspect_refuses_snapshot() {
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -8666,7 +8666,7 @@ mod deferred_terminal_tests {
 
     #[test]
     fn deferred_preflight_uses_one_terminal_poll_response() {
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         ));
@@ -8692,7 +8692,7 @@ mod deferred_terminal_tests {
     fn deferred_test_context(root: &Path) -> Arc<AppContext> {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.to_path_buf());
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -8775,7 +8775,7 @@ mod deferred_terminal_tests {
             scoped_in_root_file_count(&root, &roots, &scope, Some(Instant::now()), None);
         assert_eq!((count, complete), (0, false));
         let snapshot = fresh_payload_tests::snapshot();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config::default(),
         );

@@ -120,7 +120,7 @@ fn delete_does_not_enumerate_project_root_parent() {
     config.restrict_to_project_root = true;
     config.storage_dir = Some(ancestor.join("store"));
     config.backup.enabled = Some(false);
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let blocked = BlockDirectory::new(&ancestor);
     // Separate requests exercise both the initial root resolution and its memo.
     for name in ["cold", "cached"] {
@@ -147,7 +147,7 @@ fn delete_context(root: &Path) -> AppContext {
     config.restrict_to_project_root = false;
     config.storage_dir = Some(root.join(".store"));
     config.backup.enabled = Some(false);
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
 /// Runs a recursive delete of a fresh directory while its first path-check
@@ -295,7 +295,7 @@ fn macos_first_touch_timeout_never_mutates_after_probe_release() {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let request: RawRequest = serde_json::from_value(
         serde_json::json!({"id":"write","command":"write","file":target,"content":"after"}),
     )
@@ -394,7 +394,7 @@ fn round2_context(root: &Path) -> AppContext {
     config.restrict_to_project_root = false;
     config.storage_dir = Some(root.join(".store"));
     config.backup.enabled = Some(false);
-    AppContext::new(Box::new(crate::language::StubProvider), config)
+    crate::test_context(Box::new(crate::language::StubProvider), config)
 }
 
 fn round2_nonsearch_reply(

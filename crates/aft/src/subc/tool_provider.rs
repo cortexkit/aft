@@ -8512,7 +8512,7 @@ pub(in crate::subc) mod route_tests {
                 crate::bash_background::registry::default_kill_tests::wait_fixture(None);
             std::fs::write(&task.paths.stdout, "observed-output-marker").unwrap();
             std::fs::write(&task.paths.stderr, "").unwrap();
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 original.config().as_ref().clone(),
             ));
@@ -8739,7 +8739,7 @@ pub(in crate::subc) mod route_tests {
 
     #[cfg(unix)]
     fn runner_restore_context(root: &std::path::Path) -> Arc<AppContext> {
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.join("project")),
@@ -9487,7 +9487,7 @@ pub(in crate::subc) mod route_tests {
         config.project_root = Some(root.as_path().into());
         config.storage_dir = Some(storage.into());
         config.hashline_enabled = true;
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -10196,7 +10196,7 @@ pub(in crate::subc) mod route_tests {
         let storage = tempfile::tempdir().unwrap();
         let root = project.path().canonicalize().unwrap();
         std::fs::write(root.join("pin.rs"), "pub fn pinned_symbol() {}\n").unwrap();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),

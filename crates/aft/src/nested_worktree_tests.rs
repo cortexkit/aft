@@ -175,7 +175,7 @@ fn explicitly_named_worktree_target_still_walks_like_an_ignored_target() {
 fn glob_fallback_skips_nested_worktrees() {
     let (_dir, fixture) = fixture();
     let root = &fixture.root;
-    let ctx = crate::context::AppContext::new(
+    let ctx = crate::test_context(
         crate::context::default_language_provider_factory(),
         crate::config::Config {
             project_root: Some(root.clone()),

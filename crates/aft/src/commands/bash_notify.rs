@@ -148,7 +148,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         config.sandbox.profile.head = crate::config::SandboxMode::Off;
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let spawn = serde_json::from_value(json!({
             "id": "notify-owner-task",
             "command": "bash",

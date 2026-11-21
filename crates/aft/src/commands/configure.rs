@@ -1867,7 +1867,7 @@ fn configure_warnings_list_files_from_the_published_index_store_without_walking(
         "{walked:?}"
     );
 
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         Config {
             project_root: Some(root.clone()),
@@ -4571,7 +4571,7 @@ mod tests {
     #[test]
     fn watcher_spawn_failure_leaves_runtime_uninstalled() {
         let root = tempfile::tempdir().unwrap();
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -4649,7 +4649,7 @@ mod tests {
 
     fn test_context() -> TestContext {
         let storage = tempfile::tempdir().expect("create configure test storage");
-        let context = AppContext::new(
+        let context = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -5485,7 +5485,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -5556,7 +5556,7 @@ mod tests {
         // Restoring the other root's checkpoint would write "stale" back here.
         std::fs::write(&stale_target, "moved on\n").unwrap();
 
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -5631,7 +5631,7 @@ mod tests {
         let early_file = project.path().join("early.txt");
         std::fs::write(&early_file, "early\n").unwrap();
 
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -5727,7 +5727,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -5797,7 +5797,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(project.path());
         let canonical_root = fs::canonicalize(project.path()).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -5871,7 +5871,7 @@ mod tests {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(project.path()).unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let build_key = ctx.memoized_artifact_cache_key(&root);
         assert_eq!(
             ctx.cached_artifact_cache_key(&root),
@@ -5915,7 +5915,7 @@ mod tests {
         // deliberately exercises the shared default under its temporary XDG
         // home, so seed that production-resolved default instead. The configure
         // request still omits storage_dir, just like a plugin-less consumer.
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(crate::storage_path::storage_dir(None)),
@@ -6014,7 +6014,7 @@ mod tests {
             "missing" => {}
             _ => unreachable!(),
         }
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let mut params = json!({"project_root":project,"storage_dir":storage,"harness":"opencode"});
         if transport == "standalone" {
             // Plugins relay the raw document and its path, not their lenient
@@ -6095,7 +6095,7 @@ mod tests {
                 .to_string(),
             )
             .unwrap();
-            let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+            let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
             let request = |id: &str| {
                 let tiers =
                     crate::subc_config::read_local_cortexkit_config_tiers(Some(&user), &project);
@@ -6148,7 +6148,7 @@ mod tests {
         fs::create_dir(&project).unwrap();
         init_git_fixture(&project);
         fs::write(project.join("needle.rs"), "fn cache_retry_needle() {}\n").unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let request = configure_request_with_params(json!({
             "project_root": project, "storage_dir": storage, "harness": "opencode",
             "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
@@ -6420,7 +6420,7 @@ mod tests {
                     init_git_fixture(&project);
                     fs::write(project.join("needle.rs"), "fn contention_needle() {}\n").unwrap();
                     let ctx =
-                        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+                        crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
                     let request = configure_request_with_params(json!({
                         "project_root": project, "storage_dir": storage, "harness": "opencode",
                         "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
@@ -6517,7 +6517,7 @@ mod tests {
         let project = temp.path().join("project");
         fs::create_dir(&project).unwrap();
         let evil = temp.path().join("wire-cache");
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let request = configure_request_with_params(
             json!({"project_root":project,"harness":"opencode","storage_dir":temp.path().join("storage"),"cache_dir":evil,"config":[user_tier(json!({"indexes":{"trigram":false,"semantic":false,"callgraph":false}}))]}),
         );
@@ -7168,7 +7168,7 @@ mod tests {
                 probe_release,
             );
 
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.clone()),
@@ -8679,7 +8679,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let attach_started = Arc::new(Barrier::new(2));
         let attach_started_for_thread = Arc::clone(&attach_started);
 
@@ -8712,7 +8712,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let root = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
 
         install_project_watcher_with(
             &ctx,
@@ -8746,7 +8746,7 @@ mod tests {
         std::fs::write(root.join("Cargo.toml"), "[workspace]\n").unwrap();
         std::fs::write(root.join(".gitignore"), "/target/\n").unwrap();
         std::fs::create_dir_all(root.join("target/debug")).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.clone()),
@@ -9013,7 +9013,7 @@ mod tests {
         let root1 = tempfile::tempdir().unwrap();
         let root2 = tempfile::tempdir().unwrap();
         let root3 = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         let drops = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let drops_for_watcher = Arc::clone(&drops);
@@ -9080,7 +9080,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), Config::default());
+        let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), Config::default());
         ctx.set_cache_role(false, Some(common.path().to_path_buf()));
 
         let paths = external_ignore_watch_paths(&ctx, root.path());

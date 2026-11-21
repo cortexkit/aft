@@ -1361,7 +1361,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(dir.path().join("store"));
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config.clone(),
         ));

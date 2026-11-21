@@ -17,7 +17,7 @@ fn sample_fixture() -> Fixture {
         let mut config = (*f.ctx.config()).clone();
         config.project_root = Some(project.clone());
         let db = f.ctx.db().unwrap();
-        f.ctx = Arc::new(AppContext::new(
+        f.ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));

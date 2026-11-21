@@ -1190,7 +1190,7 @@ mod tests {
     }
 
     fn render_context(session: &Path, storage: &Path) -> crate::context::AppContext {
-        crate::context::AppContext::new(
+        crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(session.to_path_buf()),
@@ -1236,12 +1236,11 @@ mod tests {
     #[ignore = "requires an isolated copied corpus in AFT_EXTERNAL_REPRO_ROOT"]
     fn copied_external_identifier_reproduction() {
         use crate::commands::semantic_search::handle_semantic_search;
-        use crate::context::AppContext;
 
         let root = PathBuf::from(std::env::var_os("AFT_EXTERNAL_REPRO_ROOT").expect("corpus"));
         let storage = std::env::var_os("AFT_EXTERNAL_REPRO_STORAGE").map(PathBuf::from);
         let session = tempfile::tempdir().expect("session");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config {
                 project_root: Some(session.path().to_path_buf()),

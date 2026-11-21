@@ -1034,7 +1034,7 @@ mod preset_writer_tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.into());
         config.storage_dir = Some(storage.into());
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         if with_db {
             ctx.set_db(Arc::new(StdMutex::new(
                 crate::db::open(&storage.join("aft.db")).unwrap(),

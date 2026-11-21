@@ -953,7 +953,7 @@ mod audit_regressions {
         let original_consumer = "import { moved } from './foo.js';\nconsole.log(moved());\n";
         std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
         std::fs::write(&consumer, original_consumer).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
@@ -1004,7 +1004,7 @@ mod audit_regressions {
         let destination = dir.path().join("destination.ts");
         std::fs::write(&source, "export function moved() { return 1; }\n").unwrap();
         let cache = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
@@ -1038,7 +1038,7 @@ mod audit_regressions {
         let original = "export function moved() { return 1; }\n";
         std::fs::write(&source, original).unwrap();
         std::fs::write(&destination, [0xff, 0xfe]).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
@@ -3561,7 +3561,7 @@ mod rollback_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("source.ts");
         std::fs::write(&file, "before").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );

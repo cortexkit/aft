@@ -48,7 +48,7 @@ fn idle_connected_checkout_ages_by_use_blocks_in_flight_and_reopens_on_first_rep
     };
     config.idle.checkout_hours = 1;
     config.indexes.semantic = false;
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

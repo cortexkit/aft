@@ -18,7 +18,7 @@ fn env_map(names: &[(&str, &str)]) -> BTreeMap<String, String> {
 }
 
 fn context(project: &Path, storage: &Path) -> AppContext {
-    AppContext::new(
+    crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(project.to_path_buf()),
@@ -46,7 +46,7 @@ fn context_with_env(
     let mut config = context(project, storage).config().as_ref().clone();
     config.bash.env = env_map(user);
     config.bash.project_env = env_map(project_env);
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
 /// Run one background command through the real `handle` path and return its
@@ -81,7 +81,7 @@ fn provider_context(
         timeout_ms: 2000,
         watch: vec![],
     });
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
 fn fake_export(project: &Path, export: serde_json::Value) -> Vec<String> {
@@ -144,7 +144,7 @@ fn shell_env_provider_hanging_export_still_spawns_in_a_five_second_window() {
     let mut config = base.config().as_ref().clone();
     config.foreground_wait_window_ms = 5000;
     config.shell.env_provider.as_mut().unwrap().timeout_ms = 10000;
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let receipt = std::sync::Arc::new(crate::bash_background::SpawnReceipt::new(
         std::time::Instant::now() + std::time::Duration::from_millis(5000),
     ));
@@ -546,7 +546,7 @@ fn a_runon_job_receives_only_user_names_listed_in_runon_env() {
     );
     let mut config = ctx.config().as_ref().clone();
     config.bash.runon_env = vec!["TZ".to_string(), "BASHENV_TEST_PROJECT".to_string()];
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     trust(storage.path(), project.path());
 
     let plan = crate::commands::bash_remote_env::plan(ctx.config().as_ref());

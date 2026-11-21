@@ -3145,7 +3145,7 @@ mod tests {
     }
 
     fn make_ctx() -> AppContext {
-        AppContext::new(Box::new(TreeSitterProvider::new()), Config::default())
+        crate::test_context(Box::new(TreeSitterProvider::new()), Config::default())
     }
 
     #[test]
@@ -3241,7 +3241,7 @@ mod tests {
         // keeps its alias, and a real root names the real files even when the
         // request goes through the alias.
         for configured_root in [&request_root, &real_root] {
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(TreeSitterProvider::new()),
                 Config {
                     project_root: Some(configured_root.clone()),
@@ -3278,7 +3278,7 @@ mod tests {
     /// project root, so every manifest path must name the file it came from.
     #[cfg(unix)]
     fn symlinked_reexport_ctx(root: &Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.to_path_buf()),
@@ -3403,7 +3403,7 @@ mod tests {
         // Neither a missing project root nor a root that does not contain the
         // sources may lend the request's alias spelling to the manifest.
         for project_root in [None, Some(project)] {
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(TreeSitterProvider::new()),
                 Config {
                     project_root: project_root.clone(),

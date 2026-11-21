@@ -1371,7 +1371,7 @@ mod tests {
     async fn frame_loop_answers_ping_while_watch_diagnostic_database_is_locked() {
         use super::super::*;
         let (storage, root) = test_support::test_root("watch-diagnostic-disk-lock");
-        let ctx = Arc::new(crate::context::AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.as_path().into()),

@@ -315,6 +315,10 @@ pub(crate) use aft_base::test_gate;
 pub(crate) use aft_base::test_read_denial;
 #[cfg(test)]
 pub(crate) use aft_base::test_support;
+#[cfg(test)]
+mod upper_test_context;
+#[cfg(test)]
+pub(crate) use upper_test_context::test_context;
 // The fake LSP builder also compiles in integration tests under this helper name.
 #[cfg(test)]
 use test_support as test_helpers;

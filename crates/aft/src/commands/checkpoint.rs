@@ -38,7 +38,7 @@ mod tests {
                 let second = root.path().join("second.txt");
                 std::fs::write(&path, b"restore me").unwrap();
                 std::fs::write(&second, b"second").unwrap();
-                let ctx = AppContext::new(
+                let ctx = crate::test_context(
                     Box::new(crate::parser::TreeSitterProvider::new()),
                     crate::config::Config {
                         project_root: Some(root.path().to_path_buf()),

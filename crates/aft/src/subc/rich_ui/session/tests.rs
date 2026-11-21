@@ -80,7 +80,7 @@ impl Fixture {
             ..Default::default()
         };
         configure(&mut config);
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));

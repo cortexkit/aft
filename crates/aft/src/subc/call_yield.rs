@@ -520,7 +520,7 @@ mod tests {
         root: &std::path::Path,
         storage: &std::path::Path,
     ) -> Arc<crate::context::AppContext> {
-        let ctx = Arc::new(crate::context::AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.into()),

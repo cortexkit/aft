@@ -1811,7 +1811,7 @@ mod tests {
     #[test]
     fn inline_symbol_missing_file() {
         let req = make_request("1", "inline_symbol", serde_json::json!({}));
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -1834,7 +1834,7 @@ mod tests {
             "inline_symbol",
             serde_json::json!({"file": "/tmp/test.ts"}),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -1857,7 +1857,7 @@ mod tests {
             "inline_symbol",
             serde_json::json!({"file": "/tmp/test.ts", "symbol": "foo"}),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -1883,7 +1883,7 @@ mod tests {
                 "call_site_line": 1,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -1910,7 +1910,7 @@ mod tests {
                 "call_site_line": 9,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -1936,7 +1936,7 @@ mod tests {
                 "call_site_line": 9,
             }),
         );
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );

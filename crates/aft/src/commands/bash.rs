@@ -1034,7 +1034,8 @@ mod tests {
             config.remote_exec.enabled = enabled;
             config.remote_exec.enabled = true;
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
-            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+            let ctx =
+                crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
             let marker = root.path().join("must-not-run-locally");
             let req = RawRequest {
                 id: "standalone-runon".into(),
@@ -1058,7 +1059,7 @@ mod tests {
     }
 
     fn ctx_with_root(root: &std::path::Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.to_path_buf()),
@@ -2075,7 +2076,7 @@ mod tests {
     }
 
     fn spawn_test_context(project_root: &Path, storage_dir: &Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(project_root.to_path_buf()),
@@ -2113,7 +2114,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         config.sandbox.profile.head = crate::config::SandboxMode::Off;
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let mut request = spawn_test_request(
             "relative-workdir",
             "printf relative-cwd-ok > marker.txt",
@@ -2166,7 +2167,7 @@ mod tests {
         };
         assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
         let artifacts = crate::root_cache::cache_root(&config);
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         crate::sandbox_spawn::install_sandbox_spawn_test_seam(project.path().to_path_buf());
         let response = handle(
             &spawn_test_request("split-root-task", "echo durable-task", true),

@@ -58,7 +58,7 @@ fn context(root: &Path, storage: &Path) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
         crate::db::open(&storage.join("aft.db")).unwrap(),
     )));

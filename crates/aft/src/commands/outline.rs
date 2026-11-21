@@ -4372,7 +4372,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
 
     #[test]
     fn outline_files_mode_refuses_raw_url_array_targets() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -4414,7 +4414,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 path
             })
             .collect();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -4429,7 +4429,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let denied = root.join("denied.ts");
         std::fs::write(&allowed, "export function publicSymbol() {}\n").unwrap();
         std::fs::write(&denied, "export function secretSymbol() {}\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -4494,7 +4494,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         // keeps its alias, and a real root names the real files even when the
         // request goes through the alias.
         for configured_root in [&request_root, &real_root] {
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(TreeSitterProvider::new()),
                 crate::config::Config {
                     project_root: Some(configured_root.clone()),
@@ -4542,7 +4542,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             "export function secretSymbol() {}\n",
         )
         .unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -4598,7 +4598,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .collect::<String>();
         std::fs::write(&shown, &source).unwrap();
         std::fs::write(&hidden, &source).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -4638,7 +4638,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             )
             .unwrap();
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -4681,7 +4681,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .into_iter()
             .map(|file| crate::path_identity::normalize_path(&root.join(file)))
             .collect();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -4767,7 +4767,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let storage = tempfile::tempdir().unwrap();
         let provider = TreeSitterProvider::new();
         let cache = provider.symbol_cache();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(provider),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -4848,7 +4848,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         // A warm multi-file outline renders from the parse facts cached next
         // to each file's symbols, as a warm single-file outline already did.
         assert_eq!(counts, [(1, 1), (0, 0)].repeat(7));
-        let batch_ctx = AppContext::new(
+        let batch_ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -5268,7 +5268,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .unwrap();
             for cold in [true, false] {
                 let mut timings = Vec::new();
-                let mut ctx = AppContext::new(
+                let mut ctx = crate::test_context(
                     Box::new(TreeSitterProvider::new()),
                     crate::config::Config::default(),
                 );
@@ -5277,7 +5277,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
                 }
                 for _ in 0..11 {
                     if cold {
-                        ctx = AppContext::new(
+                        ctx = crate::test_context(
                             Box::new(TreeSitterProvider::new()),
                             crate::config::Config::default(),
                         );
@@ -5346,7 +5346,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let iterations = if mode == "single" { 100 } else { 1 };
         let contexts = (0..iterations)
             .map(|_| {
-                AppContext::new(
+                crate::test_context(
                     Box::new(TreeSitterProvider::new()),
                     crate::config::Config::default(),
                 )
@@ -5582,7 +5582,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             ),
         )
         .unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -5643,7 +5643,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
     }
 
     fn restricted_outline_context(root: &Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.to_path_buf()),
@@ -5782,7 +5782,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             let good = temp.path().join("good.rs");
             std::fs::write(&affected, "pub fn affected() {}\n").unwrap();
             std::fs::write(&good, "pub fn good() {}\n").unwrap();
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(ChangingProvider {
                     affected: affected.clone(),
                     break_syntax,
@@ -5887,7 +5887,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .unwrap();
             files.push(path.display().to_string());
         }
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6090,7 +6090,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let broken = temp.path().join("broken.ts");
         std::fs::write(&broken, "function (\n").unwrap();
         files.push(broken.display().to_string());
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6130,7 +6130,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             )
             .unwrap();
             std::fs::write(&included, "fn helper() {}\n#[test]\nfn checks() {}\n").unwrap();
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(TreeSitterProvider::new()),
                 crate::config::Config::default(),
             );
@@ -6188,7 +6188,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             "export function visible() {}\ndescribe(\"suite\", () => {\n  it(\"works\", () => {});\n});\n",
         )
         .unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6260,7 +6260,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             serde_json::json!({"directory": root}),
         ] {
             // A fresh context each time, so no file is warm in the cache.
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(TreeSitterProvider::new()),
                 crate::config::Config::default(),
             );
@@ -6305,7 +6305,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         use crate::parser::work_counters::tree_parses;
         let temp = tempfile::tempdir().expect("tempdir");
         let files = small_ts_files(temp.path(), OUTLINE_FILE_WALK_CAP + 5);
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6332,7 +6332,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
     fn pre_handler_probe_checks_only_the_examined_files() {
         let temp = tempfile::tempdir().expect("tempdir");
         let files = small_ts_files(temp.path(), 1_000);
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6363,7 +6363,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         use crate::parser::work_counters::tree_parses;
         let temp = tempfile::tempdir().expect("tempdir");
         let files = small_ts_files(temp.path(), 10);
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6399,7 +6399,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
     fn multi_file_outline_stops_when_the_request_deadline_is_near() {
         let temp = tempfile::tempdir().expect("tempdir");
         let files = small_ts_files(temp.path(), 4);
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6426,7 +6426,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6519,7 +6519,7 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -6885,7 +6885,7 @@ impl<T> Boxed for GenericBox<T> { pub fn boxed(&self) {} }
             .iter()
             .map(|path| path.display().to_string())
             .collect::<Vec<_>>();
-        let ctx = crate::context::AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );
@@ -7988,7 +7988,7 @@ mod audit11_regressions {
             .and_then(|tree| crate::parser::extract_symbols_from_tree(current, &tree, LangId::Rust))
             .unwrap();
 
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             crate::config::Config::default(),
         );

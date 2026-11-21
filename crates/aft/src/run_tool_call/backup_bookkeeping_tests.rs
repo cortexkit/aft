@@ -90,7 +90,7 @@ fn backup_bookkeeping_read_only_calls_do_not_wait_for_store_owner() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("small.rs");
     std::fs::write(&path, "pub fn small() {}\n").unwrap();
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.path().to_path_buf()),
@@ -161,7 +161,7 @@ fn backup_bookkeeping_mutating_tool_keeps_skipped_reason_and_undo_entry() {
     let path = root.path().join("small.rs");
     let original = "pub fn small() {}\n";
     std::fs::write(&path, original).unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.path().to_path_buf()),

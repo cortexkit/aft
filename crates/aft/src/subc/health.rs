@@ -5503,7 +5503,7 @@ mod tests {
     #[test]
     fn health_cache_codes_survive_a_recovery_between_reads() {
         let temp = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(temp.path().join("storage")),
@@ -8542,7 +8542,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(
             root.clone(),
-            Arc::new(AppContext::new(
+            Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config::default(),
             )),
@@ -8720,7 +8720,7 @@ mod tests {
     fn health_names_future_bash_tasks_without_global_shell_degradation() {
         let (dir, root) = test_root("health-task-refusal");
         let storage = dir.path().join("storage");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.clone()),
@@ -8794,7 +8794,7 @@ mod tests {
 
     fn contended_health_fixture() -> (tempfile::TempDir, Executor, HealthRollupCache, Arc<App>) {
         let (dir, root) = test_root("health-contended-census");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("storage")),
@@ -8987,7 +8987,7 @@ mod tests {
     #[test]
     fn health_wait_retries_an_unavailable_rollup() {
         let (dir, root) = test_root("health-contended-rollup");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("storage")),
@@ -9258,7 +9258,7 @@ mod tests {
         let (storage, root) = test_root("health-memory-once");
         let mut config = crate::config::Config::default();
         config.storage_dir = Some(storage.path().join("state"));
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -9309,7 +9309,7 @@ mod tests {
         config.storage_dir = Some(storage.path().join("state"));
         config.project_root = Some(root.as_path().to_path_buf());
         config.indexes.semantic = false;
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -9609,7 +9609,7 @@ mod tests {
         let mut dirs = Vec::new();
         for index in 0..200 {
             let (dir, root) = test_root(&format!("quiet-memory-payload-{index}"));
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     storage_dir: Some(storage.path().to_path_buf()),
@@ -9909,7 +9909,7 @@ mod tests {
         let (storage, root) = test_root("health-breaker-cache");
         let mut config = crate::config::Config::default();
         config.storage_dir = Some(storage.path().join("state"));
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -10149,7 +10149,7 @@ mod tests {
         config.indexes.semantic = false;
         config.indexes.callgraph = false;
         config.inspect.enabled = true;
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -10212,7 +10212,7 @@ mod tests {
             drr_quantum: 1,
         });
         let (_dir, root) = test_root("health-privacy-disclaim");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.as_path().to_owned()),
@@ -10260,7 +10260,7 @@ mod tests {
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.as_path().to_path_buf());
         config.indexes.callgraph = false;
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -11042,7 +11042,7 @@ mod tests {
     fn semantic_backend_planned_pause_is_information_but_does_not_hide_outages() {
         let executor = Executor::new();
         let (dir, root) = test_root("semantic-planned-pause-health");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("storage")),
@@ -11488,7 +11488,7 @@ mod tests {
         config.indexes.semantic = false;
         config.indexes.callgraph = false;
         config.inspect.enabled = true;
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));

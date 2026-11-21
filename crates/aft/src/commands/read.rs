@@ -2961,7 +2961,7 @@ mod tests {
             project_root: Some(root.to_path_buf()),
             ..Default::default()
         };
-        AppContext::new(default_language_provider_factory(), config)
+        crate::test_context(default_language_provider_factory(), config)
     }
 
     fn request(file: &Path, extra: Value) -> RawRequest {
@@ -3563,7 +3563,7 @@ mod hashline_wiring_tests {
     use crate::protocol::{RawRequest, DEFAULT_SESSION_ID};
 
     fn context(root: &Path) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.to_path_buf()),
@@ -3827,7 +3827,7 @@ mod github_deferred_deadline_tests {
     #[test]
     fn native_read_with_a_hanging_gh_answers_from_the_cache_within_the_call_budget() {
         let storage = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.path().to_path_buf()),

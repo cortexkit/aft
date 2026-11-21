@@ -452,7 +452,7 @@ pub(crate) mod tests {
 
     pub(crate) fn context(root: &Path, storage: &Path) -> Arc<AppContext> {
         crate::subc::lower_hooks::register();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Config {
                 project_root: Some(root.into()),

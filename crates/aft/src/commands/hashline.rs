@@ -354,7 +354,7 @@ mod tests {
         let root = std::fs::canonicalize(temp.path()).expect("canonical root");
         let path = root.join("sample.txt");
         std::fs::write(&path, contents).expect("fixture write");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.clone()),
@@ -463,7 +463,7 @@ mod tests {
         let root = std::fs::canonicalize(temp.path()).expect("canonical root");
         let path = root.join("sample.txt");
         std::fs::write(&path, "alpha\nbeta\n").expect("fixture write");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.clone()),
@@ -519,7 +519,7 @@ mod tests {
             .map(|line| format!("line_{line} = {line}\n"))
             .collect::<String>();
         std::fs::write(&primary, &primary_contents).expect("primary fixture");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.clone()),
@@ -820,7 +820,7 @@ mod tests {
         let root = std::fs::canonicalize(temp.path()).expect("canonical root");
         let path = root.join("sample.txt");
         std::fs::write(&path, "alpha\nbeta\n").expect("fixture write");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(root.clone()),
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn unregistered_hashline_handler_refuses_direct_invocation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 project_root: Some(temp.path().to_path_buf()),

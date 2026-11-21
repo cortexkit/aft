@@ -730,7 +730,7 @@ mod rollback_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("source.ts");
         std::fs::write(&file, "before").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         );

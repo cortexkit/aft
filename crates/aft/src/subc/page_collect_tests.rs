@@ -54,7 +54,7 @@ fn fixture(trust: BindTrust) -> Fixture {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
     config.sandbox.read_deny = vec![root.join("secret")];
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));
@@ -605,7 +605,7 @@ fn parity_fixture(route: ParityRoute) -> ParityFixture {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
     config.sandbox.read_deny = vec![root.join("secret")];
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

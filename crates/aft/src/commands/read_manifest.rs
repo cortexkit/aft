@@ -116,7 +116,7 @@ mod tests {
     use crate::parser::TreeSitterProvider;
 
     fn ctx_with_root(root: Option<PathBuf>) -> AppContext {
-        AppContext::new(
+        crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 project_root: root,

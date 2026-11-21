@@ -782,7 +782,7 @@ async fn unconfigured_policy_store_direct_and_frame_reads_remain_unconfined() {
     use super::super::{persistence::DatabaseWaits, route_key};
 
     let root = tempfile::tempdir().unwrap();
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.path().into()),
@@ -874,7 +874,7 @@ fn context_with_user_remote(
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
     config.remote_exec.enabled = enabled;
     config.semantic.subc_connection_file = connection;
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
         crate::db::open(&storage.join("aft.db")).unwrap(),
     )));
@@ -887,7 +887,7 @@ fn context_without_database(root: &Path, storage: &Path) -> AppContext {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.into());
     config.storage_dir = Some(storage.into());
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
 }
 
 mod catalog_preset_tests {
@@ -2839,7 +2839,7 @@ fn head_worker_preflight_catalog_matches_worker_catalog() {
 fn head_worker_preflight_validates_routing_without_a_policy_store() {
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir(root.path().join(".git")).unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.path().into()),
@@ -3766,7 +3766,7 @@ fn worker_catalog_offers_runon_only_with_an_enabled_frozen_plan() {
     off.storage_dir = Some(storage.path().into());
     off.sandbox.profile.head = crate::config::SandboxMode::Off;
     off.remote_exec.project_off = true;
-    let off_ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), off);
+    let off_ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), off);
     off_ctx.set_db(Arc::new(StdMutex::new(
         crate::db::open(&storage.path().join("aft.db")).unwrap(),
     )));
@@ -3820,7 +3820,7 @@ fn head_sessions_take_remote_runs_from_the_user_config_only() {
     config.project_root = Some(root.path().into());
     config.remote_exec.enabled = true;
     config.remote_exec.default_demand = Some("linux".into());
-    let enabled = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let enabled = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let launch = lookup(&enabled, &head).unwrap();
     assert_eq!(launch.harness, "opencode");
     assert_eq!(launch.session, "head");

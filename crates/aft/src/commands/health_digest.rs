@@ -137,7 +137,6 @@ mod tests {
         TicketedCurrent, HEALTH_DIGEST_OPERATION,
     };
     use crate::config::Config;
-    use crate::context::AppContext;
     use crate::language::StubProvider;
     use crate::protocol::RawRequest;
 
@@ -226,7 +225,7 @@ mod tests {
         let root = tempfile::tempdir().expect("create project root");
         let mut config = Config::default();
         config.project_root = Some(PathBuf::from(root.path()));
-        let ctx = AppContext::new(Box::new(StubProvider), config);
+        let ctx = crate::test_context(Box::new(StubProvider), config);
         let request = request();
         let server_count_before = ctx.lsp().server_count();
         let started = Instant::now();

@@ -90,7 +90,7 @@ async fn thalamus_fork_samples_decode_and_obey_fork_admission() {
     let root = ProjectRootId::from_path(&project).unwrap();
     let mut identity = plugin_prompt_v1_identity(&root);
     Arc::get_mut(&mut identity.0).unwrap().scope = Some(stamp("worker"));
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(project),

@@ -1496,7 +1496,8 @@ mod tests {
                 ..crate::config::Config::default()
             };
             config.sandbox.profile.head = crate::config::SandboxMode::Off;
-            let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+            let ctx =
+                crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
             let request: RawRequest = serde_json::from_value(json!({
                 "id": "quick-terminal",
                 "command": "bash",
@@ -1533,7 +1534,7 @@ mod tests {
     fn background_spawn_notices_preserve_terminal_status_and_guidance() {
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(project.path().into()),

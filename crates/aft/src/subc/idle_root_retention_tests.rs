@@ -1217,7 +1217,7 @@ fn background_task_output_compresses_the_same_after_idle_eviction() {
         ..Config::default()
     };
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));
@@ -1338,7 +1338,7 @@ fn background_task_root(project: &Path, storage: &Path) -> (ProjectRootId, Arc<A
         ..Config::default()
     };
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

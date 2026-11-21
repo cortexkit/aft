@@ -35,7 +35,7 @@ fn bound_context(root: &Path, storage: &Path) -> Arc<AppContext> {
     config.project_root = Some(root.to_path_buf());
     config.storage_dir = Some(storage.to_path_buf());
     config.indexes.semantic = false;
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

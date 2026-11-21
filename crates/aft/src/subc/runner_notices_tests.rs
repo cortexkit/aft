@@ -27,7 +27,7 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
         capture.cleared(true);
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("fixture.txt"), "needle\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.path().into()),
@@ -148,7 +148,7 @@ fn notice_templates_repeat_observations_send_typed_counts_without_appending() {
         let session = format!("notice-repeat-{identical}");
         let capture = test_endpoint::capture(&session, false);
         capture.delivery_order(Some(true));
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             Default::default(),
         );
@@ -319,7 +319,7 @@ fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
     capture.delivery_order(Some(true));
     capture.cleared(true);
     let root = tempfile::tempdir().unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         Default::default(),
     );
@@ -385,7 +385,7 @@ async fn code_search_nudge_plain_grep_on_runner_heads() {
         std::fs::create_dir(&src).unwrap();
         std::fs::write(src.join("fixture.txt"), "foo\n").unwrap();
         filetime::set_file_mtime(&src, filetime::FileTime::from_unix_time(1, 0)).unwrap();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.as_path().into()),
@@ -497,7 +497,7 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
             "task_id": "bash-native", "status": "completed", "exit_code": 0, "output": "matches\n[task bash-native]"
         }),
     );
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.path().to_path_buf()),
@@ -563,7 +563,7 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
     capture.delivery_order(Some(true));
     capture.delay_reply(Duration::from_secs(5));
     let root = tempfile::tempdir().unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.path().to_path_buf()),

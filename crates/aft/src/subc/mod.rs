@@ -13045,7 +13045,7 @@ pub(crate) mod test_support {
     }
 
     pub(super) fn test_ctx() -> Arc<AppContext> {
-        Arc::new(AppContext::new(
+        Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config::default(),
         ))
@@ -13086,7 +13086,7 @@ pub(crate) mod test_support {
         if let Some(timeout_ms) = timeout_ms {
             config.inspect.diagnostics_timeout_ms = timeout_ms;
         }
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -18317,7 +18317,7 @@ mod tests {
     #[tokio::test]
     async fn quiesced_lsp_maintenance_drains_final_events_without_resubmission_loop() {
         let (_dir, root) = test_root("quiesced-lsp-drain");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config::default(),
         ));
@@ -18418,7 +18418,7 @@ mod tests {
     #[tokio::test]
     async fn contended_lsp_maintenance_does_not_requeue_without_progress() {
         let (_dir, root) = test_root("lsp-contention-requeue");
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             crate::context::default_language_provider_factory(),
             crate::config::Config::default(),
         ));
@@ -19627,7 +19627,7 @@ mod tests {
         let release = root.as_path().join("resume-lsp");
         std::fs::write(root.as_path().join("package.json"), "{}").unwrap();
         std::fs::write(&file, "// original\n").unwrap();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.as_path().to_path_buf()),
@@ -20204,7 +20204,7 @@ mod tests {
                 assert!(command.args(args).status().unwrap().success());
             }
             let root = ProjectRootId::from_path(dir.path()).unwrap();
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 Config {
                     storage_dir: Some(storage.path().to_path_buf()),
@@ -20401,7 +20401,7 @@ mod tests {
             }
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let canonical_root = std::fs::canonicalize(dir.path()).unwrap();
-            let ctx = Arc::new(AppContext::new(
+            let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 Config {
                     storage_dir: Some(storage.path().to_path_buf()),
@@ -21980,7 +21980,7 @@ mod tests {
         let busy_root = ProjectRootId::from_path(busy_dir.path()).unwrap();
         assert!(executor.register_actor(
             busy_root.clone(),
-            Arc::new(AppContext::new(
+            Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 Config::default(),
             )),

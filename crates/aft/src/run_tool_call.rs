@@ -1473,7 +1473,7 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let root = crate::path_identity::canonicalize_normalized(temp.path());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -1557,7 +1557,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let root = crate::path_identity::canonicalize_normalized(temp.path());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -1631,7 +1631,7 @@ mod tests {
         let _ = take_edit_target_probes_for_test();
 
         let _ = slow_edit_line(
-            &AppContext::new(
+            &crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     project_root: Some(root.clone()),
@@ -1668,7 +1668,7 @@ mod tests {
             "test path {file:?} has glob characters"
         );
         std::fs::write(&file, "const value = 1;\n").unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(root.clone()),
@@ -1980,7 +1980,7 @@ mod tests {
 
         #[test]
         fn intentional_wait_is_classified_before_deferred_execution() {
-            let app = AppContext::new(
+            let app = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config::default(),
             );
@@ -2066,7 +2066,7 @@ mod tests {
 
         #[test]
         fn database_refusal_closes_every_trace_phase() {
-            let app = AppContext::new(
+            let app = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config::default(),
             );
@@ -2109,7 +2109,7 @@ mod tests {
 
         #[test]
         fn non_object_tool_args_are_rejected_before_dispatch() {
-            let app = AppContext::new(
+            let app = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config::default(),
             );
@@ -2310,7 +2310,7 @@ mod tests {
 
         #[test]
         fn reserved_method_diagnostic_names_supplied_argument_and_preserves_error_code() {
-            let app = AppContext::new(
+            let app = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config::default(),
             );

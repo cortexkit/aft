@@ -25,7 +25,7 @@ impl Fixture {
         }
         let mut config = crate::config::Config::default();
         config.project_root = Some(project.path().to_path_buf());
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.backup()
             .lock()
             .set_storage_dir(storage.path().into(), 24);

@@ -333,7 +333,7 @@ async fn flow_read_daemon_parent_confirmation() {
     let mut config = Config::default();
     config.project_root = Some(root);
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));
@@ -608,7 +608,7 @@ fn flow_read_parent_root_and_grants() {
     let mut config = Config::default();
     config.project_root = Some(root.clone());
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_db(Arc::new(StdMutex::new(
         crate::db::open(&ctx.storage_dir().join("aft.db")).unwrap(),
     )));
@@ -668,7 +668,7 @@ fn flow_read_parent_floor_from_stored_policy() {
     config.project_root = Some(root.clone());
     config.storage_dir = Some(dir.path().join("store"));
     config.sandbox.read_deny.push(secret.clone());
-    let head_ctx = AppContext::new(
+    let head_ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config.clone(),
     );
@@ -678,7 +678,7 @@ fn flow_read_parent_floor_from_stored_policy() {
     head_ctx.set_db(db.clone());
     access_grants::register(&parent, &head_ctx).unwrap();
     config.sandbox.read_deny.clear();
-    let basal_ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let basal_ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     basal_ctx.set_db(db);
     access_grants::register(&child, &basal_ctx).unwrap();
     assert_eq!(
@@ -698,7 +698,7 @@ fn flow_read_bad_request() {
     let dir = tempfile::tempdir().unwrap();
     let parent = head(dir.path());
     let child = identity(dir.path(), stamp(), "reserved:basal");
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         Config::default(),
     );
@@ -715,7 +715,7 @@ fn flow_read_persistence_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let parent = head(dir.path());
     let child = identity(dir.path(), stamp(), "reserved:basal");
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         Config::default(),
     );
@@ -745,7 +745,7 @@ fn read_fixture() -> (
     let mut config = Config::default();
     config.project_root = Some(root);
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));
@@ -941,7 +941,7 @@ fn unregistered_parent() -> (
     let mut config = Config::default();
     config.project_root = Some(root);
     config.storage_dir = Some(dir.path().join("store"));
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         config,
     ));

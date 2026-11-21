@@ -693,7 +693,7 @@ mod tests {
         let mut config = Config::default();
         config.github.shim = false;
         config.git.co_author = "off".into();
-        let ctx = AppContext::new(default_language_provider_factory(), config);
+        let ctx = crate::test_context(default_language_provider_factory(), config);
         let mut request = RawRequest {
             id: "comment".into(),
             command: "write".into(),
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn untrusted_bind_refuses_before_parsing_or_spawning_gh() {
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             default_language_provider_factory(),
             Config {
                 github: GithubConfig {

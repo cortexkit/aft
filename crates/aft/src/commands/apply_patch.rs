@@ -1034,7 +1034,7 @@ mod audit_regressions {
             if existed {
                 fs::write(&destination, "destination before").unwrap();
             }
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     format_on_edit: false,
@@ -1652,7 +1652,7 @@ mod diff_budget_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("large.txt");
         std::fs::write(&file, "x\n".repeat(100_000)).unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().to_owned()),
@@ -1686,7 +1686,7 @@ mod approved_audit11 {
         let original = "\u{feff}head\r\n  target\r\nother\r\n\ttarget\r\n";
         std::fs::write(&path, original.as_bytes()).unwrap();
         let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n-\u{feff}head\n+\u{feff}changed\n@@\n-target\n+replacement\n*** End Patch", path.display());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("state")),
@@ -1720,7 +1720,7 @@ mod approved_audit11 {
         std::fs::write(&first, original).unwrap();
         std::fs::write(&second, binary).unwrap();
         let patch = format!("*** Begin Patch\n*** Update File: {}\n@@\n-\u{feff}head\n+\u{feff}changed\n*** Update File: {}\n@@\ngarbage\n*** End Patch", first.display(), second.display());
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("state")),
@@ -1761,7 +1761,7 @@ mod write_warning_tests {
             "*** Begin Patch\n*** Update File: {}\n@@\n-export const value = 1;\n+export const value = {{;\n*** End Patch",
             path.display()
         );
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(dir.path().join("state")),

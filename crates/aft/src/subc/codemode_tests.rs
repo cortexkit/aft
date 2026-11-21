@@ -176,7 +176,7 @@ fn codemode_reply_format_belongs_to_run_while_access_belongs_to_head() {
 fn tool_output_cap_codemode_uses_the_owning_sessions_output_scope() {
     let f = fixture(run_stamp("agent-a", "head-a", Some("linked")));
     let storage = tempfile::tempdir().unwrap();
-    let ctx = crate::context::AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             storage_dir: Some(storage.path().into()),
@@ -831,7 +831,7 @@ fn saved_policy_fixture() -> (Fixture, tempfile::TempDir, Arc<AppContext>) {
     with_principal_id(&mut f.routes, channel(1), "direct");
     with_principal_id(&mut f.routes, channel(3), "reserved:broca");
     let storage = tempfile::tempdir().unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(f.routes[&channel(1)].project_root.clone()),

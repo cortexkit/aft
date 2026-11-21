@@ -29,7 +29,7 @@ fn fixture() -> (tempfile::TempDir, AppContext, PathBuf, RawRequest) {
         config.indexes.trigram = true;
         config.indexes.semantic = false;
         config.indexes.callgraph = false;
-        AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+        crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
     };
     let external = crate::path_identity::canonicalize_normalized(&external);
     let configured = crate::path_identity::canonicalize_normalized(&configured);

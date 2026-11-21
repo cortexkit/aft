@@ -16,7 +16,7 @@ struct QuietWatch {
 impl QuietWatch {
     fn start(reply_window: Duration) -> Self {
         let dir = tempfile::tempdir().unwrap();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 project_root: Some(dir.path().into()),
