@@ -1635,7 +1635,14 @@ struct RouteLeases {
     pause: std::sync::Mutex<Option<Arc<LeaseTestPause>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "test-support",
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
 #[derive(Default)]
 struct LeaseTestPause {
     acquired: tokio::sync::Notify,
@@ -1988,7 +1995,14 @@ impl SubcRelayTransport {
 
     /// A transport already holding `consumer`, for tests that serve it from a
     /// fake daemon without a module identity.
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(
+            feature = "test-support",
+            debug_assertions,
+            any(target_os = "linux", target_os = "macos")
+        )
+    ))]
     fn with_consumer(
         consumer: subc_client_rs::SubcConsumer,
         route_open_deadline: Option<Duration>,
@@ -2126,6 +2140,17 @@ impl RelayTransport for SubcRelayTransport {
 #[cfg(test)]
 #[path = "../gh_shim/plexus_bindings_contract.rs"]
 pub(crate) mod bindings_contract;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod bindings_fixture;
+#[cfg(any(
+    test,
+    all(
+        feature = "test-support",
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
+pub(crate) mod daemon_fixture;
 #[cfg(test)]
 pub(crate) mod tests;
 

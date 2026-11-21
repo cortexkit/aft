@@ -34,7 +34,7 @@ use crate::search_index::{FileEntry, PathFilters, SearchIndexSnapshot, DEFAULT_M
 /// text plane covers every path.
 #[doc(hidden)]
 pub fn ready_view(ctx: &(impl IndexHost + ?Sized)) -> Option<CheckoutView> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::today_only() {
         return None;
     }
@@ -95,7 +95,7 @@ impl ViewScope {
                 (path, now)
             })
             .collect();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_hooks::note_answer();
         Some(Self {
             view,
@@ -312,7 +312,7 @@ fn modified_at(mtime_ns: i64) -> SystemTime {
 
 /// What tests use to run grep and glob the way they ran before the data
 /// layer, in a process that runs it, and to see whether a call read it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_hooks {
     use std::cell::Cell;
 

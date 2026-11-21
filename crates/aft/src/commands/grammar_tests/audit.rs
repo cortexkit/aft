@@ -954,7 +954,10 @@ fn dead_code_gaps() {
                 r#"{"main":"main.ts","type":"module"}"#,
             );
         }
-        let _build = crate::data_layer::runtime::hold_builds_for_test(&f.root);
+        let _build =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(
+                &f.root,
+            );
         configure_inspect_with_graph(&f, false);
         assert!(f.ctx.data_checkout().unwrap().view().is_none());
         let response = inspect_category(&f.ctx, &f.root, "dead_code");

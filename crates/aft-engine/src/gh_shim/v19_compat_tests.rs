@@ -34,7 +34,7 @@ fn audit_v19_classifier_matches_pinned_main_corpus() {
         let binary = std::env::var_os("AFT_GH_MAIN_BINARY")
             .expect("live main probe requires its production binary");
         let corpus_path = Path::new(crate::test_support::manifest_dir())
-            .join("tests/fixtures/gh_shim/v19-main-classifier-corpus.json");
+            .join("../aft/tests/fixtures/gh_shim/v19-main-classifier-corpus.json");
         let output = Command::new(probe)
             .args([
                 "--exact",

@@ -3,6 +3,9 @@ use crate::config_live::*;
 use crate::context::AppContext;
 use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
+use aft_engine::test_bridge::display_data::config_live::{
+    enable_config_watches_for_test, staged_sources_empty_for_test, with_config_watch_attach_gate,
+};
 use aft_engine::test_bridge::display_data::test_config_file::write;
 use serde_json::json;
 use std::path::PathBuf;

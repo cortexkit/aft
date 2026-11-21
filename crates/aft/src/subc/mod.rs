@@ -15216,7 +15216,9 @@ mod tests {
                 ..Default::default()
             },
         ));
-        let cleanup = crate::root_cache::acquire_cache_cleanup_lease(&storage).unwrap();
+        let cleanup =
+            aft_engine::test_bridge::search_misc::root_cache::acquire_cache_cleanup_lease(&storage)
+                .unwrap();
         let result = run_subc_mode(
             &temp.path().join("missing-connection.json"),
             Arc::clone(&ctx),
@@ -15241,7 +15243,8 @@ mod tests {
             "{result:?}"
         );
         // Failed attachment must release the daemon lease too.
-        crate::root_cache::acquire_cache_cleanup_lease(&storage).unwrap();
+        aft_engine::test_bridge::search_misc::root_cache::acquire_cache_cleanup_lease(&storage)
+            .unwrap();
     }
 
     #[test]
@@ -17197,8 +17200,10 @@ mod tests {
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "1".into());
         assert_eq!(
-            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
-                .ensure_server_for_file(&file, &config))
+            aft_engine::test_bridge::search_misc::lsp::manager::settled_lsp(
+                &mut ctx.lsp(),
+                |startup_manager| startup_manager.ensure_server_for_file(&file, &config)
+            )
             .len(),
             1
         );
@@ -17228,9 +17233,10 @@ mod tests {
             .any(|failure| matches!(failure.result, ServerAttemptResult::ProjectClosed)));
         assert_eq!(ctx.lsp().active_client_count(), 0);
 
-        let file_denied = crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| {
-            startup_manager.ensure_server_for_file_detailed(&file, &config)
-        });
+        let file_denied = aft_engine::test_bridge::search_misc::lsp::manager::settled_lsp(
+            &mut ctx.lsp(),
+            |startup_manager| startup_manager.ensure_server_for_file_detailed(&file, &config),
+        );
         assert!(file_denied
             .attempts
             .iter()
@@ -17261,8 +17267,10 @@ mod tests {
         ctx.lsp()
             .set_extra_env("AFT_FAKE_LSP_IGNORE_SHUTDOWN".into(), "0".into());
         assert_eq!(
-            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
-                .ensure_server_for_file(&file, &config))
+            aft_engine::test_bridge::search_misc::lsp::manager::settled_lsp(
+                &mut ctx.lsp(),
+                |startup_manager| startup_manager.ensure_server_for_file(&file, &config)
+            )
             .len(),
             1
         );
@@ -17316,8 +17324,10 @@ mod tests {
             &root.as_path().parent().unwrap().to_string_lossy(),
         );
         assert_eq!(
-            crate::lsp::manager::settled_lsp(&mut ctx.lsp(), |startup_manager| startup_manager
-                .ensure_server_for_file(&file, &config))
+            aft_engine::test_bridge::search_misc::lsp::manager::settled_lsp(
+                &mut ctx.lsp(),
+                |startup_manager| startup_manager.ensure_server_for_file(&file, &config)
+            )
             .len(),
             1
         );
@@ -17638,7 +17648,10 @@ mod tests {
                 }).to_string()}],
             }),
         };
-        let _failure = crate::watcher_filter::force_exclusion_failure_for_test(root.as_path());
+        let _failure =
+            aft_engine::test_bridge::search_misc::watcher_filter::force_exclusion_failure_for_test(
+                root.as_path(),
+            );
         assert!(crate::commands::configure::handle_configure(&request, &ctx).success);
         crate::commands::configure::drain_deferred_configure_maintenance(&ctx);
         let parent = crate::parent_search::session_for(&ctx).expect("parent session");
@@ -20810,7 +20823,7 @@ mod tests {
             }],
         }))
         .unwrap();
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -20883,7 +20896,7 @@ mod tests {
     /// retry sleeps, and it delays maintenance of the other folder.
     #[test]
     fn standing_ticks_over_an_unreadable_git_session_ask_git_nothing() {
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let executor = Arc::new(Executor::new());
         let configured = ConfiguredRoot::unconfigured(&executor);
@@ -20896,7 +20909,7 @@ mod tests {
         // Its sender is dropped at once, so no probe attempt is held.
         let (_, release) = std::sync::mpsc::channel();
         let _probe =
-            crate::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
+            aft_engine::test_bridge::search_misc::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
                 Arc::clone(&attempts),
                 release,
@@ -21495,7 +21508,8 @@ mod tests {
                 }
             }
             let now = Instant::now();
-            let opens = crate::database_open::recorded_opens_for_test();
+            let opens =
+                aft_engine::test_bridge::display_data::database_open::recorded_opens_for_test();
             for (index, root) in roots.iter().enumerate() {
                 if ready_at[index].is_some() {
                     continue;
@@ -21528,7 +21542,7 @@ mod tests {
         if let Some(failure) = failure {
             panic!("{failure}");
         }
-        let opens = crate::database_open::recorded_opens_for_test();
+        let opens = aft_engine::test_bridge::display_data::database_open::recorded_opens_for_test();
         let mut ready_after = Vec::new();
         let mut worst_unaccounted = Duration::ZERO;
         for (index, root) in roots.iter().enumerate() {
@@ -21560,19 +21574,21 @@ mod tests {
     /// a root that is merely queued behind slow opens on a loaded machine does
     /// not.
     fn unaccounted_database_wait(
-        opens: &[crate::database_open::RecordedOpen],
+        opens: &[aft_engine::test_bridge::display_data::database_open::RecordedOpen],
         root: &Path,
         from: Instant,
         to: Instant,
     ) -> Duration {
+        use aft_engine::test_bridge::display_data::RecordedOpenTestExt as _;
         let mut busy = opens
             .iter()
             .filter(|open| {
-                open.runner == crate::database_open::DatabaseOpenRunner::Lane || open.root == root
+                open.runner() == crate::database_open::DatabaseOpenRunner::Lane
+                    || open.root() == root
             })
             .filter_map(|open| {
-                let start = open.started_at.max(from);
-                let end = open.finished_at.unwrap_or(to).min(to);
+                let start = open.started_at().max(from);
+                let end = open.finished_at().unwrap_or(to).min(to);
                 (start < end).then_some((start, end))
             })
             .collect::<Vec<_>>();
@@ -21592,30 +21608,34 @@ mod tests {
     /// Every recorded open of the storm's roots relative to that root's bind
     /// reply, for a failure message that shows where the time went.
     fn describe_database_opens(
-        opens: &[crate::database_open::RecordedOpen],
+        opens: &[aft_engine::test_bridge::display_data::database_open::RecordedOpen],
         roots: &[ConfiguredRoot],
         acked_at: &[Option<Instant>],
     ) -> String {
+        use aft_engine::test_bridge::display_data::RecordedOpenTestExt as _;
         let mut lines = Vec::new();
         for (index, root) in roots.iter().enumerate() {
             let Some(acked) = acked_at[index] else {
                 continue;
             };
             let mut any = false;
-            for open in opens.iter().filter(|open| open.root == root.canonical_root) {
+            for open in opens
+                .iter()
+                .filter(|open| open.root() == &root.canonical_root)
+            {
                 any = true;
                 lines.push(format!(
                     "root {index}: via {:?}, dispatched {:?} and started {:?} after bind reply, \
                      floor check {:?}, open {:?}, finished {:?} after bind reply, outcome {:?}",
-                    open.runner,
-                    open.dispatched_at
+                    open.runner(),
+                    open.dispatched_at()
                         .map(|dispatched| dispatched.saturating_duration_since(acked)),
-                    open.started_at.saturating_duration_since(acked),
-                    open.floor_check,
-                    open.open,
-                    open.finished_at
+                    open.started_at().saturating_duration_since(acked),
+                    open.floor_check(),
+                    open.open(),
+                    open.finished_at()
                         .map(|finished| finished.saturating_duration_since(acked)),
-                    open.outcome,
+                    open.outcome(),
                 ));
             }
             if !any {
@@ -21629,7 +21649,9 @@ mod tests {
     /// holding. Other roots' unfinished opens matter because the dedicated
     /// database-open thread serves them in order.
     fn rebind_wait_diagnostics(executor: &Executor, fixture: &ConfiguredRoot) -> String {
-        use aft_engine::test_bridge::display_data::DatabaseOpenSlotTestExt as _;
+        use aft_engine::test_bridge::display_data::{
+            DatabaseOpenSlotTestExt as _, RecordedOpenTestExt as _,
+        };
         let (slot, _) = fixture.ctx.database_open_slot();
         let database = match slot.try_lock() {
             Some(slot) => format!(
@@ -21646,15 +21668,15 @@ mod tests {
             ),
             None => "database-open slot locked (attach/publication may be in progress)".into(),
         };
-        let opens = crate::database_open::recorded_opens_for_test()
+        let opens = aft_engine::test_bridge::display_data::database_open::recorded_opens_for_test()
             .into_iter()
-            .filter(|open| open.root == fixture.canonical_root || open.finished_at.is_none())
+            .filter(|open| open.root() == &fixture.canonical_root || open.finished_at().is_none())
             .map(|open| {
                 format!(
                     "root={} lane={:?} age_ms={} queued_ms={:?} finished={} floor_ms={} open_ms={} outcome={:?}",
-                    open.root.display(), open.runner, open.started_at.elapsed().as_millis(),
-                    open.dispatched_at.map(|at| open.started_at.saturating_duration_since(at).as_millis()),
-                    open.finished_at.is_some(), open.floor_check.as_millis(), open.open.as_millis(), open.outcome,
+                    open.root().display(), open.runner(), open.started_at().elapsed().as_millis(),
+                    open.dispatched_at().map(|at| open.started_at().saturating_duration_since(at).as_millis()),
+                    open.finished_at().is_some(), open.floor_check().as_millis(), open.open().as_millis(), open.outcome(),
                 )
             })
             .collect::<Vec<_>>();
@@ -22126,10 +22148,11 @@ mod tests {
         );
         let a_answered_while_held = rebind_a.try_recv().ok();
         let a_was_answered_while_held = a_answered_while_held.is_some();
-        let a_effects_while_held = crate::context::configure_bind_effects_for_test(
-            &held_a.canonical_root,
-            "herd-session-1",
-        );
+        let a_effects_while_held =
+            aft_engine::test_bridge::display_data::context::configure_bind_effects_for_test(
+                &held_a.canonical_root,
+                "herd-session-1",
+            );
         let a_generation_while_held = held_a.ctx.configure_generation();
 
         // Let A's tail finish its held stage: it sees the queued writer and
@@ -22184,7 +22207,7 @@ mod tests {
         // exactly one terminal response.
         for held in [&held_a, &held_b] {
             assert_eq!(
-                crate::context::configure_bind_effects_for_test(
+                aft_engine::test_bridge::display_data::context::configure_bind_effects_for_test(
                     &held.canonical_root,
                     "herd-session-1"
                 ),

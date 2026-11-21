@@ -143,7 +143,8 @@ mod tests {
             config.indexes.semantic = false
         });
         write(&root, "readable-later.txt", "needle\n");
-        let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let hold =
+            aft_engine::test_bridge::display_data::data_layer::runtime::hold_builds_for_test(&root);
         bind_for_test(&ctx);
         struct Restore(PathBuf);
         impl Drop for Restore {

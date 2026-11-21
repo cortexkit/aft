@@ -515,7 +515,7 @@ struct Work {
     fill_retry: std::sync::Mutex<BuildRetry>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn build_holds_for_test() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
     static HOLDS: OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> = OnceLock::new();
     HOLDS.get_or_init(Default::default)
@@ -523,7 +523,7 @@ fn build_holds_for_test() -> &'static std::sync::Mutex<std::collections::HashSet
 
 /// Holds every build of the checkout at `root` before it starts, until the
 /// returned guard drops, so a test can look at a checkout that is building.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn hold_builds_for_test(root: &Path) -> BuildHold {
     build_holds_for_test()
         .lock()
@@ -533,10 +533,10 @@ pub(crate) fn hold_builds_for_test(root: &Path) -> BuildHold {
 }
 
 /// See [`hold_builds_for_test`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct BuildHold(PathBuf);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for BuildHold {
     fn drop(&mut self) {
         build_holds_for_test()
@@ -583,7 +583,7 @@ impl Work {
             if work.stopped.load(Ordering::Acquire) {
                 return;
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             while build_holds_for_test()
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)

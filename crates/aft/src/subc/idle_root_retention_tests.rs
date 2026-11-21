@@ -1237,7 +1237,7 @@ fn background_task_output_compresses_the_same_after_idle_eviction() {
 
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-    let launched = crate::bash_background::spawn(
+    let launched = aft_engine::test_bridge::bash_remote::bash_background::spawn(
         "req-idle-eviction",
         SESSION,
         "sleep 1",
@@ -1351,7 +1351,7 @@ fn background_task_root(project: &Path, storage: &Path) -> (ProjectRootId, Arc<A
 /// left the watchdog.
 #[cfg(unix)]
 fn run_background_task(ctx: &AppContext, command: &str) -> String {
-    let launched = crate::bash_background::spawn(
+    let launched = aft_engine::test_bridge::bash_remote::bash_background::spawn(
         "req-idle-eviction",
         SESSION,
         command,

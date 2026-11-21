@@ -164,7 +164,7 @@ async fn bash_keepalive_stalled_state_observation_goes_silent() {
     let mut h = WaitHarness::start(30_000, Duration::from_secs(25)).await;
     h.tick(30_000).await;
     let task = h.ctx.bash_background().test_task(&h.task_id).unwrap();
-    let state = task.state.lock().unwrap();
+    let state = task.test_state().lock().unwrap();
     h.quiet().await;
     h.clock.now.store(150_000, Ordering::SeqCst);
     h.quiet().await;

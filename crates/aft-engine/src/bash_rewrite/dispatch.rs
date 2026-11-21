@@ -90,7 +90,7 @@ fn route_records() -> &'static Mutex<RouteRecordStore> {
     ROUTE_RECORDS.get_or_init(|| Mutex::new(RouteRecordStore::default()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn count_route_records_for_prefix(prefix: &str) -> usize {
     route_records()
         .lock()

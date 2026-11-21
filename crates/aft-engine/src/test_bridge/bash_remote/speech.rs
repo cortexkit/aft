@@ -539,6 +539,10 @@ pub trait AuthorityRecordTestExt {
     fn seal(&self) -> &Option<ExecutionSeal>;
     fn seal_mut(&mut self) -> &mut Option<ExecutionSeal>;
     fn incarnation(&self) -> &String;
+    fn harness(&self) -> &String;
+    fn session_id(&self) -> &String;
+    fn task_id(&self) -> &String;
+    fn project_root(&self) -> &String;
 }
 
 impl AuthorityRecordTestExt for AuthorityRecord {
@@ -562,5 +566,43 @@ impl AuthorityRecordTestExt for AuthorityRecord {
     }
     fn incarnation(&self) -> &String {
         &self.incarnation
+    }
+    fn harness(&self) -> &String {
+        &self.harness
+    }
+    fn session_id(&self) -> &String {
+        &self.session_id
+    }
+    fn task_id(&self) -> &String {
+        &self.task_id
+    }
+    fn project_root(&self) -> &String {
+        &self.project_root
+    }
+}
+
+pub trait ExecutionSealTestExt {
+    fn child_pid(&self) -> u32;
+    fn child_pid_mut(&mut self) -> &mut u32;
+    fn child_start_time_ms(&self) -> u64;
+    fn child_start_time_ms_mut(&mut self) -> &mut u64;
+    fn birth_identity_mut(&mut self) -> &mut String;
+}
+
+impl ExecutionSealTestExt for ExecutionSeal {
+    fn child_pid(&self) -> u32 {
+        self.child_pid
+    }
+    fn child_pid_mut(&mut self) -> &mut u32 {
+        &mut self.child_pid
+    }
+    fn child_start_time_ms(&self) -> u64 {
+        self.child_start_time_ms
+    }
+    fn child_start_time_ms_mut(&mut self) -> &mut u64 {
+        &mut self.child_start_time_ms
+    }
+    fn birth_identity_mut(&mut self) -> &mut String {
+        &mut self.birth_identity
     }
 }

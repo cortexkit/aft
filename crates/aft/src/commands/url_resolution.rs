@@ -424,7 +424,12 @@ mod url_tests {
             cache_dir: Some(cache_parent),
             ..Default::default()
         };
-        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        assert!(
+            aft_engine::test_bridge::search_misc::root_cache::prepare_cache_root_for_test(
+                &mut config
+            )
+            .is_none()
+        );
         let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         assert!(ctx.cache_unavailable_reason().is_none());
         let cache_root = ctx.cache_dir();

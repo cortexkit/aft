@@ -543,15 +543,15 @@ impl Meaning {
             .is_none_or(|(made_for, _)| made_for != config)
         {
             *model = None;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             while lock(model_holds_for_test()).contains(checkout.root()) {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(error) = model_failure_for_test(checkout.root()) {
                 return Round::Failed(self.failure(checkout.root(), error, true));
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(dimensions) = model_free_dimensions_for_test(checkout.root()) {
                 return self.fill_without_model_for_test(checkout, config, dimensions);
             }
@@ -681,7 +681,7 @@ impl Meaning {
 
     /// A fill for a checkout with no files meaning search applies to: the
     /// plane is made for `dimensions` and nothing is embedded.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn fill_without_model_for_test(
         &self,
         checkout: &Arc<Checkout>,
@@ -715,7 +715,7 @@ impl Meaning {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn model_free_planes_for_test() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
     static PLANES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
         std::sync::OnceLock::new();
@@ -743,7 +743,7 @@ pub(crate) fn fill_with_constant_vectors_for_test(root: &Path, dimensions: usize
     Release(root.to_path_buf())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn model_free_dimensions_for_test(root: &Path) -> Option<usize> {
     lock(model_free_planes_for_test()).get(root).copied()
 }
@@ -751,7 +751,7 @@ fn model_free_dimensions_for_test(root: &Path) -> Option<usize> {
 /// Makes fills under `root` make their plane for `dimensions` without
 /// loading the model, until the returned guard drops: for a test whose
 /// embedding backend serves one session only, which its query must have.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn fill_without_model_for_test(root: &Path, dimensions: usize) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
@@ -763,7 +763,7 @@ pub(crate) fn fill_without_model_for_test(root: &Path, dimensions: usize) -> imp
     Release(root.to_path_buf())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn model_holds_for_test() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
     static HOLDS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
@@ -772,7 +772,7 @@ fn model_holds_for_test() -> &'static Mutex<std::collections::HashSet<PathBuf>> 
 
 /// Holds every model load of a fill under `root` until the returned guard
 /// drops, so a test can look at a plane that is being read back.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn hold_model_loads_for_test(root: &Path) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
@@ -814,21 +814,21 @@ fn memory_figure_read_only_failure_changes_invalidate_the_meaning_version() {
 /// Errors the next model load under a root fails with, for tests of how a
 /// failed fill is reported (a missing ONNX Runtime cannot be staged on
 /// every machine).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn model_failures_for_test() -> &'static Mutex<std::collections::HashMap<PathBuf, String>> {
     static FAILURES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, String>>> =
         std::sync::OnceLock::new();
     FAILURES.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn model_failure_for_test(root: &Path) -> Option<String> {
     lock(model_failures_for_test()).get(root).cloned()
 }
 
 /// Makes every model load of a fill under `root` fail with `error`, until
 /// the returned guard drops.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {

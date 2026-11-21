@@ -11,7 +11,7 @@ use crate::protocol::PushFrame;
 #[cfg(test)]
 use crate::watcher_filter::RescanReason;
 use crate::watcher_filter::{watcher_path_is_infra_skip_under, WatcherDispatchEvent};
-#[cfg(any(test, feature = "test-timing-hooks"))]
+#[cfg(any(test, feature = "test-support", feature = "test-timing-hooks"))]
 use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -146,13 +146,13 @@ fn set_ignore_rule_refresh_now_for_test(now: Option<Instant>) {
 #[cfg(test)]
 static ARTIFACT_DRAIN_TEST_MUTEX: Mutex<()> = Mutex::new(());
 
-#[cfg(any(test, feature = "test-timing-hooks"))]
+#[cfg(any(test, feature = "test-support", feature = "test-timing-hooks"))]
 struct WatcherPhaseCommitGate {
     reached_tx: crossbeam_channel::Sender<()>,
     release_rx: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(any(test, feature = "test-timing-hooks"))]
+#[cfg(any(test, feature = "test-support", feature = "test-timing-hooks"))]
 // Parallel tests must not replace another path's in-flight barrier.
 static WATCHER_PHASE_COMMIT_GATE: std::sync::OnceLock<
     Mutex<HashMap<PathBuf, WatcherPhaseCommitGate>>,
@@ -220,6 +220,16 @@ pub fn install_watcher_phase_commit_gate_for_test(
     crossbeam_channel::Receiver<()>,
     crossbeam_channel::Sender<()>,
 ) {
+    install_watcher_phase_commit_gate(target)
+}
+
+#[cfg(any(test, feature = "test-support", feature = "test-timing-hooks"))]
+pub(crate) fn install_watcher_phase_commit_gate(
+    target: PathBuf,
+) -> (
+    crossbeam_channel::Receiver<()>,
+    crossbeam_channel::Sender<()>,
+) {
     let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
     let (release_tx, release_rx) = crossbeam_channel::bounded(1);
     WATCHER_PHASE_COMMIT_GATE
@@ -236,7 +246,7 @@ pub fn install_watcher_phase_commit_gate_for_test(
     (reached_rx, release_tx)
 }
 
-#[cfg(any(test, feature = "test-timing-hooks"))]
+#[cfg(any(test, feature = "test-support", feature = "test-timing-hooks"))]
 fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
     let gate = WATCHER_PHASE_COMMIT_GATE
         .get_or_init(|| Mutex::new(HashMap::new()))
@@ -249,7 +259,7 @@ fn wait_on_watcher_phase_commit_gate_for_test(path: &Path) {
     }
 }
 
-#[cfg(not(any(test, feature = "test-timing-hooks")))]
+#[cfg(not(any(test, feature = "test-support", feature = "test-timing-hooks")))]
 fn wait_on_watcher_phase_commit_gate_for_test(_path: &Path) {}
 
 struct WatcherDrainUnitGuard<'a> {

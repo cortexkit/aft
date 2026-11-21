@@ -1424,7 +1424,7 @@ pub(crate) fn find_request(command: &str) -> Option<Value> {
     find_request_from_parsed(parse(command).as_ref())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
     ls_request_from_parsed(parse(command).as_ref(), ctx)
 }

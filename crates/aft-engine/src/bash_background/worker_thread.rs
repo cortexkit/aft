@@ -17,7 +17,7 @@ pub enum Worker {
 
 #[doc(hidden)]
 pub fn spawn(worker: Worker, run: impl FnOnce() + Send + 'static) -> io::Result<()> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if REFUSED.with(|refused| refused.get() == Some(worker)) {
         return Err(io::Error::other("injected worker admission failure"));
     }
@@ -25,13 +25,13 @@ pub fn spawn(worker: Worker, run: impl FnOnce() + Send + 'static) -> io::Result<
     std::thread::Builder::new().spawn(run).map(|_| ())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static REFUSED: std::cell::Cell<Option<Worker>> = const { std::cell::Cell::new(None) };
 }
 
 /// Runs `run` with creation of `worker` threads refused on this test thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_refusal<T>(worker: Worker, run: impl FnOnce() -> T) -> T {
     struct Reset(Option<Worker>);
     impl Drop for Reset {

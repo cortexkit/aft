@@ -6,7 +6,7 @@ pub struct ParsedCommand {
 }
 
 pub fn parse(command: &str) -> Option<ParsedCommand> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let command = command.trim();
     if command.is_empty() {
@@ -23,13 +23,13 @@ pub fn parse(command: &str) -> Option<ParsedCommand> {
     Some(parsed)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static PARSE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(super) fn take_parse_calls() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn take_parse_calls() -> usize {
     PARSE_CALLS.with(|calls| calls.replace(0))
 }
 

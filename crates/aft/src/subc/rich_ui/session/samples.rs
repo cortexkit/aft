@@ -232,7 +232,7 @@ fn rich_ui_samples_wait_for_pending_watcher_application() {
     *f.ctx.watcher_rx().lock() = Some(watcher_rx);
     let path = f.policy.project_root.join("main.rs");
     let (reached_rx, release_tx) =
-        crate::runtime_drain::install_watcher_phase_commit_gate_for_test(path.clone());
+        aft_engine::test_bridge::display_data::runtime_drain::install_watcher_phase_commit_gate_for_test(path.clone());
     watcher_tx
         .send(crate::watcher_filter::WatcherDispatchEvent::Paths(vec![
             path,

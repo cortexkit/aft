@@ -247,3 +247,41 @@ impl DatabaseOpenSlotTestExt for crate::database_open::DatabaseOpenSlot {
         self.pending.as_ref().map(PendingDatabaseOpen)
     }
 }
+
+pub trait RecordedOpenTestExt {
+    fn root(&self) -> &PathBuf;
+    fn runner(&self) -> crate::database_open::DatabaseOpenRunner;
+    fn dispatched_at(&self) -> Option<std::time::Instant>;
+    fn started_at(&self) -> std::time::Instant;
+    fn finished_at(&self) -> Option<std::time::Instant>;
+    fn floor_check(&self) -> Duration;
+    fn open(&self) -> Duration;
+    fn outcome(&self) -> &Option<crate::database_open::DatabaseOpenOutcome>;
+}
+
+impl RecordedOpenTestExt for crate::database_open::recorded_open::RecordedOpen {
+    fn root(&self) -> &PathBuf {
+        &self.root
+    }
+    fn runner(&self) -> crate::database_open::DatabaseOpenRunner {
+        self.runner
+    }
+    fn dispatched_at(&self) -> Option<std::time::Instant> {
+        self.dispatched_at
+    }
+    fn started_at(&self) -> std::time::Instant {
+        self.started_at
+    }
+    fn finished_at(&self) -> Option<std::time::Instant> {
+        self.finished_at
+    }
+    fn floor_check(&self) -> Duration {
+        self.floor_check
+    }
+    fn open(&self) -> Duration {
+        self.open
+    }
+    fn outcome(&self) -> &Option<crate::database_open::DatabaseOpenOutcome> {
+        &self.outcome
+    }
+}
