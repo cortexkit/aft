@@ -580,7 +580,7 @@ impl Meaning {
         model: &mut Option<(SemanticBackendConfig, SemanticEmbeddingModel)>,
     ) -> Round {
         #[cfg(all(test, target_os = "linux"))]
-        if main_parity_capture::uses_constant_vectors(checkout.root()) {
+        if main_parity_vectors::uses_constant_vectors(checkout.root()) {
             return self.fill_main_parity_vectors(checkout, config);
         }
         if model
@@ -1013,3 +1013,7 @@ pub(crate) fn waiting(coverage: &Coverage) -> bool {
 #[cfg(all(test, target_os = "linux"))]
 #[path = "main_parity_capture.rs"]
 mod main_parity_capture;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "main_parity_vectors.rs"]
+mod main_parity_vectors;

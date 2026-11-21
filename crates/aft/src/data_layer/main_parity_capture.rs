@@ -3,50 +3,15 @@
 //! Regeneration uses the same test-only constant-vector callback and command
 //! handlers in both checkouts. Production code and serializers are unchanged.
 
-use super::*;
+use super::main_parity_vectors::use_constant_vectors;
 use crate::config::{Config, IndexesConfig, SemanticBackend};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde_json::{json, Value};
-use std::collections::HashSet;
-use std::sync::{LazyLock, Mutex};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const MAIN: &str = "1c6563b4c965d48c92937d6675cdbca333f37811";
-static ROOTS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
-
-pub(super) fn uses_constant_vectors(root: &Path) -> bool {
-    ROOTS.lock().unwrap().contains(root)
-}
-
-impl Meaning {
-    pub(super) fn fill_main_parity_vectors(
-        &self,
-        checkout: &Arc<Checkout>,
-        config: &SemanticBackendConfig,
-    ) -> Round {
-        let plane = match self.plane_for(checkout, config, || {
-            Ok(crate::semantic_index::SemanticIndexFingerprint::for_config_dimension(config, 2))
-        }) {
-            Ok(plane) => plane,
-            Err(error) => return Round::Failed(FillFailure::Failed(error)),
-        };
-        match plane.fill_rounds(
-            &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            FillBudget {
-                max_batch: 64,
-                files_per_round: FILES_PER_ROUND,
-            },
-            1,
-            &mut |_| {},
-        ) {
-            Ok(report) if report.error.is_none() && report.files_left == 0 => Round::Done,
-            Ok(report) if report.error.is_none() => Round::More,
-            Ok(report) => Round::Failed(FillFailure::Failed(format!("{report:?}"))),
-            Err(error) => Round::Failed(FillFailure::Failed(error.to_string())),
-        }
-    }
-}
 
 // Each normalized field is process-specific; no product field is omitted.
 const TIMINGS: &[(&str, &str)] = &[
@@ -197,7 +162,7 @@ fn capture_case(
     if invalid_utf8 {
         write_fixture(&root.join("b.rs"), b"pub fn broken() {\n //\xff\n}\n");
     }
-    ROOTS.lock().unwrap().insert(root.clone());
+    use_constant_vectors(root.clone());
     let mut config = Config {
         project_root: Some(root.clone()),
         storage_dir: Some(storage.clone()),
