@@ -171,3 +171,35 @@ fn csharp_duplicate_alias_blocks_even_when_one_binding_is_unconditional() {
         "alias has two declarations",
     );
 }
+
+#[test]
+fn java_unreadable_superclass_preserves_fallback_until_hierarchy_is_closed() {
+    let api = (
+        "module/src/main/java/app/Api.java",
+        "package app; class Api { static void run() {} }",
+    );
+    let middle = (
+        "module/src/main/java/app/Middle.java",
+        "package app; import framework.Base; class Middle extends Base {}",
+    );
+    let direct = ("module/src/main/java/app/Direct.java", "package app; import framework.Base; class Direct extends Base { void use() { Api.run(); } }");
+    let indirect = (
+        "module/src/test/java/app/Indirect.java",
+        "package app; class Indirect extends Middle { void use() { Api.run(); } }",
+    );
+    let base = (
+        "framework/src/main/java/framework/Base.java",
+        "package framework; public class Base {}",
+    );
+    let open = checkout(&[api, middle, direct, indirect], &[]);
+    let closed = checkout(&[api, middle, direct, indirect, base], &[]);
+    let rows = records_match_files(&open);
+    for path in [direct.0, indirect.0] {
+        fallback(answer(&rows[path], "run"), path);
+    }
+    let (stats, rows) = update_checked_bytes(open, closed, &[base.0]);
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    for path in [direct.0, indirect.0] {
+        exact(answer(&rows[path], "run"), api.0, &["Api::run"]);
+    }
+}

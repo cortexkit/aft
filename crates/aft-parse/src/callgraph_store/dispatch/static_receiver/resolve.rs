@@ -285,7 +285,7 @@ impl<'a> Resolver<'a> {
         closed
     }
 
-    fn java_inherited_value(&self, owner: Type<'a>, name: &str) -> bool {
+    fn java_clear_receiver_scope(&self, owner: Type<'a>, name: &str) -> bool {
         let mut seen = BTreeSet::new();
         let mut pending = vec![owner];
         while let Some(ty) = pending.pop() {
@@ -298,14 +298,22 @@ impl<'a> Resolver<'a> {
                 .binary_search_by(|value| value.as_str().cmp(name))
                 .is_ok()
             {
-                return true;
+                return false;
             }
             let scope = &ty.facts.scopes[ty.declaration.scope as usize];
             for base in &ty.declaration.bases {
-                pending.extend(self.java_type(&ty.file, scope, base).into_iter().flatten());
+                // An unreadable superclass could contribute a field with
+                // this name. It cannot establish absence of shadowing.
+                let Some(bases) = self.java_type(&ty.file, scope, base) else {
+                    return false;
+                };
+                if bases.is_empty() {
+                    return false;
+                }
+                pending.extend(bases);
             }
         }
-        false
+        true
     }
 
     pub(in super::super) fn static_call(
@@ -323,7 +331,7 @@ impl<'a> Resolver<'a> {
                 let types = self.java_type(file, scope, &receiver.name)?;
                 if let Some(owner) = receiver.owner {
                     let root = receiver.name.split('.').next()?;
-                    if self.java_inherited_value(
+                    if !self.java_clear_receiver_scope(
                         Type {
                             file: file.to_string(),
                             facts,

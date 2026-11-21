@@ -680,6 +680,7 @@ fn bases(node: Node<'_>, source: &str, language: &str) -> Vec<String> {
                 | "extends_clause"
                 | "primary_constructor_base_type"
         ) {
+            let before = children.len();
             children.extend(child.named_children(&mut child.walk()).filter(|n| {
                 !n.is_extra()
                     && !matches!(
@@ -687,9 +688,15 @@ fn bases(node: Node<'_>, source: &str, language: &str) -> Vec<String> {
                         "implements_clause" | "type_arguments" | "argument_list"
                     )
             }));
+            if language == "java" && child.kind() == "superclass" && children.len() == before {
+                out.push(String::new());
+            }
         } else if language == "csharp" {
             // A base we cannot read is not evidence of a closed hierarchy.
             out.push(text(child, source).to_string());
+        } else if language == "java" {
+            // Keep an unreadable extends clause as a failed base lookup.
+            out.push(String::new());
         }
     }
     out
