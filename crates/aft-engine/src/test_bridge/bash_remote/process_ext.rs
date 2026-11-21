@@ -603,6 +603,7 @@ impl BgTaskStateTestExt for super::BgTaskState {
 
 pub trait ToolLaunchPolicyTestExt {
     fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
+    #[cfg(unix)]
     fn shared(&self) -> std::rc::Rc<crate::sandbox_spawn::RequestToolLaunch>;
 }
 
@@ -610,6 +611,7 @@ impl ToolLaunchPolicyTestExt for crate::sandbox_spawn::ToolLaunchPolicy<'_> {
     fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static> {
         Self::unconfined_for_test()
     }
+    #[cfg(unix)]
     fn shared(&self) -> std::rc::Rc<crate::sandbox_spawn::RequestToolLaunch> {
         Self::shared(self)
     }

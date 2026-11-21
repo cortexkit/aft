@@ -1406,7 +1406,7 @@ struct ProjectReplayScanCursor {
     database_tasks: HashSet<(String, String)>,
     database_incomplete_reason: Option<&'static str>,
     database_replay_failed: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     total_examined: usize,
 }
 
@@ -1422,7 +1422,7 @@ impl ProjectReplayScanCursor {
             database_tasks: HashSet::new(),
             database_incomplete_reason: None,
             database_replay_failed: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             total_examined: 0,
         }
     }
@@ -8513,7 +8513,7 @@ impl BgTaskRegistry {
                     PROJECT_REPLAY_SCAN_TIME_BUDGET,
                 )
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             {
                 (
                     PROJECT_REPLAY_SCAN_ENTRY_BUDGET,
@@ -8575,7 +8575,7 @@ impl BgTaskRegistry {
             if cursor.current.is_none() {
                 let session_id = cursor.sessions.pop_front().expect("pending session");
                 examined = examined.saturating_add(1);
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 {
                     cursor.total_examined = cursor.total_examined.saturating_add(1);
                 }
@@ -8621,7 +8621,7 @@ impl BgTaskRegistry {
             }
 
             examined = examined.saturating_add(1);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 cursor.total_examined = cursor.total_examined.saturating_add(1);
             }
