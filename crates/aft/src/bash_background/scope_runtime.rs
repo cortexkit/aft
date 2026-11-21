@@ -613,8 +613,8 @@ impl BgTaskRegistry {
         drop(state);
         #[cfg(target_os = "linux")]
         {
-            // Keep the scope until both the task file and its database mirror
-            // have been written, and reap without holding the registry locks.
+            // Finish the deferred database write before releasing the scope,
+            // and reap without holding the registry locks.
             drop(db);
             drop(holder);
         }

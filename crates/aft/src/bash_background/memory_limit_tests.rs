@@ -1284,7 +1284,12 @@ fn memory_limit_systemd_records_payload_oom_before_stopping_holder() {
 #[cfg(target_os = "linux")]
 #[test]
 fn memory_limit_systemd_replay_reads_payload_or_warns_on_missing_accounting() {
-    for (scope_exists, has_exit_marker) in [(true, true), (true, false), (false, true)] {
+    for (scope_exists, oom_recorded, has_exit_marker) in [
+        (true, true, true),
+        (true, true, false),
+        (false, false, true),
+        (true, false, true),
+    ] {
         let temp = tempfile::tempdir().unwrap();
         let paths =
             super::super::persistence::task_paths(temp.path(), "session", &random_slug()).unwrap();
@@ -1292,6 +1297,8 @@ fn memory_limit_systemd_replay_reads_payload_or_warns_on_missing_accounting() {
         let payload = temp.path().join("run-replay.scope/payload");
         if scope_exists {
             fs::create_dir_all(&payload).unwrap();
+        }
+        if oom_recorded {
             fs::write(payload.join("memory.events"), "oom_kill 1\n").unwrap();
         }
         let policy = systemd_memory_policy(payload.clone());
@@ -1327,8 +1334,9 @@ fn memory_limit_systemd_replay_reads_payload_or_warns_on_missing_accounting() {
         assert_eq!(recorded.exit_code, Some(137));
         assert_eq!(
             recorded.status_reason,
-            scope_exists.then(|| policy.exceeded_reason())
+            oom_recorded.then(|| policy.exceeded_reason())
         );
+        assert_eq!(payload.exists(), scope_exists);
         assert_eq!(
             read_exit_marker(&paths).unwrap(),
             Some(ExitMarker::Code(137))
@@ -1337,7 +1345,7 @@ fn memory_limit_systemd_replay_reads_payload_or_warns_on_missing_accounting() {
             .iter()
             .filter(|line| line.contains("could not read memory-cap accounting"))
             .collect();
-        assert_eq!(warnings.len(), usize::from(!scope_exists), "{logs:?}");
+        assert_eq!(warnings.len(), usize::from(!oom_recorded), "{logs:?}");
         if let Some(line) = warnings.first() {
             assert!(line.contains(&paths.task_id), "{line}");
             assert!(

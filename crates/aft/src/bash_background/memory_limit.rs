@@ -504,11 +504,13 @@ impl Drop for Monitor {
         #[cfg(target_os = "linux")]
         drop(self.take_holder());
         #[cfg(target_os = "linux")]
+        // Let systemd remove its cgroups. During restart recovery, the
+        // monitor can be dropped before AFT saves the memory-cap reason.
         if let Some(path) = self
             .policy
             .cgroup
             .as_ref()
-            .filter(|_| self.borrowed_scope.is_none())
+            .filter(|_| self.borrowed_scope.is_none() && self.policy.systemd_cgroup().is_none())
         {
             let _ = std::fs::remove_dir(path);
         }
