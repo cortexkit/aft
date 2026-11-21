@@ -3,7 +3,15 @@
 //! tests run the fetch under a short call budget, the same way a tool call
 //! does, and check the typed timeout and how long it took.
 
-use super::*;
+#[cfg(unix)]
+use std::io::Write;
+use std::thread;
+#[cfg(unix)]
+use std::time::Duration;
+use std::time::Instant;
+
+#[cfg(unix)]
+use crate::url_fetch::cache_content_path_for_url;
 
 #[allow(unused_imports)]
 pub(crate) use aft_base::url_fetch::deadline_tests::*;
@@ -12,7 +20,7 @@ pub(crate) use aft_base::url_fetch::deadline_tests::*;
 fn outline_reports_the_typed_timeout_and_its_phase() {
     let storage = tempfile::tempdir().unwrap();
     let address = serve(|_, _stream| thread::sleep(SERVER_STALL));
-    let ctx = crate::context::AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             url_fetch_allow_private: true,
@@ -43,7 +51,7 @@ fn outline_reports_the_typed_timeout_and_its_phase() {
 fn outline_says_a_repeated_failure_is_cached_and_when_it_is_fetched_again() {
     let storage = tempfile::tempdir().unwrap();
     let (address, _) = status_server();
-    let ctx = crate::context::AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             url_fetch_allow_private: true,
@@ -94,7 +102,7 @@ fn a_fetch_ending_inside_its_deadline_and_a_stalled_read_back_still_reply_before
         let _ = stream.write_all(body);
     });
     let target = url(address, "/late.md");
-    let ctx = crate::context::AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             url_fetch_allow_private: true,

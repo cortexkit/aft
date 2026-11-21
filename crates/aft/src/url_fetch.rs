@@ -200,13 +200,6 @@ mod tests {
 }
 
 #[cfg(test)]
-/// The fetch times the slow-call line reports, measured against local
-/// servers that are slow in a known phase.
-#[path = "url_fetch_deadline_tests.rs"]
-#[allow(hidden_glob_reexports)]
-mod deadline_tests;
-
-#[cfg(test)]
 mod secret_audit_regressions {
     use super::*;
     #[test]

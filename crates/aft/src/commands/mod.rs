@@ -86,6 +86,8 @@ pub mod organize_imports;
 #[cfg(test)]
 mod os_metadata_tests;
 pub mod outline;
+#[cfg(test)]
+mod outline_fetch_tests;
 pub mod read;
 pub(crate) mod read_manifest;
 pub mod remove_import;
