@@ -44,8 +44,8 @@ runs, `subc_format.rs` renders the agent-visible text on the server, and
 `response_finalize.rs` appends trailing lines such as alert reminders and the
 status bar. Because the text is rendered on the server, every host shows the
 same output. List-shaped results carry a truncation envelope
-(`list_envelope.rs`, `list_surfaces/`) whose trailer reads
-`shown N of M <unit> (<reason>) · narrow: <knobs>`.
+(`crates/aft-base/src/list_envelope.rs`, `crates/aft-base/src/list_surfaces/`)
+whose trailer reads `shown N of M <unit> (<reason>) · narrow: <knobs>`.
 
 **Tool-provider role.** `subc/tool_provider.rs` serves the CortexKit
 tool-provider contract to runners: `role.describe`, `tool.catalog`,
@@ -56,10 +56,26 @@ get `apply_patch`, others `edit` and `write`. A runner fetches a worker's
 catalog once, so the preset's parameters (remote execution, sibling checkouts)
 are frozen at that fetch and kept in `aft.db`, keyed on the session's bind
 identity and scope (`subc/remote_policy.rs`); later calls only look them up.
-Keyed calls are admitted and settled in the call ledger (`db/call_ledger.rs`),
-so a reply lost to a restart is still delivered as a late result. Long calls
-send invisible keepalives (`subc/keepalive.rs`). A finished background command
-is pushed only to the caller that launched it (`subc/push.rs`).
+Keyed calls are admitted and settled in the call ledger
+(`crates/aft-db/src/db/call_ledger.rs`), so a reply lost to a restart is still
+delivered as a late result. Long calls send invisible keepalives
+(`subc/keepalive.rs`). A finished background command is pushed only to the
+caller that launched it (`subc/push.rs`).
+
+**Remote calls.** The federation service Callosum routes tool calls from paired computers
+onto project-free `RemoteTools` routes (`subc/remote_calls.rs`,
+`subc/remote_call_service.rs`). A `fed:` harness alone is untrusted but does
+not make a local route remote. Admission resolves the portable project key
+through the Entorhinal project registry (`agent_data/transport.rs`), requires a non-federated local
+bind on that canonical folder, validates the caller's `schema_pin`
+(`subc/remote_pins.rs`), and checks or asks the Cingulate consent service for per-caller folder
+consent (`subc/remote_consent.rs`, `crates/aft-db/src/db/remote_grant_rows.rs`).
+Calls are audited (`crates/aft-db/src/db/remote_audit_rows.rs`), and the call
+ledger handles keyed admission and replay. File
+tools run in confined single-request sessions (`subc/remote_dispatch.rs`), and
+remote shells run as Linux-only foreground sandboxed commands without local
+background task IDs (`subc/remote_bash.rs`, `sandbox_spawn/remote.rs`,
+`cli/sandbox_launch/landlock_backend/remote_writes.rs`).
 
 **Scopes and runs.** The daemon stamps each route with the scope it serves: a
 head, a worker, a flow, or a code-mode run. The stamp decides the catalog
@@ -74,26 +90,26 @@ operations on call-scoped routes, never general tools (`subc/flow_read.rs`).
 
 **Access policy.** Every path a tool touches goes through
 `AppContext::validate_path` (writes) or `validate_read_path` (reads) in
-`access_policy.rs`. `subc/call_policy.rs` installs each call's environment
-first: the route's ask route, the scope whose saved grants apply, forced
-project-root restriction for an untrusted bind, and a confined worker's root
-fence. When the policy says ask for a worker's call, the call is held and the
-question goes to Cingulate through the daemon (`subc/consent.rs`), never to a
-host prompt; answers saved as grants live in `aft.db`
+`crates/aft-db/src/access_policy.rs`. `subc/call_policy.rs` installs each
+call's environment first: the route's ask route, the scope whose saved grants
+apply, forced project-root restriction for an untrusted bind, and a confined
+worker's root fence. When the policy says ask for a worker's call, the call is
+held and the question goes to the Cingulate consent service through the daemon (`subc/consent.rs`),
+never to a host prompt; answers saved as grants live in `aft.db`
 (`subc/access_grants.rs`). Plugin heads ask through their host's permission
 prompt instead.
 
-**Executor.** `executor/` schedules work per project root (an "actor"). Jobs
-run on lanes: `PureRead`, `SerialLspStatus`, `HeavyInit`, `Mutating` (a writer
-barrier reserved for configure and user mutations; a route bind starts with
-only a shared hold beside readers and maintenance, and takes the barrier only
-if it must change the root), and `MaintenanceCommit` (background drains that
-must never block reads). Jobs are classed `Interactive` or `Maintenance` so
-maintenance cannot starve tool calls; the maintenance queue is bounded and
-idempotent drains coalesce. Long work checks a `JobCancellation` token at phase
-boundaries. Process-wide heavy builds share slots through
-`cold_build_limiter.rs`, and `build_breaker.rs` suspends a build domain that
-keeps crashing.
+**Executor.** `crates/aft-base/src/executor/` schedules work per project root
+(an "actor"). Jobs run on lanes: `PureRead`, `SerialLspStatus`, `HeavyInit`,
+`Mutating` (a writer barrier reserved for configure and user mutations; a route
+bind starts with only a shared hold beside readers and maintenance, and takes the
+barrier only if it must change the root), and `MaintenanceCommit` (background
+drains that must never block reads). Jobs are classed `Interactive` or
+`Maintenance` so maintenance cannot starve tool calls; the maintenance queue is
+bounded and idempotent drains coalesce. Long work checks a `JobCancellation`
+token at phase boundaries. Process-wide heavy builds share slots through
+`crates/aft-base/src/cold_build_limiter.rs`, and `build_breaker.rs` suspends a
+build domain that keeps crashing.
 
 **Index store.** Text search, the call graph and meaning search live in one
 index store per repository (`indexes.trigram`, `indexes.callgraph`,
@@ -122,16 +138,16 @@ at once; the call graph refreshes after two quiet minutes, or at once when a
 call-graph reader asks (it waits up to 30 s, then reports building). The
 incremental engine (`data_layer/incremental.rs`) re-resolves only files whose
 recorded inputs changed, and changes are published as small segments once
-enough accumulate. The resolver itself (`callgraph_store/`: extraction,
-binding, dispatch) is shared with the gates that compare incremental results
-with cold builds. `aft_search` blends lexical and meaning lanes
-(`commands/semantic_search/`, `search_b2/`); embeddings come from fastembed
-(local ONNX), an OpenAI-compatible endpoint, Ollama, or Synapse over subc
-(`synapse_embed.rs`, chunking in `semantic_index.rs`). A plane that is still
-building says so: `grep` and `glob` walk the folder until text is ready, and
-call-graph tools answer "building" rather than from an old graph.
-Parent-folder sessions (`data_layer/parent_session/`) answer from each child
-repository's checkout. User-configured standing roots (`index.roots`,
+enough accumulate. The resolver itself (`crates/aft-parse/src/callgraph_store/`:
+extraction, binding, dispatch) is shared with the gates that compare incremental
+results with cold builds. `aft_search` blends lexical and meaning lanes
+(`commands/semantic_search/`, `search_b2/`, `search_state/`); embeddings come
+from fastembed (local ONNX), an OpenAI-compatible endpoint, Ollama, or the
+Synapse embedding service over subc (`synapse_embed.rs`, chunking in
+`semantic_index.rs`). An index that is still building says so: `grep` and `glob` walk the folder until text is
+ready, and call-graph tools answer "building" rather than from an old graph.
+Parent-folder sessions (`parent_search/`, `commands/parent_query/`) answer from
+each child repository's checkout. User-configured standing roots (`index.roots`,
 `standing_roots.rs`, `scoped_key.rs`) are indexed by the subc standing actor
 independent of sessions.
 
@@ -159,11 +175,12 @@ credentials and puts the `gh` shim and managed git hooks on the child's path.
 A foreground command that outlives its wait window becomes a background task in
 `bash_background/` (task registry, PTY runtime, watchdog, pattern watches,
 persistence across restarts). Output from a finished command is compressed by
-`compress/`: tool-specific Rust compressors, output-shape sniffers,
-package-manager compressors, TOML filters (builtin, user, and project; project
-filters load only for trusted projects), then a generic fallback. Output from a
-task that is still running is shown raw. `bash_db_hints/` adds a schema hint
-when a database CLI fails on an unknown table or column.
+`crates/aft-base/src/compress/`: tool-specific Rust compressors, output-shape
+sniffers, package-manager compressors, TOML filters (builtin, user, and
+project; project filters load only for trusted projects), then a generic
+fallback. Output from a task that is still running is shown raw.
+`bash_db_hints/` adds a schema hint when a database CLI fails on an unknown
+table or column.
 
 **Remote execution.** With `remote_exec.enabled` (user tier), a bash call with
 `runon` runs on a build server through the daemon's `exec-remote/v1`
@@ -171,8 +188,9 @@ capability (`exec_remote/`, `bash_background/remote.rs`). The job
 gets a copy of the checkout; only output, the exit code and the files named in
 `return_paths` come back, and AFT refuses a command that would edit tracked
 files before submitting it. Commands may name secret placeholders; the vault
-seam (`secret/`, `secret_proxy/`, `subc/secret_consent.rs`) resolves them per
-call, but the production vault is not wired yet, so none resolve today.
+seam (`crates/aft-base/src/secret/`, `crates/aft-base/src/secret_proxy/`,
+`subc/secret_consent.rs`) resolves them per call, but the production vault is
+not wired yet, so none resolve today.
 
 **Inspect.** `aft_inspect` (`commands/inspect.rs`, `inspect/`) reports
 diagnostics, metrics, and TODOs (tier 1) and cross-file categories such as dead
@@ -194,22 +212,21 @@ features include diagnostics for inspect and edits, and navigation.
 **Config and trust.** Config is JSONC at two tiers: user
 `~/.config/cortexkit/aft.jsonc` and project `<root>/.cortexkit/aft.jsonc`,
 each with optional `harnesses.<name>` overrides. In subc mode AFT reads both
-files itself and ignores config sent over the wire. `config_resolve.rs` parses
-both strictly and merges them, and it drops project values for
-security-relevant keys: path restriction, semantic backend endpoints and
-credentials, LSP executables, subc transport, remote execution, GitHub
-capabilities, and anything that weakens the sandbox. For these keys a project
-can only tighten: raise a sandbox mode or add read denies, switch an index or
-remote execution off, or disable tools other than `aft_safety` and the host
-tool slots. Retired
-key names are translated with a notice, and AFT rewrites the user file to
-current keys when it loads it. Separately, the subc edge assigns each route
-bind a `BindTrust` (`subc/mod.rs`): first-party principals get full replies; a
-reserved module is first-party only for the exact (module, harness) pairs it
-has been checked for; untrusted binds (MCP facades, unverified principals) get
-text-only replies, forced project-root path restriction, no bash-state
-observation, and bash only after a host permission grant. See
-[docs/config.md](docs/config.md).
+files itself and ignores config sent over the wire.
+`crates/aft-base/src/config_resolve.rs` parses both strictly and merges them,
+and it drops project values for security-relevant keys: path restriction,
+semantic backend endpoints and credentials, LSP executables, subc transport,
+remote execution, GitHub capabilities, and anything that weakens the sandbox.
+For these keys a project can only tighten: raise a sandbox mode or add read
+denies, switch an index or remote execution off, or disable tools other than
+`aft_safety` and the host tool slots. Retired key names are translated with a
+notice, and AFT rewrites the user file to current keys when it loads it.
+Separately, the subc edge assigns each route bind a `BindTrust` (`subc/mod.rs`):
+first-party principals get full replies; a reserved module is first-party only
+for the exact (module, harness) pairs it has been checked for; untrusted binds
+(MCP facades, unverified principals, `fed:` harnesses) get text-only replies,
+forced project-root path restriction, no bash-state observation, and bash only
+after a host permission grant. See [docs/config.md](docs/config.md).
 
 **`gh` shim and GitHub reads.** The same binary acts as a `gh` shim when
 invoked as `gh` or `aft gh-shim` (`gh_shim.rs`). Governed children find it
@@ -243,12 +260,13 @@ session's undo and checkpoint data out through engram's session door.
 snapshots, `alert_render.rs` tracks what is new per session and root, and the
 response finalizer appends `<system-reminder>` alerts and the
 `[AFT E.. W.. | ..]` status bar to tool results. `repeat_breaker.rs` adds a
-reminder when an agent repeats the same call. `fleet_status.rs` publishes the
-status segment to the fleet status holder when one is live. `health.digest`
-(`commands/health_digest.rs`) is a management operation, not an agent tool,
-that returns current counts with freshness tickets. The subc health report
-(`subc/health.rs`) exposes readiness, memory (`memory.rs`), and anything that
-keeps an idle root from being reclaimed.
+reminder when an agent repeats the same call. `crates/aft-base/src/fleet_status.rs`
+publishes the status segment to the fleet status holder when one is live.
+`health.digest` (`commands/health_digest.rs`) is a management operation, not an
+agent tool, that returns current counts with freshness evidence such as document
+versions or verified artifact generations. The subc health
+report (`subc/health.rs`) exposes readiness, memory (`crates/aft-base/src/memory.rs`),
+and anything that keeps an idle root from being reclaimed.
 
 **Lifecycle and storage.** `commands/configure.rs` binds a root: it resolves
 config, starts the platform watcher (`watcher_backend/`: FSEvents, inotify, or
@@ -258,7 +276,7 @@ it is quiesced: queued maintenance is cancelled, index builders are retired,
 and warm artifacts are kept for a quick rebind. After `idle.root_ttl_minutes`
 the artifacts are evicted. SQLite state (backups, bash tasks, watches, call
 ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
-`aft.db` (`db/`); storage defaults to `~/.local/share/cortexkit/aft/`
+`aft.db` (`crates/aft-db/src/db/`); storage defaults to `~/.local/share/cortexkit/aft/`
 (override with `AFT_STORAGE_DIR`).
 
 ## Code map
@@ -268,36 +286,37 @@ ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
 | Harness plugins | `packages/opencode-plugin/`, `packages/pi-plugin/` |
 | Bridge, transports, binary resolution | `packages/aft-bridge/src/` (`transport-factory.ts`, `pool.ts`, `bridge.ts`, `subc-transport.ts`, `resolver.ts`) |
 | CLI | `packages/aft-cli/src/`; native subcommands in `crates/aft/src/cli/` |
-| Process entry, standalone loop | `crates/aft/src/main.rs`, `protocol.rs` |
-| Subc edge (binds, trust, push, drain) | `crates/aft/src/subc/` |
-| Tool-call pipeline | `run_tool_call.rs`, `subc_translate.rs`, `subc_format.rs`, `response_finalize.rs`, `commands/tool_call.rs` |
-| Tool-provider role | `subc/tool_provider.rs`, `subc/remote_policy.rs`, `subc/keepalive.rs`, `db/call_ledger.rs`, `db/catalog_edit_modes.rs` |
+| Process entry, standalone loop | `main.rs`, `crates/aft-base/src/protocol.rs` |
+| Subc edge (binds, trust, push, drain) | `subc/` |
+| Tool-call pipeline | `run_tool_call.rs`, `subc_translate.rs`, `subc_format.rs`, `response_finalize.rs`, `commands/tool_call.rs`, `crates/aft-base/src/list_surfaces/` |
+| Tool-provider role | `subc/tool_provider.rs`, `subc/remote_policy.rs`, `subc/keepalive.rs`, `crates/aft-db/src/db/call_ledger.rs`, `crates/aft-db/src/db/catalog_edit_modes.rs` |
+| Remote calls (federated) | `subc/remote_calls.rs`, `subc/remote_call_service.rs`, `subc/remote_consent.rs`, `subc/remote_bash.rs`, `sandbox_spawn/remote.rs`, `crates/aft-db/src/db/remote_grant_rows.rs`, `crates/aft-db/src/db/remote_audit_rows.rs` |
 | Scopes, runs, code mode | `subc/scope_describe.rs`, `subc/run_scope.rs`, `subc/codemode.rs`, `subc/flow_read.rs` |
-| Access policy, consent, grants | `access_policy.rs`, `subc/call_policy.rs`, `subc/consent.rs`, `subc/access_grants.rs`, `db/access_grants.rs` |
-| Command handlers | `crates/aft/src/commands/` |
-| Executor | `crates/aft/src/executor/`, `cold_build_limiter.rs`, `build_breaker.rs` |
+| Access policy, consent, grants | `crates/aft-db/src/access_policy.rs`, `subc/call_policy.rs`, `subc/consent.rs`, `subc/access_grants.rs`, `crates/aft-db/src/db/access_grants.rs` |
+| Command handlers | `commands/` |
+| Executor | `crates/aft-base/src/executor/`, `crates/aft-base/src/cold_build_limiter.rs`, `build_breaker.rs` |
 | Runtime state | `context.rs` (`AppContext`) |
 | Index store formats | `crates/aft-store/` |
-| Index store in AFT | `data_layer/` (checkout, runtime, incremental, meaning, `tools/` adapters) |
-| Text search | `grep_executor.rs`, `data_layer/tools/grep.rs` |
-| Semantic search | `commands/semantic_search/`, `search_b2/`, `synapse_embed.rs`, `semantic_index.rs`, `data_layer/vectors.rs` |
-| Call graph | `callgraph_store/` (resolver), `data_layer/callgraph.rs`, `callgraph.rs`, `calls.rs` |
-| Parent-folder sessions | `data_layer/parent_session/`, `data_layer/parent.rs` |
-| Standing roots | `standing_roots.rs`, `scoped_key.rs`, `subc/standing.rs`, `db/standing_roots.rs` |
-| Parsing and symbols | `parser.rs`, `symbols.rs`, `symbol_cache_disk.rs`, `language.rs`, `imports/` |
-| Edit, patch, hashline | `edit.rs`, `format.rs`, `patch/`, `hashline/`, `fuzzy_match.rs` |
-| Bash | `bash_rewrite/`, `bash_permissions/`, `bash_background/`, `bash_db_hints/`, `sandbox_spawn.rs`, `sandbox_profile.rs`, `agent_child_env.rs`, `pty_render.rs` |
-| Remote execution, secrets | `exec_remote/`, `bash_background/remote.rs`, `secret/`, `secret_proxy/`, `subc/secret_consent.rs` |
-| Output compression | `compress/` |
+| Index store in AFT | `data_layer/` (checkout, runtime, incremental, meaning), `commands/data_callgraph.rs`, `commands/data_search.rs`, `inspect/data_sources.rs` |
+| Text search | `grep_executor.rs`, `data_layer/text_scope.rs` |
+| Semantic search | `commands/semantic_search/`, `search_b2/`, `search_state/`, `synapse_embed.rs`, `semantic_index.rs`, `data_layer/vectors.rs` |
+| Call graph | `crates/aft-parse/src/callgraph_store/` (resolver), `data_layer/callgraph.rs`, `commands/data_callgraph.rs`, `crates/aft-parse/src/callgraph.rs`, `crates/aft-parse/src/calls.rs` |
+| Parent-folder sessions | `parent_search/`, `commands/parent_query/`, `data_layer/parent_session.rs`, `data_layer/parent_query.rs`, `data_layer/parent.rs` |
+| Standing roots | `standing_roots.rs`, `scoped_key.rs`, `subc/standing.rs`, `crates/aft-db/src/db/standing_roots.rs` |
+| Parsing and symbols | `crates/aft-parse/src/parser.rs`, `crates/aft-parse/src/grammar/`, `grammar/`, `crates/aft-base/src/symbols.rs`, `crates/aft-base/src/language.rs`, `crates/aft-parse/src/imports/` |
+| Edit, patch, hashline | `edit.rs`, `format.rs`, `patch/`, `hashline/`, `crates/aft-parse/src/fuzzy_match.rs` |
+| Bash | `bash_rewrite/`, `bash_permissions/`, `bash_background/`, `bash_db_hints/`, `sandbox_spawn.rs`, `crates/aft-db/src/sandbox_profile.rs`, `agent_child_env.rs`, `crates/aft-base/src/pty_render.rs` |
+| Remote execution, secrets | `exec_remote/`, `bash_background/remote.rs`, `crates/aft-base/src/secret/`, `crates/aft-base/src/secret_proxy/`, `subc/secret_consent.rs` |
+| Output compression | `crates/aft-base/src/compress/` |
 | Inspect | `inspect/`, `commands/inspect.rs` |
 | LSP | `lsp/` |
-| Config | `config.rs`, `config_resolve.rs`, `feature_config.rs`, `config_fix.rs`, `subc_config.rs` |
-| GitHub | `gh_shim.rs`, `gh_shim_relay/`, `gh_shim_speech/`, `github_read/`, `db/github_read_cache.rs` |
-| Apps: display records, page bundles | `subc/rich_ui/`, `subc/tool_views.rs`, `page_collect/`, `db/rich_ui.rs` |
-| Backups, checkpoints | `backup.rs`, `checkpoint.rs`, `agent_data/`, `db/backups.rs` |
-| Health, alerts | `alert_state.rs`, `alert_render.rs`, `alert_records.rs`, `fleet_status.rs`, `commands/health_digest.rs`, `subc/health.rs`, `memory.rs` |
+| Config | `crates/aft-base/src/config.rs`, `crates/aft-base/src/config_resolve.rs`, `crates/aft-base/src/feature_config.rs`, `crates/aft-base/src/config_fix.rs`, `crates/aft-base/src/subc_config.rs` |
+| GitHub | `gh_shim.rs`, `gh_shim_relay/`, `gh_shim_speech/`, `github_read/`, `crates/aft-db/src/db/github_read_cache.rs` |
+| Apps: display records, page bundles | `subc/rich_ui/`, `subc/tool_views.rs`, `page_collect/`, `crates/aft-db/src/db/rich_ui.rs` |
+| Backups, checkpoints | `backup.rs`, `checkpoint.rs`, `agent_data/`, `crates/aft-db/src/db/backups.rs` |
+| Health, alerts | `alert_state.rs`, `alert_render.rs`, `crates/aft-base/src/alert_records.rs`, `crates/aft-base/src/fleet_status.rs`, `commands/health_digest.rs`, `subc/health.rs`, `crates/aft-base/src/memory.rs` |
 | Watcher | `watcher/`, `watcher_backend/`, `watcher_filter.rs` |
-| Persistence | `db/` |
+| Persistence | `crates/aft-db/src/db/` |
 
 Rust paths are relative to `crates/aft/src/` unless shown in full.
 
@@ -316,7 +335,7 @@ Every response lets the agent tell three states apart:
    Skipped side steps use a specific `<step>_skipped_reason`.
 
 The canonical field list is the `Response` doc comment in
-`crates/aft/src/protocol.rs`.
+`crates/aft-base/src/protocol.rs`.
 
 ## Rules that bite
 
