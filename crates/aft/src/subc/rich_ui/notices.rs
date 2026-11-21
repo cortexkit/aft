@@ -179,7 +179,7 @@ fn fit_preview(mut body: NoticeBody, preview: &str, cut: bool) -> Option<NoticeB
     }
 }
 
-pub(in crate::subc) struct PullRecord {
+pub(crate) struct PullRecord {
     pub id: String,
     pub bytes: Vec<u8>,
 }

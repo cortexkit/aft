@@ -1,6 +1,7 @@
 use super::*;
 use crate::subc::rich_ui::notices::pull;
 use cortexkit_role_tool_display::{NoticeBody, NoticeWrite};
+use futures_util::FutureExt;
 use serde_json::json;
 use subc_protocol::Principal;
 
@@ -22,21 +23,6 @@ async fn notice_records_no_write_or_announcement_queued_before_views_publish() {
         .unwrap()
     };
     let id = record().id;
-    let ready = NoticeViewsReady::default();
-    stage_after_views(&writer, record(), &ready, Duration::ZERO).await;
-    assert!(
-        crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms())
-            .unwrap()
-            .is_none()
-    );
-    assert!(writer
-        .outbox
-        .lock()
-        .unwrap()
-        .reads
-        .due(Instant::now())
-        .is_none());
-
     let ready = NoticeViewsReady::default();
     let waiting = stage_after_views(&writer, record(), &ready, Duration::from_secs(5));
     tokio::pin!(waiting);
@@ -70,6 +56,82 @@ async fn notice_records_no_write_or_announcement_queued_before_views_publish() {
             .as_deref(),
         Some(id.as_str())
     );
+}
+
+#[tokio::test]
+async fn notice_record_waits_in_memory_when_views_arrive_after_startup_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let conn = crate::db::open(&path).unwrap();
+    let ready = NoticeViewsReady::default();
+    let record = startup_record();
+    let id = record.id.clone();
+    let expected = record.bytes.clone();
+    stage_after_views(&writer, record, &ready, Duration::ZERO).await;
+
+    let read = || {
+        crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms()).unwrap()
+    };
+    let due = || writer.outbox.lock().unwrap().reads.due(Instant::now());
+    assert!(read().is_none());
+    assert!(due().is_none());
+    assert!(stage_pending(&writer, &ready, Duration::from_secs(5))
+        .now_or_never()
+        .is_none());
+
+    ready.confirm();
+    assert!(tokio::time::timeout(
+        Duration::from_secs(10),
+        stage_pending(&writer, &ready, Duration::from_secs(5)),
+    )
+    .await
+    .expect("publication should release the deferred notice"));
+    assert_eq!(read(), Some(expected));
+    assert_eq!(due().as_deref(), Some(id.as_str()));
+}
+
+#[tokio::test]
+async fn pending_notice_records_are_discarded_when_views_never_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let conn = crate::db::open(&path).unwrap();
+    let ready = NoticeViewsReady::default();
+    let record = startup_record();
+    let id = record.id.clone();
+    stage_after_views(&writer, record, &ready, Duration::ZERO).await;
+    ready.fail("bus_worker_stopped");
+    ready.confirm();
+    stage_after_views(&writer, startup_record(), &ready, Duration::ZERO).await;
+
+    assert_eq!(
+        stage_pending(&writer, &ready, Duration::from_secs(5)).now_or_never(),
+        Some(false),
+        "permanent failure discards queued records and closes further admission",
+    );
+    assert!(
+        crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms())
+            .unwrap()
+            .is_none()
+    );
+    assert!(writer
+        .outbox
+        .lock()
+        .unwrap()
+        .reads
+        .due(Instant::now())
+        .is_none());
+}
+
+fn startup_record() -> PullRecord {
+    pull(
+        "broca",
+        "session",
+        "aft:bash:bash-startup",
+        NoticeBody::new("bash_finished:1", None, Default::default()),
+    )
+    .unwrap()
 }
 
 #[tokio::test]

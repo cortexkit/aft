@@ -9,6 +9,8 @@ use super::{Writer, SENDER};
 use crate::late_result_bus::{NoticeViewsReady, NOTICE_VIEWS_READY};
 use crate::subc::rich_ui::notices::PullRecord;
 
+const WRITE_BUDGET: Duration = Duration::from_millis(50);
+
 pub(in crate::subc) async fn stage_notice(record: PullRecord) {
     if let Some(writer) = SENDER.get() {
         stage_after_views(
@@ -28,8 +30,23 @@ async fn stage_after_views(
     budget: Duration,
 ) {
     if views.wait(budget).await {
-        stage(writer, record, Duration::from_millis(50)).await;
+        stage(writer, record, WRITE_BUDGET).await;
+    } else {
+        views.defer(record);
     }
+}
+
+pub(super) async fn flush_pending() {
+    let writer = SENDER.get().expect("display writer started");
+    while stage_pending(writer, &NOTICE_VIEWS_READY, WRITE_BUDGET).await {}
+}
+
+async fn stage_pending(writer: &Writer, views: &NoticeViewsReady, budget: Duration) -> bool {
+    let Some(record) = views.next_pending().await else {
+        return false;
+    };
+    stage(writer, record, budget).await;
+    true
 }
 
 async fn stage(writer: &Writer, record: PullRecord, deadline: Duration) {

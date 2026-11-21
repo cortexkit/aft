@@ -47,6 +47,32 @@ async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowled
 }
 
 #[tokio::test]
+async fn oversized_notice_view_disables_pending_notice_publication() {
+    use futures_util::FutureExt;
+
+    let mut writer = RecordingWriter::default();
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
+    let notice_pin = crate::subc::tool_views::notice_view_pins().next().unwrap();
+    publication
+        .sync(
+            &mut writer,
+            vec![(
+                notice_pin.clone(),
+                vec![b'x'; declaration().max_value_bytes as usize + 1],
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(writer.0.is_empty());
+    assert!(ready
+        .next_pending()
+        .now_or_never()
+        .expect("oversized notice view should permanently close the gate")
+        .is_none());
+}
+
+#[tokio::test]
 async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     let mut writer = RecordingWriter::default();
     let ready = NoticeViewsReady::default();
