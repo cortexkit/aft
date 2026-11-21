@@ -35,6 +35,26 @@ impl Checkout {
         })
     }
 
+    /// Commit work for a pinned meaning view only while its publication and
+    /// live checkout state still match. A parser can record a failure in that
+    /// state without changing any file contents or advancing the text sequence.
+    pub(crate) fn with_current_meaning_view<T>(
+        &self,
+        view: &CheckoutView,
+        commit: impl FnOnce() -> T,
+    ) -> Option<T> {
+        let live = self.live.read().expect("no panics while holding it");
+        let same_overlay = match (&live.state, &view.current) {
+            (None, None) => true,
+            (Some(current), Some(pinned)) => Arc::ptr_eq(current, pinned),
+            _ => false,
+        };
+        (Arc::ptr_eq(live.published.as_ref()?, &view.published)
+            && live.sequence == view.sequence
+            && same_overlay)
+            .then(commit)
+    }
+
     /// How each plane stands, for status and for replies that disclose
     /// what they could not cover.
     #[must_use]
