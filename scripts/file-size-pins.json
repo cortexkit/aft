@@ -60,7 +60,7 @@
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {
-    "lines": 6302,
+    "lines": 6245,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote.rs": {
