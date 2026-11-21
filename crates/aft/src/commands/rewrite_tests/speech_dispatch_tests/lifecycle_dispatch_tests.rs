@@ -3,6 +3,7 @@ use aft_engine::test_bridge::bash_remote::AuthorityRecord;
 use aft_engine::test_bridge::bash_remote::AuthorityRecordTestExt as _;
 use aft_engine::test_bridge::bash_remote::LaunchAuthorityTestExt as _;
 use aft_engine::test_bridge::bash_remote::RefusalTestExt as _;
+use aft_engine::test_bridge::bash_remote::ServiceTestExt as _;
 use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 use aft_engine::test_bridge::bash_remote::StoredAuthorityTestExt as _;
 
@@ -11,7 +12,7 @@ fn rewrite(
     incarnation: &str,
     change: impl FnOnce(&mut AuthorityRecord),
 ) {
-    let mut record = store.get(incarnation).unwrap().record;
+    let mut record = store.get(incarnation).unwrap().record().clone();
     change(&mut record);
     let text = serde_json::to_string(&record).unwrap();
     store
@@ -103,7 +104,7 @@ async fn seal_spawn_between_preflight_and_admission_posts_exactly_once() {
         .store
         .get(&fixture.incarnation)
         .unwrap()
-        .record
+        .record()
         .seal
         .is_some());
     let state = fixture.plex.state.lock().unwrap();
@@ -137,7 +138,7 @@ async fn changed_authority_refuses(change: fn(&mut AuthorityRecord)) {
 #[tokio::test]
 async fn changed_agent_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        record.launch().authority.attributes.agent_id = Some("different-agent".into())
+        record.launch_mut().authority_mut().attributes.agent_id = Some("different-agent".into())
     })
     .await;
 }
@@ -145,7 +146,7 @@ async fn changed_agent_between_preflight_and_admission_refuses() {
 #[tokio::test]
 async fn changed_scope_owner_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        record.launch().authority.owner = subc_protocol::Principal::Reserved {
+        record.launch_mut().authority_mut().owner = subc_protocol::Principal::Reserved {
             module_id: "different-owner".into(),
         }
     })
@@ -155,26 +156,29 @@ async fn changed_scope_owner_between_preflight_and_admission_refuses() {
 #[tokio::test]
 async fn changed_scope_ref_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        record.launch().authority.scope_ref = "different-scope".into()
+        record.launch_mut().authority_mut().scope_ref = "different-scope".into()
     })
     .await;
 }
 
 #[tokio::test]
 async fn changed_scope_epoch_between_preflight_and_admission_refuses() {
-    changed_authority_refuses(|record| record.launch().authority.scope_epoch += 1).await;
+    changed_authority_refuses(|record| record.launch_mut().authority_mut().scope_epoch += 1).await;
 }
 
 #[tokio::test]
 async fn changed_route_origin_between_preflight_and_admission_refuses() {
-    changed_authority_refuses(|record| record.launch().origin.as_mut().unwrap().channel += 1).await;
+    changed_authority_refuses(|record| {
+        record.launch_mut().origin_mut().as_mut().unwrap().channel += 1
+    })
+    .await;
 }
 
 #[tokio::test]
 async fn changed_flow_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        let head = &record.launch().authority;
-        record.launch().run = Some(
+        let head = record.launch().authority();
+        let run = Some(
             ScopeStamp::new(
                 head.owner.clone(),
                 "different-run",
@@ -195,6 +199,7 @@ async fn changed_flow_between_preflight_and_admission_refuses() {
             )
             .with_expires_at_ms(Some(crate::db::call_ledger::now_ms() as u64 + 60_000)),
         );
+        *record.launch_mut().run_mut() = run;
     })
     .await;
 }
@@ -202,10 +207,10 @@ async fn changed_flow_between_preflight_and_admission_refuses() {
 #[tokio::test]
 async fn changed_repository_set_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        record.bindings_mut().insert(
-            "different/repository".into(),
-            record.bindings().values().next().unwrap().clone(),
-        );
+        let binding = record.bindings().values().next().unwrap().clone();
+        record
+            .bindings_mut()
+            .insert("different/repository".into(), binding);
     })
     .await;
 }
@@ -213,7 +218,12 @@ async fn changed_repository_set_between_preflight_and_admission_refuses() {
 #[tokio::test]
 async fn changed_binding_identity_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        record.bindings().values_mut().next().unwrap().app_handle_id = "different-app".into()
+        *record
+            .bindings_mut()
+            .values_mut()
+            .next()
+            .unwrap()
+            .app_handle_id_mut() = "different-app".into()
     })
     .await;
 }
@@ -221,12 +231,12 @@ async fn changed_binding_identity_between_preflight_and_admission_refuses() {
 #[tokio::test]
 async fn changed_binding_generation_between_preflight_and_admission_refuses() {
     changed_authority_refuses(|record| {
-        record
-            .bindings()
+        *record
+            .bindings_mut()
             .values_mut()
             .next()
             .unwrap()
-            .repo_binding_generation += 1
+            .repo_binding_generation_mut() += 1
     })
     .await;
 }

@@ -1483,6 +1483,7 @@ mod tests {
     use crate::bash_background::persistence::BgMode;
     use crate::bash_background::registry::BgTaskSnapshot;
     use crate::bash_background::BgTaskInfo;
+    use aft_engine::test_bridge::bash_remote::ReplyBudgetTestExt as _;
 
     #[cfg(unix)]
     #[test]

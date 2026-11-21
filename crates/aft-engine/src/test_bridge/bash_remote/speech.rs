@@ -150,6 +150,13 @@ impl Binding {
     pub fn repo_binding_generation(&self) -> u64 {
         self.repo_binding_generation
     }
+
+    pub fn app_handle_id_mut(&mut self) -> &mut String {
+        &mut self.app_handle_id
+    }
+    pub fn repo_binding_generation_mut(&mut self) -> &mut u64 {
+        &mut self.repo_binding_generation
+    }
 }
 
 impl Service {
@@ -387,6 +394,7 @@ impl StoreTestExt for Store {
 }
 
 pub trait ServiceTestExt {
+    fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal>;
     fn invalidate(&self, scope: &ScopeStamp);
     fn register_accepted_policy(
         &self,
@@ -394,6 +402,9 @@ pub trait ServiceTestExt {
 }
 
 impl ServiceTestExt for Service {
+    fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal> {
+        Service::revoke(self, incarnation, reason)
+    }
     fn invalidate(&self, scope: &ScopeStamp) {
         Service::invalidate(self, scope);
     }
@@ -453,6 +464,8 @@ pub trait LaunchAuthorityTestExt {
     fn origin_mut(&mut self) -> &mut Option<gh_shim_speech::model::RouteOrigin>;
     fn head_origin(&self) -> &Option<gh_shim_speech::model::RouteOrigin>;
     fn authority(&self) -> &ScopeStamp;
+    fn authority_mut(&mut self) -> &mut ScopeStamp;
+    fn run_mut(&mut self) -> &mut Option<ScopeStamp>;
     fn required_scopes(&self) -> Vec<(ScopeRole, &ScopeStamp)>;
 }
 
@@ -468,6 +481,12 @@ impl LaunchAuthorityTestExt for gh_shim_speech::model::LaunchAuthority {
     }
     fn authority(&self) -> &ScopeStamp {
         &self.authority
+    }
+    fn authority_mut(&mut self) -> &mut ScopeStamp {
+        &mut self.authority
+    }
+    fn run_mut(&mut self) -> &mut Option<ScopeStamp> {
+        &mut self.run
     }
     fn required_scopes(&self) -> Vec<(ScopeRole, &ScopeStamp)> {
         Self::required_scopes(self)
@@ -497,6 +516,7 @@ impl SpeechTicketTestExt for SpeechTicket {
 pub trait StoredAuthorityTestExt {
     fn generation(&self) -> i64;
     fn phase(&self) -> &String;
+    fn ticket_digest(&self) -> &Option<Vec<u8>>;
 }
 
 impl StoredAuthorityTestExt for StoredAuthority {
@@ -506,6 +526,9 @@ impl StoredAuthorityTestExt for StoredAuthority {
     fn phase(&self) -> &String {
         &self.phase
     }
+    fn ticket_digest(&self) -> &Option<Vec<u8>> {
+        &self.ticket_digest
+    }
 }
 
 pub trait AuthorityRecordTestExt {
@@ -514,6 +537,7 @@ pub trait AuthorityRecordTestExt {
     fn bindings(&self) -> &std::collections::BTreeMap<String, Binding>;
     fn bindings_mut(&mut self) -> &mut std::collections::BTreeMap<String, Binding>;
     fn seal(&self) -> &Option<ExecutionSeal>;
+    fn seal_mut(&mut self) -> &mut Option<ExecutionSeal>;
     fn incarnation(&self) -> &String;
 }
 
@@ -532,6 +556,9 @@ impl AuthorityRecordTestExt for AuthorityRecord {
     }
     fn seal(&self) -> &Option<ExecutionSeal> {
         &self.seal
+    }
+    fn seal_mut(&mut self) -> &mut Option<ExecutionSeal> {
+        &mut self.seal
     }
     fn incarnation(&self) -> &String {
         &self.incarnation

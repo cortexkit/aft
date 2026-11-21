@@ -1027,9 +1027,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
     #[cfg(windows)]
     use aft_engine::test_bridge::bash_remote::WindowsShell;
+    use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, SpawnPlanTestExt as _};
     use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 
     #[test]
