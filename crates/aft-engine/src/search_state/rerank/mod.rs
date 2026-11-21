@@ -88,7 +88,8 @@ impl RerankError {
     }
 }
 
-pub(crate) trait RerankBackend: Send + Sync {
+#[doc(hidden)]
+pub trait RerankBackend: Send + Sync {
     /// The identity of the scoring function. It must be constant for the
     /// lifetime of the instance and must do no I/O: it is read on the search
     /// path and is part of the key under which a list's rerank outcome is
@@ -97,13 +98,10 @@ pub(crate) trait RerankBackend: Send + Sync {
     /// I/O to learn its identity (asking a server which model it serves) must
     /// learn it while it is being built, off the search path; until it is
     /// built no backend is installed, which counts as reranking off.
-    #[doc(hidden)]
-    pub fn fingerprint(&self) -> RerankFingerprint;
-    #[doc(hidden)]
-    pub fn max_batch(&self) -> usize;
+    fn fingerprint(&self) -> RerankFingerprint;
+    fn max_batch(&self) -> usize;
     /// One score per doc, same order; must return by `deadline` or Err(Timeout).
-    #[doc(hidden)]
-    pub fn score(
+    fn score(
         &self,
         query: &str,
         docs: &[RerankDoc<'_>],

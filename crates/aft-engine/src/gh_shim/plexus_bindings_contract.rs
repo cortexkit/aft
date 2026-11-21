@@ -21,7 +21,7 @@ macro_rules! fixture {
         (
             $name,
             include_bytes!(concat!(
-                "../../tests/fixtures/gh_shim/plexus-bindings-contract/",
+                "../../../aft/tests/fixtures/gh_shim/plexus-bindings-contract/",
                 $name
             ))
             .as_slice(),

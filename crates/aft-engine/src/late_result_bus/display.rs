@@ -55,7 +55,7 @@ pub(super) fn invalidate_reader() {
 }
 
 pub(super) fn reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(reader) = TEST_READER.with(|reader| reader.borrow().clone()) {
         return Ok(reader);
     }
@@ -66,12 +66,12 @@ pub(super) fn reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
         .ok_or_else(cortexkit_role_tool_display::not_ready)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_READER: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_test_reader<T>(reader: Option<&str>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<Option<String>>);
     impl Drop for Restore {

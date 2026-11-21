@@ -262,7 +262,7 @@ pub use aft_base::task_watches;
 pub use aft_base::tool_gate;
 pub use aft_engine::synapse_embed;
 #[cfg(test)]
-pub(crate) use aft_engine::test_storage;
+pub(crate) use aft_engine::test_bridge::test_storage;
 pub(crate) use aft_engine::tool_call_result;
 pub(crate) mod tool_output;
 pub use aft_base::tool_path;
@@ -305,7 +305,7 @@ pub(crate) use aft_base::test_read_denial;
 pub(crate) use aft_base::test_support;
 #[cfg(test)]
 #[path = "base_tests/test_env.rs"]
-pub(crate) use aft_engine::test_env;
+pub(crate) use aft_engine::test_bridge::test_env;
 #[cfg(test)]
 mod upper_test_context;
 #[cfg(test)]
