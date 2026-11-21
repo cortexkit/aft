@@ -11,22 +11,28 @@ Run from the repository root on the build server. Use one
 `linux,16c,32gb,net` job at a time (build-server jobs are capped at 32 GB; a
 project whose comparison needs more runs on a rented machine). Commit the
 candidate before submitting the job.
-`build.py` archives the named source revision and overlays only the test probe,
-its feature-gated module declarations, the feature-gated negative-control hook,
-and the dead-code comparison entry point. It does **not** copy today's resolver
-over the reference. Each source archive has a separate Cargo target directory.
+`build.py` archives the named revision, then adds the gate executable, a
+test-only hook that changes one dispatch target for the negative control, and
+the streaming dead-code check. It lets the gate discard each caller's decoded
+symbols after comparison without replacing the archived resolver or dead-code
+rules. Each archive has a separate Cargo target directory.
+
+The oldest supported reference is the crate-split base `post066-batch-23`
+(`06503f7fbf9e900fcc2dc9c78e26ff86d1d0d654`). The builder rejects pre-split
+archives and archives without `content::record_key`, which the probe uses
+to record the archive's content identities.
 
 ```sh
 git log -1
 python3 scripts/telemetry/callgraph-exactness/build.py \
-  cb3a5ae1badbb30716ad1de187b903ab47e90638 \
+  06503f7fbf9e900fcc2dc9c78e26ff86d1d0d654 \
   target/measurements/exactness/reference-build
 python3 scripts/telemetry/callgraph-exactness/build.py \
   HEAD target/measurements/exactness/candidate-build
 python3 scripts/telemetry/callgraph-exactness/run.py \
   --reference target/measurements/exactness/reference-build/probe \
   --candidate target/measurements/exactness/candidate-build/probe \
-  --reference-source cb3a5ae1badbb30716ad1de187b903ab47e90638 \
+  --reference-source 06503f7fbf9e900fcc2dc9c78e26ff86d1d0d654 \
   --candidate-source "$(git rev-parse HEAD)" \
   --repository neovim/neovim \
   --repository apache/superset \

@@ -156,6 +156,13 @@ fn method_terms(parse: &crate::callgraph_store::join::ParseBlob) -> Vec<(TermKin
     for method in &parse.dispatch.methods {
         terms.push((TermKind::MethodName, method.name.as_bytes().to_vec()));
     }
+    if let Some(facts) = &parse.dispatch.static_facts {
+        terms.extend(
+            facts
+                .type_keys(&parse.language)
+                .map(|key| (TermKind::StaticType, key.into_bytes())),
+        );
+    }
     if parse.language == "go" {
         for method in &parse.dispatch.methods {
             if parse
@@ -920,27 +927,6 @@ impl StoredSlices {
         Ok(configs)
     }
 
-    /// Every file's parse and resolution, decoded from its stored record
-    /// and fragment.
-    ///
-    /// # Errors
-    ///
-    /// When a record or fragment cannot be read.
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn resolutions(
-        &self,
-    ) -> Result<
-        (
-            BTreeMap<String, (String, Arc<crate::callgraph_store::join::ParseBlob>)>,
-            BTreeMap<String, FileResolution>,
-        ),
-        String,
-    > {
-        self.resolutions_timed(&mut Vec::new())
-    }
-
-    /// [`Self::resolutions`], adding the time spent reading records,
-    /// converting them to parse output, and decoding fragments to `timings`.
     /// Every file with a stored resolution, with its record key, in path
     /// order.
     pub(crate) fn parsed_files(&self) -> impl Iterator<Item = (&String, &str)> {
@@ -1054,51 +1040,6 @@ impl StoredSlices {
                 None
             }
         }
-    }
-
-    pub(crate) fn resolutions_timed(
-        &self,
-        timings: &mut Vec<(&'static str, f64)>,
-    ) -> Result<
-        (
-            BTreeMap<String, (String, Arc<crate::callgraph_store::join::ParseBlob>)>,
-            BTreeMap<String, FileResolution>,
-        ),
-        String,
-    > {
-        let mut parses = BTreeMap::new();
-        let mut resolved = BTreeMap::new();
-        let (mut records, mut convert, mut fragments) = (0.0, 0.0, 0.0);
-        let ms = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1000.0;
-        for (file, located) in &self.paths {
-            let started = std::time::Instant::now();
-            let record = self
-                .content(located.record.0)?
-                .record(located.record.1)
-                .map_err(|error| error.to_string())?;
-            records += ms(started);
-            let started = std::time::Instant::now();
-            let CallgraphBlob::Parse(parse) =
-                blob_from_record(&record).map_err(|error| error.to_string())?
-            else {
-                return Err(format!("{file}: its stored record is not a parse"));
-            };
-            convert += ms(started);
-            let started = std::time::Instant::now();
-            let bytes = self
-                .graph(located.fragment.0)?
-                .fragment(located.fragment.1)
-                .map_err(|error| error.to_string())?;
-            let resolution = super::fragment::decode(&located.record_key, file, &bytes)
-                .map_err(|error| error.0.to_string())?;
-            fragments += ms(started);
-            parses.insert(file.clone(), (located.record_key.clone(), Arc::new(parse)));
-            resolved.insert(file.clone(), resolution);
-        }
-        timings.push(("read content records", records));
-        timings.push(("convert records to parse output", convert));
-        timings.push(("read and decode fragments", fragments));
-        Ok((parses, resolved))
     }
 
     /// The files whose current fragment is listed under `term`, in every

@@ -20,7 +20,7 @@
 
 use std::cmp::Reverse;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use crate::parser::{detect_language, LangId};
 use crate::search_index::{
@@ -280,6 +280,9 @@ pub(crate) enum RecencyTiebreak {
     None,
 }
 
+/// The path-independent part of the regex order, also used to merge children.
+pub(crate) type RankKey = (FileClass, u8, Reverse<usize>, Option<Reverse<SystemTime>>);
+
 /// Order the examined files, one result per file with its listed lines.
 ///
 /// Files are ordered by class (source, other text, data), then by the
@@ -297,25 +300,27 @@ pub(crate) fn rank_collection(
     recency: RecencyTiebreak,
 ) -> RankedFiles {
     let mut data_files = DataFileClassifier::new(project_root, query);
-    let mut keyed: Vec<((FileClass, Option<Declaration>), GrepFileMatches)> = collection
+    let mut keyed: Vec<(RankKey, GrepFileMatches)> = collection
         .files
         .into_iter()
         .map(|file| {
             let class = file_class(&file.path, &mut data_files);
             let declaration = file.matches.iter().filter_map(match_declaration).min();
-            ((class, declaration), file)
+            let key = (
+                class,
+                declaration_rank(declaration),
+                Reverse(file.matched_lines),
+                match recency {
+                    RecencyTiebreak::NewestFirst => Some(Reverse(file.modified)),
+                    RecencyTiebreak::None => None,
+                },
+            );
+            (key, file)
         })
         .collect();
-    keyed.sort_by(|((left_class, left_declaration), left), ((right_class, right_declaration), right)| {
-        left_class
-            .cmp(right_class)
-            // `None` sorts first for Option; a declaration must sort first here.
-            .then_with(|| declaration_rank(*left_declaration).cmp(&declaration_rank(*right_declaration)))
-            .then_with(|| right.matched_lines.cmp(&left.matched_lines))
-            .then_with(|| match recency {
-                RecencyTiebreak::NewestFirst => Reverse(left.modified).cmp(&Reverse(right.modified)),
-                RecencyTiebreak::None => std::cmp::Ordering::Equal,
-            })
+    keyed.sort_by(|(left_key, left), (right_key, right)| {
+        left_key
+            .cmp(right_key)
             .then_with(|| left.path.cmp(&right.path))
     });
 
@@ -325,7 +330,7 @@ pub(crate) fn rank_collection(
     // never be split across a page boundary and show up on two pages.
     let files: Vec<RankedFile> = keyed
         .into_iter()
-        .filter_map(|(_, file)| RankedFile::from_matches(file.matches, file.matched_lines))
+        .filter_map(|(rank, file)| RankedFile::from_matches(file.matches, file.matched_lines, rank))
         .collect();
 
     RankedFiles {
@@ -350,6 +355,7 @@ pub(crate) fn rank_collection(
             walk_bound: None,
         },
         files,
+        candidate_files: collection.candidate_files,
     }
 }
 
@@ -370,9 +376,18 @@ pub(crate) struct RankedFile {
     pub lines: Vec<GrepMatch>,
     /// Matching lines in the file that are not listed.
     pub more_in_file: usize,
+    pub rank: RankKey,
 }
 
 impl RankedFile {
+    pub(crate) fn unranked(line: GrepMatch) -> Self {
+        Self {
+            lines: vec![line],
+            more_in_file: 0,
+            rank: (FileClass::Source, 0, Reverse(1), None),
+        }
+    }
+
     /// True when the file's leading line declares a matched name with a
     /// declaration keyword (`fn name`, `class Name`, `const NAME`). The
     /// leading line is the file's strongest declaration, so this holds exactly
@@ -383,7 +398,7 @@ impl RankedFile {
         match_declaration(&self.lines[0]) == Some(Declaration::Keyword)
     }
 
-    fn from_matches(matches: Vec<GrepMatch>, matched_lines: usize) -> Option<Self> {
+    fn from_matches(matches: Vec<GrepMatch>, matched_lines: usize, rank: RankKey) -> Option<Self> {
         let best = matches
             .iter()
             .enumerate()
@@ -404,8 +419,46 @@ impl RankedFile {
         Some(Self {
             more_in_file: matched_lines.saturating_sub(lines.len()),
             lines,
+            rank,
         })
     }
+}
+
+/// A child's selected rows and the unpaged totals needed to render them.
+pub(crate) struct ChildPage {
+    pub summary: GrepResult,
+    pub ranked: Option<Vec<RankedFile>>,
+    pub candidate_files: usize,
+}
+
+pub(crate) fn format_search_page(
+    ranked: Option<&[RankedFile]>,
+    summary: &GrepResult,
+    project_root: &Path,
+    interpreted_as: &str,
+    examination_note: Option<&str>,
+    no_match: bool,
+) -> String {
+    let mut text = match ranked {
+        Some(page) => format!(
+            "{}\n[interpreted_as: {interpreted_as}]",
+            format_ranked_page(page, summary, project_root)
+        ),
+        None => super::format_grep_search_text(summary, project_root, interpreted_as),
+    };
+    if let Some(note) = examination_note {
+        text.push('\n');
+        text.push_str(note);
+    }
+    if no_match {
+        text.push('\n');
+        text.push_str(if summary.engine_capped {
+            "[pattern: no match in the files examined; files not examined were not searched]"
+        } else {
+            "[pattern: no match]"
+        });
+    }
+    text
 }
 
 /// The ranked files and the totals that describe the whole examination.
@@ -416,6 +469,7 @@ pub(crate) struct RankedFiles {
     pub summary: GrepResult,
     /// The same files, in the same order, with their listed lines.
     pub files: Vec<RankedFile>,
+    pub candidate_files: usize,
 }
 
 /// The count line of a ranked page. A ranked page lists one result per
@@ -853,11 +907,12 @@ mod tests {
         let listed =
             |file: &RankedFile| file.lines.iter().map(|line| line.line).collect::<Vec<_>>();
 
-        let ten = RankedFile::from_matches(lines(10), 10).expect("file");
+        let rank = (FileClass::Source, 0, Reverse(10), None);
+        let ten = RankedFile::from_matches(lines(10), 10, rank).expect("file");
         assert_eq!(listed(&ten), [7, 1, 2, 3, 4, 5, 6, 8, 9, 10]);
         assert_eq!(ten.more_in_file, 0);
 
-        let many = RankedFile::from_matches(lines(20), 30).expect("file");
+        let many = RankedFile::from_matches(lines(20), 30, rank).expect("file");
         assert_eq!(listed(&many), [7, 1, 2, 3, 4]);
         assert_eq!(many.more_in_file, 25);
 

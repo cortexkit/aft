@@ -39,6 +39,9 @@ pub struct ScanPolicy {
     /// Which paths (relative to the root) are read past `max_indexed_len`,
     /// such as source files a plane parses. `None` reads none.
     pub read_large: Option<fn(&[u8]) -> bool>,
+    /// An optional stricter read limit for selected paths. Files already
+    /// larger than this limit remain members but are not opened for reading.
+    pub read_limit: Option<fn(&[u8]) -> Option<u64>>,
     /// Ignore files read beside `.gitignore`, such as `.aftignore`.
     pub ignore_files: Vec<String>,
     /// File names that are never members, such as `.DS_Store`.
@@ -55,6 +58,7 @@ impl Default for ScanPolicy {
             max_indexed_len: 1024 * 1024,
             max_read_len: 4 * 1024 * 1024,
             read_large: None,
+            read_limit: None,
             ignore_files: vec![".aftignore".to_string()],
             skip_names: [".DS_Store", "Thumbs.db", "desktop.ini", "Icon\r"]
                 .map(String::from)
@@ -99,8 +103,16 @@ enum SizeClass {
 }
 
 impl ScanPolicy {
+    fn file_limit(&self, relative: &[u8]) -> u64 {
+        self.read_limit
+            .and_then(|limit| limit(relative))
+            .unwrap_or(u64::MAX)
+    }
+
     fn class(&self, relative: &[u8], size: u64) -> SizeClass {
-        if size <= self.max_indexed_len {
+        if size > self.file_limit(relative) {
+            SizeClass::Unread
+        } else if size <= self.max_indexed_len {
             SizeClass::Indexed
         } else if size <= self.max_read_len && self.read_large.is_some_and(|admit| admit(relative))
         {
@@ -577,7 +589,8 @@ fn record_file(
     let limit = match class {
         SizeClass::Large => policy.max_read_len,
         SizeClass::Indexed | SizeClass::Unread => policy.max_indexed_len,
-    };
+    }
+    .min(policy.file_limit(&relative));
     let Ok(bytes) = read_bounded(path, limit) else {
         return Some(unreadable(relative, stat, counters));
     };
@@ -1513,6 +1526,47 @@ mod tests {
 
     fn admits_rust(path: &[u8]) -> bool {
         path.ends_with(b".rs")
+    }
+
+    #[test]
+    fn path_read_limit_keeps_oversized_members_without_reading() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let project = root.join("project.csproj");
+        std::fs::write(&project, vec![b'x'; 65_537]).unwrap();
+        std::fs::write(root.join("other.xml"), vec![b'x'; 65_537]).unwrap();
+        let policy = ScanPolicy {
+            read_limit: Some(|path| path.ends_with(b".csproj").then_some(65_536)),
+            ..ScanPolicy::default()
+        };
+        let sink = Collect::default();
+        let first = scan(root, &policy, None, &sink).unwrap();
+        assert_eq!(first.counters.read, 1);
+        assert_eq!(
+            first.state.get(b"project.csproj").unwrap().kind,
+            PathKind::Oversize
+        );
+        assert!(
+            !sink
+                .read
+                .lock()
+                .unwrap()
+                .contains_key(b"project.csproj".as_slice())
+        );
+        std::fs::write(&project, vec![b'x'; 65_536]).unwrap();
+        let second = scan_paths(
+            root,
+            &policy,
+            &first.state,
+            &[b"project.csproj".to_vec()],
+            &sink,
+        )
+        .unwrap();
+        assert_eq!(second.counters.read, 1);
+        assert_eq!(
+            second.state.get(b"project.csproj").unwrap().kind,
+            PathKind::Text
+        );
     }
 
     #[test]

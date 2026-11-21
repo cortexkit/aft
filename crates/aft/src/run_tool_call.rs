@@ -45,6 +45,8 @@ pub fn is_read_only_request(request: &RawRequest) -> bool {
             | "trace_to"
             | "trace_to_symbol"
             | "trace_data"
+            | "version"
+            | "ping"
     )
 }
 

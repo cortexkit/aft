@@ -619,13 +619,10 @@ fn root_backend_probes() -> &'static Mutex<HashMap<PathBuf, RootBackendProbe>> {
 pub(crate) fn check_remote_backend_while_building(
     ctx: &dyn crate::data_layer::host::IndexHost,
 ) -> RemoteBackendCheck {
-    let building = matches!(
-        &*ctx
-            .semantic_index_status()
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner),
-        SemanticIndexStatus::Building { .. }
-    );
+    let building = ctx
+        .semantic_index_status()
+        .try_read()
+        .is_ok_and(|status| matches!(&*status, SemanticIndexStatus::Building { .. }));
     if !building {
         return RemoteBackendCheck::NotApplicable;
     }

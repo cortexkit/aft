@@ -31,13 +31,15 @@ const ALL: &[&str] = &[
     "session.cover",
     "session.read",
     "session.offsets",
+    "session.offsets_watch",
 ];
 const ADMIT: &[&str] = &["session.admit"];
+const ADMIT_WATCH: &[&str] = &["session.admit", "session.offsets_watch"];
 const READ: &[&str] = &["session.read"];
 const ADMIT_READ: &[&str] = &["session.admit", "session.read"];
 const CLOUD: &[&str] = &["session.admit", "session.cover", "session.read"];
 
-/// The stream-method rows of engram's SESSION_WRITER_CONTRACT at 6ca43ec0.
+/// The stream-method rows of engram's SESSION_WRITER_CONTRACT at bbeca1a9.
 pub const STREAM_REFUSALS: &[StreamRefusal] = &[
     StreamRefusal {
         code: "invalid_request",
@@ -96,7 +98,7 @@ pub const STREAM_REFUSALS: &[StreamRefusal] = &[
     },
     StreamRefusal {
         code: "container_handed_off",
-        methods: ADMIT,
+        methods: ADMIT_WATCH,
         next: FailureClass::Stop,
     },
     StreamRefusal {
@@ -120,7 +122,17 @@ pub const STREAM_REFUSALS: &[StreamRefusal] = &[
         next: FailureClass::Stop,
     },
     StreamRefusal {
-        code: "not_found",
+        code: "cut_import_pending",
+        methods: READ,
+        next: FailureClass::Retry,
+    },
+    StreamRefusal {
+        code: "cut_takeover_closed",
+        methods: READ,
+        next: FailureClass::Stop,
+    },
+    StreamRefusal {
+        code: "cut_range_not_local",
         methods: READ,
         next: FailureClass::Stop,
     },
@@ -136,9 +148,18 @@ pub const STREAM_REFUSALS: &[StreamRefusal] = &[
     },
 ];
 
+// Older engram builds returned not_found for a missing cut on session.read.
+fn legacy_read_refusal(method: &str, code: &str) -> bool {
+    method == "session.read" && code == "not_found"
+}
+
 /// Unknown codes, including known codes on another method, are unavailable and
-/// retryable rather than an invented terminal refusal.
+/// retryable rather than an invented terminal refusal. Legacy read refusals are
+/// preserved separately from the current contract table.
 pub fn classify(method: &str, code: &str) -> FailureClass {
+    if legacy_read_refusal(method, code) {
+        return FailureClass::Stop;
+    }
     STREAM_REFUSALS
         .iter()
         .find(|row| row.code == code && row.methods.contains(&method))
@@ -147,9 +168,10 @@ pub fn classify(method: &str, code: &str) -> FailureClass {
 }
 
 fn normalize(method: &str, mut error: DoorError) -> DoorError {
-    if !STREAM_REFUSALS
-        .iter()
-        .any(|row| row.code == error.code && row.methods.contains(&method))
+    if !legacy_read_refusal(method, &error.code)
+        && !STREAM_REFUSALS
+            .iter()
+            .any(|row| row.code == error.code && row.methods.contains(&method))
     {
         error.code = "unavailable".into();
     }

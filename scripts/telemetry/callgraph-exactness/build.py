@@ -14,6 +14,136 @@ from child_process import child_process, terminal_failure
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[2]
+OLDEST_SUPPORTED = "06503f7fbf9e900fcc2dc9c78e26ff86d1d0d654"
+
+
+def overlay_dead_code(source, sha):
+    """Let the gate compare stored and dead-code rows one caller at a time."""
+    layer = Path("crates/aft/src/data_layer")
+
+    def needs(text, anchor, label):
+        if text.count(anchor) != 1:
+            raise ValueError(f"exactness {sha}: missing or ambiguous {label}: {anchor.strip()!r}; "
+                             f"oldest supported crate-split revision is {OLDEST_SUPPORTED}")
+
+    snapshot = source / layer / "dead_code_snapshot.rs"
+    needs(snapshot.read_text() if snapshot.is_file() else "", "trait EntryPoints {",
+          "crate-split dead-code snapshot interface")
+
+    for filename, method in (("checkout.rs", "fn dead_code_files("),
+                             ("graph_store.rs", "fn parse_of("),
+                             ("graph_store.rs", "fn resolution_of(")):
+        path = source / layer / filename
+        needs(path.read_text() if path.is_file() else "", method, f"per-file read in {filename}")
+
+    content = source / layer / "content.rs"
+    needs(content.read_text() if content.is_file() else "", "fn record_key(",
+          "content::record_key for the exactness artifact's recorded identities")
+
+    for name in ("dead_code/stream.rs", "dead_code/stream", "dead_code_graph/stream.rs"):
+        local = REPO / layer / name
+        dest = source / layer / name
+        if local.is_dir():
+            shutil.copytree(local, dest, dirs_exist_ok=True)
+        else:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(local, dest)
+
+    dead = source / layer / "dead_code.rs"
+    text = dead.read_text()
+    if "mod stream;" not in text:
+        dead.write_text(text + '\n#[cfg(feature = "test-hooks")]\npub(crate) mod stream;\n')
+
+    graph = source / layer / "dead_code_graph.rs"
+    text = graph.read_text()
+    if "mod stream;" in text:
+        return
+
+    def graft(old, new, label):
+        nonlocal text
+        needs(text, old, label)
+        text = text.replace(old, new, 1)
+
+    # The comparison can discard each caller's decoded symbols. Leave the
+    # archive's projection rules and the normal rollup's caching in place.
+    marker = "use crate::data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND;"
+    graft(marker, marker + '\n\n#[cfg(feature = "test-hooks")]\nmod stream;',
+          "dead-code graph module anchor")
+    entry = """    pub(crate) fn project_file(
+        &self,
+        path: &str,
+        classify: &dyn Fn(u32) -> SeedClass,
+        keep_call_lines: bool,
+    ) -> Result<FileProjection, String> {"""
+    implementation = entry.replace("pub(crate) fn project_file(", "fn project_file_in(").replace(
+        "        keep_call_lines: bool,", "        keep_call_lines: bool,\n        streaming: bool,")
+    graft(entry, entry + "\n        self.project_file_in(path, classify, keep_call_lines, false)\n    }\n\n"
+          + implementation,
+          "rollup file projection entry point")
+    graft('''go_initializers: (&*file.language == "go")
+                .then(|| self.go_initializers(path, file, &rows))
+                .flatten(),''', '''go_initializers: if &*file.language == "go" {
+                self.go_initializers(path, file, &rows, streaming)?
+            } else {
+                None
+            },''',
+          "rollup Go projection call")
+    graft("        rows: &FileRows,\n    ) -> Option<GoInitializerGroup> {",
+          "        rows: &FileRows,\n        streaming: bool,\n    ) -> Result<Option<GoInitializerGroup>, String> {",
+          "rollup Go projection signature")
+    graft("if callers.is_empty() {\n            return None;", "if callers.is_empty() {\n            return Ok(None);",
+          "rollup Go projection empty result")
+    graft("let Some(target) = self.indexed(target_file) else {", """let scratch;
+            let target = if streaming && target_file != path {
+                let parse = self.source.parse(target_file)?;
+                scratch = IndexedFile::build(target_file, &parse);
+                &scratch
+            } else if let Some(file) = self.indexed(target_file) {
+                file
+            } else {""", "rollup Go package file read")
+    graft("let mut interned_symbols = BTreeMap::<&str, Arc<str>>::new();",
+          "let mut interned_symbols = BTreeSet::<Arc<str>>::new();", "rollup Go symbol interner")
+    graft("""let symbol = interned_symbols
+                        .entry(&node.scoped_name)
+                        .or_insert_with(|| Arc::from(&*node.scoped_name))
+                        .clone();""", """let symbol = if let Some(symbol) = interned_symbols.get(&*node.scoped_name) {
+                        Arc::clone(symbol)
+                    } else {
+                        let symbol = Arc::<str>::from(&*node.scoped_name);
+                        interned_symbols.insert(Arc::clone(&symbol));
+                        symbol
+                    };""", "rollup Go symbol interning")
+    graft("        Some(GoInitializerGroup {", "        Ok(Some(GoInitializerGroup {", "rollup Go projection result")
+    graft("            targets,\n        })", "            targets,\n        }))", "rollup Go projection result end")
+    graft("    compact_targets: std::sync::atomic::AtomicBool,",
+          "    compact_targets: std::sync::atomic::AtomicBool,\n"
+          "    stream_targets: std::sync::OnceLock<parking_lot::Mutex<stream::Targets>>,",
+          "rollup target cache declaration")
+    graft("            compact_targets: std::sync::atomic::AtomicBool::new(false),",
+          "            compact_targets: std::sync::atomic::AtomicBool::new(false),\n"
+          "            stream_targets: std::sync::OnceLock::new(),", "rollup target cache initialization")
+    graft(""".and_then(|(path, symbol)| self.target(path)?.lookup(symbol))
+                .map(str::to_string);""", ".and_then(|(path, symbol)| self.target_lookup(path, symbol));",
+          "rollup ordinary target lookup")
+    graft(""".and_then(|id| self.target(&target_file)?.node(id))
+                            .is_some_and(|(_, kind)| matches!(kind, "function" | "method")) =>""",
+          ".is_some_and(|id| self.target_is_constructor(&target_file, id)) =>", "rollup construction target lookup")
+    graft("""let target_node = self
+                    .target(&target.file)
+                    .and_then(|file| file.scoped(target.symbol.as_str()))
+                    .map(str::to_string);""", "let target_node = self.target_scoped(&target.file, &target.symbol);",
+          "rollup dispatch target lookup")
+    graft("""self.target(&edge.target_file)?.node(id)
+            })
+            .map(|(name, _)| name)
+            .or(reference.target_symbol.as_deref())
+            .or_else(|| edge.map(|edge| edge.target_symbol.as_str()));""",
+          """self.target_name(&edge.target_file, id)
+            })
+            .or(reference.target_symbol.as_deref().map(std::borrow::Cow::Borrowed))
+            .or_else(|| edge.map(|edge| std::borrow::Cow::Borrowed(edge.target_symbol.as_str())));""",
+          "rollup outbound target lookup")
+    graph.write_text(text)
 
 
 def build(revision, output, profile):
@@ -26,6 +156,7 @@ def build(revision, output, profile):
         tar.extractall(source, filter="data")
     if archive.wait():
         raise RuntimeError("git archive failed")
+    overlay_dead_code(source, sha)
     for name in ("crates/aft/src/data_layer/checkout/exactness.rs", "crates/aft/examples/callgraph_exactness.rs"):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -43,10 +174,10 @@ def build(revision, output, profile):
             raise ValueError("candidate needs explicit integration of the test-only flip_site_for_control hook")
         text = text.replace(anchor, anchor + '\n                        #[cfg(feature = "test-hooks")]\n                        super::checkout::exactness::flip_site_for_control(&path, &mut file);')
     graph.write_text(text)
-    gate = source / "crates/aft/src/data_layer/dead_code_gate.rs"
+    gate = source / "crates/aft/src/inspect/dead_code_gate.rs"
     text = gate.read_text()
     if "fn exactness_rows(" not in text:
-        local = (REPO / "crates/aft/src/data_layer/dead_code_gate.rs").read_text()
+        local = (REPO / "crates/aft/src/inspect/dead_code_gate.rs").read_text()
         helper = local.split("/// All dead-code finding rows,", 1)[1].split("/// Where two aggregates differ,", 1)[0]
         text += "\n/// All dead-code finding rows," + helper
     gate.write_text(text)
@@ -83,7 +214,7 @@ def build(revision, output, profile):
     (output / "build.json").write_text(json.dumps({"source_commit": sha, "profile": profile,
         "command": command, "seconds": time.monotonic() - started,
         "probe_sha256": hashlib.sha256((output / "probe").read_bytes()).hexdigest(),
-        "overlay": "exactness helper/example, cfg(test-hooks) declarations and target-flip hook only"}, indent=2) + "\n")
+        "overlay": "exactness probe, bounded dead-code check and test-hooks integrations only"}, indent=2) + "\n")
     print(f"EXACTNESS BUILT {sha}: {output / 'probe'}", flush=True)
 
 

@@ -21,7 +21,7 @@ use super::incremental_tests::checkout;
 /// files' budget, so with one byte no record is kept: each is read through,
 /// held only by the resolver reading it, and read from disk again when
 /// needed again. Returns the file-reading resolution.
-fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResolution> {
+pub(super) fn records_match_files(inputs: &CheckoutInputs) -> BTreeMap<String, FileResolution> {
     let reference = LiveCheckout::cold(inputs.clone())
         .unwrap()
         .resolved

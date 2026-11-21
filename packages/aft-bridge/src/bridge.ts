@@ -2115,18 +2115,7 @@ export class BinaryBridge implements AftProjectTransport {
         this.settleHangEvidence(id);
         this.clock.clearTimeout(entry.timer);
         entry.onSettled?.();
-        if (
-          response.success !== false &&
-          ![
-            "configure",
-            "version",
-            "status",
-            "ping",
-            "bash_drain_completions",
-            "bash_ack_completions",
-            "cancel_request",
-          ].includes(entry.command)
-        ) {
+        if (entry.command === "tool_call" && response.success === true) {
           this.timeoutRestartAwaitingRecovery = false;
         }
         this.scheduleRestartCountReset();

@@ -32,9 +32,9 @@ use aft_store::text::{
 };
 
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
+use super::content::language_for;
 #[cfg(test)]
 use super::content::EXTRACTOR_VERSION;
-use super::content::{blob_from_record, language_for};
 use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
@@ -42,9 +42,11 @@ use super::query::{SliceReader, SliceSource};
 use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
 use super::refresh_memory::{ColdGrowth, MemoryLimit, RefreshChecks, RefreshMemory, RefreshStop};
 use super::slice::FileSlice;
-use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
+use crate::callgraph_store::join::ParseBlob;
+use conversion::{extract_recorded, parse_record, staged_failure, warn_conversion_failure};
 use staged_records::StagedKind;
 
+mod conversion;
 mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
@@ -55,6 +57,7 @@ mod refresh;
 pub(crate) use refresh::RefreshCounts;
 pub(crate) mod resume;
 pub(crate) mod staged_records;
+mod status_view;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
@@ -719,10 +722,9 @@ impl Change {
     /// ran and failed. Until a refresh extracts it, a changed file is
     /// pending in the call graph, not unparsed.
     fn failed(&self) -> bool {
-        self.content
-            .peek()
-            .is_some_and(|extracted| matches!(extracted, Extracted::Nothing))
-            && self.record.as_ref().is_some_and(is_unparsed)
+        self.content.peek().is_some_and(|extracted| {
+            matches!(extracted, Extracted::Nothing | Extracted::ConversionFailed)
+        }) && self.record.as_ref().is_some_and(is_unparsed)
     }
 }
 
@@ -805,6 +807,8 @@ impl ChangeContent {
 enum Extracted {
     /// Nothing: not a parsed language, not text, or gone.
     Nothing,
+    /// Source extraction returned a record that could not become a parse.
+    ConversionFailed,
     /// Text is available, but the dynamic parse has a typed, rebuildable gap.
     GrammarGap(String),
     /// A parsed file: its parse key and parse, and the content record
@@ -1102,93 +1106,6 @@ impl Checkout {
 
     fn write_live(&self) -> std::sync::RwLockWriteGuard<'_, Live> {
         self.live.write().expect("no panics while holding it")
-    }
-
-    /// The checkout's data as queries see it now: the last publication with
-    /// the changes made since laid over it. `None` until the first build
-    /// publishes.
-    #[must_use]
-    pub fn view(&self) -> Option<CheckoutView> {
-        let live = self.live.read().expect("no panics while holding it");
-        let published = Arc::clone(live.published.as_ref()?);
-        let graph = live.graph.clone().unwrap_or_else(|| {
-            let graph: Arc<dyn SliceSource + Send + Sync> = published.graph.clone();
-            graph
-        });
-        Some(CheckoutView {
-            memory_epoch: Arc::clone(&self.memory_epoch),
-            published,
-            planes: self.planes,
-            text: Arc::clone(&live.text),
-            text_members: Arc::clone(&live.text_members),
-            callgraph_pending: Arc::clone(&live.callgraph_pending),
-            rescanning: live.rescanning,
-            graph,
-            refreshed: live.refreshed.clone(),
-            sequence: live.sequence,
-            unparsed: Arc::clone(&live.unparsed),
-            current: live.state.clone(),
-        })
-    }
-
-    /// How each plane stands, for status and for replies that disclose
-    /// what they could not cover.
-    #[must_use]
-    pub fn status(&self) -> CheckoutStatus {
-        let building = self
-            .live
-            .read()
-            .expect("no panics while holding it")
-            .building;
-        let failed = self
-            .live
-            .read()
-            .expect("no panics while holding it")
-            .failure
-            .is_some();
-        if let Some(view) = self.view() {
-            return CheckoutStatus {
-                building,
-                failed,
-                ..view.status()
-            };
-        }
-        let plane = |on: bool| {
-            if building && on {
-                PlaneStatus::Building {
-                    done: 0,
-                    total: None,
-                }
-            } else {
-                PlaneStatus::Off
-            }
-        };
-        CheckoutStatus {
-            text: plane(self.planes.text),
-            callgraph: plane(self.planes.callgraph),
-            callgraph_published: false,
-            planes: self.planes,
-            callgraph_pending: 0,
-            building,
-            unparsed: 0,
-            failed,
-        }
-    }
-
-    /// Why the last build or call-graph refresh failed, until one succeeds.
-    #[must_use]
-    pub fn failure(&self) -> Option<String> {
-        self.last_failure().map(|failure| failure.error)
-    }
-
-    /// The last failed build or call-graph refresh, until one succeeds.
-    #[must_use]
-    pub fn last_failure(&self) -> Option<Failure> {
-        self.live
-            .read()
-            .expect("no panics while holding it")
-            .failure
-            .clone()
     }
 
     /// Records how a build or refresh (`stage`) ended. A failure replaces
@@ -1747,7 +1664,6 @@ impl Checkout {
         }
         report.files = scanned.state.paths().len();
         report.text_units = collected.text.len();
-        report.extract_failures = collected.failures;
         report.stored_records = collected.reused;
         report.resumed_records = collected.resumed;
         report.scan_ms = elapsed_ms(started);
@@ -1823,7 +1739,7 @@ impl Checkout {
         // decoded size, and the resolver decodes each parse from them when it
         // reads it; the decoded records go before resolving.
         let taking = Instant::now();
-        let (mut inputs, content) = collected.take_inputs(&state);
+        let (mut inputs, content) = collected.take_inputs(&state, &mut report);
         report.parsed_files = inputs.parses.len();
         // What resolution reads is now fixed: an earlier attempt's passes 2-3
         // are reused only when they were resolved from exactly these inputs.
@@ -3182,7 +3098,7 @@ impl Checkout {
                 | Extracted::Markers(stored) => {
                     records.add_encoded(key, Arc::clone(stored));
                 }
-                Extracted::GrammarGap(_) | Extracted::Nothing => {}
+                Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {}
             }
             if !seen.insert(record.content) {
                 continue;
@@ -4389,63 +4305,6 @@ impl CheckoutView {
         })
     }
 
-    /// A dead-code snapshot holding every call row of the call graph, built
-    /// from every file's stored record and fragment in one pass. The rollup
-    /// reads the call graph file by file instead; the dead-code gate uses
-    /// this one as an independent check of that reading.
-    ///
-    /// # Errors
-    ///
-    /// When a record or fragment cannot be read.
-    pub(crate) fn rows_dead_code_snapshot(
-        &self,
-        entry_points: &dyn super::dead_code_snapshot::EntryPoints,
-    ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
-        let (mut parses, mut resolved) = self
-            .published
-            .graph
-            .resolutions()
-            .map_err(DataError::Store)?;
-        // The call graph as callgraph() answers it: what was resolved since
-        // the publication replaces what the publication stored.
-        let state = match &self.refreshed {
-            Some(refreshed) => {
-                for file in &refreshed.removed {
-                    parses.remove(file);
-                    resolved.remove(file);
-                }
-                for (file, refreshed_file) in &refreshed.replaced {
-                    let key = refreshed_file.resolution.record_key();
-                    match &refreshed_file.parse {
-                        Some(parse) => {
-                            parses.insert(file.clone(), (key.to_string(), Arc::clone(parse)));
-                        }
-                        // The publication's parse of this path, read above,
-                        // has the key the file was resolved with.
-                        None => debug_assert_eq!(
-                            parses.get(file).map(|(stored, _)| stored.as_str()),
-                            Some(key)
-                        ),
-                    }
-                    resolved.insert(file.clone(), refreshed_file.resolution.decode(file));
-                }
-                refreshed.state.clone()
-            }
-            None => self.published.state.clone(),
-        };
-        let inputs = CheckoutInputs {
-            state,
-            parses: parses.into(),
-            configs: HashMap::new(),
-        };
-        let rows = super::graph_rows::assemble(&inputs, &resolved);
-        Ok(super::dead_code::snapshot(
-            &self.published.root,
-            &rows,
-            entry_points,
-        ))
-    }
-
     /// The call graph dead code reads, file by file: the publication, with
     /// what was resolved since replacing what it stored, read on demand
     /// rather than all at once (see `dead_code_graph`).
@@ -4717,7 +4576,8 @@ fn next_inputs(
             Some(Extracted::GrammarGap(reason)) => {
                 gaps.insert(path.clone(), reason.clone());
             }
-            Some(Extracted::Markers(_) | Extracted::Nothing) | None => {}
+            Some(Extracted::Markers(_) | Extracted::Nothing | Extracted::ConversionFailed)
+            | None => {}
         }
     }
     Ok(CheckoutInputs {
@@ -4798,40 +4658,6 @@ fn changed_language(record: &PathRecord, bytes: &[u8]) -> String {
         .ok()
         .and_then(|path| language_for(path, bytes))
         .unwrap_or_default()
-}
-
-/// What the call graph reads from a changed file recorded as `source`. As
-/// in a build, a file the extractor fails on is not parsed.
-fn extract_recorded(source: &RecordedSource) -> Extracted {
-    let language = &source.language;
-    let mut extracted = match super::grammar::extract(&source.bytes, language) {
-        Ok(record) => record,
-        Err(error) => {
-            return super::grammar::reason(&error).map_or(Extracted::Nothing, Extracted::GrammarGap)
-        }
-    };
-    if let Ok(path) = std::str::from_utf8(&source.path) {
-        // Without them a configuration file's TODOs are reported unread.
-        let _ = super::content::add_config_markers(&mut extracted, path, &source.bytes);
-    }
-    match &extracted.data {
-        RecordBody::Config { source } => {
-            let source = Arc::from(source.as_slice());
-            Extracted::Config(source, Arc::new(EncodedRecord::of(&extracted)))
-        }
-        RecordBody::Markers => Extracted::Markers(Arc::new(EncodedRecord::of(&extracted))),
-        RecordBody::Parsed { .. } => match blob_from_record(&extracted) {
-            Ok(CallgraphBlob::Parse(parse)) => {
-                let key = crate::data_layer::content::record_key(source.content, language);
-                Extracted::Parse(
-                    key.digest().to_string(),
-                    Arc::new(parse),
-                    Arc::new(EncodedRecord::of(&extracted)),
-                )
-            }
-            _ => Extracted::Nothing,
-        },
-    }
 }
 
 /// The index of the newest segment `find` locates a key in.
@@ -5311,14 +5137,19 @@ impl Collected {
     /// encoded record and decoded when the resolver reads it (see
     /// [`super::callgraph::Parses::encoded`]), so the build never holds the
     /// decoded records and every decoded parse at once.
-    fn take_inputs(&mut self, state: &CheckoutState) -> (CheckoutInputs, InputsContent) {
+    fn take_inputs(
+        &mut self,
+        state: &CheckoutState,
+        report: &mut BuildReport,
+    ) -> (CheckoutInputs, InputsContent) {
+        report.extract_failures = self.failures;
         if let Some((records, entries)) = self.staged.take() {
-            return Self::staged_inputs(state, records, entries);
+            return Self::staged_inputs(state, records, entries, &mut report.extract_failures);
         }
         let mut configs = HashMap::new();
         // A record whose parse does not convert is left out, as reading it
         // decoded would leave it out; checked once while it is at hand.
-        let mut converts = HashMap::<String, bool>::new();
+        let mut converts = HashMap::<String, Result<(), String>>::new();
         for record in state.paths() {
             if record.language.is_empty() {
                 continue;
@@ -5334,9 +5165,9 @@ impl Collected {
                     configs.insert(record.path.clone(), Arc::from(source.as_slice()));
                 }
                 RecordBody::Parsed { .. } => {
-                    converts.entry(parse_key).or_insert_with(|| {
-                        matches!(blob_from_record(stored), Ok(CallgraphBlob::Parse(_)))
-                    });
+                    converts
+                        .entry(parse_key)
+                        .or_insert_with(|| parse_record(stored).map(drop));
                 }
                 RecordBody::Markers => {}
             }
@@ -5353,8 +5184,14 @@ impl Collected {
             let record_key =
                 crate::data_layer::content::record_key(record.content, &record.language);
             let parse_key = record_key.digest().to_string();
-            if converts.get(&parse_key) != Some(&true) {
-                continue;
+            match converts.get(&parse_key) {
+                Some(Ok(())) => {}
+                Some(Err(reason)) => {
+                    report.extract_failures += 1;
+                    warn_conversion_failure(path, reason);
+                    continue;
+                }
+                None => continue,
             }
             let Some(stored) = encoded.get(&record_key) else {
                 continue;
@@ -5378,6 +5215,7 @@ impl Collected {
         state: &CheckoutState,
         records: Arc<staged_records::StagedRecords>,
         entries: HashMap<String, StagedEntry>,
+        failures: &mut usize,
     ) -> (CheckoutInputs, InputsContent) {
         let mut configs = HashMap::new();
         let mut parses = Vec::new();
@@ -5413,8 +5251,12 @@ impl Collected {
                 }
                 StagedKind::Parsed {
                     converts: false, ..
+                } => {
+                    *failures += 1;
+                    let path = String::from_utf8_lossy(&record.path);
+                    warn_conversion_failure(&path, &staged_failure(&records, entry.at, &path));
                 }
-                | StagedKind::Markers => {}
+                StagedKind::Markers => {}
             }
         }
         let units = entries
@@ -5579,7 +5421,7 @@ aft_store::heap_bytes_of_fields!(RecordedSource {
 impl aft_store::heap::HeapBytes for Extracted {
     fn heap_bytes(&self, seen: &mut aft_store::heap::Seen) -> usize {
         match self {
-            Self::Nothing => 0,
+            Self::Nothing | Self::ConversionFailed => 0,
             Self::GrammarGap(reason) => reason.heap_bytes(seen),
             Self::Parse(key, parse, record) => {
                 key.heap_bytes(seen) + parse.heap_bytes(seen) + record.heap_bytes(seen)
@@ -6233,7 +6075,9 @@ impl Checkout {
                         note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
-                    Extracted::GrammarGap(_) | Extracted::Nothing => PathTodos::Unextracted,
+                    Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {
+                        PathTodos::Unextracted
+                    }
                 })
             })
             .collect()
@@ -6572,7 +6416,10 @@ mod tests {
         }
         assert_eq!(policy.0.load(Ordering::Relaxed), 1);
         assert_eq!(
-            view.rows_dead_code_snapshot(&policy).unwrap().entry_points,
+            super::super::dead_code::stream::Rows::new(&view, &policy)
+                .unwrap()
+                .metadata()
+                .entry_points,
             expected
         );
         assert_eq!(policy.0.load(Ordering::Relaxed), 2);
@@ -6829,8 +6676,7 @@ mod tests {
             "walked {walked}, allocated {allocated}"
         );
 
-        let (parses, _) = graph.resolutions().unwrap();
-        let parse = Arc::clone(&parses["src/lib.rs"].1);
+        let (_, parse) = graph.parse_of("src/lib.rs").unwrap();
         let (copy, allocated) = crate::test_allocations::count_bytes(|| ParseBlob::clone(&parse));
         assert!(allocated > 0);
         assert_eq!(heap_bytes_of(&copy), allocated);
@@ -8141,9 +7987,11 @@ pub fn other() { callee(); }
         for pattern in ["pub fn", "nothing to see", "crate::m2", "added1", "marker"] {
             answers.push(format!("{pattern}: {:?}", candidates_for(view, pattern)));
         }
-        let mut snapshot = view
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let mut snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            view,
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
         snapshot.generated_at = None;
         answers.push(format!("{snapshot:?}"));
         answers
@@ -9981,11 +9829,11 @@ pub fn other() { callee(); }
         // The dead-code snapshot follows the refreshed graph: `callee` is
         // still called (from src/extra.rs), and the snapshot equals a cold
         // build's.
-        let mut refreshed_snapshot = checkout
-            .view()
-            .unwrap()
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let mut refreshed_snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            &checkout.view().unwrap(),
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
 
         // The answers equal a cold build of the same files.
         let cold_store = tempfile::tempdir().unwrap();
@@ -10001,11 +9849,11 @@ pub fn other() { callee(); }
             callers_of(&cold.view().unwrap(), "src/util.rs", "callee"),
             after
         );
-        let mut cold_snapshot = cold
-            .view()
-            .unwrap()
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let mut cold_snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            &cold.view().unwrap(),
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
         refreshed_snapshot.generated_at = None;
         cold_snapshot.generated_at = None;
         assert_eq!(
@@ -10125,9 +9973,11 @@ pub fn other() { callee(); }
             Some(PathText::Indexed { distinct }) if distinct > 10
         ));
         assert_eq!(view.path_text(b"missing.rs").unwrap(), None);
-        let snapshot = view
-            .rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)
-            .unwrap();
+        let snapshot = super::super::dead_code::stream::Rows::fixture_snapshot(
+            &view,
+            &crate::inspect::InspectEntryPoints,
+        )
+        .unwrap();
         assert_eq!(snapshot.files.len(), 2, "{:?}", snapshot.files);
         assert!(
             snapshot

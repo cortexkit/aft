@@ -13,19 +13,39 @@ use std::time::Duration;
 struct ReaderCache {
     epoch: u64,
     module: Option<Option<String>>,
+    notice_capable: bool,
 }
 
 impl ReaderCache {
     fn invalidate(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.module = None;
+        self.notice_capable = false;
     }
 
     fn update(&mut self, epoch: u64, modules: &[subc_client_rs::CatalogEntry]) {
         if self.epoch == epoch {
             self.module = Some(crate::subc::rich_ui::display::declared_display(modules));
+            self.notice_capable = modules.iter().any(|entry| {
+                self.module.as_ref().and_then(Option::as_deref) == Some(entry.module_id.as_str())
+                    && entry.capabilities.as_ref().is_some_and(|caps| {
+                        caps.provides.iter().any(|capability| {
+                            capability
+                                == cortexkit_role_tool_display::NOTICE_RECORD_DISPLAY_CAPABILITY
+                        })
+                    })
+            });
         }
     }
+}
+
+pub(super) fn notice_reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
+    let reader = READER.lock();
+    let module = reader
+        .module
+        .as_ref()
+        .ok_or_else(cortexkit_role_tool_display::not_ready)?;
+    Ok(module.clone().filter(|_| reader.notice_capable))
 }
 
 static READER: LazyLock<parking_lot::Mutex<ReaderCache>> = LazyLock::new(Default::default);
@@ -129,6 +149,12 @@ pub(super) async fn publish_one(client: &BusClient) {
     .flatten() else {
         return;
     };
+    if crate::subc::rich_ui::notices::is_notice_id(&id)
+        && (crate::subc::rich_ui::notices::WRITER_CAPABILITY.is_none()
+            || notice_reader().ok().flatten().is_none())
+    {
+        return completed(&id, Err("notice_display_unavailable"));
+    }
     let result = crate::subc::rich_ui::display::announce(id.clone(), pull_bytes, async {
         match body(&id) {
             Ok(bytes) => tokio::time::timeout(
@@ -206,6 +232,40 @@ mod tests {
         assert_eq!(cache.module, Some(None));
         cache.update(cache.epoch, &[]);
         assert_eq!(cache.module, Some(None));
+    }
+
+    #[test]
+    fn notice_records_require_the_discovered_display_server_to_declare_its_token() {
+        use cortexkit_role_tool_display::{
+            NOTICE_RECORD_DISPLAY_CAPABILITY, TOOL_DISPLAY_CAPABILITY,
+        };
+        let module = |id: &str, provides: &[&str]| {
+            serde_json::from_value(serde_json::json!({
+                "module_id":id,"ready":true,"roles":[],"control_ops":[],
+                "capabilities":{"provides":provides,"requires":[],"must_never_reach":[]}
+            }))
+            .unwrap()
+        };
+        let mut cache = ReaderCache::default();
+        cache.update(
+            0,
+            &[
+                module("display", &[TOOL_DISPLAY_CAPABILITY]),
+                module("other", &[NOTICE_RECORD_DISPLAY_CAPABILITY]),
+            ],
+        );
+        assert_eq!(cache.module, Some(Some("display".into())));
+        assert!(!cache.notice_capable);
+        cache.update(
+            0,
+            &[module(
+                "display",
+                &[TOOL_DISPLAY_CAPABILITY, NOTICE_RECORD_DISPLAY_CAPABILITY],
+            )],
+        );
+        assert!(cache.notice_capable);
+        cache.invalidate();
+        assert!(!cache.notice_capable);
     }
     #[test]
     fn display_event_matches_role_wire_vector_without_reader_suffix() {

@@ -28,6 +28,7 @@ use aft_store::ids::{Digest128, FamilyId};
 
 use super::checkout::{Checkout, CheckoutView, DataError, DataLayer, DeltaReport, Folded, Planes};
 use super::meaning::{Meaning, MeaningState, Round};
+use super::vectors::VectorPlane;
 use crate::executor::{JobCancellation, Lane, RootMaintenanceExecutor};
 use crate::write_intent::{WriteIntent, WriteIntentListener, WritePhase};
 
@@ -332,30 +333,58 @@ impl Runner {
     /// to running unadmitted under the daemon: that would put a retired root
     /// to work.
     fn run(&self, request_id: &'static str, pool: Pool, work: impl FnOnce() + Send + 'static) {
+        self.submit(request_id, pool, work, false);
+    }
+
+    fn run_deferred(
+        &self,
+        request_id: &'static str,
+        pool: Pool,
+        work: impl FnOnce() + Send + 'static,
+    ) {
+        self.submit(request_id, pool, work, true);
+    }
+
+    fn submit(
+        &self,
+        request_id: &'static str,
+        pool: Pool,
+        work: impl FnOnce() + Send + 'static,
+        defer_admission: bool,
+    ) {
         let executor = self.executor.lock().clone();
         let Some(executor) = executor else {
             pool.submit(Box::new(work));
             return;
         };
         let cancellation = JobCancellation::new().with_root(&self.root);
-        // The admission job only hands the work to its pool, so it holds the
-        // root's maintenance lane for no longer than that.
-        executor.submit_maintenance(
-            request_id,
-            Lane::MaintenanceCommit,
-            cancellation,
-            Box::new(move || {
-                // The executor gave the admitted job the root's lifecycle; a
-                // fresh token with the same root and lifecycle lets the pool
-                // job see the root unbind at its checkpoints.
-                let token = crate::executor::current_job_cancellation().map(|token| token.fresh());
-                pool.submit(Box::new(move || {
-                    let _cancel = token.map(crate::executor::install_job_cancellation);
-                    work();
-                }));
-                crate::protocol::Response::success(request_id, serde_json::Value::Null)
-            }),
-        );
+        let admit = move || {
+            // The admission job only hands the work to its pool, so it holds
+            // the root's maintenance lane for no longer than that.
+            executor.submit_maintenance(
+                request_id,
+                Lane::MaintenanceCommit,
+                cancellation,
+                Box::new(move || {
+                    // The executor gave the admitted job the root's lifecycle;
+                    // carry it to the pool so the job can see an unbind.
+                    let token =
+                        crate::executor::current_job_cancellation().map(|token| token.fresh());
+                    pool.submit(Box::new(move || {
+                        let _cancel = token.map(crate::executor::install_job_cancellation);
+                        work();
+                    }));
+                    crate::protocol::Response::success(request_id, serde_json::Value::Null)
+                }),
+            );
+        };
+        if defer_admission {
+            // The executor checks that the root directory exists. Do that
+            // in the pool so status can reply without waiting for disk I/O.
+            pool.submit(Box::new(admit));
+        } else {
+            admit();
+        }
     }
 }
 
@@ -1336,6 +1365,28 @@ impl Work {
         })
     }
 
+    fn rebuild_meaning_coverage(self: &Arc<Self>, plane: &Arc<VectorPlane>) {
+        if self.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(rebuild) = plane.request_coverage_rebuild() else {
+            return;
+        };
+        let work = Arc::clone(self);
+        self.runner
+            .run_deferred("data-layer-meaning-coverage", Pool::Fill, move || {
+                #[cfg(test)]
+                super::vectors::status_member_builds_for_test();
+                if rebuild.run(|plane| {
+                    work.stopped.load(Ordering::Acquire)
+                        || crate::executor::current_job_cancelled()
+                        || !work.meaning.is_current_plane(plane)
+                }) {
+                    work.signal_status_change();
+                }
+            });
+    }
+
     /// Tells the status listener, if any, that the checkout's status may
     /// have changed.
     fn notify_status_change(&self) {
@@ -1352,6 +1403,10 @@ impl Work {
         }
         #[cfg(test)]
         drop(paused);
+        self.signal_status_change();
+    }
+
+    fn signal_status_change(&self) {
         self.checkout.notify_readiness_change();
         let listener = self
             .status_listener
@@ -2152,8 +2207,8 @@ impl DataCheckout {
         self.work.checkout.note_outcome(stage, result);
     }
 
-    /// Calls `notify` whenever a build, call-graph refresh or meaning fill
-    /// round of this checkout ends, so status pushes follow the data layer.
+    /// Calls `notify` when this checkout publishes work or updates its cached
+    /// measurements, so status pushes follow the data layer.
     /// Replaces any earlier listener.
     pub(crate) fn on_status_change(&self, notify: StatusListener) {
         self.disk_measurement.on_change(&notify);
@@ -2225,8 +2280,15 @@ impl DataCheckout {
         self.work.meaning.state(self.view().as_ref())
     }
 
-    pub(crate) fn cached_meaning_status(&self) -> MeaningState {
-        self.work.meaning.cached_state(self.view().as_ref())
+    pub(crate) fn cached_meaning_status(&self, view: Option<&CheckoutView>) -> MeaningState {
+        self.work
+            .meaning
+            .cached_state(view, |plane| self.work.rebuild_meaning_coverage(plane))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn meaning_plane_for_test(&self) -> Arc<VectorPlane> {
+        self.work.meaning.plane_for_test()
     }
 
     #[cfg(test)]

@@ -872,12 +872,33 @@ impl LiveCheckout {
             })
             .cloned()
             .collect::<Vec<_>>();
+        let project_keys = changed
+            .iter()
+            .filter(|path| {
+                let path = path.as_bytes();
+                old.state.get(path).map(|record| record.kind)
+                    != inputs.state.get(path).map(|record| record.kind)
+                    || old.configs.get(path) != inputs.configs.get(path)
+            })
+            .flat_map(|path| {
+                use crate::callgraph_store::join::dispatch::CSharpProjects;
+                [
+                    Some(CSharpProjects::import_dependency(path)),
+                    CSharpProjects::membership_folder(path.as_bytes())
+                        .map(|folder| CSharpProjects::dependency(&folder)),
+                ]
+                .into_iter()
+                .flatten()
+            })
+            .collect::<BTreeSet<_>>();
         if budget.is_some() {
             // A module move can invalidate thousands of method readers even
             // when few paths changed. Admit those declaration readers before
             // binding or resolving other files, rather than waiting until
             // method-call sites are processed.
-            let keys = MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents, guard)?;
+            let mut keys =
+                MethodCallInputs::changed_parse_method_keys(&old, inputs, &contents, guard)?;
+            keys.extend(project_keys.iter().cloned());
             let readers = self.reverse.sites_of(&keys, guard)?;
             admit(&mut budget, Stage::MethodReaders, &readers)?;
         }
@@ -1345,7 +1366,7 @@ impl LiveCheckout {
         super::refresh_probe::stage("sites");
         guard.boundary()?;
         let started = Instant::now();
-        let mut site_keys = BTreeSet::new();
+        let mut site_keys = project_keys;
         let mut sites = contents.clone();
         let touched = resolve
             .iter()

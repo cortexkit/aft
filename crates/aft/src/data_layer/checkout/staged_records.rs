@@ -35,7 +35,6 @@ use aft_store::ids::{Digest128, FamilyId};
 
 use super::resume::{self, FileSum, Header, Marker};
 use super::DataError;
-use crate::callgraph_store::join::CallgraphBlob;
 
 /// A staging segment is finished and a new one started past this many
 /// bytes, well below the largest segment a file may hold.
@@ -83,8 +82,8 @@ impl StagedKind {
     pub(crate) fn of(record: &ContentRecord) -> Self {
         match &record.data {
             RecordBody::Config { source } => Self::Config(Arc::from(source.as_slice())),
-            RecordBody::Parsed { .. } => match super::super::content::blob_from_record(record) {
-                Ok(CallgraphBlob::Parse(parse)) => Self::Parsed {
+            RecordBody::Parsed { .. } => match super::conversion::parse_record(record) {
+                Ok(parse) => Self::Parsed {
                     converts: true,
                     kinds: super::super::callgraph::list_kinds(&parse),
                 },

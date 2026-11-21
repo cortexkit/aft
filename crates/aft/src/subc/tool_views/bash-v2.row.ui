@@ -1,6 +1,1 @@
-<ToolHeader icon="terminal" title={input.description ?? input.command}>
-<Slot width="narrow" needs={view.completion ?? view.record}>
-{(view.completion.endReason ?? view.record.endReason) == "timed_out" || (view.completion.endReason ?? view.record.endReason) == "killed" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true
- ? <ToolText text="Failed" size="small" tone="danger" /> : null}
-</Slot>
-</ToolHeader>
+<ToolHeader icon="terminal" title={input.description ?? input.command} failed={(view.completion.endReason ?? view.record.endReason) == "timed_out" || (view.completion.endReason ?? view.record.endReason) == "killed" || ((view.completion.exitCode ?? view.record.exitCode) ?? 0) != 0 || view.call.isError == true} />

@@ -1295,6 +1295,37 @@ pub(super) fn resolve_dispatch_type_names<I: super::ResolverIndex>(
                 }
             }
         }
+        if let Some(facts) = &parse.dispatch.static_facts {
+            let candidates = facts.import_receivers().collect::<BTreeSet<_>>();
+            for (name, module) in candidates {
+                let Some(target) = index.module_target(file, module) else {
+                    continue;
+                };
+                let requested = parse
+                    .imports
+                    .iter()
+                    .filter(|import| import.module_path == module && !import.type_only)
+                    .find_map(|import| {
+                        if import.default_import.as_deref() == Some(name) {
+                            Some("default")
+                        } else {
+                            import
+                                .names
+                                .iter()
+                                .find(|spec| crate::imports::specifier_local_name(spec) == name)
+                                .map(|spec| crate::imports::specifier_imported_name(spec))
+                        }
+                    });
+                let bound = requested.and_then(|requested| {
+                    super::resolve_exported_symbol(index, &target, requested, 0)
+                });
+                // A present module with no resolvable export is not an external package.
+                targets.insert(
+                    format!("{}{name}", dispatch::STATIC_IMPORT_PREFIX),
+                    bound.unwrap_or((target, String::new())),
+                );
+            }
+        }
         return targets;
     }
     let mut names = dispatch_type_names(parse);

@@ -32,6 +32,7 @@ pub(crate) use display::with_test_reader;
 pub(crate) mod readers;
 pub(crate) mod status;
 mod views;
+pub(crate) use views::{NoticeViewsReady, NOTICE_VIEWS_READY};
 
 const SCAN_BATCH: usize = 64;
 const MAX_BACKOFF: Duration = Duration::from_secs(60);
@@ -111,6 +112,10 @@ pub(crate) fn display_reader() -> Result<Option<String>, subc_protocol::ErrorBod
     display::reader()
 }
 
+pub(crate) fn notice_display_reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
+    display::notice_reader()
+}
+
 pub(crate) struct Worker {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
@@ -145,6 +150,7 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
                 .build()
             else {
                 failure("bus_runtime");
+                NOTICE_VIEWS_READY.fail("bus_runtime");
                 return;
             };
             runtime.block_on(async {
@@ -153,8 +159,12 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
                     _ = readers::sweep_cards() => {},
                 }
             });
+            NOTICE_VIEWS_READY.fail("bus_worker_stopped");
         })
-        .map_err(|_| failure("bus_worker"))
+        .map_err(|_| {
+            failure("bus_worker");
+            NOTICE_VIEWS_READY.fail("bus_worker");
+        })
         .ok()?;
     Some(Worker {
         stop: Some(stop),

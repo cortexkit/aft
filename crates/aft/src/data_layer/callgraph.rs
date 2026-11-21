@@ -69,6 +69,22 @@ pub(crate) struct CheckoutInputs {
     pub(crate) configs: HashMap<Vec<u8>, Arc<[u8]>>,
 }
 
+impl CheckoutInputs {
+    fn csharp_projects(&self) -> crate::callgraph_store::join::dispatch::CSharpProjects {
+        crate::callgraph_store::join::dispatch::CSharpProjects::new(
+            self.state.directory_records(b"").map(|record| {
+                (
+                    record.path.as_slice(),
+                    self.configs
+                        .get(&record.path)
+                        .filter(|_| record.language == super::content::CSHARP_PROJECT_CONFIG)
+                        .map(|markers| markers.as_ref()),
+                )
+            }),
+        )
+    }
+}
+
 /// Every parsed file's record key and parse output, by path, in path order.
 ///
 /// Built in memory, every entry holds its parse. Read from a publication,
@@ -1951,8 +1967,14 @@ pub(crate) fn resolve_checkout_into(
         // member name first, with each site's result going to a sorted run
         // (see `key_order`).
         let started = std::time::Instant::now();
-        let (answers, mut results) =
-            key_order::resolve(&source, &paths, spool.dir(), budget, memory.as_deref_mut())?;
+        let (answers, mut results) = key_order::resolve(
+            &source,
+            &paths,
+            &inputs.csharp_projects(),
+            spool.dir(),
+            budget,
+            memory.as_deref_mut(),
+        )?;
         let sites_ms = started.elapsed().as_millis();
         // Assembly reads each file's record once, from disk, in path order;
         // the records the cache kept are let go.
@@ -2530,6 +2552,7 @@ pub(crate) struct MethodCallInputs {
     methods: HashMap<String, BTreeSet<String>>,
     /// Method name to the Go files of `own` whose interfaces require it.
     go_required: HashMap<String, BTreeSet<String>>,
+    static_types: HashMap<String, BTreeSet<String>>,
     /// Every file whose method-call inputs the resolver computed itself, on
     /// its own thread, the first time it read the file.
     computed_while_resolving: FirstReads,
@@ -2634,6 +2657,14 @@ impl MethodCallInputs {
     /// Files `path` in memory as declaring `file`'s methods.
     fn file(&mut self, path: &str, file: &SiteFile) {
         self.own.insert(path.to_string());
+        if let Some(facts) = &file.parse.dispatch.static_facts {
+            for key in facts.type_keys(&file.parse.language) {
+                self.static_types
+                    .entry(key)
+                    .or_default()
+                    .insert(path.to_string());
+            }
+        }
         for name in file.method_names() {
             self.methods
                 .entry(name.to_string())
@@ -2649,6 +2680,13 @@ impl MethodCallInputs {
     }
 
     fn unfile(&mut self, path: &str, file: &SiteFile) {
+        if let Some(facts) = &file.parse.dispatch.static_facts {
+            for key in facts.type_keys(&file.parse.language) {
+                if let Some(files) = self.static_types.get_mut(&key) {
+                    files.remove(path);
+                }
+            }
+        }
         for name in file.method_names() {
             if let Some(files) = self.methods.get_mut(name) {
                 files.remove(path);
@@ -2744,9 +2782,10 @@ impl MethodCallInputs {
             return Ok(Vec::new());
         }
         let source = SiteSource::new(inputs, resolved, self, guard)?;
+        let projects = inputs.csharp_projects();
         let results = if paths.len() <= SMALL_SITE_RUN {
             source.load_declarers(paths, guard)?;
-            let resolver = Resolver::over(&source);
+            let resolver = Resolver::over(&source).with_csharp_projects(&projects);
             resolve_chunk(inputs, &source, &resolver, paths, guard)
         } else {
             let chunk = paths
@@ -2760,7 +2799,7 @@ impl MethodCallInputs {
                     let _label = carry.enter();
                     // The resolver and its memo are single-threaded caches
                     // over the shared source: one per chunk of files.
-                    let resolver = Resolver::over(&source);
+                    let resolver = Resolver::over(&source).with_csharp_projects(&projects);
                     resolve_chunk(inputs, &source, &resolver, chunk, guard)
                 })
                 .collect::<Result<Vec<_>, _>>()
@@ -2955,6 +2994,14 @@ impl<'a, 's: 'a> DispatchFiles<'a> for SiteSource<'s> {
     fn files_with_method(&self, name: &str) -> Vec<String> {
         let mut files = self.stored_files(aft_store::graph::TermKind::MethodName, name);
         if let Some(own) = self.calls.methods.get(name) {
+            files.extend(own.iter().cloned());
+        }
+        files.into_iter().collect()
+    }
+
+    fn files_with_static_type(&self, key: &str) -> Vec<String> {
+        let mut files = self.stored_files(aft_store::graph::TermKind::StaticType, key);
+        if let Some(own) = self.calls.static_types.get(key) {
             files.extend(own.iter().cloned());
         }
         files.into_iter().collect()
@@ -3339,6 +3386,7 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
     own,
     methods,
     go_required,
+    static_types,
     computed_while_resolving,
 });
 #[cfg(not(feature = "callgraph-shape-census"))]
@@ -3348,5 +3396,6 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
     own,
     methods,
     go_required,
+    static_types,
     computed_while_resolving,
 });

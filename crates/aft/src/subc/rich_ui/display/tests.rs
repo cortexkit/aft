@@ -1123,7 +1123,7 @@ fn a_running_hold_preserves_observed_remote_execution() {
     assert!(writes[0].body.get("endReason").is_none());
 }
 
-fn test_writer(database: PathBuf) -> Writer {
+pub(super) fn test_writer(database: PathBuf) -> Writer {
     let (wake, _receiver) = tokio::sync::mpsc::channel(1);
     Writer {
         outbox: Mutex::new(Outbox::new()),

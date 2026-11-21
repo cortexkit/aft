@@ -100,6 +100,7 @@ struct EncodedRecord {
     heap: usize,
     methods: Vec<String>,
     go_required: Vec<String>,
+    static_types: Vec<String>,
     census: RecordCensus,
 }
 
@@ -122,6 +123,7 @@ pub(crate) struct RecordWriter {
     methods: HashMap<String, Vec<String>>,
     /// Method name to the Go files whose interfaces require it.
     go_required: HashMap<String, Vec<String>>,
+    static_types: HashMap<String, Vec<String>>,
     census: RecordCensus,
 }
 
@@ -145,6 +147,7 @@ impl RecordWriter {
             placed: Vec::new(),
             methods: HashMap::new(),
             go_required: HashMap::new(),
+            static_types: HashMap::new(),
             census: RecordCensus::default(),
         })
     }
@@ -190,6 +193,14 @@ impl RecordWriter {
                         .go_required()
                         .into_iter()
                         .map(str::to_string)
+                        .collect(),
+                    static_types: record
+                        .facts()
+                        .dispatch
+                        .static_facts
+                        .as_ref()
+                        .into_iter()
+                        .flat_map(|facts| facts.type_keys(&record.facts().language))
                         .collect(),
                     census: RecordCensus {
                         heap,
@@ -276,6 +287,12 @@ impl RecordWriter {
                 .or_default()
                 .push(record.path.clone());
         }
+        for key in record.static_types {
+            self.static_types
+                .entry(key)
+                .or_default()
+                .push(record.path.clone());
+        }
         for name in record.go_required {
             self.go_required
                 .entry(name)
@@ -354,6 +371,7 @@ impl RecordWriter {
             placed: self.placed,
             methods: self.methods,
             go_required: self.go_required,
+            static_types: self.static_types,
             disk_bytes: self.written,
             cache: Mutex::new(RecordCache::new(cache_bytes, files)),
             error: Mutex::new(None),
@@ -637,6 +655,7 @@ pub(super) struct RecordSource {
     methods: HashMap<String, Vec<String>>,
     /// Method name to the Go files whose interfaces require it.
     go_required: HashMap<String, Vec<String>>,
+    static_types: HashMap<String, Vec<String>>,
     disk_bytes: u64,
     cache: Mutex<RecordCache>,
     error: Mutex<Option<String>>,
@@ -970,6 +989,14 @@ impl<'a, 's: 'a> DispatchFiles<'a> for Pinned<'s> {
 
     fn files_with_method(&self, name: &str) -> Vec<String> {
         self.source.methods.get(name).cloned().unwrap_or_default()
+    }
+
+    fn files_with_static_type(&self, key: &str) -> Vec<String> {
+        self.source
+            .static_types
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
     }
 
     fn files_in(&self, directory: &str) -> Vec<String> {

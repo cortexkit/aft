@@ -27,6 +27,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -601,6 +602,10 @@ struct Subset {
 }
 
 impl Members {
+    fn matches(&self, view: &str, parse_gaps: Digest128, generation: Generation) -> bool {
+        self.view == view && self.parse_gaps == parse_gaps && self.generation == generation
+    }
+
     /// The members of the files `included` names, by file, prepared for
     /// `index`; kept for the next search that names the same files.
     fn subset(
@@ -1160,12 +1165,67 @@ pub struct VectorPlane {
     max_files: usize,
     loaded: Mutex<Arc<Loaded>>,
     members: Mutex<Option<Arc<Members>>>,
+    coverage_rebuild: AtomicU8,
     fill_queue: Mutex<Option<FillQueue>>,
     /// The old meaning index whose vectors fills take where they match.
     old: Option<OldIndex>,
     /// When a fill round merges the family's vector segments.
     merge: MergeLimits,
     merge_due: Mutex<Option<(Generation, u64)>>,
+}
+
+const REBUILD_IDLE: u8 = 0;
+const REBUILD_RUNNING: u8 = 1;
+const REBUILD_DIRTY: u8 = 2;
+
+/// Owns the plane's single queued or running status rebuild. Dropping the
+/// job without running it (for example, on executor refusal) makes it idle.
+pub(super) struct CoverageRebuild {
+    plane: Arc<VectorPlane>,
+    active: bool,
+}
+
+impl CoverageRebuild {
+    pub(super) fn run(mut self, cancelled: impl Fn(&Arc<VectorPlane>) -> bool) -> bool {
+        let mut surveyed = false;
+        loop {
+            // Pick up requests made while queued by reading the latest view.
+            // Requests arriving after this point get one more cache check.
+            self.plane
+                .coverage_rebuild
+                .store(REBUILD_RUNNING, Ordering::Release);
+            if cancelled(&self.plane) {
+                return false;
+            }
+            if let Some(view) = self.plane.checkout.view() {
+                surveyed |= self.plane.snapshot(&view).is_ok();
+            }
+            if self
+                .plane
+                .coverage_rebuild
+                .compare_exchange(
+                    REBUILD_RUNNING,
+                    REBUILD_IDLE,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                self.active = false;
+                return surveyed && !cancelled(&self.plane);
+            }
+        }
+    }
+}
+
+impl Drop for CoverageRebuild {
+    fn drop(&mut self) {
+        if self.active {
+            self.plane
+                .coverage_rebuild
+                .store(REBUILD_IDLE, Ordering::Release);
+        }
+    }
 }
 
 fn elapsed_ms(started: Instant) -> f64 {
@@ -1183,6 +1243,7 @@ impl VectorPlane {
             max_files,
             loaded: Mutex::new(Arc::new(Loaded::empty())),
             members: Mutex::new(None),
+            coverage_rebuild: AtomicU8::new(REBUILD_IDLE),
             fill_queue: Mutex::new(None),
             old: None,
             merge: MergeLimits::default(),
@@ -1261,32 +1322,63 @@ impl VectorPlane {
             return Ok(held);
         }
         let newest = parts.family.newest_generation().map_err(store_error)?;
+        if held.generation >= newest {
+            return Ok(held);
+        }
+        let read = Arc::new(Loaded::read(&parts, &self.producer.model, &held)?);
         let mut loaded = self.loaded.lock().expect("no panics while holding it");
-        if loaded.generation >= newest {
+        if loaded.generation >= read.generation {
             return Ok(Arc::clone(&loaded));
         }
-        let read = Arc::new(Loaded::read(&parts, &self.producer.model, &loaded)?);
-        *loaded = Arc::clone(&read);
+        let retired = std::mem::replace(&mut *loaded, Arc::clone(&read));
         self.checkout.touch_memory();
+        drop(loaded);
+        drop(retired);
         Ok(read)
     }
 
-    /// The members of `view` under `loaded`, built once per view state and
-    /// generation.
+    /// The members of the pinned `view` and `loaded` pair. Only the current
+    /// pair can populate the shared cache.
     fn members(&self, view: &CheckoutView, loaded: &Loaded) -> Result<Arc<Members>, DataError> {
+        self.members_with(view, loaded, || {
+            Members::build(view, loaded, self.max_files)
+        })
+    }
+
+    fn members_with(
+        &self,
+        view: &CheckoutView,
+        loaded: &Loaded,
+        build: impl FnOnce() -> Result<Members, DataError>,
+    ) -> Result<Arc<Members>, DataError> {
         let key = view.text_generation();
-        let mut cached = self.members.lock().expect("no panics while holding it");
-        if let Some(members) = cached.as_ref().filter(|members| {
-            members.view == key
-                && members.parse_gaps == view.parse_gaps_identity()
-                && members.generation == loaded.generation
-        }) {
+        let parse_gaps = view.parse_gaps_identity();
+        let matches = |members: &Arc<Members>| members.matches(&key, parse_gaps, loaded.generation);
+        let cached = self.members.lock().expect("no panics while holding it");
+        if let Some(members) = cached.as_ref().filter(|members| matches(members)) {
             return Ok(Arc::clone(members));
         }
-        let members = Arc::new(Members::build(view, loaded, self.max_files)?);
-        *cached = Some(Arc::clone(&members));
-        self.checkout.touch_memory();
-        Ok(members)
+        drop(cached);
+        let members = Arc::new(build()?);
+        let Some((selected, retired)) = self.checkout.with_current_meaning_view(view, || {
+            // Keep both identities stable through installation. Searches
+            // that pinned older inputs still get their own coherent survey.
+            let current = self.loaded.lock().expect("no panics while holding it");
+            if current.generation != loaded.generation {
+                return (Arc::clone(&members), None);
+            }
+            let mut cached = self.members.lock().expect("no panics while holding it");
+            if let Some(existing) = cached.as_ref().filter(|existing| matches(existing)) {
+                return (Arc::clone(existing), None);
+            }
+            let retired = cached.replace(Arc::clone(&members));
+            self.checkout.touch_memory();
+            (Arc::clone(&members), retired)
+        }) else {
+            return Ok(members);
+        };
+        drop(retired);
+        Ok(selected)
     }
 
     /// How much of `view` meaning search covers now.
@@ -1319,22 +1411,55 @@ impl VectorPlane {
         })
     }
 
-    /// A snapshot only if a producer already surveyed this exact text view and
-    /// vector generation. Status must not rebuild members on the push thread.
+    /// A snapshot only if this exact text view and vector generation were
+    /// already surveyed. Status must not rebuild members on its own thread.
     pub(crate) fn cached_snapshot(&self, view: &CheckoutView) -> Option<MeaningSnapshot> {
-        let loaded = Arc::clone(&*self.loaded.try_lock().ok()?);
-        let cached = self.members.try_lock().ok()?;
-        let members = cached.as_ref().filter(|members| {
-            members.view == view.text_generation()
-                && members.parse_gaps == view.parse_gaps_identity()
-                && members.generation == loaded.generation
-        })?;
+        let key = view.text_generation();
+        let parse_gaps = view.parse_gaps_identity();
+        let (loaded, members) = {
+            let loaded = self.loaded.try_lock().ok()?;
+            let cached = self.members.try_lock().ok()?;
+            let members = cached
+                .as_ref()
+                .filter(|members| members.matches(&key, parse_gaps, loaded.generation))?;
+            (Arc::clone(&loaded), Arc::clone(members))
+        };
         Some(MeaningSnapshot {
             loaded,
-            members: Arc::clone(members),
+            members,
             root: view.root().to_path_buf(),
             dimensions: self.producer.model.dimensions as usize,
         })
+    }
+
+    pub(super) fn request_coverage_rebuild(self: &Arc<Self>) -> Option<CoverageRebuild> {
+        let previous = self.coverage_rebuild.swap(REBUILD_DIRTY, Ordering::AcqRel);
+        (previous == REBUILD_IDLE).then(|| CoverageRebuild {
+            plane: Arc::clone(self),
+            active: true,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_members_lock_for_test(&self, run: impl FnOnce()) {
+        let _members = self.members.lock().unwrap();
+        run();
+    }
+
+    #[cfg(feature = "test-hooks")]
+    fn hold_members_for_status_test(&self) {
+        let Some(gate) = std::env::var_os("AFT_TEST_VECTOR_MEMBERS_GATE").map(PathBuf::from) else {
+            return;
+        };
+        if !gate.exists() {
+            return;
+        }
+        let _owner = self.members.lock().expect("no panics while holding it");
+        std::fs::write(gate.with_extension("waiting"), b"").expect("signal vector members gate");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while gate.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Reads the family's newest generation, if it is newer than the one
@@ -1540,6 +1665,8 @@ impl VectorPlane {
         let Some(view) = self.checkout.view() else {
             return Ok(report);
         };
+        #[cfg(feature = "test-hooks")]
+        self.hold_members_for_status_test();
         let parts = self.checkout.vector_parts();
         let model = &self.producer.model;
         let dimensions = model.dimensions as usize;
@@ -2440,6 +2567,7 @@ impl VectorPlane {
             max_files: _,
             loaded,
             members,
+            coverage_rebuild: _,
             fill_queue,
             old,
             merge: _,
@@ -2529,6 +2657,74 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap()
+    }
+
+    #[test]
+    fn vectors_discard_members_built_for_a_superseded_generation() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let view = checkout.view().unwrap();
+        let old = plane.load().unwrap();
+        let mut latest = None;
+        let survey = plane
+            .members_with(&view, &old, || {
+                assert!(
+                    plane.members.try_lock().is_ok(),
+                    "members locked during build"
+                );
+                assert!(
+                    plane.loaded.try_lock().is_ok(),
+                    "loaded locked during build"
+                );
+                let survey = Members::build(&view, &old, 100)?;
+                let mut vectors = VectorSectionsBuilder::new(producer().model).unwrap();
+                vectors
+                    .add_vector(TextDigest::of(b"new"), &vector_of("new"))
+                    .unwrap();
+                VectorPlane::publish(&checkout.vector_parts(), vectors)?;
+                plane.refresh()?;
+                latest = Some(plane.snapshot(&view)?);
+                Ok(survey)
+            })
+            .unwrap();
+        // The caller still sees its pinned generation, but it cannot replace
+        // the survey that a later caller published for the new generation.
+        let latest = latest.unwrap();
+        assert_eq!(survey.generation, old.generation);
+        assert!(latest.loaded.generation > old.generation);
+        let cached = plane.cached_snapshot(&view).expect("new survey was lost");
+        assert!(Arc::ptr_eq(&cached.members, &latest.members));
+    }
+
+    #[test]
+    fn vectors_discard_members_built_for_a_superseded_view() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let view = checkout.view().unwrap();
+        let loaded = plane.load().unwrap();
+        let mut latest = None;
+        plane
+            .members_with(&view, &loaded, || {
+                let survey = Members::build(&view, &loaded, 100)?;
+                write(dir.path(), "src/lib.rs", "pub fn edited() {}\n");
+                checkout.record_paths(&[b"src/lib.rs".to_vec()])?;
+                latest = Some(plane.snapshot(&checkout.view().unwrap())?);
+                Ok(survey)
+            })
+            .unwrap();
+        let settled_view = checkout.view().unwrap();
+        assert_ne!(settled_view.text_generation(), view.text_generation());
+        let latest = latest.unwrap();
+        let cached = plane
+            .cached_snapshot(&settled_view)
+            .expect("new survey was lost");
+        assert!(Arc::ptr_eq(&cached.members, &latest.members));
     }
 
     #[test]

@@ -181,7 +181,7 @@ process.stdin.on("data", (chunk) => {
     }
   });
 
-  test("a watchdog restart is not repeated before a tool recovers", async () => {
+  test("only a successful agent tool rearms the watchdog after a restart", async () => {
     const script = writeExecutable(
       "startup-hang.js",
       `#!/usr/bin/env node
@@ -193,8 +193,9 @@ process.stdin.on("data", chunk => {
   while ((newline = buffer.indexOf("\\n")) !== -1) {
     const req = JSON.parse(buffer.slice(0, newline));
     buffer = buffer.slice(newline + 1);
-    if (["configure", "version", "recovered"].includes(req.command)) {
-      process.stdout.write(JSON.stringify({id: req.id, success: true, version: "99.0.0", warnings: []}) + "\\n");
+    if (["configure", "version", "bash_status", "tool_call"].includes(req.command)) {
+      const success = req.name === "fails" ? false : req.name === "no_success" ? undefined : true;
+      process.stdout.write(JSON.stringify({id: req.id, success, version: "99.0.0", warnings: []}) + "\\n");
     }
   }
 });
@@ -234,9 +235,14 @@ process.stdin.on("data", chunk => {
       // its tools have made it past the same index startup work.
       await bridge.send("configure", {}, { timeoutMs: 5000 });
       await bridge.send("version");
+      expect((await bridge.send("bash_status")).success).toBe(true);
       expect(await silentPair()).toBe("Error");
       expect(bridge.isAlive()).toBe(true);
-      await bridge.send("recovered");
+      expect((await bridge.send("tool_call", { name: "fails" })).success).toBe(false);
+      expect((await bridge.send("tool_call", { name: "no_success" })).success).toBeUndefined();
+      expect(await silentPair()).toBe("Error");
+      expect(bridge.isAlive()).toBe(true);
+      expect((await bridge.send("tool_call", { name: "outline" })).success).toBe(true);
       expect(await silentPair()).toBe("BridgeRestartedError");
       expect(bridge.isAlive()).toBe(false);
     } finally {

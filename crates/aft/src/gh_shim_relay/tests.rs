@@ -2114,6 +2114,40 @@ fn read_relay_uses_github_read_and_the_ticket_scope_without_identity_fields() {
 }
 
 #[test]
+fn read_relay_logs_only_the_admitted_get_path_template() {
+    let session = "ses-read-path-log";
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue(session, "read-call", "/p");
+    let transport = FakeTransport::scoped();
+    let mut params = read_params(ticket.value().unwrap());
+    params["request"]["args"]["query"] = json!({"per_page": "81"});
+
+    let ((refused, _), lines) = crate::logging::capture_log_lines(|| {
+        run(&transport, READ_REQUEST_OPERATION, params.clone())
+    });
+    assert!(!refused.ok);
+    assert!(lines.iter().all(|line| !line.contains("gh relay read:")));
+
+    let ((relayed, _), lines) = crate::logging::capture_log_lines(|| {
+        run_with_scopes(
+            &transport,
+            READ_REQUEST_OPERATION,
+            params,
+            &scopes_for(session, Some(read_worker_stamp())),
+        )
+    });
+    assert!(relayed.ok);
+    let path_lines: Vec<_> = lines
+        .iter()
+        .map(String::as_str)
+        .filter(|line| line.contains("gh relay read:"))
+        .collect();
+    assert_eq!(
+        path_lines,
+        ["INFO gh relay read: GET /repos/{owner}/{repo}/pulls/{n}/files"]
+    );
+}
+
+#[test]
 fn read_relay_refuses_unknown_actions_unsafe_paths_and_caller_identity() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-invalid", "read-call", "/p");
     let transport = FakeTransport::scoped();

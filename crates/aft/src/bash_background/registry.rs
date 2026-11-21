@@ -1353,6 +1353,8 @@ mod shell_registry;
 pub(crate) use shell_registry::{
     ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD,
 };
+#[path = "replay_liveness.rs"]
+mod replay_liveness;
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 
@@ -4278,21 +4280,6 @@ impl BgTaskRegistry {
         });
     }
 
-    fn persisted_task_process_is_alive(metadata: &PersistedTask) -> bool {
-        if metadata.remote.is_some() && !metadata.is_terminal() {
-            return true;
-        }
-        Self::persisted_task_recorded_pids(metadata)
-            .into_iter()
-            .any(|pid| is_recorded_process_alive(pid, metadata.started_at))
-    }
-
-    /// The task's recorded child and process group leader, in that order.
-    fn persisted_task_recorded_pids(metadata: &PersistedTask) -> Vec<u32> {
-        let group_leader = metadata.pgid.and_then(|pid| u32::try_from(pid).ok());
-        metadata.child_pid.into_iter().chain(group_leader).collect()
-    }
-
     fn db_has_live_process_for_task(&self, task_id: &str) -> bool {
         self.db_live_process_task_ids(std::slice::from_ref(&task_id.to_string()))
             .contains(task_id)
@@ -5797,6 +5784,7 @@ impl BgTaskRegistry {
         );
         metadata.harness = metadata.harness.or_else(|| self.fallback_db_harness());
         metadata.default_hard_kill = hard_kill.renewable();
+        metadata.launch_owner = ProcessIdentity::of(std::process::id());
         // Pipeline-status capture is a Unix-only mechanism: the wrapper needs
         // bash/zsh PIPESTATUS, which does not exist on the Windows spawn path.
         #[cfg(unix)]
@@ -5882,6 +5870,8 @@ impl BgTaskRegistry {
         }
         layout_cleanup.disarm();
         self.dual_write_task(&paths, &metadata);
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
+        replay_liveness::test_hook::before_child_identity(&paths.json);
         let mut spawn_child = |scope: Option<&super::task_scope::ScopeLaunch>| {
             spawn_detached_child(
                 &spawn_plan,
@@ -6352,6 +6342,7 @@ impl BgTaskRegistry {
         metadata.completion_ticket_digest = completion_secrets.ticket_digest.clone();
         attach_sandbox_metadata(&mut metadata, &spawn_plan);
         metadata.mode = BgMode::Pty;
+        metadata.launch_owner = ProcessIdentity::of(std::process::id());
         let defer_bootstrap = crate::gh_shim_ticket::pty_seal_required();
         if defer_bootstrap {
             crate::gh_shim_ticket::mark_spawn_background(true);
@@ -8039,6 +8030,10 @@ impl BgTaskRegistry {
         // Every recovery write for this replay has landed; release the
         // directories so the sweep can judge them as settled storage.
         drop(recovering);
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
+        if !continuation {
+            replay_liveness::test_hook::after_replay(self, storage_dir);
+        }
         Ok(())
     }
 
@@ -8180,6 +8175,9 @@ impl BgTaskRegistry {
         process_is_alive: impl FnOnce(&PersistedTask) -> bool,
         db_ack_lookup_unavailable: &mut bool,
     ) -> Result<(), String> {
+        if replay_liveness::has_live_launch_owner(&metadata) {
+            return Ok(());
+        }
         // Disk fallback and remote checkpoints can replace the DB metadata.
         // A foreign ack only changes the durable column, so reconcile it
         // before any recovery write or completion enqueue uses the snapshot.

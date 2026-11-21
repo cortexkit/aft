@@ -284,6 +284,8 @@ pub struct Body {
     /// extractor that wrote them, which the record's extractor version
     /// names. `None` in a record from an extractor that did not store them.
     pub dead_code: Option<Vec<u8>>,
+    /// Sparse static receiver evidence; its format belongs to the extractor.
+    pub static_dispatch: Option<Vec<u8>>,
 }
 
 /// What a content record holds.
@@ -368,6 +370,10 @@ const CONFIG_WITH_TODOS: u8 = 9;
 /// A [`RecordBody::Markers`] record: the kind, then whether markers follow
 /// (a byte, 0 or 1), then the markers. Its body part is empty.
 const MARKERS: u8 = 10;
+/// A parsed record whose body ends with static receiver facts, after the
+/// other optional parts. Its flags also say whether TODO markers follow.
+const PARSED_WITH_STATIC_DISPATCH: u8 = 11;
+const STATIC_HAS_TODOS: u8 = 4;
 /// In a [`PARSED_WITH_TODOS`] record's flags: the body ends with an outline.
 const HAS_OUTLINE: u8 = 1;
 /// In a [`PARSED_WITH_TODOS`] record's flags: the body ends with dead-code
@@ -405,6 +411,16 @@ impl ContentRecord {
             }
             RecordBody::Parsed { surface, body } => {
                 match &self.todos {
+                    _ if body.static_dispatch.is_some() => {
+                        head.byte(PARSED_WITH_STATIC_DISPATCH);
+                        let flags = (u8::from(body.outline.is_some()) * HAS_OUTLINE)
+                            | (u8::from(body.dead_code.is_some()) * HAS_DEAD_CODE)
+                            | (u8::from(self.todos.is_some()) * STATIC_HAS_TODOS);
+                        head.byte(flags);
+                        if let Some(todos) = &self.todos {
+                            encode_todos(&mut head, todos);
+                        }
+                    }
                     None => head.byte(match (body.outline.is_some(), body.dead_code.is_some()) {
                         (true, true) => PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE,
                         (true, false) => PARSED_WITH_ENTRIES_AND_OUTLINE,
@@ -471,15 +487,23 @@ impl ContentRecord {
             | PARSED_WITH_ENTRIES_AND_OUTLINE
             | PARSED_WITH_ENTRIES_OUTLINE_AND_DEAD_CODE
             | PARSED_WITH_ENTRIES_AND_DEAD_CODE
-            | PARSED_WITH_TODOS) => {
+            | PARSED_WITH_TODOS
+            | PARSED_WITH_STATIC_DISPATCH) => {
                 // What the kind says follows: entry facts after the surface,
                 // and an outline and dead-code facts at the body's end.
-                let (entries, outline, dead_code) = if kind == PARSED_WITH_TODOS {
+                let static_dispatch = kind == PARSED_WITH_STATIC_DISPATCH;
+                let (entries, outline, dead_code) = if kind == PARSED_WITH_TODOS || static_dispatch
+                {
                     let flags = head.byte()?;
-                    if flags & !(HAS_OUTLINE | HAS_DEAD_CODE) != 0 {
+                    let allowed = HAS_OUTLINE
+                        | HAS_DEAD_CODE
+                        | if static_dispatch { STATIC_HAS_TODOS } else { 0 };
+                    if flags & !allowed != 0 {
                         return Err(DecodeError("parsed record flags"));
                     }
-                    todos = Some(decode_todos(&mut head)?);
+                    if !static_dispatch || flags & STATIC_HAS_TODOS != 0 {
+                        todos = Some(decode_todos(&mut head)?);
+                    }
                     (true, flags & HAS_OUTLINE != 0, flags & HAS_DEAD_CODE != 0)
                 } else {
                     (
@@ -516,6 +540,9 @@ impl ContentRecord {
                 if dead_code {
                     body.dead_code = Some(tail.blob()?.to_vec());
                 }
+                if static_dispatch {
+                    body.static_dispatch = Some(tail.blob()?.to_vec());
+                }
                 tail.finish()?;
                 RecordBody::Parsed {
                     surface: Box::new(surface),
@@ -549,6 +576,13 @@ impl ContentRecord {
             PARSED_WITH_TODOS => {
                 head.byte()?;
                 decode_todos(&mut head).map(Some)
+            }
+            PARSED_WITH_STATIC_DISPATCH => {
+                if head.byte()? & STATIC_HAS_TODOS != 0 {
+                    decode_todos(&mut head).map(Some)
+                } else {
+                    Ok(None)
+                }
             }
             CONFIG
             | MARKERS
@@ -829,6 +863,9 @@ fn encode_body(out: &mut Encoder, body: &Body) {
     if let Some(facts) = &body.dead_code {
         out.blob(facts);
     }
+    if let Some(facts) = &body.static_dispatch {
+        out.blob(facts);
+    }
 }
 
 fn decode_body(input: &mut Decoder<'_>) -> Result<Body, DecodeError> {
@@ -904,6 +941,7 @@ fn decode_body(input: &mut Decoder<'_>) -> Result<Body, DecodeError> {
         call_sites,
         outline: None,
         dead_code: None,
+        static_dispatch: None,
     })
 }
 
@@ -1035,6 +1073,7 @@ crate::heap_bytes_of_fields!(Body {
     call_sites,
     outline,
     dead_code,
+    static_dispatch,
 });
 crate::heap_bytes_of_fields!(TodoMarker {
     line,
@@ -1163,6 +1202,7 @@ mod tests {
                     }],
                     outline: None,
                     dead_code: None,
+                    static_dispatch: None,
                 }),
             },
             todos: None,

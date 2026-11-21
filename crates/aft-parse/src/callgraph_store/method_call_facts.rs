@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::callgraph_store::join::{
     self,
-    dispatch::{dependency, DispatchFacts, FieldHint, MethodHint, ReturnHint, TypeHint},
+    dispatch::{
+        dependency, DispatchFacts, FieldHint, MethodHint, ReturnHint, StaticFacts, TypeHint,
+    },
     BlobImport, ParseBlob,
 };
 
@@ -30,6 +32,8 @@ pub struct FileFacts {
     methods: Vec<MethodHint>,
     fields: Vec<FieldHint>,
     returns: Vec<ReturnHint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    static_facts: Option<Box<StaticFacts>>,
     imports: Vec<ImportFact>,
     default_export_symbol: Option<String>,
     /// Target file of each resolved import, by module path.
@@ -74,6 +78,7 @@ impl FileFacts {
             methods: parse.dispatch.methods.clone(),
             fields: parse.dispatch.fields.clone(),
             returns: parse.dispatch.returns.clone(),
+            static_facts: parse.dispatch.static_facts.clone(),
             imports: if parse.language == "python" {
                 join::dispatch::python_reexports(parse)
                     .into_iter()
@@ -113,6 +118,7 @@ impl FileFacts {
                 sites: Vec::new(),
                 fields: self.fields.clone(),
                 returns: self.returns.clone(),
+                static_facts: self.static_facts.clone(),
             },
             extractor_version: String::new(),
             language: self.language.clone(),
@@ -156,6 +162,13 @@ impl FileFacts {
         keys.insert(dependency::file(path));
         keys.insert(dependency::directory(path));
         for facts in old.into_iter().chain(new) {
+            StaticFacts::changed_keys(
+                path,
+                &facts.language,
+                None,
+                facts.static_facts.as_deref(),
+                keys,
+            );
             // A resolution that found this file through a method name recorded
             // only that name, so every method name of the file is affected.
             keys.extend(
@@ -189,6 +202,13 @@ impl FileFacts {
             return Self::changed_keys(path, Some(old), Some(new), keys);
         }
         let mut named = Vec::new();
+        StaticFacts::changed_keys(
+            path,
+            &new.language,
+            old.static_facts.as_deref(),
+            new.static_facts.as_deref(),
+            keys,
+        );
         changed_groups(
             &grouped(&old.methods, |m| m.name.as_str()),
             &grouped(&new.methods, |m| m.name.as_str()),
@@ -220,7 +240,11 @@ impl FileFacts {
         // name above accounts for it (for example the target of an import that
         // binds no local name), fall back to the whole-file keys rather than
         // invalidate nothing.
-        if named.is_empty() {
+        if named.is_empty()
+            && (old.static_facts == new.static_facts
+                || old.imports != new.imports
+                || old.import_targets != new.import_targets)
+        {
             return Self::changed_keys(path, Some(old), Some(new), keys);
         }
         keys.extend(named);
@@ -269,6 +293,7 @@ aft_store::heap_bytes_of_fields!(FileFacts {
     methods,
     fields,
     returns,
+    static_facts,
     imports,
     default_export_symbol,
     import_targets,

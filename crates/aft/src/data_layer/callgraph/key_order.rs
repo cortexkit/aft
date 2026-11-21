@@ -43,7 +43,7 @@ use rayon::prelude::*;
 
 use crate::callgraph_store::join::dispatch::projected::FileRecord;
 use crate::callgraph_store::join::dispatch::{
-    dependency, Resolution, ResolutionKey, Resolver, SharedMethods,
+    dependency, CSharpProjects, Resolution, ResolutionKey, Resolver, SharedMethods,
 };
 use crate::callgraph_store::join::ManifestJoinError;
 
@@ -167,7 +167,7 @@ fn put_optional(out: &mut Vec<u8>, text: Option<&str>) {
 /// to its calling file, which the file's number names as well as its path.
 fn encode_key(key: &ResolutionKey, file: u32, out: &mut Vec<u8>) {
     put_optional(out, key.member.as_deref());
-    if key.receiver.is_some() {
+    if key.receiver.is_some() || key.static_receiver.is_some() {
         out.push(1);
         out.extend(file.to_be_bytes());
     } else {
@@ -178,6 +178,9 @@ fn encode_key(key: &ResolutionKey, file: u32, out: &mut Vec<u8>) {
     out.push(u8::from(key.dynamic));
     out.push(u8::from(key.associated));
     put_optional(out, key.caller_scope.as_deref());
+    if let Some(receiver) = key.static_receiver {
+        out.extend(receiver.to_be_bytes());
+    }
 }
 
 /// The length of the member name's encoding at the start of an encoded
@@ -898,6 +901,7 @@ impl GroupStats {
 
 /// What the threads resolving keys share.
 struct Context<'s> {
+    projects: &'s CSharpProjects,
     source: &'s RecordSource,
     paths: &'s [String],
     answers: Interner<Resolution>,
@@ -932,6 +936,7 @@ impl<'s> Context<'s> {
         pinned: &'p Pinned<'_>,
         resolver: &Resolver<'p>,
         key: &KeyWork,
+        fallback: &mut BTreeMap<String, (u32, BTreeSet<String>)>,
     ) -> Result<KeyAnswer, ManifestJoinError> {
         let (path, record) = self.record(pinned, key.file)?;
         let site = &record
@@ -940,8 +945,42 @@ impl<'s> Context<'s> {
             .ok_or_else(|| sort_error(format!("{path} has no site {}", key.position)))?
             .site;
         resolver.take_dependencies();
-        let resolution = resolver.resolve(path, site);
-        let keys = resolver.take_dependencies();
+        let language = &record.facts().language;
+        let (answer, keys) = if let Some(resolution) = resolver.resolve_static(path, site) {
+            (
+                self.answers.intern(resolution)?,
+                resolver.take_dependencies(),
+            )
+        } else if site.receiver.is_none()
+            && !site.dynamic
+            && site.member.is_some()
+            && matches!(
+                language.as_str(),
+                "csharp" | "java" | "javascript" | "typescript" | "tsx"
+            )
+        {
+            let mut keys = resolver.take_dependencies();
+            let (answer, legacy_keys) = match fallback.entry(language.clone()) {
+                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::btree_map::Entry::Vacant(entry) => {
+                    let resolution = resolver.resolve_nonstatic(path, site);
+                    entry.insert((
+                        self.answers.intern(resolution)?,
+                        resolver.take_dependencies(),
+                    ))
+                }
+            };
+            keys.extend(legacy_keys.iter().cloned());
+            #[cfg(feature = "callgraph-shape-census")]
+            resolver.census_exit.set("unknown");
+            (*answer, keys)
+        } else {
+            let resolution = resolver.resolve_nonstatic(path, site);
+            (
+                self.answers.intern(resolution)?,
+                resolver.take_dependencies(),
+            )
+        };
         let dependencies = match keys.len() {
             0 => Dependencies::None,
             count if count <= INLINE_DEPENDENCIES => {
@@ -953,7 +992,7 @@ impl<'s> Context<'s> {
             ),
         };
         Ok(KeyAnswer {
-            answer: self.answers.intern(resolution)?,
+            answer,
             dependencies,
             #[cfg(feature = "callgraph-shape-census")]
             exit: exit_code(resolver.census_exit.get()),
@@ -979,12 +1018,15 @@ impl<'s> Context<'s> {
                 site_records::start_touches();
             }
             let pinned = Pinned::cached(self.source);
-            let resolver = Resolver::over(&pinned);
+            let resolver = Resolver::over(&pinned).with_csharp_projects(self.projects);
             if let Some(shared) = shared {
                 resolver.use_shared_methods(shared);
             }
+            // A segment contains one member name. If static proof fails,
+            // reuse the fallback answer while keeping that site's type lookup dependencies.
+            let mut fallback = BTreeMap::new();
             for key in &keys[*start..end] {
-                answers.push(self.resolve_key(&pinned, &resolver, key)?);
+                answers.push(self.resolve_key(&pinned, &resolver, key, &mut fallback)?);
             }
             if self.counting {
                 tallies.push((*group, site_records::take_touches()));
@@ -1228,6 +1270,7 @@ impl Flusher<'_, '_> {
 pub(super) fn resolve(
     source: &RecordSource,
     paths: &[String],
+    projects: &CSharpProjects,
     runs: &ScratchDir<DataError>,
     budget: Budget,
     memory: Option<&mut Vec<(String, usize)>>,
@@ -1242,6 +1285,7 @@ pub(super) fn resolve(
         WriteGuard::new(move || workspace.check_space(bytes).map_err(std::io::Error::other))
     };
     let context = Context {
+        projects,
         source,
         paths,
         answers: Interner::new(),
@@ -1587,6 +1631,7 @@ mod tests {
         ResolutionKey {
             scope: scope.to_string(),
             receiver: receiver.map(str::to_string),
+            static_receiver: None,
             member: member.map(str::to_string),
             dynamic: false,
             associated: false,

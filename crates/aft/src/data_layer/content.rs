@@ -58,7 +58,7 @@ use crate::parser::LangId;
 /// contained type of proven standard-library smart-pointer fields (for example,
 /// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
 /// 15 stores each distinct method-call answer once per fragment.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-15";
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-23";
 
 /// The language of a resolver configuration file the call graph reads raw,
 /// or the start of it. A configuration record also holds the TODO markers
@@ -68,6 +68,7 @@ pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+reco
 /// content, language and extractor version, and two files with the same
 /// bytes whose comments are read in different grammars must not share one.
 pub const CONFIG: &str = "config";
+pub(super) const CSHARP_PROJECT_CONFIG: &str = "config-csproj";
 
 /// Whether `language` (as [`language_for`] chose it) is a configuration
 /// file's (see [`CONFIG`]).
@@ -155,6 +156,11 @@ pub fn is_parsed_language(language: &str) -> bool {
 pub fn scan_policy() -> aft_store::scan::ScanPolicy {
     aft_store::scan::ScanPolicy {
         read_large: Some(parsed_or_embedded_path),
+        read_limit: Some(|path| {
+            use crate::callgraph_store::join::dispatch::CSharpProjects;
+            CSharpProjects::is_membership_config_path(path)
+                .then_some(CSharpProjects::PROJECT_READ_LIMIT)
+        }),
         ..aft_store::scan::ScanPolicy::default()
     }
 }
@@ -189,6 +195,10 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     {
         return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name()));
     }
+    use crate::callgraph_store::join::dispatch::CSharpProjects;
+    if CSharpProjects::is_membership_config_path(path.as_bytes()) {
+        return Some(CSHARP_PROJECT_CONFIG.to_string());
+    }
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
         return Some(config_language(Path::new(path)));
     }
@@ -209,6 +219,9 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     } else {
         match source_language(path) {
             Some(language) => language,
+            None if CSharpProjects::has_project_root(source) => {
+                return Some(CSHARP_PROJECT_CONFIG.to_string())
+            }
             None => return markers_language(path),
         }
     };
@@ -349,6 +362,16 @@ pub fn extract_with_tree(
     language: &str,
 ) -> Result<(ContentRecord, Option<SyntaxTree>), ManifestJoinError> {
     if is_config_language(language) {
+        if language == CSHARP_PROJECT_CONFIG {
+            use crate::callgraph_store::join::dispatch::CSharpProjects;
+            let markers = CSharpProjects::project_markers(source);
+            let blob = CallgraphBlob::Config(ConfigBlob {
+                extractor_version: EXTRACTOR_VERSION.into(),
+                language: language.into(),
+                source: markers,
+            });
+            return Ok((record_from_blob(&blob), None));
+        }
         let blob = CallgraphBlob::config(source.to_vec(), EXTRACTOR_VERSION);
         return Ok((record_from_blob(&blob), None));
     }
@@ -583,6 +606,11 @@ pub fn record_from_blob(blob: &CallgraphBlob) -> ContentRecord {
                         .collect(),
                     outline: None,
                     dead_code: None,
+                    static_dispatch: parse
+                        .dispatch
+                        .static_facts
+                        .as_deref()
+                        .map(|facts| facts.encode()),
                 }),
             },
             todos: None,
@@ -615,6 +643,15 @@ pub fn blob_from_record(record: &ContentRecord) -> Result<CallgraphBlob, Manifes
         RecordBody::Parsed { surface, body } => CallgraphBlob::Parse(ParseBlob {
             entry_point_symbols: surface.entry_point_symbols.clone(),
             dispatch: DispatchFacts {
+                static_facts: body
+                    .static_dispatch
+                    .as_deref()
+                    .map(|bytes| {
+                        crate::callgraph_store::join::dispatch::StaticFacts::decode(bytes)
+                            .map(Box::new)
+                            .map_err(|error| ManifestJoinError::InvalidBlob(error.to_string()))
+                    })
+                    .transpose()?,
                 go_package: surface.go_package.clone(),
                 types: surface
                     .types

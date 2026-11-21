@@ -10,14 +10,78 @@ impl Writer for RecordingWriter {
 }
 
 #[tokio::test]
+async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowledged() {
+    struct RejectLast(usize);
+    impl Writer for RejectLast {
+        async fn put(&mut self, _key: &str, _value: Vec<u8>) -> Result<(), &'static str> {
+            self.0 -= 1;
+            if self.0 == 0 {
+                Err("put_not_acknowledged")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    let notice_views: Vec<_> = crate::subc::tool_views::bus_snapshot()
+        .into_iter()
+        .filter(|(pin, _)| pin.starts_with("nv1:"))
+        .collect();
+    assert_eq!(notice_views.len(), 3);
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
+    let mut writer = RejectLast(notice_views.len());
+    assert_eq!(
+        publication.sync(&mut writer, notice_views.clone()).await,
+        Err("put_not_acknowledged")
+    );
+    assert!(!ready.wait(Duration::ZERO).await);
+
+    let mut writer = RecordingWriter::default();
+    publication.sync(&mut writer, notice_views).await.unwrap();
+    assert_eq!(writer.0.len(), 1, "only the unacknowledged view is retried");
+    assert!(
+        ready.wait(Duration::ZERO).await,
+        "acknowledgments reopen admission even after a timed-out send"
+    );
+}
+
+#[tokio::test]
+async fn oversized_notice_view_disables_pending_notice_publication() {
+    use futures_util::FutureExt;
+
+    let mut writer = RecordingWriter::default();
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
+    let notice_pin = crate::subc::tool_views::notice_view_pins().next().unwrap();
+    publication
+        .sync(
+            &mut writer,
+            vec![(
+                notice_pin.clone(),
+                vec![b'x'; declaration().max_value_bytes as usize + 1],
+            )],
+        )
+        .await
+        .unwrap();
+    assert!(writer.0.is_empty());
+    assert!(ready
+        .next_pending()
+        .now_or_never()
+        .expect("oversized notice view should permanently close the gate")
+        .is_none());
+}
+
+#[tokio::test]
 async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     let mut writer = RecordingWriter::default();
-    let mut publication = Publication::default();
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
     publication
         .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
         .await
         .unwrap();
-    assert_eq!(writer.0.len(), crate::subc::tool_views::SHIPPED.len());
+    assert_eq!(writer.0.len(), crate::subc::tool_views::SHIPPED.len() + 3);
     for (pin, _) in crate::subc::tool_views::SHIPPED.iter() {
         let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![pin.clone()]);
         let reply = cortexkit_role_tool_provider::views::ViewsReply::new(
@@ -56,9 +120,53 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
 }
 
 #[tokio::test]
+async fn notice_records_bus_views_and_tool_views_decode_as_the_same_one_pin_reply() {
+    use cortexkit_role_tool_provider::views::{ViewEntry, ViewsReply, ViewsRequest};
+    use serde_json::json;
+
+    let mut writer = RecordingWriter::default();
+    Publication::new(&NoticeViewsReady::default())
+        .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
+        .await
+        .unwrap();
+    for name in ["bash_finished", "bash_still_running", "bash_watch"] {
+        let pin = format!("nv1:aft:{name}:1");
+        let route = crate::subc::tool_views::answer(json!({"pins":[pin]})).unwrap();
+        let bytes = &writer
+            .0
+            .iter()
+            .find(|(stored, _)| stored == &key(&pin))
+            .unwrap()
+            .1;
+        let decoded: ViewsReply = serde_json::from_slice(bytes).unwrap();
+        decoded
+            .validate_for(&ViewsRequest::new(vec![pin.clone()]))
+            .unwrap();
+        assert_eq!(serde_json::to_value(&decoded).unwrap(), route);
+        let ViewEntry::Notice(view) = &decoded.views[&pin] else {
+            panic!("missing {pin}");
+        };
+        view.check_pin("aft", &pin).unwrap();
+        assert_eq!(view.notice.name, name);
+        assert_eq!(view.bucket_key("aft").unwrap(), key(&pin));
+    }
+    for pin in [
+        "nv1:other:bash_finished:1",
+        "nv1:aft:bash_finished:01",
+        "nv1:aft:bash_finished:9007199254740992",
+    ] {
+        assert_eq!(
+            crate::subc::tool_views::answer(json!({"pins":[pin]})).unwrap()["views"][pin],
+            "unknown"
+        );
+    }
+}
+
+#[tokio::test]
 async fn bus_views_oversized_is_skipped_not_truncated_and_changes_republish() {
     let mut writer = RecordingWriter::default();
-    let mut publication = Publication::default();
+    let ready = NoticeViewsReady::default();
+    let mut publication = Publication::new(&ready);
     let cap = declaration().max_value_bytes as usize;
     publication
         .sync(

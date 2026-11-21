@@ -507,15 +507,18 @@ fn queries(
     }
     // Preserve every dead-code input row, including initializer groups and
     // protected roots. The timestamp is deliberately outside the comparison.
-    let dead = view.rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)?;
+    let dead =
+        super::super::dead_code::stream::Rows::new(&view, &crate::inspect::InspectEntryPoints)?;
+    let snapshot = view.dead_code_snapshot_in(None, &crate::inspect::InspectEntryPoints)?;
+    super::super::dead_code::stream::artifact::write(
+        &out.join("dead-code.json"),
+        &dead,
+        &snapshot,
+    )?;
+    drop(dead);
     save(
         &out.join("dead-code-findings.json"),
         &crate::inspect::dead_code_gate::exactness_rows(&view, &out.join("dead-code-work"))?,
-    )?;
-    let initializers = dead.go_initializers.iter().map(|group| json!({"caller_file": group.caller_file, "callers": group.callers, "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>()})).collect::<Vec<_>>();
-    save(
-        &out.join("dead-code.json"),
-        &json!({"files": dead.files, "exports": dead.exported_symbols, "calls": dead.outbound_calls, "entry_points": dead.entry_points, "entry_point_symbols": dead.entry_point_symbols, "go_initializers": initializers}),
     )?;
     checked_failures(&view)?;
     save(&out.join("cache.json"), &super::super::slice_cache::shared().stats().map(|stats| json!({"budget": stats.budget_bytes, "evictions": stats.evictions, "misses": stats.misses})))?;

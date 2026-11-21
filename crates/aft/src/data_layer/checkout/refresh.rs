@@ -525,6 +525,7 @@ impl Checkout {
                     Extracted::Config(..)
                     | Extracted::Markers(_)
                     | Extracted::GrammarGap(_)
+                    | Extracted::ConversionFailed
                     | Extracted::Nothing => {
                         engine.refreshed.records.remove(name);
                     }

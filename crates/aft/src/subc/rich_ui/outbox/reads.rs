@@ -22,7 +22,13 @@ pub(crate) struct ReadCache {
 }
 
 impl ReadCache {
-    pub(super) fn insert(&mut self, id: String, arguments: Vec<u8>, weight: usize, now: Instant) {
+    pub(in crate::subc::rich_ui) fn insert(
+        &mut self,
+        id: String,
+        arguments: Vec<u8>,
+        weight: usize,
+        now: Instant,
+    ) {
         self.prune(now);
         // Preserve the first bytes and announcement when an identical key is
         // offered again; a push retry must not reset the pull retention window.

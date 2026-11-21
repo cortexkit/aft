@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{dependency, DispatchFacts, MethodHint, ParseBlob, Resolver, SiteHint, TypeHint};
 
-/// The answer [`Resolver::project_type`] gave for one name asked of one file.
+/// The answer for one type lookup in a file. Static import keys carry the
+/// class declaration's position in the static facts rather than its nominal type.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectedType {
     #[cfg(any(test, feature = "test-support"))]
@@ -509,6 +510,9 @@ impl FileRecord {
         for ordinal in associated {
             out.number(*ordinal);
         }
+        if let Some(static_facts) = &facts.dispatch.static_facts {
+            out.0.extend(static_facts.encode());
+        }
         Ok(())
     }
 
@@ -580,14 +584,15 @@ impl FileRecord {
         let associated = (0..count)
             .map(|_| input.number())
             .collect::<Result<Vec<_>, _>>()?;
+        let mut facts = declarations_of(language, go_package, types, methods);
         if input.at != bytes.len() {
-            return Err(format!(
-                "a pass-4 record has {} bytes past its end",
-                bytes.len() - input.at
+            facts.dispatch.static_facts = Some(Box::new(
+                super::StaticFacts::decode(&bytes[input.at..])
+                    .map_err(|error| error.to_string())?,
             ));
         }
         Ok(Self {
-            facts: declarations_of(language, go_package, types, methods),
+            facts,
             projections,
             mro,
             complete_names,
@@ -601,12 +606,14 @@ impl FileRecord {
 /// `parse` reduced to what the resolver reads once projections are
 /// recorded: language, Go package, types and methods.
 fn declarations(parse: &ParseBlob) -> ParseBlob {
-    declarations_of(
+    let mut facts = declarations_of(
         parse.language.clone(),
         parse.dispatch.go_package.clone(),
         parse.dispatch.types.clone(),
         parse.dispatch.methods.clone(),
-    )
+    );
+    facts.dispatch.static_facts = parse.dispatch.static_facts.clone();
+    facts
 }
 
 test_support_visibility! {
@@ -713,6 +720,23 @@ impl<'a> Resolver<'a> {
         }
     }
 
+    pub(super) fn replay_static_import(
+        &self,
+        projections: &'a (dyn Projections + 'a),
+        file: &str,
+        key: &str,
+    ) -> Option<(String, u32)> {
+        if let Recorded::Found(projected) = projections.projected_type(file, key) {
+            for dependency in &projected.dependencies {
+                self.depend(dependency.clone());
+            }
+            projected.found.clone()
+        } else {
+            projections.missing(format!("the static import projection of {key} in {file}"));
+            None
+        }
+    }
+
     /// `owner`'s resolution order as `file`'s Python `super()` call reads
     /// it, from `projections`, recording the keys computing it recorded.
     pub(super) fn replay_mro(
@@ -739,15 +763,19 @@ impl<'a> Resolver<'a> {
     /// recorded, leaving the keys recorded so far as they were.
     fn record_projection(&self, file: &str, name: &str) -> ProjectedType {
         let outer = self.take_dependencies();
-        let found = self.project_type(file, name).and_then(|(type_file, ty)| {
-            let index = self
-                .lookup(&type_file)?
-                .dispatch
-                .types
-                .iter()
-                .position(|candidate| std::ptr::eq(candidate, ty))?;
-            Some((type_file, u32::try_from(index).ok()?))
-        });
+        let found = if name.starts_with(super::STATIC_IMPORT_PREFIX) {
+            self.static_import_projection(file, name)
+        } else {
+            self.project_type(file, name).and_then(|(type_file, ty)| {
+                let index = self
+                    .lookup(&type_file)?
+                    .dispatch
+                    .types
+                    .iter()
+                    .position(|candidate| std::ptr::eq(candidate, ty))?;
+                Some((type_file, u32::try_from(index).ok()?))
+            })
+        };
         let dependencies = self.take_dependencies();
         *self.dependencies.borrow_mut() = outer;
         ProjectedType {
@@ -821,6 +849,16 @@ impl<'a> Resolver<'a> {
             }
         }
         let language = parse.language.as_str();
+        if super::typescript::supported(language) {
+            if let Some(static_facts) = &parse.dispatch.static_facts {
+                for name in static_facts.projection_names() {
+                    project(name);
+                }
+                for (name, _) in static_facts.import_receivers() {
+                    project(&format!("{}{name}", super::STATIC_IMPORT_PREFIX));
+                }
+            }
+        }
         let mut mro = BTreeMap::new();
         let mut typed_rust = false;
         let mut records = Vec::with_capacity(sites.len());

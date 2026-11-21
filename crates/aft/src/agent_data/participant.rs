@@ -719,7 +719,12 @@ fn incompatible(found: impl std::fmt::Display) -> ErrorBody {
 }
 fn import_error(reason: String) -> ErrorBody {
     match reason.as_str() {
-        "cut_not_published" | "not_found" => {
+        "cut_not_published" | "cut_takeover_closed" | "cut_range_not_local" => {
+            let mut refusal = error(RefusalCode::ParticipantFailed, &reason);
+            refusal.detail = Some(json!({"reason": reason}));
+            refusal
+        }
+        "cut_import_pending" | "not_found" => {
             error(RefusalCode::CutNotReady, "cut is not published")
         }
         "digest_mismatch"
@@ -748,4 +753,59 @@ fn door_failure(op: Op, method: &str, failure: super::door::DoorError) -> ErrorB
         code,
         format!("session door stopped {method}: {}", failure.code),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use contract::errors::{driver_action_for, may_refuse, DriverAction};
+
+    fn check_import_refusal(reason: &str, code: RefusalCode, action: DriverAction) {
+        let refusal = import_error(reason.into());
+        assert_eq!(refusal.code, code, "{reason}");
+        assert_eq!(
+            driver_action_for(Op::Import, &refusal.code),
+            action,
+            "{reason}"
+        );
+        assert!(may_refuse(Op::Import, &refusal.code), "{reason}");
+        if code == RefusalCode::ParticipantFailed {
+            assert_eq!(refusal.detail, Some(json!({"reason": reason})), "{reason}");
+        }
+    }
+
+    macro_rules! import_refusal_test {
+        ($name:ident, $reason:literal, $code:ident, $action:ident) => {
+            #[test]
+            fn $name() {
+                check_import_refusal($reason, RefusalCode::$code, DriverAction::$action);
+            }
+        };
+    }
+
+    import_refusal_test!(
+        import_cut_pending,
+        "cut_import_pending",
+        CutNotReady,
+        RetryWithinStep
+    );
+    import_refusal_test!(
+        import_takeover_closed,
+        "cut_takeover_closed",
+        ParticipantFailed,
+        Abort
+    );
+    import_refusal_test!(
+        import_range_not_local,
+        "cut_range_not_local",
+        ParticipantFailed,
+        Abort
+    );
+    import_refusal_test!(import_not_found, "not_found", CutNotReady, RetryWithinStep);
+    import_refusal_test!(
+        import_cut_not_published,
+        "cut_not_published",
+        ParticipantFailed,
+        Abort
+    );
 }

@@ -1,0 +1,15 @@
+<CardHeader title={title} />
+
+<ToolText text="Command" />
+
+<CodeBlock codeString={input.command} />
+
+<ToolText text={finished && !failed && input.exit_code != null ? "Exit " + Text(input.exit_code) + duration : summary} tone={failed ? "danger" : "muted"} />
+
+{input.output_preview == "" ? <ToolText text="No output was kept." tone="muted" /> : <ToolText text={"Output · " + Text(Count(Lines(input.output_preview))) + (Count(Lines(input.output_preview)) == 1 ? " line" : " lines")} />}
+
+{input.output_preview == "" ? null : <CodeBlock codeString={input.output_preview} />}
+
+{input.output_cut ? <ToolText text="Earlier output isn't shown." tone="muted" /> : null}
+
+<OpenItem id={"shell:" + input.task_id} label={"Shell " + input.task_id} />

@@ -137,7 +137,7 @@ fn glob(ctx: &AppContext, pattern: &str) -> Value {
     .data
 }
 
-/// A call-graph command as the parent session answers it.
+/// A command as the parent session answers it.
 fn routed(ctx: &AppContext, req: &RawRequest) -> Response {
     crate::commands::parent_query::route(req, ctx)
         .expect("a parent folder answers this command itself")
@@ -801,6 +801,112 @@ fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
     assert_eq!(skipped.len(), 2, "{response:?}");
     assert_eq!(response.data["complete"], false);
     assert_eq!(response.data["skipped_files_remaining"], 0);
+}
+
+#[test]
+fn parent_session_search_accepts_pattern_only_and_split_requests() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(temp.path()).unwrap();
+    let root = base.join("projects");
+    let storage = base.join("storage");
+    std::fs::create_dir_all(&storage).unwrap();
+    let alpha = root.join("alpha");
+    let beta = root.join("beta");
+    for (repo, name) in [(&alpha, "alpha"), (&beta, "beta")] {
+        init_repo(repo, name);
+    }
+    write(
+        &alpha,
+        "src/mention.rs",
+        "fn run() {\n    cross_parent();\n}\n",
+    );
+    write(
+        &alpha,
+        "src/queue.rs",
+        "// The scheduler drains the work queue.\nfn drain_queue() {}\n",
+    );
+    write(&beta, "src/definition.rs", "pub fn cross_parent() {}\n");
+    for repo in [&alpha, &beta] {
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "search fixtures"]);
+    }
+    let parent = {
+        let _git = crate::test_env::hermetic_git_env_guard();
+        configure(&root, &storage, false)
+    };
+    assert_eq!(parent_session(&parent).children().len(), 2);
+    settled(
+        || grep(&parent, "cross_parent"),
+        |reply| reply["complete"] == true && matched_files(reply).len() == 2,
+    );
+
+    let search = |params: Value| {
+        let mut req = request(json!({"id":"parent-search", "command":"semantic_search"}));
+        req.params = params;
+        routed(&parent, &req)
+    };
+    let files = |reply: &Value| {
+        reply["results"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{reply:#}"))
+            .iter()
+            .map(|row| row["file"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>()
+    };
+    let mention = "alpha/src/mention.rs";
+    let definition = "beta/src/definition.rs";
+    let pattern = search(json!({"pattern":"cross_parent"}));
+    assert!(pattern.success, "{pattern:?}");
+    assert_eq!(files(&pattern.data), [definition, mention]);
+    assert!(pattern.data["text"].as_str().unwrap().starts_with(&format!(
+        "{definition}\n1: pub fn cross_parent() {{}}\n\n{mention}\n2:     cross_parent();\n\n\
+         2 files match (2 matching lines); one result per file, definitions first.\n[interpreted_as: regex]"
+    )), "{}", pattern.data["text"]);
+
+    let page = search(json!({"pattern":"cross_parent", "offset":1, "topK":1}));
+    assert!(page.success, "{page:?}");
+    assert_eq!(files(&page.data), [mention]);
+    assert!(page.data["text"]
+        .as_str()
+        .unwrap()
+        .contains("2 files match (2 matching lines)"));
+
+    let query = search(json!({"query":r"\bcross_parent\b"}));
+    assert!(query.success, "{query:?}");
+    assert_eq!(
+        query.data["text"],
+        format!(
+        "{mention}:2-2 \n  cross_parent();\n{definition}:1-1 \n  pub fn cross_parent() {{}}\n\n\
+         (Parent folder: not covered by this answer:\n- .: semantic: semantic search is off)"
+    )
+    );
+
+    let prose = "scheduler drains the work queue";
+    let prose_only = search(json!({"query":prose}));
+    assert!(!files(&prose_only.data)
+        .iter()
+        .any(|file| file == definition));
+    let split = search(json!({"query":prose, "pattern":"cross_parent"}));
+    assert!(split.success, "{split:?}");
+    assert_eq!(split.data["interpreted_as"], "split");
+    assert!(
+        split.data["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["file"] == definition && row["matched_by"] == "pattern" }),
+        "{}",
+        split.data
+    );
+    assert!(split.data["text"].as_str().unwrap().starts_with(&format!(
+        "[pattern `cross_parent`: 2 files matched, 0 also found by the query; defined in {definition}:1]\n\n"
+    )), "{}", split.data["text"]);
+
+    let empty = search(json!({}));
+    let req = request(json!({"id":"parent-search", "command":"semantic_search"}));
+    let ordinary = crate::commands::semantic_search::handle_semantic_search(&req, &parent);
+    assert!(!empty.success);
+    assert_eq!(empty.data, ordinary.data);
 }
 
 /// With the data layer on, a parent folder's `aft_search` reads each
