@@ -326,6 +326,9 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
     let mut declarations = BTreeMap::<String, Vec<Value>>::new();
     let mut callees = BTreeMap::<(String, String), usize>::new();
     let mut native_files = Vec::new();
+    let mut member_readers = BTreeMap::<String, BTreeSet<usize>>::new();
+    let mut java_members = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut java_callers = BTreeMap::<String, BTreeSet<usize>>::new();
     for record in view.published.state.paths() {
         let path = std::str::from_utf8(&record.path)?;
         if path.starts_with("exactness_gate/") {
@@ -334,11 +337,29 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
         let Some((_, parse)) = view.published.graph.parse_of(path) else {
             continue;
         };
+        let reader = native_files.len();
         native_files.push(path.to_string());
         for site in &parse.dispatch.sites {
             if let Some(member) = &site.member {
                 *members.entry(member.clone()).or_default() += 1;
+                if parse.language == "java" {
+                    member_readers
+                        .entry(member.clone())
+                        .or_default()
+                        .insert(reader);
+                }
             }
+        }
+        if parse.language == "java" {
+            java_members.insert(
+                path.to_string(),
+                parse
+                    .dispatch
+                    .methods
+                    .iter()
+                    .map(|method| method.name.clone())
+                    .collect(),
+            );
         }
         for method in &parse.dispatch.methods {
             if let Some(symbol) = parse
@@ -354,6 +375,12 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
         }
         if let Some(slice) = view.graph.slice(path) {
             for edge in slice.edges() {
+                if edge.target_file().ends_with(".java") {
+                    java_callers
+                        .entry(edge.target_file().to_string())
+                        .or_default()
+                        .insert(reader);
+                }
                 *callees
                     .entry((
                         edge.target_file().to_string(),
@@ -363,6 +390,19 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
             }
         }
     }
+    // Editing a Java file can touch readers of other members of the same
+    // type too. Count distinct files for the entire source file, in addition
+    // to the individual method's site or caller count.
+    let java_file_readers = java_members
+        .into_iter()
+        .map(|(path, names)| {
+            let mut readers = java_callers.remove(&path).unwrap_or_default();
+            for name in names {
+                readers.extend(member_readers.get(&name).into_iter().flatten());
+            }
+            (path, readers.len())
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut member_rows = declarations.into_iter().map(|(member, declarations)| json!({"sites": members.get(&member).copied().unwrap_or(0), "member": member, "declarations": declarations})).collect::<Vec<_>>();
     member_rows.sort_by(|a, b| {
         b["sites"]
@@ -372,6 +412,21 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
     });
     let mut busiest = callees.into_iter().collect::<Vec<_>>();
     busiest.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    // RefreshBudget admits max(1,024, ceil(parsed / 10)) files. Reserve the
+    // 13 paths the driver's first edit batch changes: eight in exactness_gate/
+    // and five in the corpus (including both sides of the rename). Divide the
+    // rest across the four original corpus files. Subtract two from the parsed
+    // count to allow for the two deletions in that batch.
+    let java_reader_limit = (view
+        .published
+        .graph
+        .parsed_files()
+        .count()
+        .saturating_sub(2)
+        .div_ceil(10)
+        .max(1024)
+        - 13)
+        / 4;
     let mut top = Vec::new();
     // The driver renames a parameter of the first of these whose signature
     // it can edit; on some projects none of the ten busiest has a parameter
@@ -379,6 +434,12 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
     for ((path, name), callers) in busiest {
         if top.len() == 40 {
             break;
+        }
+        if java_file_readers
+            .get(&path)
+            .is_some_and(|readers| *readers > java_reader_limit)
+        {
+            continue;
         }
         let Some((_, parse)) = view.published.graph.parse_of(&path) else {
             continue;
@@ -393,7 +454,8 @@ fn native_plan(view: &CheckoutView, out: &Path) -> GateResult<()> {
     }
     save(
         &out.join("native.json"),
-        &json!({"files": native_files, "members": member_rows, "top_callees": top}),
+        &json!({"files": native_files, "members": member_rows, "top_callees": top,
+            "java_reader_limit": java_reader_limit, "java_file_readers": java_file_readers}),
     )
 }
 

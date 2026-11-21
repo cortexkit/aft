@@ -98,9 +98,12 @@ class CompareTests(unittest.TestCase):
             (root / "Callee.java").write_bytes(callee)
             for name in ("A.java", "B.java"):
                 (root / name).write_text("class Stub {}\n")
-            row = {"file": "Owner.java", "language": "java", "symbol": {"name": "run", "end_line": 2, "end_col": 24}}
-            top = {"file": "Callee.java", "language": "java", "symbol": {"name": "call", "end_line": 0, "end_col": 57}, "callers": 9}
-            plan = {"files": ["A.java", "B.java"], "members": [{"member": "run", "sites": 10, "declarations": [row]}], "top_callees": [top]}
+            row = {"file": "Owner.java", "language": "java", "symbol": {"name": "run", "scoped_name": "Owner::run", "end_line": 2, "end_col": 24}}
+            top = {"file": "Callee.java", "language": "java", "symbol": {"name": "call", "scoped_name": "Callee::call", "end_line": 0, "end_col": 57}, "callers": 9}
+            plan = {"files": ["A.java", "B.java"],
+                    "members": [{"member": "run", "sites": 10, "declarations": [{**row, "file": "Busy.java"}, row]}],
+                    "top_callees": [{**top, "file": "Busy.java", "callers": 100}, top],
+                    "java_reader_limit": 10, "java_file_readers": {"Busy.java": 11, "Owner.java": 6, "Callee.java": 4}}
             start = source.index(b"@Check")
             parameter = callee.index(b"name")
             spans = [json.dumps({"member": [start, start + len(declaration.encode())]}),
@@ -116,6 +119,7 @@ class CompareTests(unittest.TestCase):
             self.assertEqual(signature["round1"], callee.decode().replace("name", "name_exactness"))
             self.assertEqual(validate.call_count, 3)
             self.assertEqual((root / "Owner.java").read_bytes(), source)
+            self.assertEqual(native["java_file_readers"], {"Owner.java": 6, "Callee.java": 4})
 
     def test_refresh_requires_confirmation_of_the_selected_guard_override(self):
         args = SimpleNamespace(cache_bytes=1, sample=1, build_cache_bytes=1, spill_bytes=1,

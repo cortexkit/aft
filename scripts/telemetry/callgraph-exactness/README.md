@@ -121,7 +121,11 @@ signature has a parameter besides its receiver. Edits are
 syntax-validated; rejected declarations and the selected locations are recorded.
 For Java, the probe uses the Java grammar to locate the exact byte ranges of
 class methods and parameter names, including declarations with annotations or
-multi-line signatures.
+multi-line signatures. The kit skips Java files with too many estimated readers
+so the default refresh file budget is less likely to force a cold rebuild. The
+estimate counts distinct files that call any of the file's methods or refer to
+it in the call graph. The kit records the selected Java symbols, calls and file
+reader counts.
 The island and native edits are restored in `finally`, including failure paths.
 `refresh_fanout` records changed fragments belonging to files not directly edited.
 

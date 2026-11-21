@@ -124,9 +124,16 @@ def java_spans(binary, path, symbol):
 
 def native_edits(binary, root, plan, seed):
     """Derive pin-independent edits from the reference's own stored graph."""
+    java_readers = plan.get("java_file_readers", {})
+    java_limit = plan.get("java_reader_limit", 0)
+
+    def admitted_file(name):
+        return java_readers.get(name, 0) <= java_limit
+
     rng = random.Random(seed)
     files = sorted(plan["files"])
     rng.shuffle(files)
+    files = [name for name in files if admitted_file(name)]
     if len(files) < 2:
         raise ValueError("need two native files for delete/rename witnesses")
     deleted, renamed = files[:2]
@@ -149,7 +156,7 @@ def native_edits(binary, root, plan, seed):
         if member["sites"] == 0:
             continue
         for row in member["declarations"]:
-            if row["file"] in originals:
+            if row["file"] in originals or not admitted_file(row["file"]):
                 continue
             path = root / row["file"]
             symbol = row["symbol"]
@@ -185,6 +192,11 @@ def native_edits(binary, root, plan, seed):
             if not declaration.strip() or not valid(row, duplicate) or not valid(row, removed):
                 continue
             member_edit = {"file": row["file"], "member": member["member"], "sites": member["sites"], "round1": duplicate, "round2": removed, "declaration": symbol}
+            if language == "java":
+                print(f"exactness Java member {row['file']}:{symbol['scoped_name']}: "
+                      f"{member['sites']} member call sites; "
+                      f"{java_readers[row['file']]} estimated file readers (limit {java_limit})", flush=True)
+                member_edit["file_readers"] = java_readers[row["file"]]
             originals[row["file"]] = path.read_bytes()
             break
         if member_edit:
@@ -193,7 +205,7 @@ def native_edits(binary, root, plan, seed):
         raise ValueError(f"no parseable native member duplication/removal: {rejected}")
     signature_edit = None
     for row in plan["top_callees"]:
-        if row["file"] in originals:
+        if row["file"] in originals or not admitted_file(row["file"]):
             continue
         path = root / row["file"]
         if row["language"] == "java":
@@ -203,7 +215,11 @@ def native_edits(binary, root, plan, seed):
                 source_bytes = path.read_bytes()
                 changed = (source_bytes[:end] + b"_exactness" + source_bytes[end:]).decode()
                 if valid(row, changed):
-                    signature_edit = {"file": row["file"], "symbol": row["symbol"], "callers": row["callers"], "round1": changed}
+                    signature_edit = {"file": row["file"], "symbol": row["symbol"], "callers": row["callers"],
+                                      "file_readers": java_readers[row["file"]], "round1": changed}
+                    print(f"exactness Java signature {row['file']}:{row['symbol']['scoped_name']}: "
+                          f"{row['callers']} callers; "
+                          f"{java_readers[row['file']]} estimated file readers (limit {java_limit})", flush=True)
                     originals[row["file"]] = source_bytes
                     break
             continue
@@ -256,7 +272,11 @@ def native_edits(binary, root, plan, seed):
     if not signature_edit:
         raise ValueError("no parseable signature edit among the reference's busiest callees")
     edits.extend([member_edit, signature_edit])
-    return {"delete": deleted, "rename": renamed, "renamed_to": renamed + ".exactness" + Path(renamed).suffix, "edits": edits, "rejected": rejected}, originals
+    native = {"delete": deleted, "rename": renamed, "renamed_to": renamed + ".exactness" + Path(renamed).suffix, "edits": edits, "rejected": rejected}
+    if java_readers:
+        native["java_reader_limit"] = java_limit
+        native["java_file_readers"] = {name: java_readers[name] for name in originals if name in java_readers}
+    return native, originals
 
 
 def apply_native(root, native, round_):
