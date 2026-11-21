@@ -4,6 +4,7 @@ mod parser;
 mod audit11_regressions {
     use crate::parser::*;
     use crate::symbols::Symbol;
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
     use std::path::Path;
     use std::sync::{Arc, RwLock};
 

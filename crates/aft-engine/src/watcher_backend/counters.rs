@@ -7,13 +7,13 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-pub(crate) struct WatcherOverflowPrefix {
+pub struct WatcherOverflowPrefix {
     pub(crate) prefix: String,
     pub(crate) count: u64,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct WatcherBackendExclusions {
+pub struct WatcherBackendExclusions {
     pub(crate) matcher_generation: u64,
     pub(crate) paths: Vec<PathBuf>,
     /// The next candidates that lost a slot to the exclusion cap, best first.
@@ -35,7 +35,7 @@ impl Default for WatcherBackendExclusions {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct WatcherExclusionPlanningSnapshot {
+pub struct WatcherExclusionPlanningSnapshot {
     pub(crate) matcher_generation: u64,
     pub(crate) attempts: u32,
     pub(crate) attempt_limit: u32,
@@ -154,7 +154,7 @@ pub struct WatcherCounters {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct WatcherRescanInterval {
+pub struct WatcherRescanInterval {
     pub(crate) raw_events: u64,
 }
 
@@ -220,7 +220,7 @@ impl WatcherCounters {
         // events could include a changed ignore file.
         self.overflow_ignore_evidence.swap(0, Ordering::AcqRel) != 1
     }
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(target_os = "macos", test, feature = "test-support"))]
     pub(crate) fn note_fsevents_stream_creation(&self) {
         self.fsevents_stream_creations_total
             .fetch_add(1, Ordering::Relaxed);
@@ -421,7 +421,12 @@ impl WatcherCounters {
         };
     }
 
-    #[cfg(any(target_os = "macos", target_os = "linux", test))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "linux",
+        test,
+        feature = "test-support"
+    ))]
     pub(crate) fn set_exclusion_planning(&self, snapshot: WatcherExclusionPlanningSnapshot) {
         *self
             .exclusion_planning

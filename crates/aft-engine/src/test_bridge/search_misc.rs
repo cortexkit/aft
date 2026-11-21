@@ -281,6 +281,11 @@ pub fn session_call_counts(
 pub trait BackupStoreTest {
     fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf);
     fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf);
+    fn expire_discovery_for_tests(&mut self);
+    fn uses_db_pool(
+        &self,
+        conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    ) -> bool;
 }
 
 impl BackupStoreTest for crate::backup::BackupStore {
@@ -291,4 +296,80 @@ impl BackupStoreTest for crate::backup::BackupStore {
     fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
         self.rekey_for_test(session, from, to);
     }
+
+    fn expire_discovery_for_tests(&mut self) {
+        self.expire_discovery_for_tests();
+    }
+
+    fn uses_db_pool(
+        &self,
+        conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
+    ) -> bool {
+        self.uses_db_pool(conn)
+    }
 }
+
+pub use inspect::InspectManagerTest as InspectManagerTestExt;
+pub use rerank::BackendSlotTest as BackendSlotTestExt;
+pub use BackupStoreTest as BackupStoreTestExt;
+
+mod watcher_counters;
+pub use watcher_counters::{
+    WatcherBackendExclusionsTestExt, WatcherCountersTestExt, WatcherRescanIntervalTestExt,
+};
+
+pub mod watcher_backend {
+    pub mod counters {
+        pub use super::super::watcher_counters::{
+            WatcherBackendExclusions, WatcherExclusionPlanningSnapshot, WatcherOverflowPrefix,
+            WatcherRescanInterval,
+        };
+    }
+}
+
+pub trait CheckpointStoreTestExt {
+    fn unbound_in_for_test(storage_dir: &Path) -> Self;
+}
+
+impl CheckpointStoreTestExt for crate::checkpoint::CheckpointStore {
+    fn unbound_in_for_test(storage_dir: &Path) -> Self {
+        Self::unbound_in_for_test(storage_dir)
+    }
+}
+
+pub trait BuildDeathBreakerTestExt {
+    fn reset_open_calls_for_test();
+    fn open_calls_for_test() -> u64;
+}
+
+impl BuildDeathBreakerTestExt for crate::build_breaker::BuildDeathBreaker {
+    fn reset_open_calls_for_test() {
+        Self::reset_open_calls_for_test();
+    }
+
+    fn open_calls_for_test() -> u64 {
+        Self::open_calls_for_test()
+    }
+}
+
+pub trait LspManagerTestExt {
+    fn resume(&self);
+}
+
+impl LspManagerTestExt for crate::lsp::manager::LspManager {
+    fn resume(&self) {
+        self.resume();
+    }
+}
+
+pub trait LspClientTestExt {
+    fn child_pid(&self) -> u32;
+}
+
+impl LspClientTestExt for crate::lsp::client::LspClient {
+    fn child_pid(&self) -> u32 {
+        self.child_pid()
+    }
+}
+
+pub use rerank::BuildInputsTestExt;
