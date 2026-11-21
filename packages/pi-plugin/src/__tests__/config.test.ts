@@ -1042,10 +1042,10 @@ describe("loadAftConfig", () => {
 
   test("project config can disable callgraph indexing while retired chunking is dropped", () => {
     const fixture = createConfigFixture();
-    writeFileSync(
-      fixture.userConfigPath,
-      JSON.stringify({ indexes: { callgraph: true }, callgraph_chunk_size: 100 }),
-    );
+    // The user file leaves out callgraph_chunk_size: from 0.67 a user file that
+    // sets it is refused outright, which is pinned separately. This test is about
+    // the project file, whose value is dropped with a notice.
+    writeFileSync(fixture.userConfigPath, JSON.stringify({ indexes: { callgraph: true } }));
     writeFileSync(
       fixture.projectConfigPath,
       JSON.stringify({ indexes: { callgraph: false }, callgraph_chunk_size: 3 }),

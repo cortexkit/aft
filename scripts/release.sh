@@ -374,6 +374,17 @@ echo "→ Refreshing Cargo.lock..."
 cargo update -w --offline --quiet || { echo "Error: cargo update failed after version sync"; exit 1; }
 echo ""
 
+# Recapture the config parity goldens at the new version. Some config keys are
+# refused only from a given release (for example `callgraph_chunk_size` from
+# 0.67), so the TypeScript loader's answer for those cases changes with the
+# version bump, and the Rust parity test would fail on the bump commit if the
+# goldens still held the previous release's answer. The capture needs the
+# bridge's built output to resolve `@cortexkit/aft-bridge`.
+echo "→ Recapturing config parity fixtures..."
+(cd packages/aft-bridge && bun run build >/dev/null) || { echo "Error: aft-bridge build failed before parity capture"; exit 1; }
+bun scripts/capture-config-parity.ts >/dev/null || { echo "Error: config parity capture failed after version sync"; exit 1; }
+echo ""
+
 # Step 2: Commit (skip if versions were already at target)
 echo "→ Committing version bump..."
 git add -A

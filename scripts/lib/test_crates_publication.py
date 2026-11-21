@@ -18,7 +18,7 @@ SPEC = importlib.util.spec_from_file_location("workflow_gates", Path(__file__).w
 assert SPEC is not None and SPEC.loader is not None
 parser = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(parser)
-PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "agent-file-tools"]
+PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools"]
 
 
 class CratesPublicationTests(unittest.TestCase):
@@ -117,6 +117,9 @@ pathlib.Path("slept").touch()
             ["publish", "--package", "aft-secret-rules"],
             ["publish", "--package", "aft-secret-rules", "--dry-run"],
             ["publish", "--package", "aft-store"],
+            ["publish", "--package", "aft-base"],
+            ["publish", "--package", "aft-db"],
+            ["publish", "--package", "aft-parse"],
             ["publish", "--package", "agent-file-tools"],
         ])
         self.assertTrue(slept)
@@ -124,7 +127,7 @@ pathlib.Path("slept").touch()
     def test_all_existing_crates_are_a_successful_retry(self):
         result, calls, slept = self.run_publish(already=PACKAGES)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(calls), 8)
+        self.assertEqual(len(calls), 2 * len(PACKAGES))
         self.assertEqual(calls[-1], ["publish", "--package", "agent-file-tools", "--dry-run"])
         self.assertTrue(slept)
 
