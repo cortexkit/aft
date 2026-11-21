@@ -22,7 +22,6 @@ const UPPER: &[&str] = &[
     "upper_test_context",
     "test_context",
 ];
-const TRACE_FACADE: &str = "pub use crate::trace_measure_run::run;";
 const REGISTERING_HELPER: &str = "upper_test_context.rs";
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
@@ -273,7 +272,6 @@ struct Guard {
     root: PathBuf,
     parser: Parser,
     findings: Vec<String>,
-    facade: usize,
     scan: Scan,
     helper_calls: usize,
     upper_files: HashSet<PathBuf>,
@@ -289,7 +287,6 @@ impl Guard {
             root: root.to_owned(),
             parser,
             findings: Vec::new(),
-            facade: 0,
             scan,
             helper_calls: 0,
             upper_files: HashSet::new(),
@@ -445,7 +442,7 @@ impl Guard {
 
     fn visits(&self, scope: Scope) -> bool {
         match self.scan {
-            Scan::Engine => !scope.upper,
+            Scan::Engine => true,
             Scan::UpperRegistration => scope.root || scope.upper,
         }
     }
@@ -464,20 +461,11 @@ impl Guard {
     fn check(&mut self, node: Node<'_>, path: &Path, source: &str) {
         let spelling = text(node, source);
         let found = match node.kind() {
-            "use_declaration" => {
-                if path == self.root.join("data_layer/trace_measure.rs") && spelling == TRACE_FACADE
-                {
-                    self.facade += 1;
-                    if self.facade == 1 {
-                        return;
-                    }
-                }
-                use_paths(
-                    node.child_by_field_name("argument").unwrap(),
-                    source,
-                    &mut Vec::new(),
-                )
-            }
+            "use_declaration" => use_paths(
+                node.child_by_field_name("argument").unwrap(),
+                source,
+                &mut Vec::new(),
+            ),
             "scoped_identifier" | "scoped_type_identifier" | "scoped_use_list" => {
                 // The containing import was already checked with its full prefix.
                 if node.parent().is_some_and(|parent| {
@@ -515,13 +503,15 @@ impl Guard {
 
 #[test]
 fn production_engine_sources_do_not_reach_the_upper_crate() {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let manifest = crate::test_helpers::manifest_dir();
+    let root = manifest.join("src");
+    let upper = manifest.join("../aft/src");
     let scope = Scope {
         root: true,
         ..Scope::default()
     };
-    let mut registration = Guard::new(&root, Scan::UpperRegistration);
-    registration.file(&root.join("lib.rs"), &root, scope, &[]);
+    let mut registration = Guard::new(&upper, Scan::UpperRegistration);
+    registration.file(&upper.join("lib.rs"), &upper, scope, &[]);
     assert!(
         registration.findings.is_empty(),
         "use crate::test_context in upper library tests:\n{}",
@@ -536,10 +526,6 @@ fn production_engine_sources_do_not_reach_the_upper_crate() {
     guard.upper_files = registration.upper_files;
     guard.file(&root.join("lib.rs"), &root, scope, &[]);
     assert!(guard.findings.is_empty(), "{}", guard.findings.join("\n"));
-    assert_eq!(
-        guard.facade, 1,
-        "the only exception is the public trace facade"
-    );
 }
 
 #[test]
@@ -597,9 +583,9 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
         "pub use crate::trace_measure_run::run;\nuse crate::{trace_measure_run::{run as again}};",
         &[],
     );
-    assert_eq!(guard.facade, 1);
-    assert_eq!(guard.findings.len(), 1, "{:?}", guard.findings);
-    assert!(guard.findings[0].contains("run as again"));
+    assert_eq!(guard.findings.len(), 2, "{:?}", guard.findings);
+    assert!(guard.findings[0].contains("trace_measure_run::run"));
+    assert!(guard.findings[1].contains("run as again"));
 
     let mut registration = Guard::new(root, Scan::UpperRegistration);
     registration.source(

@@ -34,7 +34,8 @@ impl Drop for WorkGuard {
 
 pub(crate) struct RuntimeGuard(Arc<Service>);
 impl RuntimeGuard {
-    pub(crate) fn retain_until_process_exit(&self) {
+    #[doc(hidden)]
+    pub fn retain_until_process_exit(&self) {
         self.0
             .lifecycle
             .lock()
@@ -42,7 +43,8 @@ impl RuntimeGuard {
             .unproven = true;
     }
 
-    pub(crate) fn retire(&self) -> bool {
+    #[doc(hidden)]
+    pub fn retire(&self) -> bool {
         self.0.retire()
     }
 }
@@ -70,7 +72,8 @@ impl Service {
         Ok(WorkGuard(self.clone()))
     }
 
-    pub(crate) fn track_finalization(self: &Arc<Self>) -> WorkGuard {
+    #[doc(hidden)]
+    pub fn track_finalization(self: &Arc<Self>) -> WorkGuard {
         self.lifecycle
             .lock()
             .unwrap_or_else(|error| error.into_inner())

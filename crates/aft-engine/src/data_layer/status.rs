@@ -402,9 +402,9 @@ pub struct SemanticFillHealth {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EmbeddingBackendHealthSnapshot {
-    pub(crate) available: bool,
-    pub(crate) last_error: Option<String>,
-    pub(crate) since_ms: Option<u64>,
+    pub available: bool,
+    pub last_error: Option<String>,
+    pub since_ms: Option<u64>,
     pub(crate) next_retry_ms: Option<u64>,
     pub paused_until_ms: Option<u64>,
     /// Why the backend refused requests for now, when `paused_until_ms` is set.

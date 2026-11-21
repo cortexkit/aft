@@ -97,10 +97,13 @@ pub(crate) trait RerankBackend: Send + Sync {
     /// I/O to learn its identity (asking a server which model it serves) must
     /// learn it while it is being built, off the search path; until it is
     /// built no backend is installed, which counts as reranking off.
-    fn fingerprint(&self) -> RerankFingerprint;
-    fn max_batch(&self) -> usize;
+    #[doc(hidden)]
+    pub fn fingerprint(&self) -> RerankFingerprint;
+    #[doc(hidden)]
+    pub fn max_batch(&self) -> usize;
     /// One score per doc, same order; must return by `deadline` or Err(Timeout).
-    fn score(
+    #[doc(hidden)]
+    pub fn score(
         &self,
         query: &str,
         docs: &[RerankDoc<'_>],

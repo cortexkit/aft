@@ -194,7 +194,8 @@ pub(crate) struct RetrySlot(parking_lot::Mutex<Option<PendingRetry>>);
 impl RetrySlot {
     /// True when an armed retry's next attempt is due. Never waits: a held
     /// slot reads as not due, and the next maintenance tick probes again.
-    pub(crate) fn is_due(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_due(&self) -> bool {
         self.0.try_lock().is_some_and(|slot| {
             slot.as_ref().is_some_and(|retry| {
                 !retry.exhausted

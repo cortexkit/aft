@@ -97,7 +97,8 @@ impl DataMeaning {
     /// The summary today's index gives for chunks the embedder refused, in
     /// the same words, with how many there are and why; `None` when the
     /// embedder refused none.
-    pub(crate) fn skipped_chunks(&self) -> Option<(String, usize, SemanticSkipReason)> {
+    #[doc(hidden)]
+    pub fn skipped_chunks(&self) -> Option<(String, usize, SemanticSkipReason)> {
         let root = self.snapshot.root();
         let failed = &self.snapshot.coverage().chunks_failed;
         if failed.is_empty() {

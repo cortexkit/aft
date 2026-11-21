@@ -989,10 +989,8 @@ impl Store {
 }
 
 impl Store {
-    pub(crate) fn scope_ended(
-        &self,
-        scope: &subc_protocol::scope::ScopeStamp,
-    ) -> Result<bool, Refusal> {
+    #[doc(hidden)]
+    pub fn scope_ended(&self, scope: &subc_protocol::scope::ScopeStamp) -> Result<bool, Refusal> {
         let conn = self.connect()?;
         let key = ScopeKey::from_stamp(scope);
         conn.query_row("SELECT EXISTS(SELECT 1 FROM gh_speech_scope_ends WHERE owner=?1 AND scope_ref=?2 AND epoch=?3)",params![key.owner,key.scope_ref,key.epoch.to_string()],|row|row.get(0)).map_err(db_error)

@@ -48,7 +48,8 @@ impl fmt::Display for RefreshWork<'_> {
 }
 
 impl Checkout {
-    pub(crate) fn refresh_counts(&self) -> RefreshCounts {
+    #[doc(hidden)]
+    pub fn refresh_counts(&self) -> RefreshCounts {
         RefreshCounts {
             refreshes: self.refresh_counts.refreshes.load(Relaxed),
             guard_fallbacks: self.refresh_counts.guard_fallbacks.load(Relaxed),

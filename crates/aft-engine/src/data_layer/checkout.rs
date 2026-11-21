@@ -1019,7 +1019,7 @@ impl Checkout {
         Ok(())
     }
 
-    pub(crate) fn readiness_generation(&self) -> u64 {
+    pub fn readiness_generation(&self) -> u64 {
         *self
             .readiness
             .0
@@ -1030,11 +1030,7 @@ impl Checkout {
     /// Capture the generation before checking readiness, then wait with no
     /// checkout or writer lock held. A publication between the check and this
     /// wait changes the generation, so its wake cannot be lost.
-    pub(crate) fn wait_for_readiness_change(
-        &self,
-        generation: &mut u64,
-        wait: std::time::Duration,
-    ) {
+    pub fn wait_for_readiness_change(&self, generation: &mut u64, wait: std::time::Duration) {
         let guard = self
             .readiness
             .0

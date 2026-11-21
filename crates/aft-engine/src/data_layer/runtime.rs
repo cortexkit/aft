@@ -1790,7 +1790,8 @@ impl DataCheckout {
 
     /// Only a queued or running first text build warrants waiting. An old
     /// publication, a failure, or a checkout with no build scheduled does not.
-    pub(crate) fn first_text_building(&self) -> bool {
+    #[doc(hidden)]
+    pub fn first_text_building(&self) -> bool {
         self.work.building.load(Ordering::Acquire)
             && self.work.checkout.planes().text
             && self.work.checkout.view().is_none()
@@ -1865,7 +1866,8 @@ impl DataCheckout {
     /// that needs exact answers: refreshes now and waits for it, up to
     /// `wait`. Reports a failure at once when the last build or refresh
     /// failed and nothing is running to replace it.
-    pub(crate) fn fresh_view(&self, wait: Duration) -> Fresh {
+    #[doc(hidden)]
+    pub fn fresh_view(&self, wait: Duration) -> Fresh {
         self.request_refresh();
         let deadline = Instant::now() + wait;
         let checkout = &self.work.checkout;

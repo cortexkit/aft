@@ -110,7 +110,7 @@ pub(crate) enum RegistryError {
 }
 
 impl RegistryError {
-    pub(crate) fn is_missing_task(&self) -> bool {
+    pub fn is_missing_task(&self) -> bool {
         matches!(self, Self::TaskNotFound(_))
     }
 }
@@ -1032,7 +1032,7 @@ pub struct BgTaskSnapshot {
     pub remote_oom_kill: Option<remote::RemoteOomKill>,
     /// Whether the runner confirmed input capture, retained through disk recovery.
     #[serde(skip)]
-    pub(crate) remote_inputs_captured: Option<bool>,
+    pub remote_inputs_captured: Option<bool>,
     /// The remote stream's phase: submitting, queued, waiting on a retained job,
     /// or running after execution evidence. Local and finished tasks omit it.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1283,7 +1283,7 @@ impl ProjectReplayBatch<'_> {
 
     /// Saved task rows already name their storage namespace. MCP and federated
     /// namespace slugs cannot be converted back into their original harness.
-    pub(crate) fn replay_saved_session_for_project(
+    pub fn replay_saved_session_for_project(
         self,
         storage_dir: &Path,
         harness_segment: &str,
@@ -1684,18 +1684,18 @@ pub struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
 #[derive(Clone, Default)]
 pub(crate) struct BashDrainReplyState {
     pub(crate) completion_finished_at: Option<u64>,
-    pub(crate) completion_delivered: bool,
+    pub completion_delivered: bool,
     pub(crate) runner_completion_offers: usize,
-    pub(crate) execution_note: Option<String>,
-    pub(crate) deadline: Option<(HardKillDeadline, u64)>,
-    pub(crate) inputs_captured: Option<bool>,
+    pub execution_note: Option<String>,
+    pub deadline: Option<(HardKillDeadline, u64)>,
+    pub inputs_captured: Option<bool>,
     /// A remote task's job ID and phase, so a reply formatted on the module
     /// loop can name the build-server job without reading task state.
-    pub(crate) remote: Option<remote::RemoteProgress>,
+    pub remote: Option<remote::RemoteProgress>,
     /// Artifact-free terminal diagnostics, published with the metadata before
     /// the full output renderer can finish the canonical snapshot below.
-    pub(crate) uncaptured_terminal_facts: Option<Arc<BgTaskSnapshot>>,
-    pub(crate) uncaptured_terminal: Option<Arc<BgTaskSnapshot>>,
+    pub uncaptured_terminal_facts: Option<Arc<BgTaskSnapshot>>,
+    pub uncaptured_terminal: Option<Arc<BgTaskSnapshot>>,
 }
 
 impl BashDrainReplyCache {
@@ -13313,7 +13313,7 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    pub(crate) fn wait_owner_pause_cancel(
+    pub fn wait_owner_pause_cancel(
         &self,
         task_id: &str,
         session_id: &str,

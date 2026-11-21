@@ -220,7 +220,8 @@ pub(crate) struct Receipt {
     pending: HashMap<u64, Vec<oneshot::Sender<()>>>,
 }
 impl Receipt {
-    pub(crate) fn applied(self) {
+    #[doc(hidden)]
+    pub fn applied(self) {
         for (seq, receipts) in self.pending {
             self.wake.applied.lock().insert(seq);
             for receipt in receipts {

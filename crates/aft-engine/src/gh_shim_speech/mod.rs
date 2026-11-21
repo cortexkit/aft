@@ -91,7 +91,7 @@ impl ScopeRole {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[doc(hidden)]
 pub struct Refusal {
-    pub(crate) code: Code,
+    pub code: Code,
     pub reason: String,
     pub(crate) role: Option<ScopeRole>,
     pub(crate) detail: Option<String>,

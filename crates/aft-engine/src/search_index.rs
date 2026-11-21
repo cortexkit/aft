@@ -268,7 +268,8 @@ impl SearchIndexSnapshot {
         }
     }
 
-    pub(crate) fn file_modified(&self, path: &Path) -> Option<SystemTime> {
+    #[doc(hidden)]
+    pub fn file_modified(&self, path: &Path) -> Option<SystemTime> {
         self.path_to_id
             .get(path)
             .and_then(|id| self.files.get(*id as usize))
@@ -2240,7 +2241,8 @@ impl SearchIndexSnapshot {
         self.glob_profiled(pattern, search_root, true).0
     }
 
-    pub(crate) fn glob_profiled(
+    #[doc(hidden)]
+    pub fn glob_profiled(
         &self,
         pattern: &str,
         search_root: &Path,

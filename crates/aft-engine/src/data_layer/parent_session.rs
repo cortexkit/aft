@@ -47,7 +47,8 @@ impl<T> Clone for Plane<T> {
 }
 
 impl<T> Plane<T> {
-    pub(crate) fn ready(&self) -> Option<&Arc<T>> {
+    #[doc(hidden)]
+    pub fn ready(&self) -> Option<&Arc<T>> {
         match self {
             Self::Ready(value) => Some(value),
             _ => None,

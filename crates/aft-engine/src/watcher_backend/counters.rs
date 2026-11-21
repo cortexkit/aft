@@ -101,14 +101,14 @@ struct WatcherLossRecovery {
 
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
-    pub(crate) bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
+    pub bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     matcher_wakes: Mutex<Vec<MatcherWake>>,
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(super) backend_activity: Mutex<(u64, u64)>,
     #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     pub(super) matcher_registration_gate: Mutex<Option<super::activity_tests::RegistrationGate>>,
-    pub(crate) bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
+    pub bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,
     /// Legacy rescan work coalesces repeated drops, but a newly installed views
     /// snapshot must still learn that delivery was lost during that work.
@@ -320,7 +320,8 @@ impl WatcherCounters {
     /// flush window, not yet handed to the dispatch channel. Read it before
     /// the dispatch channel: the window is emptied only after its paths are
     /// in the channel.
-    pub(crate) fn flush_window_holds_paths(&self) -> bool {
+    #[doc(hidden)]
+    pub fn flush_window_holds_paths(&self) -> bool {
         self.unflushed_path_count.load(Ordering::Acquire) > 0
     }
 
@@ -530,7 +531,8 @@ impl WatcherCounters {
         self.last_rescan_at_ms.store(at_ms, Ordering::Release);
     }
 
-    pub(crate) fn snapshot(&self) -> WatcherCountersSnapshot {
+    #[doc(hidden)]
+    pub fn snapshot(&self) -> WatcherCountersSnapshot {
         let recovery = self
             .loss_recovery
             .lock()

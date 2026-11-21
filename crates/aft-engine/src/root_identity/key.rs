@@ -71,7 +71,8 @@ impl ArtifactCacheKeyProbeError {
         &self.detail
     }
 
-    pub(crate) fn provisional_git_reason(&self) -> Option<String> {
+    #[doc(hidden)]
+    pub fn provisional_git_reason(&self) -> Option<String> {
         if self.failure != ArtifactCacheKeyFailure::GitUnavailable {
             return None;
         }

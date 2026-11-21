@@ -967,7 +967,7 @@ impl LspEventWait {
     /// Block until an event arrives, another drain handles one, or `until`.
     /// A returned event must be passed to
     /// [`LspManager::handle_waited_event`].
-    pub(crate) fn next_event(&self, until: Instant) -> Option<ReceivedLspEvent> {
+    pub fn next_event(&self, until: Instant) -> Option<ReceivedLspEvent> {
         let remaining = until.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
             return None;
@@ -985,7 +985,7 @@ impl LspEventWait {
     /// by that check (the waiter's own handling of an event wakes it too),
     /// and a drain after it can only happen once the lock is released, so
     /// its wake is not lost.
-    pub(crate) fn clear_pending_wake(&self) {
+    pub fn clear_pending_wake(&self) {
         let _ = self.wake_rx.try_recv();
     }
 }

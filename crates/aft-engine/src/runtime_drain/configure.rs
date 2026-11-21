@@ -111,7 +111,8 @@ pub enum ConfigureMaintenanceStage {
 }
 
 impl ConfigureMaintenanceStage {
-    pub(crate) fn label(self) -> &'static str {
+    #[doc(hidden)]
+    pub fn label(self) -> &'static str {
         match self {
             Self::Admission => "admission",
             Self::DatabaseRuntime => "database_runtime",
@@ -137,7 +138,8 @@ impl ConfigureMaintenanceStage {
     /// written right after it was never seen, and the ignored file stayed in
     /// grep results. Everything after these is housekeeping and yields to
     /// requests.
-    pub(crate) fn is_non_yielding_prefix(self) -> bool {
+    #[doc(hidden)]
+    pub fn is_non_yielding_prefix(self) -> bool {
         matches!(
             self,
             Self::Admission
@@ -173,7 +175,8 @@ impl ConfigureMaintenanceContinuation {
         }
     }
 
-    pub(crate) fn retry_at(&self) -> Option<Instant> {
+    #[doc(hidden)]
+    pub fn retry_at(&self) -> Option<Instant> {
         self.callgraph_upgrade_retry_at
             .or(self.lexical_bind_retry_at)
             .or(self.replay_retry_at)
@@ -186,7 +189,7 @@ pub struct ConfigureMaintenanceState {
     pub jobs: VecDeque<ConfigureMaintenanceContinuation>,
     // Freeze retry eligibility across one full drain so a deferred unit cannot
     // become due again while other units run and monopolize the same drain.
-    pub(crate) replay_retry_cutoff: Option<Instant>,
+    pub replay_retry_cutoff: Option<Instant>,
 }
 
 impl ConfigureMaintenanceState {
@@ -242,7 +245,8 @@ impl ConfigureMaintenanceState {
     /// advances it, in which case `drop_superseded_parked_continuations`
     /// discards the rest and the newer configure's own tail repeats every
     /// root-scoped stage.
-    pub(crate) fn can_step_aside(&self) -> bool {
+    #[doc(hidden)]
+    pub fn can_step_aside(&self) -> bool {
         self.jobs.front().is_none_or(|continuation| {
             continuation.stage == ConfigureMaintenanceStage::Admission
                 || !continuation.stage.is_non_yielding_prefix()

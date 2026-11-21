@@ -57,7 +57,8 @@ impl LaunchGrantState {
         *self.0.lock() = State::default();
     }
 
-    pub(crate) fn is_absent(&self, key: &PolicyKey, grant: &AccessGrant) -> bool {
+    #[doc(hidden)]
+    pub fn is_absent(&self, key: &PolicyKey, grant: &AccessGrant) -> bool {
         self.0
             .lock()
             .absent
@@ -68,7 +69,8 @@ impl LaunchGrantState {
     /// After a grant path is confirmed missing, recreating an object at that
     /// path must not restore the grant in this session. New explicit authority
     /// is required, rather than a route rebind or an epoch change.
-    pub(crate) fn mark_absent(&self, key: &PolicyKey, grant: AccessGrant) {
+    #[doc(hidden)]
+    pub fn mark_absent(&self, key: &PolicyKey, grant: AccessGrant) {
         let mut state = self.0.lock();
         let grants = state.absent.entry(session_key(key)).or_default();
         if !grants.contains(&grant) {
@@ -100,11 +102,8 @@ impl LaunchGrantState {
         result
     }
 
-    pub(crate) fn notices(
-        &self,
-        key: &PolicyKey,
-        grants: &[UnrestoredGrant],
-    ) -> Vec<UnrestoredGrant> {
+    #[doc(hidden)]
+    pub fn notices(&self, key: &PolicyKey, grants: &[UnrestoredGrant]) -> Vec<UnrestoredGrant> {
         // Route epochs may change while the worker's session stays the same.
         let session = session_key(key);
         let mut state = self.0.lock();

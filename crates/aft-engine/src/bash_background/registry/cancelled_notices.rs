@@ -65,7 +65,8 @@ impl std::fmt::Debug for CancelledCallReceipt {
 }
 
 impl CancelledCallReceipt {
-    pub(crate) fn lines(&self) -> impl Iterator<Item = &str> {
+    #[doc(hidden)]
+    pub fn lines(&self) -> impl Iterator<Item = &str> {
         self.0
             .iter()
             .flat_map(|notices| notices.iter().map(|notice| notice.text.as_str()))

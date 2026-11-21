@@ -3443,7 +3443,7 @@ impl SemanticEmbeddingModel {
 
     /// The embedding dimension this model has learned from its backend so
     /// far, without asking it.
-    pub(crate) fn known_dimension(&self) -> Option<usize> {
+    pub fn known_dimension(&self) -> Option<usize> {
         self.dimension
     }
 

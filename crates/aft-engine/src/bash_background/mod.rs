@@ -265,13 +265,15 @@ impl SpawnReceipt {
         self
     }
 
-    pub(crate) fn bind_changed_files_deadline(
+    #[doc(hidden)]
+    pub fn bind_changed_files_deadline(
         &self,
         deadline: crate::bash_changed_files::SharedCallDeadline,
     ) {
         let _ = self.changed_files_deadline.set(deadline);
     }
-    pub(crate) fn limit_changed_files_deadline(&self, deadline: std::time::Instant) {
+    #[doc(hidden)]
+    pub fn limit_changed_files_deadline(&self, deadline: std::time::Instant) {
         if let Some(shared) = self.changed_files_deadline.get() {
             let mut bound = shared
                 .lock()
@@ -310,7 +312,8 @@ impl SpawnReceipt {
         }
     }
 
-    pub(crate) fn enter_startup_step(&self, step: BashStartupStep) {
+    #[doc(hidden)]
+    pub fn enter_startup_step(&self, step: BashStartupStep) {
         let state = self
             .state
             .lock()
@@ -325,7 +328,8 @@ impl SpawnReceipt {
             .enter(step, std::time::Instant::now());
     }
 
-    pub(crate) fn startup_step_snapshot(&self) -> BashStartupStepSnapshot {
+    #[doc(hidden)]
+    pub fn startup_step_snapshot(&self) -> BashStartupStepSnapshot {
         self.startup_steps
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -340,7 +344,8 @@ impl SpawnReceipt {
     /// Settles the receipt at the reply deadline. A pending receipt becomes
     /// refused under the same lock every commit takes, so it is impossible
     /// for this to return `Refused` and for a commit to succeed afterwards.
-    pub(crate) fn expire(&self) -> StartupOutcome {
+    #[doc(hidden)]
+    pub fn expire(&self) -> StartupOutcome {
         let mut state = self
             .state
             .lock()
@@ -384,7 +389,8 @@ impl SpawnReceipt {
         Ok(())
     }
 
-    pub(crate) fn refused(&self) -> bool {
+    #[doc(hidden)]
+    pub fn refused(&self) -> bool {
         matches!(
             *self
                 .state

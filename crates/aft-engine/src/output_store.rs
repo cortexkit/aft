@@ -108,7 +108,8 @@ impl OutputFiles {
             .join(crate::backup::hash_session(session))
     }
 
-    pub(crate) fn save(&self, scope: &OutputScope, text: &str) -> io::Result<PathBuf> {
+    #[doc(hidden)]
+    pub fn save(&self, scope: &OutputScope, text: &str) -> io::Result<PathBuf> {
         if text.len() > SAVED_FILE_LIMIT {
             return Err(io::Error::other(
                 "full tool result exceeds the 64 MiB saved-file limit",
@@ -256,7 +257,8 @@ impl OutputFiles {
         path.canonicalize()
     }
 
-    pub(crate) fn read(&self, session: &str, path: &Path) -> Option<io::Result<Vec<u8>>> {
+    #[doc(hidden)]
+    pub fn read(&self, session: &str, path: &Path) -> Option<io::Result<Vec<u8>>> {
         if !generated_name(path) {
             return None;
         }

@@ -106,7 +106,7 @@ pub enum Withheld {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PlaneReport {
     /// [`OFF`], [`BUILDING`], [`READY`] or [`UNAVAILABLE`].
-    pub(crate) status: &'static str,
+    pub status: &'static str,
     /// Why the plane is off or unavailable; see [`reason`].
     pub(crate) reason: Option<&'static str>,
     /// The failure's error text, when a failure made it unavailable.
