@@ -2,18 +2,18 @@
 //! memory and applied at exec, never to its persisted environment snapshot.
 
 use std::collections::HashMap;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use std::sync::Mutex;
 
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use crate::context::AppContext;
 use crate::protocol::Response;
-#[cfg(any(unix, test))]
+#[cfg(unix)]
 use crate::sandbox_spawn::SpawnPlan;
 #[cfg(unix)]
 use crate::sandbox_spawn::{RequestedSandboxTier, SandboxRequirement, SandboxTaskKind};

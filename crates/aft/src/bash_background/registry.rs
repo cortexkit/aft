@@ -31454,6 +31454,7 @@ mod a02_tests {
     pub(crate) fn terminal_fixture() -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>)
     {
         let (dir, ctx, task) = test_support::wait_fixture(None);
+        assert_eq!(ctx.config().bash.worker_wait_max_ms, 1_800_000);
         {
             let mut state = task.state.lock().unwrap();
             state
