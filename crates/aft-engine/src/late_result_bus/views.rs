@@ -58,7 +58,11 @@ fn status(attached: bool, reason: Option<&'static str>) {
 }
 
 pub trait Writer {
-    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
+    fn put(
+        &mut self,
+        key: &str,
+        value: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
 }
 
 struct RealWriter(async_nats::jetstream::kv::Store);
