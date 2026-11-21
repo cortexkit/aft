@@ -1,7 +1,7 @@
 use super::seams::*;
 use super::*;
 use crate::bash_background::persistence::{read_task, write_task};
-use crate::exec_remote::wire_fixture::{daemon, id, Script};
+use crate::exec_remote::wire_fixture::{id, Script};
 
 pub const READ_ONLY_NOTE: &str = "note: the build server keeps tracked files read-only during a job, so the write to src/x.rs was refused (Operation not permitted). Edit files on this machine; the job's copy is discarded.";
 

@@ -1,5 +1,5 @@
 use super::*;
-use crate::gh_shim_speech::model::AuthorityRecord;
+use aft_engine::test_bridge::bash_remote::AuthorityRecord;
 
 fn rewrite(
     store: &crate::gh_shim_speech::store::Store,
@@ -47,13 +47,17 @@ async fn promotion_between_preflight_and_admission_posts_exactly_once() {
     let session = fixture.session.clone();
     let task = fixture.task.clone();
     fixture.partners(|partners| {
-        partners.before_final_gate = Some(Arc::new(move || {
+        *partners.before_final_gate_mut() = Some(Arc::new(move || {
             aft_engine::test_bridge::bash_remote::promote_speech_task(&session, &task);
         }))
     });
     let answer = fixture.post(true, "promote-in-flight").await;
     assert!(answer.ok, "{:?}", answer.data);
-    let stored = fixture.service.store.get(&fixture.incarnation).unwrap();
+    let stored = fixture
+        .service
+        .store
+        .test_get(&fixture.incarnation)
+        .unwrap();
     assert_eq!(stored.phase, "active");
     let state = fixture.plex.state.lock().unwrap();
     assert_eq!(state.sends, 1);
@@ -64,7 +68,7 @@ async fn promotion_between_preflight_and_admission_posts_exactly_once() {
 async fn seal_spawn_between_preflight_and_admission_posts_exactly_once() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = foreground().await;
-    let conn = fixture.service.store.connect().unwrap();
+    let conn = fixture.service.store.test_connect().unwrap();
     let row =
         crate::db::bash_tasks::get_bash_task(&conn, "opencode", &fixture.session, &fixture.task)
             .unwrap()
@@ -82,7 +86,7 @@ async fn seal_spawn_between_preflight_and_admission_posts_exactly_once() {
     .unwrap();
     let ticket = fixture.params["ticket"].as_str().unwrap().to_string();
     fixture.partners(|partners| {
-        partners.before_final_gate = Some(Arc::new(move || {
+        *partners.before_final_gate_mut() = Some(Arc::new(move || {
             let _spawn = aft_engine::test_bridge::bash_remote::spawn_ticket_guard(Some(&ticket));
             aft_engine::test_bridge::bash_remote::seal_spawn(&metadata);
         }))
@@ -108,7 +112,7 @@ async fn changed_authority_refuses(change: fn(&mut AuthorityRecord)) {
     let store = fixture.service.store.clone();
     let incarnation = fixture.incarnation.clone();
     fixture.partners(|partners| {
-        partners.before_final_gate = Some(Arc::new(move || {
+        *partners.before_final_gate_mut() = Some(Arc::new(move || {
             // Keep generation unchanged: a generation-only refresh is not enough.
             rewrite(&store, &incarnation, change);
         }))
@@ -229,7 +233,7 @@ async fn revoked_between_preflight_and_admission_refuses_without_sending() {
     let service = fixture.service.clone();
     let incarnation = fixture.incarnation.clone();
     fixture.partners(|partners| {
-        partners.before_final_gate = Some(Arc::new(move || {
+        *partners.before_final_gate_mut() = Some(Arc::new(move || {
             service.revoke(&incarnation, "cancelled").unwrap();
         }))
     });
@@ -245,7 +249,7 @@ async fn ended_scope_between_preflight_and_admission_refuses_without_sending() {
     let service = fixture.service.clone();
     let scope = fixture.head.clone();
     fixture.partners(|partners| {
-        partners.before_final_gate = Some(Arc::new(move || {
+        *partners.before_final_gate_mut() = Some(Arc::new(move || {
             let generation = service.generation();
             let reply = subc_protocol::session::ModuleControlResponseToModule::ScopeDescribe {
                 status: ScopeStatus::Ended,

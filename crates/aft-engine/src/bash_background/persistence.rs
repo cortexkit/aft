@@ -1821,8 +1821,10 @@ fn sync_unchanged_metadata(
     true
 }
 
+#[cfg(test)]
+pub(crate) use test_faults::with_task_io_fault;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use test_faults::{with_task_io_fault, TaskIoFault};
+pub(crate) use test_faults::TaskIoFault;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_faults {
     use super::*;

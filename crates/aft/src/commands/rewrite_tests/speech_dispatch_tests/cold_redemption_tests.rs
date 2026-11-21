@@ -191,7 +191,7 @@ async fn cases(cases: &[&str]) {
             ])
             .env(
                 "AFT_TEST_COLD_ROOT",
-                fixture.service.store.path().parent().unwrap(),
+                fixture.service.store.test_path().parent().unwrap(),
             )
             .env(
                 "AFT_TEST_COLD_TICKET",

@@ -316,7 +316,7 @@ mod frame_loop_lock_tests {
     #[tokio::test]
     async fn module_drain_keeps_live_capture_when_stale_replay_loses_registration() {
         let (dir, registry, task) =
-            crate::bash_background::registry::remote::captured_task_after_losing_replay_for_test();
+            aft_engine::test_bridge::bash_remote::remote_support::captured_task_after_losing_replay_for_test();
         let root = ProjectRootId::from_path(dir.path()).unwrap();
         let cached = registry.drain_reply_cache(&task.task_id, &task.session_id);
         let metrics = DispatchPathMetrics::new();
@@ -393,7 +393,7 @@ mod frame_loop_lock_tests {
     #[tokio::test]
     async fn module_drain_reports_uncaptured_terminal_before_output_rendering() {
         for refused in [true, false] {
-            let fixture = crate::bash_background::registry::remote::uncaptured_terminal_before_render_for_test(refused);
+            let fixture = aft_engine::test_bridge::bash_remote::remote_support::uncaptured_terminal_before_render_for_test(refused);
             let root = ProjectRootId::from_path(fixture.dir.path()).unwrap();
             let task = &fixture.task;
             let cached = fixture
@@ -705,30 +705,29 @@ mod default_kill_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn a02_observation_polls_the_live_child_once() {
-        use std::sync::atomic::Ordering;
         let (_dir, ctx, task) =
             crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
         let child = std::process::Command::new("sleep")
             .arg("10")
             .spawn()
             .unwrap();
-        task.state.lock().unwrap().runtime =
+        *task.test_lock_state().unwrap().runtime_mut() =
             aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(child.into()));
         let registry = ctx.bash_background();
         let observation = observe_deferred_bash_wait(
             registry.clone(),
-            task.task_id.clone(),
-            task.session_id.clone(),
+            task.task_id().to_owned(),
+            task.session_id().to_owned(),
             false,
             false,
             None,
             None,
         )
         .await;
-        let polls = registry.inner.child_polls.load(Ordering::Relaxed);
+        let polls = aft_engine::test_bridge::bash_remote::child_polls(&registry);
         if let aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(mut child)) =
             std::mem::replace(
-                &mut task.state.lock().unwrap().runtime,
+                task.test_lock_state().unwrap().runtime_mut(),
                 aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(None),
             )
         {
@@ -746,7 +745,6 @@ mod default_kill_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn deferred_wait_observations_build_no_snapshots() {
-        use std::sync::atomic::Ordering;
         const OBSERVATIONS: u64 = 50;
         let (_dir, ctx, task) =
             crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
@@ -754,16 +752,16 @@ mod default_kill_tests {
             .arg("10")
             .spawn()
             .unwrap();
-        task.state.lock().unwrap().runtime =
+        *task.test_lock_state().unwrap().runtime_mut() =
             aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(child.into()));
         let registry = ctx.bash_background();
-        let snapshots_before = registry.inner.snapshots_built.load(Ordering::Relaxed);
+        let snapshots_before = aft_engine::test_bridge::bash_remote::snapshots_built(&registry);
         let mut finished = 0;
         for _ in 0..OBSERVATIONS {
             let observation = observe_deferred_bash_wait(
                 registry.clone(),
-                task.task_id.clone(),
-                task.session_id.clone(),
+                task.task_id().to_owned(),
+                task.session_id().to_owned(),
                 false,
                 false,
                 None,
@@ -772,24 +770,26 @@ mod default_kill_tests {
             .await;
             finished += u64::from(observation.target_finished);
         }
-        let polls = registry.inner.child_polls.load(Ordering::Relaxed);
-        let snapshots = registry.inner.snapshots_built.load(Ordering::Relaxed) - snapshots_before;
+        let polls = aft_engine::test_bridge::bash_remote::child_polls(&registry);
+        let snapshots =
+            aft_engine::test_bridge::bash_remote::snapshots_built(&registry) - snapshots_before;
         // End the child while it is still running, then check that a finished
         // task is reported finished without a snapshot either.
         if let aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(mut child)) =
             std::mem::replace(
-                &mut task.state.lock().unwrap().runtime,
+                task.test_lock_state().unwrap().runtime_mut(),
                 aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(None),
             )
         {
             child.kill().unwrap();
             child.wait().unwrap();
         }
-        task.state.lock().unwrap().metadata.status = crate::protocol::BgTaskStatus::Completed;
+        task.test_lock_state().unwrap().metadata_mut().status =
+            crate::protocol::BgTaskStatus::Completed;
         let terminal = observe_deferred_bash_wait(
             registry.clone(),
-            task.task_id.clone(),
-            task.session_id.clone(),
+            task.task_id().to_owned(),
+            task.session_id().to_owned(),
             false,
             false,
             None,
@@ -799,7 +799,7 @@ mod default_kill_tests {
         let missing = observe_deferred_bash_wait(
             registry.clone(),
             "bash-00000000000000ff".into(),
-            task.session_id.clone(),
+            task.session_id().to_owned(),
             false,
             false,
             None,
@@ -807,7 +807,7 @@ mod default_kill_tests {
         )
         .await;
         let snapshots_total =
-            registry.inner.snapshots_built.load(Ordering::Relaxed) - snapshots_before;
+            aft_engine::test_bridge::bash_remote::snapshots_built(&registry) - snapshots_before;
         eprintln!(
             "deferred wait observations={OBSERVATIONS} child_polls={polls} snapshots={snapshots_total}"
         );
@@ -5220,12 +5220,12 @@ mod grant_path_tests {
     }
     #[cfg(unix)]
     static CHANGED_FILES_BUDGET_FOR_TEST: std::sync::Mutex<
-        Option<crate::bash_changed_files::SharedCallDeadline>,
+        Option<aft_engine::test_bridge::bash_remote::SharedCallDeadline>,
     > = std::sync::Mutex::new(None);
 
     #[cfg(unix)]
     fn changed_files_budget_running_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        let deadline = crate::bash_background::changed_files_deadline_for_spawn()
+        let deadline = aft_engine::test_bridge::bash_remote::changed_files_deadline_for_spawn()
             .expect("reply deadline bound before dispatch");
         assert!(deadline.lock().unwrap().is_some());
         *CHANGED_FILES_BUDGET_FOR_TEST.lock().unwrap() = Some(deadline);
@@ -5740,7 +5740,7 @@ mod grant_path_tests {
             "ledger_identity_observation",
             "test dispatch observes the ledger identity a task would record",
             json!({
-                "task_requester": crate::bash_background::call_key_for_new_task("task").requester,
+                "task_requester": aft_engine::test_bridge::bash_remote::call_key_for_new_task("task").requester,
                 "ledger_carrier": crate::bash_background::registry::ledger_spawn_for_test()
                     .map(|key| key.carrier),
             }),
@@ -9158,7 +9158,7 @@ mod grant_path_tests {
     #[test]
     fn runon_capture_cached_unknown_reply_before_terminal_render_keeps_advice() {
         let fixture =
-            crate::bash_background::registry::remote::uncaptured_unknown_before_render_for_test();
+            aft_engine::test_bridge::bash_remote::remote_support::uncaptured_unknown_before_render_for_test();
         let task_id = &fixture.task.task_id;
         let launch = Response::success(
             "cached-unknown",
@@ -10066,7 +10066,7 @@ mod grant_path_tests {
     }
 
     fn held_before_spawn_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        crate::bash_background::enter_bash_startup_step(
+        aft_engine::test_bridge::bash_remote::enter_bash_startup_step(
             crate::bash_background::BashStartupStep::Profile,
         );
         hold_startup_checkpoint();
@@ -11077,7 +11077,7 @@ mod grant_path_tests {
     fn gated_inline_stub(req: RawRequest, _ctx: &AppContext) -> Response {
         let timing = BASH_TIMING_FOR_TEST.with(|slot| slot.borrow().clone().unwrap());
         BashTimingForTest::wait(&timing.admission, "inline admission");
-        crate::bash_background::commit_spawn_receipt_inline()
+        aft_engine::test_bridge::bash_remote::commit_spawn_receipt_inline()
             .expect("commit before injected deadline");
         timing.committed.notify_one();
         BashTimingForTest::wait(&timing.result, "inline result");

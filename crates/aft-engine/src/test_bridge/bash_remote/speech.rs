@@ -238,3 +238,76 @@ impl AuthorityRecord {
         }
     }
 }
+
+pub use gh_shim_speech::service::test_partners_fixture::TestPartners;
+
+type Bindings = Arc<dyn Fn(&str, &str) -> Result<Value, Refusal> + Send + Sync>;
+type Reservation = Arc<
+    dyn Fn(&str, &str, &ScopeStamp, Value) -> Result<ReservedBotRequest, Refusal> + Send + Sync,
+>;
+
+impl TestPartners {
+    pub fn for_test(
+        seal_failure: Option<Refusal>,
+        expect_placed: Option<&'static str>,
+        run_placed: Option<&'static str>,
+        reserved_send_placed: bool,
+        bindings: Bindings,
+        reserve: Reservation,
+        before_final_gate: Option<Arc<dyn Fn() + Send + Sync>>,
+    ) -> Self {
+        Self {
+            seal_failure,
+            expect_placed,
+            run_placed,
+            reserved_send_placed,
+            bindings,
+            reserve,
+            before_final_gate,
+        }
+    }
+
+    pub fn bindings(&self) -> &Bindings {
+        &self.bindings
+    }
+    pub fn bindings_mut(&mut self) -> &mut Bindings {
+        &mut self.bindings
+    }
+    pub fn reserve(&self) -> &Reservation {
+        &self.reserve
+    }
+    pub fn reserve_mut(&mut self) -> &mut Reservation {
+        &mut self.reserve
+    }
+    pub fn before_final_gate_mut(&mut self) -> &mut Option<Arc<dyn Fn() + Send + Sync>> {
+        &mut self.before_final_gate
+    }
+}
+
+impl Service {
+    #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub fn test_install_partners(&self, partners: Arc<TestPartners>) {
+        self.install_test_partners(partners);
+    }
+
+    pub fn test_partners_for_fixture(&self) -> Option<Arc<TestPartners>> {
+        self.test_partners()
+    }
+
+    #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub fn test_expire_scope_cache(&self) {
+        self.expire_test_scope_cache();
+    }
+}
+
+impl ReservedBotRequest {
+    pub fn test_send(self) -> Result<QueuedBotResponse, Refusal> {
+        self.send()
+    }
+}
+
+impl QueuedBotResponse {
+    pub async fn test_response(self) -> Result<Value, QueuedResponseError> {
+        self.response().await
+    }
+}

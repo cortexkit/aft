@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use subc_protocol::{BindIdentity, Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
+use subc_protocol::{Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
 
 // Protocol 0.34 clients require numeric daemon versions of at least 0.39.0
 // before sending project-free opens. Keep this stand-in's metadata compatible
