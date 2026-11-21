@@ -354,7 +354,7 @@ impl PreparedExactCache {
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.exact_preparations += 1);
+            crate::search_test_counts::record(|counts| counts.exact_preparations += 1);
             Arc::new(PreparedExactText::new(text))
         });
         drop(other_wait);

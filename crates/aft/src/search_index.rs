@@ -368,9 +368,7 @@ impl SearchIndexSnapshot {
         }
 
         #[cfg(test)]
-        crate::search_hot_path_measurements::record(|counts| {
-            counts.candidates_sorted += ranked.len()
-        });
+        crate::search_test_counts::record(|counts| counts.candidates_sorted += ranked.len());
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(depth);
         Ok(LexicalRankResult {
@@ -416,9 +414,7 @@ impl SearchIndexSnapshot {
             })
             .collect::<Vec<_>>();
         #[cfg(test)]
-        crate::search_hot_path_measurements::record(|counts| {
-            counts.candidates_sorted += ranked.len()
-        });
+        crate::search_test_counts::record(|counts| counts.candidates_sorted += ranked.len());
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(ranked)
     }
@@ -639,7 +635,7 @@ impl SearchIndexSnapshot {
         }
 
         #[cfg(test)]
-        crate::search_hot_path_measurements::record(|counts| {
+        crate::search_test_counts::record(|counts| {
             counts.exact_passes += 1;
             counts.exact_pass_candidates += candidate_count;
             counts.exact_pass_reads += files_read;
@@ -3111,7 +3107,7 @@ pub(crate) fn read_request_corpus_file(
             }
             let read = files.read(path, |path| {
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record_file_read_path(path);
+                crate::search_test_counts::record_file_read_path(path);
                 let file = crate::project_content::open(path)?;
                 let stat = FileStat::of(&file.metadata()?);
                 if stat.size > max_file_size {
@@ -3213,7 +3209,7 @@ fn read_search_corpus_file_with_metadata(
     }
 
     #[cfg(test)]
-    crate::search_hot_path_measurements::record_file_read_path(path);
+    crate::search_test_counts::record_file_read_path(path);
     let mut bytes = Vec::new();
     #[cfg(test)]
     audit_record(|work| work.corpus_opens += 1);
@@ -3476,7 +3472,7 @@ fn lexical_score_from_postings(
     file_id: u32,
 ) -> f32 {
     #[cfg(test)]
-    crate::search_hot_path_measurements::record(|counts| counts.score_evaluations += 1);
+    crate::search_test_counts::record(|counts| counts.score_evaluations += 1);
     if query_trigrams.is_empty() {
         return 0.0;
     }
@@ -3709,11 +3705,11 @@ where
     let builder = project_walk_builder(search_root);
 
     #[cfg(test)]
-    crate::search_hot_path_measurements::record(|counts| counts.project_walks += 1);
+    crate::search_test_counts::record(|counts| counts.project_walks += 1);
     let mut files = Vec::new();
     for entry in builder.build().filter_map(|entry| entry.ok()) {
         #[cfg(test)]
-        crate::search_hot_path_measurements::record(|counts| counts.project_walk_entries += 1);
+        crate::search_test_counts::record(|counts| counts.project_walk_entries += 1);
         if !entry
             .file_type()
             .map_or(false, |file_type| file_type.is_file())
@@ -3723,7 +3719,7 @@ where
         let path = entry.into_path();
         if filters.matches(filter_root, &path) && matches_file(&path) {
             #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.project_walk_files += 1);
+            crate::search_test_counts::record(|counts| counts.project_walk_files += 1);
             files.push(path);
             if max_files.is_some_and(|limit| files.len() > limit) {
                 return Err(files.len());

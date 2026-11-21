@@ -6045,9 +6045,7 @@ impl SemanticIndex {
             .chain(self.view_run_entries())
             .inspect(|_| {
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record(|counts| {
-                    counts.refresh_entry_visits += 1
-                });
+                crate::search_test_counts::record(|counts| counts.refresh_entry_visits += 1);
             })
             .filter(|entry| requested_relative.contains(entry.chunk.file.as_path()))
             .map(|entry| {
@@ -6061,9 +6059,7 @@ impl SemanticIndex {
             .iter()
             .inspect(|_| {
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record(|counts| {
-                    counts.refresh_entry_visits += 1
-                });
+                crate::search_test_counts::record(|counts| counts.refresh_entry_visits += 1);
             })
             .filter(|entry| requested.contains(entry.chunk.file.as_path()))
             .map(|entry| {
@@ -6078,7 +6074,7 @@ impl SemanticIndex {
             // string without bumping `SEMANTIC_INDEX_VERSION` and forcing every
             // user through a full rebuild.
             #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.reused_payload_clones += 1);
+            crate::search_test_counts::record(|counts| counts.reused_payload_clones += 1);
             let hash = blake3::hash(entry.chunk.embed_text.as_bytes());
             reuse_map
                 .entry(path.into_owned())
@@ -6104,9 +6100,7 @@ impl SemanticIndex {
         if let Some(base) = &self.shared_base {
             for entry in base.entries() {
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record(|counts| {
-                    counts.refresh_entry_visits += 1
-                });
+                crate::search_test_counts::record(|counts| counts.refresh_entry_visits += 1);
                 if self.tombstones.contains(&entry.chunk.file) {
                     continue;
                 }
@@ -6115,9 +6109,7 @@ impl SemanticIndex {
                     continue;
                 }
                 #[cfg(test)]
-                crate::search_hot_path_measurements::record(|counts| {
-                    counts.reused_payload_clones += 1
-                });
+                crate::search_test_counts::record(|counts| counts.reused_payload_clones += 1);
                 reuse_map
                     .entry(path)
                     .or_default()
@@ -7579,7 +7571,7 @@ impl SemanticIndex {
         self.hide_base_files(entry_files);
         self.entries.retain_mut(|entry| {
             #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.refresh_entry_visits += 1);
+            crate::search_test_counts::record(|counts| counts.refresh_entry_visits += 1);
             if entry_files.contains(&entry.chunk.file) {
                 removed(entry);
                 false
@@ -7669,7 +7661,7 @@ impl SemanticIndex {
             }
 
             #[cfg(test)]
-            crate::search_hot_path_measurements::record(|counts| counts.score_evaluations += 1);
+            crate::search_test_counts::record(|counts| counts.score_evaluations += 1);
             let dot = if query_vector.len() == entry.vector.len() {
                 dot_product(query_vector, &entry.vector)
             } else {
@@ -7695,9 +7687,7 @@ impl SemanticIndex {
             scored.truncate(keep);
         }
         #[cfg(test)]
-        crate::search_hot_path_measurements::record(|counts| {
-            counts.candidates_sorted += scored.len()
-        });
+        crate::search_test_counts::record(|counts| counts.candidates_sorted += scored.len());
         scored.sort_by(semantic_score_order);
 
         scored
@@ -10191,7 +10181,7 @@ fn collect_semantic_file_uncached(
         }
 
         #[cfg(test)]
-        crate::search_hot_path_measurements::record_file_read();
+        crate::search_test_counts::record_file_read();
         let source =
             crate::project_content::read_to_string(file).map_err(SemanticCollectError::Io)?;
         indexed_metadata.content_hash = if size <= cache_freshness::CONTENT_HASH_SIZE_CAP {
@@ -12953,7 +12943,7 @@ Connection: close
             )
             .unwrap();
         assert!(index.deferred_files.contains(&deferred));
-        crate::search_hot_path_measurements::reset();
+        crate::search_test_counts::reset();
         let update = index
             .refresh_invalidated_files(
                 temp.path(),
@@ -12964,7 +12954,7 @@ Connection: close
                 &mut |_, _| {},
             )
             .unwrap();
-        assert_eq!(crate::search_hot_path_measurements::counts().file_reads, 1);
+        assert_eq!(crate::search_test_counts::counts().file_reads, 1);
         assert_eq!(update.summary.total_processed, 2);
         assert_eq!(update.summary.added, 0);
         assert!(index.deferred_files.contains(&deferred));
@@ -13022,7 +13012,7 @@ Connection: close
         let before = index.entry_vectors_for_test();
         assert!(!before.is_empty());
         let entries = index.entries.len();
-        crate::search_hot_path_measurements::reset();
+        crate::search_test_counts::reset();
         let update = index
             .refresh_invalidated_files(
                 temp.path(),
@@ -13035,12 +13025,9 @@ Connection: close
             .unwrap();
         assert_eq!(index.entry_vectors_for_test(), before);
         assert_eq!(update.added_entries.len(), entries);
+        assert_eq!(crate::search_test_counts::counts().reused_payload_clones, 0);
         assert_eq!(
-            crate::search_hot_path_measurements::counts().reused_payload_clones,
-            0
-        );
-        assert_eq!(
-            crate::search_hot_path_measurements::counts().refresh_entry_visits,
+            crate::search_test_counts::counts().refresh_entry_visits,
             entries
         );
     }

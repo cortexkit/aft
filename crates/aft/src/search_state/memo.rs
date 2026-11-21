@@ -98,7 +98,7 @@ fn read_digest_after_open(
     after_open: impl FnOnce(),
 ) -> Result<String, PathBuf> {
     #[cfg(test)]
-    crate::search_hot_path_measurements::record_memo_file_read(path);
+    crate::search_test_counts::record_memo_file_read(path);
     if let Some(file) = request_files.and_then(|files| files.kept(path)) {
         return Ok(compute_content_digest(file.bytes()));
     }
@@ -905,7 +905,7 @@ impl ExactMemoStore {
         }
 
         #[cfg(test)]
-        crate::search_hot_path_measurements::record_memo_file_read(path);
+        crate::search_test_counts::record_memo_file_read(path);
         before_read();
         let read_wait = super::waits::time(super::waits::SearchWait::FileRead);
         let mut file = fs::File::open(path).map_err(|_| path.to_path_buf())?;
@@ -1270,7 +1270,7 @@ mod tests {
                 .zip(after.as_ref())
                 .map(|(a, b)| a.reusable(b, observed));
             eprintln!("Windows immediate rewrite: backdated={backdated}, native_stat_would_reuse={stat_would_reuse:?}, before={before:?}, after={after:?}");
-            crate::search_hot_path_measurements::reset();
+            crate::search_test_counts::reset();
             let changed = memo
                 .get_or_verify(&key, 0, 10, || {
                     panic!("must invalidate without rebuilding the page")
@@ -1279,10 +1279,7 @@ mod tests {
             assert!(changed.served_page_digest_mismatch);
             assert!(memo.is_key_poisoned(&key));
             assert!(!memo.has_live_entry(&key));
-            assert_eq!(
-                crate::search_hot_path_measurements::counts().memo_digest_reads,
-                1
-            );
+            assert_eq!(crate::search_test_counts::counts().memo_digest_reads, 1);
         }
     }
 
@@ -1397,20 +1394,17 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first.results.len(), 8_000);
-        crate::search_hot_path_measurements::reset();
+        crate::search_test_counts::reset();
         let warm = memo
             .get_or_verify(&key, 0, usize::MAX, || panic!("memo hit"))
             .unwrap();
         assert!(!warm.served_page_digest_mismatch);
-        assert_eq!(
-            crate::search_hot_path_measurements::counts().memo_digest_reads,
-            200
-        );
-        crate::search_hot_path_measurements::reset();
+        assert_eq!(crate::search_test_counts::counts().memo_digest_reads, 200);
+        crate::search_test_counts::reset();
         let hot = memo
             .get_or_verify(&key, 0, usize::MAX, || panic!("memo hit"))
             .unwrap();
-        let reads = crate::search_hot_path_measurements::counts().memo_digest_reads;
+        let reads = crate::search_test_counts::counts().memo_digest_reads;
         assert_eq!(hot.results.len(), 8_000);
         assert!(!hot.served_page_digest_mismatch);
         assert_eq!(reads, if reusable { 0 } else { 200 });
@@ -1461,12 +1455,9 @@ mod tests {
                     digest: digest.clone(),
                 },
             );
-            crate::search_hot_path_measurements::reset();
+            crate::search_test_counts::reset();
             memo.check_file_digest(&path, &digest).unwrap();
-            assert_eq!(
-                crate::search_hot_path_measurements::counts().memo_digest_reads,
-                1
-            );
+            assert_eq!(crate::search_test_counts::counts().memo_digest_reads, 1);
         }
         memo.check_file_digest(&path, &digest).unwrap();
         let observed = memo
@@ -1553,13 +1544,10 @@ mod tests {
             ..proof
         };
         memo.digest_proofs.lock().insert(&path, oversized);
-        crate::search_hot_path_measurements::reset();
+        crate::search_test_counts::reset();
         memo.check_file_digest(&path, &compute_content_digest(b"old"))
             .unwrap();
-        assert_eq!(
-            crate::search_hot_path_measurements::counts().memo_digest_reads,
-            1
-        );
+        assert_eq!(crate::search_test_counts::counts().memo_digest_reads, 1);
     }
 
     #[test]
@@ -1838,7 +1826,7 @@ mod tests {
     #[test]
     #[ignore = "opt-in warm exact-memo scaling measurement"]
     fn warm_exact_memo_cost_by_file_count() {
-        use crate::search_hot_path_measurements::{counts, reset};
+        use crate::search_test_counts::{counts, reset};
         for file_count in [10, 100, 1_000] {
             let temp = tempfile::tempdir().unwrap();
             let bytes = format!("pub fn symbol() {{}}\n{}", "// source payload\n".repeat(60));
@@ -1985,9 +1973,9 @@ mod tests {
             })
             .collect::<Vec<_>>();
         for (page, expected_reads) in [(&candidates[100..110], 10), (candidates.as_slice(), 200)] {
-            crate::search_hot_path_measurements::reset();
+            crate::search_test_counts::reset();
             ExactMemoStore::check_served_page_digests(page, &file_digests).unwrap();
-            let reads = crate::search_hot_path_measurements::counts().file_reads;
+            let reads = crate::search_test_counts::counts().file_reads;
             println!(
                 "SEMANTIC_WORK memo_digests: page={} files=200 reads_and_hashes={reads}",
                 page.len()
