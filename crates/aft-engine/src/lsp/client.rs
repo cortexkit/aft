@@ -246,7 +246,8 @@ pub(crate) fn rust_check_triggers(initialization_options: Option<&Value>) -> (bo
 /// results for the files as they are now. See
 /// [`LspClient::rust_check_state`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RustCheckState {
+#[doc(hidden)]
+pub enum RustCheckState {
     /// No check is running or expected: the published compiler results are
     /// current.
     Current,

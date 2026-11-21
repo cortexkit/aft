@@ -13,7 +13,8 @@ const COMPACTED_DIAGNOSTIC_GAPS: usize = 8;
 // Bound free-form text nested in these otherwise small lists.
 const COMPACTED_STATUS_TEXT_BYTES: usize = 128;
 
-pub(crate) struct StatusBody {
+#[doc(hidden)]
+pub struct StatusBody {
     pub bytes: Vec<u8>,
     pub original_bytes: usize,
     pub field_bytes: std::collections::BTreeMap<String, usize>,
@@ -22,7 +23,8 @@ pub(crate) struct StatusBody {
 
 /// Measure the whole wire body. The bounded fallback keeps the consumer's
 /// scalar state and reports omitted detail instead of silently retaining stale state.
-pub(crate) fn bounded_body(frame: &crate::protocol::StatusChangedFrame) -> StatusBody {
+#[doc(hidden)]
+pub fn bounded_body(frame: &crate::protocol::StatusChangedFrame) -> StatusBody {
     let original = serde_json::to_vec(frame).expect("JSON status frame");
     let original_bytes = original.len();
     let field_bytes = frame

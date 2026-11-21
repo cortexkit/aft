@@ -24,7 +24,8 @@ pub(crate) const NOT_VALID_UTF8: &str = "not valid UTF-8";
 pub(crate) const MAX_SOURCE_BYTES: u64 = crate::search_index::DEFAULT_MAX_FILE_SIZE;
 pub(crate) const MAX_GRAPH_SOURCE_BYTES: u64 = 4 * 1024 * 1024;
 // Agent-visible reason, approved by Ufuk; change it only with his approval.
-pub(crate) const TOO_LARGE: &str = "over the 1 MiB size limit";
+#[doc(hidden)]
+pub const TOO_LARGE: &str = "over the 1 MiB size limit";
 pub(crate) const GRAPH_TOO_LARGE: &str = "over the 4 MiB size limit";
 
 /// Reason recorded for a scope file whose read failed for a reason other than
@@ -38,7 +39,8 @@ const MAX_LINE_COUNT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Count lines without allocating even when a file contains one enormous line.
 /// The extra byte distinguishes an exact count from a bounded lower estimate.
-pub(crate) fn bounded_line_count(path: &Path) -> std::io::Result<(usize, bool)> {
+#[doc(hidden)]
+pub fn bounded_line_count(path: &Path) -> std::io::Result<(usize, bool)> {
     let file = crate::project_content::open(path)?;
     count_lines_bounded(std::io::BufReader::new(file), MAX_LINE_COUNT_BYTES)
 }
@@ -245,7 +247,8 @@ fn source_freshness_with_limit(
 /// Most skipped files named in a project-wide aggregate. The total is always
 /// reported in `skipped_files_count`, so a capped list is never mistaken for
 /// the whole set.
-pub(crate) const SKIPPED_FILES_LIMIT: usize = 20;
+#[doc(hidden)]
+pub const SKIPPED_FILES_LIMIT: usize = 20;
 
 /// Outcome of reading one scope file as source text.
 #[derive(Debug)]

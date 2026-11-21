@@ -60,7 +60,8 @@ pub fn stage_configure_sources(sources: ConfigSources) {
 
 pub(crate) struct ConfigureSourcesScope;
 
-pub(crate) fn configure_sources_scope() -> ConfigureSourcesScope {
+#[doc(hidden)]
+pub fn configure_sources_scope() -> ConfigureSourcesScope {
     STAGED_SOURCES.with(|staged| staged.borrow_mut().take());
     ConfigureSourcesScope
 }
@@ -376,7 +377,8 @@ pub fn reload_config_now(ctx: &AppContext) -> ReloadOutcome {
     outcome
 }
 
-pub(crate) fn reload_approved_user(ctx: &AppContext) -> ReloadOutcome {
+#[doc(hidden)]
+pub fn reload_approved_user(ctx: &AppContext) -> ReloadOutcome {
     let _reload = ctx.config_live().reload_lock.lock();
     let outcome = reload_config_inner_with(ctx, true);
     *ctx.config_live().last_outcome.lock() = Some(outcome.clone());
@@ -808,7 +810,8 @@ macro_rules! restart_settings {
     };
 }
 
-pub(crate) fn restart_required(key: &str) -> bool {
+#[doc(hidden)]
+pub fn restart_required(key: &str) -> bool {
     macro_rules! check {
         ($path:literal, $($field:ident).+) => {
             if key == $path

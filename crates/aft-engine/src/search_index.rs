@@ -70,11 +70,14 @@ pub enum ExactEvidenceScope {
     DefinitionsMentioning(Vec<String>),
 }
 
-pub(crate) const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
+#[doc(hidden)]
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 1_048_576;
 /// Longest matching line, in characters, before appending the truncation marker.
-pub(crate) const GREP_MAX_LINE_CHARS: usize = 500;
+#[doc(hidden)]
+pub const GREP_MAX_LINE_CHARS: usize = 500;
 /// Marks a matching line cut at `GREP_MAX_LINE_CHARS` characters.
-pub(crate) const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
+#[doc(hidden)]
+pub const GREP_LINE_TRUNCATED_MARKER: &str = "… [line truncated]";
 const EOF_SENTINEL: u8 = 0;
 #[cfg(debug_assertions)]
 thread_local! {
@@ -93,7 +96,8 @@ pub fn postings_for_trigram_count_for_debug() -> usize {
     POSTINGS_FOR_TRIGRAM_CALLS.with(Cell::get)
 }
 
-pub(crate) const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
+#[doc(hidden)]
+pub const INTERACTIVE_ARTIFACT_READ_BUDGET: Duration = Duration::from_millis(250);
 const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
 
 /// Read an artifact pointer without allowing a writer to strand an interactive request.
@@ -101,7 +105,8 @@ const BORROWED_INDEX_CHECKPOINT_INTERVAL: usize = 64;
 /// Index refreshes publish through `RwLock`s and can legitimately hold a write guard while
 /// validating or replacing a large artifact. Search must treat that contention as temporary
 /// unavailability and use its bounded fallback rather than waiting for transport timeout.
-pub(crate) fn try_read_with_budget<T>(
+#[doc(hidden)]
+pub fn try_read_with_budget<T>(
     lock: &RwLock<T>,
     budget: Duration,
 ) -> Option<RwLockReadGuard<'_, T>> {
@@ -839,7 +844,8 @@ pub enum WalkBound {
 /// may do. They limit the files examined and the time spent, never the number
 /// of matches found, so the caller can rank every file that was examined.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct GrepExaminationLimits {
+#[doc(hidden)]
+pub struct GrepExaminationLimits {
     /// Most candidate files read and verified.
     pub max_files: usize,
     /// Wall-clock time after which no further file is started.
@@ -851,7 +857,8 @@ pub(crate) struct GrepExaminationLimits {
 
 /// Every matching line found in one examined file.
 #[derive(Clone, Debug)]
-pub(crate) struct GrepFileMatches {
+#[doc(hidden)]
+pub struct GrepFileMatches {
     pub path: PathBuf,
     pub modified: SystemTime,
     /// The first `max_lines_per_file` matching lines, and any later line the
@@ -863,7 +870,8 @@ pub(crate) struct GrepFileMatches {
 
 /// Result of [`SearchIndexSnapshot::collect_grep_matches_by_file`].
 #[derive(Clone, Debug)]
-pub(crate) struct GrepFileCollection {
+#[doc(hidden)]
+pub struct GrepFileCollection {
     /// Files with at least one match, in examination order.
     pub files: Vec<GrepFileMatches>,
     /// Candidate files the trigram index admitted inside the search scope.
@@ -940,7 +948,8 @@ pub(crate) struct SearchCorpusFile {
     pub(crate) generated: bool,
 }
 
-pub(crate) enum SearchCorpusEligibility {
+#[doc(hidden)]
+pub enum SearchCorpusEligibility {
     Eligible(SearchCorpusFile),
     Unindexed(SearchFileMetadata),
     Skipped,
@@ -1110,7 +1119,8 @@ pub(crate) mod path_order_held_rows_for_test {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct PathFilters {
+#[doc(hidden)]
+pub struct PathFilters {
     includes: Option<GlobSet>,
     excludes: Option<GlobSet>,
 }
@@ -3002,7 +3012,8 @@ fn prepare_search_path(path: &Path, max_file_size: u64) -> PreparedSearchPath {
     }
 }
 
-pub(crate) fn read_search_corpus_file(path: &Path, max_file_size: u64) -> SearchCorpusEligibility {
+#[doc(hidden)]
+pub fn read_search_corpus_file(path: &Path, max_file_size: u64) -> SearchCorpusEligibility {
     read_search_corpus_file_inner(path, max_file_size, true)
 }
 
@@ -3021,7 +3032,8 @@ impl std::error::Error for CutAtSizeBound {}
 
 /// A corpus file one search request's exact pass may verify, read through
 /// the request's file set.
-pub(crate) enum RequestCorpusFile {
+#[doc(hidden)]
+pub enum RequestCorpusFile {
     Eligible {
         file: Arc<RequestFile>,
         generated: bool,
@@ -3039,7 +3051,8 @@ pub(crate) enum RequestCorpusFile {
 /// of the request kept is judged from those bytes. Otherwise the file is
 /// stat'ed and read as [`read_search_corpus_file`] reads it, and the set keeps
 /// the bytes unless they were cut at the size bound.
-pub(crate) fn read_request_corpus_file(
+#[doc(hidden)]
+pub fn read_request_corpus_file(
     files: Option<&RequestFiles>,
     path: &Path,
     max_file_size: u64,
@@ -3472,10 +3485,8 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     resolve_cache_dir_with_key(&artifact_cache_key_for_build(project_root), storage_dir)
 }
 
-pub(crate) fn build_path_filters(
-    include: &[String],
-    exclude: &[String],
-) -> Result<PathFilters, String> {
+#[doc(hidden)]
+pub fn build_path_filters(include: &[String], exclude: &[String]) -> Result<PathFilters, String> {
     Ok(PathFilters {
         includes: build_globset(include)?,
         excludes: build_globset(exclude)?,
@@ -3520,7 +3531,8 @@ pub(crate) fn walk_project_files_from(
 
 /// Enumerate the same live tree and order as `walk_project_files_from`, but
 /// retain only matching paths before building metadata and display sort keys.
-pub(crate) fn walk_project_files_from_matching<F>(
+#[doc(hidden)]
+pub fn walk_project_files_from_matching<F>(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -3557,7 +3569,8 @@ fn walk_project_files_from_inner(
     )
 }
 
-pub(crate) fn project_walk_builder(search_root: &Path) -> WalkBuilder {
+#[doc(hidden)]
+pub fn project_walk_builder(search_root: &Path) -> WalkBuilder {
     project_walk_builder_with_admission(
         search_root,
         crate::project_content::is_excluded_with_file_type,
@@ -3635,7 +3648,8 @@ fn project_walk_builder_pruned(
     builder
 }
 
-pub(crate) use crate::project_walk::is_nested_worktree_entry;
+#[doc(hidden)]
+pub use crate::project_walk::is_nested_worktree_entry;
 
 /// The membership rule the project walk applies to each entry on top of the
 /// ignore rules: content exclusions, skipped directory names and OS metadata
@@ -3994,7 +4008,8 @@ pub(crate) struct PresentOnDisk<T> {
 /// [`MISSING_ON_DISK_REFILL_BUDGET`] replacements. Order among present items
 /// is unchanged, so ranking is unaffected. Drops are logged at debug level
 /// with the reason; callers report `dropped` in their result.
-pub(crate) fn take_present_on_disk<T>(
+#[doc(hidden)]
+pub fn take_present_on_disk<T>(
     items: impl IntoIterator<Item = T>,
     limit: usize,
     path_of: impl Fn(&T) -> &Path,
@@ -4010,7 +4025,8 @@ pub(crate) fn take_present_on_disk<T>(
 
 /// Apply admission only to the bounded page/refill window. The untouched tail
 /// remains unexamined, so callers cannot advertise it as an admitted total.
-pub(crate) fn take_present_on_disk_with_admission<T, E>(
+#[doc(hidden)]
+pub fn take_present_on_disk_with_admission<T, E>(
     items: impl IntoIterator<Item = T>,
     limit: usize,
     path_of: impl Fn(&T) -> &Path,
@@ -4261,7 +4277,8 @@ pub(crate) fn validate_cached_relative_path(path: &Path) -> Option<PathBuf> {
 /// verbatim and clean forms compare alike without changing the returned paths.
 /// Metadata and display keys are snapshotted before sorting: the comparator must
 /// remain a total order even if files change or disappear during the sort.
-pub(crate) fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
+#[doc(hidden)]
+pub fn sort_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root: &Path) {
     sort_paths_by_mtime_desc_with_key_normalization(paths, stable_root, true, None);
 }
 
@@ -4277,7 +4294,8 @@ pub(crate) fn sort_walked_paths_by_mtime_desc(paths: &mut [PathBuf], stable_root
 
 /// Indexed paths already have canonical keys and mtimes. Unindexed roots still
 /// use the disk-backed ordering, so mixed-root glob retains the same contract.
-pub(crate) fn sort_paths_by_cached_mtime_desc(
+#[doc(hidden)]
+pub fn sort_paths_by_cached_mtime_desc(
     paths: &mut [PathBuf],
     stable_root: &Path,
     mtimes: &HashMap<PathBuf, SystemTime>,
@@ -4340,7 +4358,8 @@ fn sort_paths_by_mtime_desc_with_key_normalization(
 
 /// See `sort_paths_by_mtime_desc` for why mtimes are snapshotted ahead of
 /// the sort. Same fix, applied to grep matches that share files.
-pub(crate) fn sort_grep_matches_by_mtime_desc(matches: &mut [GrepMatch], project_root: &Path) {
+#[doc(hidden)]
+pub fn sort_grep_matches_by_mtime_desc(matches: &mut [GrepMatch], project_root: &Path) {
     use std::collections::HashMap;
     let mut mtimes: HashMap<PathBuf, Option<SystemTime>> = HashMap::new();
     let mut display_paths: HashMap<PathBuf, String> = HashMap::with_capacity(matches.len());
@@ -4420,7 +4439,8 @@ fn sort_shared_grep_matches_by_cached_mtime_desc<F>(
     });
 }
 
-pub(crate) fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> SearchScope {
+#[doc(hidden)]
+pub fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> SearchScope {
     // Keep the returned scope path in the historical canonical/lexical form.
     // Only `is_within_search_root` normalizes its operands for the membership
     // comparison; callers pass this path on to filesystem and display logic.
@@ -4441,7 +4461,8 @@ pub(crate) fn resolve_search_scope(project_root: &Path, path: Option<&str>) -> S
     SearchScope { root, use_index }
 }
 
-pub(crate) fn is_binary_bytes(content: &[u8]) -> bool {
+#[doc(hidden)]
+pub fn is_binary_bytes(content: &[u8]) -> bool {
     content_inspector::inspect(content).is_binary()
 }
 

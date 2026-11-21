@@ -5,12 +5,14 @@
 //! for differential tests. Once a request is accepted, its handler response is
 //! returned directly; native bash is never run as a recovery path.
 
-pub(crate) mod bash_hints;
+#[doc(hidden)]
+pub mod bash_hints;
 pub mod catalog;
 pub mod differential;
 pub mod dispatch;
 pub mod footer;
-pub(crate) mod notices;
+#[doc(hidden)]
+pub mod notices;
 pub mod observation;
 pub use crate::bash_parse as parser;
 pub mod rules;
@@ -80,7 +82,8 @@ impl Drop for RewritesOffScope {
 }
 
 /// Run `run` with command rewriting turned off when `off` is true.
-pub(crate) fn with_rewrites_off<R>(off: bool, run: impl FnOnce() -> R) -> R {
+#[doc(hidden)]
+pub fn with_rewrites_off<R>(off: bool, run: impl FnOnce() -> R) -> R {
     let previous = REWRITES_OFF.with(|slot| slot.replace(off || slot.get()));
     let _scope = RewritesOffScope(previous);
     run()

@@ -258,7 +258,7 @@ impl Drop for RequestHarnessScope {
 /// Run `run` with backups and checkpoints keyed under the storage namespace of `harness`, the
 /// harness of the route that issued the request. An unparseable harness leaves
 /// the store's configured namespace in effect.
-pub(crate) fn with_request_harness<R>(harness: &str, run: impl FnOnce() -> R) -> R {
+pub fn with_request_harness<R>(harness: &str, run: impl FnOnce() -> R) -> R {
     let segment = harness
         .parse::<crate::harness::Harness>()
         .ok()
@@ -292,7 +292,7 @@ impl Drop for RequestRunScope {
 
 /// Run `run` with every new undo snapshot tagged with `run_id`, the codemode
 /// run that made the edit. `None` leaves snapshots untagged.
-pub(crate) fn with_request_run<R>(run_id: Option<&str>, run: impl FnOnce() -> R) -> R {
+pub fn with_request_run<R>(run_id: Option<&str>, run: impl FnOnce() -> R) -> R {
     let previous = REQUEST_RUN_ID.with(|slot| slot.replace(run_id.map(str::to_owned)));
     let _scope = RequestRunScope(previous);
     run()
@@ -563,7 +563,7 @@ impl PathFingerprint {
 /// replaced with a fresh read. Symlinks deliberately use the existing path-based
 /// snapshot code so their link metadata and target semantics remain unchanged.
 #[derive(Debug, Clone)]
-pub(crate) struct CapturedRegularFile {
+pub struct CapturedRegularFile {
     metadata: std::fs::Metadata,
     bytes: Arc<[u8]>,
 }

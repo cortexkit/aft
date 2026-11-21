@@ -140,7 +140,8 @@ impl Default for DatabaseOpenSlot {
 
 /// Where a staged open ran; named in the readiness log line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DatabaseOpenRunner {
+#[doc(hidden)]
+pub enum DatabaseOpenRunner {
     /// The dedicated database-open thread, dispatched after the bind ack.
     Lane,
     /// The root's configure tail, at its database stage.
@@ -158,7 +159,8 @@ impl DatabaseOpenRunner {
 
 /// How one open attempt ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DatabaseOpenOutcome {
+#[doc(hidden)]
+pub enum DatabaseOpenOutcome {
     Ready,
     /// The storage root's reader floor, or a schema version newer than this
     /// build reads, refused the database before any read-write connection.
@@ -170,7 +172,8 @@ pub(crate) enum DatabaseOpenOutcome {
 
 /// Timings of one open attempt, measured inside the open itself.
 #[derive(Clone, Debug)]
-pub(crate) struct DatabaseOpenReport {
+#[doc(hidden)]
+pub struct DatabaseOpenReport {
     /// Reader-floor check plus the read-only schema peek.
     pub(crate) floor_check: Duration,
     /// Taking the process-shared database slot and opening SQLite (PRAGMAs,
@@ -186,7 +189,8 @@ pub(crate) struct DatabaseOpenReport {
 /// again by any persistence-dependent tool that finds the root initializing,
 /// so a staged open can never sit unscheduled. Does nothing when no open is
 /// staged (an unchanged rebind, or the open is already running).
-pub(crate) fn dispatch(ctx: &Arc<AppContext>) {
+#[doc(hidden)]
+pub fn dispatch(ctx: &Arc<AppContext>) {
     if !ctx.mark_database_open_dispatched() {
         return;
     }
@@ -210,11 +214,8 @@ pub(crate) fn dispatch(ctx: &Arc<AppContext>) {
 /// that before session replay). Without it, return as soon as another thread
 /// is running this root's open: that runner picks up anything staged after it
 /// started before it stops.
-pub(crate) fn run_staged_open(
-    ctx: &AppContext,
-    runner: DatabaseOpenRunner,
-    wait_for_in_flight: bool,
-) {
+#[doc(hidden)]
+pub fn run_staged_open(ctx: &AppContext, runner: DatabaseOpenRunner, wait_for_in_flight: bool) {
     let (slot_mutex, idle) = ctx.database_open_slot();
     let mut slot = slot_mutex.lock();
     loop {

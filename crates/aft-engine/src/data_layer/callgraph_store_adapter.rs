@@ -57,7 +57,8 @@ fn is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-pub(crate) const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
+#[doc(hidden)]
+pub const CALLBACK_REFERENCE_LABEL: &str = " (callback reference)";
 pub(crate) const UNRESOLVED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} in the analyzed {language} code could not be resolved, so a dynamic or indirect call may still reach `{symbol}`.";
 const UNRESOLVED_NAMED_CALLERS_NOTE: &str = "Incomplete: {count} call site{plural} named `{symbol}` in the analyzed {language} code could not be resolved; additional callers may be missing.";
 const TEST_FILTER_NOTE: &str = "Test filtering incomplete: AFT could not tell whether {count} caller site{plural} {verb} test code, so {subject} still shown.";
@@ -2662,7 +2663,8 @@ pub fn serialized_response<T: Serialize>(req_id: &str, operation: &str, value: &
     }
 }
 
-pub(crate) fn serialized_response_with_view<T: Serialize>(
+#[doc(hidden)]
+pub fn serialized_response_with_view<T: Serialize>(
     req_id: &str,
     operation: &str,
     value: &T,
@@ -2676,7 +2678,8 @@ pub(crate) fn serialized_response_with_view<T: Serialize>(
     )
 }
 
-pub(crate) fn response_with_view(
+#[doc(hidden)]
+pub fn response_with_view(
     mut response: Response,
     view: Option<&crate::data_layer::checkout::CheckoutView>,
     queried_paths: &[&Path],

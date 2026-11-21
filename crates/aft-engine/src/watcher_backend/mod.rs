@@ -7,7 +7,8 @@ use crate::watcher_filter::SharedGitignore;
 mod activity_tests;
 pub(crate) mod cookie;
 pub(crate) mod counters;
-pub(crate) mod flush;
+#[doc(hidden)]
+pub mod flush;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod mailbox;
 
@@ -173,7 +174,8 @@ impl ProjectWatcher {
     }
 }
 
-pub(crate) fn create_project_watcher(
+#[doc(hidden)]
+pub fn create_project_watcher(
     root: PathBuf,
     extra_watch_paths: Vec<PathBuf>,
     tx: impl Into<crate::watcher_filter::RawEventSender>,

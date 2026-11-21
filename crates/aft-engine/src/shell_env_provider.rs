@@ -42,7 +42,8 @@ fn encode_removals(environment: &mut HashMap<String, String>, names: Vec<String>
     }
 }
 
-pub(crate) fn clear_request_control(environment: &mut HashMap<String, String>) {
+#[doc(hidden)]
+pub fn clear_request_control(environment: &mut HashMap<String, String>) {
     environment.retain(|key, _| !key.eq_ignore_ascii_case(REMOVALS_ENV));
 }
 
@@ -427,7 +428,8 @@ pub(crate) fn sweep_preflight_layouts_on_startup() {
 }
 
 #[cfg(unix)]
-pub(crate) fn host_preflight(
+#[doc(hidden)]
+pub fn host_preflight(
     ctx: &crate::context::AppContext,
     cwd: &Path,
     environment: &mut HashMap<String, String>,

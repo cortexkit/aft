@@ -299,7 +299,8 @@ fn forget_refused_request_key(stable_key: &str) {
         .forget(stable_key);
 }
 
-pub(crate) fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
+#[doc(hidden)]
+pub fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
     let mut pauses = lane_pauses()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

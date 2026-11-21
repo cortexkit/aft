@@ -39,12 +39,14 @@ use aft_store::family::NewerFormat;
 /// A plane's state on the status surfaces, in the words the consumers of
 /// `feature_status` already use.
 pub(crate) const OFF: &str = "off";
-pub(crate) const BUILDING: &str = "building";
+#[doc(hidden)]
+pub const BUILDING: &str = "building";
 pub(crate) const READY: &str = "ready";
 pub(crate) const UNAVAILABLE: &str = "unavailable";
 
 /// Why a plane is off or unavailable.
-pub(crate) mod reason {
+#[doc(hidden)]
+pub mod reason {
     /// Nothing has queried the root yet, so its checkout is not bound and
     /// nothing is built.
     pub(crate) const NOT_BOUND: &str = "not_bound";
@@ -359,9 +361,11 @@ pub fn text_plane_ready(ctx: &dyn IndexHost) -> Option<bool> {
 
 const INDEX_GAP_NOTE: &str =
     "(Index skipped {folders}; results may miss files in them:\n{paths}\n)";
-pub(crate) const INDEX_GAP_PREVIEW: usize = 3;
+#[doc(hidden)]
+pub const INDEX_GAP_PREVIEW: usize = 3;
 
-pub(crate) fn parse_gap_preview(shown: usize, total: usize) -> crate::list_envelope::ListEnvelope {
+#[doc(hidden)]
+pub fn parse_gap_preview(shown: usize, total: usize) -> crate::list_envelope::ListEnvelope {
     use crate::list_envelope::{ListEnvelope, Reason, Total, Unit};
     ListEnvelope::new(
         shown,
@@ -383,13 +387,15 @@ fn folder_count(count: usize) -> String {
     )
 }
 
-pub(crate) fn skipped_folder_health_note(root: &Path, count: usize) -> String {
+#[doc(hidden)]
+pub fn skipped_folder_health_note(root: &Path, count: usize) -> String {
     format!("{}: index skipped {}", root.display(), folder_count(count))
 }
 
 /// Report only gaps intersecting the request's scope, under its read policy.
 /// The preview is bounded independently of the number of skipped folders.
-pub(crate) fn disclose_index_gaps(
+#[doc(hidden)]
+pub fn disclose_index_gaps(
     ctx: &impl IndexHost,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
@@ -546,7 +552,8 @@ pub(super) fn disclose_parse_gaps(
     .into();
 }
 
-pub(crate) fn report(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
+#[doc(hidden)]
+pub fn report(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
     report_inner(ctx, false)
 }
 
@@ -1656,7 +1663,8 @@ fn user_commands_operator_projection_returns_without_waiting_and_coalesces_disk_
 /// is normal), `Some(Some(field))` otherwise, in today's shape. `None` when
 /// the data layer is off, so zoom asks today's store. Like every status
 /// read, it never binds the checkout.
-pub(crate) fn zoom_callgraph_field(ctx: &dyn IndexHost) -> Option<Option<Value>> {
+#[doc(hidden)]
+pub fn zoom_callgraph_field(ctx: &dyn IndexHost) -> Option<Option<Value>> {
     let report = report(ctx)?;
     let plane = &report.callgraph;
     // `callgraph_off` tells the agent the call graph is switched off in

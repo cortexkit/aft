@@ -758,7 +758,8 @@ fn registry() -> &'static Mutex<Vec<Entry>> {
 }
 
 /// Process-wide standing reader-floor refusals, without resolving paths or waiting.
-pub(crate) fn try_floor_refusal_counts() -> Option<std::collections::BTreeMap<String, u64>> {
+#[doc(hidden)]
+pub fn try_floor_refusal_counts() -> Option<std::collections::BTreeMap<String, u64>> {
     let entries = registry().try_lock().ok()?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5);
     let mut counts = std::collections::BTreeMap::new();

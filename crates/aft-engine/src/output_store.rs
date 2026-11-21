@@ -41,7 +41,8 @@ pub(crate) struct OutputFiles {
 /// A deferred daemon (subc) tool reply can be sent after its AppContext is evicted.
 /// Capture only the private output store and task registry needed to save it,
 /// without retaining the project's indexes or other runtime state.
-pub(crate) struct OutputScope {
+#[doc(hidden)]
+pub struct OutputScope {
     storage: PathBuf,
     directory: PathBuf,
     pub(crate) session: String,

@@ -205,7 +205,8 @@ impl RepeatBreaker {
     }
 }
 
-pub(crate) fn hash_value(value: &impl Hash) -> u64 {
+#[doc(hidden)]
+pub fn hash_value(value: &impl Hash) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
     hasher.finish()

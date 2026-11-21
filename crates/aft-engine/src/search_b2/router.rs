@@ -250,7 +250,8 @@ fn token_ranges(raw: &str, start: usize, end: usize, spans: &[DelimitedSpan]) ->
     ranges
 }
 
-pub(crate) fn identifier_shaped_tokens(query: &str) -> Vec<String> {
+#[doc(hidden)]
+pub fn identifier_shaped_tokens(query: &str) -> Vec<String> {
     let analysis = analyze(query);
     analysis
         .tokens
@@ -268,7 +269,8 @@ pub(crate) fn identifier_shaped_tokens(query: &str) -> Vec<String> {
         .collect()
 }
 
-pub(crate) fn is_identifier_shaped_token(token: &str) -> bool {
+#[doc(hidden)]
+pub fn is_identifier_shaped_token(token: &str) -> bool {
     let token = token.trim_matches(|character: char| matches!(character, '"' | '\'' | '`'));
     let is_name_segment = |segment: &str| {
         !segment.is_empty()
@@ -309,7 +311,8 @@ pub(crate) fn is_identifier_shaped_token(token: &str) -> bool {
 /// the parts, pass as exact evidence and outrank every file that contains the
 /// literal. Surrounding quotes are ignored, matching how the exact lane reads
 /// a quoted phrase.
-pub(crate) fn is_hyphenated_literal(query: &str) -> bool {
+#[doc(hidden)]
+pub fn is_hyphenated_literal(query: &str) -> bool {
     let mut token = query.trim();
     if token.len() >= 2 {
         let first = token.as_bytes()[0];

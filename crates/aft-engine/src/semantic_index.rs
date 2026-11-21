@@ -254,7 +254,7 @@ fn embedding_backend_build_health_registry(
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn unix_millis_now() -> u64 {
+pub fn unix_millis_now() -> u64 {
     #[cfg(test)]
     if let Some(now) = LANE_PAUSE_TEST_CLOCK.with(|clock| clock.borrow().clone()) {
         return now.load(std::sync::atomic::Ordering::SeqCst);
@@ -575,7 +575,7 @@ const REMOTE_BACKEND_PROBE_DEADLINE: Duration = Duration::from_secs(10);
 /// What `status` and `search` may say about a remote embedding backend while
 /// the semantic index is building.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RemoteBackendCheck {
+pub enum RemoteBackendCheck {
     /// No remote backend, no build in progress, or no URL to check.
     NotApplicable,
     /// The first probe for this backend has not finished. Readers say the
@@ -612,7 +612,7 @@ pub(crate) use root_state::{try_lock_root_state, try_retire_root_embedding_state
 /// thread, at most one per root, and callers read only the cached result. The
 /// probe never overrides an outage the build recorded, and a later successful
 /// probe clears only an outage a probe recorded.
-pub(crate) fn check_remote_backend_while_building(
+pub fn check_remote_backend_while_building(
     ctx: &dyn crate::data_layer::host::IndexHost,
 ) -> RemoteBackendCheck {
     let building = ctx
@@ -832,9 +832,7 @@ fn clear_embedding_backend_build_failure(project_root: &Path) {
         .remove(project_root);
 }
 
-pub(crate) fn embedding_backend_build_health(
-    project_root: &Path,
-) -> Option<EmbeddingBackendBuildHealth> {
+pub fn embedding_backend_build_health(project_root: &Path) -> Option<EmbeddingBackendBuildHealth> {
     let now_ms = unix_millis_now();
     let mut registry = embedding_backend_build_health_registry()
         .lock()
@@ -1215,7 +1213,7 @@ struct SkippedEmbeddingRows {
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum SemanticSkipReason {
+pub enum SemanticSkipReason {
     ProviderRefusedInput,
     InputExceededModelContext,
 }
@@ -1817,7 +1815,7 @@ fn record_query_embed_observation(root: Option<&Path>, elapsed_ms: u64, timed_ou
     state.elapsed_ms.push_back(elapsed_ms);
 }
 
-pub(crate) fn query_embed_health_snapshot(root: &Path) -> QueryEmbedHealthSnapshot {
+pub fn query_embed_health_snapshot(root: &Path) -> QueryEmbedHealthSnapshot {
     let registry = query_embed_health_registry()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2547,11 +2545,11 @@ pub fn strip_query_embedding_timeout_marker(error: &str) -> String {
 
 const QUERY_EMBEDDING_BUSY_MARKER: &str = "[query-embed-busy]";
 
-pub(crate) fn query_embedding_is_busy(error: &str) -> bool {
+pub fn query_embedding_is_busy(error: &str) -> bool {
     error.contains(QUERY_EMBEDDING_BUSY_MARKER)
 }
 
-pub(crate) fn strip_query_embedding_busy_marker(error: &str) -> String {
+pub fn strip_query_embedding_busy_marker(error: &str) -> String {
     error.replace(QUERY_EMBEDDING_BUSY_MARKER, "")
 }
 
@@ -2592,7 +2590,7 @@ pub fn with_query_embedding_phase_observer_for_test<T>(
 }
 
 #[cfg(any(debug_assertions, feature = "test-timing-hooks"))]
-pub(crate) fn observe_query_embedding_phase(phase: &'static str) {
+pub fn observe_query_embedding_phase(phase: &'static str) {
     QUERY_EMBEDDING_PHASE_OBSERVER.with(|slot| {
         if let Some(observer) = slot.borrow_mut().as_mut() {
             observer(phase);

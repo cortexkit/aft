@@ -27,7 +27,8 @@ pub(crate) struct LspChildRootSnapshot {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct LspCensus {
+#[doc(hidden)]
+pub struct LspCensus {
     pub process_probe_age_ms: u64,
     /// Worker rust-analyzer admission refusals since process start, not start failures.
     pub capacity_refusals: u64,
@@ -77,7 +78,8 @@ pub(crate) struct FdCensus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct LifecycleCensusSnapshot {
+#[doc(hidden)]
+pub struct LifecycleCensusSnapshot {
     pub measured_age_ms: Option<u64>,
     pub lsp: LspCensus,
     pub threads: ThreadCensus,
@@ -136,10 +138,8 @@ impl LifecycleCensusCache {
 /// Collect the process census after root contexts have been snapshotted by the
 /// health worker. Registry locks are held only long enough to copy PIDs; all OS
 /// probes happen after those locks are released.
-pub(crate) fn collect(
-    app: &App,
-    contexts: &[std::sync::Arc<AppContext>],
-) -> LifecycleCensusSnapshot {
+#[doc(hidden)]
+pub fn collect(app: &App, contexts: &[std::sync::Arc<AppContext>]) -> LifecycleCensusSnapshot {
     let lsp_health = app.lsp_child_registry().health_snapshot();
     let lsp = LspCensus {
         process_probe_age_ms: lsp_health.process_probe_age_ms,

@@ -90,7 +90,8 @@ pub(crate) fn process_from_root_rollups<'a>(
     }
 }
 
-pub(crate) fn shared_process_memory() -> SharedProcessMemory {
+#[doc(hidden)]
+pub fn shared_process_memory() -> SharedProcessMemory {
     SharedProcessMemory {
         shared_semantic_bases: crate::semantic_index::shared_semantic_bases_memory(),
         data_layer_block_cache: crate::data_layer::surfaces::block_cache_estimate(),
@@ -113,7 +114,8 @@ pub(crate) fn rollup_snapshot(
 
 /// Build a rollup with the process-wide shared memory already measured, so
 /// one health rollup measures it once for every surface it fills.
-pub(crate) fn rollup_snapshot_with_shared(
+#[doc(hidden)]
+pub fn rollup_snapshot_with_shared(
     roots_status: &'static str,
     roots: BTreeMap<String, RootMemoryRollup>,
     allocator: AllocatorObservation,
@@ -176,7 +178,8 @@ pub(crate) fn snapshot_uncapped_with_allocator(
 
 /// The uncapped form with the process-wide shared memory already
 /// measured; see [`rollup_snapshot_with_shared`].
-pub(crate) fn snapshot_uncapped_with_shared(
+#[doc(hidden)]
+pub fn snapshot_uncapped_with_shared(
     roots_status: &'static str,
     roots: BTreeMap<String, RootMemorySnapshot>,
     allocator: AllocatorObservation,

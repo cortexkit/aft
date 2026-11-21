@@ -521,7 +521,8 @@ pub(crate) fn record_prepared_text(update: impl FnOnce(&mut PreparedTextCounts))
 }
 
 /// Count code-reference answer-cache work in this thread's open scope.
-pub(crate) fn record_code_references(update: impl FnOnce(&mut CodeReferenceCounts)) {
+#[doc(hidden)]
+pub fn record_code_references(update: impl FnOnce(&mut CodeReferenceCounts)) {
     COLLECTOR.with(|collector| {
         let mut collector = collector.borrow_mut();
         if collector.active {

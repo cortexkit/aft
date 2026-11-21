@@ -26,11 +26,14 @@ use tokio::sync::{oneshot, Notify};
 use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
-pub(crate) mod display;
+#[doc(hidden)]
+pub mod display;
 #[cfg(test)]
 pub(crate) use display::with_test_reader;
-pub(crate) mod readers;
-pub(crate) mod status;
+#[doc(hidden)]
+pub mod readers;
+#[doc(hidden)]
+pub mod status;
 pub(crate) mod views;
 #[doc(hidden)]
 pub use views::{NoticeViewsReady, PullRecord, NOTICE_VIEWS_READY};
@@ -38,7 +41,8 @@ pub use views::{NoticeViewsReady, PullRecord, NOTICE_VIEWS_READY};
 pub(crate) type DisplayPublish<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), &'static str>> + Send + 'a>>;
 
-pub(crate) struct Hooks {
+#[doc(hidden)]
+pub struct Hooks {
     pub(crate) take_due_read: fn() -> Option<(String, Vec<u8>)>,
     pub(crate) mark_read_published: fn(&str, bool),
     pub(crate) announce: for<'a> fn(String, Vec<u8>, DisplayPublish<'a>) -> DisplayPublish<'a>,
@@ -47,7 +51,8 @@ pub(crate) struct Hooks {
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
 
-pub(crate) fn register(hooks: Hooks) {
+#[doc(hidden)]
+pub fn register(hooks: Hooks) {
     let _ = HOOKS.set(hooks);
 }
 
@@ -83,7 +88,8 @@ struct BusHealth {
     warned: std::collections::HashSet<&'static str>,
 }
 
-pub(crate) fn health() -> serde_json::Value {
+#[doc(hidden)]
+pub fn health() -> serde_json::Value {
     serde_json::to_value(&*HEALTH.lock()).expect("bus health is JSON")
 }
 
@@ -113,11 +119,13 @@ fn failure(code: &'static str) {
     }
 }
 
-pub(crate) fn display_committed() {
+#[doc(hidden)]
+pub fn display_committed() {
     DISPLAY.notify_one();
 }
 
-pub(crate) fn display_read_evicted_early(reason: &'static str) {
+#[doc(hidden)]
+pub fn display_read_evicted_early(reason: &'static str) {
     let mut health = HEALTH.lock();
     health.display_read_evicted_early = health.display_read_evicted_early.saturating_add(1);
     if health.warned.insert(reason) {
@@ -129,7 +137,8 @@ pub(crate) fn display_read_evicted_early(reason: &'static str) {
     }
 }
 
-pub(crate) fn display_reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
+#[doc(hidden)]
+pub fn display_reader() -> Result<Option<String>, subc_protocol::ErrorBody> {
     display::reader()
 }
 
@@ -138,7 +147,8 @@ pub fn notice_display_reader() -> Result<Option<String>, subc_protocol::ErrorBod
     display::notice_reader()
 }
 
-pub(crate) struct Worker {
+#[doc(hidden)]
+pub struct Worker {
     stop: Option<oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -161,7 +171,8 @@ impl Drop for Worker {
 
 /// Start after the provider has attached to the daemon. Neither the frame loop
 /// nor a request executor runs credential issuance, database scans or publishes.
-pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Option<Worker> {
+#[doc(hidden)]
+pub fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Option<Worker> {
     status::initialize();
     let (stop, stopped) = oneshot::channel();
     let thread = std::thread::Builder::new()

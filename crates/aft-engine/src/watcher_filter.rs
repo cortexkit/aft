@@ -2144,7 +2144,8 @@ fn valid_observed_exclusion_prefix(
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
-pub(crate) fn load_watcher_observations(
+#[doc(hidden)]
+pub fn load_watcher_observations(
     root: &Path,
     counters: &crate::watcher_backend::counters::WatcherCounters,
     db: Option<&Arc<Mutex<crate::db::TrackedConnection>>>,

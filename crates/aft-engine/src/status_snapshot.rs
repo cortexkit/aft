@@ -40,7 +40,8 @@ impl From<CompressionAggregate> for CompressionAggregateSerde {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatusSnapshotKind {
+#[doc(hidden)]
+pub enum StatusSnapshotKind {
     Explicit,
     Push,
     Operator,

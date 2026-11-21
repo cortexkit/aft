@@ -4,12 +4,14 @@ use crate::protocol::Response;
 use crate::search_index::resolve_search_scope;
 
 #[derive(Debug)]
-pub(crate) enum SearchPathResolution {
+#[doc(hidden)]
+pub enum SearchPathResolution {
     Single(PathBuf),
     Multi(Vec<PathBuf>),
 }
 
-pub(crate) fn resolve_path_or_multi<F>(
+#[doc(hidden)]
+pub fn resolve_path_or_multi<F>(
     raw: &str,
     project_root: &Path,
     validate: F,
@@ -118,7 +120,8 @@ pub(crate) fn dedupe_nested_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     deduped
 }
 
-pub(crate) fn canonical_key(path: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn canonical_key(path: &Path) -> PathBuf {
     crate::bounded_io::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 

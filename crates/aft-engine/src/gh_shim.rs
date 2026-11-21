@@ -34,7 +34,7 @@ use subc_protocol::{BindIdentity, RouteTarget};
 
 mod enable_gate;
 mod manifest_guard;
-pub(crate) mod manifest_sync;
+pub mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
 mod numeric_id_cache;

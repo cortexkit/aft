@@ -23,7 +23,8 @@ pub use request::{
     build_request, return_max_bytes, FrozenParams, PresetParams, RootConfinement,
     RETURN_TOTAL_CAP_BYTES,
 };
-pub(crate) use request::{
+#[doc(hidden)]
+pub use request::{
     read_policy_unavailable, sibling_refusal, SiblingRefusal, SiblingValidationError,
 };
 pub use stream::{GapRecovery, OutputSink, ResumePoint, StreamConsumer};

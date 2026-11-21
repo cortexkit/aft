@@ -4,12 +4,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub(crate) mod invocation;
-pub(crate) mod model;
+#[doc(hidden)]
+pub mod model;
 pub(crate) mod partner;
-pub(crate) mod scope;
-pub(crate) mod service;
-pub(crate) mod start_view;
-pub(crate) mod store;
+#[doc(hidden)]
+pub mod scope;
+#[doc(hidden)]
+pub mod service;
+#[doc(hidden)]
+pub mod start_view;
+#[doc(hidden)]
+pub mod store;
 
 pub(crate) const REFUSAL_STAGE: &str = "task_authority";
 
@@ -24,14 +29,16 @@ pub(crate) const UNAVAILABLE_TEXT: &str = "this command's bot-write permission c
 pub(crate) const OWNER_UNRESOLVED_TEXT: &str = "this command's bot-write permission cannot be verified ({reason}): this session has no verified head scope yet; retry in a minute, and tell the operator if it repeats.";
 pub(crate) const ENDED_TEXT: &str = "the {scope_role} this command started from has ended ({reason}), so it can no longer write as the bot; start the command again from a live session.";
 pub(crate) const UNKNOWN_TEXT: &str = "AFT could not confirm that the {scope_role} this command started from is still active ({reason}); retry in a minute.";
-pub(crate) const REVOCATION_NOT_DURABLE: &str = "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
+#[doc(hidden)]
+pub const REVOCATION_NOT_DURABLE: &str = "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
 // Worker reads retain their separate broker policy; worker writes always refuse.
 pub(crate) const WORKER_WRITE_REFUSED: &str =
     "workers cannot write to GitHub; report what should be posted to your parent instead";
 pub(crate) const WORKER_WRITE_CODE: &str = "gh_shim_worker_write_refused";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum Code {
+#[doc(hidden)]
+pub enum Code {
     IdentityConflict,
     PolicyDenied,
     AuthorityUnavailable,
@@ -64,7 +71,8 @@ impl Code {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ScopeRole {
+#[doc(hidden)]
+pub enum ScopeRole {
     Authority,
     Head,
     Run,
@@ -81,7 +89,8 @@ impl ScopeRole {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct Refusal {
+#[doc(hidden)]
+pub struct Refusal {
     pub(crate) code: Code,
     pub(crate) reason: String,
     pub(crate) role: Option<ScopeRole>,

@@ -8,7 +8,8 @@ use std::fs::OpenOptions;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-pub(crate) const OPERATION: &str = "file.read_exact";
+#[doc(hidden)]
+pub const OPERATION: &str = "file.read_exact";
 const MAX_BYTES: u64 = 1024 * 1024;
 
 pub(crate) struct ExactRead {
@@ -17,7 +18,8 @@ pub(crate) struct ExactRead {
 }
 
 #[derive(Default)]
-pub(crate) struct ReadHooks {
+#[doc(hidden)]
+pub struct ReadHooks {
     #[cfg(test)]
     pub mid_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Runs after the path and policy checks, before the file is identified
@@ -26,7 +28,8 @@ pub(crate) struct ReadHooks {
     pub after_check: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
-pub(crate) fn read_exact(
+#[doc(hidden)]
+pub fn read_exact(
     path: &Path,
     root: &Path,
     policy: &AccessPolicy,
@@ -112,9 +115,11 @@ fn read_with(
     })
 }
 
-pub(crate) use aft_base::no_follow_file::OpenedFile;
+#[doc(hidden)]
+pub use aft_base::no_follow_file::OpenedFile;
 
-pub(crate) fn open_no_follow(root: &Path, target: &Path) -> Result<OpenedFile, ReadExactRefusal> {
+#[doc(hidden)]
+pub fn open_no_follow(root: &Path, target: &Path) -> Result<OpenedFile, ReadExactRefusal> {
     aft_base::no_follow_file::open_no_follow(root, target).map_err(Into::into)
 }
 
@@ -166,7 +171,8 @@ fn open_contents(root: &Path, target: &Path) -> Result<File, ReadExactRefusal> {
     aft_base::no_follow_file::open_contents(root, target).map_err(Into::into)
 }
 
-pub(crate) use crate::task_temp_reads::opened_location;
+#[doc(hidden)]
+pub use crate::task_temp_reads::opened_location;
 
 #[cfg(unix)]
 fn path_identity(path: &Path) -> io::Result<(u64, u64)> {
@@ -214,7 +220,8 @@ fn handle_identity(file: &File) -> io::Result<(u64, u64)> {
 
 /// Stable module-operation refusals; messages deliberately omit paths and policy contents.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReadExactRefusal {
+#[doc(hidden)]
+pub enum ReadExactRefusal {
     BadRequest,
     AccessDenied,
     NotFound,
