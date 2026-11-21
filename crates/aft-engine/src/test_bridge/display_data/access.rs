@@ -1,4 +1,4 @@
-//! Extensions used by upper tests without changing the engine's inherent API.
+//! Extensions for agent-file-tools tests that leave the engine's inherent API unchanged.
 
 use crate::config::Config;
 use crate::context::{App, AppContext};
