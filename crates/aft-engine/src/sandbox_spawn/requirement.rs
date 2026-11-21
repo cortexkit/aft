@@ -8,7 +8,8 @@ pub(crate) enum SandboxRequirementReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct SandboxRequirement {
+#[doc(hidden)]
+pub struct SandboxRequirement {
     pub(crate) mode: SandboxMode,
     pub(crate) reason: SandboxRequirementReason,
 }

@@ -5,7 +5,8 @@ use super::*;
 // complete log lines without buffering an arbitrarily long line or key block.
 // Longer undecidable formats are withheld; exact secrets add their full length.
 const SHELL_MASK_CONTEXT_BYTES: usize = 16 * 1024;
-pub(crate) const SHELL_MASK_WITHHELD: &str = "[output withheld: masking context unavailable]";
+#[doc(hidden)]
+pub const SHELL_MASK_WITHHELD: &str = "[output withheld: masking context unavailable]";
 
 #[derive(Default)]
 struct FormatScan {
@@ -16,7 +17,8 @@ struct FormatScan {
 }
 
 #[derive(Clone)]
-pub(crate) struct ShellSnapshot {
+#[doc(hidden)]
+pub struct ShellSnapshot {
     pub metadata: PersistedTask,
     pub stdout: u64,
     pub stderr: u64,
@@ -56,7 +58,8 @@ impl FileStamp {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct ShellSnapshotCache {
+#[doc(hidden)]
+pub struct ShellSnapshotCache {
     live: HashMap<String, (Vec<u8>, Vec<Option<FileStamp>>, ShellSnapshot)>,
     saved: HashMap<
         String,
@@ -98,7 +101,8 @@ fn saved_stamps(paths: &TaskPaths, mode: &BgMode) -> Vec<Option<FileStamp>> {
 }
 
 #[derive(Clone)]
-pub(crate) struct ShellReader {
+#[doc(hidden)]
+pub struct ShellReader {
     live: Option<BgTaskRegistry>,
     metadata: PersistedTask,
     paths: TaskPaths,

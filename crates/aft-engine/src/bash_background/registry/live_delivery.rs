@@ -4,7 +4,8 @@ use std::sync::Arc;
 /// Shared by every registry attached to this daemon connection. Only the
 /// message loop publishes; readers hold an immutable snapshot.
 #[derive(Default)]
-pub(crate) struct RouteDeliverySessions(parking_lot::RwLock<Arc<HashSet<String>>>);
+#[doc(hidden)]
+pub struct RouteDeliverySessions(parking_lot::RwLock<Arc<HashSet<String>>>);
 
 impl RouteDeliverySessions {
     pub(crate) fn publish(&self, sessions: HashSet<&str>) {

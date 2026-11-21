@@ -38,7 +38,8 @@ pub enum RootConfinement {
 }
 
 #[derive(Debug)]
-pub(crate) enum SiblingValidationError {
+#[doc(hidden)]
+pub enum SiblingValidationError {
     Refused(String),
     Unavailable(crate::protocol::Response),
 }
@@ -161,7 +162,8 @@ impl FrozenParams {
 
 /// Whether a file-read policy error means the grant store couldn't be read in
 /// time, as opposed to the path not being granted.
-pub(crate) fn read_policy_unavailable(response: &crate::protocol::Response) -> bool {
+#[doc(hidden)]
+pub fn read_policy_unavailable(response: &crate::protocol::Response) -> bool {
     response.data["code"].as_str().is_some_and(|code| {
         code == "grants_unavailable"
             || code == "io_timeout"
@@ -186,7 +188,8 @@ fn preflight_covers(grants: &[crate::access_policy::AccessGrant], path: &Path) -
 
 /// Why a sibling was refused. Each reason has its own agent-visible sentence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SiblingRefusal {
+#[doc(hidden)]
+pub enum SiblingRefusal {
     /// The path is not absolute, does not resolve, or has no `.git` at its top.
     /// Named as the plan gave it.
     NotCheckoutRoot,
@@ -196,7 +199,8 @@ pub(crate) enum SiblingRefusal {
 }
 
 // Agent-visible refusal wording. Approved by Ufuk (2026-11-05).
-pub(crate) fn sibling_refusal(reason: SiblingRefusal, path: &Path) -> String {
+#[doc(hidden)]
+pub fn sibling_refusal(reason: SiblingRefusal, path: &Path) -> String {
     let path = path.display();
     match reason {
         SiblingRefusal::NotCheckoutRoot => {

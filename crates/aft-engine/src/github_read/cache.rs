@@ -371,7 +371,8 @@ impl GithubReadDeferred {
     }
 }
 
-pub(crate) fn worker_stopped() -> GithubReadError {
+#[doc(hidden)]
+pub fn worker_stopped() -> GithubReadError {
     GithubReadError::FetchFailed("GitHub read worker stopped before completing".to_string())
 }
 

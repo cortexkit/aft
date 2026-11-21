@@ -3,7 +3,8 @@ use crate::search_index::{GrepResult, IndexStatus, WalkBound};
 /// A note spelling out what an incomplete fallback walk left unsearched and
 /// how to get an exhaustive answer, or `None` when the walk reached every
 /// file (or no walk ran).
-pub(crate) fn walk_coverage_note(result: &GrepResult) -> Option<String> {
+#[doc(hidden)]
+pub fn walk_coverage_note(result: &GrepResult) -> Option<String> {
     let bound = result.walk_bound?;
     let files = result.files_read_directly;
     let index = match result.index_status {
@@ -33,7 +34,8 @@ pub(crate) fn walk_coverage_note(result: &GrepResult) -> Option<String> {
     Some(format!("({checked} {exhaustive})"))
 }
 
-pub(crate) fn plural(count: usize, word: &str) -> String {
+#[doc(hidden)]
+pub fn plural(count: usize, word: &str) -> String {
     if count == 1 {
         format!("{count} {word}")
     } else {
