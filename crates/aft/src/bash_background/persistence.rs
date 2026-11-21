@@ -421,6 +421,9 @@ pub struct PersistedTask {
     /// Used to detect when the OS reuses that PID for a different process.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub child_start_time_ms: Option<u64>,
+    /// AFT process responsible for publishing a local shell's launch result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) launch_owner: Option<ProcessIdentity>,
     /// `Some` records a completed check of the task's process group, including
     /// an empty group. `None` means it could not be checked; the reason is in
     /// `live_descendants_unavailable`.
@@ -671,6 +674,7 @@ impl PersistedTask {
             child_pid: None,
             pgid: None,
             child_start_time_ms: None,
+            launch_owner: None,
             live_descendants: None,
             live_descendants_omitted: 0,
             live_descendants_unavailable: None,
@@ -742,6 +746,7 @@ impl PersistedTask {
 
     pub fn mark_running(&mut self, child_pid: u32, pgid: i32) {
         self.status = BgTaskStatus::Running;
+        self.launch_owner = None;
         self.child_pid = Some(child_pid);
         self.pgid = Some(pgid);
         self.child_start_time_ms = crate::process_identity::process_start_time_ms(child_pid);

@@ -204,3 +204,113 @@ async fn pinned_executable_linux_shell_keeps_the_gh_shim_refusal() {
     );
     assert!(!output.contains("real gh"), "{result:?}");
 }
+
+#[tokio::test]
+async fn pinned_executable_linux_peer_replay_keeps_a_starting_shell_shim() {
+    use std::ffi::OsStr;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let storage = home.join("storage");
+    let project = root.join("project");
+    let first_root = root.join("first");
+    let peer_root = root.join("peer");
+    let bin = root.join("bin");
+    for directory in [&storage, &project, &first_root, &peer_root, &bin] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let real_gh = bin.join("gh");
+    fs::write(&real_gh, "#!/bin/sh\necho real gh\nexit 1\n").unwrap();
+    fs::set_permissions(&real_gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let deploy = root.join("aft-deploy");
+    copy_and_warm_aft(&deploy);
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+
+    let starting = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let first_replayed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer_replayed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let starting_addr = starting.local_addr().unwrap().to_string();
+    let first_replayed_addr = first_replayed.local_addr().unwrap().to_string();
+    let peer_replayed_addr = peer_replayed.local_addr().unwrap().to_string();
+    let first_env = [
+        ("PATH", path.as_os_str()),
+        (
+            "AFT_TEST_BASH_BEFORE_CHILD_IDENTITY",
+            OsStr::new(&starting_addr),
+        ),
+        (
+            "AFT_TEST_BASH_AFTER_STARTING_REPLAY",
+            OsStr::new(&first_replayed_addr),
+        ),
+    ];
+    let peer_env = [(
+        "AFT_TEST_BASH_AFTER_STARTING_REPLAY",
+        OsStr::new(&peer_replayed_addr),
+    )];
+    let (mut first, mut peer) = tokio::join!(
+        Daemon::spawn_with_env(&deploy, &first_root, &home, &storage, &first_env),
+        Daemon::spawn_with_env(&deploy, &peer_root, &home, &storage, &peer_env),
+    );
+    let checkpoint = async |listener: &TcpListener| {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert_eq!(stream.read_u8().await.unwrap(), b'1');
+    };
+    let limit = Duration::from_secs(30);
+    configure(&mut first, &home, &project, &storage, "off").await;
+    tokio::time::timeout(limit, checkpoint(&first_replayed))
+        .await
+        .unwrap();
+
+    let replay_while_starting = async {
+        let (mut gate, _) = starting.accept().await.unwrap();
+        let mut metadata_path = String::new();
+        BufReader::new(&mut gate)
+            .read_line(&mut metadata_path)
+            .await
+            .unwrap();
+        let metadata_path = Path::new(metadata_path.trim_end());
+        let read_task = || -> serde_json::Value {
+            serde_json::from_slice(&fs::read(metadata_path).unwrap()).unwrap()
+        };
+        let before = read_task();
+        let shim = metadata_path
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("io/startup-image/shims/gh");
+        assert_eq!(before["status"], "starting", "{before:?}");
+        assert!(before["child_pid"].is_null(), "{before:?}");
+        assert!(shim.exists(), "missing held shell shim: {shim:?}");
+        configure(&mut peer, &home, &project, &storage, "off").await;
+        checkpoint(&peer_replayed).await;
+        let after = read_task();
+        let shim_retained = shim.exists();
+        gate.write_all(b"1").await.unwrap();
+        (after["status"].clone(), shim_retained)
+    };
+    let (result, replay) = tokio::join!(
+        foreground(&mut first, "gh --shim-version"),
+        tokio::time::timeout(limit, replay_while_starting),
+    );
+    let (held_status, shim_retained) = replay.unwrap();
+    first.shutdown().await;
+    peer.shutdown().await;
+    assert_eq!(
+        result["status"], "completed",
+        "peer left task {held_status}, shim retained: {shim_retained}; {result:?}"
+    );
+    assert!(
+        result["output"]
+            .as_str()
+            .unwrap()
+            .contains("\"shim_version\""),
+        "{result:?}"
+    );
+    assert_eq!(held_status, "starting");
+    assert!(shim_retained);
+}
