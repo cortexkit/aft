@@ -1,3 +1,5 @@
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
 use super::*;
 use std::time::{Duration, Instant};
 

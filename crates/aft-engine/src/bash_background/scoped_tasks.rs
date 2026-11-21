@@ -65,3 +65,8 @@ pub(crate) fn running(metadata: &crate::bash_background::persistence::PersistedT
             }),
     }
 }
+
+#[cfg(feature = "test-support")]
+pub(crate) fn remote_running(job_id: String) -> Remote {
+    Remote { job_id }
+}

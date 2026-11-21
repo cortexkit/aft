@@ -117,12 +117,12 @@ fn bash_kill_scope_kills_promoted_background_and_grandchildren() {
             rendered.contains("killed (cancelled by owner)"),
             "{rendered}"
         );
-        let notices = tasks.registry.take_cancelled_call_notices(session);
+        let notices = tasks.registry.test_take_cancelled_call_notices(session);
         assert_eq!(notices.len(), 1);
         assert!(notices[0].contains("killed (cancelled by owner)"));
         assert!(tasks
             .registry
-            .take_cancelled_call_notices(session)
+            .test_take_cancelled_call_notices(session)
             .is_empty());
     }
     wait_for(|| !crate::process_identity::is_process_alive(pid));

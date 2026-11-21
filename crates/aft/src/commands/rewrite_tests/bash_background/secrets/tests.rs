@@ -6,6 +6,10 @@ use crate::sandbox_spawn::SpawnPlan;
 use crate::secret::SecretVault;
 use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
 use aft_engine::test_bridge::bash_remote::secrets_support::*;
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::PreflightTestExt as _;
+use aft_engine::test_bridge::bash_remote::PreparedTaskTestExt as _;
+use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
@@ -331,7 +335,7 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
             };
             for (pty, background) in [(false, false), (false, true), (true, true)] {
                 let plan = preflight(&ctx, "sandbox-raise", pty, background, requirement).unwrap();
-                assert!(plan.plan.protects_secret_memory(), "{:?}", plan.plan);
+                assert!(plan.plan().protects_secret_memory(), "{:?}", plan.plan());
                 assert_eq!(
                     crate::sandbox_spawn::effective_sandbox_mode(
                         &ctx,
@@ -458,7 +462,7 @@ fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
                 SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap(),
             )
             .unwrap();
-            let task = preflight.task.as_ref().unwrap();
+            let task = preflight.task().as_ref().unwrap();
             let principal = AuthenticatedPrincipal::FirstParty;
             let shell = Path::new("/bin/sh");
             let prepared = aft_engine::test_bridge::bash_remote::prepare_task_payload(
@@ -471,7 +475,7 @@ fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
                 &Default::default(),
             )
             .unwrap();
-            let plan = preflight.plan.clone().with_prepared_task(prepared);
+            let plan = preflight.plan().clone().with_prepared_task(prepared);
             let digest = aft_engine::test_bridge::bash_remote::save_local_launch(
                 &plan,
                 root.path(),

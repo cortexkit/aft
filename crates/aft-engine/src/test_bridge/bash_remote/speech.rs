@@ -311,3 +311,229 @@ impl QueuedBotResponse {
         self.response().await
     }
 }
+
+pub trait StoreTestExt {
+    fn get(&self, incarnation: &str) -> Result<StoredAuthority, Refusal>;
+    fn connect(&self) -> Result<crate::db::TrackedConnection, Refusal>;
+    fn find_digest(&self, digest: &[u8; 32], current_run: &str)
+        -> Result<StoredAuthority, Refusal>;
+    fn revoke(&self, incarnation: &str, reason: &str) -> Result<(), Refusal>;
+    fn seal(&self, incarnation: &str, seal: &ExecutionSeal) -> Result<(), Refusal>;
+    fn advance_policy(&self, policy: &PolicySnapshot) -> Result<i64, Refusal>;
+    fn record_end(&self, proof: &gh_shim_speech::scope::ValidatedEnd) -> Result<(), Refusal>;
+    fn pending_legacy_for_identity(&self, session: &str, task: &str) -> Result<u64, Refusal>;
+    fn final_legacy_gate<T>(
+        &self,
+        incarnation: &str,
+        nonce: &str,
+        expected_generation: i64,
+        policy_generation: i64,
+        current_policy: &PolicySnapshot,
+        forwarding_run: &str,
+        enqueue: impl FnOnce() -> Result<T, Refusal>,
+    ) -> Result<T, GateError>;
+}
+
+impl StoreTestExt for Store {
+    fn get(&self, incarnation: &str) -> Result<StoredAuthority, Refusal> {
+        Store::get(self, incarnation)
+    }
+    fn connect(&self) -> Result<crate::db::TrackedConnection, Refusal> {
+        Store::connect(self)
+    }
+    fn find_digest(
+        &self,
+        digest: &[u8; 32],
+        current_run: &str,
+    ) -> Result<StoredAuthority, Refusal> {
+        Store::find_digest(self, digest, current_run)
+    }
+    fn revoke(&self, incarnation: &str, reason: &str) -> Result<(), Refusal> {
+        Store::revoke(self, incarnation, reason)
+    }
+    fn seal(&self, incarnation: &str, seal: &ExecutionSeal) -> Result<(), Refusal> {
+        Store::seal(self, incarnation, seal)
+    }
+    fn advance_policy(&self, policy: &PolicySnapshot) -> Result<i64, Refusal> {
+        Store::advance_policy(self, policy)
+    }
+    fn record_end(&self, proof: &gh_shim_speech::scope::ValidatedEnd) -> Result<(), Refusal> {
+        Store::record_end(self, proof)
+    }
+    fn pending_legacy_for_identity(&self, session: &str, task: &str) -> Result<u64, Refusal> {
+        Store::pending_legacy_for_identity(self, session, task)
+    }
+    fn final_legacy_gate<T>(
+        &self,
+        incarnation: &str,
+        nonce: &str,
+        expected_generation: i64,
+        policy_generation: i64,
+        current_policy: &PolicySnapshot,
+        forwarding_run: &str,
+        enqueue: impl FnOnce() -> Result<T, Refusal>,
+    ) -> Result<T, GateError> {
+        Store::final_legacy_gate(
+            self,
+            incarnation,
+            nonce,
+            expected_generation,
+            policy_generation,
+            current_policy,
+            forwarding_run,
+            enqueue,
+        )
+    }
+}
+
+pub trait ServiceTestExt {
+    fn invalidate(&self, scope: &ScopeStamp);
+    fn register_accepted_policy(
+        &self,
+    ) -> Result<Option<(PolicySnapshot, std::collections::BTreeMap<String, String>)>, Refusal>;
+}
+
+impl ServiceTestExt for Service {
+    fn invalidate(&self, scope: &ScopeStamp) {
+        Service::invalidate(self, scope);
+    }
+    fn register_accepted_policy(
+        &self,
+    ) -> Result<Option<(PolicySnapshot, std::collections::BTreeMap<String, String>)>, Refusal> {
+        Service::register_accepted_policy(self)
+    }
+}
+
+pub trait RefusalTestExt: Sized {
+    fn scoped(code: Code, reason: impl Into<String>, role: ScopeRole) -> Self;
+    fn wire_data(&self) -> Value;
+    fn detail(&self) -> &Option<String>;
+    fn retry_before_send(&self) -> bool;
+    fn retry_before_send_mut(&mut self) -> &mut bool;
+}
+
+impl RefusalTestExt for Refusal {
+    fn scoped(code: Code, reason: impl Into<String>, role: ScopeRole) -> Self {
+        Refusal::scoped(code, reason, role)
+    }
+    fn wire_data(&self) -> Value {
+        Refusal::wire_data(self)
+    }
+    fn detail(&self) -> &Option<String> {
+        &self.detail
+    }
+    fn retry_before_send(&self) -> bool {
+        self.retry_before_send
+    }
+    fn retry_before_send_mut(&mut self) -> &mut bool {
+        &mut self.retry_before_send
+    }
+}
+
+pub trait RouteScopesTestExt {
+    fn origin_live(
+        &self,
+        origin: Option<&gh_shim_speech::model::RouteOrigin>,
+        stamp: &ScopeStamp,
+    ) -> bool;
+}
+
+impl RouteScopesTestExt for crate::gh_shim_relay::RouteScopes {
+    fn origin_live(
+        &self,
+        origin: Option<&gh_shim_speech::model::RouteOrigin>,
+        stamp: &ScopeStamp,
+    ) -> bool {
+        Self::origin_live(self, origin, stamp)
+    }
+}
+
+pub trait LaunchAuthorityTestExt {
+    fn origin(&self) -> &Option<gh_shim_speech::model::RouteOrigin>;
+    fn origin_mut(&mut self) -> &mut Option<gh_shim_speech::model::RouteOrigin>;
+    fn head_origin(&self) -> &Option<gh_shim_speech::model::RouteOrigin>;
+    fn authority(&self) -> &ScopeStamp;
+    fn required_scopes(&self) -> Vec<(ScopeRole, &ScopeStamp)>;
+}
+
+impl LaunchAuthorityTestExt for gh_shim_speech::model::LaunchAuthority {
+    fn origin(&self) -> &Option<gh_shim_speech::model::RouteOrigin> {
+        &self.origin
+    }
+    fn origin_mut(&mut self) -> &mut Option<gh_shim_speech::model::RouteOrigin> {
+        &mut self.origin
+    }
+    fn head_origin(&self) -> &Option<gh_shim_speech::model::RouteOrigin> {
+        &self.head_origin
+    }
+    fn authority(&self) -> &ScopeStamp {
+        &self.authority
+    }
+    fn required_scopes(&self) -> Vec<(ScopeRole, &ScopeStamp)> {
+        Self::required_scopes(self)
+    }
+}
+
+pub trait RedeemedTestExt {
+    fn launch(&self) -> &Option<gh_shim_speech::model::LaunchAuthority>;
+}
+
+impl RedeemedTestExt for gh_shim_ticket::Redeemed {
+    fn launch(&self) -> &Option<gh_shim_speech::model::LaunchAuthority> {
+        &self.launch
+    }
+}
+
+pub trait SpeechTicketTestExt {
+    fn background(&self) -> &std::sync::atomic::AtomicBool;
+}
+
+impl SpeechTicketTestExt for SpeechTicket {
+    fn background(&self) -> &std::sync::atomic::AtomicBool {
+        &self.background
+    }
+}
+
+pub trait StoredAuthorityTestExt {
+    fn generation(&self) -> i64;
+    fn phase(&self) -> &String;
+}
+
+impl StoredAuthorityTestExt for StoredAuthority {
+    fn generation(&self) -> i64 {
+        self.generation
+    }
+    fn phase(&self) -> &String {
+        &self.phase
+    }
+}
+
+pub trait AuthorityRecordTestExt {
+    fn launch(&self) -> &gh_shim_speech::model::LaunchAuthority;
+    fn launch_mut(&mut self) -> &mut gh_shim_speech::model::LaunchAuthority;
+    fn bindings(&self) -> &std::collections::BTreeMap<String, Binding>;
+    fn bindings_mut(&mut self) -> &mut std::collections::BTreeMap<String, Binding>;
+    fn seal(&self) -> &Option<ExecutionSeal>;
+    fn incarnation(&self) -> &String;
+}
+
+impl AuthorityRecordTestExt for AuthorityRecord {
+    fn launch(&self) -> &gh_shim_speech::model::LaunchAuthority {
+        &self.launch
+    }
+    fn launch_mut(&mut self) -> &mut gh_shim_speech::model::LaunchAuthority {
+        &mut self.launch
+    }
+    fn bindings(&self) -> &std::collections::BTreeMap<String, Binding> {
+        &self.bindings
+    }
+    fn bindings_mut(&mut self) -> &mut std::collections::BTreeMap<String, Binding> {
+        &mut self.bindings
+    }
+    fn seal(&self) -> &Option<ExecutionSeal> {
+        &self.seal
+    }
+    fn incarnation(&self) -> &String {
+        &self.incarnation
+    }
+}

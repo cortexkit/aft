@@ -102,13 +102,13 @@ fn cancelled_running_signal_has_a_confirmed_verdict() {
 
 #[test]
 fn cancel_with_unknown_exit_and_no_liveness_proof_stays_unknown() {
-    let terminal = wire_tests::cancel_exit_status_unknown_terminal();
+    let terminal = wire_fixture::cancel_exit_status_unknown_terminal();
     assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
 }
 
 #[test]
 fn cancel_with_typed_execution_ended_proof_is_killed() {
-    let terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    let terminal = wire_fixture::cancel_exit_status_unknown_terminal().with_execution_ended();
     assert!(terminal.execution_ended());
     assert_eq!(grade(&terminal), Verdict::CancelKilled);
 }
@@ -117,7 +117,7 @@ fn cancel_with_typed_execution_ended_proof_is_killed() {
 fn cancel_with_execution_ended_false_or_absent_stays_unknown() {
     for proof in [None, Some(false)] {
         let mut value =
-            serde_json::to_value(wire_tests::cancel_exit_status_unknown_terminal()).unwrap();
+            serde_json::to_value(wire_fixture::cancel_exit_status_unknown_terminal()).unwrap();
         if let Some(proof) = proof {
             value["execution_ended"] = proof.into();
         } else {
@@ -136,11 +136,12 @@ fn execution_ended_proof_does_not_supply_an_exit_status_or_unknown_kind() {
         Some(Killed::Deadline),
         Some(Killed::Unknown("future_kill".into())),
     ] {
-        let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+        let mut terminal =
+            wire_fixture::cancel_exit_status_unknown_terminal().with_execution_ended();
         terminal.killed = killed;
         assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
     }
-    let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    let mut terminal = wire_fixture::cancel_exit_status_unknown_terminal().with_execution_ended();
     terminal.outcome = Outcome::Unknown {
         kind: "future_outcome".into(),
     };

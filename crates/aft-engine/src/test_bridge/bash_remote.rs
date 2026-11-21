@@ -113,6 +113,7 @@ pub mod bash_hints {
 
 pub const QUEUE_CAPACITY: usize = bash_background::runner_notice_scheduler::QUEUE_CAPACITY;
 pub const PREFER_TOOL: &str = crate::bash_rewrite::notices::PREFER_TOOL;
+#[cfg(unix)]
 pub const PROXY_UNAVAILABLE: &str = bash_background::secrets::PROXY_UNAVAILABLE;
 pub const COMMAND_BYTES: usize = bash_background::scoped_tasks::COMMAND_BYTES;
 pub const OWNER_PAUSED_REASON: &str = registry::OWNER_PAUSED_REASON;
@@ -293,3 +294,47 @@ pub mod secrets_support {
 
 mod speech;
 pub use speech::*;
+
+pub fn remote_running(job_id: String) -> bash_background::scoped_tasks::scoped_tasks_types::Remote {
+    bash_background::scoped_tasks::remote_running(job_id)
+}
+
+pub struct StoreWriteTicket(bash_background::store_writes::Ticket);
+
+pub fn store_write_ticket(storage: &Path) -> StoreWriteTicket {
+    StoreWriteTicket(bash_background::store_writes::Ticket::new(storage))
+}
+
+impl StoreWriteTicket {
+    pub fn resolved(self) {
+        self.0.resolved();
+    }
+}
+
+impl BgTask {
+    pub fn test_state(&self) -> &std::sync::Mutex<BgTaskState> {
+        &self.state
+    }
+}
+
+impl registry::BgTaskRegistry {
+    pub fn test_task(&self, task_id: &str) -> Option<std::sync::Arc<BgTask>> {
+        self.task_for_test(task_id)
+    }
+
+    pub fn test_shutdown_flag(&self) -> &std::sync::atomic::AtomicBool {
+        &self.inner.shutdown
+    }
+
+    pub fn test_take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
+        self.take_cancelled_call_notices(session_id)
+    }
+}
+
+mod process_ext;
+pub use process_ext::*;
+
+mod scheduler_ext;
+pub use scheduler_ext::*;
+
+pub use registry::remote::remote_types::{DrainingRetryTestExt, KeyedSubmissionTestExt};
