@@ -1183,7 +1183,12 @@ mod tests {
                 cache_dir: Some(parent.to_path_buf()),
                 ..Default::default()
             };
-            assert!(root_cache::prepare_cache_root_for_test(&mut config).is_none());
+            assert!(
+                aft_engine::test_bridge::display_data::reader_floor::prepare_cache_root_for_test(
+                    &mut config
+                )
+                .is_none()
+            );
             config
         };
         // The probe snapshots the running config on root A and prepares it.
@@ -1238,7 +1243,9 @@ mod tests {
             if name == "project-c" {
                 config.cache_config_unknown = Some("unreadable user document".into());
             }
-            root_cache::prepare_cache_root_for_test(&mut config);
+            aft_engine::test_bridge::display_data::reader_floor::prepare_cache_root_for_test(
+                &mut config,
+            );
             let ctx = Arc::new(AppContext::from_app(crate::test_app(), config));
             let root = ProjectRootId::from_path(&project).unwrap();
             executor.register_actor(root.clone(), Arc::clone(&ctx));

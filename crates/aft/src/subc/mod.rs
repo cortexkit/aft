@@ -16632,18 +16632,18 @@ mod tests {
         ctx.set_canonical_cache_root(root.as_path().to_path_buf());
         ctx.mark_subc_bound();
         let mut inputs = slot::BuildInputs::from_config(&Config::default(), true);
-        inputs.search().rerank = Some(crate::config::RerankConfig {
+        inputs.search_mut().rerank = Some(crate::config::RerankConfig {
             backend: Some(crate::config::RerankBackendKind::Synapse),
             ..Default::default()
         });
-        inputs.semantic().subc_connection_file = Some(connection.path().to_path_buf());
-        inputs.semantic().route_project_root = Some(root.as_path().to_path_buf());
+        inputs.semantic_mut().subc_connection_file = Some(connection.path().to_path_buf());
+        inputs.semantic_mut().route_project_root = Some(root.as_path().to_path_buf());
         // An explicit pin needs no discovery server, but constructs the real
         // Synapse transport and its nested Tokio runtime on the build thread.
         ctx.rerank_slot().set_constructor_for_test(
             Arc::new(|inputs| {
                 let backend = synapse::SynapseReranker::connect(
-                    &inputs.semantic(),
+                    inputs.semantic(),
                     "test-reranker".into(),
                     Some("test-pin".into()),
                     100,
