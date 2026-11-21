@@ -141,7 +141,7 @@ async fn bus_secret_detach_mid_wait_restores_existing_long_poll_and_answer() {
     tokio::time::advance(SECRET_PENDING_BACKOFF).await;
     tokio::task::yield_now().await;
     assert_eq!(endpoint.awaits().len(), 1);
-    attachment.state.send_replace(false);
+    attachment.state().send_replace(false);
     tokio::task::yield_now().await;
     assert_eq!(endpoint.awaits().len(), 2);
     assert_eq!(endpoint.awaits()[1].params["timeout_ms"], 120_000);
