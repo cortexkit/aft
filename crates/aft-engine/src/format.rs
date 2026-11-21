@@ -24,15 +24,20 @@ pub struct ExternalToolResult {
     pub truncated: bool,
 }
 
-pub(crate) struct SubprocessOutcome {
-    pub(crate) stdout: String,
-    // Formatters keep lossy text; JSON providers use this bit to reject malformed
-    // UTF-8 instead of silently replacing bytes before parsing.
-    pub(crate) stdout_utf8_valid: bool,
-    pub(crate) stderr: String,
-    pub(crate) status: ExitStatus,
-    pub(crate) truncated: bool,
+mod subprocess_outcome {
+    use std::process::ExitStatus;
+
+    pub struct SubprocessOutcome {
+        pub(crate) stdout: String,
+        // Formatters keep lossy text; JSON providers use this bit to reject malformed
+        // UTF-8 instead of silently replacing bytes before parsing.
+        pub(crate) stdout_utf8_valid: bool,
+        pub(crate) stderr: String,
+        pub(crate) status: ExitStatus,
+        pub(crate) truncated: bool,
+    }
 }
+pub(crate) use subprocess_outcome::SubprocessOutcome;
 
 /// Errors from external tool execution.
 #[derive(Debug)]

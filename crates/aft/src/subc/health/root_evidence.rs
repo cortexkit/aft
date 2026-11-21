@@ -52,11 +52,7 @@ mod tests {
 
     #[test]
     fn refresh_fallback_counters_survive_compaction_without_marking_a_root_failed() {
-        let counts = json!(RefreshCounts {
-            refreshes: 3,
-            guard_fallbacks: 1,
-            precheck_fallbacks: 0
-        });
+        let counts = json!(RefreshCounts::new_for_test(3, 1, 0));
         let mut root = json!({"callgraph_refresh": counts});
         assert!(!health_failure_evidence(&root));
         compact_health_root(&mut root);

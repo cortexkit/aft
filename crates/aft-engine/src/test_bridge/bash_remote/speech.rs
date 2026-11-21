@@ -408,6 +408,22 @@ pub trait ServiceTestExt {
     ) -> Result<Option<(PolicySnapshot, std::collections::BTreeMap<String, String>)>, Refusal>;
 }
 
+impl crate::gh_shim_speech::model::LaunchAuthority {
+    pub fn new_for_test(
+        authority: subc_protocol::scope::ScopeStamp,
+        run: Option<subc_protocol::scope::ScopeStamp>,
+        origin: Option<crate::gh_shim_speech::model::RouteOrigin>,
+        head_origin: Option<crate::gh_shim_speech::model::RouteOrigin>,
+    ) -> Self {
+        Self {
+            authority,
+            run,
+            origin,
+            head_origin,
+        }
+    }
+}
+
 impl ServiceTestExt for Service {
     fn check_pending(
         &self,

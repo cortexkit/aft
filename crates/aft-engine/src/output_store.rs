@@ -329,18 +329,21 @@ fn stores() -> &'static Mutex<Vec<std::sync::Weak<OutputFiles>>> {
     STORES.get_or_init(Default::default)
 }
 
-/// Counts the directory entries and filesystem work examined in one cleanup pass.
-#[derive(Debug, Default)]
-pub(crate) struct CleanupReport {
-    pub session_entries: usize,
-    pub file_entries: usize,
-    pub read_dirs: usize,
-    pub remove_dirs: usize,
-    pub removed: usize,
-    pub errors: usize,
-    pub steps: usize,
-    pub complete: bool,
+mod cleanup_report {
+    /// Counts the directory entries and filesystem work examined in one cleanup pass.
+    #[derive(Debug, Default)]
+    pub struct CleanupReport {
+        pub session_entries: usize,
+        pub file_entries: usize,
+        pub read_dirs: usize,
+        pub remove_dirs: usize,
+        pub removed: usize,
+        pub errors: usize,
+        pub steps: usize,
+        pub complete: bool,
+    }
 }
+pub(crate) use cleanup_report::CleanupReport;
 
 struct CleanupCursor {
     sessions: ReadDir,
