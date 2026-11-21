@@ -1237,18 +1237,38 @@ pub fn maybe_spawn_retention(
                 &db,
                 i64::try_from(now).unwrap_or(i64::MAX),
             );
-            if let Ok(conn) = db.try_lock() {
-                if let Err(error) = crate::db::display_records::sweep(
-                    &conn, i64::try_from(now).unwrap_or(i64::MAX),
-                ) {
-                    crate::slog_warn!("display record retention failed: {error}");
+            // These sweeps write, so they take the same short busy budget as the
+            // other maintenance writes: under another process's write lock they
+            // defer to the next run instead of holding the connection mutex for
+            // the steady busy timeout, which would stall every request's reads.
+            let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
+            let now_ms = i64::try_from(now).unwrap_or(i64::MAX);
+            let report = |what: &str, outcome: Result<(), crate::db::MaintenanceWriteError>| {
+                match outcome {
+                    Ok(()) | Err(crate::db::MaintenanceWriteError::MutexHeld) => {}
+                    Err(crate::db::MaintenanceWriteError::Busy(error)) => {
+                        crate::slog_debug!("{what} retention deferred: {error}");
+                    }
+                    Err(crate::db::MaintenanceWriteError::Poisoned) => {
+                        log::warn!("{what} retention skipped: database mutex poisoned");
+                    }
+                    Err(crate::db::MaintenanceWriteError::Failed(error)) => {
+                        crate::slog_warn!("{what} retention failed: {error}");
+                    }
                 }
-                if let Err(error) = crate::db::codemode_owners::sweep(
-                    &conn, i64::try_from(now).unwrap_or(i64::MAX),
-                ) {
-                    crate::slog_warn!("codemode runner snapshot retention failed: {error}");
-                }
-            }
+            };
+            report(
+                "display record",
+                crate::db::maintenance_write(&db, budget, |conn| {
+                    crate::db::display_records::sweep(conn, now_ms).map(|_| ())
+                }),
+            );
+            report(
+                "codemode runner snapshot",
+                crate::db::maintenance_write(&db, budget, |conn| {
+                    crate::db::codemode_owners::sweep(conn, now_ms)
+                }),
+            );
             IN_FLIGHT.store(false, Ordering::Release);
         })
     {
