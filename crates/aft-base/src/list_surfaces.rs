@@ -1625,7 +1625,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // these items only describe the pattern input.
     ExclusionEntry {
         file: "commands/semantic_search/split_query.rs",
-        enclosing_item: "summary_line",
+        enclosing_item: "line",
         location_or_primitive: "commands::semantic_search::split_query::SUMMARY_DEFINITION_SITES",
         reason: "the one-line pattern summary names at most three definition sites as a preview; the reply's pattern_summary.definition_files carries the full count, and no result is removed",
     },
