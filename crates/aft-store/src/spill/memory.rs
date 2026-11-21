@@ -1,4 +1,4 @@
-//! Fixed-capacity allocations, charged for their capacity rather than length.
+//! Allocations charged for their capacity rather than length.
 
 use std::mem::size_of;
 use std::sync::{Arc, Mutex};
@@ -49,7 +49,7 @@ impl Memory {
 }
 
 /// All record, index, reader, heap, and I/O allocations go through this wrapper.
-/// No operation may grow the vector after construction.
+/// Only `grow_to` may grow a vector after construction.
 #[derive(Debug)]
 pub(super) struct Buffer<T> {
     vec: Vec<T>,
@@ -80,6 +80,33 @@ impl<T> Buffer<T> {
             memory: memory.clone(),
             charged: actual,
         })
+    }
+
+    pub(super) fn grow_to(&mut self, capacity: usize) -> Result<(), Error> {
+        debug_assert!(capacity > self.capacity());
+        let bytes = capacity
+            .checked_mul(size_of::<T>())
+            .ok_or(Error::Overflow)?;
+        // A realloc may move the buffer. Charge the new capacity while the
+        // old capacity is still live, even if the allocator extends in place.
+        self.memory.charge(bytes)?;
+        let previous = self.vec.as_ptr();
+        if let Err(error) = self.vec.try_reserve_exact(capacity - self.vec.len()) {
+            self.memory.release(bytes);
+            return Err(Error::Allocation(error));
+        }
+        self.memory.release(self.charged);
+        let relocated = self.charged != 0 && self.vec.as_ptr() != previous;
+        let actual = self.capacity() * size_of::<T>();
+        self.charged = bytes;
+        if actual > bytes {
+            self.memory.charge(actual - bytes)?;
+        }
+        self.charged = actual;
+        if relocated {
+            self.memory.update(|s| s.relocations += 1);
+        }
+        Ok(())
     }
 
     pub(super) fn push(&mut self, item: T) {

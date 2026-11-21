@@ -90,8 +90,27 @@ impl GraphSectionsSpill {
         config: Config,
         guard: WriteGuard,
     ) -> Result<Self, crate::spill::Error> {
+        Self::create(workspace, config, guard, Sorter::ephemeral_fixed_keys)
+    }
+
+    /// A delta may have only a few terms. Start with an empty sorting tail
+    /// and grow it as those terms arrive, within the same sort budget.
+    pub fn delta(
+        workspace: Box<dyn Scratch>,
+        config: Config,
+        guard: WriteGuard,
+    ) -> Result<Self, crate::spill::Error> {
+        Self::create(workspace, config, guard, Sorter::growing_fixed_keys)
+    }
+
+    fn create(
+        workspace: Box<dyn Scratch>,
+        config: Config,
+        guard: WriteGuard,
+        sorter: fn(&std::path::Path, Config, usize) -> Result<Sorter, crate::spill::Error>,
+    ) -> Result<Self, crate::spill::Error> {
         guard.check()?;
-        let mut terms = Sorter::ephemeral_fixed_keys(workspace.path(), config, 25)?;
+        let mut terms = sorter(workspace.path(), config, 25)?;
         terms.set_write_guard(guard.clone())?;
         Ok(Self {
             data: None,
@@ -467,6 +486,54 @@ impl GraphSectionsSpill {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn delta_sort_uses_only_arriving_term_memory() {
+        use crate::spill::FIXED_TAIL_ENTRY_BYTES;
+
+        let root = tempfile::tempdir().unwrap();
+        let mut config = Config::new(256 << 20);
+        config.fan_in = 128;
+        let mut spill = GraphSectionsSpill::delta(
+            super::super::scratch::for_test(root.path()),
+            config,
+            WriteGuard::new(|| Ok(())),
+        )
+        .unwrap();
+
+        const FILES: u32 = 80;
+        const TERMS_PER_FILE: u32 = 1024;
+        let terms = (0..TERMS_PER_FILE)
+            .map(u32::to_le_bytes)
+            .collect::<Vec<_>>();
+        let slack = 1 << 20; // run metadata, initial pages, and placed fragments
+        for n in 1..=FILES {
+            spill
+                .add(
+                    FragmentKey::from_digest(Digest128::of(&n.to_le_bytes())),
+                    PackedFragment::new(
+                        b"fragment",
+                        b"slice",
+                        terms.iter().map(|term| (TermKind::ALL[0], term.as_slice())),
+                    ),
+                )
+                .unwrap();
+            let live = (n * TERMS_PER_FILE) as usize * (25 + FIXED_TAIL_ENTRY_BYTES);
+            let stats = spill.terms.as_ref().unwrap().stats();
+            assert_eq!(stats.runs_written, 0);
+            assert!(spill.held_bytes() <= 2 * live + slack, "{stats:?}");
+            // Doubling capacity can briefly hold the preceding allocation
+            // too. Account for both rather than only the new retained tail.
+            assert!(stats.peak_buffered_bytes <= 3 * live + slack, "{stats:?}");
+        }
+        let stats = spill.terms.as_ref().unwrap().stats();
+        assert!(
+            stats.peak_buffered_bytes > stats.buffered_bytes,
+            "{stats:?}"
+        );
+        assert!(stats.peak_buffered_bytes < config.memory_budget);
+    }
+
     #[test]
     fn fragment_ranges_close_before_listing_and_refuse_corruption() {
         let root = tempfile::tempdir().unwrap();

@@ -106,6 +106,8 @@ pub struct Stats {
     /// held for merging (one record per run).
     pub peak_merge_head_bytes: usize,
     pub allocations: u64,
+    /// Growth operations that moved an already allocated tail buffer.
+    pub relocations: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -141,14 +143,19 @@ struct Entry {
     sequence: u64,
 }
 
+#[cfg(test)]
+pub(crate) const FIXED_TAIL_ENTRY_BYTES: usize = size_of::<Entry>();
+
 #[derive(Debug)]
 struct Tail {
     entries: Buffer<Entry>,
     bytes: Buffer<u8>,
+    entry_limit: usize,
+    byte_limit: usize,
 }
 
 impl Tail {
-    fn new(memory: &Memory, config: Config) -> Result<Self, Error> {
+    fn new(memory: &Memory, config: Config, on_demand: bool) -> Result<Self, Error> {
         let available = memory.available().saturating_sub(config.buffer_bytes);
         let count = available / 3 / size_of::<Entry>();
         if count == 0 {
@@ -157,9 +164,50 @@ impl Tail {
                 budget: config.memory_budget,
             });
         }
-        let entries = Buffer::new(count, memory)?;
-        let bytes = Buffer::new(available - count * size_of::<Entry>(), memory)?;
-        Ok(Self { entries, bytes })
+        let byte_limit = available - count * size_of::<Entry>();
+        let entries = Buffer::new(if on_demand { 0 } else { count }, memory)?;
+        let bytes = Buffer::new(if on_demand { 0 } else { byte_limit }, memory)?;
+        Ok(Self {
+            entries,
+            bytes,
+            entry_limit: count,
+            byte_limit,
+        })
+    }
+
+    /// Returns false when the next record would need a run, including when
+    /// a buffer cannot grow within the budget while its old capacity lives.
+    fn reserve(&mut self, memory: &Memory, config: Config, bytes: usize) -> Result<bool, Error> {
+        let entries = self.entries.len() + 1;
+        let bytes = self.bytes.len().checked_add(bytes).ok_or(Error::Overflow)?;
+        if entries > self.entry_limit || bytes > self.byte_limit {
+            return Ok(false);
+        }
+        Ok(
+            Self::grow(&mut self.entries, memory, config, entries, self.entry_limit)?
+                && Self::grow(&mut self.bytes, memory, config, bytes, self.byte_limit)?,
+        )
+    }
+
+    fn grow<T>(
+        buffer: &mut Buffer<T>,
+        memory: &Memory,
+        config: Config,
+        needed: usize,
+        limit: usize,
+    ) -> Result<bool, Error> {
+        let current = buffer.capacity();
+        if current >= needed {
+            return Ok(true);
+        }
+        let width = size_of::<T>();
+        let affordable = memory.available().saturating_sub(config.buffer_bytes) / width;
+        if affordable < needed {
+            return Ok(false);
+        }
+        let target = current.saturating_mul(2).max(needed).max(4096 / width);
+        buffer.grow_to(target.min(limit).min(affordable))?;
+        Ok(true)
     }
 
     fn sort(&mut self) {
@@ -186,11 +234,12 @@ pub struct Sorter {
     fixed_key_bytes: usize,
     source_range: u64,
     tail_ranges: Option<(u64, u64)>,
+    on_demand_tail: bool,
 }
 
 impl Sorter {
     pub fn new(root: &Path, config: Config) -> Result<Self, Error> {
-        Self::create(root, config, 0, true)
+        Self::create(root, config, 0, true, false)
     }
 
     /// Sort fixed-width keys without values or per-record disk framing. Equal
@@ -199,7 +248,7 @@ impl Sorter {
         if bytes == 0 {
             return Err(Error::Config("fixed key width must be nonzero"));
         }
-        Self::create(root, config, bytes, true)
+        Self::create(root, config, bytes, true, false)
     }
 
     /// Disposable fixed runs: checksummed but without manifests, fsync or
@@ -208,7 +257,16 @@ impl Sorter {
         if bytes == 0 {
             return Err(Error::Config("fixed key width must be nonzero"));
         }
-        Self::create(root, config, bytes, false)
+        Self::create(root, config, bytes, false, false)
+    }
+
+    /// Disposable fixed runs for a delta that may need only a fraction of
+    /// the budget. Its sorting tail allocates capacity as records arrive.
+    pub fn growing_fixed_keys(root: &Path, config: Config, bytes: usize) -> Result<Self, Error> {
+        if bytes == 0 {
+            return Err(Error::Config("fixed key width must be nonzero"));
+        }
+        Self::create(root, config, bytes, false, true)
     }
 
     fn create(
@@ -216,6 +274,7 @@ impl Sorter {
         config: Config,
         fixed_key_bytes: usize,
         durable: bool,
+        on_demand_tail: bool,
     ) -> Result<Self, Error> {
         let config = config.validate()?;
         let memory = Memory::new(config.memory_budget);
@@ -237,6 +296,7 @@ impl Sorter {
             fixed_key_bytes,
             source_range: 0,
             tail_ranges: None,
+            on_demand_tail,
         })
     }
 
@@ -260,6 +320,7 @@ impl Sorter {
             fixed_key_bytes: 0,
             source_range: 0,
             tail_ranges: None,
+            on_demand_tail: false,
         };
         let result = this
             .workspace
@@ -324,23 +385,34 @@ impl Sorter {
         }
         let len = key.len().checked_add(value.len()).ok_or(Error::Overflow)?;
         if self.tail.is_none() {
-            self.tail = Some(Tail::new(&self.memory, self.config)?);
+            self.tail = Some(Tail::new(&self.memory, self.config, self.on_demand_tail)?);
         }
-        let tail = self.tail.as_ref().expect("tail");
-        if len > tail.bytes.capacity() {
+        let tail = self.tail.as_mut().expect("tail");
+        if len > tail.byte_limit {
             return Err(Error::Budget {
                 needed: self
                     .config
                     .memory_budget
-                    .saturating_add(len - tail.bytes.capacity()),
+                    .saturating_add(len - tail.byte_limit),
                 budget: self.config.memory_budget,
             });
         }
-        if tail.entries.len() == tail.entries.capacity()
-            || len > tail.bytes.capacity() - tail.bytes.len()
-        {
+        let fits = if self.on_demand_tail {
+            tail.reserve(&self.memory, self.config, len)?
+        } else {
+            tail.entries.len() < tail.entries.capacity()
+                && len <= tail.bytes.capacity() - tail.bytes.len()
+        };
+        if !fits {
             self.spill()?;
-            self.tail = Some(Tail::new(&self.memory, self.config)?);
+            let mut tail = Tail::new(&self.memory, self.config, self.on_demand_tail)?;
+            if self.on_demand_tail && !tail.reserve(&self.memory, self.config, len)? {
+                return Err(Error::Budget {
+                    needed: self.config.memory_budget.saturating_add(1),
+                    budget: self.config.memory_budget,
+                });
+            }
+            self.tail = Some(tail);
         }
         let next = self.sequence.checked_add(1).ok_or(Error::Overflow)?;
         let tail = self.tail.as_mut().expect("tail");

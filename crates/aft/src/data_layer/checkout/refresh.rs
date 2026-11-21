@@ -86,7 +86,7 @@ impl DeltaScratch {
                 .check_space(remaining.load(Relaxed))
                 .map_err(io::Error::other)
         });
-        let mut spill = GraphSectionsSpill::new(workspace, graph_spill_config(), guard)
+        let mut spill = GraphSectionsSpill::delta(workspace, graph_spill_config(), guard)
             .map_err(SectionsError::Spill)
             .map_err(DeltaError::finish)?;
         spill.estimate_space(files, estimate, reserve);
