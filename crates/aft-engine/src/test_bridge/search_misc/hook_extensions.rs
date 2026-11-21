@@ -1,4 +1,5 @@
 pub mod backup {
+    pub use crate::backup::{A03_FINGERPRINT_HASHES, A03_LIVE_FINGERPRINT_READS};
     use std::path::Path;
 
     pub fn reset_capture_read_count(path: &Path) {
@@ -76,6 +77,12 @@ pub mod memory_census {
 pub mod root_cache {
     use std::path::Path;
 
+    pub fn prepare_cache_root_for_test(
+        config: &mut crate::config::Config,
+    ) -> Option<crate::config_resolve::ConfigWarning> {
+        crate::reader_floor::prepare_cache_root_for_test(config)
+    }
+
     pub fn acquire_cache_cleanup_lease(storage: &Path) -> std::io::Result<std::fs::File> {
         aft_base::cache_location::acquire_cache_cleanup_lease(storage)
     }
@@ -141,6 +148,10 @@ pub mod lsp {
         pub use crate::lsp::document::CONTENT_HASH_READS;
     }
 
+    pub mod registry {
+        pub use crate::lsp::registry::{BIOME_CONFIG_DIRECTORY_PROBES, BIOME_ROOT_WALKS};
+    }
+
     pub mod manager {
         use crate::lsp::manager::LspManager;
 
@@ -155,6 +166,18 @@ pub mod lsp {
             operation: impl Fn(&mut LspManager) -> R,
         ) -> R {
             crate::lsp::manager::settled_lsp(manager, operation)
+        }
+    }
+}
+
+pub mod file_read_exact {
+    use crate::file_read_exact::ReadHooks;
+    use std::sync::Arc;
+
+    pub fn read_hooks_with_mid_read(mid_read: Arc<dyn Fn() + Send + Sync>) -> ReadHooks {
+        ReadHooks {
+            mid_read: Some(mid_read),
+            ..ReadHooks::default()
         }
     }
 }

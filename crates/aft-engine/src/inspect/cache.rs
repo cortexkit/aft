@@ -623,7 +623,7 @@ pub struct ReadonlyInspectCache {
 }
 
 impl InspectCache {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
         let memory = match self.memory.try_read() {
             Ok(memory) => memory,

@@ -67,12 +67,24 @@ pub trait BackendSlotTest {
 }
 
 pub trait BuildInputsTestExt {
+    fn search(&self) -> &SearchConfig;
     fn search_mut(&mut self) -> &mut SearchConfig;
+    fn semantic(&self) -> &SemanticBackendConfig;
+    fn semantic_mut(&mut self) -> &mut SemanticBackendConfig;
 }
 
 impl BuildInputsTestExt for slot::BuildInputs {
+    fn search(&self) -> &SearchConfig {
+        &self.search
+    }
     fn search_mut(&mut self) -> &mut SearchConfig {
         &mut self.search
+    }
+    fn semantic(&self) -> &SemanticBackendConfig {
+        &self.semantic
+    }
+    fn semantic_mut(&mut self) -> &mut SemanticBackendConfig {
+        &mut self.semantic
     }
 }
 
@@ -93,6 +105,7 @@ pub mod synapse {
     pub use crate::search_state::rerank::synapse::synapse_fixture::{
         config, fake_daemon, fake_daemon_gated,
     };
+    pub use crate::search_state::rerank::synapse::SynapseReranker;
 }
 
 pub mod fixture {

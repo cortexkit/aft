@@ -44,18 +44,17 @@ const SCENARIOS: [&str; 4] = ["off", "building", "unavailable", "partially_ready
 
 /// Everything a scenario keeps alive for the duration of one consumer call:
 /// the project directory and the senders behind simulated in-flight builds.
-struct Scenario {
+struct Scenario<B, G> {
     ctx: AppContext,
     root: tempfile::TempDir,
     _search_tx: Option<crossbeam_channel::Sender<crate::search_index::SearchIndex>>,
     /// Keeps the index store's build from starting, so its text index stays
     /// building for the whole call.
-    _build_hold: Option<aft_engine::test_bridge::display_data::data_layer::runtime::BuildHold>,
-    _call_graph_hold:
-        Option<aft_engine::test_bridge::display_data::data_layer::checkout::CallGraphHold>,
+    _build_hold: Option<B>,
+    _call_graph_hold: Option<G>,
 }
 
-impl Scenario {
+impl<B, G> Scenario<B, G> {
     fn root(&self) -> PathBuf {
         std::fs::canonicalize(self.root.path()).expect("canonical root")
     }
@@ -68,7 +67,7 @@ impl Scenario {
 ///   are borrow-only so a query cannot start a build);
 /// - `partially_ready`: trigram ready, semantic backend down, callgraph
 ///   building.
-fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
+fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario<impl Drop, impl Drop> {
     let root = tempfile::tempdir().expect("project root");
     for (rel, content) in files {
         let path = root.path().join(rel);
@@ -228,7 +227,7 @@ fn glob_matches_the_shared_fixtures() {
     }
 }
 
-fn search(scenario: &Scenario) -> Value {
+fn search(scenario: &Scenario<impl Sized, impl Sized>) -> Value {
     response_json(&crate::commands::semantic_search::handle_semantic_search(
         &request("semantic_search", json!({ "query": "needle" })),
         &scenario.ctx,

@@ -91,6 +91,7 @@ impl InspectManagerTest for InspectManager {
 }
 
 pub trait InspectCacheTest {
+    fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate;
     fn latest_aggregate_any_hash(
         &self,
         category: InspectCategory,
@@ -104,6 +105,9 @@ pub trait InspectCacheTest {
 }
 
 impl InspectCacheTest for InspectCache {
+    fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
+        self.legacy_estimated_memory_for_test()
+    }
     fn latest_aggregate_any_hash(
         &self,
         category: InspectCategory,

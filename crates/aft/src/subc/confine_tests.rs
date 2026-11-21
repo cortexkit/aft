@@ -130,13 +130,13 @@ fn confined_escape_matrix() {
 #[test]
 fn confined_never_asks() {
     let f = Fixture::new();
-    let before = aft_engine::test_bridge::display_data::context::confinement::ask_calls();
+    let before = aft_engine::test_bridge::display_data::read_fence::ask_calls();
     for name in ["read", "grep", "glob", "outline"] {
         let response = f.call(name, arguments(name, "../live/sentinel.rs"));
         assert_eq!(response.data["code"], "path_outside_confined_root");
     }
     assert_eq!(
-        aft_engine::test_bridge::display_data::context::confinement::ask_calls(),
+        aft_engine::test_bridge::display_data::read_fence::ask_calls(),
         before,
         "confined access reached the consent ask path"
     );
@@ -1054,10 +1054,10 @@ fn read_on_filesystem_helper(f: &Fixture, input: &str) -> Response {
                     "filesystem helper lost the confinement fence"
                 );
                 assert!(helper_ctx.request_force_restrict(&request.id));
-                let asks = aft_engine::test_bridge::display_data::context::confinement::ask_calls();
+                let asks = aft_engine::test_bridge::display_data::read_fence::ask_calls();
                 let response = crate::commands::read::handle_read(&request, &helper_ctx);
                 assert_eq!(
-                    aft_engine::test_bridge::display_data::context::confinement::ask_calls(),
+                    aft_engine::test_bridge::display_data::read_fence::ask_calls(),
                     asks
                 );
                 Ok(response)

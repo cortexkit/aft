@@ -459,7 +459,7 @@ impl ConfigReloadSignalTestExt for crate::watcher_filter::config_events::ConfigR
 
 mod hook_extensions;
 pub use hook_extensions::{
-    backup, grep_executor, large_read, lsp, memory_census, root_cache, root_identity,
-    semantic_index, standing_roots, synapse_embed, watcher_filter, CountsTestExt, DaemonTestExt,
-    IdleLspFixtureTestExt,
+    backup, file_read_exact, grep_executor, large_read, lsp, memory_census, root_cache,
+    root_identity, semantic_index, standing_roots, synapse_embed, watcher_filter, CountsTestExt,
+    DaemonTestExt, IdleLspFixtureTestExt,
 };

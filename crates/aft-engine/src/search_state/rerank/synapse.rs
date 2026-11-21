@@ -11,7 +11,7 @@ use super::{RerankBackend, RerankDoc, RerankError, RerankFingerprint};
 use crate::config::SemanticBackendConfig;
 use crate::synapse_embed::{SynapseEmbeddingError, SynapseRerankTransport};
 
-pub(crate) struct SynapseReranker {
+pub struct SynapseReranker {
     model: String,
     required_fingerprint: String,
     max_queue_ms: u64,
@@ -21,7 +21,7 @@ pub(crate) struct SynapseReranker {
 impl SynapseReranker {
     /// The embedding configuration supplies only the daemon connection and route identity.
     /// The rerank model and its pin are independent of the embedding model.
-    pub(crate) fn connect(
+    pub fn connect(
         config: &SemanticBackendConfig,
         model: String,
         required_fingerprint: Option<String>,
