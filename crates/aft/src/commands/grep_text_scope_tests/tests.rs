@@ -206,7 +206,8 @@ fn compare(fixture: &Fixture, today: &SearchIndexSnapshot, view: &CheckoutView, 
 fn a_view_answers_grep_and_glob_as_todays_index_does() {
     let mut fixture = Fixture::new();
     a_small_checkout(&mut fixture);
-    let today = SearchIndex::build(&fixture.root).snapshot();
+    let today =
+        aft_engine::test_bridge::search_misc::search_index_fixture::build(&fixture.root).snapshot();
     let checkout = fixture.bind();
     let view = checkout.view().unwrap();
     compare(
@@ -251,7 +252,8 @@ fn build_folders_are_left_out_as_today_and_a_file_named_build_is_kept() {
         fixture.write(&format!("{folder}/out.rs"), b"fn alpha() {}\n");
     }
     fixture.write("tools/build", b"alpha, a file named build\n");
-    let today = SearchIndex::build(&fixture.root).snapshot();
+    let today =
+        aft_engine::test_bridge::search_misc::search_index_fixture::build(&fixture.root).snapshot();
     let checkout = fixture.bind();
     let view = checkout.view().unwrap();
     compare(&fixture, &today, &view, &["", "src", "tools"]);

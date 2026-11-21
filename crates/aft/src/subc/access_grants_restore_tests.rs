@@ -252,10 +252,12 @@ impl WireRestore {
         crate::executable_cache::write_executable(&launcher, format!(
             "#!/bin/sh\nshift\n[ \"$1\" = --profile-json ] || exit 91\nprintf '%s' \"$2\" > '{}'\nshift 2\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n", profile.display()
         ).as_bytes()).unwrap();
-        Box::new(crate::sandbox_spawn::install_sandbox_launcher_for_test(
-            &self.revived.project_root,
-            launcher,
-        ))
+        Box::new(
+            aft_engine::test_bridge::bash_remote::sandbox_spawn::install_sandbox_launcher_for_test(
+                &self.revived.project_root,
+                launcher,
+            ),
+        )
     }
 }
 

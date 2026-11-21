@@ -783,7 +783,9 @@ fn native_launcher(root: &Path) -> impl Drop {
         .unwrap_or_else(|| {
             panic!("build the real aft binary before running native secret-bash tests; looked in {candidates:?}")
         });
-    crate::sandbox_spawn::install_sandbox_launcher_for_test(root, launcher)
+    aft_engine::test_bridge::bash_remote::sandbox_spawn::install_sandbox_launcher_for_test(
+        root, launcher,
+    )
 }
 
 #[cfg(unix)]

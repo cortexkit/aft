@@ -761,7 +761,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         assert_eq!(partial.results.len(), 1);
-        let index = SearchIndex::build(project.path());
+        let index =
+            aft_engine::test_bridge::search_misc::search_index_fixture::build(project.path());
         let ready = lane
             .search(
                 Some(&index),

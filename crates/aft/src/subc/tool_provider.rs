@@ -10310,7 +10310,7 @@ pub(in crate::subc) mod route_tests {
             );
             let operator_binary = storage.path().join("operator-aft");
             std::fs::write(&operator_binary, "operator executable fixture").unwrap();
-            let _launcher = crate::sandbox_spawn::install_sandbox_launcher_for_test(
+            let _launcher = aft_engine::test_bridge::bash_remote::sandbox_spawn::install_sandbox_launcher_for_test(
                 &identity.project_root,
                 operator_binary.clone(),
             );
@@ -10441,10 +10441,11 @@ pub(in crate::subc) mod route_tests {
         );
         let operator_binary = storage.path().join("operator-aft");
         std::fs::write(&operator_binary, "operator executable fixture").unwrap();
-        let _launcher = crate::sandbox_spawn::install_sandbox_launcher_for_test(
-            &identity.project_root,
-            operator_binary.clone(),
-        );
+        let _launcher =
+            aft_engine::test_bridge::bash_remote::sandbox_spawn::install_sandbox_launcher_for_test(
+                &identity.project_root,
+                operator_binary.clone(),
+            );
         ctx.update_config(|config| {
             config.gh_shim.binary_path = Some(operator_binary);
             config.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;

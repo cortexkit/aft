@@ -2306,7 +2306,7 @@ mod tests {
         for index in 0..600 {
             std::fs::write(root.join(format!("f{index:04}.txt")), "needle\n".repeat(3)).unwrap();
         }
-        let index = crate::search_index::SearchIndex::build(&root);
+        let index = aft_engine::test_bridge::search_misc::search_index_fixture::build(&root);
         let snapshot = index.snapshot();
         let pattern = compiled_literal("needle");
         let query = aft_engine::test_bridge::search_misc::decompose_grep_pattern(&pattern);
@@ -2360,7 +2360,7 @@ mod tests {
         for index in 0..256 {
             std::fs::write(root.join(format!("dense_{index:03}.txt")), &content).unwrap();
         }
-        let index = crate::search_index::SearchIndex::build(&root);
+        let index = aft_engine::test_bridge::search_misc::search_index_fixture::build(&root);
         let snapshot = index.snapshot();
         let pattern = compiled_literal("x");
         let query = aft_engine::test_bridge::search_misc::decompose_grep_pattern(&pattern);
@@ -2879,7 +2879,8 @@ mod tests {
             std::fs::write(path, content).expect("write fixture");
         }
 
-        let index = crate::search_index::SearchIndex::build(project.path());
+        let index =
+            aft_engine::test_bridge::search_misc::search_index_fixture::build(project.path());
         let snapshot = index.snapshot();
         let cases = [
             (vec!["**/*.rs".to_string()], Vec::new(), 100),

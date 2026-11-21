@@ -1148,7 +1148,7 @@ impl SearchIndex {
 
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn build(root: &Path) -> Self {
-        Self::build_with_limit(root, DEFAULT_MAX_FILE_SIZE)
+        fixture_build::build(root)
     }
 
     /// An empty in-memory corpus to populate through a bounded disk walk.
@@ -1167,15 +1167,7 @@ impl SearchIndex {
     /// Production queries may only populate a corpus through its bounded walk.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn build_with_limit(root: &Path, max_file_size: u64) -> Self {
-        let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        let mut index = Self::empty_ready_for_root(&root);
-        index.max_file_size = max_file_size;
-        for entry in project_walk_builder(&root).build().flatten() {
-            if entry.file_type().is_some_and(|kind| kind.is_file()) {
-                index.update_file(entry.path());
-            }
-        }
-        index
+        fixture_build::build_with_limit(root, max_file_size)
     }
 
     pub fn index_file(&mut self, path: &Path, content: &[u8]) {
@@ -7431,3 +7423,5 @@ mod streamed_scan_tests {
         }
     }
 }
+#[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
+pub(crate) mod fixture_build;
