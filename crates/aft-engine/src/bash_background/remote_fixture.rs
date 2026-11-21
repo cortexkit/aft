@@ -1451,3 +1451,27 @@ pub(super) fn persist_accepted_with_snapshot_scope(
 // Reattachment is recorded in metadata without adding agent-visible wording.
 #[cfg(test)]
 pub(super) const REATTACHED_RESULT_SENTENCE: Option<&str> = None;
+
+impl Drop for UncapturedTerminalBeforeRenderForTest {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(publisher) = self.publisher.take() {
+            let result = publisher.join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+impl UncapturedTerminalBeforeRenderForTest {
+    pub fn dir(&self) -> &tempfile::TempDir {
+        &self.dir
+    }
+    pub fn registry(&self) -> &BgTaskRegistry {
+        &self.registry
+    }
+    pub fn task(&self) -> &Arc<BgTask> {
+        &self.task
+    }
+}

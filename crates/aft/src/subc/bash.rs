@@ -352,8 +352,8 @@ mod frame_loop_lock_tests {
             super::super::test_support::route_identity(&root, &task.session_id),
         )]);
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
-        let state = task.state.lock().unwrap();
-        assert!(state.metadata.remote.as_ref().unwrap().accepted);
+        let state = task.test_state().lock().unwrap();
+        assert!(state.metadata().remote.as_ref().unwrap().accepted);
         let no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
         let reply = answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true);
         tokio::pin!(reply);
@@ -394,8 +394,8 @@ mod frame_loop_lock_tests {
     async fn module_drain_reports_uncaptured_terminal_before_output_rendering() {
         for refused in [true, false] {
             let fixture = aft_engine::test_bridge::bash_remote::remote_support::uncaptured_terminal_before_render_for_test(refused);
-            let root = ProjectRootId::from_path(fixture.dir.path()).unwrap();
-            let task = &fixture.task;
+            let root = ProjectRootId::from_path(fixture.dir().path()).unwrap();
+            let task = &fixture.task();
             let cached = fixture
                 .registry
                 .drain_reply_cache(&task.task_id, &task.session_id);
@@ -434,7 +434,7 @@ mod frame_loop_lock_tests {
                     worker_session: false,
                     server_completion: false,
                     late_results: false,
-                    registry: fixture.registry.clone(),
+                    registry: fixture.registry().clone(),
                     request_id: "terminal-before-render".into(),
                     ver: PROTOCOL_VERSION,
                     flags: Flags::new(false, Priority::Passive, false),
@@ -446,8 +446,8 @@ mod frame_loop_lock_tests {
                 super::super::test_support::route_identity(&root, &task.session_id),
             )]);
             let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
-            let state = task.state.lock().unwrap();
-            assert!(state.metadata.status.is_terminal());
+            let state = task.test_state().lock().unwrap();
+            assert!(state.metadata().status.is_terminal());
             let no_task_locks =
                 crate::bash_background::registry::forbid_task_state_locks_for_test();
             let reply =
@@ -642,7 +642,7 @@ mod frame_loop_lock_tests {
                 false
             )
         );
-        let _state = task.state.lock().unwrap();
+        let _state = task.test_state().lock().unwrap();
         let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
         // The frame loop awaits this function directly. It must be ready even
         // while task state is unavailable, not merely offload a blocking read
@@ -4958,7 +4958,9 @@ fn with_bash_timing_for_test<T>(
     let commit_time = timing.as_ref().map(|timing| timing.commit_time);
     let _restore = Restore(BASH_TIMING_FOR_TEST.with(|slot| slot.replace(timing)));
     match commit_time {
-        Some(now) => crate::bash_background::with_spawn_commit_time_for_test(now, run),
+        Some(now) => {
+            aft_engine::test_bridge::bash_remote::with_spawn_commit_time_for_test(now, run)
+        }
         None => run(),
     }
 }
@@ -5512,7 +5514,7 @@ mod grant_path_tests {
 
     #[test]
     fn failed_background_handoff_logs_identity_and_keeps_status_observable() {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
 
         let (dir, _root) = super::super::test_support::test_root("detach-failure-log");
         let ctx = super::super::test_support::test_ctx();
@@ -5616,10 +5618,10 @@ mod grant_path_tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(completed.data["exit_code"], 0, "{completed:?}");
-        let task = registry.task_for_test(&task_id).unwrap();
-        let state = task.state.lock().unwrap();
-        let notify = state.metadata.notify_on_completion;
-        let delivered = state.metadata.completion_delivered;
+        let task = registry.test_task(&task_id).unwrap();
+        let state = task.test_state().lock().unwrap();
+        let notify = state.metadata().notify_on_completion;
+        let delivered = state.metadata().completion_delivered;
         drop(state);
         let notices = registry.drain_completions().len();
         eprintln!("failed-detach observation: running_status={} terminal_status={} exit_code={} notify_on_completion={notify} completion_delivered={delivered} completion_notices={notices}",
@@ -6557,7 +6559,7 @@ mod grant_path_tests {
         REMOTE_RUNON_CONNECTION
             .lock()
             .unwrap()
-            .insert(dir.path().into(), daemon.connection.clone());
+            .insert(dir.path().into(), daemon.connection().clone());
         assert!(std::process::Command::new("git")
             .args(["init", "--quiet"])
             .current_dir(dir.path())
@@ -6599,8 +6601,7 @@ mod grant_path_tests {
         assert_eq!(response.data["queue_position"], 7, "{response:?}");
         assert_eq!(response.data["remote_job_id"], id().to_string());
         let cancels = || {
-            daemon
-                .log
+            daemon.log()()
                 .lock()
                 .unwrap()
                 .iter()
@@ -6724,8 +6725,7 @@ mod grant_path_tests {
         fn job_cancels(daemon: &Daemon) -> usize {
             // Request-level Cancel only closes an observation at ck-motor;
             // exec.cancel is the operation that stops the remote job.
-            daemon
-                .log
+            daemon.log()()
                 .lock()
                 .unwrap()
                 .iter()
@@ -6799,7 +6799,7 @@ mod grant_path_tests {
             daemon.wait_for_requests("exec.run", 1).await;
             wait_for_task_state(&ctx, "remote job accepted", |registry| {
                 registry
-                    .task_for_test(&call.task_id)
+                    .test_task(&call.task_id)
                     .unwrap()
                     .state
                     .lock()
@@ -6848,8 +6848,8 @@ mod grant_path_tests {
                 Err(super::super::super::call_yield::NotYieldable::Scope)
             ));
             assert_eq!(job_cancels(&daemon), 0);
-            daemon.output_gate.notify_one();
-            daemon.completion_gate.notify_one();
+            daemon.output_gate().notify_one();
+            daemon.completion_gate().notify_one();
             assert_eq!(
                 settled(&ctx, &call.task_id).await.status,
                 BgTaskStatus::Completed
@@ -6922,8 +6922,8 @@ mod grant_path_tests {
                     "{change}"
                 );
                 assert_eq!(job_cancels(&daemon), 0, "{change}");
-                daemon.output_gate.notify_one();
-                daemon.completion_gate.notify_one();
+                daemon.output_gate().notify_one();
+                daemon.completion_gate().notify_one();
                 assert_eq!(
                     settled(&ctx, &call.task_id).await.status,
                     BgTaskStatus::Completed,
@@ -6948,7 +6948,7 @@ mod grant_path_tests {
             .await;
             wait_for_task_state(&ctx, "remote job accepted", |registry| {
                 registry
-                    .task_for_test(&call.task_id)
+                    .test_task(&call.task_id)
                     .unwrap()
                     .state
                     .lock()
@@ -6987,7 +6987,7 @@ mod grant_path_tests {
             .await;
             wait_for_task_state(&ctx, "remote job accepted", |registry| {
                 registry
-                    .task_for_test(&call.task_id)
+                    .test_task(&call.task_id)
                     .unwrap()
                     .state
                     .lock()
@@ -7066,7 +7066,7 @@ mod grant_path_tests {
         REMOTE_RUNON_CONNECTION
             .lock()
             .unwrap()
-            .insert(dir.path().into(), daemon.connection.clone());
+            .insert(dir.path().into(), daemon.connection().clone());
         let ctx = super::super::test_support::test_ctx();
         ctx.update_config(|config| {
             config.project_root = Some(dir.path().into());
@@ -7342,7 +7342,7 @@ mod grant_path_tests {
             .contains(REMOTE_INPUT_CAPTURE_WARNING));
         assert_eq!(task_id, registered_task);
         assert!(rx.try_recv().is_err(), "the call has one launch reply");
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "retry accepted", |registry| {
             registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
         })
@@ -7383,7 +7383,7 @@ mod grant_path_tests {
             .contains(REMOTE_INPUT_CAPTURE_WARNING));
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+                let task = ctx.bash_background().test_task(&task_id).unwrap();
                 if task
                     .state
                     .lock()
@@ -7476,7 +7476,7 @@ mod grant_path_tests {
             assert_eq!(done.response_for_test().data["task_id"], task_id);
             assert_eq!(done.response_for_test().data["remote_phase"], "submitting");
             assert!(!ctx.bash_background().is_task_terminal(&task_id));
-            daemon.acceptance_gate.notify_one();
+            daemon.acceptance_gate().notify_one();
         }
     }
 
@@ -7511,7 +7511,7 @@ mod grant_path_tests {
                     });
                 daemon.wait_for_requests("exec.run", 1).await;
                 assert!(rx.try_recv().is_err());
-                daemon.acceptance_gate.notify_one();
+                daemon.acceptance_gate().notify_one();
                 let done = tokio::time::timeout(Duration::from_secs(1), rx.recv())
                     .await
                     .expect("a pre-start refusal must not consume the worker wait budget")
@@ -7553,7 +7553,7 @@ mod grant_path_tests {
             let (daemon, _dir, root, executor, _ctx) =
                 capture_fixture_with_claims(Script::Plain, &["unrelated/v1"]).await;
             if unavailable_connection {
-                std::fs::remove_file(&daemon.connection).unwrap();
+                std::fs::remove_file(&daemon.connection()).unwrap();
             }
             let mut rx =
                 with_bash_timing_for_test(Some(BashTimingForTest::new(Instant::now())), || {
@@ -7635,7 +7635,7 @@ mod grant_path_tests {
             .as_str()
             .unwrap()
             .contains("capturing inputs"));
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "runner acceptance", |registry| {
             registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
         })
@@ -7732,7 +7732,7 @@ mod grant_path_tests {
             .unwrap();
         assert!(done.result.is_none(), "module loop owns the only reply");
         assert!(writer_rx.try_recv().is_err(), "one terminal reply per call");
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
     }
 
     #[cfg(unix)]
@@ -7775,7 +7775,7 @@ mod grant_path_tests {
                 .unwrap();
         }
         assert!(done.try_recv().is_err());
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         let completed = tokio::time::timeout(Duration::from_secs(10), done.recv())
             .await
             .unwrap()
@@ -7852,8 +7852,8 @@ mod grant_path_tests {
                 false,
                 false,
             );
-            let task = ctx.bash_background().task_for_test(&task_id).unwrap();
-            let state = task.state.lock().unwrap();
+            let task = ctx.bash_background().test_task(&task_id).unwrap();
+            let state = task.test_state().lock().unwrap();
             let no_task_locks =
                 crate::bash_background::registry::forbid_task_state_locks_for_test();
             assert_eq!(
@@ -7910,7 +7910,7 @@ mod grant_path_tests {
                 "{before:?}"
             );
 
-            daemon.acceptance_gate.notify_one();
+            daemon.acceptance_gate().notify_one();
             let claim = drain::BashCallClaim::default();
             let response = Response::success("capture-observer", json!({"task_id":task_id}));
             assert!(
@@ -8038,9 +8038,9 @@ mod grant_path_tests {
             !ctx.bash_background().is_task_terminal(&task_id),
             "the reply described a live task"
         );
-        daemon.output_gate.notify_one();
+        daemon.output_gate().notify_one();
         wait_for_task_state(&ctx, "completed", |registry| {
-            daemon.completion_gate.notify_one();
+            daemon.completion_gate().notify_one();
             registry.is_task_terminal(&task_id)
         })
         .await;
@@ -8125,13 +8125,13 @@ mod grant_path_tests {
                 assert!(done.result.is_none());
                 assert!(
                     ctx.bash_background()
-                        .take_cancelled_call_notices("deadline-session")
+                        .test_take_cancelled_call_notices("deadline-session")
                         .iter()
                         .any(|notice| notice.contains(&task_id)),
                     "cancelled call must hand off the task id"
                 );
             }
-            daemon.acceptance_gate.notify_one();
+            daemon.acceptance_gate().notify_one();
         }
     }
 
@@ -8160,7 +8160,7 @@ mod grant_path_tests {
         let registered_at = Instant::now();
         let early = tokio::time::timeout(Duration::from_millis(900), rx.recv()).await;
         if early.is_err() {
-            daemon.acceptance_gate.notify_one();
+            daemon.acceptance_gate().notify_one();
             let _ = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
             panic!("background runon must reply within one second of task registration, before Accepted");
         }
@@ -8193,7 +8193,7 @@ mod grant_path_tests {
             .job_id
             .is_none());
 
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "completed", |registry| {
             registry.is_task_terminal(&task_id)
         })
@@ -8255,7 +8255,7 @@ mod grant_path_tests {
         );
         assert_eq!(run["return_chunked"], true);
 
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "completed", |registry| {
             registry.is_task_terminal(&task_id)
         })
@@ -8310,7 +8310,7 @@ mod grant_path_tests {
             .unwrap()
             .contains(REMOTE_ADMISSION_PENDING_NOTE));
 
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "runner refusal recorded", |registry| {
             registry
                 .observed_status(&task_id, "deadline-session", 0)
@@ -8371,7 +8371,7 @@ mod grant_path_tests {
         });
         wait_for_task_state(&ctx, "cancel intent before dispatch", |registry| {
             registry
-                .task_for_test(&task_id)
+                .test_task(&task_id)
                 .unwrap()
                 .state
                 .lock()
@@ -8383,7 +8383,7 @@ mod grant_path_tests {
                 .cancel_requested
         })
         .await;
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         let killed = tokio::time::timeout(Duration::from_secs(5), kill)
             .await
             .expect("cancelled startup must settle once its connection resolves")
@@ -8523,12 +8523,12 @@ mod grant_path_tests {
         assert!(pending.contains("the job may still run"), "{killed:?}");
         assert_eq!(admission_status(&ctx, &task_id).data["status"], "starting");
         assert!(
-            daemon.log.lock().unwrap().iter().all(|(header, body)| {
+            daemon.log().lock().unwrap().iter().all(|(header, body)| {
                 header.ty != FrameType::Cancel && body["method"] != "exec.cancel"
             }),
             "without an id the observation must remain open, not detach"
         );
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         daemon.wait_for_requests("exec.cancel", 1).await;
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -8553,7 +8553,7 @@ mod grant_path_tests {
         })
         .await
         .expect("the runner must confirm cancellation after acceptance");
-        let log = daemon.log.lock().unwrap();
+        let log = daemon.log().lock().unwrap();
         let cancel = log
             .iter()
             .find(|(_, body)| body["method"] == "exec.cancel")
@@ -8880,7 +8880,7 @@ mod grant_path_tests {
             end_codemode_run(&ctx, &cancel, &run).await;
             let remote = ctx
                 .bash_background()
-                .task_for_test(&task_id)
+                .test_task(&task_id)
                 .unwrap()
                 .state
                 .lock()
@@ -8894,9 +8894,9 @@ mod grant_path_tests {
                 "accepted_first={accepted_first}: the run's end must not cancel the head's job"
             );
             assert!(!ctx.bash_background().is_task_terminal(&task_id));
-            daemon.acceptance_gate.notify_one();
-            daemon.output_gate.notify_one();
-            daemon.completion_gate.notify_one();
+            daemon.acceptance_gate().notify_one();
+            daemon.output_gate().notify_one();
+            daemon.completion_gate().notify_one();
             wait_for_task_state(&ctx, "finished", |registry| {
                 registry.is_task_terminal(&task_id)
             })
@@ -8978,7 +8978,7 @@ mod grant_path_tests {
             "the reply must come before the runner accepted the job"
         );
 
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "completed", |registry| {
             registry.is_task_terminal(&task_id)
         })
@@ -9078,9 +9078,9 @@ mod grant_path_tests {
             false,
             false,
         );
-        let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+        let task = ctx.bash_background().test_task(&task_id).unwrap();
         {
-            let _state = task.state.lock().unwrap();
+            let _state = task.test_state().lock().unwrap();
             let _no_task_locks =
                 crate::bash_background::registry::forbid_task_state_locks_for_test();
             let cached = ctx
@@ -9182,18 +9182,18 @@ mod grant_path_tests {
     fn runon_capture_cached_unknown_reply_before_terminal_render_keeps_advice() {
         let fixture =
             aft_engine::test_bridge::bash_remote::remote_support::uncaptured_unknown_before_render_for_test();
-        let task_id = &fixture.task.task_id;
+        let task_id = &fixture.task().task_id();
         let launch = Response::success(
             "cached-unknown",
             json!({"task_id": task_id, "status": "starting", "output": ""}),
         );
         // The worker is held after metadata publication but before the canonical
         // output cache is built; no task or artifact reads may rescue this reply.
-        let _state = fixture.task.state.lock().unwrap();
+        let _state = fixture.task().test_state().lock().unwrap();
         let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
         for background in [false, true] {
             let reply = cached_runon_launch_reply(
-                &fixture.registry,
+                &fixture.registry(),
                 task_id,
                 "session",
                 &launch,
@@ -9385,7 +9385,7 @@ mod grant_path_tests {
             !ctx.bash_background().is_task_terminal(&task_id),
             "the runner has not accepted or completed the task"
         );
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         wait_for_task_state(&ctx, "runner accepted", |registry| {
             registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
         })
@@ -9510,8 +9510,8 @@ mod grant_path_tests {
                         release_rx.recv_timeout(Duration::from_secs(60)).unwrap();
                     });
                     entered_rx.await.unwrap();
-                    let task = ctx.bash_background().task_for_test(&task_id).unwrap();
-                    let state = task.state.lock().unwrap();
+                    let task = ctx.bash_background().test_task(&task_id).unwrap();
+                    let state = task.test_state().lock().unwrap();
                     let pending = with_capture_warning(&Response::success(
                         "queued-observation", json!({"task_id":task_id, "status":"running"}),
                     ));
@@ -9631,7 +9631,7 @@ mod grant_path_tests {
                         Some(false),
                         "the reply is selected while the runner is still gated"
                     );
-                    daemon.acceptance_gate.notify_one();
+                    daemon.acceptance_gate().notify_one();
                     wait_for_task_state(&ctx, "Accepted and completed", |registry| {
                         registry.runon_inputs_captured(&task_id, "deadline-session") == Some(true)
                             && registry.is_task_terminal(&task_id)
@@ -9661,9 +9661,9 @@ mod grant_path_tests {
                 // timer and dispatch stayed held until Accepted was observed.
                 assert_launch_reply(&done, &task_id, &case, ReplyDecided::AfterAcceptance);
                 if !finished {
-                    daemon.output_gate.notify_one();
+                    daemon.output_gate().notify_one();
                     wait_for_task_state(&ctx, "completed", |registry| {
-                        daemon.completion_gate.notify_one();
+                        daemon.completion_gate().notify_one();
                         registry.is_task_terminal(&task_id)
                     })
                     .await;
@@ -9778,7 +9778,7 @@ mod grant_path_tests {
             .await
             .unwrap()
             .unwrap();
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
         let response = done.response_for_test();
         assert!(response.success, "{response:?}");
         assert!(response.data["task_id"].is_string(), "{response:?}");
@@ -9825,7 +9825,7 @@ mod grant_path_tests {
             .unwrap()
             .job_id
             .is_none());
-        daemon.acceptance_gate.notify_one();
+        daemon.acceptance_gate().notify_one();
     }
 
     #[tokio::test]
@@ -10097,19 +10097,19 @@ mod grant_path_tests {
     }
 
     fn disk_full_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(TaskIoFault::LayoutEnospc, || running_bash_stub(req, ctx))
     }
 
     fn running_disk_full_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(TaskIoFault::RunningHook(held_running_enospc), || {
             running_bash_stub(req, ctx)
         })
     }
 
     fn slow_running_write_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(TaskIoFault::RunningHook(held_running_write), || {
             running_bash_stub(req, ctx)
         })
@@ -10212,7 +10212,7 @@ mod grant_path_tests {
                 .call
                 .ctx
                 .bash_background()
-                .task_for_test(task_id)
+                .test_task(task_id)
                 .is_some(),
             "running process must be registered despite ENOSPC"
         );
@@ -10232,7 +10232,7 @@ mod grant_path_tests {
                 .call
                 .ctx
                 .bash_background()
-                .task_for_test(task_id)
+                .test_task(task_id)
                 .is_some(),
             "receipt must name the actual late-registered task"
         );
@@ -10351,7 +10351,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     fn held_starting_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(TaskIoFault::StartingHook(hold_startup_checkpoint), || {
             running_bash_stub(req, ctx)
         })
@@ -10580,7 +10580,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     fn slow_starting_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(
             TaskIoFault::StartingDelay(Duration::from_millis(300)),
             || running_bash_stub(req, ctx),
@@ -10589,7 +10589,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     fn slow_running_record_stub(req: RawRequest, ctx: &AppContext) -> Response {
-        use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+        use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
         with_task_io_fault(
             TaskIoFault::RunningDelay(Duration::from_millis(1200)),
             || running_bash_stub(req, ctx),
@@ -10886,9 +10886,8 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_deadline_at_the_commit_boundary_is_never_ambiguous() {
-        use crate::bash_background::{
-            with_spawn_commit_time_for_test, with_spawn_receipt, SpawnReceipt,
-        };
+        use crate::bash_background::{with_spawn_receipt, SpawnReceipt};
+        use aft_engine::test_bridge::bash_remote::with_spawn_commit_time_for_test;
 
         // Drive the real spawn path at exact clock positions, then settle its
         // receipt as the subc reply timer does. A delay sweep can miss the
@@ -11220,7 +11219,7 @@ mod grant_path_tests {
                     _ = BashTimingForTest::event(&timing.committed, "task registered") => {},
                 }
                 let task_id = timing.task_id.lock().unwrap().clone().unwrap();
-                let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+                let task = ctx.bash_background().test_task(&task_id).unwrap();
                 BashTimingForTest::event(&timing.reply.armed, "reply watchdog armed").await;
                 let (held_tx, held_rx) = oneshot::channel();
                 let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -11229,7 +11228,7 @@ mod grant_path_tests {
                     Lane::Mutating,
                     "held-writer".into(),
                     Box::new(move |_| {
-                        let _state = task.state.lock().unwrap();
+                        let _state = task.test_state().lock().unwrap();
                         held_tx.send(()).unwrap();
                         let _ = release_rx.recv_timeout(Duration::from_secs(5));
                         Response::success("held-writer", json!({}))
@@ -11352,7 +11351,7 @@ mod grant_path_tests {
             if let Some(snapshot) = ctx.bash_background().list(0).first() {
                 break ctx
                     .bash_background()
-                    .task_for_test(&snapshot.info.task_id)
+                    .test_task(&snapshot.info.task_id)
                     .unwrap();
             }
             assert!(
@@ -11368,7 +11367,7 @@ mod grant_path_tests {
             Lane::Mutating,
             "writer-after-spawn".into(),
             Box::new(move |_| {
-                let _state = task.state.lock().unwrap();
+                let _state = task.test_state().lock().unwrap();
                 held_tx.send(()).unwrap();
                 let _ = release_rx.recv_timeout(Duration::from_secs(5));
                 Response::success("writer-after-spawn", json!({}))
@@ -11442,7 +11441,7 @@ mod grant_path_tests {
             _ = BashTimingForTest::event(&timing.committed, "task registered") => {},
         }
         let task_id = timing.task_id.lock().unwrap().clone().unwrap();
-        let task = ctx.bash_background().task_for_test(&task_id).unwrap();
+        let task = ctx.bash_background().test_task(&task_id).unwrap();
         BashTimingForTest::event(&timing.reply.armed, "foreground deadline armed").await;
         let (held_tx, held_rx) = oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -11451,7 +11450,7 @@ mod grant_path_tests {
             Lane::Mutating,
             "held-writer".into(),
             Box::new(move |_| {
-                let _state = task.state.lock().unwrap();
+                let _state = task.test_state().lock().unwrap();
                 held_tx.send(()).unwrap();
                 let _ = release_rx.recv_timeout(Duration::from_secs(5));
                 Response::success("held-writer", json!({}))

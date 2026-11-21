@@ -323,10 +323,10 @@ fn audit_resolved_relaxed_secret_plan_refuses() {
             c.sandbox.profile.head = crate::config::SandboxMode::Relaxed;
             c.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;
         });
-        let reply =
-            crate::sandbox_spawn::with_spawn_plan_for_test(SpawnPlan::RelaxedUnenforced, || {
-                f.launch("echo '{{ck-secret:test}}'", false, json!({}))
-            });
+        let reply = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(
+            SpawnPlan::RelaxedUnenforced,
+            || f.launch("echo '{{ck-secret:test}}'", false, json!({})),
+        );
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));
         assert_eq!(reply.data["message"], "This command needs the strict sandbox because it uses a vault key, but the resolved plan has no strict native launcher. No command was started.");
         assert_eq!(f.vault.resolves.load(Ordering::SeqCst), 0);

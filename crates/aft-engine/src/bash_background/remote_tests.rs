@@ -957,18 +957,6 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
     assert_eq!(remote_execution_note(&remote), "ran remotely on ck-motor");
 }
 
-impl Drop for UncapturedTerminalBeforeRenderForTest {
-    fn drop(&mut self) {
-        let _ = self.release.send(());
-        if let Some(publisher) = self.publisher.take() {
-            let result = publisher.join();
-            if !std::thread::panicking() {
-                result.unwrap();
-            }
-        }
-    }
-}
-
 #[test]
 fn runon_network_lost_acceptance_does_not_claim_rerun_safe() {
     let dir = tempfile::tempdir().unwrap();
