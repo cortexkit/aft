@@ -21,7 +21,7 @@ pub(super) struct ViewsHealth {
     warned: HashSet<&'static str>,
 }
 
-fn declaration() -> &'static ModuleBucket {
+pub(crate) fn declaration() -> &'static ModuleBucket {
     MODULE_BUCKETS
         .iter()
         .find(|row| row.owner == "aft" && row.name == "views")
@@ -79,12 +79,21 @@ pub(crate) struct Publication<'a> {
 }
 
 impl<'a> Publication<'a> {
-    fn new(notice_views: &'a NoticeViewsReady) -> Self {
+    pub(crate) fn new(notice_views: &'a NoticeViewsReady) -> Self {
         Self {
             notice_views,
             written: HashSet::new(),
             skipped: HashSet::new(),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn sync_for_test(
+        &mut self,
+        writer: &mut impl Writer,
+        values: &[(String, Vec<u8>)],
+    ) -> Result<(), &'static str> {
+        self.sync(writer, values).await
     }
 
     pub(crate) async fn sync_with_hooks(

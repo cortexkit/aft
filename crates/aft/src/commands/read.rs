@@ -4258,3 +4258,11 @@ mod github_deferred_deadline_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "github_read_cache_tests.rs"]
+mod github_read_cache_tests;
+
+#[cfg(test)]
+#[path = "runtime_drain_tests.rs"]
+mod runtime_drain_tests;

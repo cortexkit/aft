@@ -102,3 +102,7 @@ pub fn handle_edit_history(req: &RawRequest, ctx: &AppContext) -> Response {
         }),
     )
 }
+
+#[cfg(test)]
+#[path = "edit_history_backup_tests.rs"]
+mod backup_tests;
