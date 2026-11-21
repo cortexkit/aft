@@ -504,7 +504,7 @@ mod tests {
             &executor,
             &HashMap::new(),
             &metrics,
-            &App::default_shared(),
+            &crate::test_app(),
         );
         health::with_route_ownership_summary(
             &mut report,
@@ -662,10 +662,7 @@ mod tests {
         let executor = Executor::new();
         executor.register_actor(
             root.clone(),
-            Arc::new(AppContext::from_app(
-                App::default_shared(),
-                Config::default(),
-            )),
+            Arc::new(AppContext::from_app(crate::test_app(), Config::default())),
         );
         let mut fixture = Fixture::default();
         let metrics = DispatchPathMetrics::new();

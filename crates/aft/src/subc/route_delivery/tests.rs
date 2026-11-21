@@ -13,7 +13,7 @@ pub(super) fn record_policy_visit(root: &ProjectRootId) {
 #[test]
 fn one_bind_updates_only_its_root_and_publishes_one_shared_snapshot() {
     let (dir, _) = test_support::test_root("route-delivery-fleet");
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Executor::new();
     let metrics = DispatchPathMetrics::new();
     let delivery = &app.route_delivery_sessions;

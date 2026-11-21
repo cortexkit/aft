@@ -2,6 +2,12 @@ use std::sync::Once;
 
 use crate::{config::Config, context::AppContext, language::LanguageProvider};
 
+pub(crate) fn test_app() -> std::sync::Arc<crate::context::App> {
+    aft_engine::test_bridge::test_storage::with_isolated_context(
+        crate::context::App::default_shared,
+    )
+}
+
 pub(crate) fn test_context(provider: Box<dyn LanguageProvider>, config: Config) -> AppContext {
     // These handlers belong to the upper layer. Engine fixtures can build a
     // context without installing them.

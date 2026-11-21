@@ -2930,7 +2930,7 @@ mod tests {
     const TEST_PROGRESS_BODY_LIMIT: usize = 16 * 1024;
 
     fn originated_progress(chunk: &str) -> PushFrame {
-        let ctx = AppContext::from_app(App::default_shared(), Config::default());
+        let ctx = AppContext::from_app(crate::test_app(), Config::default());
         let (tx, rx) = std::sync::mpsc::channel();
         ctx.set_progress_sender(Some(Arc::new(Box::new(move |frame| {
             tx.send(frame).unwrap();

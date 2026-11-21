@@ -72,7 +72,7 @@ impl Harness {
                     read,
                     write,
                     &storage.join("connection.json"),
-                    App::default_shared(),
+                    crate::test_app(),
                     Arc::new(Executor::new()),
                     dispatch,
                     Some(user),

@@ -808,7 +808,7 @@ async fn tool_result_capability_is_selected_per_bind_not_per_call() {
             read,
             write,
             &module_root.join("absent-connection.json"),
-            App::default_shared(),
+            crate::test_app(),
             loop_executor,
             |request, ctx| {
                 if request.command == "configure" {
@@ -973,7 +973,7 @@ async fn tool_result_non_negotiating_routes_keep_legacy_success_and_error_bytes(
             read,
             write,
             &module_root.join("absent-connection.json"),
-            App::default_shared(),
+            crate::test_app(),
             executor,
             |request, ctx| {
                 if request.command == "configure" {

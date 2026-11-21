@@ -51,7 +51,7 @@ async fn module_loop_control_request_fits_with_stack_headroom() {
                     read,
                     write,
                     &connection_file,
-                    App::default_shared(),
+                    crate::test_app(),
                     Arc::new(Executor::new()),
                     |_, _| unreachable!("a health request needs no executor job"),
                     None,

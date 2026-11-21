@@ -76,7 +76,7 @@ fn bind(root: &Path, tool: bool, epoch: u32, corr: u64) -> Frame {
 
 async fn retracted_bind(tool: bool, trigger: &str, expected_code: &str) {
     let (dir, root) = test_support::test_root("retracted-control-bind");
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let storage = dir.path().join("storage");
     if tool {
