@@ -1,6 +1,6 @@
 use super::*;
 use crate::bash_background::persistence::{DirectorySnapshot, PinnedDir, TaskLayout};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 
 const TASK_READ_RECORD_CAPACITY: usize = 64;
