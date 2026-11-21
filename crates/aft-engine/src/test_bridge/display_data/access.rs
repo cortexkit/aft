@@ -13,14 +13,20 @@ use std::time::Duration;
 // Keep the test contract and its forwarding signature together. The calls in
 // the engine still resolve to their inherent methods.
 macro_rules! test_methods {
-    ($extension:ident for $engine:ty { $( $(#[$attr:meta])* fn $name:ident(&self $(, $arg:ident: $ty:ty)*) $(-> $result:ty)?; )* }) => {
+    ($extension:ident for $engine:ty { $( $(#[$attr:meta])* fn $name:ident(&self $(, $arg:ident: $ty:ty)*) $(-> $result:ty)?; )* }
+        $(associated { $(fn $static_name:ident($($static_arg:ident: $static_ty:ty),*) -> $static_result:ty;)* })?
+    ) => {
         pub trait $extension {
             $( $(#[$attr])* fn $name(&self $(, $arg: $ty)*) $(-> $result)?; )*
+            $($(fn $static_name($($static_arg: $static_ty),*) -> $static_result;)*)?
         }
         impl $extension for $engine {
             $( $(#[$attr])* fn $name(&self $(, $arg: $ty)*) $(-> $result)? {
                 <$engine>::$name(self $(, $arg)*)
             } )*
+            $($(fn $static_name($($static_arg: $static_ty),*) -> $static_result {
+                <$engine>::$static_name($($static_arg),*)
+            })*)?
         }
     };
 }
@@ -57,6 +63,8 @@ test_methods! { AppContextTestExt for AppContext {
     fn artifact_cache_key_derivation_count_for_test(&self) -> u64;
     fn set_unbound_build_abandon_grace_for_test(&self, grace: Duration);
     fn lsp_post_edit_worker_running_for_test(&self) -> bool;
+} associated {
+    fn ignore_walks_on_current_thread_for_test() -> u64;
 }}
 
 test_methods! { ConfigLiveStateTestExt for crate::config_live::ConfigLiveState {
@@ -76,6 +84,9 @@ test_methods! { DataCheckoutTestExt for DataCheckout {
     fn request_refresh(&self);
     fn meaning_status(&self) -> crate::data_layer::meaning::MeaningState;
     fn root(&self) -> &Path;
+} associated {
+    fn open(root: &Path, storage: &Path, executor: Option<crate::executor::RootMaintenanceExecutor>) -> Result<Arc<DataCheckout>, DataError>;
+    fn open_planes(root: &Path, storage: &Path, executor: Option<crate::executor::RootMaintenanceExecutor>, planes: crate::data_layer::checkout::Planes) -> Result<Arc<DataCheckout>, DataError>;
 }}
 
 test_methods! { CheckoutTestExt for Checkout {
@@ -86,6 +97,8 @@ test_methods! { CheckoutTestExt for Checkout {
 
 test_methods! { SnapshotStoreTestExt for crate::page_collect::snapshot::SnapshotStore {
     fn live_count(&self) -> usize;
+} associated {
+    fn open(storage_dir: &Path) -> crate::page_collect::snapshot::SnapshotStore;
 }}
 
 pub use crate::data_layer::host::IndexHost;
@@ -176,21 +189,4 @@ impl StoredOutline {
     pub fn symbols(&self) -> &[aft_store::content::OutlineSymbol] {
         &self.0.symbols
     }
-}
-
-pub fn open_snapshot_store(storage_dir: &Path) -> crate::page_collect::snapshot::SnapshotStore {
-    crate::page_collect::snapshot::SnapshotStore::open(storage_dir)
-}
-
-pub fn open_data_checkout(
-    root: &Path,
-    storage: &Path,
-    executor: Option<crate::executor::RootMaintenanceExecutor>,
-    planes: crate::data_layer::checkout::Planes,
-) -> Result<Arc<DataCheckout>, DataError> {
-    DataCheckout::open_planes(root, storage, executor, planes)
-}
-
-pub fn ignore_walks_on_current_thread_for_test() -> u64 {
-    AppContext::ignore_walks_on_current_thread_for_test()
 }

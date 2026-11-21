@@ -267,7 +267,7 @@ mod tests {
         // Bound and built: ready, with the file count and the store's size.
         assert!(ctx.data_checkout().is_some());
         let ready = settled(&ctx);
-        assert_eq!(ready.files, Some(3));
+        assert_eq!(ready.files(), Some(3));
         let payload = ctx.build_status_snapshot();
         assert_eq!(
             payload["search_index"],
@@ -343,7 +343,7 @@ mod tests {
             "callgraph_unavailable"
         );
         checkout.note_outcome_for_test("refresh", &Ok(()));
-        assert_eq!(report(&ctx).unwrap().callgraph.status, READY);
+        assert_eq!(report(&ctx).unwrap().callgraph().status, READY);
     }
 
     #[test]

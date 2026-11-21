@@ -1494,7 +1494,7 @@ isolated!(
             .outline_symbols(b"bad.luau")
             .unwrap()
             .unwrap()
-            .symbols
+            .symbols()
             .is_empty());
         let cache = f.ctx.symbol_cache();
         let generation = cache.write().unwrap().reset();
@@ -1505,7 +1505,7 @@ isolated!(
             &|| false,
         )
         .unwrap();
-        assert_eq!(report.loaded, 2, "{report:?}");
+        assert_eq!(report.loaded(), 2, "{report:?}");
         let parser =
             crate::parser::FileParser::with_symbol_cache(cache).with_dynamic_languages(true);
         assert_eq!(parser.cached_has_error(&bad), None);

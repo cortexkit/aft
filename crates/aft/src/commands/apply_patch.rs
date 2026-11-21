@@ -1554,7 +1554,8 @@ mod tests {
                 delete_lines: None,
             })
             .collect();
-        edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));
+        aft_engine::test_bridge::search_misc::edit::A03_DIFF_CONSTRUCTIONS
+            .with(|count| count.set(0));
         let (diff, files, _) = metadata_files(&applied, None, &HashMap::new());
         assert_eq!(
             files,
@@ -1564,7 +1565,8 @@ mod tests {
         );
         assert_eq!(diff, files[0]["patch"].as_str().unwrap());
         assert_eq!(
-            edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.get()),
+            aft_engine::test_bridge::search_misc::edit::A03_DIFF_CONSTRUCTIONS
+                .with(|count| count.get()),
             1,
             "one final aggregated pair computation"
         );
@@ -1779,9 +1781,11 @@ mod write_warning_tests {
             lsp_hints: None,
             session_id: None,
         };
-        edit::FORCE_MODE_RESTORE_FAILURE.with(|forced| forced.set(true));
+        aft_engine::test_bridge::search_misc::edit::FORCE_MODE_RESTORE_FAILURE
+            .with(|forced| forced.set(true));
         let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
-        edit::FORCE_MODE_RESTORE_FAILURE.with(|forced| forced.set(false));
+        aft_engine::test_bridge::search_misc::edit::FORCE_MODE_RESTORE_FAILURE
+            .with(|forced| forced.set(false));
         assert_eq!(response["code"], "apply_patch_failed", "{response}");
         assert!(
             response["failures"][0]["error"]

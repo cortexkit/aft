@@ -1427,7 +1427,7 @@ impl Drop for DataCheckout {
 
 impl DataCheckout {
     /// [`Self::open_planes`] with every plane.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open(
         root: &Path,
         storage: &Path,
