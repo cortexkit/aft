@@ -27,9 +27,6 @@ use crate::data_layer::host::{IndexHost, TextView};
 use crate::pattern_compile::CompiledPattern;
 use crate::search_index::{FileEntry, PathFilters, SearchIndexSnapshot, DEFAULT_MAX_FILE_SIZE};
 
-#[cfg(test)]
-mod tests;
-
 /// The data layer's view of this root, when grep and glob may answer from
 /// it: the process runs the data layer, the checkout has published, and its
 /// text plane covers every path.

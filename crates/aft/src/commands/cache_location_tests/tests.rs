@@ -1,10 +1,19 @@
 use crate::reader_floor::clean_old_for_test as clean_old;
 use crate::reader_floor::prepare_cache_root_for_test as prepare_cache_root;
 
-use super::*;
+use crate::cache_location;
+use crate::cache_location::*;
 use crate::config::Config;
+use crate::pinned_dir::PinnedDir;
 #[allow(unused_imports)]
 pub(crate) use aft_base::cache_location::tests::*;
+use std::fs;
+#[cfg(unix)]
+use std::fs::File;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 fn without_host_process_scan<R>(run: impl FnOnce() -> R) -> R {
     with_legacy_daemon_processes_for_test(String::new(), run)
@@ -54,7 +63,8 @@ fn legacy_cleanup_refuses_a_non_resolved_storage_root() {
         source: "test".into(),
         doc: serde_json::json!({"storage":{"cache_dir":parent}}).to_string(),
     }];
-    let report = without_host_process_scan(|| super::clean_old(&tiers, &storage, |_| true));
+    let report =
+        without_host_process_scan(|| cache_location::clean_old(&tiers, &storage, |_| true));
     assert_eq!(
         report.reason,
         Some("old_cache_storage_root_mismatch"),
@@ -116,7 +126,7 @@ fn legacy_cleanup_requires_the_active_namespace_on_its_own_device() {
     // No simulated volume here: this deliberately models an old enrollment on
     // the primary device, which is not sufficient to authorize legacy cleanup.
     let report = without_host_process_scan(|| {
-        super::clean_old_resolved(&tiers, &storage, &storage, |_| {
+        cache_location::clean_old_resolved(&tiers, &storage, &storage, |_| {
             panic!("same-device namespace must be refused before confirmation")
         })
     });
@@ -150,7 +160,7 @@ fn enrollment_device_comparison_uses_the_pinned_creation_parent() {
         cache_dir: Some(parent.clone()),
         ..Default::default()
     };
-    let warning = super::prepare_cache_root(&mut config)
+    let warning = cache_location::prepare_cache_root(&mut config)
         .expect("a different pathname probe must not change the pinned creation device");
     assert_eq!(warning.code, CACHE_DIR_ON_STORAGE_DEVICE);
     assert!(!parent.join("aft").exists());
@@ -714,8 +724,8 @@ fn first_enrollment_refuses_the_durable_storage_device() {
         cache_dir: Some(parent.clone()),
         ..Default::default()
     };
-    let warning =
-        super::prepare_cache_root(&mut config).expect("a same-device mount stub must be refused");
+    let warning = cache_location::prepare_cache_root(&mut config)
+        .expect("a same-device mount stub must be refused");
     assert_eq!(warning.code, CACHE_DIR_ON_STORAGE_DEVICE);
     assert!(warning.message.contains(CACHE_DIR_ON_STORAGE_DEVICE));
     assert!(cache_unavailable(&config)

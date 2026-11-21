@@ -36,6 +36,8 @@ pub mod bash_wait_detach;
 pub mod bash_watch;
 pub mod bash_write;
 pub mod batch;
+#[cfg(test)]
+mod cache_location_tests;
 pub(crate) use crate::blocking_wait;
 pub mod call_tree;
 pub mod callers;
@@ -60,6 +62,8 @@ pub(crate) use crate::file_read_exact;
 pub(crate) mod github_comments;
 pub mod glob;
 pub mod grep;
+#[cfg(test)]
+mod grep_text_scope_tests;
 pub mod hashline;
 pub mod health_digest;
 pub mod impact;
@@ -113,6 +117,8 @@ pub mod zoom;
 
 #[cfg(test)]
 mod storage_floor_tests;
+#[cfg(test)]
+mod store_diet_tests;
 
 pub(crate) mod data_callgraph;
 pub(crate) mod data_search;

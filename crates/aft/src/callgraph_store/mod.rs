@@ -63,10 +63,6 @@ use tree_sitter::Node;
 pub mod dead_code_projection;
 
 #[cfg(test)]
-#[path = "../../tests/store_diet/harness.rs"]
-mod store_diet;
-
-#[cfg(test)]
 mod local_symbol_memo_tests {
     use super::*;
 
