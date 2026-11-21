@@ -56,7 +56,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Why the last fill round stopped, told apart as today's semantic build
 /// tells its failures apart. Each is retried; only the wording differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum FillFailure {
+pub enum FillFailure {
     /// The embedding backend could not be reached, or refused for a while
     /// (a paused model lane, a transient error); its health records why.
     Unreachable(String),

@@ -480,7 +480,7 @@ impl CollectRefusal {
 
 /// One file in a collected bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct FileRecord {
+pub struct FileRecord {
     /// Relative to the page's folder, `/`-separated.
     pub path: String,
     pub size: u64,
@@ -490,7 +490,7 @@ pub(crate) struct FileRecord {
 
 /// A file the page names that is not in the bundle.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Omitted {
+pub struct Omitted {
     pub path: String,
     pub reason: OmitReason,
 }

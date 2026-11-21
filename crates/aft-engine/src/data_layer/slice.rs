@@ -521,7 +521,7 @@ struct Edges {
 
 /// A file's slice of the call graph.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FileSlice {
+pub struct FileSlice {
     path: String,
     language: String,
     record_key: String,
