@@ -6796,10 +6796,7 @@ impl AppContext {
     /// session runs for one child repository, which answers from the
     /// checkout the session holds for that child (see
     /// `data_layer::parent::search_children`), never one of its own.
-    pub(crate) fn pin_data_checkout(
-        &self,
-        checkout: Arc<crate::data_layer::runtime::DataCheckout>,
-    ) {
+    pub fn pin_data_checkout(&self, checkout: Arc<crate::data_layer::runtime::DataCheckout>) {
         let mut slot = self.data_checkout.lock();
         if !slot
             .as_ref()
