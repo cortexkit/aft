@@ -11525,13 +11525,16 @@ mod tests {
         let (_dir, root) = test_root("health-snapshot-age-coverage");
         let ctx = test_ctx();
         let watcher = ctx.watcher_counters();
-        watcher.set_exclusion_planning(crate::context::WatcherExclusionPlanningSnapshot {
-            matcher_generation: 7,
-            attempts: 8,
-            attempt_limit: 8,
-            status: "exhausted",
-            last_failure: Some("io_deadline"),
-        });
+        use aft_engine::test_bridge::search_misc::watcher_backend::counters::{
+            WatcherExclusionPlanningSnapshot, WatcherOverflowPrefix,
+        };
+        watcher.set_exclusion_planning(WatcherExclusionPlanningSnapshot::new(
+            7,
+            8,
+            8,
+            "exhausted",
+            Some("io_deadline"),
+        ));
         watcher.note_fsevents_stream_creation();
         watcher.note_raw_event();
         watcher.note_raw_event();
@@ -11540,10 +11543,10 @@ mod tests {
         watcher.note_paths_dispatched(6);
         watcher.note_overflow(
             crate::watcher_filter::RescanReason::UserDropped,
-            vec![crate::context::WatcherOverflowPrefix {
-                prefix: "packages/opencode-plugin".to_string(),
-                count: 23,
-            }],
+            vec![WatcherOverflowPrefix::new(
+                "packages/opencode-plugin".to_string(),
+                23,
+            )],
         );
         assert_eq!(
             watcher
