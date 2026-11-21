@@ -38,14 +38,9 @@ enum AnchorKey {
 
 static ANCHORS: OnceLock<Mutex<HashMap<AnchorKey, Weak<Anchor>>>> = OnceLock::new();
 
-#[derive(Clone, Debug)]
-pub(crate) struct StoredAuthority {
-    pub(crate) record: AuthorityRecord,
-    pub(crate) ticket_digest: Option<Vec<u8>>,
-    pub(crate) phase: String,
-    pub(crate) generation: i64,
-}
-
+#[path = "store_types.rs"]
+pub(crate) mod store_types;
+pub(crate) use store_types::{GateError, StoredAuthority};
 fn unavailable(site: &str, check: &str, identifiers: serde_json::Value) -> Refusal {
     crate::gh_shim_speech::snapshot_invalid(site, check, identifiers)
 }
@@ -802,12 +797,6 @@ fn validate_gate(
         return Err(rollback());
     }
     Ok(())
-}
-
-#[derive(Debug)]
-pub(crate) enum GateError {
-    BeforeSend(Refusal),
-    AfterSend,
 }
 
 fn rollback() -> Refusal {

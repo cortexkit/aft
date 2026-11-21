@@ -62,7 +62,7 @@ pub fn env_conflicts(env: &HashMap<String, String>) -> bool {
 
 #[doc(hidden)]
 pub fn vault() -> Arc<dyn SecretVault> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(vault) = TEST_VAULT.with(|slot| slot.borrow().clone()) {
         return vault;
     }
@@ -156,14 +156,10 @@ pub fn preflight(
 pub(crate) type SharedRuntime = Arc<Mutex<Runtime>>;
 
 #[cfg(unix)]
-pub(crate) struct Runtime {
-    proxy: SecretProxy,
-    bundle: PathBuf,
-    pub(crate) lifetime: crate::secret::SecretScope,
-    pub(crate) authorization: crate::secret::SecretScope,
-    armed: bool,
-}
-
+#[path = "secrets_types.rs"]
+pub(crate) mod secrets_types;
+#[cfg(unix)]
+pub(crate) use secrets_types::Runtime;
 #[cfg(unix)]
 impl Runtime {
     pub(crate) fn approval_status(&self) -> Vec<String> {
@@ -268,11 +264,11 @@ pub fn authorize(
         labels.to_vec(),
         crate::context::call_context::current_secret_consent_context(),
         {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
                 TEST_HTTPS_PORT.with(std::cell::Cell::get)
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             {
                 None
             }
@@ -322,7 +318,7 @@ pub fn authorize(
     })
 }
 
-#[cfg(all(not(test), unix))]
+#[cfg(all(unix, not(any(test, feature = "test-support"))))]
 fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
     SecretProxy::start(config)
 }
@@ -330,7 +326,7 @@ fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::
 // Only test builds can inject this upstream config. Release launches always
 // call SecretProxy::start; neither a tool argument nor a test-only switch can
 // select this override.
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 fn start_proxy(config: ProxyConfig) -> Result<SecretProxy, crate::secret_proxy::ProxyError> {
     match TEST_UPSTREAM.with(|slot| slot.borrow().clone()) {
         Some(upstream) => SecretProxy::start_for_test(config, upstream),
@@ -439,7 +435,7 @@ fn native_roots() -> Result<Vec<u8>, ()> {
     Err(())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TEST_HTTPS_PORT: std::cell::Cell<Option<u16>> = const { std::cell::Cell::new(None) };
     static TEST_VAULT: std::cell::RefCell<Option<Arc<dyn SecretVault>>> = const { std::cell::RefCell::new(None) };
@@ -447,28 +443,26 @@ thread_local! {
     static TEST_UPSTREAM: std::cell::RefCell<Option<rustls::ClientConfig>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_support {
     use super::*;
 
     #[cfg(unix)]
-    pub(crate) fn set_https_port(port: Option<u16>) {
+    pub fn set_https_port(port: Option<u16>) {
         TEST_HTTPS_PORT.with(|slot| slot.set(port));
     }
 
-    pub(crate) fn replace_vault(
-        vault: Option<Arc<dyn SecretVault>>,
-    ) -> Option<Arc<dyn SecretVault>> {
+    pub fn replace_vault(vault: Option<Arc<dyn SecretVault>>) -> Option<Arc<dyn SecretVault>> {
         TEST_VAULT.with(|slot| slot.replace(vault))
     }
 
     #[cfg(target_os = "macos")]
-    pub(crate) fn set_upstream(config: rustls::ClientConfig) {
+    pub fn set_upstream(config: rustls::ClientConfig) {
         TEST_UPSTREAM.with(|slot| slot.replace(Some(config)));
     }
 
     #[cfg(unix)]
-    pub(crate) fn unarmed_runtime(
+    pub fn unarmed_runtime(
         proxy: SecretProxy,
         bundle: PathBuf,
         lifetime: crate::secret::SecretScope,
@@ -484,12 +478,12 @@ pub(crate) mod test_support {
     }
 
     #[cfg(unix)]
-    pub(crate) fn native_roots() -> Result<Vec<u8>, ()> {
+    pub fn native_roots() -> Result<Vec<u8>, ()> {
         super::native_roots()
     }
 
     #[cfg(unix)]
-    pub(crate) fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
+    pub fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
         super::write_bundle(path, ca)
     }
 }

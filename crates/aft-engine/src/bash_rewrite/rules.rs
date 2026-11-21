@@ -1414,12 +1414,12 @@ fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> O
     Some(json!({ "file": target, "include_hidden": include_hidden }))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn grep_request(command: &str, binary: &str) -> Option<Value> {
     grep_request_from_parsed(parse(command).as_ref(), binary)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn find_request(command: &str) -> Option<Value> {
     find_request_from_parsed(parse(command).as_ref())
 }

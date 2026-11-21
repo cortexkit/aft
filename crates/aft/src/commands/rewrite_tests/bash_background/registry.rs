@@ -2,23 +2,24 @@ mod tests {
     use crate::bash_background::persistence::{
         task_paths, write_task, BgMode, ExitMarker, PersistedTask,
     };
-    use crate::bash_background::registry::{test_support::registry_cases::*, TaskRuntime};
     use crate::bash_background::watches::{PatternMatch, WatchPattern};
-    use crate::bash_background::{buffer::BgBuffer, BgTaskStatus};
+    use crate::bash_background::BgTaskStatus;
     use crate::protocol::BashPatternMatchFrame;
+    use aft_engine::test_bridge::bash_remote::BgBuffer;
+    use aft_engine::test_bridge::bash_remote::{registry_support::registry_cases::*, TaskRuntime};
     use std::{fs, path::PathBuf, time::Instant};
 
     #[test]
     fn approved_head_status_paging_does_not_renew_default_kill() {
         let (_dir, ctx, task) = super::super::default_kill_tests::wait_fixture(None);
-        fs::write(&task.paths.stdout, "output").unwrap();
-        fs::write(&task.paths.stderr, "").unwrap();
-        let request = serde_json::from_value(serde_json::json!({"id": "head-page", "command": "bash_status", "session_id": task.session_id, "worker_session": false, "params": {"task_id": task.task_id, "output_offset": 0}})).unwrap();
+        fs::write(&task.paths().stdout, "output").unwrap();
+        fs::write(&task.paths().stderr, "").unwrap();
+        let request = serde_json::from_value(serde_json::json!({"id": "head-page", "command": "bash_status", "session_id": task.session_id(), "worker_session": false, "params": {"task_id": task.task_id(), "output_offset": 0}})).unwrap();
         let response = crate::commands::bash_status::handle(&request, &ctx);
         assert!(response.success, "status failed: {:?}", response.data);
         assert_eq!(
             ctx.bash_background()
-                .hard_kill_deadline(&task.task_id, &task.session_id)
+                .hard_kill_deadline(task.task_id(), task.session_id())
                 .unwrap()
                 .limit_ms,
             1_800_000
@@ -39,13 +40,13 @@ mod tests {
         let (id, task) =
             insert_terminal_piped_task(ctx.bash_background(), &dir, "true", "", "", false);
         {
-            let mut state = task.lock_state().unwrap();
-            state.metadata.mode = BgMode::Pty;
-            state.runtime = TaskRuntime::Pty(None);
-            state.buffer = BgBuffer::registered(&task.paths, BgMode::Pty);
-            write_task(&task.paths.json, &state.metadata).unwrap();
+            let mut state = task.test_lock_state().unwrap();
+            state.metadata_mut().mode = BgMode::Pty;
+            *state.runtime_mut() = TaskRuntime::Pty(None);
+            *state.buffer_mut() = BgBuffer::registered(&task.paths(), BgMode::Pty);
+            write_task(&task.paths().json, &state.metadata()).unwrap();
         }
-        fs::write(&task.paths.pty, vec![b'x'; 3 * 64 * 1024]).unwrap();
+        fs::write(&task.paths().pty, vec![b'x'; 3 * 64 * 1024]).unwrap();
         let request = serde_json::from_value(serde_json::json!({"id": "pty-page", "command": "bash_status", "session_id": "session", "params": {"task_id": id, "output_offset": 0, "output_mode": "raw"}})).unwrap();
         reset_full_artifact_read_calls();
         let response = crate::commands::bash_status::handle(&request, &ctx);
@@ -78,7 +79,7 @@ mod tests {
             &ctx,
             crate::protocol::Response::success(
                 "wait-drop",
-                serde_json::json!({"task_id": task.task_id, "status": "running"}),
+                serde_json::json!({"task_id": task.task_id(), "status": "running"}),
             ),
         );
         assert!(matches!(
@@ -187,13 +188,14 @@ mod tests {
                 carrier: "reserved:carrier".into(),
                 call_key: "terminal".into(),
             };
-            let (frame, _, retained_body) = crate::bash_background::frames::recovered_bash_frame(
-                snapshot,
-                &key,
-                dir.path(),
-                None,
-            )
-            .expect("terminal recovered frame");
+            let (frame, _, retained_body) =
+                aft_engine::test_bridge::bash_remote::recovered_bash_frame(
+                    snapshot,
+                    &key,
+                    dir.path(),
+                    None,
+                )
+                .expect("terminal recovered frame");
             let retained = retained_body
                 .as_deref()
                 .expect("recovered native result is retained");
@@ -223,16 +225,16 @@ mod tests {
     fn retry_overflow_sticky_gap_survives_restart_and_exact_ack() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, _, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let watch = registry
             .register_watch(
-                task.task_id.clone(),
+                task.task_id().to_owned(),
                 WatchPattern::Substring("READY".into()),
                 false,
             )
             .unwrap();
         let mut first = PatternMatch {
-            task_id: task.task_id.clone(),
+            task_id: task.task_id().to_owned(),
             watch_id: watch.clone(),
             match_text: "READY first".into(),
             match_offset: 10,
@@ -241,13 +243,13 @@ mod tests {
             batch: None,
             literal_pattern: false,
         };
-        persist_watch_match(&registry, "session", &task.task_id, &mut first, 20, 0, 0);
+        persist_watch_match(&registry, "session", task.task_id(), &mut first, 20, 0, 0);
         let mut second = first.clone();
         second.match_offset = 30;
         second.match_text = "READY second".into();
-        persist_watch_match(&registry, "session", &task.task_id, &mut second, 40, 0, 0);
+        persist_watch_match(&registry, "session", task.task_id(), &mut second, 40, 0, 0);
         let frame = BashPatternMatchFrame::new(
-            &task.task_id,
+            task.task_id(),
             "session",
             &watch,
             "READY first",
@@ -270,14 +272,14 @@ mod tests {
         assert_eq!(gap.first_offset, Some(10));
         assert!(pending.context.contains("they cannot be recovered."));
         for terminal in [false, true] {
-            ack_persisted_watches_for_task(&registry, "session", &task.task_id, terminal);
+            ack_persisted_watches_for_task(&registry, "session", task.task_id(), terminal);
             assert!(registry
                 .pending_pattern_matches_for_session("session")
                 .iter()
                 .any(|frame| frame.watch_id == watch));
         }
         assert!(registry
-            .ack_pattern_match_for_session("session", &task.task_id, &watch, 30)
+            .ack_pattern_match_for_session("session", task.task_id(), &watch, 30)
             .unwrap()
             .is_none());
         let (restarted, _, _) = registry_with_db_and_frames(dir.path());
@@ -297,7 +299,7 @@ mod tests {
             1
         );
         restarted
-            .ack_pattern_match_for_session("session", &task.task_id, &watch, pending.match_offset)
+            .ack_pattern_match_for_session("session", task.task_id(), &watch, pending.match_offset)
             .unwrap()
             .unwrap();
         assert!(!restarted
@@ -311,7 +313,7 @@ mod tests {
             .iter()
             .any(|f| f.watch_id == watch));
         let later = BashPatternMatchFrame::new(
-            &task.task_id,
+            task.task_id(),
             "session",
             &watch,
             "another lost notice",
@@ -328,11 +330,11 @@ mod tests {
             .unwrap();
         assert!(newer.match_offset > pending.match_offset);
         assert!(restarted
-            .ack_pattern_match_for_session("session", &task.task_id, &watch, pending.match_offset)
+            .ack_pattern_match_for_session("session", task.task_id(), &watch, pending.match_offset)
             .unwrap()
             .is_none());
         restarted
-            .ack_pattern_match_for_session("session", &task.task_id, &watch, newer.match_offset)
+            .ack_pattern_match_for_session("session", task.task_id(), &watch, newer.match_offset)
             .unwrap()
             .unwrap();
     }
@@ -341,9 +343,9 @@ mod tests {
     fn retry_overflow_gap_only_does_not_consume_once_watch_and_recoverable_batches_are_not_lost() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, _, watch) = each_line_running_fixture_with_once(dir.path(), true);
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let frame = BashPatternMatchFrame::new(
-            &task.task_id,
+            task.task_id(),
             "session",
             &watch,
             "unpersisted",
@@ -371,11 +373,11 @@ mod tests {
             0
         );
         registry
-            .ack_pattern_match_for_session("session", &task.task_id, &watch, pending.match_offset)
+            .ack_pattern_match_for_session("session", task.task_id(), &watch, pending.match_offset)
             .unwrap()
             .unwrap();
-        assert_eq!(registry.active_watch_count(&task.task_id), 1);
-        append_each_line_output(&task.paths.stdout, b"READY after gap\n");
+        assert_eq!(registry.active_watch_count(task.task_id()), 1);
+        append_each_line_output(&task.paths().stdout, b"READY after gap\n");
         registry.scan_task_watch_output(&task);
         let matched = registry
             .pending_pattern_matches_for_session("session")
@@ -398,9 +400,9 @@ mod tests {
     fn retry_overflow_retired_watch_gap_ack_prevents_replay_after_restart() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, _, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let frame = BashPatternMatchFrame::new(
-            &task.task_id,
+            task.task_id(),
             "session",
             "retired-watch",
             "old match",
@@ -420,7 +422,7 @@ mod tests {
         registry
             .ack_pattern_match_for_session(
                 "session",
-                &task.task_id,
+                task.task_id(),
                 "retired-watch",
                 notice.match_offset,
             )

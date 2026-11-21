@@ -511,7 +511,7 @@ async fn bash_kill_scope_stops_a_task_that_falls_back_to_local_between_its_passe
 /// worker started during recovery to reach the runner.
 #[tokio::test]
 async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_clients(
         Script::Draining {
             refusals: u32::MAX,
             retry_after_ms: Some(200),
@@ -615,7 +615,7 @@ async fn a_bind_then_bash_kill_scope_recovery_share_one_saved_task() {
         let saved = read_task(&json).ok()?;
         (saved.status == BgTaskStatus::Killed
             && saved.status_reason.as_deref()
-                == Some(crate::bash_background::registry::OWNER_PAUSED_REASON))
+                == Some(aft_engine::test_bridge::bash_remote::OWNER_PAUSED_REASON))
         .then_some(())
     })
     .await;
@@ -1234,7 +1234,7 @@ async fn runon_cd_system_and_missing_non_home_paths_are_allowed() {
         .canonicalize()
         .unwrap();
     assert!(!outside.starts_with(home));
-    assert!(crate::root_identity::nearest_git_marker(&outside)
+    assert!(aft_engine::test_bridge::search_misc::nearest_git_marker(&outside)
         .unwrap()
         .is_none());
     for target in [
@@ -2182,7 +2182,7 @@ async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
 /// started during recovery to reach the runner.
 #[tokio::test]
 async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_clients(
         signer_retry_script(1),
         "exec-remote/v1",
         2,
@@ -2437,7 +2437,7 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
 /// `sent` must still stand after the whole recovery deadline has passed.
 #[tokio::test]
 async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
-    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -2788,7 +2788,7 @@ async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_co
         );
         assert_eq!(
             report[0].outcome,
-            reg::return_files::ReturnOutcome::Returned { bytes: 5 }
+            aft_engine::test_bridge::bash_remote::ReturnOutcome::Returned { bytes: 5 }
         );
         let mut refused = return_call(&["../../outside.txt"]);
         refused["workdir"] = serde_json::json!(cwd);
@@ -2874,14 +2874,14 @@ async fn runon_return_paths_places_verified_files_and_lists_every_path() {
     let task_id = reply.data["task_id"].as_str().unwrap();
     let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
     assert!(
-        remote::remote_report(&saved).unwrap().starts_with(report),
+        aft_engine::test_bridge::bash_remote::remote_report(&saved).unwrap().starts_with(report),
         "{saved:?}"
     );
 }
 
 #[tokio::test]
 async fn runon_uncounted_expired_replay_reports_expired_after_bounded_recovery() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
         Script::MotorExpiredReplay,
         RETURN_CLAIMS,
         1,
@@ -3019,7 +3019,7 @@ async fn runon_return_paths_copied_files_are_not_listed_as_left_on_the_server() 
     // The command runs in `sub/`, so the runner names its files relative to
     // the checkout (`sub/dist/hello.txt`) while return_paths names them
     // relative to the workdir (`dist/hello.txt`).
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
         Script::ReturnVectorReporting(
             "failed-missing",
             &["sub/dist/hello.txt", "sub/dist/absent.txt", "sub/other.txt"],
@@ -3082,7 +3082,7 @@ fn runon_windows_with_return_paths_is_refused_before_anything_runs() {
 async fn runon_return_paths_unsupported_by_the_runner_is_final_and_never_runs_locally() {
     // ck-motor advertises chunked return, but the runner that would take the
     // job (a Windows runner or an older Linux one) cannot copy files back.
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
         Script::ReturnPathsUnsupported,
         RETURN_CLAIMS,
         1,
@@ -3142,7 +3142,7 @@ async fn runon_return_over_cap_report_names_the_requested_cap() {
         if large {
             claims.push(exec::types::RETURN_LARGE_CAPABILITY);
         }
-        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
             Script::ReturnVector("failed-over-cap"),
             &claims,
             1,
@@ -3167,14 +3167,14 @@ async fn runon_return_over_cap_report_names_the_requested_cap() {
         assert!(output.contains(&report), "{output}");
         let task_id = reply.data["task_id"].as_str().unwrap();
         let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
-        assert!(remote::remote_report(&saved).unwrap().contains(&report));
+        assert!(aft_engine::test_bridge::bash_remote::remote_report(&saved).unwrap().contains(&report));
     }
 }
 
 #[tokio::test]
 async fn runon_return_v3_uses_advertised_cap_for_new_and_existing_outputs() {
     for local_bytes in [None, Some(5), Some(5 * 1024 * 1024), Some(6 * 1024 * 1024)] {
-        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
             Script::ReturnVector("two-files-one-empty"),
             &[
                 "exec-remote/v1",
@@ -3229,7 +3229,7 @@ async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
         } else {
             Script::ReturnVector("two-files-one-empty")
         };
-        let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+        let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
             script,
             &[
                 "exec-remote/v1",
@@ -3282,7 +3282,7 @@ async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
 
 #[tokio::test]
 async fn runon_return_cap_second_refusal_is_not_keyed_recovery() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
         Script::ReturnCapRefusal {
             code: "invalid_params",
             field: "return_max_bytes",

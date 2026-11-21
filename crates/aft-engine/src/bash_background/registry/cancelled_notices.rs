@@ -177,7 +177,7 @@ impl BgTaskRegistry {
         CancelledCallReceipt((!notices.is_empty()).then(|| Arc::new(notices)))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn take_cancelled_call_notices(&self, session_id: &str) -> Vec<String> {
         let receipt = self.reserve_cancelled_call_notices(session_id);
         let lines = receipt.lines().map(str::to_owned).collect();

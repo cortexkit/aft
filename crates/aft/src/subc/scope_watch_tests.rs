@@ -35,7 +35,7 @@ fn spawn_scoped(
             crate::sandbox_spawn::SpawnPlan::Unsandboxed,
             command,
             BashShell::Bash,
-            crate::bash_background::registry::resolve_posix_shell(),
+            aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
             "watch-session".into(),
             root.as_path().into(),
             HashMap::new(),

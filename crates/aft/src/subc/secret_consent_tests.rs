@@ -91,14 +91,17 @@ async fn bus_secret_card_wake_applies_once_and_replay_ignores_message_id() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let body = serde_json::to_vec(&json!({"elicitation_id":endpoint.id,"feed":"answers","seq":7}))
         .unwrap();
-    crate::late_result_bus::readers::card_wake(&body, "mismatched-id")
+    aft_engine::test_bridge::display_data::late_result_bus::card_wake(&body, "mismatched-id")
         .await
         .unwrap();
     assert_eq!(waiter.await.unwrap(), ConsentOutcome::Answered);
     assert_eq!(endpoint.awaits().len(), 2);
-    crate::late_result_bus::readers::card_wake(&body, "different-transport-id")
-        .await
-        .unwrap();
+    aft_engine::test_bridge::display_data::late_result_bus::card_wake(
+        &body,
+        "different-transport-id",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         transport
             .file_cancellable(&request, Duration::ZERO, None)

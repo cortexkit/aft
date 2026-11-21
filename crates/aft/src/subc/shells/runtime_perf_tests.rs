@@ -1,6 +1,6 @@
 use super::*;
-use crate::bash_background::buffer::ARTIFACT_OPENS;
 use crate::bash_background::persistence::{read_task_at, TaskPaths};
+use aft_engine::test_bridge::bash_remote::with_artifact_opens;
 use std::io::Write;
 
 fn cpu_ns() -> u64 {
@@ -70,7 +70,7 @@ fn append(paths: &TaskPaths) {
         .unwrap()
         .write_all(b"progress\n")
         .unwrap();
-    crate::bash_background::shell_metadata::changed();
+    aft_engine::test_bridge::bash_remote::shell_metadata::changed();
 }
 
 #[test]
@@ -95,8 +95,8 @@ fn shells_watch_collection_fixture() {
             for paths in &active {
                 append(paths);
             }
-            ARTIFACT_OPENS.with(|count| count.set(0));
-            crate::bash_background::persistence::work_counts::reset();
+            with_artifact_opens(|count| count.set(0));
+            aft_engine::test_bridge::bash_remote::work_counts::reset();
             FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
             let start = std::time::Instant::now();
             let cpu_start = cpu_ns();
@@ -105,8 +105,8 @@ fn shells_watch_collection_fixture() {
             wall += start.elapsed();
             assert_eq!(collected.rows.len(), 300);
             facts = collected.db;
-            opens += ARTIFACT_OPENS.with(|count| count.get());
-            file_opens += crate::bash_background::persistence::work_counts::get().opens;
+            opens += with_artifact_opens(|count| count.get());
+            file_opens += aft_engine::test_bridge::bash_remote::work_counts::get().opens;
             queries += FACTS_SQL_TRACE.with(|trace| trace.borrow().len());
         }
         println!("{}: 40 roots / 300 retained / 5 output producers / 40 revisions: CPU {:.3} ms/revision, wall {:.3} ms/revision, artifact opens {:.1}/revision, persistence file/directory opens {:.1}/revision, SQL statements {:.1}/revision", if legacy { "legacy" } else { "cached" }, cpu as f64 / 40e6, wall.as_secs_f64() * 25.0, opens as f64 / 40.0, file_opens as f64 / 40.0, queries as f64 / 40.0);

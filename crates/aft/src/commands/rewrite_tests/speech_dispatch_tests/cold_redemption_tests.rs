@@ -7,11 +7,11 @@ fn cold_redemption_probe_child() {
     };
     let ticket = std::env::var("AFT_TEST_COLD_TICKET").unwrap();
     let case = std::env::var("AFT_TEST_COLD_CASE").unwrap();
-    let service = crate::gh_shim_speech::service::record_service(Path::new(&root));
+    let service = aft_engine::test_bridge::bash_remote::record_service(Path::new(&root));
     let store = &service.store;
     let stored = store
         .find_digest(
-            &crate::gh_shim_ticket::speech_digest(&ticket).unwrap(),
+            &aft_engine::test_bridge::bash_remote::speech_digest(&ticket).unwrap(),
             crate::gh_shim_speech::service::run_nonce().unwrap(),
         )
         .unwrap();
@@ -146,7 +146,7 @@ fn cold_redemption_probe_child() {
         ],
     )
     .unwrap();
-    let result = crate::gh_shim_ticket::redeem_speech_cold(&ticket, &service);
+    let result = aft_engine::test_bridge::bash_remote::redeem_speech_cold(&ticket, &service);
     conn.execute("UPDATE bash_tasks SET harness=?1,session_id=?2,task_id=?3,project_key=?4,status=?5,pid=?6,pgid=?7,metadata=?8 WHERE rowid=?9",
         rusqlite::params![row.harness,row.session_id,row.task_id,row.project_key,row.status,row.pid,row.pgid,row.metadata,rowid]).unwrap();
     conn.execute(
@@ -191,7 +191,7 @@ async fn cases(cases: &[&str]) {
             ])
             .env(
                 "AFT_TEST_COLD_ROOT",
-                fixture.service.store.path().parent().unwrap(),
+                fixture.service.store.test_path().parent().unwrap(),
             )
             .env(
                 "AFT_TEST_COLD_TICKET",

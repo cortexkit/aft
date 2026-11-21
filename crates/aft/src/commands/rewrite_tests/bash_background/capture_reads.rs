@@ -1,19 +1,20 @@
 mod tests {
-    use crate::bash_background::persistence::work_counts;
-    use crate::bash_background::registry::test_support::{
+    use crate::bash_background::registry::BgTaskRegistry;
+    use crate::log_redact::SECRET_PLACEHOLDER;
+    use aft_engine::test_bridge::bash_remote::registry_support::{
         display_bodies, filler, terminal_task, with_secret,
         DISPLAY_LINE_FINISH_BYTES as LINE_FINISH_BYTES,
     };
-    use crate::bash_background::registry::{BgTask, BgTaskRegistry};
-    use crate::log_redact::SECRET_PLACEHOLDER;
+    use aft_engine::test_bridge::bash_remote::work_counts;
+    use aft_engine::test_bridge::bash_remote::BgTask;
 
     fn display_detail(
         registry: &BgTaskRegistry,
         task: &std::sync::Arc<BgTask>,
     ) -> serde_json::Value {
         let (metadata, buffer) = {
-            let state = task.lock_state().unwrap();
-            (state.metadata.clone(), state.buffer.clone())
+            let state = task.test_lock_state().unwrap();
+            (state.metadata().clone(), state.buffer().clone())
         };
         display_bodies(registry, task, &metadata, &buffer).detail
     }
@@ -50,8 +51,8 @@ mod tests {
         let task = terminal_task(&registry, &fixture, &stdout, false);
         let limit = crate::subc::rich_ui::display::detail_byte_limit();
         let (mut metadata, buffer) = {
-            let state = task.lock_state().unwrap();
-            (state.metadata.clone(), state.buffer.clone())
+            let state = task.test_lock_state().unwrap();
+            (state.metadata().clone(), state.buffer().clone())
         };
         install_tail_display(&mut metadata);
 
@@ -82,8 +83,8 @@ mod tests {
         let stdout = format!("{}\nfirst\nsecond\nthird\nlast\n", filler(limit));
         let task = terminal_task(&registry, &fixture, &stdout, false);
         let (mut metadata, buffer) = {
-            let state = task.lock_state().unwrap();
-            (state.metadata.clone(), state.buffer.clone())
+            let state = task.test_lock_state().unwrap();
+            (state.metadata().clone(), state.buffer().clone())
         };
         install_tail_display(&mut metadata);
 

@@ -1,4 +1,4 @@
-use crate::bash_background::registry::test_support::{
+use aft_engine::test_bridge::bash_remote::registry_support::{
     capture_display_terminal, display_bodies, set_completion_secrets, terminal_fixture,
 };
 
@@ -29,8 +29,8 @@ fn bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes() {
     let (_dir, ctx, task) = terminal_fixture();
     super::default_kill_tests::assert_worker_wait_limit(&ctx);
     let (mut metadata, buffer) = {
-        let state = task.lock_state().unwrap();
-        (state.metadata.clone(), state.buffer.clone())
+        let state = task.test_lock_state().unwrap();
+        (state.metadata().clone(), state.buffer().clone())
     };
     set_completion_secrets(
         &task,
@@ -43,11 +43,11 @@ fn bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes() {
         .unwrap();
     metadata.display = Some(task_display(pin));
     std::fs::write(
-        &task.paths.stdout,
+        &task.paths().stdout,
         format!("plain {SECRET}\ncolored unpredictable-\x1b[31mlong-credential-value\x1b[0m\n"),
     )
     .unwrap();
-    std::fs::write(&task.paths.stderr, format!("ticket {TICKET}\n")).unwrap();
+    std::fs::write(&task.paths().stderr, format!("ticket {TICKET}\n")).unwrap();
     let bodies = display_bodies(ctx.bash_background(), &task, &metadata, &buffer);
     assert_eq!(
         bodies.tail,
@@ -75,17 +75,17 @@ fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
         .unwrap();
     let display = task_display(pin);
     let (stale, buffer) = {
-        let mut state = task.lock_state().unwrap();
-        state.metadata.display = Some(display);
-        let stale = state.metadata.clone();
-        let current = state.metadata.display.as_mut().unwrap();
+        let mut state = task.test_lock_state().unwrap();
+        state.metadata_mut().display = Some(display);
+        let stale = state.metadata().clone();
+        let current = state.metadata_mut().display.as_mut().unwrap();
         current.reply_produced = true;
         current.deferred = true;
-        (stale, state.buffer.clone())
+        (stale, state.buffer().clone())
     };
     capture_display_terminal(ctx.bash_background(), &task, &stale, &buffer);
     assert!(
-        task.lock_state()
+        task.test_lock_state()
             .unwrap()
             .metadata
             .display
@@ -93,11 +93,11 @@ fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
             .unwrap()
             .attempted
     );
-    let persisted = crate::bash_background::persistence::read_task(&task.paths.json).unwrap();
+    let persisted = crate::bash_background::persistence::read_task(&task.paths().json).unwrap();
     assert!(persisted.display.as_ref().unwrap().attempted);
     capture_display_terminal(ctx.bash_background(), &task, &stale, &buffer);
     assert!(
-        task.lock_state()
+        task.test_lock_state()
             .unwrap()
             .metadata
             .display

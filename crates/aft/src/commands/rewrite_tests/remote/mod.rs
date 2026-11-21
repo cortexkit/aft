@@ -2,9 +2,11 @@
 pub(crate) mod tests;
 
 #[cfg(unix)]
+use aft_engine::test_bridge::bash_remote::remote_support::*;
+#[cfg(unix)]
 use reg::*;
 #[cfg(unix)]
-use remote::{seams::*, *};
+use remote::*;
 #[cfg(unix)]
 use {
     crate::bash_background::persistence::{
@@ -13,9 +15,9 @@ use {
     },
     crate::bash_background::registry::{self as reg, remote},
     crate::bash_background::BgTaskStatus,
-    crate::exec_remote::wire_tests::{daemon, id, Script},
     crate::exec_remote::{self as exec, types::*, OutputSink, Verdict},
     crate::sandbox_spawn::SpawnPlan,
+    aft_engine::test_bridge::bash_remote::remote_wire::{daemon, id, Script},
     std::collections::HashMap,
     std::fs,
     std::path::{Path, PathBuf},

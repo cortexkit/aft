@@ -1,7 +1,7 @@
 use crate::config::SandboxMode;
-use crate::sandbox_spawn::git_policy_bench_support;
-use crate::sandbox_spawn::git_policy_cache_tests::{commit, git_ok, Fixture};
 use crate::sandbox_spawn::{install_sandbox_launcher_for_test, with_worker_jail};
+use aft_engine::test_bridge::bash_remote::git_policy_bench_support;
+use aft_engine::test_bridge::bash_remote::git_policy_cache_support::{commit, git_ok, Fixture};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -25,13 +25,13 @@ fn relaxed_worker_bash_spawn_latency() {
     let storage = tempfile::tempdir().unwrap();
     let hooks = tempfile::tempdir().unwrap();
     fixture.hooks(hooks.path().to_str().unwrap());
-    commit(&fixture.root);
+    commit(fixture.root());
     let linked = tempfile::tempdir().unwrap();
     let mut worktrees = Vec::new();
     for index in 0..4 {
         let root = linked.path().join(format!("worker-{index}"));
         git_ok(
-            &fixture.root,
+            fixture.root(),
             &[
                 "worktree",
                 "add",
@@ -122,7 +122,7 @@ fn worker_bash_git_policy_cost() {
     // the command may write cannot be made read-only. Keep hooks outside.
     fixture.hooks(hooks.path().to_str().unwrap());
     let commit = git_policy_bench_support::git_output(
-        &fixture.root,
+        fixture.root(),
         &[
             "-c",
             "user.name=Policy Bench",
@@ -138,11 +138,11 @@ fn worker_bash_git_policy_cost() {
     .unwrap();
     assert!(commit.status.success(), "{commit:?}");
     let linked = tempfile::tempdir().unwrap();
-    let mut roots = vec![(fixture.root.clone(), 10)];
+    let mut roots = vec![(fixture.root().clone(), 10)];
     for index in 0..4 {
         let root = linked.path().join(format!("worker-{index}"));
         let output = git_policy_bench_support::git_output(
-            &fixture.root,
+            fixture.root(),
             &[
                 "worktree",
                 "add",
