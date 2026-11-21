@@ -397,7 +397,7 @@ pub trait ServiceTestExt {
     fn check_pending(
         &self,
         incarnation: Option<&str>,
-        launch: &LaunchAuthority,
+        launch: &crate::gh_shim_speech::model::LaunchAuthority,
         session: &str,
         task: &str,
     ) -> Result<(), Refusal>;
@@ -412,7 +412,7 @@ impl ServiceTestExt for Service {
     fn check_pending(
         &self,
         incarnation: Option<&str>,
-        launch: &LaunchAuthority,
+        launch: &crate::gh_shim_speech::model::LaunchAuthority,
         session: &str,
         task: &str,
     ) -> Result<(), Refusal> {
