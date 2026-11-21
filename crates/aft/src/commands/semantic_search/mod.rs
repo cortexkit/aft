@@ -10875,7 +10875,9 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
+    use aft_engine::test_bridge::display_data::{
+        note_checkout_outcome_for_test, CheckoutTestExt as _, DataCheckoutTestExt as _,
+    };
 
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -11045,7 +11047,8 @@ mod tests {
             }
             aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
             if failed {
-                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+                note_checkout_outcome_for_test::<()>(
+                    &ctx.data_checkout().unwrap(),
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),
@@ -11085,7 +11088,8 @@ mod tests {
             if cancel {
                 token.request_cancel();
             } else {
-                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+                note_checkout_outcome_for_test::<()>(
+                    &ctx.data_checkout().unwrap(),
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),

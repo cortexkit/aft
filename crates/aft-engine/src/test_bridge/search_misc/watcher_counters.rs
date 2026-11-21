@@ -105,3 +105,28 @@ impl WatcherCountersTestExt for WatcherCounters {
         self.backend_exclusions()
     }
 }
+
+pub trait WatcherCountersSnapshotTestExt {
+    fn rescans_unknown_total(&self) -> u64;
+    fn exclusion_planning(&self) -> &Option<WatcherExclusionPlanningSnapshot>;
+}
+
+impl WatcherCountersSnapshotTestExt for crate::watcher_backend::counters::WatcherCountersSnapshot {
+    fn rescans_unknown_total(&self) -> u64 {
+        self.rescans_unknown_total
+    }
+
+    fn exclusion_planning(&self) -> &Option<WatcherExclusionPlanningSnapshot> {
+        &self.exclusion_planning
+    }
+}
+
+pub trait WatcherExclusionPlanningSnapshotTestExt {
+    fn attempts(&self) -> u32;
+}
+
+impl WatcherExclusionPlanningSnapshotTestExt for WatcherExclusionPlanningSnapshot {
+    fn attempts(&self) -> u32 {
+        self.attempts
+    }
+}

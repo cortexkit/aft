@@ -13,6 +13,8 @@ use crate::error::AftError;
 use crate::fs_lock::AdvisoryLockGuard;
 use sha2::{Digest, Sha256};
 
+#[cfg(any(test, feature = "test-support"))]
+mod bridge_fixture;
 pub mod latency;
 #[cfg(test)]
 #[path = "agent_data/ordinary_backup_format_tests.rs"]
@@ -384,7 +386,7 @@ enum BackupContent {
     OnDisk {
         path: PathBuf,
         size: u64,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         reads: Option<Arc<AtomicU64>>,
     },
 }
@@ -395,7 +397,7 @@ impl BackupContent {
         Ok(Self::OnDisk {
             path,
             size,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             reads: None,
         })
     }
@@ -407,7 +409,7 @@ impl BackupEntry {
         match &self.content {
             BackupContent::Captured(bytes) => Ok(Arc::clone(bytes)),
             BackupContent::OnDisk { path, .. } => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 if let BackupContent::OnDisk {
                     reads: Some(reads), ..
                 } = &self.content
@@ -1066,7 +1068,7 @@ pub struct BackupStore {
     enforce_temp_path_policy: bool,
     #[cfg(test)]
     disk_io_count: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     history_content_reads: Arc<AtomicU64>,
     #[cfg(test)]
     history_metadata_reads: AtomicU64,
@@ -1168,7 +1170,7 @@ impl BackupStore {
             enforce_temp_path_policy: false,
             #[cfg(test)]
             disk_io_count: AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             history_content_reads: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             history_metadata_reads: AtomicU64::new(0),
@@ -2543,28 +2545,6 @@ impl BackupStore {
         }
     }
 
-    /// Record one more directory as created by the newest entry for `key`, to
-    /// test that undo authorizes every directory it would remove.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
-        let entry = self
-            .entries
-            .get_mut(session)
-            .and_then(|files| files.get_mut(key))
-            .and_then(|stack| stack.last_mut())
-            .expect("key has a backup");
-        entry.created_dirs.push(dir);
-    }
-
-    /// Move a session's backups to a different key, to test how undo treats a
-    /// key it did not write itself.
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
-        let files = self.entries.get_mut(session).expect("session has backups");
-        let stack = files.remove(from).expect("key has backups");
-        files.insert(to, stack);
-    }
-
     /// Preview the paths that `restore_last_operation` would touch for `session`.
     ///
     /// This mirrors the operation selection logic used by restore, but only reads
@@ -3168,7 +3148,7 @@ impl BackupStore {
                     entry.content = BackupContent::OnDisk {
                         path: dir.join(name),
                         size: entry.content_size(),
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         reads: Some(Arc::clone(&self.history_content_reads)),
                     };
                 }
@@ -5150,7 +5130,7 @@ impl BackupStore {
             Some(path) => BackupContent::on_disk(path).map_err(|error| error.to_string())?,
             None => BackupContent::Captured(Arc::from([])),
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let BackupContent::OnDisk { reads, .. } = &mut content {
             *reads = Some(Arc::clone(&self.history_content_reads));
         }
@@ -7142,24 +7122,6 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    impl BackupStore {
-        pub(crate) fn history_meta_path_for_test(
-            &self,
-            session: &str,
-            path: &Path,
-        ) -> Option<PathBuf> {
-            Some(
-                self.session_dir(session)?
-                    .join(Self::path_hash(&canonicalize_key(path)))
-                    .join("meta.json"),
-            )
-        }
-
-        pub(crate) fn history_content_reads_for_test(&self) -> u64 {
-            self.history_content_reads.load(Ordering::Relaxed)
-        }
-    }
-
     #[cfg(windows)]
     #[test]
     fn backup_storage_floor_windows_short_names_and_missing_descendants() {
