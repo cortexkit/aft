@@ -20,12 +20,16 @@ pub(crate) struct Gate {
     marker: &'static str,
     open: Mutex<bool>,
     opened: Condvar,
-    pub(super) held: AtomicUsize,
+    held: AtomicUsize,
     /// Texts embedded, excluding the semantic index's model fingerprint probe.
     pub(crate) texts: AtomicUsize,
 }
 
 impl Gate {
+    pub(crate) fn held(&self) -> usize {
+        self.held.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn open(&self) {
         *self.open.lock().unwrap() = true;
         self.opened.notify_all();

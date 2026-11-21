@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 use aft_store::ids::{ContentKey, Digest128, FamilyId};
 use serde_json::{json, Value};
 
-#[cfg(feature = "wasm-grammars")]
-use super::checkout::CheckoutView;
-use super::checkout::{Checkout, DataLayer};
 use crate::context::AppContext;
+#[cfg(feature = "wasm-grammars")]
+use crate::data_layer::checkout::CheckoutView;
+use crate::data_layer::checkout::{Checkout, DataLayer};
 use crate::protocol::{RawRequest, Response};
 
 #[cfg(all(
@@ -70,7 +70,7 @@ fn context(root: &Path, storage: &Path) -> AppContext {
         ..Default::default()
     };
     config.indexes.semantic = false;
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_canonical_cache_root(root.into());
     ctx
 }
@@ -84,7 +84,7 @@ fn meaning_query(ctx: &AppContext) -> Response {
 
 fn enable_meaning(ctx: &AppContext, root: &Path) -> impl Drop {
     ctx.update_config(|config| config.indexes.semantic = true);
-    let fill = super::meaning::fill_with_constant_vectors_for_test(root, 2);
+    let fill = crate::data_layer::meaning::fill_with_constant_vectors_for_test(root, 2);
     crate::semantic_admission::note_opened("luau-s4", root);
     fill
 }
@@ -164,7 +164,10 @@ fn luau_s4_keyed_language_preserves_every_builtin_key() {
     // built-in language's record keys. Update it only together with a deliberate
     // record-format change for the built-in extractors.
     const ORIGINAL_EXTRACTOR: &str = "ruled-callgraph-v14-resolver-precision+record-15";
-    assert_eq!(super::content::EXTRACTOR_VERSION, ORIGINAL_EXTRACTOR);
+    assert_eq!(
+        crate::data_layer::content::EXTRACTOR_VERSION,
+        ORIGINAL_EXTRACTOR
+    );
     for language in [
         "typescript",
         "tsx",
@@ -204,13 +207,17 @@ fn luau_s4_keyed_language_preserves_every_builtin_key() {
         "config",
     ] {
         assert_eq!(
-            super::content::record_key(content, language),
+            crate::data_layer::content::record_key(content, language),
             aft_store::content::RecordKey::new(content, language, ORIGINAL_EXTRACTOR)
         );
     }
     assert_ne!(
-        super::content::record_key(content, "luau"),
-        aft_store::content::RecordKey::new(content, "luau", super::content::EXTRACTOR_VERSION)
+        crate::data_layer::content::record_key(content, "luau"),
+        aft_store::content::RecordKey::new(
+            content,
+            "luau",
+            crate::data_layer::content::EXTRACTOR_VERSION
+        )
     );
     assert_eq!(
         crate::parser::detect_language(Path::new("a.lua")),
@@ -334,7 +341,10 @@ fn luau_s4_feature_matrix() {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "data_layer::grammar_tests::luau_s4_feature_matrix",
+                &format!(
+                    "{}::luau_s4_feature_matrix",
+                    module_path!().split_once("::").unwrap().1
+                ),
                 "--nocapture",
             ])
             .env("AFT_S4_PHASE", phase)
@@ -436,7 +446,7 @@ fn scenario(phase: &str) {
         assert!(view.current_state().skipped_parses().is_empty());
         std::fs::write(
             dir.join("key-a"),
-            super::content::record_key(ContentKey::of(b.as_bytes()), "luau")
+            crate::data_layer::content::record_key(ContentKey::of(b.as_bytes()), "luau")
                 .digest()
                 .to_string(),
         )
@@ -465,15 +475,15 @@ fn scenario(phase: &str) {
             "old grammar graph cannot serve under a new identity"
         );
         checkout.build().unwrap();
-        assert!(super::content::parses_of_for_test(b.as_bytes()) > 0);
+        assert!(crate::data_layer::content::parses_of_for_test(b.as_bytes()) > 0);
         assert_eq!(
-            super::content::parses_of_for_test(ts.as_bytes()),
+            crate::data_layer::content::parses_of_for_test(ts.as_bytes()),
             0,
             "built-in records stay reusable"
         );
         assert_ne!(
             std::fs::read_to_string(dir.join("key-a")).unwrap(),
-            super::content::record_key(ContentKey::of(b.as_bytes()), "luau")
+            crate::data_layer::content::record_key(ContentKey::of(b.as_bytes()), "luau")
                 .digest()
                 .to_string()
         );
@@ -524,7 +534,10 @@ fn scenario(phase: &str) {
         &[&root.join("plain.ts")],
     );
     assert_eq!(old.data, new.data, "built-in answers cannot gain Luau gaps");
-    assert_eq!(super::content::parses_of_for_test(b.as_bytes()), 0);
+    assert_eq!(
+        crate::data_layer::content::parses_of_for_test(b.as_bytes()),
+        0
+    );
     assert_eq!(registry.request_count(), 1);
     let pending = ask(
         &ctx,
@@ -553,7 +566,7 @@ fn scenario(phase: &str) {
         json!(root.join("a.luau"))
     );
     assert_eq!(pending_zoom.data["gaps"][0]["code"], "grammar_unavailable");
-    let runtime = super::runtime::DataCheckout::open(&root, &storage, None).unwrap();
+    let runtime = crate::data_layer::runtime::DataCheckout::open(&root, &storage, None).unwrap();
     let wait = Instant::now();
     while !runtime
         .view()
@@ -602,10 +615,10 @@ fn scenario(phase: &str) {
     feature = "test-hooks",
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
-fn vector_plane(checkout: &Arc<Checkout>) -> super::vectors::VectorPlane {
-    super::vectors::VectorPlane::new(
+fn vector_plane(checkout: &Arc<Checkout>) -> crate::data_layer::vectors::VectorPlane {
+    crate::data_layer::vectors::VectorPlane::new(
         Arc::clone(checkout),
-        super::vectors::Producer::for_stored_model(aft_store::vector::ModelIdentity {
+        crate::data_layer::vectors::Producer::for_stored_model(aft_store::vector::ModelIdentity {
             name: "luau-fixture".into(),
             revision: "fixture-v1".into(),
             dimensions: 2,
@@ -756,17 +769,17 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
         );
     }
     let plane = vector_plane(&checkout);
-    let parsed = super::content::parses_of_for_test(module.as_bytes());
+    let parsed = crate::data_layer::content::parses_of_for_test(module.as_bytes());
     let report = plane
         .fill(
             &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
-            super::vectors::FillBudget::default(),
+            crate::data_layer::vectors::FillBudget::default(),
             &mut |_| {},
         )
         .unwrap();
     assert!(report.files_queued > 0);
     assert_eq!(
-        super::content::parses_of_for_test(module.as_bytes()),
+        crate::data_layer::content::parses_of_for_test(module.as_bytes()),
         parsed,
         "Luau semantic chunks must use stored records"
     );

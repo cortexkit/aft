@@ -63,6 +63,15 @@ pub mod policy_environment;
 pub(crate) use crate::file_read_exact;
 pub(crate) mod github_comments;
 pub mod glob;
+#[cfg(all(
+    test,
+    not(all(
+        feature = "wasm-grammars",
+        target_os = "windows",
+        target_arch = "aarch64"
+    ))
+))]
+mod grammar_tests;
 pub mod grep;
 #[cfg(test)]
 mod grep_text_scope_tests;
@@ -84,6 +93,8 @@ pub mod lsp_inspect;
 pub mod lsp_navigation;
 pub mod lsp_prepare_rename;
 pub mod lsp_rename;
+#[cfg(test)]
+mod meaning_query_tests;
 pub mod memory_census;
 pub mod move_file;
 pub mod move_symbol;
@@ -96,6 +107,8 @@ pub mod outline;
 mod outline_fetch_tests;
 #[cfg(test)]
 mod outline_parser_tests;
+#[cfg(test)]
+mod outline_storage_tests;
 pub mod read;
 pub(crate) mod read_manifest;
 pub mod remove_import;
