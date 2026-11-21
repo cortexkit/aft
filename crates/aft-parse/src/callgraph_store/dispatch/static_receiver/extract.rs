@@ -388,7 +388,7 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
         ordinal: u32,
         written: Option<Node<'tree>>,
         call: Node<'tree>,
-        ts_binding: impl FnOnce(Node<'tree>) -> (Option<Node<'tree>>, Option<usize>),
+        ts_binding: impl FnOnce(Node<'tree>) -> (Option<Node<'tree>>, Option<usize>, bool),
     ) {
         // Several call references can name one AST ordinal. Dispatch
         // keeps the first hint at that ordinal, including a hint without
@@ -435,7 +435,10 @@ impl<'tree, 'source, N: Nav<'tree>> Index<'tree, 'source, N> {
                 let Some(identifier) = root_identifier(written) else {
                     return;
                 };
-                let (binding, binding_scope) = ts_binding(identifier);
+                let (binding, binding_scope, written) = ts_binding(identifier);
+                if written {
+                    return;
+                }
                 if name.contains('.') {
                     let Some(id) = binding_scope.and_then(|scope| {
                         self.ts_dotted

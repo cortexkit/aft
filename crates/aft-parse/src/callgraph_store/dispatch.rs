@@ -1230,10 +1230,12 @@ pub fn extract_with<'tree>(
                 .then_some(receiver_node)
                 .flatten();
             index.site(reference.ordinal, written, call, |identifier| {
-                ts_objects.as_ref().map_or((None, None), |objects| {
+                ts_objects.as_ref().map_or((None, None, false), |objects| {
+                    let scope = objects.binding_scope(identifier);
                     (
                         objects.binding(identifier),
-                        objects.binding_scope(identifier),
+                        scope,
+                        objects.class_binding_written(identifier, scope),
                     )
                 })
             });

@@ -11,6 +11,13 @@ pub(super) fn supported(language: &str) -> bool {
     matches!(language, "typescript" | "tsx" | "javascript")
 }
 
+fn written_between(writes: &[(usize, usize)], start: usize, end: usize) -> bool {
+    let first = writes.partition_point(|(position, _)| *position < start);
+    writes
+        .get(first)
+        .is_some_and(|(_, position)| *position <= end)
+}
+
 pub(super) fn object_identity(object: Node<'_>) -> String {
     let position = object.start_position();
     format!("@object:{}:{}", position.row, position.column)
@@ -174,6 +181,7 @@ pub(super) struct Objects<'nodes, 'tree, 'source, N> {
     import_node: Option<Node<'tree>>,
     bindings: FxHashMap<(usize, &'source str), Option<Node<'tree>>>,
     writes: FxHashMap<&'source str, Vec<(usize, usize)>>,
+    class_writes: FxHashMap<&'source str, Vec<(usize, usize)>>,
     aliases: FxHashSet<&'source str>,
     return_statements: FxHashMap<usize, Vec<Node<'tree>>>,
     returned_literals: FxHashMap<usize, Node<'tree>>,
@@ -225,6 +233,7 @@ impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
             import_node: None,
             bindings: FxHashMap::default(),
             writes: FxHashMap::default(),
+            class_writes: FxHashMap::default(),
             aliases: FxHashSet::default(),
             return_statements: FxHashMap::default(),
             returned_literals: FxHashMap::default(),
@@ -550,12 +559,53 @@ impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
                             .entry(text(left, self.source))
                             .or_default()
                             .push((node.start_byte(), node.end_byte()));
+                    } else if matches!(
+                        kind,
+                        "assignment_expression" | "augmented_assignment_expression"
+                    ) {
+                        self.index_class_write(left, node);
                     }
+                }
+            }
+            if kind == "for_in_statement" && field(node, &["kind"]).is_none() {
+                if let Some(left) = field(node, &["left"]) {
+                    self.index_class_write(left, node);
                 }
             }
         }
         for writes in self.writes.values_mut() {
             writes.sort_unstable();
+        }
+        for writes in self.class_writes.values_mut() {
+            writes.sort_unstable();
+        }
+    }
+
+    fn index_class_write(&mut self, target: Node<'tree>, statement: Node<'tree>) {
+        let mut pending = vec![target];
+        while let Some(node) = pending.pop() {
+            match node.kind() {
+                "identifier" | "shorthand_property_identifier_pattern" => {
+                    self.class_writes
+                        .entry(text(node, self.source))
+                        .or_default()
+                        .push((statement.start_byte(), statement.end_byte()));
+                }
+                "pair_pattern" => pending.extend(field(node, &["value"])),
+                "assignment_pattern" | "object_assignment_pattern" => {
+                    pending.extend(field(node, &["left"]))
+                }
+                "member_expression" | "subscript_expression" => {
+                    pending.extend(field(node, &["object"]))
+                }
+                "object_pattern"
+                | "array_pattern"
+                | "rest_pattern"
+                | "parenthesized_expression" => {
+                    pending.extend(node.named_children(&mut node.walk()));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -678,16 +728,38 @@ impl<'nodes, 'tree, 'source, N: Nav<'tree>> Objects<'nodes, 'tree, 'source, N> {
         let Some(&(start, end)) = self.write_scopes.get(&binding.id()) else {
             return true;
         };
+        self.aliases.contains(name)
+            || self
+                .writes
+                .get(name)
+                .is_some_and(|writes| written_between(writes, start, end))
+    }
+
+    pub(super) fn class_binding_written(
+        &self,
+        identifier: Node<'tree>,
+        scope: Option<usize>,
+    ) -> bool {
+        let name = text(identifier, self.source);
         if self.aliases.contains(name) {
             return true;
         }
-        let Some(writes) = self.writes.get(name) else {
+        let plain = self.writes.get(name);
+        let patterns = self.class_writes.get(name);
+        if plain.is_none() && patterns.is_none() {
             return false;
-        };
-        let index = writes.partition_point(|(position, _)| *position < start);
-        writes
-            .get(index)
-            .is_some_and(|(_, position)| *position <= end)
+        }
+        let mut current = Some(identifier);
+        while let Some(node) = current {
+            if Some(node.id()) == scope {
+                return plain
+                    .into_iter()
+                    .chain(patterns)
+                    .any(|writes| written_between(writes, node.start_byte(), node.end_byte()));
+            }
+            current = self.nav.parent(node);
+        }
+        true
     }
 
     pub(super) fn receiver(&self, expression: Node<'tree>, call: Node<'tree>) -> Option<String> {

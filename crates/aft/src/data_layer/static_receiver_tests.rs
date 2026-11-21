@@ -489,3 +489,39 @@ fn csharp_static_receiver_refresh_matches_cold_on_type_and_hierarchy_changes() {
         );
     }
 }
+
+#[test]
+fn typescript_rewritten_class_receiver_keeps_fallback() {
+    for language in ["ts", "js"] {
+        let path = format!("src/consumer.{language}");
+        let classes = "class Api { static run() {} } class Other { static run() {} }";
+        let untouched = format!("{classes} Api.run();");
+        let rows = records_match_files(&checkout(&[(&path, &untouched)], &[]));
+        exact(answer(&rows[&path], "run"), &path, &["Api::run"]);
+        for body in [
+            "Api = Other; Api.run();",
+            "Api ||= Other; Api.run();",
+            "[Api] = [Other]; Api.run();",
+            "({ value: Api = Other } = values); Api.run();",
+            "({ Api } = values); Api.run();",
+            "Api++; Api.run();",
+            "--Api; Api.run();",
+            "Api.run(); function rebind() { Api = Other; }",
+        ] {
+            let source = format!("{classes} {body}");
+            let rows = records_match_files(&checkout(&[(&path, &source)], &[]));
+            let result = answer(&rows[&path], "run");
+            assert_eq!(
+                (result.unresolved, result.external),
+                (1, 0),
+                "{language}: {body}: {result:?}"
+            );
+            assert!(
+                result
+                    .protected
+                    .contains(&(path.clone(), "Other::run".into())),
+                "{language}: {body}: {result:?}"
+            );
+        }
+    }
+}
