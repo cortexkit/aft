@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Acquire, renew, or release a Tests job's exclusive MOTOR grant."""
+"""Lease the Mac mini from MOTOR, the fleet VM scheduler, for a CI job."""
 
 import argparse
 import importlib.util
@@ -16,6 +16,7 @@ protocol = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(protocol)
 
 GRANT_WAIT = timedelta(minutes=50)
+RENEWAL_ACK_WAIT = timedelta(minutes=5)
 
 
 def job_owner(env, shard=""):
@@ -36,17 +37,21 @@ def require_grant(hold, deadline):
 
 
 def acquire(owner, holds, grants):
-    now = protocol.utcnow()
-    hold = protocol.Hold(holds, now + protocol.MAX_HOLD_DURATION, grants, owner=owner)
+    deadline = protocol.utcnow() + GRANT_WAIT
+    # The initial lease only needs time to drain the fleet. Start the full
+    # lease at the grant so the drain does not consume the build's work time.
+    hold = protocol.Hold(holds, deadline, grants, owner=owner)
     hold.request()
     try:
-        require_grant(hold, now + GRANT_WAIT)
+        require_grant(hold, deadline)
+        refresh(owner, holds, grants, deadline=deadline)
     except BaseException:
-        hold.release()
+        # If renewal was published but not granted, its expiry has changed.
+        protocol.remove_owned_hold(holds, owner)
         raise
 
 
-def refresh(owner, holds, grants):
+def refresh(owner, holds, grants, *, deadline=None):
     record = protocol.read_hold_record(holds / "hold.json")
     if not record or record["owner"] != owner:
         raise RuntimeError(f"No MOTOR hold for {owner} to renew")
@@ -54,7 +59,8 @@ def refresh(owner, holds, grants):
     hold = protocol.Hold(holds, expiry, grants, owner=owner)
     now = protocol.utcnow()
     hold.refresh(now + protocol.MAX_HOLD_DURATION)
-    require_grant(hold, min(expiry, now + GRANT_WAIT))
+    cutoff = min(expiry, now + RENEWAL_ACK_WAIT)
+    require_grant(hold, min(cutoff, deadline) if deadline is not None else cutoff)
 
 
 def main():

@@ -51,21 +51,6 @@ whole measurement process group is stopped at 05:00. The hold is removed in a
 `finally` block and an always-run Actions step also removes it on cancellation.
 MOTOR owns removal of the grant file.
 
-### Mac mini holds for Tests
-
-Before switching the Tests jobs to the mini, MOTOR must honour the same
-hold/grant protocol at all hours (`hold_window = "always"`). The Tests jobs
-request a lease after checkout and wait up to 50 minutes for the exact grant
-before setup or tests. Owners use `aft-tests-<run id>-<attempt>-<job>`, with
-the shard number appended when a matrix shares a job ID. The jobs remove
-their own hold after native cleanup even when a work step fails. MOTOR still
-owns the grant file.
-
-Each job's timeout includes the grant wait and fits within one three-hour
-lease. A longer job must run `python3 scripts/ci/macos-hold.py refresh` (with
-the same `--shard`, if any) before the current lease expires and receive the
-renewed grant before continuing.
-
 Every run carries model, CPU/core count, memory, macOS version, power source
 and power settings in `machine.json`, with a post-run snapshot and a separate
 `night-status.json` verdict. Pass logs also record model, CPU, macOS and power.
@@ -108,6 +93,22 @@ Pure contract checks (including stand-in hold/grant folders, no real MOTOR state
 python3 -m unittest discover -s scripts/telemetry -p 'test_cpu_precision.py' -v
 python3 -m unittest discover -s scripts/telemetry -p 'test_mac_cost_gate.py' -v
 ```
+
+## Mac mini holds for CI
+
+The Tests jobs and both macOS release builds need the fleet VM scheduler
+(MOTOR) to honour holds at all hours (`hold_window = "always"`). After checkout,
+each job requests a hold and waits for a grant with the same owner and expiry.
+At the first grant, it renews the hold once for three hours and waits for MOTOR to
+acknowledge the new expiry before work starts. The renewal wait stops after
+five minutes or at the original 50-minute deadline, whichever is earlier.
+Owners use `aft-tests-<run id>-<attempt>-<job>`, with the shard number
+appended when a matrix shares a job ID. An `always()` step removes only that
+job's hold, even after failure; MOTOR owns the grant file.
+
+The release jobs have a 200-minute total timeout. Each puts all build and
+packaging steps in a composite step with a separate 150-minute timeout, so a
+quick grant cannot leave them running past the renewed lease.
 
 ## Run locally
 

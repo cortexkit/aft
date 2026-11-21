@@ -1,5 +1,5 @@
 name: MOTOR macOS hold
-description: Acquire or release exclusive access to the Mac mini for an AFT Tests job
+description: Acquire or release exclusive access to the Mac mini for an AFT CI job
 inputs:
   phase:
     description: acquire or release

@@ -962,9 +962,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         archive_index = next(i for i, step in enumerate(steps) if "nextest archive" in step.get("run", ""))
         self.assertEqual(steps.index(timings), archive_index + 1)
 
-    def test_macos_test_jobs_use_the_dedicated_runner_without_changing_release(self) -> None:
-        # Tests reuse the Mac mini's local Cargo outputs. Publication retains
-        # its existing runner choices.
+    def test_macos_tests_and_release_builds_use_the_dedicated_runner(self) -> None:
         suite = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/_unit-suite.yml"))
         release = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/release.yml"))
         jobs = suite["jobs"]
@@ -972,8 +970,10 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(producer["name"], "Cargo libtest archive (macOS)")
         for name in ("unit-macos-libtest-archive", "unit-macos-libtest-shard", "unit-macos-bin-archive", "unit-macos-nextest-archive", "unit-macos-inventory-proof"):
             self.assertEqual(jobs[name]["runs-on"], ["self-hosted", "mac-mini"], name)
-        for name in ("build-darwin-arm64", "build-darwin-x64"):
-            self.assertEqual(release["jobs"][name]["runs-on"], ["self-hosted", "mac-mini"], name)
+        for arch, name in (("arm64", "Build macOS ARM64"), ("x64", "Build macOS x64")):
+            job = release["jobs"][f"build-darwin-{arch}"]
+            self.assertEqual(job["name"], name)
+            self.assertEqual(job["runs-on"], ["self-hosted", "mac-mini"], name)
         self.assertEqual(release["jobs"]["e2e-darwin-arm64"]["runs-on"], "macos-26")
         for workflow in (suite, release):
             self.assertEqual(
@@ -1009,7 +1009,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                     self.assertIn(f"Runner: {runner} (test-runner)", text)
                     self.assertRegex(text, rf"{heading}: \d+s")
 
-    def test_mac_mini_jobs_hold_through_cleanup_and_fit_one_lease(self) -> None:
+    def test_mac_mini_jobs_hold_through_cleanup_and_fit_post_grant_lease(self) -> None:
         work_budgets = {
             "unit-macos-nextest-archive": 30,
             "unit-macos-libtest-archive": 90,
@@ -1023,15 +1023,18 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             "unit-macos-conformance": 45,
             "e2e-macos": 45,
             "native-ci-cleanup": 5,
+            "build-darwin-arm64": 150,
+            "build-darwin-x64": 150,
         }
         hold_script = runpy.run_path(str(REPO_ROOT / "scripts/ci/macos-hold.py"))
         wait_minutes = hold_script["GRANT_WAIT"].total_seconds() / 60
+        renewal_minutes = hold_script["RENEWAL_ACK_WAIT"].total_seconds() / 60
         lease_minutes = hold_script["protocol"].MAX_HOLD_DURATION.total_seconds() / 60
         cleanup_margin_minutes = 5  # GitHub's cancellation grace period
         self.assertLessEqual(lease_minutes, 180)
 
         held_jobs = {}
-        for filename in ("_unit-suite.yml", "_e2e-suite.yml", "tests.yml"):
+        for filename in ("_unit-suite.yml", "_e2e-suite.yml", "tests.yml", "release.yml"):
             jobs = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows" / filename))["jobs"]
             for name, job in jobs.items():
                 matrix = job.get("strategy", {}).get("matrix", {})
@@ -1058,8 +1061,18 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                     timeout = int(limits[1])
                 else:
                     timeout = int(job["timeout-minutes"])
-                self.assertGreaterEqual(timeout, work_budgets[name] + wait_minutes)
-                self.assertLessEqual(timeout + cleanup_margin_minutes, lease_minutes)
+                work_budget = work_budgets[name]
+                self.assertGreaterEqual(timeout, work_budget + wait_minutes)
+                self.assertLessEqual(renewal_minutes + work_budget + cleanup_margin_minutes, lease_minutes)
+                if name.startswith("build-darwin-"):
+                    # An early grant can leave nearly the whole job timeout.
+                    # All release work must be inside a separately timed step.
+                    self.assertEqual(len(steps), 4)
+                    arch = name.removeprefix("build-darwin-")
+                    self.assertEqual(steps[2]["uses"], f"./.github/actions/release-darwin-{arch}")
+                    self.assertEqual(int(steps[2]["timeout-minutes"]), work_budget)
+                else:
+                    self.assertLessEqual(timeout + cleanup_margin_minutes, lease_minutes)
 
     def test_unit_archive_compilation_isolated_and_real_cli_is_retained(self) -> None:
         lib = workflow_job("unit-macos-libtest-archive")
