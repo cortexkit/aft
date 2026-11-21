@@ -22,8 +22,6 @@ pub use attachments::{
     DownloadedGithubImage, GithubImageAttachment, GithubImageDownloader,
     ReqwestGithubImageDownloader, MAX_GITHUB_IMAGE_ATTACHMENTS, MAX_GITHUB_IMAGE_ATTACHMENT_BYTES,
 };
-#[cfg(test)]
-pub(crate) use cache::tests::uncached_running_read;
 pub(crate) use cache::worker_stopped;
 pub use cache::{
     apply_selector, sqlite_cache_store, GithubReadCacheStore, GithubReadClock,
@@ -51,3 +49,8 @@ pub use resource::{
     parse_resource, GithubCommentSelector, GithubResource, GithubResourceKind,
     InvalidGithubResource,
 };
+
+#[cfg(test)]
+pub(crate) fn stale_thread_note_for_test() -> &'static str {
+    thread_text::STALE
+}
