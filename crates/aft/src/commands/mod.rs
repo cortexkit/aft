@@ -98,6 +98,8 @@ pub mod restore_checkpoint;
 pub(crate) mod rewrite_tests;
 mod rollback_outcome;
 pub mod safety_purge;
+#[cfg(test)]
+mod search_boundary_tests;
 pub mod semantic_search;
 pub mod state;
 pub mod status;

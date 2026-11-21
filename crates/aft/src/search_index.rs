@@ -3832,7 +3832,7 @@ mod grep_binary_prefix_tests {
         std::fs::write(&path, b"// ascii source\n".repeat((17 << 20) / 16)).unwrap();
         for cached in [false, true] {
             let _scope = crate::bounded_io::enter_disclosure_if_absent();
-            let files = crate::commands::semantic_search::request_files::RequestFiles::default();
+            let files = crate::search_state::request_files::RequestFiles::default();
             let (eligible, _, largest) = crate::test_allocations::count_bytes_and_largest(|| {
                 if cached {
                     matches!(
@@ -5146,19 +5146,6 @@ mod tests {
     }
 
     #[test]
-    fn semantic_namespaces_share_type_identity() {
-        use std::any::TypeId;
-        assert_eq!(
-            TypeId::of::<super::exact_lane::QualifiedMember>(),
-            TypeId::of::<crate::commands::semantic_search::exact_lane::QualifiedMember>()
-        );
-        assert_eq!(
-            TypeId::of::<super::memo::ExactMemoStore>(),
-            TypeId::of::<crate::commands::semantic_search::memo::ExactMemoStore>()
-        );
-    }
-
-    #[test]
     fn storage_and_sqlite_files_never_reach_corpus_open() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().canonicalize().unwrap();
@@ -6386,35 +6373,6 @@ mod tests {
         assert_eq!(result.matches.len(), 3);
         assert!(result.engine_capped);
         assert!(!result.scan_deadline_reached);
-    }
-
-    #[test]
-    fn bounded_line_text_renders_exactly_like_the_whole_line() {
-        use crate::commands::grep::{truncate_grep_line, truncate_line_text, GREP_MAX_LINE_CHARS};
-
-        let mut invalid = "é".repeat(GREP_MAX_LINE_CHARS - 1).into_bytes();
-        invalid.extend_from_slice(&[0xff, 0xe2, 0x82, b'x']);
-        invalid.extend_from_slice(&"tail".repeat(2_000).into_bytes());
-        let lines: Vec<Vec<u8>> = vec![
-            b"short line".to_vec(),
-            Vec::new(),
-            "a".repeat(GREP_MAX_LINE_CHARS).into_bytes(),
-            "a".repeat(GREP_MAX_LINE_CHARS + 1).into_bytes(),
-            "é".repeat(GREP_MAX_LINE_CHARS + 1).into_bytes(),
-            "€".repeat(5_000).into_bytes(),
-            "needle-pad".repeat(100_000).into_bytes(),
-            invalid,
-        ];
-        for line in &lines {
-            let whole = String::from_utf8_lossy(line).into_owned();
-            let bounded = bounded_grep_line_text_bytes(line);
-            assert_eq!(truncate_grep_line(&bounded), truncate_grep_line(&whole));
-            assert_eq!(truncate_line_text(&bounded), truncate_line_text(&whole));
-            if whole.chars().count() <= GREP_MAX_LINE_CHARS {
-                assert_eq!(bounded, whole, "a line within the bound is kept whole");
-            }
-            assert!(bounded.chars().count() <= GREP_MAX_LINE_CHARS + 20);
-        }
     }
 
     #[test]
