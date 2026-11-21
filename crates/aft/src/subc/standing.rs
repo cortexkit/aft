@@ -1785,7 +1785,7 @@ mod tests {
         ctx.set_harness(crate::harness::Harness::Opencode);
         ctx.set_degraded_reasons(vec![format!(
             "{}: stubbed unreadable repository",
-            crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON
+            aft_engine::test_bridge::search_misc::GIT_IDENTITY_UNAVAILABLE_REASON
         )]);
         assert!(ctx.artifact_identity_provisional());
         let executor = Arc::new(Executor::new());

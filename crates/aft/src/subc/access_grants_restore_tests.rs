@@ -872,3 +872,5 @@ async fn grants_stalled_restore_retries_after_path_recovers() {
 use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::LaunchGrantStateTestExt as _;
+
+use aft_engine::test_bridge::display_data::UnrestoredGrantTestExt as _;

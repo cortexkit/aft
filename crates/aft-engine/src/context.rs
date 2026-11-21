@@ -397,7 +397,7 @@ impl Drop for ConfigPinGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Ignore-file walks run by this thread; see
     /// `AppContext::ignore_walks_on_current_thread_for_test`.
@@ -4171,7 +4171,7 @@ impl AppContext {
         }
 
         let git_common_dir = self.git_common_dir.lock().clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         IGNORE_WALKS_ON_THREAD.with(|walks| walks.set(walks.get() + 1));
         let inputs = gitignore_state::IgnoreInputSnapshot::collect(root, git_common_dir.as_deref());
         if inputs.has_same_effective_inputs(previous_inputs.as_ref()) {
@@ -11225,7 +11225,7 @@ impl AppContext {
         current_root: Option<&Path>,
         cap_detail: bool,
     ) -> crate::memory::MemorySnapshot {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.status_emitter()
             .memory_census_builds
             .fetch_add(1, Ordering::Relaxed);

@@ -11306,7 +11306,8 @@ mod tests {
             .expect("building progress timestamp");
 
         std::thread::sleep(Duration::from_millis(2));
-        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+        aft_engine::test_bridge::search_misc::record_tier2_attempt_outcome_for_test(
+            &ctx.inspect_manager(),
             crate::inspect_category::InspectCategory::Duplicates,
             crate::inspect::JobOutcome::Fresh {
                 payload: json!({ "count": 3 }),
@@ -11714,7 +11715,7 @@ mod tests {
         std::fs::write(
             &memo,
             serde_json::to_vec(&json!({ (memo_root.to_string_lossy().to_string()): {
-                "key": crate::root_identity::key::artifact_key_from_git_identity(&commit),
+                "key": aft_engine::test_bridge::search_misc::artifact_key_from_git_identity(&commit),
                 "git_root_commit": commit, "recorded_at_ms": 0
             }}))
             .unwrap(),
@@ -11749,9 +11750,11 @@ mod tests {
             after, before,
             "health changed legacy memo bytes or mtime (old entry: {old_entry})"
         );
-        assert!(crate::root_identity::read(&root, &storage)
-            .unwrap()
-            .is_none());
+        assert!(
+            aft_engine::test_bridge::search_misc::read_root_identity(&root, &storage)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

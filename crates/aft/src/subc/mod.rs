@@ -17190,7 +17190,7 @@ mod tests {
         }
         let _env = ScopedEnv::set("AFT_TEST_DISABLE_FILE_WATCHER", "0");
         let _sync = ScopedEnv::set("AFT_TEST_SYNC_FILE_WATCHER_START", "1");
-        let before = crate::lifecycle_census::thread_census();
+        let before = aft_engine::test_bridge::search_misc::thread_census();
         if !before.classified {
             return;
         }
@@ -17217,7 +17217,7 @@ mod tests {
             );
             roots.push((dir, root, ctx));
         }
-        let bound = crate::lifecycle_census::thread_census();
+        let bound = aft_engine::test_bridge::search_misc::thread_census();
         eprintln!("threads before={before:?} bound={bound:?}");
         assert!(bound.classified);
         assert!(
