@@ -2279,9 +2279,13 @@ async fn exercise_catalog_remote_bash(
     };
     let bind = identity(root.path(), "one", 7, true);
     let root_id = bind.root.clone();
-    let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));
+    let ctx = context(
+        root.path(),
+        storage.path(),
+        Some(daemon.connection().clone()),
+    );
     ctx.app()
-        .set_subc_connection_file(daemon.connection.clone());
+        .set_subc_connection_file(daemon.connection().clone());
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root_id.clone(), Arc::new(ctx)));
     let (writer, mut replies) = mpsc::channel(8);
@@ -2312,7 +2316,7 @@ async fn exercise_catalog_remote_bash(
     drop(executor);
     let ctx = context(root.path(), storage.path(), None);
     ctx.app()
-        .set_subc_connection_file(daemon.connection.clone());
+        .set_subc_connection_file(daemon.connection().clone());
     let executor = Arc::new(Executor::new());
     assert!(executor.register_actor(root_id.clone(), Arc::new(ctx)));
     let routes = HashMap::from([(route_key(42, 1), bind)]);
@@ -2402,7 +2406,7 @@ async fn exercise_catalog_remote_bash(
             "{response:?}"
         );
     }
-    let log = daemon.log.lock().unwrap();
+    let log = daemon.log().lock().unwrap();
     assert_eq!(
         log.iter()
             .filter(|(_, b)| b["method"] == "exec.run")
@@ -2494,14 +2498,14 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
         .await;
         let dir = tempfile::tempdir().unwrap();
         init_remote_git_fixture(dir.path());
-        let ctx = context(dir.path(), dir.path(), Some(daemon.connection.clone()));
+        let ctx = context(dir.path(), dir.path(), Some(daemon.connection().clone()));
         let registry = ctx.bash_background().clone();
         let task = registry
             .spawn_remote(
                 crate::bash_background::RemoteLaunch {
                     explicit_runon: false,
                     params: Default::default(),
-                    connection_file: Some(daemon.connection.clone()),
+                    connection_file: Some(daemon.connection().clone()),
                     harness: "runner".into(),
                     session: "session".into(),
                     requested_platform: None,
@@ -2571,7 +2575,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 crate::protocol::BgTaskStatus::Starting,
                 "the fake runner has not sent Accepted yet"
             );
-            daemon.acceptance_gate.notify_one();
+            daemon.acceptance_gate().notify_one();
             tokio::time::timeout(Duration::from_secs(10), async {
                 loop {
                     let status = registry
@@ -2682,14 +2686,14 @@ async fn drained_remote_call_names_its_task_and_remote_job() {
     .await;
     let dir = tempfile::tempdir().unwrap();
     init_remote_git_fixture(dir.path());
-    let ctx = context(dir.path(), dir.path(), Some(daemon.connection.clone()));
+    let ctx = context(dir.path(), dir.path(), Some(daemon.connection().clone()));
     let registry = ctx.bash_background().clone();
     let task = registry
         .spawn_remote(
             crate::bash_background::RemoteLaunch {
                 explicit_runon: true,
                 params: Default::default(),
-                connection_file: Some(daemon.connection.clone()),
+                connection_file: Some(daemon.connection().clone()),
                 harness: "runner".into(),
                 session: "session".into(),
                 requested_platform: None,
@@ -2734,7 +2738,7 @@ async fn drained_remote_call_names_its_task_and_remote_job() {
     );
     assert!(message.contains(capture_warning), "{message}");
 
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     let progress = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(progress) = registry
@@ -3311,7 +3315,7 @@ async fn siblings_pass_cores_launch_fetches_then_brocas_fetch_and_submit() {
     let ctx = &fixture.ctx;
     init_remote_git_fixture(&fixture.path("head"));
     ctx.update_config(|config| {
-        config.semantic.subc_connection_file = Some(daemon.connection.clone());
+        config.semantic.subc_connection_file = Some(daemon.connection().clone());
     });
     let commons = fixture.path("granted/commons");
     let plan = sibling_plan(&[&commons], &[&commons]);
@@ -3575,7 +3579,11 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
     let storage = tempfile::tempdir().unwrap();
     init_remote_git_fixture(root.path());
     std::fs::create_dir(sibling.path().join(".git")).unwrap();
-    let ctx = context(root.path(), storage.path(), Some(daemon.connection.clone()));
+    let ctx = context(
+        root.path(),
+        storage.path(),
+        Some(daemon.connection().clone()),
+    );
     ctx.update_config(|config| config.restrict_to_project_root = false);
     let mut head = identity(root.path(), "siblings-submit-head", 7, true);
     let stamp = Arc::get_mut(&mut head.0).unwrap().scope.as_mut().unwrap();

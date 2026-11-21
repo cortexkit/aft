@@ -3099,7 +3099,8 @@ mod tests {
     #[test]
     fn strict_worker_uncontained_plan_requires_approval() {
         use crate::config::SandboxMode;
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail};
+        use crate::sandbox_spawn::with_worker_jail;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -3130,7 +3131,8 @@ mod tests {
     #[test]
     fn strict_worker_contained_plan_keeps_scanner_report_only() {
         use crate::config::SandboxMode;
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail};
+        use crate::sandbox_spawn::with_worker_jail;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();

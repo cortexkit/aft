@@ -1,5 +1,6 @@
 use super::*;
-use crate::gh_shim_speech::start_view::{inject, START_VIEW_ENV};
+use crate::gh_shim_speech::start_view::inject;
+use aft_engine::test_bridge::bash_remote::START_VIEW_ENV;
 use std::path::PathBuf;
 
 #[tokio::test]

@@ -8348,24 +8348,15 @@ mod v22_tests;
 #[cfg(test)]
 #[path = "gh_shim/v23_tests.rs"]
 mod v23_tests;
-
 // The review-thread rows are declared for Linux and macOS only, and the
 // signed fixtures verify only under the debug test key.
-#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
-#[path = "gh_shim/review_thread_tests.rs"]
-mod review_thread_tests;
-
 #[cfg(test)]
 #[path = "gh_shim/bypass_bot_credentials_tests.rs"]
 mod bypass_bot_credentials_tests;
-#[cfg(any(
-    test,
-    all(
-        feature = "test-support",
-        debug_assertions,
-        any(target_os = "linux", target_os = "macos")
-    )
-))]
+#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+#[path = "gh_shim/review_thread_tests.rs"]
+mod review_thread_tests;
+#[cfg(any(test, feature = "test-support"))]
 #[path = "gh_shim_speech/dispatch_test_support.rs"]
 pub(crate) mod speech_dispatch_support;
 #[cfg(test)]

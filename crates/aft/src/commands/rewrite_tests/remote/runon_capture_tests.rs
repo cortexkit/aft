@@ -16,7 +16,7 @@ fn local_command(
             SpawnPlan::Unsandboxed,
             command,
             crate::bash_background::BashShell::Bash,
-            crate::bash_background::registry::resolve_posix_shell(),
+            aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
             session.into(),
             workdir.into(),
             HashMap::new(),
@@ -34,7 +34,7 @@ fn local_command(
 fn start_runon(ctx: &crate::context::AppContext, daemon: &Daemon) -> String {
     let response = handle_with_policy(
         ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({"command": "printf capture", "runon": "linux", "compressed": false}),
     );
     assert!(response.success, "{response:?}");
@@ -48,7 +48,7 @@ fn start_remote_editor(
 ) -> String {
     ctx.bash_background()
         .spawn_remote(
-            launch(daemon.connection.clone()),
+            launch(daemon.connection().clone()),
             SpawnPlan::Unsandboxed,
             &format!("touch .editor-started; {EDIT}"),
             resolve_posix_shell(),
@@ -66,7 +66,7 @@ fn start_remote_editor(
         .unwrap()
 }
 
-fn start_log_capture(root: &Path) -> RemoteLaunchLogCapture {
+fn start_log_capture(root: &Path) -> Arc<Mutex<Vec<String>>> {
     let capture = Arc::new(Mutex::new(Vec::new()));
     remote_launch_log_captures()
         .lock()
@@ -306,7 +306,7 @@ async fn runon_capture_warns_if_foreground_command_starts_and_finishes_during_co
         "printf 'edited during copy\n' > tracked.txt",
     );
     terminal(ctx.bash_background(), &local).await;
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     let done = terminal(ctx.bash_background(), &job).await;
     assert_warning(&done, true);
 }
@@ -346,7 +346,7 @@ async fn runon_launch_logs_send_phases_and_acceptance_capture_time() {
     let secret = "runon-diagnostic-secret-value";
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": command,
             "runon": "linux",
@@ -373,7 +373,7 @@ async fn runon_launch_logs_send_phases_and_acceptance_capture_time() {
         .unwrap()
         .iter()
         .any(|line| line.contains("runon: remote task accepted ")));
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     wait_for("executor acceptance must be logged", || {
         capture
             .lock()

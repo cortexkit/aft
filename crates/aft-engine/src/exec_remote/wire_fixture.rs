@@ -1663,3 +1663,39 @@ async fn outage_daemon_with(
         _dir: dir,
     }
 }
+
+impl Daemon {
+    pub fn connection(&self) -> &std::path::PathBuf {
+        &self.connection
+    }
+    pub fn connections(&self) -> &std::sync::atomic::AtomicUsize {
+        &self.connections
+    }
+    pub fn log(&self) -> &Arc<Mutex<Vec<(subc_protocol::EnvelopeHeader, Value)>>> {
+        &self.log
+    }
+    pub fn acceptance_gate(&self) -> &Arc<tokio::sync::Notify> {
+        &self.acceptance_gate
+    }
+    pub fn output_gate(&self) -> &Arc<tokio::sync::Notify> {
+        &self.output_gate
+    }
+    pub fn completion_gate(&self) -> &Arc<tokio::sync::Notify> {
+        &self.completion_gate
+    }
+}
+
+impl OutageDaemon {
+    pub fn connection(&self) -> &std::path::PathBuf {
+        &self.connection
+    }
+    pub fn log(&self) -> &Arc<Mutex<Vec<Value>>> {
+        &self.log
+    }
+    pub fn refused_connects(&self) -> &Arc<tokio::sync::watch::Sender<usize>> {
+        &self.refused_connects
+    }
+    pub fn connects(&self) -> &Arc<tokio::sync::watch::Sender<usize>> {
+        &self.connects
+    }
+}
