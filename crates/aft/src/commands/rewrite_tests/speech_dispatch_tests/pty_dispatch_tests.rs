@@ -272,7 +272,7 @@ fn probe_revoked_in_a_new_process(fixture: &Fixture) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "gh_shim::speech_dispatch_tests::pty::revoked_probe_child",
+            concat!(module_path!(), "::revoked_probe_child").trim_start_matches("aft::"),
             "--nocapture",
         ])
         .env(

@@ -40,7 +40,7 @@
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {
-    "lines": 8527,
+    "lines": 8523,
     "reason": "Split GitHub shim policy and commands pending; AFT crate split lane."
   },
   "crates/aft/src/subc/consent_tests.rs": {

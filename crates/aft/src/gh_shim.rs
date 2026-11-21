@@ -17035,7 +17035,3 @@ pub(crate) fn speech_protected_without_view(args: &[OsString]) -> bool {
 #[cfg(test)]
 #[path = "gh_shim_speech/policy_tests.rs"]
 mod speech_policy_tests;
-
-#[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
-#[path = "gh_shim_speech/dispatch_tests.rs"]
-mod speech_dispatch_tests;
