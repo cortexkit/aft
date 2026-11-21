@@ -1354,7 +1354,7 @@ async fn exec_remote_bash_restart_connect_failures_exhaust_reattach_budget() {
 /// job's real result once the runner is back.
 #[tokio::test]
 async fn exec_remote_bash_route_outage_past_five_minutes_still_delivers_result() {
-    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -1392,7 +1392,7 @@ async fn exec_remote_bash_route_outage_past_five_minutes_still_delivers_result()
 
 #[tokio::test]
 async fn exec_remote_bash_keyed_disconnect_replays_job_finished_while_detached() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use crate::exec_remote::wire_fixture::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Running).await;
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
@@ -1414,8 +1414,10 @@ async fn exec_remote_bash_keyed_disconnect_replays_job_finished_while_detached()
     assert_eq!(attaches[0]["params"]["from_seq"], 2);
 }
 
-async fn keyed_disconnect_exhausts_allowance(replay: crate::exec_remote::wire_tests::OutageReplay) {
-    let daemon = crate::exec_remote::wire_tests::outage_daemon_with_replay(replay).await;
+async fn keyed_disconnect_exhausts_allowance(
+    replay: crate::exec_remote::wire_fixture::OutageReplay,
+) {
+    let daemon = crate::exec_remote::wire_fixture::outage_daemon_with_replay(replay).await;
     let dir = tempfile::tempdir().unwrap();
     shorten_reattach_budget(dir.path());
     let clock = PausedReattachClock::new(dir.path());
@@ -1453,18 +1455,19 @@ async fn keyed_disconnect_exhausts_allowance(replay: crate::exec_remote::wire_te
 
 #[tokio::test]
 async fn exec_remote_bash_keyed_disconnect_job_not_found_keeps_unknown_text() {
-    keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_tests::OutageReplay::NotFound)
+    keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_fixture::OutageReplay::NotFound)
         .await;
 }
 
 #[tokio::test]
 async fn exec_remote_bash_keyed_disconnect_repeated_closes_stop_at_allowance() {
-    keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_tests::OutageReplay::Close).await;
+    keyed_disconnect_exhausts_allowance(crate::exec_remote::wire_fixture::OutageReplay::Close)
+        .await;
 }
 
 #[tokio::test]
 async fn exec_remote_bash_keyed_disconnect_unknown_attach_terminal_is_not_resubmitted() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use crate::exec_remote::wire_fixture::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Unknown).await;
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
@@ -1488,7 +1491,7 @@ async fn exec_remote_bash_keyed_disconnect_unknown_attach_terminal_is_not_resubm
 /// job's result.
 #[tokio::test]
 async fn exec_remote_bash_untimed_runon_survives_an_outage_past_five_minutes() {
-    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -1542,7 +1545,7 @@ async fn exec_remote_bash_untimed_runon_survives_an_outage_past_five_minutes() {
 /// result says why, names the job and gives advice the agent can follow.
 #[tokio::test]
 async fn exec_remote_bash_route_outage_gives_up_after_the_jobs_own_limits() {
-    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -1586,7 +1589,7 @@ fn reattach_backoff_doubles_from_a_tenth_of_a_second_up_to_thirty_seconds() {
 
 #[tokio::test]
 async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
-    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::queued_outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -1673,7 +1676,7 @@ async fn large_queued_runon_recovers_after_the_small_queue_deadline() {
 
 #[tokio::test]
 async fn large_queued_runon_recovery_ends_after_queue_runtime_and_grace() {
-    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::queued_outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -1698,7 +1701,7 @@ async fn large_queued_runon_recovery_ends_after_queue_runtime_and_grace() {
 
 #[tokio::test]
 async fn short_queued_runon_keeps_the_five_minute_queue_allowance() {
-    let daemon = crate::exec_remote::wire_tests::queued_outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::queued_outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -1738,7 +1741,7 @@ async fn short_queued_runon_keeps_the_five_minute_queue_allowance() {
 fn workspace_owner_holders_reads_ck_motor_queue_report() {
     let holder: Uuid = "0192a64a-1234-7000-8000-0000000000aa".parse().unwrap();
     let other: Uuid = "0192a64a-1234-7000-8000-0000000000bb".parse().unwrap();
-    let detail = crate::exec_remote::wire_tests::queue_owner_detail(holder);
+    let detail = crate::exec_remote::wire_fixture::queue_owner_detail(holder);
     assert_eq!(workspace_owner_holders(&detail), [holder, other]);
     // Another blocker is not a workspace owner, even with running holders.
     let other_phase = detail.replacen("waiting_on=workspace owner", "waiting_on=permits", 1);
@@ -2205,7 +2208,7 @@ fn cancel_terminal(outcome: Outcome, killed: Option<Killed>, ran: Ran) -> Termin
 
 #[tokio::test]
 async fn remote_cancel_placement_without_job_id_expires_with_truthful_warning() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::PlacementWait { job_id: false },
         &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
         1,
@@ -2250,7 +2253,7 @@ async fn remote_cancel_placement_without_job_id_expires_with_truthful_warning() 
 
 #[tokio::test]
 async fn remote_cancel_placement_progress_id_cancels_before_acceptance() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::PlacementWait { job_id: true },
         &["exec-remote/v1", exec::types::PROGRESS_CAPABILITY],
         1,
@@ -2543,7 +2546,7 @@ const TERMINAL_PENDING: &str =
 async fn start_held_terminal_task(
     registry: &BgTaskRegistry,
     dir: &Path,
-) -> (crate::exec_remote::wire_tests::Daemon, String) {
+) -> (crate::exec_remote::wire_fixture::Daemon, String) {
     let daemon = daemon(Script::GappedCancel, "exec-remote/v1").await;
     let task_id = start(registry, dir, daemon.connection.clone());
     let task = registry.task(&task_id).unwrap();
@@ -2589,7 +2592,7 @@ async fn timed_kill(
 /// runner sends the terminal, the task still ends as killed.
 async fn assert_held_terminal_still_lands(
     registry: &BgTaskRegistry,
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &crate::exec_remote::wire_fixture::Daemon,
     task_id: &str,
 ) {
     daemon.wait_for_requests("exec.cancel", 1).await;
@@ -4574,7 +4577,7 @@ async fn exec_remote_bash_double_restart_starts_local_fallback_once() {
     let dir = tempfile::tempdir().unwrap();
     let counter = dir.path().join("local-runs");
     let release = dir.path().join("release");
-    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let _release_on_failure = ReleaseOnDrop::new(release.clone());
     let command = format!(
         "printf x >> '{}'; {}",
         counter.display(),
@@ -4669,7 +4672,7 @@ async fn exec_remote_bash_refusal_queue_wait_is_not_local_run_time() {
     let daemon = daemon(Script::AttachRefused, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let release = dir.path().join("release");
-    let _release_on_failure = ReleaseOnDrop(release.clone());
+    let _release_on_failure = ReleaseOnDrop::new(release.clone());
     let command = format!(
         "{}; printf budget-proof",
         crate::test_gate::gate(&format!("'{}'", release.display()), "/bin/sleep 0.01")
@@ -5030,7 +5033,7 @@ fn remote_request_refuses_unrelated_repositories_and_non_git_directories() {
 
 #[test]
 fn published_report_vectors_render_changes_say_nothing_when_empty_and_name_what_is_absent() {
-    use crate::exec_remote::wire_tests::report_vector;
+    use crate::exec_remote::wire_fixture::report_vector;
     // Reported and changed: every kind of change is named, none copied back.
     let all = "These files changed on the server and were NOT copied back:\n  result.txt\n\
          Git state changed on the server and was NOT copied back:\n  \
@@ -5967,7 +5970,7 @@ async fn runon_draining_kill_stops_retries() {
 
 #[tokio::test]
 async fn runon_draining_restart_preserves_remaining_budget_and_request() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_clients(
         Script::Draining {
             refusals: u32::MAX,
             retry_after_ms: Some(10_000),
@@ -6032,7 +6035,7 @@ async fn runon_draining_restart_preserves_remaining_budget_and_request() {
 
 #[tokio::test]
 async fn runon_draining_restart_resubmits_and_accepts() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_clients(
         Script::Draining {
             refusals: 1,
             retry_after_ms: Some(200),
@@ -6129,7 +6132,7 @@ async fn runon_draining_restart_obeys_persisted_cancel() {
 
 #[tokio::test]
 async fn runon_draining_restart_does_not_resubmit_ambiguous_dispatch() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_clients(
         Script::Draining {
             refusals: 1,
             retry_after_ms: Some(10_000),
@@ -6444,7 +6447,7 @@ async fn the_owed_cancel_pass_and_a_replay_racing_send_one_cancel() {
 #[tokio::test]
 async fn a_paused_runon_jobs_unsent_cancel_is_sent_after_a_restart() {
     let daemon =
-        crate::exec_remote::wire_tests::daemon_with_clients(Script::Cancel, "exec-remote/v1", 2)
+        crate::exec_remote::wire_fixture::daemon_with_clients(Script::Cancel, "exec-remote/v1", 2)
             .await;
     let dir = tempfile::tempdir().unwrap();
     let scope = owner_scope("unsent-cancel");
@@ -7564,7 +7567,7 @@ mod fallback_worker_broker;
 
 #[test]
 fn hinted_retry_needs_the_named_refusal_ran_none_and_a_hint() {
-    use crate::exec_remote::wire_tests::signer_refusal;
+    use crate::exec_remote::wire_fixture::signer_refusal;
     assert_eq!(
         hinted_retry_after_ms(&signer_refusal("runner_sign_unavailable", Some(2000))),
         Some(2000)
@@ -7602,7 +7605,7 @@ fn hinted_retry_needs_the_named_refusal_ran_none_and_a_hint() {
 
 #[tokio::test]
 async fn runon_signer_refusal_is_resubmitted_after_its_hint_and_only_success_is_seen() {
-    use crate::exec_remote::wire_tests::{signer_refusal, SIGNER_REFUSAL_VECTOR};
+    use crate::exec_remote::wire_fixture::{signer_refusal, SIGNER_REFUSAL_VECTOR};
     // The fake runner sends ck-motor's record exactly, losing no field.
     assert_eq!(
         serde_json::to_value(StreamRecord::Terminal(signer_refusal(
@@ -7730,7 +7733,7 @@ async fn runon_signer_retry_follows_a_live_draining_resubmission() {
 /// daemon, whose draining resubmission meets a hinted signer refusal.
 #[tokio::test]
 async fn runon_signer_retry_follows_a_draining_resubmission_resumed_after_restart() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_clients(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_clients(
         Script::DrainingThenSigner {
             signer_refusals: 1,
             draining_after_ms: 10_000,
@@ -7806,7 +7809,7 @@ fn precommit_remote_handle_failure_removes_layout() {
 /// cancel, and delivers the job's result once the runner is back.
 #[tokio::test]
 async fn exec_remote_reconnect_failure_without_owner_pause_keeps_retrying() {
-    let daemon = crate::exec_remote::wire_tests::outage_daemon().await;
+    let daemon = crate::exec_remote::wire_fixture::outage_daemon().await;
     let dir = tempfile::tempdir().unwrap();
     let clock = PausedReattachClock::new(dir.path());
     let registry = registry();
@@ -7835,8 +7838,8 @@ async fn submission_daemon(
     mismatch: bool,
     always_unknown: bool,
     clients: usize,
-) -> crate::exec_remote::wire_tests::Daemon {
-    crate::exec_remote::wire_tests::daemon_with_capabilities(
+) -> crate::exec_remote::wire_fixture::Daemon {
+    crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::Submission {
             never_accepted,
             mismatch,
@@ -7849,7 +7852,7 @@ async fn submission_daemon(
     .await
 }
 
-fn submission_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde_json::Value> {
+fn submission_runs(daemon: &crate::exec_remote::wire_fixture::Daemon) -> Vec<serde_json::Value> {
     daemon
         .log
         .lock()
@@ -7861,14 +7864,14 @@ fn submission_runs(daemon: &crate::exec_remote::wire_tests::Daemon) -> Vec<serde
 }
 
 async fn preaccepted_recovery_fixture(
-    answer: crate::exec_remote::wire_tests::SubmissionOutage,
+    answer: crate::exec_remote::wire_fixture::SubmissionOutage,
 ) -> (
     tempfile::TempDir,
-    crate::exec_remote::wire_tests::OutageDaemon,
+    crate::exec_remote::wire_fixture::OutageDaemon,
     BgTaskRegistry,
     String,
 ) {
-    let daemon = crate::exec_remote::wire_tests::preaccepted_outage_daemon(answer).await;
+    let daemon = crate::exec_remote::wire_fixture::preaccepted_outage_daemon(answer).await;
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
     let mut launch = launch(daemon.connection.clone());
@@ -7903,7 +7906,7 @@ fn assert_no_preaccepted_local_run(registry: &BgTaskRegistry, task_id: &str) {
 
 #[tokio::test]
 async fn runon_preaccepted_separate_interruptions_each_get_a_recovery_window() {
-    use crate::exec_remote::wire_tests::SubmissionOutage;
+    use crate::exec_remote::wire_fixture::SubmissionOutage;
     let (_dir, daemon, registry, task_id) =
         preaccepted_recovery_fixture(SubmissionOutage::Repeated).await;
     daemon.restore();
@@ -7977,7 +7980,7 @@ async fn runon_preaccepted_separate_interruptions_each_get_a_recovery_window() {
 
 #[tokio::test]
 async fn runon_preaccepted_route_reopens_after_long_admission_wait() {
-    use crate::exec_remote::wire_tests::SubmissionOutage;
+    use crate::exec_remote::wire_fixture::SubmissionOutage;
     let (_dir, daemon, registry, task_id) =
         preaccepted_recovery_fixture(SubmissionOutage::NeverAccepted).await;
     let task = registry.task(&task_id).unwrap();
@@ -7997,7 +8000,7 @@ async fn runon_preaccepted_route_reopens_after_long_admission_wait() {
 
 #[tokio::test]
 async fn runon_preaccepted_accepted_answer_attaches_without_fresh_submission() {
-    use crate::exec_remote::wire_tests::SubmissionOutage;
+    use crate::exec_remote::wire_fixture::SubmissionOutage;
     let (_dir, daemon, registry, task_id) =
         preaccepted_recovery_fixture(SubmissionOutage::Accepted).await;
     daemon.restore();
@@ -8019,7 +8022,7 @@ async fn runon_preaccepted_accepted_answer_attaches_without_fresh_submission() {
 
 #[tokio::test]
 async fn runon_preaccepted_never_accepted_resubmits_exactly_once_with_fresh_key() {
-    use crate::exec_remote::wire_tests::SubmissionOutage;
+    use crate::exec_remote::wire_fixture::SubmissionOutage;
     let (_dir, daemon, registry, task_id) =
         preaccepted_recovery_fixture(SubmissionOutage::NeverAccepted).await;
     daemon.restore();
@@ -8039,10 +8042,11 @@ async fn runon_preaccepted_never_accepted_resubmits_exactly_once_with_fresh_key(
 
 #[tokio::test]
 async fn runon_preaccepted_exhausted_recovery_is_fate_unknown() {
-    use crate::exec_remote::wire_tests::SubmissionOutage;
-    let daemon =
-        crate::exec_remote::wire_tests::preaccepted_outage_daemon(SubmissionOutage::NeverAccepted)
-            .await;
+    use crate::exec_remote::wire_fixture::SubmissionOutage;
+    let daemon = crate::exec_remote::wire_fixture::preaccepted_outage_daemon(
+        SubmissionOutage::NeverAccepted,
+    )
+    .await;
     let dir = tempfile::tempdir().unwrap();
     let registry = registry();
     let mut launch = launch(daemon.connection.clone());
@@ -8071,7 +8075,7 @@ async fn runon_preaccepted_exhausted_recovery_is_fate_unknown() {
 
 #[tokio::test]
 async fn runon_preaccepted_ambiguous_keyed_answer_is_not_resubmitted() {
-    use crate::exec_remote::wire_tests::SubmissionOutage;
+    use crate::exec_remote::wire_fixture::SubmissionOutage;
     let (_dir, daemon, registry, task_id) =
         preaccepted_recovery_fixture(SubmissionOutage::Ambiguous).await;
     daemon.restore();
@@ -8192,7 +8196,7 @@ async fn submission_key_never_accepted_uses_one_new_key() {
 
 #[tokio::test]
 async fn submission_key_disconnect_before_acceptance_keeps_keyed_recovery() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::Submission {
             never_accepted: true,
             mismatch: false,
@@ -8284,7 +8288,7 @@ async fn submission_key_mismatch_preserves_existing_job_for_cancel() {
 
 async fn stopped_submission(
     dir: &Path,
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &crate::exec_remote::wire_fixture::Daemon,
 ) -> (BgTaskRegistry, String) {
     stopped_draining_roots().lock().unwrap().insert(dir.into());
     let registry = registry();
@@ -8398,7 +8402,7 @@ async fn submission_key_closed_runner_time_budget_is_not_resubmitted() {
 
 #[tokio::test]
 async fn submission_key_daemon_restart_reconnects_and_attaches_without_resubmission() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::Submission {
             never_accepted: false,
             mismatch: false,
@@ -8539,8 +8543,8 @@ impl Drop for LostSubmissionReplies {
     }
 }
 
-async fn review_daemon(script: Script, clients: usize) -> crate::exec_remote::wire_tests::Daemon {
-    crate::exec_remote::wire_tests::daemon_with_capabilities(
+async fn review_daemon(script: Script, clients: usize) -> crate::exec_remote::wire_fixture::Daemon {
+    crate::exec_remote::wire_fixture::daemon_with_capabilities(
         script,
         &["exec-remote/v1", "exec-remote-submission-key/v1"],
         clients,
@@ -8727,7 +8731,7 @@ async fn local_fallback_with_return_paths_says_the_files_stayed_in_place() {
     // Prefix routing (not runon) may still fall back to a local run when the
     // runner refuses before start. A task that asked for files back says
     // they were written here and nothing was copied.
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::KnownRefused,
         RETURN_CLAIMS,
         1,
@@ -8987,7 +8991,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
 
 #[tokio::test]
 async fn return_paths_unsupported_never_falls_back_even_for_prefix_routing() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::ReturnPathsUnsupported,
         RETURN_CLAIMS,
         1,
@@ -9157,7 +9161,7 @@ fn expired_gap_unverified_line_is_the_approved_text() {
 }
 
 /// Requests the daemon received to list its catalog.
-fn catalog_lists(daemon: &crate::exec_remote::wire_tests::Daemon) -> usize {
+fn catalog_lists(daemon: &crate::exec_remote::wire_fixture::Daemon) -> usize {
     daemon
         .log
         .lock()
@@ -9169,7 +9173,7 @@ fn catalog_lists(daemon: &crate::exec_remote::wire_tests::Daemon) -> usize {
 
 /// Task record writes and daemon catalog lists so far, for one task.
 fn monitor_counts(
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &crate::exec_remote::wire_fixture::Daemon,
     task_id: &str,
 ) -> (usize, usize) {
     (
@@ -9183,7 +9187,7 @@ fn monitor_counts(
 /// changes: the worker's 50 ms polls in between cost neither.
 #[tokio::test]
 async fn runon_monitor_polls_without_a_change_write_nothing_and_list_no_catalog() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::GatedStages { position: 2 },
         &[
             "exec-remote/v1",
@@ -9246,7 +9250,7 @@ async fn runon_monitor_polls_without_a_change_write_nothing_and_list_no_catalog(
 /// most once per checkpoint interval and never lists the catalog.
 #[tokio::test]
 async fn runon_monitor_steady_output_writes_only_checkpoints_and_lists_no_catalog() {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = crate::exec_remote::wire_fixture::daemon_with_capabilities(
         Script::Continuous,
         &[
             "exec-remote/v1",

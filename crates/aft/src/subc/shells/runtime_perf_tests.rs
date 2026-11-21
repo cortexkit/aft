@@ -1,6 +1,7 @@
 use super::*;
 use crate::bash_background::persistence::{read_task_at, TaskPaths};
 use aft_engine::test_bridge::bash_remote::with_artifact_opens;
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 use std::io::Write;
 
 fn cpu_ns() -> u64 {

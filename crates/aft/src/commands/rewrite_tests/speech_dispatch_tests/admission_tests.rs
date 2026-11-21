@@ -1,4 +1,9 @@
 use super::*;
+use aft_engine::test_bridge::bash_remote::LaunchAuthorityTestExt as _;
+use aft_engine::test_bridge::bash_remote::RefusalTestExt as _;
+use aft_engine::test_bridge::bash_remote::RouteScopesTestExt as _;
+use aft_engine::test_bridge::bash_remote::SpeechTicketTestExt as _;
+use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 
 fn subconscious_options(sdk_daemon: bool) -> LaunchOptions {
     LaunchOptions {
@@ -64,7 +69,7 @@ async fn agent_selected_bindings_without_a_row_refuse_with_a_specific_detail() {
     assert_eq!(denial.code, Code::AuthorityUnavailable);
     assert_eq!(denial.reason, "binding_unverifiable");
     assert!(denial
-        .detail
+        .detail()
         .as_deref()
         .unwrap()
         .starts_with("no_binding_row:"));
@@ -72,7 +77,7 @@ async fn agent_selected_bindings_without_a_row_refuse_with_a_specific_detail() {
     params["ticket"] = json!(ticket.value().unwrap());
     let answer = post_params(&fixture, &params, &fixture.routes(true)).await;
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
-    assert_eq!(answer.data["detail"], denial.detail.as_deref().unwrap());
+    assert_eq!(answer.data["detail"], denial.detail().as_deref().unwrap());
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 0);
 }
 
@@ -93,7 +98,7 @@ async fn agent_selected_bindings_reject_even_a_signed_row_for_another_agent() {
     let denial = speech.prepared().denial().unwrap();
     assert_eq!(denial.code, Code::IdentityConflict);
     assert_eq!(denial.reason, "binding_changed");
-    let detail = denial.detail.as_deref().unwrap();
+    let detail = denial.detail().as_deref().unwrap();
     assert!(
         detail.contains(other_agent) && detail.contains("agent_2bfd6927602f7977"),
         "{detail}"
@@ -115,7 +120,7 @@ async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
     .unwrap();
     let context = warm.prepared().context().clone();
     assert_eq!(
-        context.test_prepare().denial().unwrap().detail.as_deref(),
+        context.test_prepare().denial().unwrap().detail().as_deref(),
         Some("inside_tokio_runtime")
     );
     let dir = tempfile::tempdir().unwrap();
@@ -125,7 +130,7 @@ async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
         aft_engine::test_bridge::bash_remote::record_service(dir.path()),
     );
     assert_eq!(
-        context.test_prepare().denial().unwrap().detail.as_deref(),
+        context.test_prepare().denial().unwrap().detail().as_deref(),
         Some("no_runtime")
     );
 }
@@ -204,7 +209,7 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
             fixture.params["ticket"].as_str().unwrap(),
         )
         .unwrap();
-        assert!(!warm.background.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!warm.background().load(std::sync::atomic::Ordering::SeqCst));
         assert!(fixture
             .service
             .store
@@ -241,7 +246,7 @@ async fn foreground_launch_uses_its_live_origin_despite_other_session_routes() {
         let ticket = call_ticket(&fixture).await;
         let mut params = fixture.params.clone();
         params["ticket"] = json!(ticket.value().unwrap());
-        let captured = fixture.launch.authority.clone();
+        let captured = fixture.launch.authority().clone();
         fixture.partners(|partners| {
             let reserve = partners.reserve().clone();
             *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
@@ -282,7 +287,7 @@ async fn background_classic_with_closed_origin_and_agreeing_routes_still_posts()
     let fixture = Fixture::new(false).await;
     let routes = fixture.routes(false);
     assert_eq!(routes.for_session(&fixture.session), Some(&fixture.head));
-    assert!(!routes.origin_live(fixture.launch.origin.as_ref(), &fixture.head));
+    assert!(!routes.origin_live(fixture.launch.origin().as_ref(), &fixture.head));
     let answer = post_params(&fixture, &fixture.params, &routes).await;
     assert!(answer.ok, "{:?}", answer.data);
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
@@ -296,7 +301,10 @@ async fn foreground_run_keeps_session_fallback_when_head_origin_closes() {
     let mut params = fixture.params.clone();
     params["ticket"] = json!(ticket.value().unwrap());
     let mut routes = fixture.routes(false);
-    routes.push_origin(fixture.launch.origin.clone().unwrap(), fixture.run.clone());
+    routes.push_origin(
+        fixture.launch.origin().clone().unwrap(),
+        fixture.run.clone(),
+    );
     let answer = post_params(&fixture, &params, &routes).await;
     assert!(answer.ok, "{:?}", answer.data);
     assert_eq!(fixture.plex.state.lock().unwrap().sends, 1);
@@ -314,7 +322,7 @@ async fn foreground_live_origin_rejects_request_for_another_agent() {
     replacement.attributes.agent_id = Some("replacement-agent".into());
     let mut routes = fixture.routes(true);
     routes.push(&fixture.session, Some(replacement));
-    assert!(routes.origin_live(fixture.launch.origin.as_ref(), &fixture.head));
+    assert!(routes.origin_live(fixture.launch.origin().as_ref(), &fixture.head));
     assert_eq!(routes.for_session(&fixture.session), None);
     let answer = post_params(&fixture, &params, &routes).await;
     assert!(!answer.ok, "{:?}", answer.data);
@@ -346,7 +354,10 @@ async fn foreground_call_rejects_each_rebound_launch_identity_field() {
         params["request"]["metadata"]["agent_id"] = json!(stamp.attributes.agent_id);
         let mut routes = RouteScopes::default();
         routes.speech = Some(fixture.service.clone());
-        routes.push_origin(fixture.launch.origin.clone().unwrap(), Some(stamp.clone()));
+        routes.push_origin(
+            fixture.launch.origin().clone().unwrap(),
+            Some(stamp.clone()),
+        );
         routes.push(&fixture.session, Some(stamp));
         let answer = post_params(&fixture, &params, &routes).await;
         assert_eq!(

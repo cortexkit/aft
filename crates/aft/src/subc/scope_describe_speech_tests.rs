@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[tokio::test]

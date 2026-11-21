@@ -792,21 +792,6 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct DrainingRetry {
-    request_digest: String,
-    attempts: u32,
-    pub(crate) first_refusal_at_ms: Option<u64>,
-    pub(crate) next_retry_at_ms: Option<u64>,
-    waited_ms: Option<u64>,
-    /// When AFT last submitted the job again after a draining refusal, in
-    /// Unix milliseconds. The runner's queue wait and run timeout count from
-    /// that submission, so re-attach limits do too. Records written before
-    /// this field existed lack it and count from the task's start.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    resubmitted_at_ms: Option<u64>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RemoteOutputStream {
@@ -1004,20 +989,9 @@ fn is_zero_u64(value: &u64) -> bool {
     *value == 0
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct KeyedSubmission {
-    key: String,
-    created_at_ms: u64,
-    pub(crate) request_digest: String,
-    attempts: u8,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    recovery_started_at_ms: Option<u64>,
-    fresh_key_used: bool,
-    resuming: bool,
-    pub(crate) reattached: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    refusal: Option<TerminalRecord>,
-}
+#[path = "remote_types.rs"]
+pub(crate) mod remote_types;
+pub(crate) use remote_types::{DrainingRetry, KeyedSubmission};
 
 #[cfg(unix)]
 impl KeyedSubmission {

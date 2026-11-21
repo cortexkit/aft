@@ -312,13 +312,14 @@ mod progress_lifetime_tests {
 #[cfg(all(test, unix))]
 mod frame_loop_lock_tests {
     use super::*;
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 
     #[tokio::test]
     async fn module_drain_keeps_live_capture_when_stale_replay_loses_registration() {
         let (dir, registry, task) =
             aft_engine::test_bridge::bash_remote::remote_support::captured_task_after_losing_replay_for_test();
         let root = ProjectRootId::from_path(dir.path()).unwrap();
-        let cached = registry.drain_reply_cache(&task.task_id, &task.session_id);
+        let cached = registry.drain_reply_cache(&task.task_id(), &task.session_id());
         let metrics = DispatchPathMetrics::new();
         let route = RouteChannel {
             channel: 1,
@@ -334,8 +335,8 @@ mod frame_loop_lock_tests {
             drain::BashDetachTarget {
                 reply_cache: cached.clone(),
                 run_scoped: true,
-                task_id: task.task_id.clone(),
-                session_id: task.session_id.clone(),
+                task_id: task.task_id().to_owned(),
+                session_id: task.session_id().to_owned(),
                 wait_mode: false,
                 worker_session: false,
                 server_completion: false,
@@ -349,7 +350,7 @@ mod frame_loop_lock_tests {
         );
         let routes = HashMap::from([(
             route,
-            super::super::test_support::route_identity(&root, &task.session_id),
+            super::super::test_support::route_identity(&root, &task.session_id()),
         )]);
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let state = task.test_state().lock().unwrap();
@@ -397,8 +398,8 @@ mod frame_loop_lock_tests {
             let root = ProjectRootId::from_path(fixture.dir().path()).unwrap();
             let task = &fixture.task();
             let cached = fixture
-                .registry
-                .drain_reply_cache(&task.task_id, &task.session_id);
+                .registry()
+                .drain_reply_cache(&task.task_id(), &task.session_id());
             let published = cached.snapshot();
             assert_eq!(published.inputs_captured, Some(false));
             assert!(
@@ -428,8 +429,8 @@ mod frame_loop_lock_tests {
                 drain::BashDetachTarget {
                     reply_cache: cached,
                     run_scoped: true,
-                    task_id: task.task_id.clone(),
-                    session_id: task.session_id.clone(),
+                    task_id: task.task_id().to_owned(),
+                    session_id: task.session_id().to_owned(),
                     wait_mode: false,
                     worker_session: false,
                     server_completion: false,
@@ -443,7 +444,7 @@ mod frame_loop_lock_tests {
             );
             let routes = HashMap::from([(
                 route,
-                super::super::test_support::route_identity(&root, &task.session_id),
+                super::super::test_support::route_identity(&root, &task.session_id()),
             )]);
             let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
             let state = task.test_state().lock().unwrap();
@@ -531,8 +532,8 @@ mod frame_loop_lock_tests {
                 PROTOCOL_VERSION,
                 root,
                 "remote-handback-lock".into(),
-                task.task_id.clone(),
-                task.session_id.clone(),
+                task.task_id().to_owned(),
+                task.session_id().to_owned(),
                 Some(_dir.path().into()),
                 _dir.path().into(),
                 Instant::now(),
@@ -566,7 +567,7 @@ mod frame_loop_lock_tests {
         let completion = completion_rx.recv().await.unwrap();
         let response = completion.result.unwrap().response;
         assert!(response.success, "{response:?}");
-        assert_eq!(response.data["task_id"], task.task_id);
+        assert_eq!(response.data["task_id"], task.task_id());
         assert_eq!(response.data["status"], "running");
     }
 
@@ -590,10 +591,10 @@ mod frame_loop_lock_tests {
             drain::BashDetachTarget {
                 reply_cache: ctx
                     .bash_background()
-                    .drain_reply_cache(&task.task_id, &task.session_id),
+                    .drain_reply_cache(&task.task_id(), &task.session_id()),
                 run_scoped: true,
-                task_id: task.task_id.clone(),
-                session_id: task.session_id.clone(),
+                task_id: task.task_id().to_owned(),
+                session_id: task.session_id().to_owned(),
                 wait_mode: false,
                 worker_session: false,
                 server_completion: false,
@@ -607,28 +608,36 @@ mod frame_loop_lock_tests {
         );
         let routes = HashMap::from([(
             route,
-            super::super::test_support::route_identity(&root, &task.session_id),
+            super::super::test_support::route_identity(&root, &task.session_id()),
         )]);
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let registry = ctx.bash_background();
         let initial_note = crate::commands::bash_orchestrate::kill_deadline_note(
             registry,
-            &task.task_id,
-            &task.session_id,
+            &task.task_id(),
+            &task.session_id(),
             false,
         );
         // Renew after registering the detach target: drain must see the new
         // deadline even when the update did not need a durable metadata write.
         registry
-            .renew_hard_kill(&task.task_id, &task.session_id, Duration::from_secs(3600))
+            .renew_hard_kill(
+                &task.task_id(),
+                &task.session_id(),
+                Duration::from_secs(3600),
+            )
             .unwrap();
         registry
-            .renew_hard_kill(&task.task_id, &task.session_id, Duration::from_secs(3601))
+            .renew_hard_kill(
+                &task.task_id(),
+                &task.session_id(),
+                Duration::from_secs(3601),
+            )
             .unwrap();
         let expected = stateful_module_drain_reply_for_test(
             registry,
-            &task.task_id,
-            &task.session_id,
+            &task.task_id(),
+            &task.session_id(),
             "drain-lock",
             false,
             false,
@@ -637,8 +646,8 @@ mod frame_loop_lock_tests {
             initial_note,
             crate::commands::bash_orchestrate::kill_deadline_note(
                 registry,
-                &task.task_id,
-                &task.session_id,
+                &task.task_id(),
+                &task.session_id(),
                 false
             )
         );
@@ -659,7 +668,7 @@ mod frame_loop_lock_tests {
         );
         let frame = writer_rx.recv().await.unwrap().frame;
         let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_eq!(body["structuredContent"]["task_id"], task.task_id);
+        assert_eq!(body["structuredContent"]["task_id"], task.task_id());
         assert_eq!(body["structuredContent"]["status"], "running");
         assert_eq!(
             body["structuredContent"]["output"], expected.data["output"],
@@ -825,12 +834,12 @@ mod default_kill_tests {
                 explicit_timeout,
             );
         let registry = ctx.bash_background();
-        registry.begin_wait_mode_session(&task.session_id, &task.task_id);
-        assert!(registry.signal_wait_mode_detach(&task.session_id));
+        registry.begin_wait_mode_session(&task.session_id(), &task.task_id());
+        assert!(registry.signal_wait_mode_detach(&task.session_id()));
         let observation = observe_deferred_bash_wait(
             registry.clone(),
-            task.task_id.clone(),
-            task.session_id.clone(),
+            task.task_id().to_owned(),
+            task.session_id().to_owned(),
             true,
             worker_session,
             Some(Duration::from_millis(1_800_000)),
@@ -839,9 +848,9 @@ mod default_kill_tests {
         .await;
         assert!(!observation.target_finished);
         assert!(observation.detach_pending);
-        registry.end_wait_mode_session(&task.session_id, &task.task_id);
+        registry.end_wait_mode_session(&task.session_id(), &task.task_id());
         registry
-            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .hard_kill_deadline(&task.task_id(), &task.session_id())
             .unwrap()
             .limit_ms
     }
@@ -3540,6 +3549,7 @@ mod runon_refusal_log_tests {
 #[cfg(test)]
 mod suspend_deadline_tests {
     use super::*;
+    use aft_engine::test_bridge::bash_remote::ReplyBudgetTestExt as _;
     use futures_util::FutureExt;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -4906,6 +4916,9 @@ pub(super) async fn assert_deferred_wait_entrypoint_for_test(
 
 #[cfg(test)]
 mod grant_path_tests {
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+    use aft_engine::test_bridge::bash_remote::ReplyBudgetTestExt as _;
+    use aft_engine::test_bridge::bash_remote::SpawnReceiptTestExt as _;
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_progress_reaches_subc_origin_before_command_finishes() {
@@ -6778,7 +6791,7 @@ mod grant_path_tests {
                 registry
                     .test_task(&call.task_id)
                     .unwrap()
-                    .state
+                    .test_state()
                     .lock()
                     .unwrap()
                     .metadata
@@ -6927,7 +6940,7 @@ mod grant_path_tests {
                 registry
                     .test_task(&call.task_id)
                     .unwrap()
-                    .state
+                    .test_state()
                     .lock()
                     .unwrap()
                     .metadata
@@ -6966,7 +6979,7 @@ mod grant_path_tests {
                 registry
                     .test_task(&call.task_id)
                     .unwrap()
-                    .state
+                    .test_state()
                     .lock()
                     .unwrap()
                     .metadata
@@ -7362,7 +7375,7 @@ mod grant_path_tests {
             loop {
                 let task = ctx.bash_background().test_task(&task_id).unwrap();
                 if task
-                    .state
+                    .test_state()
                     .lock()
                     .unwrap()
                     .metadata
@@ -7561,7 +7574,7 @@ mod grant_path_tests {
                 "{response:?}"
             );
             assert!(!daemon
-                .log
+                .log()
                 .lock()
                 .unwrap()
                 .iter()
@@ -8219,7 +8232,7 @@ mod grant_path_tests {
             "nothing is copied back before the job ends"
         );
         let run = daemon
-            .log
+            .log()
             .lock()
             .unwrap()
             .iter()
@@ -8350,7 +8363,7 @@ mod grant_path_tests {
             registry
                 .test_task(&task_id)
                 .unwrap()
-                .state
+                .test_state()
                 .lock()
                 .unwrap()
                 .metadata
@@ -8368,7 +8381,7 @@ mod grant_path_tests {
         assert_eq!(killed.data["status"], "killed", "{killed:?}");
         assert!(
             !daemon
-                .log
+                .log()
                 .lock()
                 .unwrap()
                 .iter()
@@ -8859,7 +8872,7 @@ mod grant_path_tests {
                 .bash_background()
                 .test_task(&task_id)
                 .unwrap()
-                .state
+                .test_state()
                 .lock()
                 .unwrap()
                 .metadata
@@ -8886,7 +8899,7 @@ mod grant_path_tests {
             );
             assert!(
                 !daemon
-                    .log
+                    .log()
                     .lock()
                     .unwrap()
                     .iter()
@@ -11781,6 +11794,7 @@ mod grant_path_tests {
 #[cfg(all(test, unix))]
 mod run_tests {
     use super::*;
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 
     async fn run(command: &str, timeout: u64, deadline: Option<Instant>) -> Value {
         run_with_scope(

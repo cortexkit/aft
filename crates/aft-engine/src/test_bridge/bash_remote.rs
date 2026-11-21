@@ -113,6 +113,7 @@ pub mod bash_hints {
 
 pub const QUEUE_CAPACITY: usize = bash_background::runner_notice_scheduler::QUEUE_CAPACITY;
 pub const PREFER_TOOL: &str = crate::bash_rewrite::notices::PREFER_TOOL;
+#[cfg(unix)]
 pub const PROXY_UNAVAILABLE: &str = bash_background::secrets::PROXY_UNAVAILABLE;
 pub const COMMAND_BYTES: usize = bash_background::scoped_tasks::COMMAND_BYTES;
 pub const OWNER_PAUSED_REASON: &str = registry::OWNER_PAUSED_REASON;
@@ -332,3 +333,11 @@ impl registry::BgTaskRegistry {
         self.take_cancelled_call_notices(session_id)
     }
 }
+
+mod process_ext;
+pub use process_ext::*;
+
+mod scheduler_ext;
+pub use scheduler_ext::*;
+
+pub use registry::remote::remote_types::{DrainingRetryTestExt, KeyedSubmissionTestExt};

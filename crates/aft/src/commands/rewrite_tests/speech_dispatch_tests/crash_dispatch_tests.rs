@@ -1,4 +1,5 @@
 use super::*;
+use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 
 #[tokio::test]
 async fn crash_after_bound_commit_child() {

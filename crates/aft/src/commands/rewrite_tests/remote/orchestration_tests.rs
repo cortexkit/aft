@@ -1,3 +1,6 @@
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::BgTaskStateTestExt as _;
+use aft_engine::test_bridge::bash_remote::KeyedSubmissionTestExt as _;
 fn read_only_result_case(
     locked: Option<bool>,
     outcome: Outcome,
@@ -562,7 +565,7 @@ async fn runon_executor_refusal_never_spawns_locally_and_returns_error() {
         assert_eq!(done.child_pid, None);
         assert_eq!(done.info.status, BgTaskStatus::Failed);
         let task = ctx.bash_background().test_task(task_id).unwrap();
-        assert!(!task.test_state().lock().unwrap().metadata.local_fallback_started);
+        assert!(!task.test_state().lock().unwrap().metadata().local_fallback_started);
         assert_runon_refusal(&refusal_response(done), reason);
         let status = crate::commands::bash_status::handle(
             &crate::protocol::RawRequest {
@@ -872,7 +875,7 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
     // Startup can publish a detach target before replay inserts its task.
     // The reserved handle must receive the canonical recovered reply too.
     let reserved = recovered.drain_reply_cache(&task_id, "session");
-    let metadata = task.test_state().lock().unwrap().metadata.clone();
+    let metadata = task.test_state().lock().unwrap().metadata().clone();
     recovered
         .insert_rehydrated_task(metadata, task.paths().clone(), true)
         .unwrap();
@@ -1009,7 +1012,7 @@ async fn runon_restart_first_watch_reattaches(
     let saved = resolve_task_layout(&session_tasks_dir(&storage, "session"), &task_id).unwrap();
     let saved = read_task_at(&saved).unwrap();
     assert!(saved.scope.is_some());
-    assert!(!saved.remote.unwrap().submission.unwrap().reattached);
+    assert!(!saved.remote.unwrap().submission.unwrap().reattached());
     if let Some(database) = relaxed_lookup {
         if database {
             let db = Arc::new(Mutex::new(
@@ -1159,7 +1162,7 @@ async fn runon_restart_first_watch_reattaches(
             .unwrap()
             .contains("remote outcome unknown"));
     }
-    assert!(completed.remote.unwrap().submission.unwrap().reattached);
+    assert!(completed.remote.unwrap().submission.unwrap().reattached());
     let lines = capture.lock().unwrap();
     let warnings: Vec<_> = lines
         .iter()
@@ -1489,7 +1492,7 @@ async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
         "attach queue progress must finish publishing its status",
         || {
             let mut state = task.test_state().lock().unwrap();
-            if state.remote_admission_note.as_deref() != Some("queued on the runner (42 s)") {
+            if state.remote_admission_note().as_deref() != Some("queued on the runner (42 s)") {
                 return None;
             }
             // Metadata is saved before the ephemeral line is published. Wait for
@@ -1498,7 +1501,7 @@ async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
                 state.metadata().remote.as_ref().unwrap().queue_wait_ms,
                 Some(42_000)
             );
-            state.remote_admission_note = None;
+            *state.remote_admission_note_mut() = None;
             assert_eq!(
                 remote_phase_note(&state.metadata(), unix_millis()).as_deref(),
                 Some("queued on the runner (42 s)")
@@ -1557,14 +1560,14 @@ async fn remote_queue_wait_wire_vectors_reach_bash_status_as_queued_progress() {
         let task = ctx.bash_background().test_task(&task_id).unwrap();
         wait_for("published queue-wait bytes must reach bash status", || {
             let mut state = task.test_state().lock().unwrap();
-            if state.remote_admission_note.as_deref() != Some("queued on the runner (0 s)") {
+            if state.remote_admission_note().as_deref() != Some("queued on the runner (0 s)") {
                 return None;
             }
             assert_eq!(
                 state.metadata().remote.as_ref().unwrap().queue_wait_ms,
                 Some(42)
             );
-            state.remote_admission_note = None;
+            *state.remote_admission_note_mut() = None;
             Some(())
         })
         .await;
@@ -1858,7 +1861,7 @@ async fn exec_remote_bash_no_policy_and_disabled_are_byte_identical_local_output
         let task = response.data["task_id"].as_str().unwrap();
         let done = terminal(ctx.bash_background(), task).await;
         let task = ctx.bash_background().test_task(task).unwrap();
-        assert!(task.test_state().lock().unwrap().metadata.remote.is_none());
+        assert!(task.test_state().lock().unwrap().metadata().remote.is_none());
         outputs.push((
             fs::read(&task.paths().stdout).unwrap(),
             fs::read(&task.paths().stderr).unwrap(),
@@ -2066,7 +2069,7 @@ async fn runon_windows_advertised_preserves_request_mapping_and_full_exit_code()
         let saved = read_task(&task.paths().json).unwrap();
         assert_eq!(saved.exit_code, Some(i64::from(code)));
         let conn = crate::db::open(&dir.path().join("roundtrip.db")).unwrap();
-        let row = saved.to_bash_task_row("broca", &task.paths).unwrap();
+        let row = saved.to_bash_task_row("broca", &task.paths()).unwrap();
         crate::db::bash_tasks::upsert_bash_task(&conn, &row).unwrap();
         let restored_row = crate::db::bash_tasks::get_bash_task(&conn, "broca", "session", task_id)
             .unwrap()
@@ -2147,7 +2150,7 @@ async fn runon_windows_unacknowledged_platform_cancels_and_distrusts_exit() {
         "{reply:?}"
     );
     assert!(daemon
-        .log
+        .log()
         .lock()
         .unwrap()
         .iter()
@@ -2763,7 +2766,7 @@ async fn without_runon_new_shape_plans_keep_commands_local() {
     let done = terminal(ctx.bash_background(), &task_id).await;
     assert!(exec_runs(&daemon).is_empty());
     let task = ctx.bash_background().test_task(&task_id).unwrap();
-    assert!(task.test_state().lock().unwrap().metadata.remote.is_none());
+    assert!(task.test_state().lock().unwrap().metadata().remote.is_none());
     assert_eq!(
         crate::commands::bash_orchestrate::format_foreground_result(&done),
         "local-proof"
