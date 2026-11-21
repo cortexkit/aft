@@ -231,7 +231,8 @@ impl BashStartupStepSnapshot {
 #[derive(Clone, Copy)]
 /// Fixture clock shared by the startup reply timer and receipt commit fence.
 /// Freezing time never overrides an already refused or committed receipt.
-pub(crate) enum StartupClockForTest {
+#[doc(hidden)]
+pub enum StartupClockForTest {
     Frozen,
     Expired,
 }
@@ -340,7 +341,8 @@ impl SpawnReceipt {
     }
 
     #[cfg(feature = "test-timing-hooks")]
-    pub(crate) fn startup_clock_for_test(&self) -> Option<StartupClockForTest> {
+    #[doc(hidden)]
+    pub fn startup_clock_for_test(&self) -> Option<StartupClockForTest> {
         self.startup_clock_for_test
     }
 

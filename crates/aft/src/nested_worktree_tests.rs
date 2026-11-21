@@ -212,7 +212,7 @@ fn glob_fallback_skips_nested_worktrees() {
 fn trigram_index_holds_no_nested_worktree_files() {
     let (_dir, fixture) = fixture();
     let root = &fixture.root;
-    let index = crate::search_index::SearchIndex::build(root);
+    let index = aft_engine::test_bridge::search_misc::search_index_fixture::build(root);
     assert!(index.is_ready(), "fixture index must build");
     let snapshot = index.snapshot();
     assert!(snapshot.has_file_in_scope(&root.join("src/main.rs")));

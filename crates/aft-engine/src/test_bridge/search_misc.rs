@@ -470,3 +470,6 @@ pub use hook_extensions::{
     root_identity, semantic_index, standing_roots, synapse_embed, watcher_filter, CountsTestExt,
     DaemonTestExt, IdleLspFixtureTestExt,
 };
+pub mod search_index_fixture {
+    pub use crate::search_index::fixture_build::{build, build_with_limit};
+}

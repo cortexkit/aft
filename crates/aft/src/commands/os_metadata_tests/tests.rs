@@ -5,7 +5,6 @@ use serde_json::json;
 use crate::context::AppContext;
 use crate::parser::TreeSitterProvider;
 
-use crate::search_index::SearchIndex;
 #[allow(unused_imports)]
 pub(crate) use aft_base::os_metadata::tests::*;
 
@@ -60,7 +59,10 @@ fn nested_metadata_files_are_skipped_at_any_depth() {
     let files: &[&str] = &["a/b/.DS_Store", "a/desktop.ini", "a/b/c/._notes.rs"];
     let (_dir, root) = fixture(files);
 
-    assert_eq!(SearchIndex::build(&root).file_count(), 0);
+    assert_eq!(
+        aft_engine::test_bridge::search_misc::search_index_fixture::build(&root).file_count(),
+        0
+    );
     assert_eq!(glob_all(&root, false), Vec::<String>::new());
 }
 

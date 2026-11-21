@@ -503,7 +503,11 @@ mod tests {
         for at in 0..FILES {
             std::fs::write(root.join(format!("file-{at:02}.rs")), &content).unwrap();
         }
-        let index = SearchIndex::build_with_limit(&root, (content.len() + 1) as u64).snapshot();
+        let index = aft_engine::test_bridge::search_misc::search_index_fixture::build_with_limit(
+            &root,
+            (content.len() + 1) as u64,
+        )
+        .snapshot();
         let CompileResult::Ok(pattern) = compile(".+", CompileOpts::default()) else {
             panic!("line-local regex");
         };
@@ -895,7 +899,8 @@ mod tests {
         .expect("write a.rs");
         std::fs::write(root.join("b.md"), "alpha beta\n").expect("write b.md");
         std::fs::write(root.join("c.json"), "{\"beta\": 1}\n").expect("write c.json");
-        let snapshot = SearchIndex::build(&root).snapshot();
+        let snapshot =
+            aft_engine::test_bridge::search_misc::search_index_fixture::build(&root).snapshot();
         let CompileResult::Ok(pattern) = compile("alpha|beta", CompileOpts::default()) else {
             panic!("pattern compiles");
         };

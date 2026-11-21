@@ -751,7 +751,7 @@ pub struct SandboxSpawnObservation {
 static TEST_OBSERVATIONS: OnceLock<Mutex<HashMap<PathBuf, Vec<SandboxSpawnObservation>>>> =
     OnceLock::new();
 
-#[cfg(all(unix, any(test, feature = "test-hooks")))]
+#[cfg(all(unix, any(test, feature = "test-hooks", feature = "test-support")))]
 static TEST_LAUNCHERS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::new();
 
 thread_local! {
@@ -5899,7 +5899,7 @@ fn observation_key(project_root: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
     if let Some(launchers) = TEST_LAUNCHERS.get() {
         if let Some(root) = ctx.config().project_root.as_deref() {
             if let Some(path) = launchers
@@ -5915,37 +5915,10 @@ fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
     crate::pinned_executable::path()
 }
 
-/// Use the real aft executable for an in-process integration fixture. The test
-/// harness cannot re-exec itself as `aft sandbox-launch`; it only accepts libtest
-/// arguments. Only executable selection changes, not the native sandbox policy.
+#[cfg(all(unix, any(test, feature = "test-hooks", feature = "test-support")))]
+pub(crate) mod launcher_fixture;
 #[cfg(all(unix, any(test, feature = "test-hooks")))]
-#[doc(hidden)]
-pub fn install_sandbox_launcher_for_test(project_root: &Path, launcher_path: PathBuf) -> impl Drop {
-    struct LauncherScope(PathBuf, Option<PathBuf>);
-
-    impl Drop for LauncherScope {
-        fn drop(&mut self) {
-            let mut launchers = TEST_LAUNCHERS
-                .get()
-                .expect("sandbox launcher test map installed")
-                .lock()
-                .expect("sandbox launcher test mutex poisoned");
-            if let Some(previous) = self.1.take() {
-                launchers.insert(self.0.clone(), previous);
-            } else {
-                launchers.remove(&self.0);
-            }
-        }
-    }
-
-    let root = observation_key(project_root);
-    let previous = TEST_LAUNCHERS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .expect("sandbox launcher test mutex poisoned")
-        .insert(root.clone(), launcher_path);
-    LauncherScope(root, previous)
-}
+pub use launcher_fixture::install_sandbox_launcher_for_test;
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() -> R) -> R {

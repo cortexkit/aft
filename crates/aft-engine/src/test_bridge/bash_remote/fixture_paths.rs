@@ -164,6 +164,8 @@ pub mod bash_background {
 pub mod sandbox_spawn {
     #[cfg(target_os = "macos")]
     pub use super::super::sandbox::probe_command_for_plan;
+    #[cfg(unix)]
+    pub use crate::sandbox_spawn::launcher_fixture::install_sandbox_launcher_for_test;
 
     #[cfg(target_os = "linux")]
     pub mod remote {
