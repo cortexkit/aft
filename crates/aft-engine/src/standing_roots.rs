@@ -315,7 +315,8 @@ impl ArtifactLifecycle {
 
 impl StandingRoots {
     /// Idle passes retain verified identity until repository evidence changes.
-    pub(crate) fn reconcile_background(
+    #[doc(hidden)]
+    pub fn reconcile_background(
         &self,
         config: &Config,
     ) -> Result<StandingReconcileReport, StandingRootsError> {

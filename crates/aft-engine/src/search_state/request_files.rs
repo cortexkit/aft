@@ -52,7 +52,8 @@ pub struct FileStat {
 }
 
 impl FileStat {
-    pub(crate) fn of(metadata: &std::fs::Metadata) -> Self {
+    #[doc(hidden)]
+    pub fn of(metadata: &std::fs::Metadata) -> Self {
         Self {
             size: metadata.len(),
             modified: metadata.modified().ok(),
@@ -92,7 +93,8 @@ impl RequestFile {
         Self::new(bytes, stat)
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
+    #[doc(hidden)]
+    pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
@@ -103,19 +105,22 @@ impl RequestFile {
     }
 
     /// Blake3 of the bytes, the digest the exact lane's caches are keyed by.
-    pub(crate) fn digest(&self) -> blake3::Hash {
+    #[doc(hidden)]
+    pub fn digest(&self) -> blake3::Hash {
         *self.digest.get_or_init(|| blake3::hash(&self.bytes))
     }
 
     /// The bytes as text when they are valid UTF-8 (what `read_to_string`
     /// accepts).
-    pub(crate) fn utf8(&self) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn utf8(&self) -> Option<&str> {
         std::str::from_utf8(&self.bytes).ok()
     }
 
     /// The bytes decoded as `String::from_utf8_lossy` decodes them, built
     /// once.
-    pub(crate) fn lossy_text(&self) -> &str {
+    #[doc(hidden)]
+    pub fn lossy_text(&self) -> &str {
         let lossy = self
             .lossy
             .get_or_init(|| match String::from_utf8_lossy(&self.bytes) {
@@ -246,7 +251,8 @@ impl RequestFiles {
     }
 
     /// The kept bytes of `path`, without reading the disk.
-    pub(crate) fn kept(&self, path: &Path) -> Option<Arc<RequestFile>> {
+    #[doc(hidden)]
+    pub fn kept(&self, path: &Path) -> Option<Arc<RequestFile>> {
         let slot = self.slots.lock().get(path).cloned()?;
         let file = slot.file.lock().clone()?;
         self.served.fetch_add(1, Ordering::Relaxed);
@@ -258,7 +264,8 @@ impl RequestFiles {
     /// phase's own way to read the file (its admission checks, deadline and
     /// size bounds), and returns the stat it took before reading, if any. A
     /// failed read keeps nothing, so the next phase tries its own read.
-    pub(crate) fn read(
+    #[doc(hidden)]
+    pub fn read(
         &self,
         path: &Path,
         read: impl FnOnce(&Path) -> io::Result<(Vec<u8>, Option<FileStat>)>,
@@ -340,7 +347,8 @@ impl RequestFiles {
 
     /// Stop keeping `path`: a phase read it fresh and rejected it, so no
     /// later phase is expected to want it.
-    pub(crate) fn release(&self, path: &Path) {
+    #[doc(hidden)]
+    pub fn release(&self, path: &Path) {
         let Some(slot) = self.slots.lock().get(path).cloned() else {
             return;
         };
@@ -354,7 +362,8 @@ impl RequestFiles {
     /// The matching line of `path` for `query` within `range`, computed once
     /// per request. Successful no-match results are cached; failed computations
     /// are returned without caching, so a later phase can retry the read.
-    pub(crate) fn matching_line_checked(
+    #[doc(hidden)]
+    pub fn matching_line_checked(
         &self,
         path: &Path,
         query: &str,

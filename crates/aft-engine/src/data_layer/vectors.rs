@@ -365,7 +365,8 @@ impl Coverage {
             && self.grammar_outline_failures().next().is_none()
     }
 
-    pub(crate) fn grammar_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
+    #[doc(hidden)]
+    pub fn grammar_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
         self.files_failed.iter().filter(|(path, reason)| {
             super::grammar::downloaded_language(path)
                 .is_some_and(|language| *reason == outline_failed_reason(language))

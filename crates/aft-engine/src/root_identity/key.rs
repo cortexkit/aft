@@ -172,21 +172,21 @@ pub(crate) fn artifact_cache_key_read_only(
 #[derive(Debug, Default)]
 #[doc(hidden)]
 pub struct ArtifactCacheKeyTimings {
-    pub(crate) git_usable: Duration,
-    pub(crate) rev_list: Duration,
+    pub git_usable: Duration,
+    pub rev_list: Duration,
     /// Git processes actually started, including unborn-branch verification.
-    pub(crate) git_spawns: usize,
+    pub git_spawns: usize,
     /// Full history traversals, excluding cheap HEAD verification on reuse.
     pub(crate) root_walks: usize,
-    pub(crate) retry_wait: Duration,
-    pub(crate) memo_wait: Duration,
-    pub(crate) memo_hold: Duration,
-    pub(crate) memo_load: Duration,
-    pub(crate) memo_prune: Duration,
-    pub(crate) memo_write: Duration,
-    pub(crate) legacy_memo: Duration,
-    pub(crate) context_memo_wait: Duration,
-    pub(crate) context_cache_hit: bool,
+    pub retry_wait: Duration,
+    pub memo_wait: Duration,
+    pub memo_hold: Duration,
+    pub memo_load: Duration,
+    pub memo_prune: Duration,
+    pub memo_write: Duration,
+    pub legacy_memo: Duration,
+    pub context_memo_wait: Duration,
+    pub context_cache_hit: bool,
 }
 
 fn time_cache_key_work<T>(elapsed: &mut Duration, run: impl FnOnce() -> T) -> T {

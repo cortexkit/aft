@@ -18,7 +18,7 @@ impl LspManager {
 
     /// Process exit must also reap clients detached when their last route closed.
     /// Their shutdown threads cannot be relied on after the daemon exits.
-    pub(crate) fn shutdown_at_process_exit(
+    pub fn shutdown_at_process_exit(
         clients: Vec<(ServerKey, LspClient)>,
         registry: LspChildRegistry,
     ) -> LspShutdownAllOutcome {
@@ -193,7 +193,7 @@ impl LspManager {
     /// Shut down taken clients on a detached thread named `aft-lsp-idle-reap`.
     /// Idle reapers use this so a hung Shutdown handshake cannot stall the
     /// daemon loop or hold the manager mutex.
-    pub(crate) fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
+    pub fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
         if clients.is_empty() {
             return;
         }

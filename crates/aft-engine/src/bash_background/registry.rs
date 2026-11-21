@@ -883,7 +883,7 @@ pub struct BgCompletion {
 }
 
 impl BgCompletion {
-    pub(crate) fn into_push_frame(self) -> PushFrame {
+    pub fn into_push_frame(self) -> PushFrame {
         let mut frame = BashCompletedFrame::new(
             self.task_id,
             self.session_id,
@@ -1266,7 +1266,7 @@ pub struct ProjectReplayBatch<'a> {
 }
 
 impl ProjectReplayBatch<'_> {
-    pub(crate) fn replay_session_for_project(
+    pub fn replay_session_for_project(
         self,
         storage_dir: &Path,
         harness: &Harness,
@@ -1298,7 +1298,7 @@ impl ProjectReplayBatch<'_> {
         )
     }
 
-    pub(crate) fn continue_project_replay(
+    pub fn continue_project_replay(
         self,
         storage_dir: &Path,
         harness: &Harness,
@@ -1365,9 +1365,9 @@ mod task_image_cleanup;
 const MAX_DUPLICATE_COMMAND_TASKS_TO_CHECK: usize = 128;
 
 pub struct DuplicateRunningTask {
-    pub(crate) task_id: String,
-    pub(crate) age: Duration,
-    pub(crate) same_session: bool,
+    pub task_id: String,
+    pub age: Duration,
+    pub same_session: bool,
 }
 
 #[path = "task_access.rs"]
@@ -1738,7 +1738,7 @@ impl BashDrainReplyCache {
         }
     }
 
-    pub(crate) fn snapshot(&self) -> BashDrainReplyState {
+    pub fn snapshot(&self) -> BashDrainReplyState {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2221,7 +2221,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn changed_files_budget(
+    pub fn changed_files_budget(
         &self,
         task_id: &str,
         deadline: Option<Instant>,
@@ -2364,7 +2364,7 @@ impl BgTaskRegistry {
             .map(|(_, job)| Arc::clone(job))
     }
 
-    pub(crate) fn append_db_hint(&self, task_id: &str, text: &mut String) {
+    pub fn append_db_hint(&self, task_id: &str, text: &mut String) {
         #[cfg(unix)]
         if let Some(job) = self.db_hint_job(task_id) {
             if let Some(hint) = job.hint() {
@@ -2425,11 +2425,7 @@ impl BgTaskRegistry {
             .is_some()
     }
 
-    pub(crate) fn is_readable_session_owned_artifact_path(
-        &self,
-        session_id: &str,
-        path: &Path,
-    ) -> bool {
+    pub fn is_readable_session_owned_artifact_path(&self, session_id: &str, path: &Path) -> bool {
         let Ok(requested) = fs::canonicalize(path) else {
             return false;
         };
@@ -2543,7 +2539,7 @@ impl BgTaskRegistry {
 
     /// Bound artifact access as well as the scan loop: a slow disk must not
     /// spend the watch's reply-delivery margin inside a single page read.
-    pub(crate) fn read_artifact_page_until(
+    pub fn read_artifact_page_until(
         &self,
         task_id: &str,
         session_id: &str,
@@ -2571,7 +2567,7 @@ impl BgTaskRegistry {
         })
     }
 
-    pub(crate) fn read_artifact_page(
+    pub fn read_artifact_page(
         &self,
         task_id: &str,
         session_id: &str,
@@ -2681,7 +2677,7 @@ impl BgTaskRegistry {
         *self.inner.before_bootstrap_release.lock().unwrap() = Some((arrived, release));
     }
 
-    pub(crate) fn speech_database_path(&self) -> Option<PathBuf> {
+    pub fn speech_database_path(&self) -> Option<PathBuf> {
         self.inner
             .speech_db_path
             .read()
@@ -2689,7 +2685,7 @@ impl BgTaskRegistry {
             .clone()
     }
 
-    pub(crate) fn queued_bot_writes(&self, session: &str, task: &str) -> Option<u64> {
+    pub fn queued_bot_writes(&self, session: &str, task: &str) -> Option<u64> {
         let mut paths = std::collections::BTreeSet::new();
         if let Some(path) = self.speech_database_path() {
             paths.insert(path);
@@ -2824,7 +2820,7 @@ impl BgTaskRegistry {
         self.inner.compression_aggregates.clear();
     }
 
-    pub(crate) fn claim_bash_env_disclosure(&self, session_id: &str) -> bool {
+    pub fn claim_bash_env_disclosure(&self, session_id: &str) -> bool {
         self.inner
             .bash_env_disclosed_sessions
             .lock()
@@ -2878,7 +2874,7 @@ impl BgTaskRegistry {
         self.register_foreground_task(session_id, task_id);
     }
 
-    pub(crate) fn foreground_wait_guard(
+    pub fn foreground_wait_guard(
         &self,
         session_id: &str,
         task_id: &str,
@@ -3072,7 +3068,7 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
-    pub(crate) fn wait_mode_detach_pending(&self, session_id: &str) -> bool {
+    pub fn wait_mode_detach_pending(&self, session_id: &str) -> bool {
         self.inner
             .wait_detach
             .lock()
@@ -3080,7 +3076,7 @@ impl BgTaskRegistry {
             .unwrap_or(false)
     }
 
-    pub(crate) async fn terminal_transition_notified(&self) {
+    pub async fn terminal_transition_notified(&self) {
         self.inner.terminal_transition.notified().await;
     }
 
@@ -3282,7 +3278,7 @@ impl BgTaskRegistry {
         snapshot
     }
 
-    pub(crate) fn execution_note(&self, task_id: &str, session: &str) -> Option<String> {
+    pub fn execution_note(&self, task_id: &str, session: &str) -> Option<String> {
         let task = self.task_for_session(task_id, session)?;
         let state = task.lock_state().ok()?;
         rendered_execution_note(&state.metadata)
@@ -3290,7 +3286,7 @@ impl BgTaskRegistry {
 
     /// Resolve a runner job alias only within the caller's own task records.
     /// Leave misses unchanged so the tool's ordinary task-not-found path applies.
-    pub(crate) fn resolve_task_reference(
+    pub fn resolve_task_reference(
         &self,
         reference: &str,
         session: &str,
@@ -3332,7 +3328,7 @@ impl BgTaskRegistry {
 
     /// `None` means this was not an explicit runon request. Local commands and
     /// commands routed remotely by legacy configuration retain immediate launches.
-    pub(crate) fn runon_launch_pending(&self, task_id: &str, session: &str) -> Option<bool> {
+    pub fn runon_launch_pending(&self, task_id: &str, session: &str) -> Option<bool> {
         let task = self.task_for_session(task_id, session)?;
         let state = task.lock_state().ok()?;
         state
@@ -3345,7 +3341,7 @@ impl BgTaskRegistry {
 
     /// Only the remote stream's `Accepted` record proves the runner copied inputs;
     /// the dispatch worker can also finish after an uncaptured refusal or error.
-    pub(crate) fn runon_inputs_captured(&self, task_id: &str, session: &str) -> Option<bool> {
+    pub fn runon_inputs_captured(&self, task_id: &str, session: &str) -> Option<bool> {
         let task = self.task_for_session(task_id, session)?;
         let state = task.lock_state().ok()?;
         let remote = state
@@ -3356,17 +3352,13 @@ impl BgTaskRegistry {
         Some(remote.accepted)
     }
 
-    pub(crate) fn runon_launch_state(
-        &self,
-        task_id: &str,
-        session: &str,
-    ) -> Option<RunonLaunchState> {
+    pub fn runon_launch_state(&self, task_id: &str, session: &str) -> Option<RunonLaunchState> {
         let task = self.task_for_session(task_id, session)?;
         let launch = task.runon_launch_state.lock().ok()?.clone();
         launch
     }
 
-    pub(crate) fn drain_reply_cache(&self, task_id: &str, session: &str) -> BashDrainReplyCache {
+    pub fn drain_reply_cache(&self, task_id: &str, session: &str) -> BashDrainReplyCache {
         // Startup can hand back an ID before inserting the task. Keep that
         // target and the eventual task on the same slot, without retaining
         // cache values after both have gone away.
@@ -3395,17 +3387,13 @@ impl BgTaskRegistry {
         cache
     }
 
-    pub(crate) fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
+    pub fn is_remote_task(&self, task_id: &str, session: &str) -> bool {
         self.task_for_session(task_id, session)
             .is_some_and(|t| t.lock_state().is_ok_and(|s| s.metadata.remote.is_some()))
     }
 
     /// A remote task's job ID and phase; `None` for a local task.
-    pub(crate) fn remote_progress(
-        &self,
-        task_id: &str,
-        session: &str,
-    ) -> Option<remote::RemoteProgress> {
+    pub fn remote_progress(&self, task_id: &str, session: &str) -> Option<remote::RemoteProgress> {
         self.task_for_session(task_id, session)?
             .lock_state()
             .ok()?
@@ -4085,7 +4073,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn unknown_bash_result_for_task(
+    pub fn unknown_bash_result_for_task(
         &self,
         task_id: &str,
         session_id: &str,
@@ -4114,7 +4102,7 @@ impl BgTaskRegistry {
 
     /// Record a finished shell call when its attachment left after the task
     /// already exited. Otherwise no later terminal write would store its result.
-    pub(crate) fn settle_detached_call(&self, task_id: &str) {
+    pub fn settle_detached_call(&self, task_id: &str) {
         let Some(task) = self.task(task_id) else {
             return;
         };
@@ -4134,7 +4122,7 @@ impl BgTaskRegistry {
     /// Persist the result of a program's shell call in the call ledger after
     /// its initial tool reply hands off the still-running task. Flush an
     /// already-terminal task as well, so a racing completion cannot be lost.
-    pub(crate) fn hold_running_call(
+    pub fn hold_running_call(
         &self,
         task_id: &str,
         body: &[u8],
@@ -4627,7 +4615,7 @@ impl BgTaskRegistry {
         self.observed_erased_watch_reference(task_id)
     }
 
-    pub(crate) fn observed_erased_watch_reference(&self, task_id: &str) -> bool {
+    pub fn observed_erased_watch_reference(&self, task_id: &str) -> bool {
         if let Some(identity) = super::TaskIdentity::current() {
             if !self.task_identity_allows_current(&identity.session, task_id) {
                 return false;
@@ -4841,7 +4829,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn retain_retry_gap(
+    pub fn retain_retry_gap(
         &self,
         harness: &str,
         candidate: &crate::task_watch_lines::Candidate,
@@ -7100,7 +7088,7 @@ impl BgTaskRegistry {
 
     /// Reserve in memory without scanning or waiting for an earlier replay
     /// batch while holding lifecycle admission.
-    pub(crate) fn claim_project_replay_batch(&self) -> Option<ProjectReplayBatch<'_>> {
+    pub fn claim_project_replay_batch(&self) -> Option<ProjectReplayBatch<'_>> {
         self.inner
             .project_replay_batch_claimed
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -7113,11 +7101,11 @@ impl BgTaskRegistry {
         self.task(task_id).map(|task| Arc::as_ptr(&task) as usize)
     }
 
-    pub(crate) fn task_registration_exists(&self, task_id: &str) -> bool {
+    pub fn task_registration_exists(&self, task_id: &str) -> bool {
         self.task(task_id).is_some()
     }
 
-    pub(crate) fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {
+    pub fn project_replay_pending(&self, storage_dir: &Path, project_root: &Path) -> bool {
         let project_root = canonicalized_path(project_root);
         self.inner
             .project_replay_scan
@@ -7133,7 +7121,7 @@ impl BgTaskRegistry {
             })
     }
 
-    pub(crate) fn project_replay_retry_at(&self) -> Option<Instant> {
+    pub fn project_replay_retry_at(&self) -> Option<Instant> {
         self.inner
             .project_replay_scan
             .lock()
@@ -7190,7 +7178,7 @@ impl BgTaskRegistry {
         Ok(self.project_replay_pending(storage_dir, project_root))
     }
 
-    pub(crate) fn repair_legacy_root_tasks(&self, storage_root: &Path, harness: Harness) {
+    pub fn repair_legacy_root_tasks(&self, storage_root: &Path, harness: Harness) {
         let root_tasks = storage_root.join("bash-tasks");
         // Replayed tasks pin their artifact directories, including after exit.
         // Defer their migration to a later daemon rather than invalidate those
@@ -7956,7 +7944,7 @@ impl BgTaskRegistry {
     /// deferred session replay. The lookup is confined to the route's storage
     /// namespace and session directory: it never scans other sessions or uses
     /// the project-wide relaxed status fallback.
-    pub(crate) fn recover_watch_task(
+    pub fn recover_watch_task(
         &self,
         storage_dir: &Path,
         session_id: &str,
@@ -7977,7 +7965,7 @@ impl BgTaskRegistry {
     /// Restore an explicitly requested task before an owning session kills it.
     /// Delivered terminals are omitted by project replay, but may still name
     /// a runner job whose outcome is unknown.
-    pub(crate) fn recover_kill_task(
+    pub fn recover_kill_task(
         &self,
         storage_dir: &Path,
         session_id: &str,
@@ -9072,7 +9060,7 @@ impl BgTaskRegistry {
     }
 
     /// Counts and work ages only: no snapshots, output reads, process probes or database access.
-    pub(crate) fn try_route_census(&self) -> Option<Vec<RouteCensusTask>> {
+    pub fn try_route_census(&self) -> Option<Vec<RouteCensusTask>> {
         let tasks = self.inner.tasks.try_lock().ok()?;
         let watches = self.inner.watch_registry.try_lock().ok()?;
         let now_ms = unix_millis();
@@ -9098,7 +9086,7 @@ impl BgTaskRegistry {
         Some(rows)
     }
 
-    pub(crate) fn try_scope_background_tasks(
+    pub fn try_scope_background_tasks(
         &self,
         scope: &scoped_tasks::Selector,
         remaining: &mut usize,
@@ -9125,7 +9113,7 @@ impl BgTaskRegistry {
         Ok((known, running))
     }
 
-    pub(crate) fn notice_metadata(&self, task_id: &str) -> Option<PersistedTask> {
+    pub fn notice_metadata(&self, task_id: &str) -> Option<PersistedTask> {
         let task = self.task(task_id)?;
         let mut metadata = task.lock_state().ok()?.metadata.clone();
         metadata.completion_delivered |= task
@@ -9137,11 +9125,7 @@ impl BgTaskRegistry {
 
     /// Resolve a terminal hold even when no persistence callback reaches it,
     /// then keep the delivery decision fenced through the actual notice send.
-    pub(crate) fn send_runner_completion<T>(
-        &self,
-        task_id: &str,
-        send: impl FnOnce() -> T,
-    ) -> Option<T> {
+    pub fn send_runner_completion<T>(&self, task_id: &str, send: impl FnOnce() -> T) -> Option<T> {
         self.settle_detached_call(task_id);
         let task = self.task(task_id)?;
         let mut delivery = task
@@ -9426,7 +9410,7 @@ impl BgTaskRegistry {
         batches
     }
 
-    pub(crate) fn observed_status(
+    pub fn observed_status(
         &self,
         task_id: &str,
         session_id: &str,
@@ -9441,7 +9425,7 @@ impl BgTaskRegistry {
     /// acknowledging, or populating output caches. If the task is not already
     /// registered, read its session's persisted bundle without starting recovery
     /// and its watchdog.
-    pub(crate) fn observation_status(
+    pub fn observation_status(
         &self,
         task_id: &str,
         session_id: &str,
@@ -9489,7 +9473,7 @@ impl BgTaskRegistry {
         Some((snapshot, resolved.paths))
     }
 
-    pub(crate) fn observation_artifact_page_until(
+    pub fn observation_artifact_page_until(
         &self,
         paths: TaskPaths,
         artifact: TaskArtifact,
@@ -9514,7 +9498,7 @@ impl BgTaskRegistry {
     }
 
     /// Explain failed adoption without importing a task from another namespace.
-    pub(crate) fn unadopted_task_message(
+    pub fn unadopted_task_message(
         &self,
         task_id: &str,
         session_id: &str,
@@ -9564,7 +9548,7 @@ impl BgTaskRegistry {
     /// Arm while the registered child handle still protects its process identity.
     /// Readiness only wakes the caller; the ordinary status poll still owns
     /// reaping, exit-marker interpretation and the final output read.
-    pub(crate) fn observe_foreground_exit(
+    pub fn observe_foreground_exit(
         &self,
         task_id: &str,
         session_id: &str,
@@ -9593,7 +9577,7 @@ impl BgTaskRegistry {
     /// task's child, so a piped command's exit is noticed between watchdog
     /// passes, but builds no snapshot: a snapshot opens task files on disk,
     /// and every held call asks this once per poll interval.
-    pub(crate) fn wait_target_finished(&self, task_id: &str, session_id: &str) -> bool {
+    pub fn wait_target_finished(&self, task_id: &str, session_id: &str) -> bool {
         if validate_task_id(task_id).is_err() {
             return true;
         }
@@ -9606,7 +9590,7 @@ impl BgTaskRegistry {
 
     /// Read a finished task's files without registering tasks, rewriting records,
     /// or starting threads to monitor surviving processes.
-    pub(crate) fn terminal_status_from_disk(
+    pub fn terminal_status_from_disk(
         &self,
         task_id: &str,
         session_id: &str,
@@ -9682,7 +9666,7 @@ impl BgTaskRegistry {
         )
     }
 
-    pub(crate) fn status_settled_owned(
+    pub fn status_settled_owned(
         &self,
         task_id: &str,
         session_id: &str,
@@ -10057,7 +10041,7 @@ impl BgTaskRegistry {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn kill_relaxed_typed(
+    pub fn kill_relaxed_typed(
         &self,
         task_id: &str,
         project_root: &Path,
@@ -10801,7 +10785,7 @@ impl BgTaskRegistry {
     /// Kill a running call's task because its caller withdrew the call
     /// (`tool.withdraw`). The task is named by the call ledger row, so it is
     /// found by id alone; its status reason is [`WITHDRAWN_REASON`].
-    pub(crate) fn kill_withdrawn(&self, task_id: &str) -> Result<BgTaskSnapshot, String> {
+    pub fn kill_withdrawn(&self, task_id: &str) -> Result<BgTaskSnapshot, String> {
         let session_id = self
             .task(task_id)
             .map(|task| task.session_id.clone())
@@ -10820,7 +10804,7 @@ impl BgTaskRegistry {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn kill_typed(
+    pub fn kill_typed(
         &self,
         task_id: &str,
         session_id: &str,
@@ -10916,11 +10900,7 @@ impl BgTaskRegistry {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn promote_typed(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Result<bool, RegistryError> {
+    pub fn promote_typed(&self, task_id: &str, session_id: &str) -> Result<bool, RegistryError> {
         let task = self
             .task_for_session(task_id, session_id)
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
@@ -10992,7 +10972,7 @@ impl BgTaskRegistry {
     /// [`Self::take_cancelled_call_notices`]). The flag is written to the
     /// task's record, so the notice survives an AFT restart. A task that has
     /// already finished is left alone: its completion notice reports it.
-    pub(crate) fn note_cancelled_call(&self, task_id: &str, session_id: &str) {
+    pub fn note_cancelled_call(&self, task_id: &str, session_id: &str) {
         let Some(task) = self.task_for_session(task_id, session_id) else {
             return;
         };
@@ -11058,7 +11038,7 @@ impl BgTaskRegistry {
 
     /// Records the worker wait limit in force, which a task reloaded after a
     /// restart is granted from the restart (see `insert_rehydrated_task`).
-    pub(crate) fn set_worker_wait_window(&self, window: Duration) {
+    pub fn set_worker_wait_window(&self, window: Duration) {
         self.inner
             .worker_wait_window_ms
             .store(window.as_millis() as u64, Ordering::Relaxed);
@@ -11083,7 +11063,7 @@ impl BgTaskRegistry {
     /// worker polling every second costs about one write a minute. Without
     /// the write, a restart would reload the 30-minute limit and kill a long
     /// watched build at once.
-    pub(crate) fn renew_hard_kill(
+    pub fn renew_hard_kill(
         &self,
         task_id: &str,
         session_id: &str,
@@ -11147,11 +11127,7 @@ impl BgTaskRegistry {
     }
 
     /// The task's own kill deadline, for replies that hand the task back.
-    pub(crate) fn hard_kill_deadline(
-        &self,
-        task_id: &str,
-        session_id: &str,
-    ) -> Option<HardKillDeadline> {
+    pub fn hard_kill_deadline(&self, task_id: &str, session_id: &str) -> Option<HardKillDeadline> {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.lock_state().ok()?;
         if state.metadata.remote.is_some() {
@@ -11162,7 +11138,7 @@ impl BgTaskRegistry {
 
     /// Time left until the task's own hard kill, measured from its monotonic
     /// start time so wait handoffs can avoid racing a timeout terminal.
-    pub(crate) fn hard_kill_remaining(&self, task_id: &str, session_id: &str) -> Option<Duration> {
+    pub fn hard_kill_remaining(&self, task_id: &str, session_id: &str) -> Option<Duration> {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.lock_state().ok()?;
         if state.metadata.status.is_terminal() || state.metadata.remote.is_some() {
@@ -11174,7 +11150,7 @@ impl BgTaskRegistry {
 
     /// The task's hard-kill limit and the command start time that its absolute
     /// deadline is measured from.
-    pub(crate) fn hard_kill_deadline_with_start(
+    pub fn hard_kill_deadline_with_start(
         &self,
         task_id: &str,
         session_id: &str,
@@ -11682,7 +11658,7 @@ impl BgTaskRegistry {
         self.unacked_wake_count_for_session(Some(session_id)) > 0
     }
 
-    pub(crate) fn has_unacked_wakes_for_identity(&self, identity: &super::TaskIdentity) -> bool {
+    pub fn has_unacked_wakes_for_identity(&self, identity: &super::TaskIdentity) -> bool {
         self.inner.completions.lock().map_or(true, |completions| {
             completions.iter().any(|completion| {
                 completion.session_id == identity.session
@@ -11723,7 +11699,7 @@ impl BgTaskRegistry {
 
     /// Consume a terminal result returned directly to its originating session,
     /// without treating a running-status poll or a foreign observation as ack.
-    pub(crate) fn ack_terminal_result_for_session(&self, task_id: &str, session_id: &str) {
+    pub fn ack_terminal_result_for_session(&self, task_id: &str, session_id: &str) {
         let Some(task) = self.task_for_session(task_id, session_id) else {
             return;
         };
@@ -11927,7 +11903,7 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn runner_completion_delivery_cutover(&self) -> Result<u64, String> {
+    pub fn runner_completion_delivery_cutover(&self) -> Result<u64, String> {
         self.inner
             .runner_completion_delivery_cutover
             .get()
@@ -11935,24 +11911,24 @@ impl BgTaskRegistry {
             .ok_or_else(|| "runner completion delivery cutover is not initialized".into())
     }
 
-    pub(crate) fn completion_finished_at(&self, task_id: &str) -> Option<u64> {
+    pub fn completion_finished_at(&self, task_id: &str) -> Option<u64> {
         self.runner_completion_state(task_id)?
             .completion_finished_at
     }
 
-    pub(crate) fn runner_completion_state(&self, task_id: &str) -> Option<BashDrainReplyState> {
+    pub fn runner_completion_state(&self, task_id: &str) -> Option<BashDrainReplyState> {
         Some(self.task(task_id)?.drain_reply.snapshot())
     }
 
     /// Reserve in memory only; the completion writer persists the returned count.
-    pub(crate) fn reserve_runner_completion_offer(&self, task_id: &str) -> Option<usize> {
+    pub fn reserve_runner_completion_offer(&self, task_id: &str) -> Option<usize> {
         let task = self.task(task_id)?;
         let mut published = task.drain_reply.0.lock().ok()?;
         published.runner_completion_offers = published.runner_completion_offers.saturating_add(1);
         Some(published.runner_completion_offers)
     }
 
-    pub(crate) fn persist_runner_completion_offer(
+    pub fn persist_runner_completion_offer(
         &self,
         session: &str,
         task_id: &str,
@@ -11974,7 +11950,7 @@ impl BgTaskRegistry {
 
     /// Replace a completion request only after the runner definitively refused it.
     /// Refused sends record no send_id, so retries can safely use the new bytes.
-    pub(crate) fn replace_runner_completion_notice(
+    pub fn replace_runner_completion_notice(
         &self,
         session: &str,
         task_id: &str,
@@ -11984,7 +11960,7 @@ impl BgTaskRegistry {
     }
 
     /// Save the request and its delivery progress together before another network call.
-    pub(crate) fn persist_runner_completion_delivery(
+    pub fn persist_runner_completion_delivery(
         &self,
         session: &str,
         task_id: &str,
@@ -12013,7 +11989,7 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    pub(crate) fn freeze_runner_notice_policy(
+    pub fn freeze_runner_notice_policy(
         &self,
         session: &str,
         task_id: &str,
@@ -12057,7 +12033,7 @@ impl BgTaskRegistry {
             .expect("notice policy was frozen"))
     }
 
-    pub(crate) fn freeze_runner_completion_notice(
+    pub fn freeze_runner_completion_notice(
         &self,
         session: &str,
         task_id: &str,
@@ -12649,7 +12625,7 @@ impl BgTaskRegistry {
     /// Find one active task that has the same command and canonical execution
     /// context. The scan stays in the in-memory watchdog index and checks a
     /// fixed number of candidates, so task history cannot slow a spawn.
-    pub(crate) fn find_running_duplicate(
+    pub fn find_running_duplicate(
         &self,
         session_id: &str,
         command: &str,
@@ -12703,9 +12679,7 @@ impl BgTaskRegistry {
     }
 
     #[cfg(unix)]
-    pub(crate) fn secret_authorization_scope_stamps(
-        &self,
-    ) -> Vec<subc_protocol::scope::ScopeStamp> {
+    pub fn secret_authorization_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
         self.inner
             .secret_proxies
             .lock()
@@ -12723,7 +12697,7 @@ impl BgTaskRegistry {
     }
 
     /// Fence approvals before asynchronous scope cleanup can block or fail.
-    pub(crate) fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
+    pub fn fence_scope_end(&self, scope: &subc_protocol::scope::ScopeStamp) {
         self.inner
             .revoked_scopes
             .lock()
@@ -12738,7 +12712,7 @@ impl BgTaskRegistry {
     /// Serialize the final approval/dispatch check with confirmed scope ends.
     /// Callers hold the owning database lock first; the closure must not take
     /// task-state locks. Scope-end insertion itself never takes the database lock.
-    pub(crate) fn with_live_scope<T>(
+    pub fn with_live_scope<T>(
         &self,
         scope: &subc_protocol::scope::ScopeStamp,
         run: impl FnOnce() -> T,
@@ -12764,7 +12738,7 @@ impl BgTaskRegistry {
         self.inner.revoked_scopes.try_lock().is_ok()
     }
 
-    pub(crate) fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
+    pub fn kill_scope(&self, scope: &subc_protocol::scope::ScopeStamp) {
         // Remember the end before taking the task snapshot. A dispatch already
         // queued on another thread may register its process after this pass.
         self.fence_scope_end(scope);
@@ -12812,7 +12786,7 @@ impl BgTaskRegistry {
     /// lifetime. This secret-authorization revocation marker never kills
     /// ordinary shell tasks.
     #[cfg(unix)]
-    pub(crate) fn revoke_secret_authorization(&self, scope: &subc_protocol::scope::ScopeStamp) {
+    pub fn revoke_secret_authorization(&self, scope: &subc_protocol::scope::ScopeStamp) {
         self.inner
             .revoked_secret_authorizations
             .lock()
@@ -12925,7 +12899,7 @@ impl BgTaskRegistry {
     /// ones, after [`Self::begin_scope_pause`] chose `members`, the tasks the
     /// pause covers. A member already finished by the pause itself (its
     /// worker settled the recorded intent first) is reported as stopped.
-    pub(crate) fn pause_scope(
+    pub fn pause_scope(
         &self,
         scope: &subc_protocol::scope::ScopeStamp,
         remote: bool,
@@ -12941,7 +12915,7 @@ impl BgTaskRegistry {
     /// intent a remote task the runner refuses between the passes could fall
     /// back to a local command that neither pass stops; with it, the fallback
     /// does not start and the task ends as paused.
-    pub(crate) fn begin_scope_pause(
+    pub fn begin_scope_pause(
         &self,
         scope: &subc_protocol::scope::ScopeStamp,
     ) -> Result<HashSet<String>, String> {
@@ -12968,7 +12942,7 @@ impl BgTaskRegistry {
 
     /// The members of an owner's pause (see [`Self::begin_scope_pause`])
     /// that are still running, which the pause must not report as done.
-    pub(crate) fn unstopped_pause_members(&self, members: &HashSet<String>) -> Vec<String> {
+    pub fn unstopped_pause_members(&self, members: &HashSet<String>) -> Vec<String> {
         let mut running = members
             .iter()
             .filter(|task_id| self.task(task_id).is_some_and(|task| !task.is_terminal()))
@@ -12999,7 +12973,7 @@ impl BgTaskRegistry {
     /// namespaces) and every harness directory beneath it are searched.
     /// Records that cannot be read are skipped, as replay skips them; a
     /// record of this scope that cannot be restored is returned as an error.
-    pub(crate) fn recover_saved_scope_tasks(
+    pub fn recover_saved_scope_tasks(
         storage_root: &Path,
         scope: &subc_protocol::scope::ScopeStamp,
         live: &[BgTaskRegistry],
@@ -13099,7 +13073,7 @@ impl BgTaskRegistry {
     /// task (see [`SavedRemoteTaskClaim`]), that project registry runs its
     /// worker, as its replay would have. Otherwise the task's saved record
     /// stays unfinished, so a later replay of its project resumes it.
-    pub(crate) fn start_held_remote_workers(&self) {
+    pub fn start_held_remote_workers(&self) {
         let held = self
             .inner
             .held_remote_workers
@@ -13509,7 +13483,7 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    pub(crate) fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
+    pub fn kill_scope_if_revoked(&self, scope: &subc_protocol::scope::ScopeStamp) {
         if self.scope_revoked(scope) {
             self.kill_scope(scope);
         }
@@ -13577,7 +13551,7 @@ impl BgTaskRegistry {
     /// The kill worker checks saved process identities before refreshing those
     /// samples, releasing groups no longer owned by the task. A cached routing
     /// identity avoids filesystem calls or process enumeration on the frame loop.
-    pub(crate) fn try_has_reclaimable_tasks_for_root(
+    pub fn try_has_reclaimable_tasks_for_root(
         &self,
         project_root: &crate::path_identity::ProjectRootId,
     ) -> Option<bool> {
@@ -15510,7 +15484,7 @@ impl BgTaskRegistry {
     /// registry, and a codemode program's shell calls run on its head's root,
     /// so a withdraw arriving on the program's own root uses this to find the
     /// registry that can kill the task.
-    pub(crate) fn holds_task(&self, task_id: &str) -> bool {
+    pub fn holds_task(&self, task_id: &str) -> bool {
         self.task(task_id).is_some()
     }
 

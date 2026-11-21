@@ -45,9 +45,9 @@ pub(crate) struct OutputFiles {
 pub struct OutputScope {
     storage: PathBuf,
     directory: PathBuf,
-    pub(crate) session: String,
-    pub(crate) files: std::sync::Arc<OutputFiles>,
-    pub(crate) bash: crate::bash_background::BgTaskRegistry,
+    pub session: String,
+    pub files: std::sync::Arc<OutputFiles>,
+    pub bash: crate::bash_background::BgTaskRegistry,
 }
 
 impl std::fmt::Debug for OutputScope {
@@ -59,7 +59,8 @@ impl std::fmt::Debug for OutputScope {
 }
 
 impl OutputScope {
-    pub(crate) fn new(ctx: &AppContext, session: &str, harness: Option<&str>) -> Self {
+    #[doc(hidden)]
+    pub fn new(ctx: &AppContext, session: &str, harness: Option<&str>) -> Self {
         let storage = ctx.storage_dir();
         let harness_root = harness
             .and_then(|h| h.parse::<crate::harness::Harness>().ok())

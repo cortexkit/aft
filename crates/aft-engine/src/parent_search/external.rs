@@ -47,10 +47,8 @@ impl ExternalSearch {
     /// The search of the repository at `root` for `ctx`, bound now if `ctx`
     /// holds none: `None` when the command dispatcher or published checkout
     /// is missing. The caller falls through to the bounded search instead.
-    pub(crate) fn of(
-        ctx: &crate::context::AppContext,
-        root: &Path,
-    ) -> Option<std::sync::Arc<Self>> {
+    #[doc(hidden)]
+    pub fn of(ctx: &crate::context::AppContext, root: &Path) -> Option<std::sync::Arc<Self>> {
         let dispatch = SEARCH.get().copied()?;
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
         ctx.external_data_search(&root, || Self::bind(ctx, &root, dispatch))
@@ -134,7 +132,8 @@ impl ExternalSearch {
     /// model without admitting the external repository to a fill. The engine
     /// borrows `ctx`'s model for query embedding. Returns the reply and how many
     /// paths differ from the publication the answer read.
-    pub(crate) fn search(
+    #[doc(hidden)]
+    pub fn search(
         &self,
         req: &crate::protocol::RawRequest,
         ctx: &crate::context::AppContext,

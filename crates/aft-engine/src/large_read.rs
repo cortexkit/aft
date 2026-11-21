@@ -328,7 +328,8 @@ pub struct Utf8Check {
 impl Utf8Check {
     /// Check the next bytes, handing every complete stretch of text to
     /// `text` in order. False when the bytes cannot be UTF-8.
-    pub(crate) fn feed(&mut self, mut bytes: &[u8], mut text: impl FnMut(&str)) -> bool {
+    #[doc(hidden)]
+    pub fn feed(&mut self, mut bytes: &[u8], mut text: impl FnMut(&str)) -> bool {
         if self.carry_len > 0 {
             // The carry is a valid start of one character; complete it.
             let width = utf8_width(self.carry[0]);
@@ -368,7 +369,8 @@ impl Utf8Check {
     }
 
     /// True when no incomplete character is left at the end.
-    pub(crate) fn finish(&self) -> bool {
+    #[doc(hidden)]
+    pub fn finish(&self) -> bool {
         self.carry_len == 0
     }
 }

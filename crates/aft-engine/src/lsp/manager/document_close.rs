@@ -95,7 +95,7 @@ impl LspManager {
     /// [`Self::close_inspect_documents`]. A document AFT edits stays open:
     /// an edit opens it through `didOpen`/`didChange`, not through a pull.
     /// A document reopened or edited since the pull is left open.
-    pub(crate) fn close_documents_opened_for_pulls(
+    pub fn close_documents_opened_for_pulls(
         &mut self,
         file_path: &Path,
         results: &[PullFileResult],

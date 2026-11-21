@@ -285,7 +285,8 @@ impl SearchIndexSnapshot {
     /// is known but its content was not indexed, for example because it is
     /// too large), or `absent`. The audit needs this to tell "never indexed"
     /// apart from "indexed but not retrieved".
-    pub(crate) fn audit_index_state(&self, path: &Path) -> &'static str {
+    #[doc(hidden)]
+    pub fn audit_index_state(&self, path: &Path) -> &'static str {
         match self.path_to_id.get(path) {
             Some(file_id) if !self.is_active_file(*file_id) => "absent",
             Some(file_id) if self.unindexed_files.contains(file_id) => "unindexed",
@@ -387,7 +388,8 @@ impl SearchIndexSnapshot {
     /// Score the union of the three rarest nonempty postings without ranking
     /// each posting merely to discover its membership. Trigram-value ties and
     /// candidate filtering match the canonical lexical lane's discovery rules.
-    pub(crate) fn lexical_selected_pool(
+    #[doc(hidden)]
+    pub fn lexical_selected_pool(
         &self,
         query_trigrams: &[u32],
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
@@ -944,8 +946,8 @@ struct PreparedIndexedFile {
 
 pub(crate) struct SearchCorpusFile {
     metadata: SearchFileMetadata,
-    pub(crate) bytes: Vec<u8>,
-    pub(crate) generated: bool,
+    pub bytes: Vec<u8>,
+    pub generated: bool,
 }
 
 #[doc(hidden)]
@@ -1170,7 +1172,8 @@ impl SearchIndex {
     /// An empty in-memory corpus to populate through a bounded disk walk.
     /// Marking it ready prevents query lanes from starting an unbounded build;
     /// the caller must disclose the walk's coverage separately.
-    pub(crate) fn empty_ready_for_root(root: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn empty_ready_for_root(root: &Path) -> Self {
         Self {
             project_root: root.to_path_buf(),
             ready: true,
@@ -2008,7 +2011,8 @@ impl SearchIndexSnapshot {
     /// `limits.max_files` of them are read, none started after the time
     /// budget. When a bound leaves files unexamined, `examination_capped`
     /// reports it, so the caller can say what its ranking covered.
-    pub(crate) fn collect_grep_matches_by_file(
+    #[doc(hidden)]
+    pub fn collect_grep_matches_by_file(
         &self,
         pattern: &CompiledPattern,
         filters: &PathFilters,
@@ -4686,7 +4690,8 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
 }
 
 impl PathFilters {
-    pub(crate) fn matches(&self, root: &Path, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn matches(&self, root: &Path, path: &Path) -> bool {
         if !crate::bash_background::registry::safe_task_entry(path) {
             return false;
         }

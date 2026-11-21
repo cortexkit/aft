@@ -9,11 +9,13 @@ pub(super) struct WatcherGap {
 }
 
 impl App {
-    pub(crate) fn set_subc_connection_file(&self, path: PathBuf) {
+    #[doc(hidden)]
+    pub fn set_subc_connection_file(&self, path: PathBuf) {
         *self.subc_connection_file.write() = Some(path);
     }
 
-    pub(crate) fn subc_connection_file(&self) -> Option<PathBuf> {
+    #[doc(hidden)]
+    pub fn subc_connection_file(&self) -> Option<PathBuf> {
         self.subc_connection_file.read().clone()
     }
 }
@@ -115,7 +117,7 @@ impl AppContext {
     /// Gate every watcher-maintained artifact after a watcher stops. Files
     /// may change before it starts again, so a later bind must reconcile
     /// from disk instead of serving snapshots that missed those edits.
-    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
+    pub fn invalidate_artifacts_after_watcher_gap(&self) {
         self.mark_watcher_gap_pending();
         self.next_semantic_persist_epoch();
         self.semantic_index

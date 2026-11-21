@@ -236,9 +236,9 @@ fn record_embedding_call(
 
 #[derive(Clone, Debug)]
 pub(crate) struct EmbeddingBackendBuildHealth {
-    pub(crate) last_error: String,
-    pub(crate) since_ms: u64,
-    pub(crate) next_retry_ms: u64,
+    pub last_error: String,
+    pub since_ms: u64,
+    pub next_retry_ms: u64,
     failures: usize,
     /// True while the only evidence is a reachability probe from a status or
     /// search request (see `probe_remote_backend_while_building`). A real build
@@ -1789,8 +1789,8 @@ struct QueryEmbedHealthState {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct QueryEmbedHealthSnapshot {
-    pub(crate) query_embed_timeouts: u64,
-    pub(crate) query_embed_p50_ms: u64,
+    pub query_embed_timeouts: u64,
+    pub query_embed_p50_ms: u64,
 }
 
 fn query_embed_health_registry() -> &'static Mutex<HashMap<PathBuf, QueryEmbedHealthState>> {
@@ -3419,7 +3419,7 @@ impl SemanticEmbeddingModel {
     /// An HTTP backend's calls run side by side, each with its own budget.
     /// What a query learns about the backend (its dimension) stays on the
     /// handle until [`Self::adopt_query_dimension`] copies it back.
-    pub(crate) fn share_for_query(&mut self) -> Self {
+    pub fn share_for_query(&mut self) -> Self {
         self.log_query_instruction_once();
         Self {
             backend: self.backend,
@@ -3451,7 +3451,7 @@ impl SemanticEmbeddingModel {
     /// [`Self::share_for_query`] learned back onto this model, so it need not
     /// ask the backend for it again (see [`Self::dimension`]). A handle of
     /// another model changes nothing.
-    pub(crate) fn adopt_query_dimension(&mut self, handle: &Self) {
+    pub fn adopt_query_dimension(&mut self, handle: &Self) {
         if Arc::ptr_eq(&self.query_embedding_cache, &handle.query_embedding_cache)
             && handle.dimension.is_some()
         {
@@ -5530,7 +5530,7 @@ impl SemanticIndex {
         self.skipped_rows.total
     }
 
-    pub(crate) fn skipped_chunks_summary(&self) -> Option<String> {
+    pub fn skipped_chunks_summary(&self) -> Option<String> {
         let summaries = [
             format_skipped_chunks_summary(
                 &self.project_root,
@@ -5549,7 +5549,7 @@ impl SemanticIndex {
         (!summaries.is_empty()).then(|| summaries.join("\n"))
     }
 
-    pub(crate) fn skipped_chunk_reason(&self) -> SemanticSkipReason {
+    pub fn skipped_chunk_reason(&self) -> SemanticSkipReason {
         if self.skipped_rows.refused.is_empty() {
             SemanticSkipReason::InputExceededModelContext
         } else {
@@ -7454,7 +7454,7 @@ impl SemanticIndex {
     ///
     /// Filtering before top-K selection prevents excluded files from consuming the
     /// bounded candidate window and hiding lower-ranked eligible results.
-    pub(crate) fn search_filtered<F>(
+    pub fn search_filtered<F>(
         &self,
         query_vector: &[f32],
         top_k: usize,

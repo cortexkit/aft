@@ -298,13 +298,16 @@ pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
 #[doc(hidden)]
 pub struct BudgetGuard(SharedCallDeadline);
 impl BudgetGuard {
-    pub(crate) fn new(deadline: Instant) -> Self {
+    #[doc(hidden)]
+    pub fn new(deadline: Instant) -> Self {
         Self(Arc::new(Mutex::new(Some(deadline))))
     }
-    pub(crate) fn shared(&self) -> SharedCallDeadline {
+    #[doc(hidden)]
+    pub fn shared(&self) -> SharedCallDeadline {
         self.0.clone()
     }
-    pub(crate) fn clear(&self) {
+    #[doc(hidden)]
+    pub fn clear(&self) {
         *self
             .0
             .lock()

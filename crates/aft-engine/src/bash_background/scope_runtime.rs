@@ -18,7 +18,8 @@ pub(super) fn replay_terminal_metadata(
 }
 
 impl BgTaskRegistry {
-    pub(crate) fn configure_task_scope_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
+    #[doc(hidden)]
+    pub fn configure_task_scope_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
         self.inner
             .task_scopes
             .configure_runtime(daemon_mode, max_runtime);
@@ -132,7 +133,8 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn start_task_scope_cleanup(&self, storage_dir: &Path) {
+    #[doc(hidden)]
+    pub fn start_task_scope_cleanup(&self, storage_dir: &Path) {
         #[cfg(target_os = "linux")]
         {
             if !self.inner.task_scopes.is_daemon() {

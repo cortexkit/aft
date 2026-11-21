@@ -6,7 +6,8 @@ impl BgTaskRegistry {
     /// Find held task scopes, including published tasks whose process is still
     /// starting. Run away from daemon frame dispatch: acquiring registry locks
     /// and checking whether descendant processes remain alive can block.
-    pub(crate) fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
+    #[doc(hidden)]
+    pub fn live_scope_stamps(&self) -> Vec<subc_protocol::scope::ScopeStamp> {
         // Snapshot in spawn's publication order without holding both locks.
         let published = self.task_arcs();
         let mut candidates = self.running_tasks();

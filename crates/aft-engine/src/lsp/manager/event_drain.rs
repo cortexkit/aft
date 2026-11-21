@@ -277,7 +277,7 @@ impl LspManager {
 
     /// The next moment a rust-analyzer check can change without a new event,
     /// such as a deferred save falling due or the publish-settle window closing.
-    pub(crate) fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
+    pub fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
         self.clients.get(server_key).and_then(|client| {
             client.rust_check_next_timed_change(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
         })

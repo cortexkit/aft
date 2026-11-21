@@ -92,7 +92,7 @@ impl ScopeRole {
 #[doc(hidden)]
 pub struct Refusal {
     pub(crate) code: Code,
-    pub(crate) reason: String,
+    pub reason: String,
     pub(crate) role: Option<ScopeRole>,
     pub(crate) detail: Option<String>,
     // Internal transport provenance, never part of the public refusal.
@@ -115,7 +115,8 @@ pub(crate) fn snapshot_invalid(site: &str, check: &str, identifiers: Value) -> R
 }
 
 impl Refusal {
-    pub(crate) fn new(code: Code, reason: impl Into<String>) -> Self {
+    #[doc(hidden)]
+    pub fn new(code: Code, reason: impl Into<String>) -> Self {
         Self {
             code,
             reason: reason.into(),

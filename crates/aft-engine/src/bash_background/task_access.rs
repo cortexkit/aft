@@ -282,11 +282,8 @@ pub(super) fn has_multiple_hard_links(metadata: &fs::Metadata) -> bool {
 impl BgTaskRegistry {
     /// Expand only an explicitly named bundle directory or registered file,
     /// never a storage ancestor. Recheck session/head access for each exact name.
-    pub(crate) fn explicit_task_artifacts(
-        &self,
-        session: &str,
-        path: &Path,
-    ) -> Option<Vec<PathBuf>> {
+    #[doc(hidden)]
+    pub fn explicit_task_artifacts(&self, session: &str, path: &Path) -> Option<Vec<PathBuf>> {
         // Exact owned outputs include legacy flat-layout tasks, which have no
         // bundle read record. Ownership bypasses storage exclusion, not SQLite
         // or link checks, and never authorizes the containing directory.
@@ -414,7 +411,8 @@ impl BgTaskRegistry {
     /// Scratch ownership comes only from a task still held by this registry.
     /// The persisted sandbox path is recorded from the spawn plan, not inferred
     /// from the scratch directory's name or its caller-writable contents.
-    pub(crate) fn is_session_owned_scratch_path(&self, session: &str, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn is_session_owned_scratch_path(&self, session: &str, path: &Path) -> bool {
         let Ok(requested) = fs::canonicalize(path) else {
             return false;
         };
@@ -451,7 +449,8 @@ impl BgTaskRegistry {
     /// recorded before cleanup, so the read can fail as not-found rather than
     /// ask for permission to read nothing. `identity` is the policy identity:
     /// absolute, with existing ancestors canonicalized and `..` removed.
-    pub(crate) fn is_session_missing_scratch_path(&self, session: &str, identity: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn is_session_missing_scratch_path(&self, session: &str, identity: &Path) -> bool {
         if !identity.is_absolute()
             || identity.components().any(|component| {
                 matches!(
@@ -558,11 +557,8 @@ impl BgTaskRegistry {
             .is_some_and(|name| parent.open_file(name, false).is_ok())
     }
 
-    pub(crate) fn readable_worker_task_owner(
-        &self,
-        task_id: &str,
-        storage: &Path,
-    ) -> Option<String> {
+    #[doc(hidden)]
+    pub fn readable_worker_task_owner(&self, task_id: &str, storage: &Path) -> Option<String> {
         #[cfg(test)]
         self.inner
             .task_access_work

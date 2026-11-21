@@ -13,10 +13,8 @@ use std::fs;
 
 impl BgTaskRegistry {
     /// Withdrawal needs proof of death before freezing a missing-registry task's answer.
-    pub(crate) fn unregistered_task_process_liveness(
-        &self,
-        metadata: &PersistedTask,
-    ) -> ProcessLiveness {
+    #[doc(hidden)]
+    pub fn unregistered_task_process_liveness(&self, metadata: &PersistedTask) -> ProcessLiveness {
         if metadata.remote.is_some() {
             return ProcessLiveness::Unknown;
         }

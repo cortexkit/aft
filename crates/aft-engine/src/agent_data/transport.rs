@@ -143,7 +143,8 @@ impl JsonDoorTransport for ModuleTransport {
 pub struct EntorhinalRegistry(pub ModuleTransport);
 
 impl EntorhinalRegistry {
-    pub(crate) async fn enumerate_async(self) -> Result<EnumerateReply, String> {
+    #[doc(hidden)]
+    pub async fn enumerate_async(self) -> Result<EnumerateReply, String> {
         let body = serde_json::to_vec(&enumerate_request()).map_err(|error| error.to_string())?;
         let reply = self
             .0

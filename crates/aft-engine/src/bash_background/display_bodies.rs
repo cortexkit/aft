@@ -3,7 +3,7 @@ use super::*;
 impl BgTaskRegistry {
     /// Records the display identity of the task that an original `bash` reply
     /// started. A later `bash_status` or `bash_watch` does not own that display.
-    pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
+    pub fn capture_display_reply(&self, response: &serde_json::Value) {
         use crate::bash_background::frames;
 
         if !frames::enabled() {

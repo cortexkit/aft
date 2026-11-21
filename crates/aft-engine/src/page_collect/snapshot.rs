@@ -41,7 +41,8 @@ pub enum ReadRefusal {
 }
 
 impl ReadRefusal {
-    pub(crate) fn code(self) -> &'static str {
+    #[doc(hidden)]
+    pub fn code(self) -> &'static str {
         match self {
             Self::Expired => "snapshot_expired",
             Self::NotInSnapshot => "not_in_snapshot",
@@ -110,7 +111,8 @@ impl SnapshotStore {
     /// The store for `storage_dir`. The first call in a process removes
     /// snapshots an earlier process left behind; the daemon makes that call
     /// when it starts.
-    pub(crate) fn for_storage(storage_dir: &Path) -> Arc<SnapshotStore> {
+    #[doc(hidden)]
+    pub fn for_storage(storage_dir: &Path) -> Arc<SnapshotStore> {
         static STORES: OnceLock<Mutex<HashMap<PathBuf, Arc<SnapshotStore>>>> = OnceLock::new();
         let mut stores = STORES
             .get_or_init(Default::default)
@@ -183,7 +185,8 @@ impl SnapshotStore {
     }
 
     /// Delete every expired snapshot now.
-    pub(crate) fn expire_due(&self) {
+    #[doc(hidden)]
+    pub fn expire_due(&self) {
         let dirs = {
             let mut state = self.lock();
             self.take_expired(&mut state)
@@ -193,7 +196,8 @@ impl SnapshotStore {
 
     /// Start a snapshot for `owner`, or refuse with [`Busy`] when
     /// [`MAX_LIVE`] are live.
-    pub(crate) fn begin(self: &Arc<Self>, owner: SnapshotOwner) -> Result<Builder, BeginError> {
+    #[doc(hidden)]
+    pub fn begin(self: &Arc<Self>, owner: SnapshotOwner) -> Result<Builder, BeginError> {
         let expired;
         {
             let mut state = self.lock();
@@ -237,7 +241,8 @@ impl SnapshotStore {
     /// `path` in snapshot `id`, read from the snapshot folder only. A
     /// snapshot of another session is answered exactly like one that does
     /// not exist.
-    pub(crate) fn read(
+    #[doc(hidden)]
+    pub fn read(
         &self,
         id: &str,
         owner: &SnapshotOwner,
@@ -277,7 +282,8 @@ impl SnapshotStore {
     /// Delete snapshot `id` if it is `owner`'s. Returns whether it was
     /// live; a snapshot of another session is left alone and reported as
     /// not live, as an unknown one is.
-    pub(crate) fn release(&self, id: &str, owner: &SnapshotOwner) -> bool {
+    #[doc(hidden)]
+    pub fn release(&self, id: &str, owner: &SnapshotOwner) -> bool {
         let (removed, expired) = {
             let mut state = self.lock();
             let removed = match state.ready.get(id) {

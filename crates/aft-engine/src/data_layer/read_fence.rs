@@ -83,7 +83,8 @@ impl Fence {
     }
 
     /// The caller already matched this candidate with its discovery filters.
-    pub(crate) fn record_matched_floor(&self, path: &Path) {
+    #[doc(hidden)]
+    pub fn record_matched_floor(&self, path: &Path) {
         if let Some(omissions) = &self.floor_omissions {
             omissions.lock().paths.insert(path.to_path_buf());
         }
@@ -524,7 +525,8 @@ const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
 
 impl ConfinedIgnoreRules {
     /// Rules for a walk on this thread, or `None` when no confined call runs.
-    pub(crate) fn current(names: &'static [&'static str]) -> Option<Arc<Self>> {
+    #[doc(hidden)]
+    pub fn current(names: &'static [&'static str]) -> Option<Arc<Self>> {
         let fence = capture();
         fence.active().then(|| {
             Arc::new(Self {
@@ -537,12 +539,14 @@ impl ConfinedIgnoreRules {
 
     /// The read policy check for a walked entry, recording a denial; see
     /// [`Fence::admits_walk_entry`].
-    pub(crate) fn admits(&self, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn admits(&self, path: &Path) -> bool {
         self.fence.admits_walk_entry(path)
     }
 
     /// Whether the confined root's own ignore files exclude `path`.
-    pub(crate) fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
+    #[doc(hidden)]
+    pub fn is_ignored(&self, path: &Path, is_dir: bool) -> bool {
         self.is_ignored_with_root(path, is_dir, None)
     }
 

@@ -26,7 +26,8 @@ const DISCOVERY_ENTRY_LIMIT_REASON: &str = "AFT stopped looking for repositories
 pub struct Gaps(Vec<Value>);
 
 impl Gaps {
-    pub(crate) fn push(&mut self, kind: &str, path: String, reason: String) {
+    #[doc(hidden)]
+    pub fn push(&mut self, kind: &str, path: String, reason: String) {
         let gap = json!({"kind": kind, "path": path, "reason": reason});
         if !self.0.contains(&gap) {
             self.0.push(gap);
@@ -34,13 +35,15 @@ impl Gaps {
     }
 
     /// Records that `child` cannot answer this request, and why.
-    pub(crate) fn child(&mut self, child: &Child, reason: String) {
+    #[doc(hidden)]
+    pub fn child(&mut self, child: &Child, reason: String) {
         self.push("parent_child_unavailable", child.display(), reason);
     }
 
     /// Children, skipped children and outside paths a search of `scope`
     /// covers but cannot reach, beyond the per-child plane gaps.
-    pub(crate) fn scope(&mut self, session: &dyn ParentView, scope: &Path) {
+    #[doc(hidden)]
+    pub fn scope(&mut self, session: &dyn ParentView, scope: &Path) {
         let Some(discovery) = session.discovery() else {
             self.discovering();
             return;
@@ -100,7 +103,8 @@ impl Gaps {
         );
     }
 
-    pub(crate) fn into_values(self) -> Vec<Value> {
+    #[doc(hidden)]
+    pub fn into_values(self) -> Vec<Value> {
         self.0
     }
 

@@ -25,7 +25,8 @@ pub struct LaunchAuthority {
 }
 
 impl LaunchAuthority {
-    pub(crate) fn classic(scope: ScopeStamp, origin: Option<RouteOrigin>) -> Result<Self, Refusal> {
+    #[doc(hidden)]
+    pub fn classic(scope: ScopeStamp, origin: Option<RouteOrigin>) -> Result<Self, Refusal> {
         if scope.kind != ScopeKind::Head {
             return Err(Refusal::new(
                 Code::AuthorityUnavailable,
@@ -42,7 +43,8 @@ impl LaunchAuthority {
         Ok(value)
     }
 
-    pub(crate) fn codemode(
+    #[doc(hidden)]
+    pub fn codemode(
         head: ScopeStamp,
         run: ScopeStamp,
         run_origin: Option<RouteOrigin>,

@@ -159,7 +159,8 @@ impl BgTaskRegistry {
     /// This registry's unfinished local commands whose sandbox allowed
     /// `path` from `scope`'s saved grants. Build-server jobs are left out:
     /// they never run under a local sandbox.
-    pub(crate) fn folder_grant_tasks(&self, scope: &ScopeKey, path: &Path) -> Vec<HeldTask> {
+    #[doc(hidden)]
+    pub fn folder_grant_tasks(&self, scope: &ScopeKey, path: &Path) -> Vec<HeldTask> {
         self.task_arcs()
             .into_iter()
             .filter(|task| !task.is_terminal())
@@ -183,7 +184,8 @@ impl BgTaskRegistry {
     /// Stop one command because a folder its sandbox allowed was revoked,
     /// through the same process-group kill a scope end uses. Returns whether
     /// this kill ended it (a command can finish on its own meanwhile).
-    pub(crate) fn kill_for_folder_revocation(&self, task: &HeldTask) -> Result<bool, String> {
+    #[doc(hidden)]
+    pub fn kill_for_folder_revocation(&self, task: &HeldTask) -> Result<bool, String> {
         self.kill_with_status_reason(
             &task.task_id,
             &task.session_id,

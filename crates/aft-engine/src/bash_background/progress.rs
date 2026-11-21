@@ -138,12 +138,8 @@ pub struct BashProgressPump {
 }
 
 impl BashProgressPump {
-    pub(crate) fn new(
-        ctx: &AppContext,
-        task_id: String,
-        session_id: String,
-        request_id: String,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn new(ctx: &AppContext, task_id: String, session_id: String, request_id: String) -> Self {
         let registry = ctx.bash_background().clone();
         let (tick, ticks) = mpsc::sync_channel(1);
         let (results, ready) = mpsc::sync_channel(1);
@@ -171,7 +167,8 @@ impl BashProgressPump {
         }
     }
 
-    pub(crate) fn poll(&mut self, terminal: bool, emit: &mut impl FnMut(ProgressFrame)) {
+    #[doc(hidden)]
+    pub fn poll(&mut self, terminal: bool, emit: &mut impl FnMut(ProgressFrame)) {
         if self.tick.is_none() {
             return;
         }

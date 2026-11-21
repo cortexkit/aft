@@ -112,7 +112,8 @@ impl RevisionSession {
     /// linked worktree resolves to its own checkout, which shares refs and
     /// objects with the main one). Without a project root, `anchor` (the
     /// requested path) locates it.
-    pub(crate) fn open(
+    #[doc(hidden)]
+    pub fn open(
         req: &RawRequest,
         ctx: &AppContext,
         reference: &str,
@@ -218,7 +219,8 @@ impl RevisionSession {
     }
 
     /// Add [`Self::reply_field`] to a successful response.
-    pub(crate) fn annotate(&self, response: &mut Response) {
+    #[doc(hidden)]
+    pub fn annotate(&self, response: &mut Response) {
         if response.success {
             if let Some(data) = response.data.as_object_mut() {
                 data.insert("revision".into(), self.reply_field());
@@ -227,7 +229,8 @@ impl RevisionSession {
     }
 
     /// Map a materialized revision file back to its checkout path for host read checks.
-    pub(crate) fn logical_path(&self, staged: &Path) -> Option<PathBuf> {
+    #[doc(hidden)]
+    pub fn logical_path(&self, staged: &Path) -> Option<PathBuf> {
         self.materialized
             .borrow()
             .iter()
@@ -237,7 +240,8 @@ impl RevisionSession {
     /// Copy `requested` (the path argument, already checked against the read
     /// rules by the caller) out of the commit, returning the copy's path.
     /// `display` is how the reply names the path.
-    pub(crate) fn materialize(
+    #[doc(hidden)]
+    pub fn materialize(
         &self,
         req: &RawRequest,
         ctx: &AppContext,

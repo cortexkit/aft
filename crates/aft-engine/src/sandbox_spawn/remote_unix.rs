@@ -163,7 +163,8 @@ pub(crate) struct Running {
 }
 
 impl Start {
-    pub(crate) fn start(self, timeout: Duration) -> Result<Running, String> {
+    #[doc(hidden)]
+    pub fn start(self, timeout: Duration) -> Result<Running, String> {
         let result = (|| -> io::Result<Running> {
             let (reader, writer) = UnixStream::pair()?;
             reader.set_nonblocking(true)?;

@@ -12,8 +12,8 @@ use super::job::canonicalize_normalized;
 #[doc(hidden)]
 pub struct InspectInventory {
     root: PathBuf,
-    pub(crate) sources: Vec<PathBuf>,
-    pub(crate) manifests: Vec<PathBuf>,
+    pub sources: Vec<PathBuf>,
+    pub manifests: Vec<PathBuf>,
 }
 
 #[cfg(test)]
@@ -446,7 +446,8 @@ impl Drop for InventoryGuard {
 }
 
 impl InspectInventory {
-    pub(crate) fn install(self: &Arc<Self>) -> InventoryGuard {
+    #[doc(hidden)]
+    pub fn install(self: &Arc<Self>) -> InventoryGuard {
         InventoryGuard(CURRENT.with(|slot| slot.replace(Some(Arc::clone(self)))))
     }
 
@@ -466,7 +467,8 @@ impl InspectInventory {
     /// folder, a rescan against the disk is still pending, or the root is one
     /// where the source walk uses other ignore settings (confinement, or a
     /// Jujutsu-only repository).
-    pub(crate) fn from_checkout(
+    #[doc(hidden)]
+    pub fn from_checkout(
         root: &Path,
         view: &crate::data_layer::checkout::CheckoutView,
     ) -> Option<Self> {
@@ -534,10 +536,8 @@ impl InspectInventory {
         })
     }
 
-    pub(crate) fn collect(
-        root: &Path,
-        keep_walking: impl Fn() -> bool + Send + Sync + 'static,
-    ) -> Self {
+    #[doc(hidden)]
+    pub fn collect(root: &Path, keep_walking: impl Fn() -> bool + Send + Sync + 'static) -> Self {
         #[cfg(test)]
         let _profile = super::walk_profile::Walk::start("shared_inventory");
         let normalized_root = canonicalize_normalized(root);
@@ -681,7 +681,8 @@ pub(crate) enum StoreListMiss {
 
 impl StoreListMiss {
     /// The name logs give this reason.
-    pub(crate) const fn as_str(self) -> &'static str {
+    #[doc(hidden)]
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::NotBound => "not_bound",
             Self::FolderOfRepositories => "folder_of_repositories",

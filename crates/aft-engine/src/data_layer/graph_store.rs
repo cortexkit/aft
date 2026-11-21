@@ -731,7 +731,8 @@ impl StoredSlices {
     ///
     /// When a segment is malformed, or a parsed file has no record or
     /// fragment in any segment.
-    pub(crate) fn open(
+    #[doc(hidden)]
+    pub fn open(
         segments: Vec<Arc<Segment>>,
         inputs: &CheckoutInputs,
         fragments: &BTreeMap<String, FragmentKey>,

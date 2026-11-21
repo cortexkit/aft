@@ -16,7 +16,7 @@ impl AppContext {
     /// Rebuilding, clearing, or confirming that the ignore files still match
     /// an earlier build all bump the generation. A `None` matcher at generation
     /// zero is "not known yet", not "this project ignores nothing".
-    pub(crate) fn gitignore_published(&self) -> bool {
+    pub fn gitignore_published(&self) -> bool {
         self.gitignore_generation.load(Ordering::SeqCst) > 0
     }
 

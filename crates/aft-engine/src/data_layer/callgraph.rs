@@ -63,7 +63,7 @@ pub(crate) struct CheckoutInputs {
     /// The checkout's paths.
     pub(crate) state: CheckoutState,
     /// Every parsed file's record key and parse output, by path.
-    pub(crate) parses: Parses,
+    pub parses: Parses,
     /// The raw bytes of every resolver configuration file (`package.json`,
     /// `Cargo.toml`, `go.mod`, `tsconfig*.json`, `.gitignore`), by path.
     pub(crate) configs: HashMap<Vec<u8>, Arc<[u8]>>,

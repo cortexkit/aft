@@ -130,14 +130,16 @@ struct ContextWatches {
 }
 
 impl ConfigLiveState {
-    pub(crate) fn applied_bind_snapshot(&self) -> Option<u64> {
+    #[doc(hidden)]
+    pub fn applied_bind_snapshot(&self) -> Option<u64> {
         match self.applied_bind_snapshot.load(Ordering::Acquire) {
             0 => None,
             id => Some(id),
         }
     }
 
-    pub(crate) fn clear_applied_bind_snapshot(&self) {
+    #[doc(hidden)]
+    pub fn clear_applied_bind_snapshot(&self) {
         self.applied_bind_snapshot.store(0, Ordering::Release);
     }
     pub fn signal(&self) -> Arc<ConfigReloadSignal> {

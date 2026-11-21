@@ -153,12 +153,12 @@ impl ConfigureMaintenanceStage {
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct ConfigureMaintenanceContinuation {
-    pub(crate) job: ConfigureMaintenanceJob,
-    pub(crate) stage: ConfigureMaintenanceStage,
-    pub(crate) replay_retry_at: Option<Instant>,
+    pub job: ConfigureMaintenanceJob,
+    pub stage: ConfigureMaintenanceStage,
+    pub replay_retry_at: Option<Instant>,
     pub(crate) lexical_bind_retry_at: Option<Instant>,
     pub(crate) callgraph_upgrade_retry_at: Option<Instant>,
-    pub(crate) replay_error_logged: bool,
+    pub replay_error_logged: bool,
 }
 
 impl ConfigureMaintenanceContinuation {
@@ -183,7 +183,7 @@ impl ConfigureMaintenanceContinuation {
 #[derive(Debug, Default)]
 #[doc(hidden)]
 pub struct ConfigureMaintenanceState {
-    pub(crate) jobs: VecDeque<ConfigureMaintenanceContinuation>,
+    pub jobs: VecDeque<ConfigureMaintenanceContinuation>,
     // Freeze retry eligibility across one full drain so a deferred unit cannot
     // become due again while other units run and monopolize the same drain.
     pub(crate) replay_retry_cutoff: Option<Instant>,
@@ -194,7 +194,8 @@ impl ConfigureMaintenanceState {
         self.jobs.is_empty()
     }
 
-    pub(crate) fn has_ready_job(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_ready_job(&self) -> bool {
         let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
         self.jobs.iter().any(|continuation| {
             continuation
@@ -203,7 +204,8 @@ impl ConfigureMaintenanceState {
         })
     }
 
-    pub(crate) fn select_ready_job(&mut self, ctx: &AppContext) -> bool {
+    #[doc(hidden)]
+    pub fn select_ready_job(&mut self, ctx: &AppContext) -> bool {
         let now = self.replay_retry_cutoff.unwrap_or_else(Instant::now);
         let Some(index) = self.jobs.iter().position(|continuation| {
             ctx.subc_unbound_quiesced()
@@ -217,7 +219,8 @@ impl ConfigureMaintenanceState {
         true
     }
 
-    pub(crate) fn absorb_enqueued(&mut self, ctx: &AppContext) {
+    #[doc(hidden)]
+    pub fn absorb_enqueued(&mut self, ctx: &AppContext) {
         self.jobs.extend(
             ctx.drain_configure_maintenance()
                 .into_iter()

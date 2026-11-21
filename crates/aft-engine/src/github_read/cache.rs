@@ -337,7 +337,8 @@ impl GithubReadDeferred {
 
     /// Split the handle for a caller that polls the result channel itself and
     /// gives the late answer when its own deadline passes.
-    pub(crate) fn into_parts(
+    #[doc(hidden)]
+    pub fn into_parts(
         self,
     ) -> (
         crate::pending_response::PendingResponseReceiver<

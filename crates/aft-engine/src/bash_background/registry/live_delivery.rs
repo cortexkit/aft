@@ -8,7 +8,8 @@ use std::sync::Arc;
 pub struct RouteDeliverySessions(parking_lot::RwLock<Arc<HashSet<String>>>);
 
 impl RouteDeliverySessions {
-    pub(crate) fn publish(&self, sessions: HashSet<&str>) {
+    #[doc(hidden)]
+    pub fn publish(&self, sessions: HashSet<&str>) {
         let current = self.snapshot();
         if current.len() == sessions.len() && sessions.iter().all(|id| current.contains(*id)) {
             return;
@@ -42,7 +43,8 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn use_route_delivery_sessions(&self, routes: &Arc<RouteDeliverySessions>) {
+    #[doc(hidden)]
+    pub fn use_route_delivery_sessions(&self, routes: &Arc<RouteDeliverySessions>) {
         if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
             let _hold = self.inner.live_delivery_lock_diagnostics.hold();
             if !matches!(&*live_sessions, LiveDelivery::Routes(current) if Arc::ptr_eq(current, routes))
@@ -52,16 +54,16 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn clear_live_delivery_sessions(&self) {
+    #[doc(hidden)]
+    pub fn clear_live_delivery_sessions(&self) {
         if let Ok(mut live_sessions) = self.inner.live_delivery_sessions.lock() {
             let _hold = self.inner.live_delivery_lock_diagnostics.hold();
             *live_sessions = LiveDelivery::default();
         }
     }
 
-    pub(crate) fn live_delivery_lock_diagnostics(
-        &self,
-    ) -> Arc<crate::lock_diagnostics::LockDiagnostics> {
+    #[doc(hidden)]
+    pub fn live_delivery_lock_diagnostics(&self) -> Arc<crate::lock_diagnostics::LockDiagnostics> {
         Arc::clone(&self.inner.live_delivery_lock_diagnostics)
     }
 

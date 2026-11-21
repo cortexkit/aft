@@ -76,7 +76,8 @@ enum OnDisk {
 impl ViewScope {
     /// `search_root` as a scope of `view`, or `None` when it is outside the
     /// view's checkout.
-    pub(crate) fn of(view: CheckoutView, search_root: &Path) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn of(view: CheckoutView, search_root: &Path) -> Option<Self> {
         let relative = checkout_path(view.root(), search_root)?;
         let root = view.root().to_path_buf();
         let changed = view
@@ -109,12 +110,14 @@ impl ViewScope {
 
     /// Whether the scope is the whole checkout, which always answers from
     /// the view, even when it holds no file.
-    pub(crate) fn is_whole_checkout(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_whole_checkout(&self) -> bool {
         self.relative.is_empty()
     }
 
     /// Whether any file of the checkout is in scope now.
-    pub(crate) fn has_files(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_files(&self) -> bool {
         self.files().next().is_some()
     }
 
@@ -133,10 +136,8 @@ impl ViewScope {
     /// # Errors
     ///
     /// When the view's text plane cannot be read.
-    pub(crate) fn candidates(
-        &self,
-        pattern: &CompiledPattern,
-    ) -> Result<SearchIndexSnapshot, DataError> {
+    #[doc(hidden)]
+    pub fn candidates(&self, pattern: &CompiledPattern) -> Result<SearchIndexSnapshot, DataError> {
         // A pattern the planner cannot parse still has candidates: every
         // file in scope, which the search reads and checks.
         let query = plan_pattern(
@@ -192,7 +193,8 @@ impl ViewScope {
     }
 
     /// Every file in scope, as a snapshot for glob to list.
-    pub(crate) fn listing(&self) -> SearchIndexSnapshot {
+    #[doc(hidden)]
+    pub fn listing(&self) -> SearchIndexSnapshot {
         self.snapshot(
             self.files()
                 .filter_map(|(path, size, modified)| self.entry(path, size, modified)),
