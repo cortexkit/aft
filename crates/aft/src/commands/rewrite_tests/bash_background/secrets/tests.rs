@@ -563,7 +563,7 @@ fn secret_bash_sandbox_raise_real_spawn_probe() {
         target.as_os_str().to_owned(),
     ];
     let run = |plan: &SpawnPlan| {
-        crate::sandbox_spawn::probe_command_for_plan(
+        aft_engine::test_bridge::bash_remote::sandbox_spawn::probe_command_for_plan(
             plan,
             OsStr::new("/bin/sh"),
             &args,
@@ -579,7 +579,7 @@ fn secret_bash_sandbox_raise_real_spawn_probe() {
     assert_eq!(off.stdout, b"started");
     assert_eq!(std::fs::read(&target).unwrap(), b"probe");
     std::fs::remove_file(&target).unwrap();
-    let denied = run(&raised.plan);
+    let denied = run(raised.plan());
     assert!(!denied.status.success(), "{denied:?}");
     assert_eq!(
         denied.stdout, b"started",
