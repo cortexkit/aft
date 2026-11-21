@@ -423,15 +423,45 @@ pub(crate) fn outcomes_for_test(root: &Path) -> Vec<&'static str> {
 }
 
 #[cfg(test)]
+pub(crate) use self::test_support::todos_job;
+
+#[cfg(test)]
+mod test_support {
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, RwLock};
+
+    use crate::config::Config;
+    use crate::inspect::{InspectCategory, InspectJob, JobKey, JobScope};
+    use crate::parser::SymbolCache;
+
+    pub(crate) fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+        let scope = JobScope::for_project(root.to_path_buf());
+        InspectJob {
+            job_id: 1,
+            key: JobKey::for_category_scope(InspectCategory::Todos, &scope),
+            category: InspectCategory::Todos,
+            scope_files,
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join("inspect"),
+            config: Arc::new(Config {
+                project_root: Some(root.to_path_buf()),
+                ..Config::default()
+            }),
+            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::PathBuf;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     use super::*;
     use crate::config::Config;
-    use crate::inspect::{InspectCategory, JobKey, JobScope};
-    use crate::parser::SymbolCache;
 
     /// The markers extraction records for `source` at `path`, as the index
     /// store's records hold them.
@@ -510,26 +540,6 @@ mod tests {
         let lexical = markers_lexical(b"x = \"// TODO: quoted\"\n# XXX: real\n");
         assert_eq!(lexical.language, "lexical");
         assert_eq!(lines(&lexical), vec![(2, "XXX".into(), "real".into())]);
-    }
-
-    pub(super) fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
-        let scope = JobScope::for_project(root.to_path_buf());
-        InspectJob {
-            job_id: 1,
-            key: JobKey::for_category_scope(InspectCategory::Todos, &scope),
-            category: InspectCategory::Todos,
-            scope_files,
-            project_root: root.to_path_buf(),
-            inspect_dir: root.join("inspect"),
-            config: Arc::new(Config {
-                project_root: Some(root.to_path_buf()),
-                ..Config::default()
-            }),
-            symbol_cache: Arc::new(RwLock::new(SymbolCache::new())),
-            inspect_writer: true,
-            callgraph_writer: true,
-            callgraph_snapshot: None,
-        }
     }
 
     fn write(root: &Path, relative: &str, contents: &str) {
