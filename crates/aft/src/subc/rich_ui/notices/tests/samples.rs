@@ -11,7 +11,9 @@ fn read(bytes: &[u8], sha256: &str) -> Value {
 #[test]
 fn notice_records_match_occipital_phone_reader_sample_contract() {
     let sample = read(
-        include_bytes!("../../../../../tests/fixtures/notice-records/02-wake-records-with-notices.json"),
+        include_bytes!(
+            "../../../../../tests/fixtures/notice-records/02-wake-records-with-notices.json"
+        ),
         "f6a3c1c6df70a10a79b1abdbc2c4f59e17b8e6fc6edb3cf1c86719b7b233c0ae",
     );
     let sample_views = read(
