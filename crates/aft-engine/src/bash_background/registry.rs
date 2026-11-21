@@ -31203,6 +31203,6 @@ mod a02_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 #[path = "push_projection_fixture.rs"]
 pub(crate) mod push_projection_fixture;

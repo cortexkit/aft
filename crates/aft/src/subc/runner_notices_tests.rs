@@ -1,13 +1,13 @@
 use super::*;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
-use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::ScheduledTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::SchedulerTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::SchedulerTestExt as _;
+use aft_engine::test_bridge::bash_remote::{BgTaskTestExt as _, PersistedTaskTestExt as _};
 
 fn notice_route(session: &str) -> CodeSearchNotice {
     CodeSearchNotice {
@@ -2439,20 +2439,20 @@ impl HeldCompletion {
         };
         let registered = task.registry.test_task(id).unwrap();
         let mut state = registered.test_lock_state().unwrap();
-        state.metadata.call_key = Some(crate::bash_background::TaskCallKey {
+        *state.metadata_mut().call_key_mut() = Some(crate::bash_background::TaskCallKey {
             requester: key.carrier.clone(),
             key: key.call_key.clone(),
             minted: false,
         });
         let paths =
             crate::bash_background::persistence::resolve_task(task.storage.path(), id, id).unwrap();
-        crate::bash_background::persistence::write_task_at(&paths, &state.metadata).unwrap();
+        crate::bash_background::persistence::write_task_at(&paths, state.metadata()).unwrap();
         std::fs::write(&paths.paths.stdout, "recovered held output\n").unwrap();
         let conn = db.lock().unwrap();
         crate::db::bash_tasks::upsert_bash_task(
             &conn,
             &state
-                .metadata
+                .metadata()
                 .to_bash_task_row("runner", &paths.paths)
                 .unwrap(),
         )

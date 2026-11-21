@@ -146,7 +146,7 @@ static HOOKS: OnceLock<Hooks> = OnceLock::new();
 pub fn register(hooks: Hooks) {
     let _ = HOOKS.set(hooks);
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn registered() -> bool {
     HOOKS.get().is_some()
 }
