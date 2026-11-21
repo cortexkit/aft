@@ -10550,9 +10550,7 @@ fn degraded_warning(ctx: &AppContext) -> String {
 mod tests {
     use super::first_text_wait::test_signals::{Exit as FirstTextWaitExit, EXITED, STARTED};
     use super::*;
-    use aft_engine::test_bridge::display_data::{
-        note_checkout_outcome_for_test, CheckoutTestExt as _, DataCheckoutTestExt as _,
-    };
+    use aft_engine::test_bridge::display_data::{CheckoutTestExt as _, DataCheckoutTestExt as _};
 
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -10721,8 +10719,7 @@ mod tests {
             }
             aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
             if failed {
-                note_checkout_outcome_for_test::<()>(
-                    &ctx.data_checkout().unwrap(),
+                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),
@@ -10743,8 +10740,7 @@ mod tests {
             FirstTextWaitExit::Failure,
             "search_lanes_unavailable",
             |checkout, _| {
-                note_checkout_outcome_for_test::<()>(
-                    checkout,
+                checkout.note_outcome_for_test::<()>(
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),
