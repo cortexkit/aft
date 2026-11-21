@@ -17,7 +17,7 @@ fn truthful_count_shape_keeps_proven_values_and_omits_unproven_categories() {
 
 #[test]
 fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seams() {
-    let context = include_str!("../src/context.rs");
+    let context = include_str!("../../aft-engine/src/context.rs");
     let inspect = include_str!("../src/commands/inspect.rs");
     let response_finalize = include_str!("../src/response_finalize.rs");
     let subc_format = include_str!("../src/subc_format.rs");

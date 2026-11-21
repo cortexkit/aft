@@ -18,8 +18,8 @@ const SOURCES: &[&str] = &[
     "crates/aft-fake-lsp/build.rs",
     "crates/aft-fake-lsp/src/main.rs",
     "crates/aft/tests/lsp/fake_server.rs",
-    "crates/aft/src/lsp/jsonrpc.rs",
-    "crates/aft/src/lsp/transport.rs",
+    "crates/aft-engine/src/lsp/jsonrpc.rs",
+    "crates/aft-engine/src/lsp/transport.rs",
 ];
 
 pub fn fake_server_binary() -> PathBuf {

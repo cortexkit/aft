@@ -53,155 +53,139 @@ pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
 // a guarantee that every production path is panic-free; public accessors can
 // still require a configured context, and each invariant needs local review.
 
-pub mod access_policy;
+pub use aft_engine::access_policy;
 #[cfg(test)]
 mod access_policy_tests;
-pub mod agent_child_env;
 pub(crate) use aft_base::agent_commands;
-pub mod agent_data;
 pub use aft_base::alert_records;
-pub mod alert_state;
+pub use aft_engine::agent_child_env;
+pub use aft_engine::agent_data;
+pub use aft_engine::alert_state;
 // The `aft` binary installs its allocator; the library sets the operation
 // labels it attributes allocations to.
 pub use aft_base::alloc_trace;
-pub use aft_parse::ast_grep_hints;
-pub mod ast_grep_lang;
-pub mod backup;
-pub mod bash_background;
-pub(crate) mod bash_changed_files;
-#[cfg(unix)]
-pub(crate) mod bash_db_hints;
 pub(crate) use aft_base::bash_env;
-pub mod bash_parse;
-pub mod bash_permissions;
-pub mod bash_rewrite;
-pub(crate) mod blocking_wait;
 pub(crate) use aft_base::bounded_io;
+pub use aft_engine::ast_grep_lang;
+pub use aft_engine::backup;
+pub use aft_engine::bash_background;
+pub(crate) use aft_engine::bash_changed_files;
+#[cfg(unix)]
+pub(crate) use aft_engine::bash_db_hints;
+pub use aft_engine::bash_parse;
+pub use aft_engine::bash_permissions;
+pub use aft_engine::bash_rewrite;
+pub(crate) use aft_engine::blocking_wait;
+pub use aft_parse::ast_grep_hints;
 pub(crate) mod bounded_io_command;
 pub use aft_base::atomic_replace;
-pub mod cache_freshness;
-pub mod cache_location;
-pub mod callgraph;
 pub use aft_parse::callgraph_extractor;
-pub mod callgraph_store;
-pub mod calls;
-pub mod checkpoint;
 pub(crate) use aft_base::clock;
 pub use aft_base::cold_build_limiter;
+pub use aft_engine::cache_freshness;
+pub use aft_engine::cache_location;
+pub use aft_engine::callgraph;
+pub use aft_engine::callgraph_store;
+pub use aft_engine::calls;
+pub use aft_engine::checkpoint;
+pub use aft_parse::callgraph_extractor;
 pub mod commands;
 pub use aft_base::compress;
-#[cfg(test)]
-mod compress_boundary_tests;
-#[cfg(test)]
-mod fleet_status_boundary_tests;
 pub use aft_base::config;
 pub use aft_base::config_fix;
-pub mod config_live;
 pub use aft_base::config_resolve;
 pub use aft_base::config_sources;
-pub mod context;
 pub(crate) use aft_base::cross_volume;
+pub use aft_engine::config_live;
+pub use aft_engine::context;
 pub mod data_layer;
-pub(crate) mod database_open;
-pub mod db;
 pub use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
 pub use aft_base::disk_floor;
 pub(crate) use aft_base::durability;
 pub(crate) use aft_base::durable_dir;
-pub mod edit;
 pub use aft_base::effective_path;
-pub mod engram_catalog;
 #[doc(hidden)]
 pub use aft_base::environment;
-#[cfg(test)]
-mod engine_source_guard_tests;
 pub use aft_base::error;
-pub mod exec_remote;
 #[cfg(test)]
 use aft_base::executable_cache;
-pub mod executor;
-pub mod extract;
 pub use aft_base::feature_config;
-pub mod feature_status;
 pub(crate) use aft_base::file_identity;
-pub mod file_kind;
-pub(crate) mod file_read_exact;
 pub use aft_base::fleet_status;
-pub mod format;
-pub mod fs_lock;
-pub use aft_parse::fuzzy_match;
-pub mod gh_shim;
 pub use aft_base::gh_shim_paths;
-pub mod gh_shim_relay;
-pub(crate) mod gh_shim_speech;
-pub mod gh_shim_ticket;
-pub(crate) mod gh_shim_worker_broker;
-#[cfg(unix)]
-pub(crate) mod gh_shim_worker_endpoints;
 pub use aft_base::git_head;
-pub mod git_index_reader;
 pub(crate) use aft_base::git_probe;
 pub(crate) use aft_base::git_revision;
-pub(crate) mod git_root_resolution;
 pub(crate) use aft_base::github_address;
-pub mod github_read;
 pub use aft_base::grammar_state;
-pub mod grammar;
-pub mod grep_executor;
 pub use aft_base::harness;
 pub use aft_base::harness_partition_guard;
-pub mod hashline;
 pub use aft_base::host_tool_names;
-pub mod imports;
-pub mod indent;
-pub mod inspect;
 pub use aft_base::inspect_category;
-pub(crate) mod io_accounting;
 pub use aft_base::jsonc;
 pub use aft_base::jsonc_edit;
-pub mod lang_id;
 pub use aft_base::language;
 pub(crate) use aft_base::large_read_counts;
-pub(crate) use aft_parse::line_matcher;
-pub(crate) mod large_read;
-pub(crate) mod late_result_bus;
 #[doc(hidden)]
 pub use aft_base::launch_fds;
 pub use aft_base::launch_nonce;
-pub(crate) mod lifecycle_census;
 pub use aft_base::list_envelope;
 pub use aft_base::list_surfaces;
-pub mod live_db_files;
-pub mod local_embed;
 pub(crate) use aft_base::lock_diagnostics;
 pub use aft_base::log_ctx;
 pub use aft_base::log_redact;
-pub mod logging;
-pub mod lsp;
-pub mod lsp_hints;
-mod luau;
-pub mod memory;
-pub mod memory_census;
-pub mod native_route;
 pub(crate) use aft_base::native_stat;
 pub use aft_base::ndjson_text;
+pub(crate) use aft_engine::database_open;
+pub use aft_engine::db;
+pub use aft_engine::edit;
+pub use aft_engine::engram_catalog;
+pub use aft_engine::exec_remote;
+pub use aft_engine::executor;
+pub use aft_engine::extract;
+pub use aft_engine::feature_status;
+pub use aft_engine::file_kind;
+pub(crate) use aft_engine::file_read_exact;
+pub use aft_engine::format;
+pub use aft_engine::fs_lock;
+pub use aft_engine::gh_shim;
+pub use aft_engine::gh_shim_relay;
+pub(crate) use aft_engine::gh_shim_speech;
+pub use aft_engine::gh_shim_ticket;
+pub(crate) use aft_engine::gh_shim_worker_broker;
+#[cfg(unix)]
+pub(crate) use aft_engine::gh_shim_worker_endpoints;
+pub use aft_engine::git_index_reader;
+pub(crate) use aft_engine::git_root_resolution;
+pub use aft_engine::github_read;
+pub use aft_engine::grammar;
+pub use aft_engine::grep_executor;
+pub use aft_engine::hashline;
+pub use aft_engine::imports;
+pub use aft_engine::indent;
+pub use aft_engine::inspect;
+pub(crate) use aft_engine::io_accounting;
+pub use aft_engine::lang_id;
+pub(crate) use aft_engine::large_read;
+pub(crate) use aft_engine::late_result_bus;
+pub(crate) use aft_engine::lifecycle_census;
+pub use aft_engine::live_db_files;
+pub use aft_engine::local_embed;
+pub use aft_engine::logging;
+pub use aft_engine::lsp;
+pub use aft_engine::lsp_hints;
+pub use aft_engine::memory;
+pub use aft_engine::memory_census;
+pub use aft_engine::native_route;
+pub use aft_parse::fuzzy_match;
+pub(crate) use aft_parse::line_matcher;
 #[cfg(test)]
 mod nested_worktree_tests;
 pub use aft_base::ort_lifecycle;
-pub mod ort_pin;
-pub(crate) mod os_metadata;
-pub(crate) mod output_store;
-pub(crate) mod page_collect;
-pub mod parent_search;
-pub mod parser;
-pub mod patch;
-pub mod path_identity;
 pub use aft_base::pattern_compile;
 pub use aft_base::pending_response;
-pub mod persisted_format;
 pub(crate) use aft_base::pinned_dir;
-pub mod pinned_executable;
 use aft_base::platform_tls;
 pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
@@ -213,45 +197,53 @@ pub(crate) use aft_base::process_group;
 pub use aft_base::process_identity;
 pub use aft_base::process_io;
 pub(crate) use aft_base::process_spawn;
-pub(crate) mod production_storage;
-pub(crate) mod project_content;
 pub use aft_base::project_walk;
 pub use aft_base::protocol;
-#[cfg(test)]
-pub(crate) use aft_base::walk_profile;
-pub(crate) mod provisional_identity_retry;
 pub use aft_base::pty_render;
 pub use aft_base::query_shape;
 pub use aft_base::read_policy;
-pub mod reader_floor;
-pub mod repeat_state;
+#[cfg(test)]
+pub(crate) use aft_base::walk_profile;
+pub use aft_engine::ort_pin;
+pub(crate) use aft_engine::os_metadata;
+pub(crate) use aft_engine::output_store;
+pub(crate) use aft_engine::page_collect;
+pub use aft_engine::parent_search;
+pub use aft_engine::parser;
+pub use aft_engine::patch;
+pub use aft_engine::path_identity;
+pub use aft_engine::persisted_format;
+pub use aft_engine::pinned_executable;
+pub(crate) use aft_engine::production_storage;
+pub(crate) use aft_engine::project_content;
+pub(crate) use aft_engine::provisional_identity_retry;
+pub use aft_engine::reader_floor;
+pub use aft_engine::repeat_state;
 pub mod response_finalize;
-pub(crate) mod revision_read;
-pub mod root_cache;
-pub mod root_identity;
+pub(crate) use aft_engine::revision_read;
+pub use aft_engine::root_cache;
+pub use aft_engine::root_identity;
 pub mod run_tool_call;
-pub mod runtime_drain;
-pub mod runtime_registry;
-pub use aft_db::sandbox_profile;
-pub mod sandbox_spawn;
-pub mod scoped_key;
-pub mod search_b2;
-pub mod search_index;
-pub mod search_state;
-pub mod secret;
-pub mod secret_proxy;
-pub mod semantic_admission;
-pub mod semantic_index;
-pub mod setup_plan;
 pub(crate) use aft_base::shared_timer;
-pub(crate) mod shell_env_provider;
 pub use aft_base::shell_format;
-pub mod standing_roots;
-pub(crate) mod status_push;
-pub(crate) mod status_snapshot;
 pub use aft_base::storage_path;
-#[cfg(all(test, unix))]
-mod storage_permissions_tests;
+pub use aft_db::sandbox_profile;
+pub use aft_engine::runtime_drain;
+pub use aft_engine::runtime_registry;
+pub use aft_engine::sandbox_spawn;
+pub use aft_engine::scoped_key;
+pub use aft_engine::search_b2;
+pub use aft_engine::search_index;
+pub use aft_engine::search_state;
+pub use aft_engine::secret;
+pub use aft_engine::secret_proxy;
+pub use aft_engine::semantic_admission;
+pub use aft_engine::semantic_index;
+pub use aft_engine::setup_plan;
+pub(crate) use aft_engine::shell_env_provider;
+pub use aft_engine::standing_roots;
+pub(crate) use aft_engine::status_push;
+pub(crate) use aft_engine::status_snapshot;
 pub mod subc;
 pub use aft_base::subc_config;
 #[cfg(test)]
@@ -259,32 +251,32 @@ pub use aft_base::subc_config;
 mod subc_fake;
 pub mod subc_format;
 pub mod subc_translate;
-pub mod symbol_diff;
+pub use aft_engine::symbol_diff;
 pub(crate) mod trace_measure_run;
 pub use aft_base::symbols;
-pub mod synapse_embed;
 pub(crate) use aft_base::system_temp;
 pub(crate) use aft_base::task_temp_reads;
 pub use aft_base::task_watch_lines;
 pub use aft_base::task_watches;
-#[cfg(test)]
-pub(crate) mod test_storage;
 pub use aft_base::tool_gate;
-pub(crate) mod tool_call_result;
+pub use aft_engine::synapse_embed;
+#[cfg(test)]
+pub(crate) use aft_engine::test_storage;
+pub(crate) use aft_engine::tool_call_result;
 pub(crate) mod tool_output;
 pub use aft_base::tool_path;
 pub(crate) use aft_base::tool_progress;
-pub mod url_fetch;
 use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
 pub(crate) use aft_base::walk_boundary;
-pub(crate) mod watcher_backend;
-pub mod watcher_filter;
 pub(crate) use aft_base::watcher_markers;
 pub use aft_base::write_counters;
-pub mod write_intent;
-pub mod write_ledger;
+pub use aft_engine::url_fetch;
+pub(crate) use aft_engine::watcher_backend;
+pub use aft_engine::watcher_filter;
+pub use aft_engine::write_intent;
+pub use aft_engine::write_ledger;
 // Compiled on all platforms so cross-platform unit tests in
 // `commands::bash::try_spawn_with_fallback` can exercise the retry
 // decision logic without a real Windows runtime. The module itself only
@@ -292,13 +284,11 @@ pub mod write_ledger;
 #[allow(unused_imports)]
 pub(crate) use aft_base::windows_command;
 pub use aft_base::windows_path;
-pub mod windows_shell;
 pub use aft_base::worker_jail_canary;
+pub use aft_engine::windows_shell;
 
 #[cfg(all(test, target_os = "linux"))]
 mod daemon_heap_probe;
-#[cfg(test)]
-mod gate_hermeticity_tests;
 #[cfg(test)]
 pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
@@ -306,14 +296,14 @@ pub(crate) use aft_base::search_hot_path_measurements as search_test_counts;
 #[cfg(test)]
 pub(crate) use aft_base::test_allocations;
 #[cfg(test)]
-#[path = "base_tests/test_env.rs"]
-pub(crate) mod test_env;
-#[cfg(test)]
 pub(crate) use aft_base::test_gate;
 #[cfg(all(test, windows))]
 pub(crate) use aft_base::test_read_denial;
 #[cfg(test)]
 pub(crate) use aft_base::test_support;
+#[cfg(test)]
+#[path = "base_tests/test_env.rs"]
+pub(crate) use aft_engine::test_env;
 #[cfg(test)]
 mod upper_test_context;
 #[cfg(test)]
@@ -321,9 +311,6 @@ pub(crate) use upper_test_context::test_context;
 // The fake LSP builder also compiles in integration tests under this helper name.
 #[cfg(test)]
 use test_support as test_helpers;
-
-#[cfg(all(test, target_os = "macos"))]
-mod disk_write_hunt;
 
 #[cfg(test)]
 #[path = "../tests/helpers/fake_lsp.rs"]

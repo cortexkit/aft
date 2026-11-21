@@ -131,7 +131,7 @@ mod tests {
                 "reader-floor registration must precede {entry}"
             );
         }
-        let shim = include_str!("../gh_shim.rs")
+        let shim = include_str!("../../../aft-engine/src/gh_shim.rs")
             .split_once("pub fn run_from_env() -> i32 {")
             .unwrap()
             .1;

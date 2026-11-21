@@ -4,10 +4,10 @@ extern crate self as aft;
 
 mod lsp {
     pub mod jsonrpc {
-        include!("../../aft/src/lsp/jsonrpc.rs");
+        include!("../../aft-engine/src/lsp/jsonrpc.rs");
     }
     pub mod transport {
-        include!("../../aft/src/lsp/transport.rs");
+        include!("../../aft-engine/src/lsp/transport.rs");
     }
 }
 
