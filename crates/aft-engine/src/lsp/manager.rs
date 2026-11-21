@@ -10656,6 +10656,10 @@ fn env_binary_override_from(
         .map(PathBuf::from)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[path = "idle_fixture.rs"]
+pub(crate) mod idle_fixture;
+
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
 pub(crate) mod regression_tests;
@@ -13681,7 +13685,7 @@ mod current_content_diagnostics_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn settled_lsp<R>(
     manager: &mut LspManager,
     operation: impl Fn(&mut LspManager) -> R,

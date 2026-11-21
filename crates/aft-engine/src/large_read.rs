@@ -80,13 +80,13 @@ pub fn visit_lines(
         line.extend_from_slice(&chunk[..count]);
         reader.consume(count);
         read += count as u64;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STEP_TAP.with(|tap| {
             if let Some(tap) = tap.borrow_mut().as_mut() {
                 tap(read);
             }
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if LINE_SCAN_FAILURE.with(|failure| {
             if failure.get() == Some(site) {
                 failure.take();
@@ -111,7 +111,7 @@ pub fn visit_lines(
 /// Bytes read per step from a large file.
 pub(crate) const STEP_BYTES: usize = 1024 * 1024;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static LINE_SCAN_FAILURE: std::cell::Cell<Option<Site>> = const { std::cell::Cell::new(None) };
     /// Replaces [`STEP_BYTES`] on this thread, so tests can put step edges
@@ -126,12 +126,13 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     /// A [`Steps`] reservation that would grow its buffer past this many
     /// bytes fails on this thread, as a refused allocation does.
+    #[cfg(test)]
     static REFUSE_RESERVE_OVER: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 /// Fail one raw-line scan at `site` after it consumes its first chunk. The
 /// assertion prevents a regression test from passing without reaching the read.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
@@ -150,7 +151,7 @@ pub(crate) fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) ->
 }
 
 /// Run `work` with `tap` called after every step or raw-line chunk on this thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_step_tap<T>(tap: impl FnMut(u64) + 'static, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
@@ -179,7 +180,7 @@ pub(crate) fn with_reserve_limit<T>(bytes: usize, work: impl FnOnce() -> T) -> T
 
 /// Run `work` with a different step size and large-file threshold on this
 /// thread.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_test_steps<T>(step: usize, large: u64, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
@@ -195,7 +196,7 @@ pub(crate) fn with_test_steps<T>(step: usize, large: u64, work: impl FnOnce() ->
 }
 
 pub(crate) fn step_bytes() -> usize {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(step) = STEP_OVERRIDE.with(std::cell::Cell::get) {
         return step;
     }
@@ -205,7 +206,7 @@ pub(crate) fn step_bytes() -> usize {
 /// Whether a file of `size` bytes is a large read.
 #[doc(hidden)]
 pub fn is_large(size: u64) -> bool {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(large) = LARGE_OVERRIDE.with(std::cell::Cell::get) {
         return size > large;
     }
@@ -293,7 +294,7 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
         }
         let before = buffer.len();
         *buffer = self.source.append(std::mem::take(buffer), want)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STEP_TAP.with(|tap| {
             if let Some(tap) = tap.borrow_mut().as_mut() {
                 tap(self.read + (buffer.len() - before) as u64);
@@ -1065,12 +1066,12 @@ pub fn health() -> serde_json::Value {
 }
 
 /// Every site's name, for tests that size the health entry at its largest.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn site_names() -> impl Iterator<Item = &'static str> {
     SITES.into_iter().map(|(_, name)| name)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn widest_health_for_test() -> serde_json::Value {
     summarize_health_sites(
         site_names()

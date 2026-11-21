@@ -120,3 +120,15 @@ impl InspectCacheTest for InspectCache {
         self.store_tier2_aggregate(key, contribution_set_hash, aggregate)
     }
 }
+
+pub mod data_sources {
+    pub fn set_todo_store_wait_for_test(project_root: &std::path::Path, wait: std::time::Duration) {
+        crate::inspect::data_sources::set_todo_store_wait_for_test(project_root, wait);
+    }
+}
+
+pub mod cache {
+    pub fn aggregate_memory_walks_for_test() -> usize {
+        crate::inspect::cache::aggregate_memory_walks_for_test()
+    }
+}

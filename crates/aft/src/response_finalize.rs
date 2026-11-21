@@ -1094,7 +1094,8 @@ mod tests {
         ctx.update_status_bar_todos(Some(4));
         let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
         ctx.install_fleet_status_client(Some(client));
-        crate::context::STATUS_COUNT_PROBES.with(|count| count.set(0));
+        aft_engine::test_bridge::display_data::context::STATUS_COUNT_PROBES
+            .with(|count| count.set(0));
         let mut response = Response::success("counts", serde_json::json!({}));
         let mut text = "contents".to_string();
         finalize_tool_response(&mut response, &mut text, &ctx, "counts", "read", false);
@@ -1104,7 +1105,8 @@ mod tests {
             .expect("fleet publication")
             .complete_unavailable();
         assert_eq!(
-            crate::context::STATUS_COUNT_PROBES.with(|count| count.get()),
+            aft_engine::test_bridge::display_data::context::STATUS_COUNT_PROBES
+                .with(|count| count.get()),
             1
         );
     }

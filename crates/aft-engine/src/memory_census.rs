@@ -95,7 +95,7 @@ pub fn shared_process_memory() -> SharedProcessMemory {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn rollup_snapshot(
     roots_status: &'static str,
     roots: BTreeMap<String, RootMemoryRollup>,

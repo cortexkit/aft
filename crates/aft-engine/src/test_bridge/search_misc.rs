@@ -266,6 +266,10 @@ pub fn keep_request_file(
 pub mod output;
 pub mod search;
 pub mod edit {
+    pub fn file_reporter_registered() -> bool {
+        crate::edit::file_reporter_registered()
+    }
+
     pub use crate::edit::{
         A03_DIFF_CONSTRUCTIONS, A03_LINE_INDEX_PASSES, FORCE_MODE_RESTORE_FAILURE,
         LINE_OFFSET_BYTES_SCANNED,
@@ -452,3 +456,10 @@ impl ConfigReloadSignalTestExt for crate::watcher_filter::config_events::ConfigR
         &self.due_at_ms
     }
 }
+
+mod hook_extensions;
+pub use hook_extensions::{
+    backup, grep_executor, large_read, lsp, memory_census, root_cache, root_identity,
+    semantic_index, standing_roots, synapse_embed, watcher_filter, CountsTestExt, DaemonTestExt,
+    IdleLspFixtureTestExt,
+};
