@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime};
 
 use aft_store::ids::{Digest128, FamilyId};
 
-use super::ViewScope;
 use crate::data_layer::checkout::{Checkout, CheckoutView, DataLayer};
+use crate::data_layer::text_scope::ViewScope;
 use crate::pattern_compile::{compile, CompileOpts, CompileResult, CompiledPattern};
 use crate::search_index::{
     decompose_grep_pattern, sort_paths_by_cached_mtime_desc, GrepResult, GrepScanOrder,

@@ -127,3 +127,6 @@ mod tests {
             .starts_with("crate::reader_floor::register_cache_hooks();"));
     }
 }
+#[cfg(test)]
+#[path = "call_ledger_recovery_tests.rs"]
+mod call_ledger_recovery_tests;
