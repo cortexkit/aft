@@ -279,6 +279,8 @@ impl ProjectWatcher {
                         }
                     }
 
+                    #[cfg(test)]
+                    super::activity_tests::note_backend_wait(&counters);
                     let wait = if active_flushes.is_empty() {
                         BACKEND_POLL_INTERVAL
                     } else {

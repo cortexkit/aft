@@ -101,6 +101,8 @@ struct WatcherLossRecovery {
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
     pub(crate) bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(super) backend_activity: Mutex<(u64, u64)>,
     pub(crate) bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,
     /// Legacy rescan work coalesces repeated drops, but a newly installed views

@@ -370,6 +370,8 @@ impl ProjectWatcher {
                         }
                     }
 
+                    #[cfg(test)]
+                    super::activity_tests::note_backend_wait(&counters);
                     match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
                         Ok(Ok(event)) => {
                             let directory_arrival = is_directory_arrival(&event);

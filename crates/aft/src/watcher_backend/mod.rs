@@ -3,6 +3,8 @@ use std::sync::atomic::AtomicU64;
 use std::sync::{mpsc, Arc};
 
 use crate::watcher_filter::SharedGitignore;
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod activity_tests;
 pub(crate) mod cookie;
 pub(crate) mod counters;
 pub(crate) mod flush;
