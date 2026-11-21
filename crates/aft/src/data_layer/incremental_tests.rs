@@ -15,6 +15,161 @@ use super::incremental::LiveCheckout;
 use crate::callgraph_store::join::{CallgraphBlob, ResolutionStatus};
 
 #[test]
+fn colliding_reverse_readers_survive_refile_and_fold() {
+    use aft_store::family::Family;
+    use aft_store::graph::{term_hash, TermKind};
+    use aft_store::ids::FamilyId;
+
+    use super::checkout::{Checkout, DataLayer, Folded};
+    use super::incremental::with_binding_hash_collision;
+
+    const ORIGINAL: &str = "original.ts";
+    const COLLIDER: &str = "collider.ts";
+    const REFILED: &str = "b-refiled.ts";
+    const REMOVED: &str = "d-removed.ts";
+    const LIVE: &str = "e-live.ts";
+    const STORED: &str = "z-stored.ts";
+    const READ_ORIGINAL: &str = "import { run } from './original.ts'; export const value = run();";
+    const READ_COLLIDER: &str = "import { run } from './collider.ts'; export const value = run();";
+
+    let base = crate::test_support::manifest_dir().join("../../target/scratch/reverse-collision");
+    std::fs::create_dir_all(&base).unwrap();
+    let dir = tempfile::tempdir_in(base).unwrap();
+    let run = |name: &str, collide: bool| {
+        let root = dir.path().join(name).join("root");
+        let store = dir.path().join(name).join("store");
+        std::fs::create_dir_all(&root).unwrap();
+        for file in [REFILED, REMOVED, LIVE, STORED] {
+            std::fs::write(root.join(file), READ_ORIGINAL).unwrap();
+        }
+        std::fs::write(root.join(ORIGINAL), "export function run() { return 1; }").unwrap();
+        std::fs::write(root.join(COLLIDER), "export function run() { return 2; }").unwrap();
+        let family = FamilyId::from_digest(Digest128::of(b"reverse reader collision"));
+        let tree =
+            Checkout::bind(Arc::new(DataLayer::new(8 << 20, 2)), &store, family, &root).unwrap();
+        tree.build().unwrap();
+        let paths = |files: &[&str]| files.iter().map(|file| (*file).to_owned()).collect();
+        tree.inspect_engine(|live| {
+            let stored = live.stored_for_test();
+            for (term, expected) in [
+                (ORIGINAL, paths(&[REFILED, REMOVED, LIVE, STORED])),
+                (COLLIDER, BTreeSet::new()),
+            ] {
+                assert_eq!(
+                    stored.files_recording(TermKind::BindingKey, term.as_bytes()),
+                    expected
+                );
+                assert_eq!(
+                    stored.files_recording_hash(TermKind::BindingKey, term_hash(term.as_bytes())),
+                    expected
+                );
+            }
+        })
+        .unwrap()
+        .unwrap();
+        if !collide {
+            assert!(tree.check_stored_inputs().unwrap().is_empty());
+        }
+
+        let refresh = |changed: &[&str]| {
+            tree.record_paths(
+                &changed
+                    .iter()
+                    .map(|file| file.as_bytes().to_vec())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let stats = tree.refresh_callgraph().unwrap().unwrap();
+            assert!(!stats.cold_build, "the fixture must not rebuild cold");
+            stats
+        };
+        let readers = |key| {
+            tree.inspect_engine(|live| live.binding_readers_for_test(key))
+                .unwrap()
+                .unwrap()
+        };
+
+        // Both rewritten files move from the original term to its collider.
+        // Unchanged files still come from the publication.
+        for file in [REFILED, LIVE] {
+            std::fs::write(root.join(file), READ_COLLIDER).unwrap();
+        }
+        refresh(&[REFILED, LIVE]);
+        assert_eq!(
+            readers(ORIGINAL),
+            if collide {
+                paths(&[REFILED, REMOVED, LIVE, STORED])
+            } else {
+                paths(&[REMOVED, STORED])
+            }
+        );
+
+        // Emptying one file's reads and removing another must suppress their
+        // old postings without removing the shared bucket's other readers.
+        std::fs::write(root.join(REFILED), "export const value = 0;").unwrap();
+        std::fs::remove_file(root.join(REMOVED)).unwrap();
+        refresh(&[REFILED, REMOVED]);
+        assert_eq!(
+            readers(ORIGINAL),
+            if collide {
+                paths(&[LIVE, STORED])
+            } else {
+                paths(&[STORED])
+            }
+        );
+        assert_eq!(
+            readers(COLLIDER),
+            if collide {
+                paths(&[LIVE, STORED])
+            } else {
+                paths(&[LIVE])
+            }
+        );
+
+        // Removing the target makes the refresh look up its binding readers.
+        std::fs::remove_file(root.join(ORIGINAL)).unwrap();
+        let stats = refresh(&[ORIGINAL]);
+        assert_eq!(stats.rebound_by_keys, if collide { 2 } else { 1 });
+        assert!(tree.publish_changes().unwrap().is_some());
+        assert!(matches!(tree.fold().unwrap(), Folded::Done(_)));
+
+        let snapshot = Family::open(&store, family).unwrap().snapshot().unwrap();
+        let [info] = snapshot.manifest().segments() else {
+            panic!("fold must leave exactly one active segment");
+        };
+        let known = aft_store::text::KNOWN
+            .into_iter()
+            .chain(super::graph_store::known_sections())
+            .chain(aft_store::vector::KNOWN)
+            .collect::<Vec<_>>();
+        let cache = Arc::new(aft_store::cache::BlockCache::new(8 << 20));
+        let segment = snapshot
+            .open_shared_segment(info.id, &known, &cache)
+            .unwrap();
+        let sections = segment
+            .sections()
+            .filter(|(_, info)| (0x0300..=0x0306).contains(&info.id.kind.get()))
+            .map(|(section, info)| (info.id, segment.read_range(section, 0..info.len).unwrap()))
+            .collect::<BTreeMap<_, _>>();
+        assert!(!sections.is_empty());
+        sections
+    };
+
+    let normal = run("normal", false);
+    let collided = with_binding_hash_collision(COLLIDER, ORIGINAL, || run("collision", true));
+    assert_eq!(
+        collided.keys().collect::<Vec<_>>(),
+        normal.keys().collect::<Vec<_>>()
+    );
+    for (id, bytes) in &normal {
+        assert!(
+            collided[id] == *bytes,
+            "folded graph section {id:?} changed"
+        );
+    }
+}
+
+#[test]
 fn refresh_memory_guard_checks_inside_one_large_site_batch() {
     use super::incremental::UpdateError;
     use super::refresh_memory::{RefreshMemory, RefreshStop};

@@ -156,6 +156,55 @@ impl ReaderPaths {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ReaderHash {
+    #[cfg(test)]
+    collision: Option<(u64, u64)>,
+}
+
+impl ReaderHash {
+    fn new(_kind: TermKind) -> Self {
+        Self {
+            #[cfg(test)]
+            collision: (_kind == TermKind::BindingKey)
+                .then(|| BINDING_HASH_COLLISION.get())
+                .flatten(),
+        }
+    }
+
+    fn hash(self, term: &[u8]) -> u64 {
+        let hash = term_hash(term);
+        #[cfg(test)]
+        if let Some((from, to)) = self.collision {
+            if hash == from {
+                return to;
+            }
+        }
+        hash
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BINDING_HASH_COLLISION: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Give two binding terms the same hash in engines started by `run`.
+/// The stored graph writer still sees the original terms.
+#[cfg(test)]
+pub(super) fn with_binding_hash_collision<T>(from: &str, to: &str, run: impl FnOnce() -> T) -> T {
+    struct Reset(Option<(u64, u64)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            BINDING_HASH_COLLISION.set(self.0);
+        }
+    }
+    let collision = (term_hash(from.as_bytes()), term_hash(to.as_bytes()));
+    assert_ne!(collision.0, collision.1);
+    let _reset = Reset(BINDING_HASH_COLLISION.replace(Some(collision)));
+    run()
+}
+
 /// Which files recorded each input key, for one kind of recording: the
 /// reverse inputs a change is looked up in.
 ///
@@ -166,6 +215,7 @@ impl ReaderPaths {
 #[derive(Debug)]
 struct Readers {
     kind: TermKind,
+    hasher: ReaderHash,
     by_key: HashMap<u64, HashSet<u32>>,
     keys_of: HashMap<u32, Vec<u64>>,
     /// Files whose stored terms of this kind no longer apply.
@@ -176,6 +226,7 @@ impl Readers {
     fn new(kind: TermKind) -> Self {
         Self {
             kind,
+            hasher: ReaderHash::new(kind),
             by_key: HashMap::new(),
             keys_of: HashMap::new(),
             replaced: HashSet::new(),
@@ -184,9 +235,10 @@ impl Readers {
 
     fn set(&mut self, file: u32, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
         self.remove(file);
+        let hasher = self.hasher;
         let hashes = keys
             .into_iter()
-            .map(|key| term_hash(key.as_ref()))
+            .map(|key| hasher.hash(key.as_ref()))
             .filter(|&hash| self.by_key.entry(hash).or_default().insert(file))
             .collect::<Vec<_>>();
         if !hashes.is_empty() {
@@ -225,7 +277,7 @@ impl Readers {
     ) -> Result<BTreeSet<String>, RefreshStop> {
         let mut files = BTreeSet::new();
         for key in keys {
-            let hash = term_hash(key.as_ref());
+            let hash = self.hasher.hash(key.as_ref());
             if let Some(found) = self.by_key.get(&hash) {
                 for &file in found {
                     guard.file()?;
@@ -518,6 +570,24 @@ impl LiveCheckout {
             started.elapsed().as_secs_f64() * 1000.0
         );
         missing
+    }
+
+    #[cfg(test)]
+    pub(super) fn binding_readers_for_test(&self, key: &str) -> BTreeSet<String> {
+        self.reverse
+            .binding
+            .of(
+                [key],
+                &self.reverse.paths,
+                self.reverse.stored.as_deref(),
+                None,
+            )
+            .expect("unguarded reader lookup cannot stop")
+    }
+
+    #[cfg(test)]
+    pub(super) fn stored_for_test(&self) -> &StoredSlices {
+        self.reverse.stored.as_deref().expect("stored-backed test")
     }
 
     /// Files whose recorded reads or surface answers no longer hold in the
@@ -1482,9 +1552,11 @@ impl LiveCheckout {
     }
 }
 
+aft_store::heap_bytes_none!(ReaderHash);
 aft_store::heap_bytes_of_fields!(ReaderPaths { ids, paths });
 aft_store::heap_bytes_of_fields!(Readers {
     kind,
+    hasher,
     by_key,
     keys_of,
     replaced,
