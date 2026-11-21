@@ -7,11 +7,11 @@ pub(in crate::subc) const CATALOG_DIGEST: &str =
 
 pub(super) fn append(entry: &mut Shipped) {
     let mut manifest = entry.history.last().expect("shipped view").clone();
-    // Revision 3 already used this catalog. Only the replaced placeholders
-    // need revision 4 for apps to accept their new sources.
+    // The file-tool views changed since revision 3. Bash still serves the
+    // same sources on this catalog.
     let (revision_delta, sources) = match entry.tool.name.as_str() {
         "edit" => (
-            2,
+            3,
             Some([include_str!("edit.row.ui"), include_str!("edit.page.ui")]),
         ),
         "bash" => (

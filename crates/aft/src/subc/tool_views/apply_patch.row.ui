@@ -11,7 +11,7 @@ export const removed = view.completion.removedLines ?? view.record.removedLines
  : outcome == "partial" ? <ToolText text="Partly applied" size="small" tone="warning" />
  : view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />
  : added != null && removed != null
- ? <Card appearance="clear" direction="row" gap="xs"><ToolText text={"+" + Text(added)} font="mono" size="small" tone="success" /><ToolText text={"−" + Text(removed)} font="mono" size="small" tone="danger" /></Card>
+ ? <Card appearance="clear" direction="row" gap="xs"><ToolText text={"+" + Text(added)} font="mono" size="small" tone="success" width="natural" /><ToolText text={"−" + Text(removed)} font="mono" size="small" tone="danger" width="natural" /></Card>
  : view.call.phase == "running" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}
 </Slot>
 </ToolHeader>

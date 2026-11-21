@@ -232,7 +232,7 @@ mod tests {
                     "tail".into(),
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
-            } else if matches!(entry.tool.name.as_str(), "write" | "apply_patch") {
+            } else if matches!(entry.tool.name.as_str(), "edit" | "write" | "apply_patch") {
                 assert_eq!(view.template_revision, 4);
             } else {
                 assert_eq!(view.template_revision, 3);
@@ -270,19 +270,19 @@ mod tests {
                 _ => "view.output ??",
             }));
             // Canonical row and page SHA-256s reported by occipital-check
-            // 0.1.7. The write and apply_patch samples were checked at phone
+            // 0.1.7. Samples for all three file tools were checked at phone
             // and desktop widths.
             let digests = match entry.tool.name.as_str() {
                 "apply_patch" => [
-                    "a15a500f28427f4fe7459a861ef7af668fc5897d08b9422496f032f62f9bbc3e",
+                    "3ec957da89287b0d7abaef752ddd79a862bb83c74f0fc0b7eb11af193e73193d",
                     "58f52d34e95b95f474281175d3790627a4f9263e87a078b8b1fefef80116688b",
                 ],
                 "edit" => [
-                    "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
+                    "0fea838e52c7f79185fa7892f1605fd6be7b2c4e97ec93e9c0543ef95807f531",
                     "3a457fd30d60ca7acc5bab258da9786bc309a44190d5454795f2b80a870332d7",
                 ],
                 "write" => [
-                    "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
+                    "0fea838e52c7f79185fa7892f1605fd6be7b2c4e97ec93e9c0543ef95807f531",
                     "3422ad764d8aea87c95e6f6b38e21bf10096d27ef72bedb07a9f4276b8fa23fd",
                 ],
                 "bash" => continue, // Covered by the tail-pin compatibility test.
@@ -424,11 +424,13 @@ mod tests {
                     )),
                 ),
                 "edit" => (
-                    format!("{index}.json"),
+                    "edit.json".into(),
                     json!([{
+                        "name":"edit-one-file",
                         "input":{"path":"src/a.rs","edits":[{"oldString":"old","newString":"new"}]},
                         "record":{"durationMs":1,"outcome":"held","reason":"consent"},
                         "completion":{"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"},
+                        "detail":{"schema":"aft/files-detail/1","revision":1,"files":[{"change":"modified","path":"src/a.rs"}],"hunks":[{"title":"Change 1 · line 1","oldStart":1,"newStart":1,"lines":[{"kind":"delete","text":"old"},{"kind":"add","text":"new"}]}]},
                     }]),
                 ),
                 "write" | "apply_patch" => (format!("{name}.json"), file_samples[name].clone()),
