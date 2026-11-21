@@ -1867,11 +1867,11 @@ fn watchdog_cost_shared_tool_output_cleanup_collects_all_registry_stores() {
 #[ignore = "measurement: 67 registries, 163 sessions, 217 retained files"]
 fn watchdog_cost_shared_tool_output_cleanup_measurement() {
     let (base, registries) = shared_tool_output_store(67);
-    let cpu = cleanup_cpu_ns();
+    let cpu = cleanup_phase_timing::cleanup_cpu_ns();
     let start = Instant::now();
     let work = super::super::watchdog::run_cleanup(registries.iter().cloned());
     let elapsed = start.elapsed();
-    let cpu = cleanup_cpu_ns() - cpu;
+    let cpu = cleanup_phase_timing::cleanup_cpu_ns() - cpu;
     eprintln!(
         "bash periodic cleanup elapsed_ms={:.3} cpu_ms={:.3} registries={} sessions=163 files=217 gc_requests={} tool_output_walks={} tool_output_read_dirs={} tool_output_remove_dirs={}",
         elapsed.as_secs_f64() * 1000.0, cpu as f64 / 1_000_000.0,
@@ -2293,49 +2293,6 @@ fn watchdog_cost_large_store_maintenance_measurement() {
     registry.detach();
 }
 
-#[cfg(unix)]
-fn cleanup_cpu_ns() -> u64 {
-    let mut time: libc::timespec = unsafe { std::mem::zeroed() };
-    assert_eq!(
-        unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
-        0
-    );
-    time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
-}
-
-#[cfg(unix)]
-thread_local! {
-    static CLEANUP_PHASES: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(unix)]
-pub(super) struct CleanupPhaseTimer(Option<(bool, u64)>);
-
-#[cfg(unix)]
-impl CleanupPhaseTimer {
-    pub(super) fn start(image: bool) -> Self {
-        Self(CLEANUP_PHASES.with(|phases| phases.get().map(|_| (image, cleanup_cpu_ns()))))
-    }
-}
-
-#[cfg(unix)]
-impl Drop for CleanupPhaseTimer {
-    fn drop(&mut self) {
-        if let Some((image, start)) = self.0 {
-            let elapsed = cleanup_cpu_ns() - start;
-            CLEANUP_PHASES.with(|phases| {
-                let (mut queue, mut images) = phases.get().unwrap();
-                if image {
-                    images += elapsed;
-                } else {
-                    queue += elapsed;
-                }
-                phases.set(Some((queue, images)));
-            });
-        }
-    }
-}
-
 /// One scheduled minute has one cleanup pass. Measure that pass's calling-thread
 /// CPU, excluding fixture setup and the separate persisted-GC worker. Run alone
 /// with --ignored --nocapture --test-threads=1.
@@ -2433,21 +2390,21 @@ fn watchdog_cost_live_shaped_cleanup_measurement() {
     assert_eq!(registry.inner.tasks.lock().unwrap().len(), TASKS);
     let worker = std::thread::Builder::new().name("aft-bash-cleanup".into()).spawn(move || {
         fn phase(label: &str, work: impl FnOnce()) -> u64 {
-            let cpu = cleanup_cpu_ns();
+            let cpu = cleanup_phase_timing::cleanup_cpu_ns();
             let wall = Instant::now();
             work();
-            let ns = cleanup_cpu_ns() - cpu;
+            let ns = cleanup_phase_timing::cleanup_cpu_ns() - cpu;
             eprintln!("CLEANUP {label} cpu_us={:.3} wall_us={:.3}", ns as f64 / 1_000.0, wall.elapsed().as_secs_f64() * 1_000_000.0);
             ns
         }
         work_counts::reset();
-        CLEANUP_PHASES.with(|phases| phases.set(Some((0, 0))));
+        cleanup_phase_timing::begin();
         let speech = phase("speech_sweep", crate::gh_shim_speech::start_view::sweep_queued);
         let scratch = phase("scratch_sweep", || registry.sweep_retained_scratch());
         let finished = phase("finished_total", || registry.cleanup_finished(super::super::watchdog::FINISHED_RETENTION));
         let gc = phase("gc_request", || BgTaskRegistry::request_recurring_persisted_gc(std::slice::from_ref(&registry)));
         let total = speech + scratch + finished + gc;
-        let (queue, images) = CLEANUP_PHASES.with(|phases| phases.take().unwrap());
+        let (queue, images) = cleanup_phase_timing::finish();
         eprintln!("CLEANUP tasks={TASKS} saved={SAVED} rows={TASKS} queue_drain_us={:.3} images_us={:.3} retention_and_lookup_us={:.3} image_stats={} total_cpu_us/min={:.3}", queue as f64 / 1_000.0, images as f64 / 1_000.0, (finished - queue - images) as f64 / 1_000.0, work_counts::get().stats, total as f64 / 1_000.0);
         let deadline = Instant::now() + Duration::from_secs(60);
         while persisted_gc_slots().lock().unwrap().values().any(|slot| slot.running) {

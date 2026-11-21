@@ -11444,7 +11444,7 @@ impl BgTaskRegistry {
         let cutoff = now.checked_sub(older_than);
         let candidates: Vec<_> = {
             #[cfg(all(test, unix))]
-            let _timer = watchdog_cost_tests::CleanupPhaseTimer::start(false);
+            let _timer = cleanup_phase_timing::CleanupPhaseTimer::start(false);
             let mut queue = self
                 .inner
                 .cleanup_queue
@@ -11461,7 +11461,7 @@ impl BgTaskRegistry {
             };
             {
                 #[cfg(all(test, unix))]
-                let _timer = watchdog_cost_tests::CleanupPhaseTimer::start(true);
+                let _timer = cleanup_phase_timing::CleanupPhaseTimer::start(true);
                 image_cleanup.record(self.cleanup_terminal_task_image(&task));
             }
             let delivered_terminal = !task.terminal_persist_dirty.load(Ordering::SeqCst)
@@ -31880,6 +31880,55 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+#[cfg(unix)]
+mod cleanup_phase_timing {
+    pub(super) fn cleanup_cpu_ns() -> u64 {
+        let mut time: libc::timespec = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut time) },
+            0
+        );
+        time.tv_sec as u64 * 1_000_000_000 + time.tv_nsec as u64
+    }
+
+    thread_local! {
+        static CLEANUP_PHASES: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+    }
+
+    pub(super) fn begin() {
+        CLEANUP_PHASES.with(|phases| phases.set(Some((0, 0))));
+    }
+
+    pub(super) fn finish() -> (u64, u64) {
+        CLEANUP_PHASES.with(|phases| phases.take().unwrap())
+    }
+
+    pub(super) struct CleanupPhaseTimer(Option<(bool, u64)>);
+
+    impl CleanupPhaseTimer {
+        pub(super) fn start(image: bool) -> Self {
+            Self(CLEANUP_PHASES.with(|phases| phases.get().map(|_| (image, cleanup_cpu_ns()))))
+        }
+    }
+
+    impl Drop for CleanupPhaseTimer {
+        fn drop(&mut self) {
+            if let Some((image, start)) = self.0 {
+                let elapsed = cleanup_cpu_ns() - start;
+                CLEANUP_PHASES.with(|phases| {
+                    let (mut queue, mut images) = phases.get().unwrap();
+                    if image {
+                        images += elapsed;
+                    } else {
+                        queue += elapsed;
+                    }
+                    phases.set(Some((queue, images)));
+                });
+            }
+        }
+    }
+}
 #[cfg(test)]
 #[path = "watchdog_cost_test.rs"]
 mod watchdog_cost_tests;
