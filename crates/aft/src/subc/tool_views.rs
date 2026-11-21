@@ -279,12 +279,10 @@ mod tests {
     fn bash_catalog_serves_a_new_tail_pin_without_changing_the_old_record_schema() {
         use crate::subc::tool_provider::{tools_for_session, CatalogPreset};
 
-        // Canonical row and page SHA-256s reported by occipital-check from
-        // cortexkit/occipital at 6771d71. The run used bash calls from the
-        // phone-reader-tool-display-v7 and phone-reader-tool-tail-v2 tags
-        // at phone and desktop widths.
+        // Occipital's template checker (occipital-check 0.1.7) reported these
+        // canonical hashes and verified the row height for each Bash outcome.
         let legacy_template_digests = [
-            "05bea365ae991818307b3b44a5e7984bd06f7f2d95c193d1d4772680f935b618",
+            "291990ef28f5790ab9d2d21fea9a0d5c620f6bebb9c66a3cda9a92d11cf3b924",
             "e8d1495e42c90404af114aaa5e369d1e57e24571174798dd974589c3a07e173a",
         ];
         // The Occipital checker hashes the entire canonical template document,
@@ -406,30 +404,47 @@ mod tests {
                 }
                 _ => unreachable!(),
             };
-            let (record, mut completion) = if entry.tool.name == "bash" {
-                (
-                    json!({"durationMs":8,"outcome":"success","phase":"background_started","taskId":"bash-demo1","outputBytes":0,"execution":"local"}),
-                    json!({"outcome":"success","phase":"background_finished","taskId":"bash-demo1","exitCode":0,"runDurationMs":2400,"outputBytes":3,"endReason":"exited","execution":"local"}),
-                )
+            let samples = if entry.tool.name == "bash" {
+                bash_checker_samples(&input, has_bash_tail(pin))
             } else {
-                (
-                    json!({"durationMs":1,"outcome":"held","reason":"consent"}),
-                    json!({"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"}),
-                )
+                vec![json!({
+                    "input":input,
+                    "record":{"durationMs":1,"outcome":"held","reason":"consent"},
+                    "completion":{"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"},
+                })]
             };
-            if has_bash_tail(pin) {
-                completion["tail"] = json!([
-                    {"text":"running 12 tests"},
-                    {"text":"test result: ok. 12 passed; 0 failed","tone":"muted"},
-                    {"text":"warning: 1 test took over 60 s","tone":"danger"},
-                ]);
-            }
-            let document = json!({"input_schema":entry.tool.input_schema,"view":view(pin).unwrap(),"samples":[{"input":input,"record":record,"completion":completion}]});
+            let document = json!({"input_schema":entry.tool.input_schema,"view":view(pin).unwrap(),"samples":samples});
             std::fs::write(
                 dir.join(format!("{index}.json")),
                 serde_json::to_vec(&document).unwrap(),
             )
             .unwrap();
         }
+    }
+
+    fn bash_checker_samples(input: &Value, has_tail: bool) -> Vec<Value> {
+        let mut samples = Vec::new();
+        for (end_reason, exit_code, outcome) in [
+            ("exited", Some(0), "success"),
+            ("exited", Some(1), "error"),
+            ("timed_out", Some(124), "error"),
+            ("killed", None, "error"),
+        ] {
+            let mut record = json!({"durationMs":8,"outcome":outcome,"phase":"foreground_finished","outputBytes":3,"endReason":end_reason,"execution":"local"});
+            if let Some(code) = exit_code {
+                record["exitCode"] = json!(code);
+            }
+            samples.push(json!({"input":input,"record":record}));
+        }
+        let record = json!({"durationMs":8,"outcome":"success","phase":"background_started","taskId":"bash-demo1","outputBytes":0,"execution":"local"});
+        let mut completion = json!({"outcome":"error","phase":"background_finished","taskId":"bash-demo1","exitCode":1,"runDurationMs":2400,"outputBytes":3,"endReason":"exited","execution":"local"});
+        if has_tail {
+            completion["tail"] = json!([
+                {"text":"running 12 tests"},
+                {"text":"test result: FAILED. 11 passed; 1 failed","tone":"danger"},
+            ]);
+        }
+        samples.push(json!({"input":input,"record":record,"completion":completion}));
+        samples
     }
 }
