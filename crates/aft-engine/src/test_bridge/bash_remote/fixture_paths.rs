@@ -222,7 +222,7 @@ pub mod gh_shim_worker_broker {
 pub mod gh_shim_speech {
     #[cfg(unix)]
     pub mod service {
-        pub use crate::gh_shim_speech::service::RuntimeGuard;
+        pub use crate::gh_shim_speech::service::lifecycle::RuntimeGuard;
     }
 }
 
