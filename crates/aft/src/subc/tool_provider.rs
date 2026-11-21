@@ -8505,10 +8505,10 @@ pub(in crate::subc) mod route_tests {
             {
                 let mut state = task.lock_state().unwrap();
                 state
-                    .metadata
+                    .metadata_mut()
                     .mark_terminal(BgTaskStatus::Completed, Some(0), None);
-                state.metadata.completion_delivered = false;
-                write_task(&task.paths().json, &state.metadata).unwrap();
+                state.metadata_mut().completion_delivered = false;
+                write_task(&task.paths().json, state.metadata()).unwrap();
             }
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let reply = exchange_with_actor(
