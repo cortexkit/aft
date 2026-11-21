@@ -102,7 +102,7 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(
                 &project_root,
             ));
-            crate::data_layer::surfaces::bind_for_test(&ctx);
+            aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         }
         "unavailable" => ctx.set_cache_writer_capabilities(false, true),
         "partially_ready" => {

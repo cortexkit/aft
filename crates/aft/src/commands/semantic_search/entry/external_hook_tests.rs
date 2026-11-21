@@ -33,7 +33,9 @@ fn fixture() -> (tempfile::TempDir, AppContext, PathBuf, RawRequest) {
     };
     let external = crate::path_identity::canonicalize_normalized(&external);
     let configured = crate::path_identity::canonicalize_normalized(&configured);
-    crate::data_layer::surfaces::serve_text_index_for_test(&context(external.clone()));
+    aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&context(
+        external.clone(),
+    ));
     let request = RawRequest {
         id: "external-hook".to_owned(),
         command: "semantic_search".to_owned(),

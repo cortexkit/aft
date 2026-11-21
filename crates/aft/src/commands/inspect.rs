@@ -9283,7 +9283,7 @@ mod deferred_terminal_tests {
         ctx.update_config(|config| config.indexes.callgraph = true);
         // Dead code reads its call graph from the root's index-store
         // checkout, so the run can only complete once that graph is built.
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         let mut config = ctx.config().as_ref().clone();
         config.indexes.callgraph = true;
         let snapshot = InspectSnapshot::new(
