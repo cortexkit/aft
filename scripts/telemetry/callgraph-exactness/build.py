@@ -146,6 +146,35 @@ def overlay_dead_code(source, sha):
     graph.write_text(text)
 
 
+def overlay_exactness_refresh_guard(source):
+    """Bypass only refresh memory in optimized, non-release exactness probes."""
+    layer = source / "crates/aft/src/data_layer"
+    memory = layer / "refresh_memory.rs"
+    probe = layer / "checkout/exactness.rs"
+    memory_text = memory.read_text()
+    probe_text = probe.read_text()
+    impl = "impl RefreshMemory {"
+    refresh_call = "checkout\n                .refresh_callgraph()?"
+    if (memory_text.count(impl) != 1 or probe_text.count(refresh_call) != 1
+            or "fn refresh_callgraph_with(" not in (layer / "checkout/refresh.rs").read_text()):
+        raise ValueError("exactness probe needs explicit integration of the refresh memory override")
+    memory.write_text(memory_text.replace(impl, impl + '''
+    #[cfg(feature = "test-hooks")]
+    pub(super) fn without_ceiling_for_exactness() -> Self {
+        Self::new(None, 0)
+    }
+'''))
+    probe.write_text(probe_text.replace(refresh_call, '''if std::env::var("AFT_EXACTNESS_DISABLE_REFRESH_MEMORY_GUARD").as_deref() == Ok("1") {
+                eprintln!("refresh memory guard: off (exactness)");
+                checkout.refresh_callgraph_with(
+                    false,
+                    &super::super::refresh_memory::RefreshMemory::without_ceiling_for_exactness(),
+                )?
+            } else {
+                checkout.refresh_callgraph()?
+            }'''))
+
+
 def build(revision, output, profile):
     sha = subprocess.check_output(["git", "rev-parse", revision], cwd=REPO, text=True).strip()
     output.mkdir(parents=True, exist_ok=False)
@@ -161,6 +190,8 @@ def build(revision, output, profile):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(REPO / name, path)
+    if profile == "ci-storm":
+        overlay_exactness_refresh_guard(source)
     checkout = source / "crates/aft/src/data_layer/checkout.rs"
     text = checkout.read_text()
     if "pub mod exactness;" not in text:

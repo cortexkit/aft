@@ -3,6 +3,7 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -86,6 +87,46 @@ class CompareTests(unittest.TestCase):
             self.assertNotIn("def run", added["round2"])
             self.assertIn("def keep", added["round2"])
             self.assertIn("callee(value_exactness)", signature["round1"])
+
+    def test_java_native_edits_splice_parser_byte_ranges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            declaration = "@Check public <T> T run(\r\n        List<T> input\r\n    ) { return null; }"
+            source = f"class Owner {{ int café; {declaration} void keep() {{}} }}\r\n".encode()
+            callee = "class Callee { int café; void call(@Check String name) {} }\r\n".encode()
+            (root / "Owner.java").write_bytes(source)
+            (root / "Callee.java").write_bytes(callee)
+            for name in ("A.java", "B.java"):
+                (root / name).write_text("class Stub {}\n")
+            row = {"file": "Owner.java", "language": "java", "symbol": {"name": "run", "end_line": 2, "end_col": 24}}
+            top = {"file": "Callee.java", "language": "java", "symbol": {"name": "call", "end_line": 0, "end_col": 57}, "callers": 9}
+            plan = {"files": ["A.java", "B.java"], "members": [{"member": "run", "sites": 10, "declarations": [row]}], "top_callees": [top]}
+            start = source.index(b"@Check")
+            parameter = callee.index(b"name")
+            spans = [json.dumps({"member": [start, start + len(declaration.encode())]}),
+                     json.dumps({"parameter": [parameter, parameter + 4]})]
+            with (patch.object(RUN.subprocess, "check_output", side_effect=spans) as locate,
+                  patch.object(RUN.subprocess, "run") as validate):
+                validate.return_value.returncode = 0
+                native, _ = RUN.native_edits(Path("probe"), root, plan, 1441)
+            self.assertEqual(locate.call_args_list[0].args[0], ["probe", "java-edit-spans", str(root / "Owner.java"), "run", "2", "24"])
+            added, signature = native["edits"]
+            self.assertEqual(added["round1"], source.decode() + "\nclass ExactnessGateNative {\n" + declaration + "\n}\n")
+            self.assertEqual(added["round2"], source.decode().replace(declaration, ""))
+            self.assertEqual(signature["round1"], callee.decode().replace("name", "name_exactness"))
+            self.assertEqual(validate.call_count, 3)
+            self.assertEqual((root / "Owner.java").read_bytes(), source)
+
+    def test_refresh_requires_confirmation_of_the_selected_guard_override(self):
+        args = SimpleNamespace(cache_bytes=1, sample=1, build_cache_bytes=1, spill_bytes=1,
+                               timeout_s=1, disable_refresh_memory_guard=True)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(RUN, "child_process") as spawn:
+                spawn.return_value.__enter__.return_value.wait.return_value = 0
+                with self.assertRaisesRegex(ValueError, "expected refresh memory guard off"):
+                    RUN.probe(args, Path("probe"), "refresh", root, root / "store", root / "unconfirmed", 1)
+                self.assertEqual(spawn.call_args.kwargs["env"]["AFT_EXACTNESS_DISABLE_REFRESH_MEMORY_GUARD"], "1")
 
     def rust_signature_edit(self, first_source):
         with tempfile.TemporaryDirectory() as directory:

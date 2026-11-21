@@ -24,6 +24,8 @@ spec = importlib.util.spec_from_file_location("exactness_matrix", HERE.parent / 
 MATRIX = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(MATRIX)
 
+REFRESH_GUARD_OFF = "refresh memory guard: off (exactness)"
+
 
 def save(path, value):
     MATRIX.save(path, value)
@@ -113,6 +115,13 @@ def island(root, round_):
     return changes
 
 
+def java_spans(binary, path, symbol):
+    return json.loads(subprocess.check_output([
+        str(binary), "java-edit-spans", str(path), symbol["name"],
+        str(symbol["end_line"]), str(symbol["end_col"]),
+    ])) or {}
+
+
 def native_edits(binary, root, plan, seed):
     """Derive pin-independent edits from the reference's own stored graph."""
     rng = random.Random(seed)
@@ -143,26 +152,36 @@ def native_edits(binary, root, plan, seed):
             if row["file"] in originals:
                 continue
             path = root / row["file"]
-            source = path.read_text()
-            lines = source.splitlines(keepends=True)
             symbol = row["symbol"]
-            # BlobSymbol spans are zero-based with an inclusive end row.
-            start, end = symbol["start_line"], symbol["end_line"] + 1
-            declaration = "".join(lines[start:end])
             language = row["language"]
-            if language in ("typescript", "tsx", "javascript"):
-                added = "\nclass ExactnessGateNative {\n" + declaration + "\n}\n"
-            elif language == "python":
-                added = "\nclass ExactnessGateNative:\n" + textwrap.indent(textwrap.dedent(declaration), "    ") + "\n"
-            elif language == "go":
-                added = "\ntype ExactnessGateNative struct {}\n" + re.sub(r"\b" + re.escape(row["owner"]) + r"\b", "ExactnessGateNative", declaration, count=1)
-            elif language == "lua":
-                added = "\nExactnessGateNative = {}\n" + declaration.replace(row["owner"], "ExactnessGateNative", 1)
+            if language == "java":
+                span = java_spans(binary, path, symbol).get("member")
+                if span is None:
+                    continue
+                source_bytes = path.read_bytes()
+                start, end = span
+                declaration = source_bytes[start:end].decode()
+                duplicate = source_bytes.decode() + "\nclass ExactnessGateNative {\n" + declaration + "\n}\n"
+                removed = (source_bytes[:start] + source_bytes[end:]).decode()
             else:
-                rejected.append({"file": row["file"], "reason": f"no syntax-preserving new-owner template for {language}"})
-                continue
-            duplicate = source + added
-            removed = "".join(lines[:start] + lines[end:])
+                source = path.read_text()
+                lines = source.splitlines(keepends=True)
+                # Stored symbol spans are zero-based with an inclusive end row.
+                start, end = symbol["start_line"], symbol["end_line"] + 1
+                declaration = "".join(lines[start:end])
+                if language in ("typescript", "tsx", "javascript"):
+                    added = "\nclass ExactnessGateNative {\n" + declaration + "\n}\n"
+                elif language == "python":
+                    added = "\nclass ExactnessGateNative:\n" + textwrap.indent(textwrap.dedent(declaration), "    ") + "\n"
+                elif language == "go":
+                    added = "\ntype ExactnessGateNative struct {}\n" + re.sub(r"\b" + re.escape(row["owner"]) + r"\b", "ExactnessGateNative", declaration, count=1)
+                elif language == "lua":
+                    added = "\nExactnessGateNative = {}\n" + declaration.replace(row["owner"], "ExactnessGateNative", 1)
+                else:
+                    rejected.append({"file": row["file"], "reason": f"no syntax-preserving new-owner template for {language}"})
+                    continue
+                duplicate = source + added
+                removed = "".join(lines[:start] + lines[end:])
             if not declaration.strip() or not valid(row, duplicate) or not valid(row, removed):
                 continue
             member_edit = {"file": row["file"], "member": member["member"], "sites": member["sites"], "round1": duplicate, "round2": removed, "declaration": symbol}
@@ -177,6 +196,17 @@ def native_edits(binary, root, plan, seed):
         if row["file"] in originals:
             continue
         path = root / row["file"]
+        if row["language"] == "java":
+            span = java_spans(binary, path, row["symbol"]).get("parameter")
+            if span is not None:
+                end = span[1]
+                source_bytes = path.read_bytes()
+                changed = (source_bytes[:end] + b"_exactness" + source_bytes[end:]).decode()
+                if valid(row, changed):
+                    signature_edit = {"file": row["file"], "symbol": row["symbol"], "callers": row["callers"], "round1": changed}
+                    originals[row["file"]] = source_bytes
+                    break
+            continue
         source = path.read_text()
         lines = source.splitlines(keepends=True)
         line = row["symbol"]["start_line"]
@@ -251,6 +281,9 @@ def probe(args, binary, mode, root, store, out, threads, reference=None, changes
     env = {k: v for k, v in os.environ.items() if not k.startswith("AFT_")}
     env.update(AFT_CALLGRAPH_BUILD_CACHE_BYTES=str(args.build_cache_bytes),
                AFT_CALLGRAPH_SPILL_BYTES=str(args.spill_bytes))
+    bypass = mode == "refresh" and args.disable_refresh_memory_guard
+    if bypass:
+        env["AFT_EXACTNESS_DISABLE_REFRESH_MEMORY_GUARD"] = "1"
     if flip:
         env["AFT_EXACTNESS_FLIP_SITE"] = "exactness_gate/service.ts"
     started = time.monotonic()
@@ -270,7 +303,16 @@ def probe(args, binary, mode, root, store, out, threads, reference=None, changes
                 print(f"exactness {out.name}: {mode} still running ({time.monotonic()-started:.0f}s)", flush=True)
     elapsed = time.monotonic() - started
     row = {"mode": mode, "threads": threads, "seconds": elapsed, "exit_code": code, "command": command}
-    if code == 0:
+    log_path = out / "probe.log"
+    guard_error = None
+    if mode == "refresh":
+        with log_path.open() as log:
+            off = any(line.rstrip("\n") == REFRESH_GUARD_OFF for line in log)
+        row["refresh_memory_guard"] = "off (exactness)" if off else "on"
+        if off != bypass:
+            guard_error = f"expected refresh memory guard {'off' if bypass else 'on'}; probe reported {'off' if off else 'no bypass'}"
+            row["error"] = guard_error
+    if code == 0 and guard_error is None:
         operations = {}
         positive_paths = 0
         errors = 0
@@ -284,9 +326,12 @@ def probe(args, binary, mode, root, store, out, threads, reference=None, changes
                    health=json.loads((out / "health.json").read_text()),
                    slice_cache=json.loads((out / "cache.json").read_text()))
     save(out / "run.json", row)
-    print(f"exactness {out}: {elapsed:.2f}s exit={code}", flush=True)
+    note = f"; {REFRESH_GUARD_OFF}" if row.get("refresh_memory_guard") == "off (exactness)" else ""
+    print(f"exactness {out}: {elapsed:.2f}s exit={code}{note}", flush=True)
     if code:
-        raise ValueError(f"{out}: probe failed: {(out / 'probe.log').read_text()[-6000:]}")
+        raise ValueError(f"{out}: probe failed: {log_path.read_text()[-6000:]}")
+    if guard_error:
+        raise ValueError(f"{out}: {guard_error}")
     return row
 
 
@@ -386,6 +431,8 @@ def main():
     parser.add_argument("--seed", type=int, default=1441)
     parser.add_argument("--timeout-s", type=int, default=14400, help="per probe, not whole project")
     parser.add_argument("--negative-control", action="store_true")
+    parser.add_argument("--disable-refresh-memory-guard", action="store_true",
+                        help="exactness only: bypass the refresh ceiling in ci-storm probes built by build.py")
     args = parser.parse_args()
     for key in ("reference", "candidate", "manifest", "results"):
         setattr(args, key, getattr(args, key).resolve())

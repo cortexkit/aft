@@ -52,6 +52,14 @@ must explicitly integrate the hook rather than silently skipping it.
 
 The default build profile is `ci-storm`, an optimized test build. These binaries
 enable `test-hooks` and must never be shipped as production binaries.
+For correctness-only runs blocked by the refresh memory ceiling, pass
+`--disable-refresh-memory-guard` to `run.py` with a `ci-storm` probe built by
+`build.py`. The bypass exists only in that archived probe, not in release or
+direct Cargo builds. Only the incremental refresh stops enforcing the ceiling;
+admission, cancellation and the publication guard still run normally. The
+driver requires each refresh process to report `refresh memory guard: off
+(exactness)` before it compares artifacts. These runs do not measure whether
+the refresh fits within the memory ceiling.
 
 For a reference-against-itself proof, pass the reference probe as both binaries
 and the legacy SHA as both source identities. The negative-control invocation
@@ -111,6 +119,9 @@ a distinct new owner, removal of an existing declaration in the next round,
 and a parameter-name change on the busiest callee (of the forty busiest) whose
 signature has a parameter besides its receiver. Edits are
 syntax-validated; rejected declarations and the selected locations are recorded.
+For Java, the probe uses the Java grammar to locate the exact byte ranges of
+class methods and parameter names, including declarations with annotations or
+multi-line signatures.
 The island and native edits are restored in `finally`, including failure paths.
 `refresh_fanout` records changed fragments belonging to files not directly edited.
 

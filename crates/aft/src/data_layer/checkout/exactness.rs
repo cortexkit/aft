@@ -525,9 +525,73 @@ fn queries(
     Ok(())
 }
 
+fn java_edit_spans(
+    path: &Path,
+    source: &str,
+    name: &str,
+    end: tree_sitter::Point,
+) -> GateResult<Value> {
+    let tree =
+        crate::parser::parse_source_with_cached_parser(path, source, crate::parser::LangId::Java)?;
+    // Match the stored symbol's end point and name rather than copying whole
+    // lines, which may also contain other declarations or a class brace.
+    let previous = tree_sitter::Point::new(end.row, end.column.saturating_sub(1));
+    let mut node = tree
+        .root_node()
+        .descendant_for_point_range(previous, previous);
+    while let Some(candidate) = node {
+        if matches!(
+            candidate.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) && candidate.end_position() == end
+            && candidate
+                .child_by_field_name("name")
+                .is_some_and(|id| &source[id.byte_range()] == name)
+            && !candidate.has_error()
+        {
+            let member = (candidate.kind() == "method_declaration"
+                && candidate.child_by_field_name("body").is_some()
+                && candidate.parent().is_some_and(|body| {
+                    body.kind() == "class_body"
+                        && body
+                            .parent()
+                            .is_some_and(|owner| owner.kind() == "class_declaration")
+                }))
+            .then(|| [candidate.start_byte(), candidate.end_byte()]);
+            let parameter = candidate
+                .child_by_field_name("parameters")
+                .and_then(|parameters| {
+                    parameters
+                        .named_children(&mut parameters.walk())
+                        .find_map(|param| match param.kind() {
+                            "formal_parameter" => param.child_by_field_name("name"),
+                            "spread_parameter" => param
+                                .named_children(&mut param.walk())
+                                .find(|child| child.kind() == "variable_declarator")
+                                .and_then(|child| child.child_by_field_name("name")),
+                            _ => None,
+                        })
+                })
+                .map(|id| [id.start_byte(), id.end_byte()]);
+            return Ok(json!({"member": member, "parameter": parameter}));
+        }
+        node = candidate.parent();
+    }
+    Ok(Value::Null)
+}
+
 /// Commands are deliberately separate processes: `refresh` must bind the
 /// on-disk publication, never inherit the cold builder's engine.
 pub fn run(args: Vec<String>) -> GateResult<()> {
+    if let [mode, path, name, end_line, end_col] = args.as_slice() {
+        if mode == "java-edit-spans" {
+            let path = Path::new(path);
+            let source = std::fs::read_to_string(path)?;
+            let end = tree_sitter::Point::new(end_line.parse()?, end_col.parse()?);
+            println!("{}", java_edit_spans(path, &source, name, end)?);
+            return Ok(());
+        }
+    }
     if args.first().is_some_and(|mode| mode == "validate") {
         let path = Path::new(args.get(1).ok_or("validate requires a path")?);
         let source = std::fs::read_to_string(path)?;
@@ -619,6 +683,39 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_edit_spans_use_stored_symbol_coordinates() {
+        use crate::callgraph_store::join::CallgraphBlob;
+
+        let declaration = "@Marker public <T extends Number> T lookup(\n        @Marker java.util.List<T> input\n    ) { return input.get(0); }";
+        let source = format!(
+            "class Service {{ int café; {declaration} void keep() {{}} }}\ninterface API {{ void lookup(String... names); }}\n"
+        );
+        let blob = CallgraphBlob::extract(&source, "java", "test").unwrap();
+        let spans = |symbol: &crate::callgraph_store::join::BlobSymbol| {
+            java_edit_spans(
+                Path::new("Service.java"),
+                &source,
+                &symbol.name,
+                tree_sitter::Point::new(symbol.end_line as usize, symbol.end_col as usize),
+            )
+            .unwrap()
+        };
+        let text = |value: &Value| {
+            let [start, end]: [usize; 2] = serde_json::from_value(value.clone()).unwrap();
+            &source[start..end]
+        };
+        let symbols = &blob.parse().unwrap().symbols;
+        let mut matches = symbols.iter().filter(|symbol| symbol.name == "lookup");
+        let method = spans(matches.next().unwrap());
+        assert_eq!(text(&method["member"]), declaration);
+        assert_eq!(text(&method["parameter"]), "input");
+        let interface = spans(matches.next().unwrap());
+        assert!(interface["member"].is_null());
+        assert_eq!(text(&interface["parameter"]), "names");
+        assert!(matches.next().is_none());
+    }
 
     #[test]
     fn positive_path_expectation_respects_test_endpoints() {
