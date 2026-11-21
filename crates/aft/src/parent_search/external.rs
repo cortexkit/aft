@@ -12,6 +12,7 @@ pub(crate) struct ExternalSearch {
     /// Set until the first search: the bind has just compared the files on
     /// disk with the publication, so that search need not again.
     pub(crate) just_bound: std::sync::atomic::AtomicBool,
+    dispatch: SearchDispatch,
 }
 
 /// How long a repository whose store could not be bound is answered by the
@@ -43,18 +44,22 @@ fn note_failure(root: &Path) {
 
 impl ExternalSearch {
     /// The search of the repository at `root` for `ctx`, bound now if `ctx`
-    /// holds none: `None` when the data layer is off, or nothing has
-    /// published a checkout of `root`. Such a repository is walked, as
-    /// today, and a query never builds a store for it.
+    /// holds none: `None` when the command dispatcher or published checkout
+    /// is missing. The caller falls through to the bounded search instead.
     pub(crate) fn of(
         ctx: &crate::context::AppContext,
         root: &Path,
     ) -> Option<std::sync::Arc<Self>> {
+        let dispatch = SEARCH.get().copied()?;
         let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
-        ctx.external_data_search(&root, || Self::bind(ctx, &root))
+        ctx.external_data_search(&root, || Self::bind(ctx, &root, dispatch))
     }
 
-    fn bind(ctx: &crate::context::AppContext, root: &Path) -> Option<Self> {
+    fn bind(
+        ctx: &crate::context::AppContext,
+        root: &Path,
+        dispatch: SearchDispatch,
+    ) -> Option<Self> {
         let storage = ctx.storage_dir();
         let planes = crate::data_layer::checkout::Planes {
             text: true,
@@ -105,6 +110,78 @@ impl ExternalSearch {
             checkout,
             engine,
             just_bound: std::sync::atomic::AtomicBool::new(true),
+            dispatch,
         })
+    }
+}
+
+type SearchDispatch =
+    fn(&crate::protocol::RawRequest, &crate::context::AppContext) -> crate::protocol::Response;
+
+static SEARCH: std::sync::OnceLock<SearchDispatch> = std::sync::OnceLock::new();
+
+pub(crate) fn register(dispatch: SearchDispatch) {
+    let _ = SEARCH.set(dispatch);
+}
+
+impl ExternalSearch {
+    /// Answers `req` from the repository's checkout. Its files are compared
+    /// with the checkout's state first (a repository outside the root has
+    /// no watcher), so text answers read what changed from disk. Its meaning
+    /// plane reads the vectors the repository's store holds for `ctx`'s
+    /// model without admitting the external repository to a fill. The engine
+    /// borrows `ctx`'s model for query embedding. Returns the reply and how many
+    /// paths differ from the publication the answer read.
+    pub(crate) fn search(
+        &self,
+        req: &crate::protocol::RawRequest,
+        ctx: &crate::context::AppContext,
+    ) -> (crate::protocol::Response, usize) {
+        if !self
+            .just_bound
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            if let Err(error) = self.checkout.checkout().rescan() {
+                crate::slog_warn!(
+                    "data layer could not compare {} with its files: {error}",
+                    self.checkout.root().display()
+                );
+            }
+        }
+        let config = ctx.config();
+        let mut lent = ctx.semantic_embedding_model().lock().take();
+        if config.indexes.semantic {
+            if lent.is_none() {
+                lent =
+                    crate::semantic_index::EmbeddingModel::from_config_for_query(&config.semantic)
+                        .ok();
+            }
+            if let Some(fingerprint) = lent
+                .as_mut()
+                .and_then(|model| model.fingerprint(&config.semantic).ok())
+            {
+                if let Err(error) = self
+                    .checkout
+                    .read_meaning_only(&config.semantic, &fingerprint)
+                {
+                    crate::slog_warn!(
+                        "data layer cannot read the meaning plane of {}: {error}",
+                        self.checkout.root().display()
+                    );
+                }
+            }
+        }
+        *self.engine.semantic_embedding_model().lock() = lent;
+        let response = (self.dispatch)(req, &self.engine);
+        let returned = self.engine.semantic_embedding_model().lock().take();
+        let mut model = ctx.semantic_embedding_model().lock();
+        if model.is_none() {
+            *model = returned;
+        }
+        let drift = self
+            .checkout
+            .view()
+            .map_or(0, |view| view.changed_paths().len());
+        (response, drift)
     }
 }

@@ -51,6 +51,8 @@ pub(crate) fn report_file_with_input_paths(
 
 use std::path::Path;
 
+#[cfg(windows)]
+pub(crate) mod delete_tree_win;
 pub(crate) mod remote_links;
 
 use crate::config::Config;

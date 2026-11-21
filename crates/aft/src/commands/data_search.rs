@@ -916,69 +916,13 @@ fn is_within_search_root(search_root: &Path, path: &Path) -> bool {
         .starts_with(crate::path_identity::normalize_path(search_root))
 }
 
-impl ExternalSearch {
-    /// Answers `req` from the repository's checkout. Its files are compared
-    /// with the checkout's state first (a repository outside the root has
-    /// no watcher), so text answers read what changed from disk. Its meaning
-    /// plane reads the vectors the repository's store holds for `ctx`'s
-    /// model and never fills: semantic search is not admitted for a
-    /// repository no session opened. The query is embedded with `ctx`'s
-    /// model, lent to the engine for the call. Returns the reply and how many
-    /// paths differ from the publication the answer read.
-    pub(crate) fn search(
-        &self,
-        req: &crate::protocol::RawRequest,
-        ctx: &crate::context::AppContext,
-    ) -> (crate::protocol::Response, usize) {
-        if !self
-            .just_bound
-            .swap(false, std::sync::atomic::Ordering::AcqRel)
-        {
-            if let Err(error) = self.checkout.checkout().rescan() {
-                crate::slog_warn!(
-                    "data layer could not compare {} with its files: {error}",
-                    self.checkout.root().display()
-                );
-            }
-        }
-        let config = ctx.config();
-        let mut lent = ctx.semantic_embedding_model().lock().take();
-        if config.indexes.semantic {
-            if lent.is_none() {
-                lent =
-                    crate::semantic_index::EmbeddingModel::from_config_for_query(&config.semantic)
-                        .ok();
-            }
-            if let Some(fingerprint) = lent
-                .as_mut()
-                .and_then(|model| model.fingerprint(&config.semantic).ok())
-            {
-                if let Err(error) = self
-                    .checkout
-                    .read_meaning_only(&config.semantic, &fingerprint)
-                {
-                    crate::slog_warn!(
-                        "data layer cannot read the meaning plane of {}: {error}",
-                        self.checkout.root().display()
-                    );
-                }
-            }
-        }
-        *self.engine.semantic_embedding_model().lock() = lent;
-        let response = crate::commands::semantic_search::with_absolute_result_paths(|| {
-            crate::commands::semantic_search::handle_parent_child_search(req, &self.engine)
-        });
-        let returned = self.engine.semantic_embedding_model().lock().take();
-        let mut model = ctx.semantic_embedding_model().lock();
-        if model.is_none() {
-            *model = returned;
-        }
-        let drift = self
-            .checkout
-            .view()
-            .map_or(0, |view| view.changed_paths().len());
-        (response, drift)
-    }
+pub(crate) fn dispatch_external_search(
+    req: &crate::protocol::RawRequest,
+    engine: &crate::context::AppContext,
+) -> crate::protocol::Response {
+    crate::commands::semantic_search::with_absolute_result_paths(|| {
+        crate::commands::semantic_search::handle_parent_child_search(req, engine)
+    })
 }
 
 #[cfg(test)]
@@ -1102,29 +1046,6 @@ mod tests {
             !lane(TextIndex::Data(&pair.data), &query, true, &pair.root).contains("x1.txt"),
             "the shared content's files are outside the three rarest"
         );
-    }
-}
-
-impl DataSemantic {
-    /// This root's meaning search, with the data layer on and semantic
-    /// search switched on and admitted for the root: binds the checkout if
-    /// nothing has, and starts a fill when files wait for vectors. `None`
-    /// otherwise (the root has no checkout in the data layer, or semantic
-    /// search is off), and the caller keeps reading today's index.
-    pub(crate) fn current(
-        ctx: &(impl crate::data_layer::host::IndexHost + ?Sized),
-    ) -> Option<Self> {
-        if !ctx.config().indexes.semantic {
-            return None;
-        }
-        // The context's checkout slot is held while a checkout binds (a bind
-        // scans the folder); the meaning plane's snapshot can wait for a
-        // generation reload or a member-cache build.
-        let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
-        let _wait = waits::time(SearchWait::MeaningView);
-        Self::from_state(checkout.meaning(|| ctx.data_meaning_config()), || {
-            checkout.last_failure()
-        })
     }
 }
 

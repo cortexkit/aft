@@ -109,7 +109,7 @@ pub(crate) fn unlink(path: &Path) -> io::Result<()> {
     }
     #[cfg(windows)]
     if crate::context::confinement::remote_mutation() {
-        use crate::commands::delete_tree::win::{dispose, location, open_entry};
+        use super::delete_tree_win::{dispose, location, open_entry};
         let file = open_entry(path)?;
         if location(&file)? != crate::policy_path::policy_path(path) {
             return Err(refused(path));

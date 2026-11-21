@@ -23,6 +23,7 @@ use crate::data_layer::host::IndexHost;
 use crate::data_layer::meaning::{self, FillFailure, MeaningState};
 use crate::data_layer::status::SemanticIndexStatus;
 use crate::data_layer::vectors::{Coverage, MeaningSnapshot};
+use crate::search_state::waits::{self, SearchWait};
 use crate::semantic_index::SemanticSkipReason;
 
 /// The stage a meaning plane reports while its checkout has published
@@ -143,6 +144,27 @@ pub(crate) enum DataSemantic {
 }
 
 impl DataSemantic {
+    /// This root's meaning search, with the data layer on and semantic
+    /// search switched on and admitted for the root: binds the checkout if
+    /// nothing has, and starts a fill when files wait for vectors. `None`
+    /// otherwise (the root has no checkout in the data layer, or semantic
+    /// search is off), and the caller keeps reading today's index.
+    pub(crate) fn current(
+        ctx: &(impl crate::data_layer::host::IndexHost + ?Sized),
+    ) -> Option<Self> {
+        if !ctx.config().indexes.semantic {
+            return None;
+        }
+        // The context's checkout slot is held while a checkout binds (a bind
+        // scans the folder); the meaning plane's snapshot can wait for a
+        // generation reload or a member-cache build.
+        let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
+        let _wait = waits::time(SearchWait::MeaningView);
+        Self::from_state(checkout.meaning(|| ctx.data_meaning_config()), || {
+            checkout.last_failure()
+        })
+    }
+
     /// As [`Self::current`] for status reads: never binds a checkout and
     /// never starts a fill.
     pub(crate) fn probe(ctx: &(impl IndexHost + ?Sized)) -> Option<Self> {

@@ -36,6 +36,7 @@ pub(crate) fn register() {
         },
         bus_snapshot: super::tool_views::bus_snapshot,
     });
+    crate::commands::register_external_search();
 }
 
 #[cfg(test)]

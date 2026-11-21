@@ -430,6 +430,10 @@ pub(crate) enum CollectRefusal {
 }
 
 impl CollectRefusal {
+    pub(crate) fn into_error(self) -> subc_protocol::ErrorBody {
+        subc_protocol::ErrorBody::new(self.code(), self.message()).with_detail(self.detail())
+    }
+
     pub(crate) fn code(&self) -> &'static str {
         match self {
             Self::EntryUnreadable { .. } => "entry_unreadable",
