@@ -45,7 +45,7 @@ impl portable_pty::ChildKiller for NoopKiller {
     }
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     registry: BgTaskRegistry,
     task: Arc<BgTask>,
     release: crossbeam_channel::Sender<()>,
@@ -58,7 +58,7 @@ impl Fixture {
         Self::with_exit_code(fail_reader, 0)
     }
 
-    fn with_exit_code(fail_reader: bool, exit_code: i32) -> Self {
+    pub(crate) fn with_exit_code(fail_reader: bool, exit_code: i32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured_frames = frames.clone();
@@ -148,7 +148,7 @@ impl Fixture {
         }
     }
 
-    fn finish_reader(&self) {
+    pub(crate) fn finish_reader(&self) {
         self.release.send(()).unwrap();
         self.registry
             .inner
@@ -170,7 +170,22 @@ impl Fixture {
         assert_eq!(fs::read(&self.task.paths.pty).unwrap(), b"");
     }
 
-    fn assert_incomplete(&self, exit_code: i32) {
+    pub(crate) fn poll(&self) {
+        self.registry.poll_task(&self.task).unwrap();
+    }
+
+    pub(crate) fn expire_drain_deadline(&self) {
+        if let TaskRuntime::Pty(Some(pty)) = &mut self.task.state.lock().unwrap().runtime {
+            // Advance only the drain clock, not wall time or the task's hard kill.
+            pty.output_drain.as_mut().unwrap().deadline = Some(Instant::now() - WAIT);
+        }
+    }
+
+    pub(crate) fn assert_incomplete(
+        &self,
+        exit_code: i32,
+        assert_status_text: impl FnOnce(serde_json::Value, &str),
+    ) {
         let snapshot = self.task.snapshot(0);
         let expected_status = if exit_code == 0 {
             BgTaskStatus::Completed
@@ -202,15 +217,7 @@ impl Fixture {
         assert_eq!(completions[0].exit_code, Some(i64::from(exit_code)));
         assert_eq!(serde_json::json!(completions[0])["output_incomplete"], true);
         assert_eq!(completions[0].status_reason, snapshot.info.status_reason);
-        let text = crate::subc_format::format_response(
-            "bash_status",
-            &crate::protocol::Response::success("status", data),
-            false,
-        );
-        assert!(
-            text.contains(snapshot.info.status_reason.as_deref().unwrap()),
-            "status text: {text}"
-        );
+        assert_status_text(data, snapshot.info.status_reason.as_deref().unwrap());
         let frames = self.frames.lock().unwrap();
         let completed: Vec<_> = frames
             .iter()
@@ -275,34 +282,6 @@ fn conpty_completion_waits_for_output_capture() {
             .len(),
         1
     );
-}
-
-#[test]
-fn conpty_completion_drain_deadline_reports_incomplete_output() {
-    for exit_code in [0, 17] {
-        let fixture = Fixture::with_exit_code(false, exit_code);
-        if let TaskRuntime::Pty(Some(pty)) = &mut fixture.task.state.lock().unwrap().runtime {
-            // Advance only the drain clock, not wall time or the task's hard kill.
-            pty.output_drain.as_mut().unwrap().deadline = Some(Instant::now() - WAIT);
-        }
-        fixture.registry.poll_task(&fixture.task).unwrap();
-        fixture.assert_incomplete(exit_code);
-        fixture.finish_reader();
-        fixture.registry.poll_task(&fixture.task).unwrap();
-        fixture.assert_incomplete(exit_code); // Late EOF must not rewrite the declared outcome.
-    }
-}
-
-#[test]
-fn conpty_completion_reader_error_reports_incomplete_output() {
-    for exit_code in [0, 17] {
-        let fixture = Fixture::with_exit_code(true, exit_code);
-        fixture.finish_reader();
-        fixture.registry.poll_task(&fixture.task).unwrap();
-        fixture.assert_incomplete(exit_code);
-        fixture.registry.poll_task(&fixture.task).unwrap();
-        fixture.assert_incomplete(exit_code);
-    }
 }
 
 #[test]
