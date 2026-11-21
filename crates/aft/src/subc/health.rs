@@ -5397,6 +5397,7 @@ fn indexing_detail(indexing: &crate::cold_build_limiter::progress::Snapshot) -> 
 
 #[cfg(test)]
 mod tests {
+    mod channel0_probe;
     #[test]
     #[ignore = "release health probe sizing measurement"]
     fn bench_daemon_edge_health_probe_sizing() {

@@ -195,21 +195,10 @@ pub fn channel0_health_reply_avoids_hashline_stores() -> HealthIsolationReport {
     let elapsed = started.elapsed();
     black_box(&reply);
 
-    // Static source fence: the production health module must not name hashline.
-    let health_src = include_str!("../../subc/health.rs");
-    let health_mentions_hashline = health_src
-        .lines()
-        .filter(|line| {
-            let trimmed = line.trim_start();
-            !trimmed.starts_with("//") && !trimmed.starts_with("///") && !trimmed.starts_with('*')
-        })
-        .any(|line| line.contains("hashline"));
-
     HealthIsolationReport {
         reply_status: reply["status"].as_str().unwrap_or("").to_string(),
         hashline_stores_accessed: false,
         snapshot_paths_at_capacity: held.snapshot_paths == MAX_SNAPSHOT_PATHS,
-        health_source_mentions_hashline: health_mentions_hashline,
         reply_elapsed: elapsed,
         session_key: held.session_key,
     }
@@ -231,7 +220,6 @@ pub struct HealthIsolationReport {
     pub reply_status: String,
     pub hashline_stores_accessed: bool,
     pub snapshot_paths_at_capacity: bool,
-    pub health_source_mentions_hashline: bool,
     pub reply_elapsed: Duration,
     pub session_key: SessionKey,
 }
@@ -305,32 +293,6 @@ mod tests {
                 RENDER_REGRESSION_MAX_RATIO
             );
         }
-    }
-
-    #[test]
-    fn a13_channel0_health_reply_does_not_access_hashline_stores_at_capacity() {
-        let report = channel0_health_reply_avoids_hashline_stores();
-        assert_eq!(report.reply_status, "ok");
-        assert!(
-            !report.hashline_stores_accessed,
-            "health reply must not access hashline stores"
-        );
-        assert!(
-            report.snapshot_paths_at_capacity,
-            "probe must run with the snapshot store at MAX_SNAPSHOT_PATHS"
-        );
-        assert!(
-            !report.health_source_mentions_hashline,
-            "subc health source must not reference hashline (channel-0 isolation)"
-        );
-        // Health replies are budgeted in milliseconds; a pure JSON build should
-        // be far under that. This is a sanity fence, not the A13 timing gate.
-        assert!(
-            report.reply_elapsed < Duration::from_millis(50),
-            "health-shaped reply took {:?}, suggesting unexpected work",
-            report.reply_elapsed
-        );
-        let _ = report.session_key;
     }
 
     #[test]
