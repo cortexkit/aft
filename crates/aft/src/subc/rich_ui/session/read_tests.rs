@@ -76,7 +76,7 @@ pub(super) fn indexed_fixture_with_setup(shape: &str, setup: impl FnOnce(&mut Fi
     assert!(response.success, "configure: {response:?}");
     crate::runtime_drain::drain_deferred_configure_maintenance(&f.ctx);
     // The index store serves search and the call graph once its build ends.
-    crate::data_layer::surfaces::serve_text_index_for_test(&f.ctx);
+    aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&f.ctx);
     if shape == "non-core-head" {
         for route in [&mut f.carrier, &mut f.policy] {
             Arc::get_mut(&mut route.0)

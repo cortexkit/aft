@@ -995,7 +995,8 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     for name in ["alpha", "beta"] {
         init_repo(&root.join(name), name);
     }
-    let (base_url, gate) = crate::data_layer::meaning_query::test_support::serve("never-held");
+    let (base_url, gate) =
+        aft_engine::test_bridge::display_data::meaning_query::serve("never-held");
     gate.open();
     let semantic = SemanticBackendConfig {
         backend: SemanticBackend::OpenAiCompatible,
@@ -1058,7 +1059,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     }));
     let beta_gap = child_gap(
         "beta",
-        Some(crate::data_layer::parent::NO_VECTORS.to_string()),
+        Some(aft_engine::test_bridge::display_data::NO_VECTORS.to_string()),
     );
     // Each child builds its checkout on first use; once both have
     // published, only beta is named, for its missing vectors.

@@ -146,7 +146,7 @@ fn retained_aft_engines() {
                 let epoch =
                     start + Duration::from_secs((mode_index * 240 + phase_index * 120) as u64);
                 // Warm initial publication and memory figures outside the steady-state window.
-                crate::context::with_memory_walk_clock_for_test(epoch, || {
+                aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(epoch, || {
                     cache.refresh_for_test(&executor, &app);
                 });
                 let mut total_cpu = 0;

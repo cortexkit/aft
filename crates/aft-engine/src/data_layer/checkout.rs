@@ -5602,7 +5602,7 @@ impl CheckoutView {
             let Some(ordinal) = content.find(key).map_err(DataError::store)? else {
                 continue;
             };
-            #[cfg(test)]
+            #[cfg(any(test, all(unix, feature = "test-support")))]
             super::outline::note_record_read();
             let record = content.record(ordinal).map_err(DataError::store)?;
             let RecordBody::Parsed { surface, body } = record.data else {

@@ -269,3 +269,111 @@ pub mod memory_profile {
         runtime::with_memory_figure_baseline_for_test(baseline, run)
     }
 }
+
+pub mod outline {
+    use crate::data_layer::{checkout, content, outline};
+    use crate::parser::SharedSymbolCache;
+    use aft_store::content::{OutlineSymbol, Surface};
+    use std::path::Path;
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct Prewarm(outline::Prewarm);
+
+    impl Prewarm {
+        pub fn cancelled() -> Self {
+            Self(outline::Prewarm {
+                stopped: true,
+                ..Default::default()
+            })
+        }
+
+        pub fn cached(&self) -> u64 {
+            self.0.cached
+        }
+        pub fn loaded(&self) -> u64 {
+            self.0.loaded
+        }
+        pub fn left(&self) -> u64 {
+            self.0.left
+        }
+        pub fn stopped(&self) -> bool {
+            self.0.stopped
+        }
+    }
+
+    pub fn prewarm(
+        view: &checkout::CheckoutView,
+        cache: &SharedSymbolCache,
+        generation: u64,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<Prewarm, checkout::DataError> {
+        outline::prewarm(view, cache, generation, stop).map(Prewarm)
+    }
+
+    pub fn already_claimed_for_test(
+        cache: &SharedSymbolCache,
+        generation: u64,
+        root: &Path,
+    ) -> bool {
+        outline::already_claimed_for_test(cache, generation, root)
+    }
+
+    pub fn complete_rust_outline(
+        symbols: Vec<OutlineSymbol>,
+        surface: &Surface,
+    ) -> Vec<OutlineSymbol> {
+        content::complete_rust_outline(symbols, surface)
+    }
+
+    #[cfg(unix)]
+    pub fn record_reads() -> u64 {
+        outline::record_reads()
+    }
+
+    #[cfg(unix)]
+    pub mod tables {
+        use crate::data_layer::outline::tables;
+
+        pub fn without_sharing<T>(work: impl FnOnce() -> T) -> T {
+            tables::without_sharing(work)
+        }
+
+        pub fn shared_bytes() -> Option<u64> {
+            tables::shared().stats().map(|stats| stats.bytes)
+        }
+    }
+}
+
+pub mod callgraph_roots {
+    use crate::data_layer::{callgraph_roots, query, trace_measure};
+    use std::collections::BTreeSet;
+    use std::path::{Path, PathBuf};
+
+    pub fn normalize(path: &Path) -> PathBuf {
+        callgraph_roots::normalize(path)
+    }
+
+    pub fn rust_program_roots(path: &Path) -> BTreeSet<PathBuf> {
+        callgraph_roots::rust_program_roots(path)
+    }
+
+    pub fn memory_reader(root: &Path) -> query::SliceReader<impl query::SliceSource> {
+        trace_measure::memory_reader(root)
+    }
+}
+
+pub mod trace_budget {
+    pub use crate::data_layer::callgraph_store_adapter::trace_budget_fixture::{
+        impact_budget_fixture, impact_result_with_budget_for_test, IMPACT_BUDGET_NOTE_FOR_TEST,
+    };
+}
+
+pub const NO_VECTORS: &str = crate::data_layer::parent::NO_VECTORS;
+
+pub fn bind_foreground(
+    root: &std::path::Path,
+    storage: &std::path::Path,
+    planes: crate::data_layer::checkout::Planes,
+) -> Result<crate::data_layer::checkout::Checkout, crate::data_layer::checkout::DataError> {
+    crate::data_layer::runtime::bind_foreground(root, storage, planes)
+}

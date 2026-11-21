@@ -1501,8 +1501,13 @@ isolated!(
             .is_empty());
         let cache = f.ctx.symbol_cache();
         let generation = cache.write().unwrap().reset();
-        let report =
-            crate::data_layer::outline::prewarm(&view, &cache, generation, &|| false).unwrap();
+        let report = aft_engine::test_bridge::display_data::outline::prewarm(
+            &view,
+            &cache,
+            generation,
+            &|| false,
+        )
+        .unwrap();
         assert_eq!(report.loaded, 2, "{report:?}");
         let parser =
             crate::parser::FileParser::with_symbol_cache(cache).with_dynamic_languages(true);
