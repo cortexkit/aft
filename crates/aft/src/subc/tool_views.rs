@@ -232,6 +232,8 @@ mod tests {
                     "tail".into(),
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
+            } else if matches!(entry.tool.name.as_str(), "write" | "apply_patch") {
+                assert_eq!(view.template_revision, 4);
             } else {
                 assert_eq!(view.template_revision, 3);
             }
@@ -261,27 +263,22 @@ mod tests {
                 );
             }
             let page = view.template["page"]["source"].as_str().unwrap();
-            assert!(page.contains(if entry.tool.name == "edit" {
-                "view.detail.hunks"
-            } else {
-                "view.output ??"
+            assert!(page.contains(match entry.tool.name.as_str() {
+                "edit" | "write" => "view.detail.hunks",
+                "apply_patch" => "view.detail.files",
+                _ => "view.output ??",
             }));
-            // Canonical row and page SHA-256s reported by occipital-check from
-            // cortexkit/occipital at 6771d71. The run used the edit call from
-            // the phone-reader-tool-display-v7 tag and AFT's exported write and
-            // apply_patch samples at phone and desktop widths.
+            // Canonical row and page SHA-256s reported by occipital-check
+            // 0.1.7. The write and apply_patch samples were checked at phone
+            // and desktop widths.
             let digests = match entry.tool.name.as_str() {
                 "apply_patch" => [
-                    "808bb3c1e481027c3e5b8ab46f532ca0ed91be1936064dbda748a854d39ce434",
-                    "e6a2c7a3607648817895ed3c4cd3e40f868d8ddef0ac54dd654e13a42b0ee4d2",
+                    "e13744cb5e3fe03a188391d6245127f58d0b1b69884e5793656ac2186f64f0c6",
+                    "2acf86a6d82f3e8992005d8ab24840ea0fbdd41260a4bb643177640210854e9d",
                 ],
-                "edit" => [
+                "edit" | "write" => [
                     "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
                     "3a457fd30d60ca7acc5bab258da9786bc309a44190d5454795f2b80a870332d7",
-                ],
-                "write" => [
-                    "39eb5d8d7be00d7b901f5bf5ee6f0a47d5840989349fe61bf61e70ddb564e3ec",
-                    "c87fe9bf996c6a5c84488a4a063a96939c79ea4e2d4597c16f696852c4f912df",
                 ],
                 "bash" => continue, // Covered by the tail-pin compatibility test.
                 name => panic!("missing template digests for {name}"),
@@ -407,33 +404,33 @@ mod tests {
         let dir = std::path::Path::new(crate::test_support::manifest_dir())
             .join("../../target/tool-views-check");
         std::fs::create_dir_all(&dir).unwrap();
+        let file_samples: BTreeMap<String, Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/tool_views/write-and-apply-patch-samples.json"
+        ))
+        .unwrap();
         for (index, (pin, entry)) in SHIPPED.iter().enumerate() {
-            let input = match entry.tool.name.as_str() {
-                "bash" => json!({"command":"printf ok"}),
-                "edit" => {
-                    json!({"path":"src/a.rs","edits":[{"oldString":"old","newString":"new"}]})
-                }
-                "write" => json!({"path":"src/a.rs","content":"new\n"}),
-                "apply_patch" => {
-                    json!({"patchText":"*** Begin Patch\n*** Add File: src/a.rs\n+new\n*** End Patch"})
-                }
+            let name = &entry.tool.name;
+            let (filename, samples) = match name.as_str() {
+                "bash" => (
+                    format!("{index}.json"),
+                    json!(bash_checker_samples(
+                        &json!({"command":"printf ok"}),
+                        has_bash_tail(pin)
+                    )),
+                ),
+                "edit" => (
+                    format!("{index}.json"),
+                    json!([{
+                        "input":{"path":"src/a.rs","edits":[{"oldString":"old","newString":"new"}]},
+                        "record":{"durationMs":1,"outcome":"held","reason":"consent"},
+                        "completion":{"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"},
+                    }]),
+                ),
+                "write" | "apply_patch" => (format!("{name}.json"), file_samples[name].clone()),
                 _ => unreachable!(),
             };
-            let samples = if entry.tool.name == "bash" {
-                bash_checker_samples(&input, has_bash_tail(pin))
-            } else {
-                vec![json!({
-                    "input":input,
-                    "record":{"durationMs":1,"outcome":"held","reason":"consent"},
-                    "completion":{"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"},
-                })]
-            };
             let document = json!({"input_schema":entry.tool.input_schema,"view":view(pin).unwrap(),"samples":samples});
-            std::fs::write(
-                dir.join(format!("{index}.json")),
-                serde_json::to_vec(&document).unwrap(),
-            )
-            .unwrap();
+            std::fs::write(dir.join(filename), serde_json::to_vec(&document).unwrap()).unwrap();
         }
     }
 

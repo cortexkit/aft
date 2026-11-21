@@ -1,0 +1,12 @@
+{(view.completion.outcome ?? view.record.outcome) == "error" && (view.completion.fileCount ?? view.record.fileCount ?? 0) == 0
+ ? <ToolText text="Not applied" tone="danger" /> : null}
+
+{Each(view.detail.files ?? [], "file", [
+  file.path != null ? <ToolText size="large" text={FileName(file.path ?? "")} /> : null,
+  file.diff != null && file.diff != "" ? <Diff hunks={[{lines:
+    Each(Slice(Split(EndsWith(file.diff, "\n") ? file.diff : (file.diff ?? "") + "\n", "\n"), StartsWith(file.diff, "--- ") ? 2 : 0, -1), "line", {
+      kind: StartsWith(line, "+") ? "add" : StartsWith(line, "-") ? "delete" : StartsWith(line, " ") ? "context" : "plain",
+      text: StartsWith(line, "+") || StartsWith(line, "-") || StartsWith(line, " ") ? Slice(line, 1) : line
+    })
+  }]} /> : null
+])}

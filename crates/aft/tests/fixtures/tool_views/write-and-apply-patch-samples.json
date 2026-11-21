@@ -1,0 +1,59 @@
+{
+  "write": [
+    {
+      "name": "write-one-file",
+      "input": {"path": "src/a.rs", "content": "new\n"},
+      "record": {"durationMs": 12, "outcome": "success", "fileCount": 1, "modifiedCount": 1, "createdCount": 0, "deletedCount": 0, "movedCount": 0, "addedLines": 1, "removedLines": 1, "path": "src/a.rs"},
+      "detail": {
+        "schema": "aft/files-detail/1",
+        "revision": 1,
+        "files": [{"change": "modified", "path": "src/a.rs", "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"}]
+      }
+    }
+  ],
+  "apply_patch": [
+    {
+      "name": "patch-one-file",
+      "input": {"patchText": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch"},
+      "record": {"durationMs": 12, "outcome": "success", "fileCount": 1, "modifiedCount": 1, "createdCount": 0, "deletedCount": 0, "movedCount": 0, "addedLines": 1, "removedLines": 1, "path": "src/a.rs"},
+      "detail": {
+        "schema": "aft/files-detail/1",
+        "revision": 1,
+        "files": [{"change": "modified", "path": "src/a.rs", "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"}]
+      }
+    },
+    {
+      "name": "patch-three-files",
+      "input": {"patchText": "*** Begin Patch\n*** Add File: src/c.rs\n+third\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** Delete File: src/b.rs\n*** End Patch"},
+      "record": {"durationMs": 12, "outcome": "success", "fileCount": 3, "modifiedCount": 1, "createdCount": 1, "deletedCount": 1, "movedCount": 0, "addedLines": 2, "removedLines": 2},
+      "detail": {
+        "schema": "aft/files-detail/1",
+        "revision": 1,
+        "files": [
+          {"change": "modified", "path": "src/a.rs", "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"},
+          {"change": "deleted", "path": "src/b.rs", "diff": "--- a/src/b.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-second\n"},
+          {"change": "created", "path": "src/c.rs", "diff": "--- /dev/null\n+++ b/src/c.rs\n@@ -0,0 +1 @@\n+third\n"}
+        ]
+      }
+    },
+    {
+      "name": "patch-partial",
+      "input": {"patchText": "*** Begin Patch\n*** Add File: src/c.rs\n+third\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** Delete File: src/b.rs\n*** End Patch"},
+      "record": {"durationMs": 1, "outcome": "held", "reason": "consent"},
+      "completion": {"durationMs": 12, "heldMs": 2000, "outcome": "partial", "fileCount": 2, "modifiedCount": 1, "createdCount": 1, "deletedCount": 0, "movedCount": 0, "addedLines": 2, "removedLines": 1},
+      "detail": {
+        "schema": "aft/files-detail/1",
+        "revision": 1,
+        "files": [
+          {"change": "modified", "path": "src/a.rs", "diff": "--- a/src/a.rs\n+++ b/src/a.rs\n@@ -1 +1 @@\n-old\n+new\n"},
+          {"change": "created", "path": "src/c.rs", "diff": "--- /dev/null\n+++ b/src/c.rs\n@@ -0,0 +1 @@\n+third\n"}
+        ]
+      }
+    },
+    {
+      "name": "patch-refused",
+      "input": {"patchText": "*** Begin Patch\n*** Update File: src/a.rs\n@@\n-old\n+new\n*** End Patch"},
+      "record": {"durationMs": 12, "outcome": "error", "reason": "apply_patch_failed", "fileCount": 0, "modifiedCount": 0, "createdCount": 0, "deletedCount": 0, "movedCount": 0}
+    }
+  ]
+}

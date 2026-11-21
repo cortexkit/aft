@@ -7,12 +7,24 @@ pub(in crate::subc) const CATALOG_DIGEST: &str =
 
 pub(super) fn append(entry: &mut Shipped) {
     let mut manifest = entry.history.last().expect("shipped view").clone();
-    let sources = match entry.tool.name.as_str() {
-        "edit" => Some([include_str!("edit.row.ui"), include_str!("edit.page.ui")]),
-        "bash" => Some([include_str!("bash.row.ui"), include_str!("bash.page.ui")]),
-        // The app's checker only accepts the current catalog digest. For
-        // tools without a new source, refresh the digest and keep the view.
-        _ => None,
+    let edit = [include_str!("edit.row.ui"), include_str!("edit.page.ui")];
+    // Revision 3 already used this catalog. Only the replaced placeholders
+    // need revision 4 for apps to accept their new sources.
+    let (revision_delta, sources) = match entry.tool.name.as_str() {
+        "edit" => (2, Some(edit)),
+        "bash" => (
+            2,
+            Some([include_str!("bash.row.ui"), include_str!("bash.page.ui")]),
+        ),
+        "write" => (3, Some(edit)),
+        "apply_patch" => (
+            3,
+            Some([
+                include_str!("apply_patch.row.ui"),
+                include_str!("apply_patch.page.ui"),
+            ]),
+        ),
+        _ => (2, None),
     };
     for (index, slot) in ["row", "page"].into_iter().enumerate() {
         manifest.template[slot]["catalog"]["digest"] = json!(CATALOG_DIGEST);
@@ -20,8 +32,7 @@ pub(super) fn append(entry: &mut Shipped) {
             manifest.template[slot]["source"] = json!(sources[index]);
         }
     }
-    // The revision served on the previous catalog was one ahead of shipped.json.
-    manifest.template_revision += 2;
+    manifest.template_revision += revision_delta;
     entry.history.push(manifest);
 }
 
