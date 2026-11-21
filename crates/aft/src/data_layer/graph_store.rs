@@ -17,7 +17,8 @@ use std::sync::{Arc, Mutex};
 
 use aft_store::content::{ContentRecord, ContentSectionsBuilder, ContentSegment, RecordKey};
 use aft_store::graph::{
-    FragmentKey, GraphSectionsBuilder, GraphSectionsSpill, GraphSegment, PackedFragment, TermKind,
+    term_hash, FragmentKey, GraphSectionsBuilder, GraphSectionsSpill, GraphSegment, PackedFragment,
+    TermKind,
 };
 use aft_store::ids::Digest128;
 use aft_store::segment::{KnownSection, Segment, SegmentMeta, SegmentWriter};
@@ -1075,6 +1076,11 @@ impl StoredSlices {
     }
 
     fn files_for(&self, kind: TermKind, term: &[u8]) -> BTreeSet<String> {
+        self.files_recording_hash(kind, term_hash(term))
+    }
+
+    /// As [`Self::files_recording`], for a term whose [`term_hash`] is known.
+    pub(super) fn files_recording_hash(&self, kind: TermKind, hash: u64) -> BTreeSet<String> {
         let mut files = BTreeSet::new();
         for (index, segment) in self.segments.iter().enumerate() {
             let graph = match GraphSegment::open(segment) {
@@ -1086,7 +1092,7 @@ impl StoredSlices {
                 }
             };
             let index = u32::try_from(index).expect("fewer than 2^32 segments");
-            match graph.candidates(kind, term) {
+            match graph.candidates_by_hash(kind, hash) {
                 Ok(ordinals) => files.extend(
                     ordinals
                         .into_iter()

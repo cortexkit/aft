@@ -41,7 +41,7 @@ fn is_config_named(path: &str, name: &str) -> bool {
             .is_some_and(|parent| parent.ends_with('/'))
 }
 
-use aft_store::graph::TermKind;
+use aft_store::graph::{term_hash, TermKind};
 
 use super::callgraph::{
     bind_all_checked, dispatch_targets, resolve_files, resolve_files_checked, resolver_index,
@@ -50,7 +50,7 @@ use super::callgraph::{
 use super::graph_store::StoredSlices;
 use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
 use super::refresh_memory::{RefreshChecks, RefreshMemory, RefreshStop};
-use super::subjects::{affected_by, subjects, Subject};
+use super::subjects::{affected_by, subjects};
 
 /// What one update did, for measurement.
 #[derive(Clone, Debug, Default)]
@@ -130,6 +130,32 @@ fn admit<'a>(
     Ok(())
 }
 
+/// Stable ids used by every kind of reverse input, with one allocation per
+/// path. Removed paths keep their ids to hide the old postings until the
+/// engine switches to a publication that includes the removals.
+#[derive(Default)]
+struct ReaderPaths {
+    ids: HashMap<Arc<str>, u32>,
+    paths: Vec<Arc<str>>,
+}
+
+impl ReaderPaths {
+    fn intern(&mut self, path: &str) -> u32 {
+        if let Some(&id) = self.ids.get(path) {
+            return id;
+        }
+        let id = u32::try_from(self.paths.len()).expect("fewer than 2^32 reverse input paths");
+        let path: Arc<str> = Arc::from(path);
+        self.paths.push(Arc::clone(&path));
+        self.ids.insert(path, id);
+        id
+    }
+
+    fn path(&self, id: u32) -> &str {
+        &self.paths[id as usize]
+    }
+}
+
 /// Which files recorded each input key, for one kind of recording: the
 /// reverse inputs a change is looked up in.
 ///
@@ -140,10 +166,10 @@ fn admit<'a>(
 #[derive(Debug)]
 struct Readers {
     kind: TermKind,
-    by_key: HashMap<String, HashSet<String>>,
-    keys_of: HashMap<String, BTreeSet<String>>,
+    by_key: HashMap<u64, HashSet<u32>>,
+    keys_of: HashMap<u32, Vec<u64>>,
     /// Files whose stored terms of this kind no longer apply.
-    replaced: HashSet<String>,
+    replaced: HashSet<u32>,
 }
 
 impl Readers {
@@ -156,55 +182,65 @@ impl Readers {
         }
     }
 
-    fn set(&mut self, file: &str, keys: BTreeSet<String>) {
+    fn set(&mut self, file: u32, keys: impl IntoIterator<Item = impl AsRef<[u8]>>) {
         self.remove(file);
-        for key in &keys {
-            self.by_key
-                .entry(key.clone())
-                .or_default()
-                .insert(file.to_string());
+        let hashes = keys
+            .into_iter()
+            .map(|key| term_hash(key.as_ref()))
+            .filter(|&hash| self.by_key.entry(hash).or_default().insert(file))
+            .collect::<Vec<_>>();
+        if !hashes.is_empty() {
+            self.keys_of.insert(file, hashes);
         }
-        self.keys_of.insert(file.to_string(), keys);
     }
 
-    fn remove(&mut self, file: &str) {
-        self.replaced.insert(file.to_string());
-        let Some(keys) = self.keys_of.remove(file) else {
+    fn remove(&mut self, file: u32) {
+        self.replaced.insert(file);
+        let Some(hashes) = self.keys_of.remove(&file) else {
             return;
         };
-        for key in keys {
-            if let Some(files) = self.by_key.get_mut(&key) {
-                files.remove(file);
+        for hash in hashes {
+            if let std::collections::hash_map::Entry::Occupied(mut entry) = self.by_key.entry(hash)
+            {
+                let files = entry.get_mut();
+                files.remove(&file);
                 if files.is_empty() {
-                    self.by_key.remove(&key);
+                    entry.remove();
                 }
             }
         }
     }
 
     /// The files that recorded one of `keys`: those filed in memory, and
-    /// those `stored` files under it that were not filed again since. A
-    /// stored term is a hash, so a few extra files may be listed; every
+    /// those `stored` files under it that were not filed again since. Both
+    /// indexes use hashes, so a few extra files may be listed; every
     /// caller checks or redoes a listed file, so an extra one costs work,
     /// never correctness.
-    fn of<'k>(
+    fn of(
         &self,
-        keys: impl IntoIterator<Item = &'k String>,
+        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
+        paths: &ReaderPaths,
         stored: Option<&StoredSlices>,
         guard: Option<&RefreshMemory>,
     ) -> Result<BTreeSet<String>, RefreshStop> {
         let mut files = BTreeSet::new();
         for key in keys {
-            if let Some(found) = self.by_key.get(key) {
-                for file in found {
+            let hash = term_hash(key.as_ref());
+            if let Some(found) = self.by_key.get(&hash) {
+                for &file in found {
                     guard.file()?;
-                    files.insert(file.clone());
+                    files.insert(paths.path(file).to_owned());
                 }
             }
             if let Some(stored) = stored {
-                for file in stored.files_recording(self.kind, key.as_bytes()) {
+                for file in stored.files_recording_hash(self.kind, hash) {
                     guard.file()?;
-                    if !self.replaced.contains(&file) {
+                    if self.replaced.is_empty()
+                        || !paths
+                            .ids
+                            .get(file.as_str())
+                            .is_some_and(|id| self.replaced.contains(id))
+                    {
                         files.insert(file);
                     }
                 }
@@ -214,18 +250,13 @@ impl Readers {
     }
 }
 
-/// The key a [`Subject`] is filed under in memory: the bytes of its stored
-/// term.
-fn subject_key(subject: &Subject) -> String {
-    String::from_utf8_lossy(&subject.term()).into_owned()
-}
-
 /// Filed under this key: files with a configuration read attributed to no
 /// field, which any configuration change may change.
 pub(crate) const UNATTRIBUTED_TERM: &[u8] = b"u\0";
 
 /// Every reverse input of a checkout's resolution.
 struct ReverseInputs {
+    paths: ReaderPaths,
     /// What each file's binding probed or read (pass 1).
     binding: Readers,
     /// What each file's resolution depends on (pass 2).
@@ -246,6 +277,7 @@ struct ReverseInputs {
 impl ReverseInputs {
     fn new(stored: Option<Arc<StoredSlices>>) -> Self {
         Self {
+            paths: ReaderPaths::default(),
             binding: Readers::new(TermKind::BindingKey),
             resolution: Readers::new(TermKind::ResolutionKey),
             dispatch: Readers::new(TermKind::DispatchKey),
@@ -260,7 +292,8 @@ impl ReverseInputs {
         keys: impl IntoIterator<Item = &'k String>,
         guard: Option<&RefreshMemory>,
     ) -> Result<BTreeSet<String>, RefreshStop> {
-        self.binding.of(keys, self.stored.as_deref(), guard)
+        self.binding
+            .of(keys, &self.paths, self.stored.as_deref(), guard)
     }
 
     fn resolution_of<'k>(
@@ -268,7 +301,8 @@ impl ReverseInputs {
         keys: impl IntoIterator<Item = &'k String>,
         guard: Option<&RefreshMemory>,
     ) -> Result<BTreeSet<String>, RefreshStop> {
-        self.resolution.of(keys, self.stored.as_deref(), guard)
+        self.resolution
+            .of(keys, &self.paths, self.stored.as_deref(), guard)
     }
 
     fn dispatch_of<'k>(
@@ -276,7 +310,8 @@ impl ReverseInputs {
         keys: impl IntoIterator<Item = &'k String>,
         guard: Option<&RefreshMemory>,
     ) -> Result<BTreeSet<String>, RefreshStop> {
-        self.dispatch.of(keys, self.stored.as_deref(), guard)
+        self.dispatch
+            .of(keys, &self.paths, self.stored.as_deref(), guard)
     }
 
     fn sites_of<'k>(
@@ -284,19 +319,27 @@ impl ReverseInputs {
         keys: impl IntoIterator<Item = &'k String>,
         guard: Option<&RefreshMemory>,
     ) -> Result<BTreeSet<String>, RefreshStop> {
-        self.sites.of(keys, self.stored.as_deref(), guard)
+        self.sites
+            .of(keys, &self.paths, self.stored.as_deref(), guard)
     }
 
-    fn subjects_of<'k>(
+    fn subjects_of(
         &self,
-        keys: impl IntoIterator<Item = &'k String>,
+        keys: impl IntoIterator<Item = impl AsRef<[u8]>>,
         guard: Option<&RefreshMemory>,
     ) -> Result<BTreeSet<String>, RefreshStop> {
-        self.subjects.of(keys, self.stored.as_deref(), guard)
+        self.subjects
+            .of(keys, &self.paths, self.stored.as_deref(), guard)
     }
 
     fn note_prebound(&mut self, file: &str, binding: &ViewBindingDependencies) {
-        self.binding.set(file, binding.dependencies.clone());
+        let id = self.paths.intern(file);
+        self.binding.set(id, &binding.dependencies);
+    }
+
+    fn note_sites(&mut self, file: &str, keys: &BTreeSet<String>) {
+        let id = self.paths.intern(file);
+        self.sites.set(id, keys);
     }
 
     fn note_resolution(
@@ -305,17 +348,18 @@ impl ReverseInputs {
         resolution: &FileResolution,
         facts: &CheckoutFacts<'_>,
     ) {
-        self.resolution
-            .set(file, resolution.binding.dependencies.clone());
+        let id = self.paths.intern(file);
+        self.resolution.set(id, &resolution.binding.dependencies);
         match &resolution.dispatch {
             Some(dispatch) => {
-                let mut keys = dispatch.trace.dependencies();
-                keys.extend(dispatch.trace.probes().iter().cloned());
-                self.dispatch.set(file, keys);
+                let trace = &dispatch.trace;
+                let dependencies = trace.dependencies();
+                self.dispatch
+                    .set(id, dependencies.iter().chain(trace.probes()));
             }
-            None => self.dispatch.remove(file),
+            None => self.dispatch.remove(id),
         }
-        self.sites.set(file, resolution.site_dependencies.clone());
+        self.sites.set(id, &resolution.site_dependencies);
         self.note_subjects(file, resolution, facts);
     }
 
@@ -342,21 +386,23 @@ impl ReverseInputs {
         let mut keys = BTreeSet::new();
         for question in questions {
             for subject in subjects(question, facts) {
-                keys.insert(subject_key(&subject));
+                keys.insert(subject.term());
             }
         }
         if resolution.binding.unattributed {
-            keys.insert(String::from_utf8_lossy(UNATTRIBUTED_TERM).into_owned());
+            keys.insert(UNATTRIBUTED_TERM.to_vec());
         }
-        self.subjects.set(file, keys);
+        let id = self.paths.intern(file);
+        self.subjects.set(id, keys);
     }
 
     fn remove(&mut self, file: &str) {
-        self.binding.remove(file);
-        self.resolution.remove(file);
-        self.dispatch.remove(file);
-        self.sites.remove(file);
-        self.subjects.remove(file);
+        let id = self.paths.intern(file);
+        self.binding.remove(id);
+        self.resolution.remove(id);
+        self.dispatch.remove(id);
+        self.sites.remove(id);
+        self.subjects.remove(id);
     }
 }
 
@@ -400,8 +446,9 @@ impl LiveCheckout {
         ]
         .into_iter()
         .flat_map(|readers| readers.replaced.iter())
+        .map(|&id| reverse.paths.path(id))
         .filter(|file| self.resolved.contains_key(file))
-        .cloned()
+        .map(str::to_owned)
         .collect()
     }
 
@@ -442,17 +489,18 @@ impl LiveCheckout {
             &built.subjects,
         ];
         for readers in kinds {
-            for (key, files) in &readers.by_key {
-                let found = stored.files_recording(readers.kind, key.as_bytes());
+            for (&hash, files) in &readers.by_key {
+                let found = stored.files_recording_hash(readers.kind, hash);
                 lookups += 1;
                 postings += found.len();
                 let lost = files
                     .iter()
+                    .map(|&id| built.paths.path(id))
                     .filter(|file| !found.contains(*file))
                     .collect::<Vec<_>>();
                 if !lost.is_empty() && missing.len() < 50 {
                     missing.push(format!(
-                        "{:?} {key:?}: {} readers not filed, e.g. {}",
+                        "{:?} {hash:016x}: {} readers not filed, e.g. {}",
                         readers.kind,
                         lost.len(),
                         lost[0]
@@ -544,11 +592,11 @@ impl LiveCheckout {
         for path in changed {
             guard.file()?;
             for subject in affected_by(path.as_bytes(), &before, &after) {
-                keys.insert(subject_key(&subject));
+                keys.insert(subject.term());
             }
         }
         if configs_changed {
-            keys.insert(String::from_utf8_lossy(UNATTRIBUTED_TERM).into_owned());
+            keys.insert(UNATTRIBUTED_TERM.to_vec());
         }
         let files = self.reverse.subjects_of(&keys, guard)?;
         let inputs = &self.inputs;
@@ -1399,9 +1447,7 @@ impl LiveCheckout {
             })?;
             file.sites = kept;
             file.site_dependencies = dependencies;
-            self.reverse
-                .sites
-                .set(&path, file.site_dependencies.clone());
+            self.reverse.note_sites(&path, &file.site_dependencies);
         }
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -1436,6 +1482,7 @@ impl LiveCheckout {
     }
 }
 
+aft_store::heap_bytes_of_fields!(ReaderPaths { ids, paths });
 aft_store::heap_bytes_of_fields!(Readers {
     kind,
     by_key,
@@ -1443,6 +1490,7 @@ aft_store::heap_bytes_of_fields!(Readers {
     replaced,
 });
 aft_store::heap_bytes_of_fields!(ReverseInputs {
+    paths,
     binding,
     resolution,
     dispatch,

@@ -180,7 +180,7 @@ impl TermKind {
 }
 
 /// The stored hash of a term.
-fn term_hash(term: &[u8]) -> u64 {
+pub fn term_hash(term: &[u8]) -> u64 {
     let digest = Digest128::of(term);
     let bytes = digest.as_bytes();
     u64::from_le_bytes([
@@ -599,10 +599,19 @@ impl<'s> GraphSegment<'s> {
     ///
     /// When a read fails or a posting block is malformed.
     pub fn candidates(&self, kind: TermKind, term: &[u8]) -> Result<Vec<u32>, SegmentError> {
+        self.candidates_by_hash(kind, term_hash(term))
+    }
+
+    /// Like [`Self::candidates`], for a term whose [`term_hash`] is already known.
+    ///
+    /// # Errors
+    ///
+    /// When a read fails or a posting block is malformed.
+    pub fn candidates_by_hash(&self, kind: TermKind, hash: u64) -> Result<Vec<u32>, SegmentError> {
         let Some((_, lookup, postings)) = self.terms.iter().find(|(each, ..)| *each == kind) else {
             return Ok(Vec::new());
         };
-        let Some(list) = lookup.get(term_hash(term))? else {
+        let Some(list) = lookup.get(hash)? else {
             return Ok(Vec::new());
         };
         // The count is stored, so it is checked against the bytes its blocks
