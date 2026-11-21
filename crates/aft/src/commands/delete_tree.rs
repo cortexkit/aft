@@ -830,7 +830,7 @@ pub(crate) mod win {
     use std::io;
 
     pub(crate) use crate::edit::delete_tree_win::{dispose, location, open_entry};
-    use crate::edit::delete_tree_win::{DELETE, FILE_READ_ATTRIBUTES};
+    use crate::edit::delete_tree_win::{DELETE, FILE_READ_ATTRIBUTES, FILE_SHARE_ALL};
 
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;

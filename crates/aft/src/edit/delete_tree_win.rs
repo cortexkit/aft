@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 pub(crate) const DELETE: u32 = 0x0001_0000;
 pub(crate) const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-const FILE_SHARE_ALL: u32 = 0x0000_0007;
+pub(crate) const FILE_SHARE_ALL: u32 = 0x0000_0007;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_DISPOSITION_INFO: i32 = 4;
