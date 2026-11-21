@@ -6010,7 +6010,7 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            aft_engine::test_bridge::search_misc::root_cache::prepare_cache_root_for_test(
+            aft_engine::test_bridge::display_data::reader_floor::prepare_cache_root_for_test(
                 &mut split
             )
             .is_none()
