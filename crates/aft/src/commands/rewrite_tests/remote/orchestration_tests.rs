@@ -963,6 +963,15 @@ async fn exec_remote_bash_keyed_disconnect_reattaches_while_job_is_running() {
     assert!(!watch.contains("outcome unknown"), "{watch}");
 }
 
+const REATTACH_DRAIN_CHILD_TEST: &str =
+    "commands::rewrite_tests::remote::tests::runon_restart_reattach_drain_child";
+
+#[tokio::test]
+#[ignore = "run only as the subprocess for restart reattachment tests"]
+async fn runon_restart_reattach_drain_child() {
+    aft_engine::test_bridge::bash_remote::remote_support::runon_restart_reattach_drain_child().await;
+}
+
 async fn runon_restart_first_watch_reattaches(
     watch_before_replay: bool,
     relaxed_lookup: Option<bool>,
@@ -987,8 +996,9 @@ async fn runon_restart_first_watch_reattaches(
     let child = tokio::task::spawn_blocking(move || {
         std::process::Command::new(std::env::current_exe().unwrap())
             .args([
+                "--ignored",
                 "--exact",
-                "bash_background::registry::remote::tests::runon_restart_reattach_drain_child",
+                REATTACH_DRAIN_CHILD_TEST,
                 "--nocapture",
             ])
             .env("AFT_RUNON_RESTART_FIXTURE", fixture_root)
@@ -999,6 +1009,13 @@ async fn runon_restart_first_watch_reattaches(
     .await
     .unwrap();
     assert!(child.status.success(), "{child:?}");
+    let stdout = String::from_utf8_lossy(&child.stdout);
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed;")),
+        "reattachment subprocess selector {REATTACH_DRAIN_CHILD_TEST:?} did not run exactly one test:\n{stdout}"
+    );
     let task_id = fs::read_to_string(root.path().join("task-id")).unwrap();
     let ctx = runon_restart_context(&project, &root.path().join("storage"));
     ctx.bash_background()

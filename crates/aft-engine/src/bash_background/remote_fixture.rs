@@ -1479,3 +1479,61 @@ impl UncapturedTerminalBeforeRenderForTest {
         &self.task
     }
 }
+
+/// Start an accepted remote task in a child process and leave its record for replay.
+pub async fn runon_restart_reattach_drain_child() {
+    let Some(root) = std::env::var_os("AFT_RUNON_RESTART_FIXTURE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let project = root.join("project");
+    let ctx = runon_restart_context(&project, &root.join("storage"));
+    ctx.bash_background()
+        .set_harness(crate::harness::Harness::Runner);
+    let storage = crate::bash_background::task_storage_dir(&ctx);
+    let mut launch = launch(PathBuf::from(
+        std::env::var_os("AFT_RUNON_RESTART_CONNECTION").unwrap(),
+    ));
+    launch.explicit_runon = true;
+    launch.harness = "runner".into();
+    let task_id = super::super::with_scope_spawn(Some(owner_scope("restart-worker")), || {
+        ctx.bash_background()
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                "printf remote-restart-proof",
+                resolve_posix_shell(),
+                "session".into(),
+                project.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
+                storage,
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.clone()),
+            )
+            .unwrap()
+    });
+    wait_for(
+        "the remote job must be accepted and started before drain",
+        || {
+            let task = ctx.bash_background().task(&task_id).unwrap();
+            let state = task.state.lock().unwrap();
+            state.metadata.remote.as_ref().and_then(|remote| {
+                (remote.accepted
+                    && remote.started.is_some()
+                    && remote.last_seq == Some(0)
+                    && remote.submission.is_some())
+                .then_some(())
+            })
+        },
+    )
+    .await;
+    // Module drain detaches, not cancels, accepted jobs. Exiting this child
+    // also removes its worker threads and in-memory task ownership, so the
+    // replacement must recover from disk rather than share the old task.
+    ctx.bash_background().detach();
+    fs::write(root.join("task-id"), task_id).unwrap();
+}
