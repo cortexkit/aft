@@ -230,7 +230,7 @@ impl ConfigLiveState {
 /// files always retain a direct watch because the coverage flag certifies only
 /// the extra `.cortexkit` watch, not legacy directories or symlink targets.
 pub fn sync_config_watches(ctx: &AppContext) {
-    if config_watches_disabled() {
+    if config_watches_disabled(ctx) {
         return;
     }
     let state = ctx.config_live();
@@ -277,16 +277,19 @@ pub fn sync_config_watches(ctx: &AppContext) {
 /// none either, unless a test turns them on, so the hundreds of configure unit
 /// tests do not each leave a watch thread behind. The reload itself still
 /// runs when asked.
-fn config_watches_disabled() -> bool {
+fn config_watches_disabled(_ctx: &AppContext) -> bool {
     if std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1") {
         return true;
     }
-    cfg!(test) && !CONFIG_WATCHES_ENABLED_FOR_TEST.load(Ordering::Acquire)
+    let is_unit_test = cfg!(test);
+    #[cfg(feature = "test-support")]
+    let is_unit_test = is_unit_test || _ctx.app().has_isolated_test_storage();
+    is_unit_test && !CONFIG_WATCHES_ENABLED_FOR_TEST.load(Ordering::Acquire)
 }
 
 static CONFIG_WATCHES_ENABLED_FOR_TEST: AtomicBool = AtomicBool::new(false);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn enable_config_watches_for_test() {
     CONFIG_WATCHES_ENABLED_FOR_TEST.store(true, Ordering::Release);
 }
@@ -1112,13 +1115,13 @@ pub struct ConfigFileWatch {
     attached: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     // Captured when a watch is created, so only watches from this fixture wait.
     static CONFIG_WATCH_ATTACH_GATE: std::cell::RefCell<Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_config_watch_attach_gate<T>(
     gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     run: impl FnOnce() -> T,
@@ -1164,7 +1167,7 @@ impl ConfigFileWatch {
         let attached = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         #[cfg(any(test, feature = "test-support"))]
         let thread_attached = attached.clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let attach_gate = CONFIG_WATCH_ATTACH_GATE.with(|slot| slot.borrow().clone());
         let spawned = thread::Builder::new()
             .name("aft-config-watch".to_string())
@@ -1176,7 +1179,7 @@ impl ConfigFileWatch {
                     counters,
                     #[cfg(any(test, feature = "test-support"))]
                     thread_attached,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     attach_gate,
                 )
             });
@@ -1420,12 +1423,14 @@ fn run_config_file_watch(
         std::sync::Mutex<bool>,
         std::sync::Condvar,
     )>,
-    #[cfg(test)] attach_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
+    #[cfg(any(test, feature = "test-support"))] attach_gate: Option<
+        Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    >,
 ) {
     let Some(dir) = file.parent().map(Path::to_path_buf) else {
         return;
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(gate) = attach_gate {
         let (open, _) = gate
             .1
@@ -1678,7 +1683,7 @@ pub fn request_reload_for_roots(roots: &[Arc<AppContext>]) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn staged_sources_empty_for_test() -> bool {
     STAGED_SOURCES.with(|slot| slot.borrow().is_none())
 }

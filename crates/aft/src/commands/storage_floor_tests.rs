@@ -413,8 +413,8 @@ fn storage_floor_glob_edit_match_skips_store_files_before_reading() {
         .iter()
         .map(|path| crate::file_identity::metadata(path).unwrap())
         .collect::<Vec<_>>();
-    crate::backup::reset_capture_read_count(&f.store);
-    crate::backup::reset_capture_read_count(&nonmatching);
+    aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&f.store);
+    aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&nonmatching);
     let response = super::edit_match::handle_edit_match(
         &request(
             "edit_match",
@@ -436,7 +436,10 @@ fn storage_floor_glob_edit_match_skips_store_files_before_reading() {
         let after = crate::file_identity::metadata(path).unwrap();
         assert_eq!(before.1, after.1);
         assert_eq!(before.0.modified().unwrap(), after.0.modified().unwrap());
-        assert_eq!(crate::backup::capture_read_count(path), 0);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::backup::capture_read_count(path),
+            0
+        );
     }
 }
 

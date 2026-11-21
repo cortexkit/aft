@@ -1130,7 +1130,9 @@ mod a03_tests {
                         let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "counts", "command": "write", "file": path, "content": "const value = 2;\n", "preview": preview, "include_diff": include_diff})).unwrap();
                         edit::A03_HANDLER_READS.with(|count| count.set(0));
                         edit::A03_SYNTAX_PARSES.with(|count| count.set(0));
-                        crate::backup::reset_capture_read_count(&path);
+                        aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(
+                            &path,
+                        );
                         let response = crate::commands::write::handle_write(&req, &ctx);
                         assert!(response.success, "{:?}", response);
                         assert_eq!(response.data["created"], !existed);
@@ -1143,7 +1145,9 @@ mod a03_tests {
                             )
                         );
                         let reads = edit::A03_HANDLER_READS.with(|count| count.get())
-                            + crate::backup::capture_read_count(&path);
+                            + aft_engine::test_bridge::search_misc::backup::capture_read_count(
+                                &path,
+                            );
                         assert_eq!(reads, usize::from(existed) + usize::from(!preview), "write existed={existed} preview={preview} diff={include_diff} lang={extension}");
                         assert_eq!(
                             edit::A03_SYNTAX_PARSES.with(|count| count.get()),
@@ -1173,9 +1177,11 @@ mod a03_tests {
         let path = temp.path().join("live.txt");
         let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         std::fs::write(&path, "é before\r\n").unwrap();
-        crate::backup::A03_FINGERPRINT_HASHES.with(|count| count.set(0));
-        crate::backup::A03_LIVE_FINGERPRINT_READS.with(|count| count.set(0));
-        crate::backup::reset_capture_read_count(&path);
+        aft_engine::test_bridge::search_misc::backup::A03_FINGERPRINT_HASHES
+            .with(|count| count.set(0));
+        aft_engine::test_bridge::search_misc::backup::A03_LIVE_FINGERPRINT_READS
+            .with(|count| count.set(0));
+        aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&path);
         edit::A03_HANDLER_READS.with(|count| count.set(0));
         let req = request(
             &path,
@@ -1189,10 +1195,12 @@ mod a03_tests {
         std::fs::write(&path, "external post-state\n").unwrap();
         let mut store = ctx.backup().lock();
         store.record_post_mutation_states();
-        let hashes = crate::backup::A03_FINGERPRINT_HASHES.with(|count| count.get());
-        let live_reads = crate::backup::A03_LIVE_FINGERPRINT_READS.with(|count| count.get());
+        let hashes = aft_engine::test_bridge::search_misc::backup::A03_FINGERPRINT_HASHES
+            .with(|count| count.get());
+        let live_reads = aft_engine::test_bridge::search_misc::backup::A03_LIVE_FINGERPRINT_READS
+            .with(|count| count.get());
         let reads = edit::A03_HANDLER_READS.with(|count| count.get())
-            + crate::backup::capture_read_count(&path)
+            + aft_engine::test_bridge::search_misc::backup::capture_read_count(&path)
             + live_reads;
         eprintln!("A03 handler + finalizer reads={reads}, hashes={hashes}, live fingerprint reads={live_reads}");
         assert_eq!(live_reads, 1);
@@ -1222,7 +1230,7 @@ mod a03_tests {
         let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         for preview in [true, false] {
             std::fs::write(&path, "const value = 1;\n").unwrap();
-            crate::backup::reset_capture_read_count(&path);
+            aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&path);
             edit::A03_HANDLER_READS.with(|counter| counter.set(0));
             edit::A03_SYNTAX_PARSES.with(|counter| counter.set(0));
             let response = handle_batch(
@@ -1237,7 +1245,7 @@ mod a03_tests {
             );
             assert!(response.success, "{:?}", response);
             let reads = edit::A03_HANDLER_READS.with(|counter| counter.get())
-                + crate::backup::capture_read_count(&path);
+                + aft_engine::test_bridge::search_misc::backup::capture_read_count(&path);
             let parses = edit::A03_SYNTAX_PARSES.with(|counter| counter.get());
             eprintln!("A03 batch preview={preview}: handler reads={reads}, syntax parses={parses}");
             assert_eq!(parses, if preview { 0 } else { 2 });

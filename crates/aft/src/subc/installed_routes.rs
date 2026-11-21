@@ -75,11 +75,15 @@ mod tests {
         let client = crate::fleet_status::FleetStatusClient::dial_channel(4).0;
         client.publish(root.as_path(), "opencode", session, "[AFT E0 W0 | T1]");
         assert_eq!(
-            status::test_value(session).unwrap()["segment"],
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(session)
+                .unwrap()["segment"],
             "[AFT E0 W0 | T1]"
         );
         remove_route_channel(&mut routes, &mut roots, first);
-        assert!(status::test_value(session).is_some());
+        assert!(
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(session)
+                .is_some()
+        );
         insert_route_channel(
             &mut routes,
             &mut roots,
@@ -87,19 +91,30 @@ mod tests {
             route_identity(&root, other),
         );
         assert!(
-            status::test_value(session).is_none(),
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(session)
+                .is_none(),
             "replacement ends the last old-session route"
         );
         assert!(
-            status::test_value(other).is_none(),
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(other)
+                .is_none(),
             "a bound route alone does not publish a segment"
         );
         client.publish(root.as_path(), "opencode", session, "late completion");
-        assert!(status::test_value(session).is_none());
+        assert!(
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(session)
+                .is_none()
+        );
         client.publish(root.as_path(), "opencode", other, "[AFT E1 W0 | T2]");
-        assert!(status::test_value(other).is_some());
+        assert!(
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(other)
+                .is_some()
+        );
         remove_route_channel(&mut routes, &mut roots, second);
-        assert!(status::test_value(other).is_none());
+        assert!(
+            aft_engine::test_bridge::display_data::late_result_bus::status::test_value(other)
+                .is_none()
+        );
     }
 }
 

@@ -1506,8 +1506,14 @@ fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
         project_root: Some(root.clone()),
         ..Default::default()
     };
-    let walks = || crate::lsp::registry::BIOME_ROOT_WALKS.with(std::cell::Cell::get);
-    let probes = || crate::lsp::registry::BIOME_CONFIG_DIRECTORY_PROBES.with(std::cell::Cell::get);
+    let walks = || {
+        aft_engine::test_bridge::search_misc::lsp::registry::BIOME_ROOT_WALKS
+            .with(std::cell::Cell::get)
+    };
+    let probes = || {
+        aft_engine::test_bridge::search_misc::lsp::registry::BIOME_CONFIG_DIRECTORY_PROBES
+            .with(std::cell::Cell::get)
+    };
     let (walks_before, probes_before) = (walks(), probes());
     detect_missing_lsp_binaries(&files, &config);
     assert_eq!(
@@ -1874,7 +1880,7 @@ fn configure_warnings_list_files_from_the_published_index_store_without_walking(
             ..Default::default()
         },
     );
-    crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
+    aft_engine::test_bridge::display_data::data_layer::surfaces::serve_text_only_for_test(&ctx);
     assert!(crate::inspect::data_sources::bound_inventory(&root).is_ok());
     let (listed, store_entries) = warn();
     assert_eq!(store_entries, 0, "a published checkout lists the files");
@@ -6003,7 +6009,12 @@ mod tests {
             cache_dir: Some(cache),
             ..Default::default()
         };
-        assert!(crate::root_cache::prepare_cache_root_for_test(&mut split).is_none());
+        assert!(
+            aft_engine::test_bridge::search_misc::root_cache::prepare_cache_root_for_test(
+                &mut split
+            )
+            .is_none()
+        );
         drop(split);
         match failure {
             "number" => fs::write(
@@ -6415,7 +6426,7 @@ mod tests {
                 .then(|| Err(std::io::Error::from_raw_os_error(libc::ENOENT)))
         }
         for outcome in ["recover", "edited", "unbound", "unbound_after_poll"] {
-            crate::provisional_identity_retry::with_timing_for_test(
+            aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
                 Duration::ZERO,
                 Duration::from_secs(1),
                 || {
@@ -7158,7 +7169,7 @@ mod tests {
 
     #[test]
     fn configure_cancellation_stops_the_git_probe_retry_ladder() {
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
@@ -7168,7 +7179,7 @@ mod tests {
         let probe_attempts = Arc::new(AtomicUsize::new(0));
         let (release_probe, probe_release) = mpsc::channel();
         let _probe_guard =
-            crate::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
+            aft_engine::test_bridge::search_misc::root_identity::key::force_git_root_commit_probe_held_transient_for_paths_for_test(
                 vec![canonical_root.clone()],
                 Arc::clone(&probe_attempts),
                 probe_release,
@@ -7275,14 +7286,14 @@ mod tests {
 
     #[test]
     fn handle_configure_keeps_unreadable_git_unindexed_without_saving_a_path_identity() {
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("repo");
         std::fs::create_dir_all(root.join(".git")).expect("create git marker");
         let storage = temp.path().join("storage");
         let canonical_root = std::fs::canonicalize(&root).expect("canonical root");
         let _override =
-            crate::root_identity::key::force_git_root_commit_probe_transient_for_paths_for_test(
+            aft_engine::test_bridge::search_misc::root_identity::key::force_git_root_commit_probe_transient_for_paths_for_test(
                 vec![root.clone(), canonical_root.clone()],
                 "spawn failed: Too many open files (os error 24)",
             );
@@ -7315,7 +7326,7 @@ mod tests {
             aft_engine::test_bridge::search_misc::read_root_identity(&root, &storage).unwrap(),
             None
         );
-        let path_key = crate::root_identity::key::artifact_path_identity_key_for_test(&root);
+        let path_key = aft_engine::test_bridge::search_misc::root_identity::key::artifact_path_identity_key_for_test(&root);
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
         assert!(!storage.join("callgraph").join(&path_key).exists());
@@ -7366,7 +7377,7 @@ mod tests {
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
         let request = trigram_bind_request(&root, &storage);
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -7453,7 +7464,7 @@ mod tests {
             ctx.cached_artifact_cache_key(&root).as_deref(),
             Some(git_key.as_str())
         );
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -7486,7 +7497,7 @@ mod tests {
                     .expect("the settled bind publishes its key");
                 assert_eq!(
                     settled,
-                    crate::root_identity::key::artifact_path_identity_key_for_test(&root)
+                    aft_engine::test_bridge::search_misc::root_identity::key::artifact_path_identity_key_for_test(&root)
                 );
                 assert_ne!(
                     settled, git_key,
@@ -7526,7 +7537,7 @@ mod tests {
         let request = configure_request_with_params(
             json!({"project_root":root,"storage_dir":storage,"harness":"pi","cortexkit_user_config_path":user}),
         );
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -7566,7 +7577,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -7608,7 +7619,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::ZERO,
             || {
@@ -7637,7 +7648,7 @@ mod tests {
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let (_temp, root, storage, lock) = busy_bind_fixture();
         let ctx = test_context();
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -7683,19 +7694,19 @@ mod tests {
 
     #[test]
     fn dubious_ownership_identity_does_not_retry_in_the_background() {
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let _git_env = crate::test_env::hermetic_git_env_guard();
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap().join("repo");
         std::fs::create_dir_all(root.join(".git")).expect("create git marker");
         let storage = temp.path().join("storage");
         let _override =
-            crate::root_identity::key::force_git_root_commit_probe_transient_for_paths_for_test(
+            aft_engine::test_bridge::search_misc::root_identity::key::force_git_root_commit_probe_transient_for_paths_for_test(
                 vec![root.clone()],
                 "fatal: detected dubious ownership in repository",
             );
         let ctx = test_context();
-        crate::provisional_identity_retry::with_timing_for_test(
+        aft_engine::test_bridge::display_data::provisional_identity_retry::with_timing_for_test(
             Duration::ZERO,
             Duration::from_secs(600),
             || {
@@ -9437,7 +9448,7 @@ mod tests {
 
     #[test]
     fn cache_key_resolve_profile_counts_cold_and_unchanged_configure_probes() {
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         init_git_fixture(root.path());
@@ -9483,7 +9494,7 @@ mod tests {
     #[test]
     fn cache_key_resolve_shares_only_verified_unchanged_repository_history() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
@@ -9566,7 +9577,7 @@ mod tests {
     #[test]
     fn cache_key_resolve_shared_history_survives_sibling_commits() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
@@ -9660,7 +9671,7 @@ mod tests {
     #[test]
     fn cache_key_resolve_shared_history_requires_readable_head() {
         let _git_env = crate::test_env::hermetic_git_env_guard();
-        let _probe_lock = crate::root_identity::key::git_root_commit_probe_override_lock_for_test();
+        let _probe_lock = aft_engine::test_bridge::search_misc::root_identity::key::git_root_commit_probe_override_lock_for_test();
         let temp = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let main = temp.path().join("main");
