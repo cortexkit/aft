@@ -70,6 +70,8 @@ pub mod impact;
 mod import_specifier_edit;
 pub mod inline_symbol;
 pub mod inspect;
+#[cfg(test)]
+mod inspect_boundary_tests;
 pub mod list_checkpoints;
 pub mod list_filters;
 pub mod lsp_diagnostics;
