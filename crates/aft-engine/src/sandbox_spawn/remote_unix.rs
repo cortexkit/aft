@@ -47,7 +47,7 @@ pub(crate) struct Start {
     path: OsString,
 }
 
-pub(crate) fn prepare(
+pub fn prepare(
     ctx: &AppContext,
     folder: &Path,
     workdir: PathBuf,

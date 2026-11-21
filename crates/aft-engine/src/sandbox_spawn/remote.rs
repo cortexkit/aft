@@ -71,7 +71,8 @@ pub async fn run_for_test(
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn prepare(_: &AppContext, _: &Path, _: PathBuf, _: String) -> Result<Start, String> {
+#[doc(hidden)]
+pub fn prepare(_: &AppContext, _: &Path, _: PathBuf, _: String) -> Result<Start, String> {
     Err("no remote shell sandbox backend".into())
 }
 
