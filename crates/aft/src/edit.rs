@@ -1524,9 +1524,9 @@ pub(crate) const DIFF_OMITTED_NOTICE: &str = "Diff preview omitted: exceeds the 
 
 /// One allowance shared by every file in a reply, including duplicate host fields.
 pub(crate) struct DiffBudget {
-    remaining: usize,
+    pub(crate) remaining: usize,
     copies: usize,
-    omitted: bool,
+    pub(crate) omitted: bool,
 }
 
 impl DiffBudget {
@@ -1635,9 +1635,9 @@ impl DiffBudget {
     }
 }
 
-struct BoundedDiffText {
-    text: String,
-    limit: usize,
+pub(crate) struct BoundedDiffText {
+    pub(crate) text: String,
+    pub(crate) limit: usize,
 }
 
 impl std::fmt::Write for BoundedDiffText {
@@ -1647,103 +1647,6 @@ impl std::fmt::Write for BoundedDiffText {
         }
         self.text.push_str(text);
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod diff_budget_tests {
-    use super::*;
-    use serde_json::json;
-    use std::fmt::Write;
-
-    #[test]
-    fn diff_budget_writer_stops_the_stream_before_allocating_large_chunks() {
-        let mut sink = BoundedDiffText {
-            text: String::new(),
-            limit: 16,
-        };
-        let mut visited = 0;
-        let rendered = (0..1_000_000).try_for_each(|_| {
-            visited += 1;
-            sink.write_str("12345678")
-        });
-        assert!(rendered.is_err());
-        assert_eq!(visited, 3);
-        assert_eq!(sink.text, "1234567812345678");
-        let capacity = sink.text.capacity();
-        assert!(sink.write_str(&"x".repeat(1_000_000)).is_err());
-        assert_eq!(sink.text.capacity(), capacity);
-    }
-
-    #[test]
-    fn diff_budget_counts_all_files_and_duplicate_fields() {
-        let mut budget = DiffBudget::new(2);
-        let text = "x\n".repeat(15_000);
-        let first = budget.render("first.txt", &text, "").unwrap();
-        assert!(first.len() * 2 < DIFF_RESPONSE_BUDGET);
-        assert!(budget.render("second.txt", &text, "").is_none());
-        let mut result = json!({"metadata": {"diff": first, "files": [
-            {"type": "delete", "patch": first, "deletions": 15_000},
-            {"type": "delete", "patch": null, "deletions": 15_000}
-        ]}});
-        budget.finish(&mut result);
-        assert!(result["metadata"].get("diff").is_none());
-        assert!(result["metadata"]["files"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|f| f.get("patch").is_none()));
-        assert_eq!(result["metadata"]["files"][1]["deletions"], 15_000);
-    }
-
-    #[test]
-    fn diff_budget_bounds_mutations_and_edit_write_previews_with_counts() {
-        let before = "x\n".repeat(100_000);
-        for mode in 0..3 {
-            let mut result = json!({"ok": true});
-            match mode {
-                0 => attach_mutation_diff(&mut result, "large.txt", &before, ""),
-                1 => attach_edit_diff(
-                    &mut result,
-                    &json!({"include_diff_content": true}),
-                    "large.txt",
-                    &before,
-                    "",
-                ),
-                _ => attach_preview_diff(
-                    &mut result,
-                    &json!({"include_diff_content": true}),
-                    "large.txt",
-                    &before,
-                    "",
-                ),
-            }
-            assert_eq!(result["diff_preview_omitted"], true);
-            assert!(result["metadata"].get("diff").is_none());
-            assert!(result.get("preview_diff").is_none());
-            if mode != 0 {
-                assert_eq!(result["diff"]["additions"], 0);
-                assert_eq!(result["diff"]["deletions"], 100_000);
-                assert!(result["diff"].get("before").is_none());
-            }
-            let response = crate::protocol::Response::success("budget", result);
-            let rendered = crate::subc_format::format_response("edit", &response, false);
-            assert_eq!(rendered.lines().last(), Some(DIFF_OMITTED_NOTICE));
-            assert!(serde_json::to_vec(&response).unwrap().len() < DIFF_RESPONSE_BUDGET);
-        }
-    }
-
-    #[test]
-    fn diff_budget_boundary_and_small_utf8_patches_preserve_exact_bytes() {
-        let mut budget = DiffBudget::new(1);
-        let patch = budget.render("small.txt", "old\r\n", "é\n").unwrap();
-        assert_eq!(patch, "Index: small.txt\n===================================================================\n--- small.txt\n+++ small.txt\n@@ -1 +1 @@\n-old\r\n+é\n");
-        let mut budget = DiffBudget::new(2);
-        budget.remaining = patch.len() * 2;
-        assert_eq!(budget.render("small.txt", "old\r\n", "é\n").unwrap(), patch);
-        assert_eq!(budget.remaining, 0);
-        budget.separator(&mut String::new(), "\n");
-        assert!(budget.omitted);
     }
 }
 
@@ -2483,9 +2386,9 @@ pub(crate) fn write_format_validate_admitted(
     )
 }
 
-mod bash;
+pub(crate) mod bash;
 mod python_indent;
-mod swift;
+pub(crate) mod swift;
 pub mod tool_launcher;
 
 fn write_format_validate_impl(
@@ -3294,111 +3197,6 @@ mod tests {
             read_edit_source(&path).err().unwrap().to_string(),
             std::fs::read_to_string(&path).err().unwrap().to_string()
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a03_formatter_checker_final_buffer_parity() {
-        let root = tempfile::tempdir().unwrap();
-        let path = root.path().join("edge.ts");
-        let bin = root.path().join("node_modules/.bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        std::fs::write(root.path().join(".oxfmtrc.json"), "{}").unwrap();
-        std::fs::write(root.path().join("tsconfig.json"), "{}").unwrap();
-        for (tool, value) in [("oxfmt", 3), ("tsc", 4)] {
-            let tool_path = bin.join(tool);
-            crate::executable_cache::write_executable(
-                &tool_path,
-                format!("#!/bin/sh\nif [ \"$1\" = '--version' ]; then echo '{tool} 1.0'; exit 0; fi\nprintf 'const value = {value};\\n' > '{}'\n", path.display()).as_bytes(),
-            )
-            .unwrap();
-        }
-        let config = Config {
-            project_root: Some(root.path().to_path_buf()),
-            format_on_edit: true,
-            formatter: [("typescript".into(), "oxfmt".into())].into(),
-            checker: [("typescript".into(), "tsc".into())].into(),
-            ..Config::default()
-        };
-        for full in [false, true] {
-            std::fs::write(&path, "const value = 1;\n").unwrap();
-            let (original, observation) = read_edit_source(&path).unwrap();
-            A03_HANDLER_READS.with(|count| count.set(0));
-            A03_SYNTAX_PARSES.with(|count| count.set(0));
-            let params = serde_json::json!({"validate": if full {"full"} else {"syntax"}, "include_diff_content": true});
-            let mut result = write_format_validate_observed(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-                &path,
-                "const value = 2;\n",
-                &config,
-                &params,
-                &original,
-                &observation,
-            )
-            .unwrap();
-            let final_text = if full {
-                "const value = 4;\n"
-            } else {
-                "const value = 3;\n"
-            };
-            assert!(result.formatted, "{:?}", result.format_skipped_reason);
-            assert!(result.validation_errors.is_empty());
-            assert_eq!(result.syntax_valid, Some(true));
-            assert_eq!(
-                result.reformatted_excerpt.as_ref().unwrap().text,
-                final_text.trim_end()
-            );
-            assert_eq!(result.final_content(&path), Some(final_text));
-            let mut response = serde_json::json!({});
-            attach_edit_diff(
-                &mut response,
-                &params,
-                "edge.ts",
-                &original,
-                result.final_content(&path).unwrap(),
-            );
-            assert_eq!(
-                response["diff"],
-                serde_json::json!({"before": original, "after": final_text, "additions": 1, "deletions": 1})
-            );
-            assert_eq!(response["metadata"]["diff"], format!("Index: edge.ts\n===================================================================\n--- edge.ts\n+++ edge.ts\n@@ -1 +1 @@\n-const value = 1;\n+{}", final_text));
-            assert_eq!(
-                A03_HANDLER_READS.with(|count| count.get()),
-                if full { 2 } else { 1 }
-            );
-            assert_eq!(A03_SYNTAX_PARSES.with(|count| count.get()), 2);
-
-            std::fs::write(&path, "const value = 1;\n").unwrap();
-            crate::backup::reset_capture_read_count(&path);
-            A03_HANDLER_READS.with(|count| count.set(0));
-            A03_SYNTAX_PARSES.with(|count| count.set(0));
-            let ctx = AppContext::new(Box::new(crate::language::StubProvider), config.clone());
-            let req: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
-                "id": "formatter-checker", "command": "batch", "file": path,
-                "edits": [{"match": "1", "replacement": "2"}],
-                "validate": if full {"full"} else {"syntax"}, "include_diff_content": true
-            }))
-            .unwrap();
-            let response = crate::commands::batch::handle_batch(&req, &ctx);
-            assert!(response.success, "{:?}", response);
-            assert_eq!(response.data["diff"]["after"], final_text);
-            assert_eq!(
-                response.data["metadata"]["diff"],
-                build_unbounded_unified_diff(
-                    path.to_str().unwrap(),
-                    "const value = 1;\n",
-                    final_text
-                )
-            );
-            let reads = A03_HANDLER_READS.with(|count| count.get())
-                + crate::backup::capture_read_count(&path);
-            assert_eq!(
-                reads,
-                if full { 3 } else { 2 },
-                "handler-wide formatter/checker content reads"
-            );
-            assert_eq!(A03_SYNTAX_PARSES.with(|count| count.get()), 2);
-        }
     }
 
     // --- line_col_to_byte ---

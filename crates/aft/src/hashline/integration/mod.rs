@@ -11,6 +11,9 @@ mod preflight;
 mod schema;
 mod transport;
 
+#[cfg(test)]
+pub(crate) use transport::build_display_metadata;
+
 pub use binding::{
     effective_for_capture, BindingGuard, BindingHandle, BindingRegistry, DowngradeWarning,
     HashlineBinding, RegistrationOutcome, RegistrationRequest, SessionKey,
