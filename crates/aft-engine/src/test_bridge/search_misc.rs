@@ -262,3 +262,31 @@ pub fn keep_request_file(
 ) -> std::sync::Arc<crate::search_state::request_files::RequestFile> {
     guard.files().keep_read(path, bytes, stat)
 }
+
+pub mod output;
+pub mod search;
+pub use crate::edit::{
+    A03_DIFF_CONSTRUCTIONS, A03_LINE_INDEX_PASSES, FORCE_MODE_RESTORE_FAILURE,
+    LINE_OFFSET_BYTES_SCANNED,
+};
+
+pub fn session_call_counts(
+    breaker: &crate::repeat_state::RepeatBreaker,
+) -> std::collections::HashMap<String, usize> {
+    breaker.session_call_counts()
+}
+
+pub trait BackupStoreTest {
+    fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf);
+    fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf);
+}
+
+impl BackupStoreTest for crate::backup::BackupStore {
+    fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
+        self.add_created_dir_for_test(session, key, dir);
+    }
+
+    fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
+        self.rekey_for_test(session, from, to);
+    }
+}

@@ -2487,7 +2487,7 @@ fn blocked_synapse_connect_never_delays_searches_reading_not_ready() {
 #[test]
 fn cache_root_unavailable_reranker_never_activates() {
     let mut inputs = onnx_inputs(None);
-    inputs.cache_unavailable = true;
+    bridge::set_cache_unavailable(&mut inputs, true);
     let builds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let observed = Arc::clone(&builds);
     let slot = bridge::slot_with_constructor(Arc::new(move |_| {

@@ -408,7 +408,7 @@ impl OnnxReranker {
         Ok(response)
     }
 
-    pub(crate) fn wait_for_reply(
+    pub fn wait_for_reply(
         response: &Receiver<Result<Vec<f32>, RerankError>>,
         deadline: Instant,
         now: Instant,

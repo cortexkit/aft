@@ -101,3 +101,7 @@ pub mod fixture {
 }
 
 pub mod onnx;
+
+pub fn set_cache_unavailable(inputs: &mut slot::BuildInputs, value: bool) {
+    inputs.cache_unavailable = value;
+}

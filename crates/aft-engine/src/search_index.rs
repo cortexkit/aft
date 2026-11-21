@@ -220,7 +220,7 @@ impl SearchIndex {
 impl SearchIndexSnapshot {
     /// The files this snapshot answers for, with the size and content hash it
     /// records for each and the modification time observed when it was built.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn file_entries(&self) -> &[FileEntry] {
         &self.files
     }
@@ -296,7 +296,7 @@ impl SearchIndexSnapshot {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
         let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {

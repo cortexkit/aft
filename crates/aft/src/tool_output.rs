@@ -3,8 +3,6 @@
 #[cfg(test)]
 use std::path::Path;
 use std::path::PathBuf;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 
 use crate::context::AppContext;
 pub(crate) use crate::output_store::OutputScope;
@@ -550,6 +548,7 @@ fn visible_inspect_rows(full: &str, visible: &str, tail: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aft_engine::test_bridge::search_misc::output::OutputFilesTest as _;
     use serde_json::{json, Value};
 
     fn context(root: &Path, storage: &Path) -> AppContext {
@@ -743,7 +742,7 @@ mod tests {
             );
             assert_eq!(text, original);
         }
-        assert!(ctx.output_files().files.lock().is_empty());
+        assert!(ctx.output_files().files_are_empty());
     }
 
     #[test]
@@ -868,7 +867,7 @@ mod tests {
             1
         );
         assert!(!text.contains("[output cut"));
-        assert!(ctx.output_files().files.lock().is_empty());
+        assert!(ctx.output_files().files_are_empty());
     }
 
     #[test]
@@ -887,7 +886,7 @@ mod tests {
                 std::fs::write(&path, &source).unwrap();
                 path
             };
-            let files_before = ctx.output_files().files.lock().len();
+            let files_before = ctx.output_files().file_count();
             let mut params = json!({"file":path});
             if ranged {
                 params["start_line"] = 31.into();
@@ -915,7 +914,7 @@ mod tests {
             assert!(text.len() <= TEXT_LIMIT, "{} bytes", text.len());
             assert!(text.ends_with(&notices));
             assert!(!text.contains("[output cut"));
-            assert_eq!(ctx.output_files().files.lock().len(), files_before);
+            assert_eq!(ctx.output_files().file_count(), files_before);
             assert_eq!(response.data, original_data);
 
             let rows: Vec<_> = text
@@ -988,7 +987,7 @@ mod tests {
             assert!(text.contains("Use startLine/endLine or offset/limit to read other sections."));
             assert!(text.ends_with("\nstatus bar"));
             assert!(!text.contains("[output cut"));
-            assert!(ctx.output_files().files.lock().is_empty());
+            assert!(ctx.output_files().files_are_empty());
         }
     }
 
@@ -1057,7 +1056,7 @@ mod tests {
             );
             assert!(text.ends_with("\nstatus bar"));
             assert!(!text.contains("[output cut"));
-            assert!(ctx.output_files().files.lock().is_empty());
+            assert!(ctx.output_files().files_are_empty());
 
             let shown: std::collections::BTreeSet<usize> = text
                 .lines()
@@ -1315,7 +1314,7 @@ mod tests {
         );
         assert!(text.ends_with("[output cut at 50 KB of 65536.0 KB; the full result could not be saved: full tool result exceeds the 64 MiB saved-file limit]"));
         assert!(!text.contains("full result saved"));
-        assert!(ctx.output_files().files.lock().is_empty());
+        assert!(ctx.output_files().files_are_empty());
     }
 
     #[test]
@@ -1364,7 +1363,7 @@ mod tests {
         assert!(!files.is_result_path(&ctx, &ordinary));
         assert!(files.owner(&ordinary).is_none());
         assert!(files.read("owner", &ordinary).is_none());
-        assert_eq!(files.canonicalizations.load(Ordering::Relaxed), 0);
+        assert_eq!(files.canonicalizations(), 0);
         let mut text = "row\n".repeat(20_000);
         cap(
             &ctx,
@@ -1374,30 +1373,21 @@ mod tests {
             &mut text,
         );
         let path = saved_path(&text);
-        let before = files.canonicalizations.load(Ordering::Relaxed);
+        let before = files.canonicalizations();
         for _ in 0..50 {
             files.restore(&ctx, "owner", &path);
             assert!(files.is_result_path(&ctx, &path));
             assert_eq!(files.owner(&path).as_deref(), Some("owner"));
         }
-        assert_eq!(files.canonicalizations.load(Ordering::Relaxed), before);
+        assert_eq!(files.canonicalizations(), before);
         let restored = context(temp.path(), &temp.path().join("store"));
         assert!(restored.output_files().is_result_path(&restored, &path));
-        let before = restored
-            .output_files()
-            .canonicalizations
-            .load(Ordering::Relaxed);
+        let before = restored.output_files().canonicalizations();
         assert!(before > 0, "a new context must resolve its root once");
         for _ in 0..50 {
             assert!(restored.output_files().is_result_path(&restored, &path));
         }
-        assert_eq!(
-            restored
-                .output_files()
-                .canonicalizations
-                .load(Ordering::Relaxed),
-            before
-        );
+        assert_eq!(restored.output_files().canonicalizations(), before);
     }
 
     #[test]

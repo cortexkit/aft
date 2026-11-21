@@ -2544,7 +2544,7 @@ impl BackupStore {
 
     /// Record one more directory as created by the newest entry for `key`, to
     /// test that undo authorizes every directory it would remove.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
         let entry = self
             .entries
@@ -2557,7 +2557,7 @@ impl BackupStore {
 
     /// Move a session's backups to a different key, to test how undo treats a
     /// key it did not write itself.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
         let files = self.entries.get_mut(session).expect("session has backups");
         let stack = files.remove(from).expect("key has backups");

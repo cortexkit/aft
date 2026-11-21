@@ -4705,7 +4705,10 @@ mod code_references {
         #[test]
         fn code_reference_cache_reuses_content_but_separates_grammar_and_edits() {
             let source = "fn CachedParseMarker(x: ExternalCacheType) { x; } // CommentCacheOnly";
-            let file = request_files::RequestFile::unshared(source.as_bytes().to_vec(), None);
+            let file = aft_engine::test_bridge::search_misc::search::unshared_request_file(
+                source.as_bytes().to_vec(),
+                None,
+            );
             let mut parser = crate::parser::FileParser::new();
             let before = crate::parser::work_counters::tree_parses();
             assert_eq!(
@@ -4734,7 +4737,10 @@ mod code_references {
             assert_eq!(crate::parser::work_counters::tree_parses(), after);
             // A Rust-looking name in a Python comment is not a Python identifier.
             let text = "# fn CachedGrammarMarker() {}";
-            let bytes = request_files::RequestFile::unshared(text.as_bytes().to_vec(), None);
+            let bytes = aft_engine::test_bridge::search_misc::search::unshared_request_file(
+                text.as_bytes().to_vec(),
+                None,
+            );
             for extension in ["rs", "py", "h", "c"] {
                 let path = PathBuf::from(format!("same.{extension}"));
                 assert_eq!(
@@ -4748,7 +4754,10 @@ mod code_references {
                 );
             }
             let changed = "// ExternalCacheType";
-            let bytes = request_files::RequestFile::unshared(changed.as_bytes().to_vec(), None);
+            let bytes = aft_engine::test_bridge::search_misc::search::unshared_request_file(
+                changed.as_bytes().to_vec(),
+                None,
+            );
             assert_eq!(
                 cached(
                     Path::new("first.rs"),
