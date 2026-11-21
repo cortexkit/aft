@@ -11,7 +11,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 #[cfg(unix)]
-use crate::url_fetch::cache_content_path_for_url;
+use crate::url_fetch::{cache_content_path_for_url, URL_REPLY_MARGIN};
 
 #[allow(unused_imports)]
 pub(crate) use aft_base::url_fetch::deadline_tests::*;
