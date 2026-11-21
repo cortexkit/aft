@@ -54,7 +54,7 @@ fn status(attached: bool, reason: Option<&'static str>) {
     health.reason = reason;
 }
 
-pub(crate) trait Writer {
+pub trait Writer {
     async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
 }
 
@@ -70,14 +70,14 @@ impl Writer for RealWriter {
 }
 
 #[derive(Default)]
-pub(crate) struct Publication {
+pub struct Publication {
     written: HashSet<(String, blake3::Hash)>,
     skipped: HashSet<(String, blake3::Hash)>,
 }
 
 impl Publication {
-    #[cfg(test)]
-    pub(crate) async fn sync_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn sync_for_test(
         &mut self,
         writer: &mut impl Writer,
         values: Vec<(String, Vec<u8>)>,
@@ -85,7 +85,7 @@ impl Publication {
         self.sync(writer, values).await
     }
 
-    pub(crate) async fn sync_with_hooks(
+    pub async fn sync_with_hooks(
         &mut self,
         writer: &mut impl Writer,
         hooks: Option<&Hooks>,
@@ -180,11 +180,18 @@ pub(super) fn unavailable(reason: &'static str) {
 #[cfg(test)]
 mod tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
-pub(crate) struct RecordingWriter(pub(crate) Vec<(String, Vec<u8>)>);
+pub struct RecordingWriter(pub(crate) Vec<(String, Vec<u8>)>);
 
-#[cfg(test)]
+#[cfg(feature = "test-support")]
+impl RecordingWriter {
+    pub fn writes(&self) -> &[(String, Vec<u8>)] {
+        &self.0
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 impl Writer for RecordingWriter {
     async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str> {
         self.0.push((key.into(), value));

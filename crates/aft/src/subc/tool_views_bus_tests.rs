@@ -1,4 +1,6 @@
-use crate::late_result_bus::views::{key, Publication, RecordingWriter};
+use aft_engine::test_bridge::display_data::late_result_bus::views::{
+    key, Publication, RecordingWriter,
+};
 
 #[tokio::test]
 async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
@@ -8,7 +10,10 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
         .sync_for_test(&mut writer, crate::subc::tool_views::bus_snapshot())
         .await
         .unwrap();
-    assert_eq!(writer.0.len(), crate::subc::tool_views::SHIPPED.len());
+    assert_eq!(
+        writer.writes().len(),
+        crate::subc::tool_views::SHIPPED.len()
+    );
     for (pin, _) in crate::subc::tool_views::SHIPPED.iter() {
         let request = cortexkit_role_tool_provider::views::ViewsRequest::new(vec![pin.clone()]);
         let reply = cortexkit_role_tool_provider::views::ViewsReply::new(
@@ -23,7 +28,7 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
         let route_bytes = serde_json::to_vec(&serde_json::to_value(reply).unwrap()).unwrap();
         assert_eq!(
             writer
-                .0
+                .writes()
                 .iter()
                 .find(|(stored, _)| stored == &key(pin))
                 .unwrap()
@@ -38,10 +43,10 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     assert!(crate::subc::tool_views::SHIPPED.contains_key(pin));
     assert_eq!(key(pin), "7470313a6170706c795f70617463683a666136326339373937653564313434333637313466353633306431353831356432616463313138353032336133646362613366336564323066633966303534383a31");
     assert_ne!(key(pin), key(&pin.replace(":1", ":2")));
-    let writes = writer.0.len();
+    let writes = writer.writes().len();
     publication
         .sync_for_test(&mut writer, crate::subc::tool_views::bus_snapshot())
         .await
         .unwrap();
-    assert_eq!(writer.0.len(), writes);
+    assert_eq!(writer.writes().len(), writes);
 }

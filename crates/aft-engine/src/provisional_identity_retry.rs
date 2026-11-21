@@ -74,21 +74,25 @@ const PRODUCTION_TIMING: Timing = Timing {
     give_up_after: GIVE_UP_AFTER,
 };
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    static TIMING_FOR_TEST: std::cell::Cell<Option<Timing>> = const { std::cell::Cell::new(None) };
     static NOW_FOR_TEST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    static TIMING_FOR_TEST: std::cell::Cell<Option<Timing>> = const { std::cell::Cell::new(None) };
+}
+
 fn now() -> Instant {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(now) = NOW_FOR_TEST.with(std::cell::Cell::get) {
         return now;
     }
     Instant::now()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_clock_for_test<T>(body: impl FnOnce() -> T) -> T {
     struct Restore(Option<Instant>);
     impl Drop for Restore {
@@ -100,7 +104,7 @@ pub(crate) fn with_clock_for_test<T>(body: impl FnOnce() -> T) -> T {
     body()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn advance_clock_for_test(elapsed: Duration) {
     NOW_FOR_TEST
         .with(|slot| slot.set(Some(slot.get().expect("test clock is installed") + elapsed)));

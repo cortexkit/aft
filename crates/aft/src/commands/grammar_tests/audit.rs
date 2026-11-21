@@ -1,7 +1,8 @@
 //! Isolated regressions for grammar coverage at command and fill boundaries.
 
 use super::*;
-use crate::data_layer::{grammar, runtime::DataCheckout, test_gates};
+use crate::data_layer::runtime::DataCheckout;
+use aft_engine::test_bridge::display_data::{grammar, meaning, test_gates};
 
 fn run(name: &str, test: fn()) {
     if std::env::var("AFT_S4_AUDIT_TEST").as_deref() == Ok(name) {
@@ -210,7 +211,7 @@ fn timeout_refusals() {
     assert_eq!(response.data["complete"], false);
     assert_eq!(response.data["path"], json!(path));
     let mut response = Response::success("timeout", json!({"gaps":[{"kind":"existing"}]}));
-    crate::data_layer::surfaces::disclose_parse_gaps(
+    aft_engine::test_bridge::display_data::surfaces::disclose_parse_gaps(
         &runtime.view().unwrap(),
         &[f.root.clone()],
         &mut response,
@@ -292,7 +293,7 @@ fn missing_outlines() {
         .coverage()
         .clone();
     assert_eq!(coverage.files, 4);
-    assert!(!crate::data_layer::meaning::waiting(&coverage));
+    assert!(!meaning::waiting(&coverage));
     assert!(!coverage.complete());
 }
 
@@ -438,7 +439,7 @@ fn trace_gaps() {
         assert!(!response.data["text"].as_str().unwrap().ends_with('\n'));
     }
     let mut response = Response::success("merge", json!({"gaps":[{"kind":"existing"}]}));
-    crate::data_layer::surfaces::disclose_parse_gaps(
+    aft_engine::test_bridge::display_data::surfaces::disclose_parse_gaps(
         &runtime.view().unwrap(),
         &[f.root.clone()],
         &mut response,
@@ -489,7 +490,7 @@ fn readiness(before_gap_publication: bool) {
     let build = before_gap_publication.then(|| hold(&f.root, BuildPublication));
     let fill = hold(&f.root, FillSurvey);
     let publication = hold(&f.root, DeltaPublication);
-    let _model = crate::data_layer::meaning::fill_with_constant_vectors_for_test(&f.root, 2);
+    let _model = meaning::fill_with_constant_vectors_for_test(&f.root, 2);
     let runtime = DataCheckout::open(&f.root, &f.storage, None).unwrap();
     runtime.configure_meaning(Some(&crate::config::SemanticBackendConfig::default()));
     if let Some(build) = &build {
@@ -539,7 +540,7 @@ fn readiness(before_gap_publication: bool) {
     drop(fill);
     let snapshot = until(
         || match runtime.meaning_status() {
-            crate::data_layer::meaning::MeaningState::Serving { snapshot, .. }
+            meaning::MeaningState::Serving { snapshot, .. }
                 if snapshot.coverage().pending.is_empty()
                     && snapshot.coverage().files_embedded == 1 =>
             {
@@ -1065,7 +1066,7 @@ isolated!(
         let _ = meaning_query(&f.ctx);
         until(
             || match runtime.meaning_status() {
-                crate::data_layer::meaning::MeaningState::Serving { snapshot, .. }
+                meaning::MeaningState::Serving { snapshot, .. }
                     if snapshot.coverage().pending.is_empty() =>
                 {
                     Some(())
@@ -1233,7 +1234,7 @@ isolated!(
         assert_eq!(warm_row["symbols"], 1, "{:?}", response.data);
         let manifest = response.data["content_files"].as_array().unwrap();
         assert!(
-            manifest.contains(&json!(crate::inspect::job::normalize_path(&warm))),
+            manifest.contains(&json!(crate::path_identity::normalize_path(&warm))),
             "{:?}",
             response.data
         );
@@ -1483,7 +1484,7 @@ isolated!(
         );
         assert_eq!(
             cold.data["content_files"],
-            json!([crate::inspect::job::normalize_path(&valid)])
+            json!([crate::path_identity::normalize_path(&valid)])
         );
 
         let checkout = f.ctx.data_checkout().unwrap();
@@ -1566,7 +1567,7 @@ isolated!(
             );
             assert_eq!(
                 response.data["content_files"],
-                json!([crate::inspect::job::normalize_path(&root.join("a.ts"))])
+                json!([crate::path_identity::normalize_path(&root.join("a.ts"))])
             );
         }
     }
@@ -1648,7 +1649,7 @@ isolated!(
         assert_eq!(cold.data["complete"], true);
         assert_eq!(
             cold.data["content_files"],
-            json!([crate::inspect::job::normalize_path(&path)])
+            json!([crate::path_identity::normalize_path(&path)])
         );
         assert_eq!(cold.data["files"][0]["symbols"], 1);
         assert_eq!(crate::parser::work_counters::tree_parses() - before, 1);

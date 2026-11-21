@@ -1006,7 +1006,7 @@ pub(crate) fn current_task() -> Option<TaskDisplay> {
 }
 
 #[cfg(test)]
-pub(crate) use crate::bash_background::frames::bash_bodies;
+pub(crate) use aft_engine::test_bridge::bash_remote::bash_bodies;
 
 pub(in crate::subc) fn bash_tail(
     metadata: &crate::bash_background::persistence::PersistedTask,

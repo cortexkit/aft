@@ -1683,3 +1683,11 @@ pub(crate) fn staged_sources_empty_for_test() -> bool {
 #[cfg(test)]
 #[path = "config_live_tests.rs"]
 pub(crate) mod tests;
+
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod test_config_file {
+    pub fn write(path: &std::path::Path, text: &str) {
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
+        std::fs::write(path, text).expect("write config");
+    }
+}

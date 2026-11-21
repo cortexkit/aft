@@ -28,6 +28,8 @@ pub(crate) fn register() {
 
 #[cfg(test)]
 mod tests {
+    use aft_engine::test_bridge::display_data::{configure, late_result_bus};
+
     #[test]
     fn display_hook_without_writer_never_polls_publish() {
         const CHILD: &str = "AFT_TEST_DISPLAY_HOOK_WRITERLESS_CHILD";
@@ -52,11 +54,11 @@ mod tests {
         }
 
         super::register();
-        let hooks = crate::late_result_bus::hooks().unwrap();
+        let hooks = late_result_bus::hooks().unwrap();
         let result = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap()
-            .block_on(crate::late_result_bus::display::announce(
+            .block_on(late_result_bus::display::announce(
                 Some(hooks),
                 "record:writerless".to_owned(),
                 vec![1],
@@ -70,15 +72,15 @@ mod tests {
     #[test]
     fn edge_registers_every_lower_layer_hook() {
         super::register();
-        assert!(crate::runtime_drain::configure::registered());
-        assert!(crate::runtime_drain::configure::database_runtime().is_some());
-        assert!(crate::runtime_drain::configure::command_hooks().is_some());
+        assert!(configure::registered());
+        assert!(configure::database_runtime().is_some());
+        assert!(configure::command_hooks().is_some());
         assert!(crate::cache_location::reader_floor_hooks_registered());
         assert!(crate::bash_background::frames::registered());
         assert!(crate::edit::file_reporter_registered());
         assert!(crate::db::call_ledger::held_result_projector_registered());
         assert!(crate::commands::bash_watch::restart::registered());
-        assert!(crate::late_result_bus::hooks().is_some());
+        assert!(late_result_bus::hooks().is_some());
     }
 
     #[test]

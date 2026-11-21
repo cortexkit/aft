@@ -1,8 +1,8 @@
 use crate::config::Config;
 use crate::context::{default_language_provider_factory, AppContext};
-use crate::runtime_drain::tests::watcher_context_with;
 use crate::runtime_drain::{drain_inspect_events, drain_watcher_events_bounded};
 use crate::watcher_filter::{RescanReason, WatcherDispatchEvent};
+use aft_engine::test_bridge::display_data::watcher_context_with;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -13,7 +13,12 @@ fn inspect_failure_drain_does_not_delay_unrelated_read() {
     let root = std::fs::canonicalize(temp.path()).unwrap();
     std::fs::write(root.join("hello.txt"), "hello from read\n").unwrap();
     let (ctx, _) = watcher_context_with(&root, crate::test_context);
-    let _writer = crate::inspect::cache::tests::foreign_writer(&root, &ctx.inspect_dir(), false);
+    let _writer = aft_engine::test_bridge::search_misc::foreign_writer(
+        &root,
+        &ctx.inspect_dir(),
+        false,
+        "commands::read::runtime_drain_tests::foreign_writer_process",
+    );
     let request = crate::protocol::RawRequest {
         id: "unrelated-read".into(),
         command: "read".into(),
@@ -23,7 +28,8 @@ fn inspect_failure_drain_does_not_delay_unrelated_read() {
     };
     assert!(crate::commands::read::handle_read(&request, &ctx).success);
     for _ in 0..3 {
-        ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
+        aft_engine::test_bridge::search_misc::record_tier2_attempt_outcome_for_test(
+            &ctx.inspect_manager(),
             InspectCategory::Duplicates,
             JobOutcome::Failed {
                 message: "failed to open inspect cache: writer_lease_timeout: inspect writer lease deadline elapsed".into(),
@@ -46,13 +52,19 @@ fn inspect_failure_drain_does_not_delay_unrelated_read() {
     }
 }
 
+#[test]
+fn foreign_writer_process() {
+    aft_engine::test_bridge::search_misc::foreign_writer_process();
+}
+
 /// Waits up to 60 s for `ctx`'s checkout in the data layer to publish
 /// both its text search index and its call graph, with no recorded edit
 /// pending. The text index is published first, and the call graph's
 /// publication is a new one that changes the view's text generation, so
 /// a test counting the reads of one text generation waits for both.
 fn wait_for_data_layer_settled(ctx: &AppContext) {
-    use crate::data_layer::surfaces::{report, READY};
+    use crate::data_layer::surfaces::report;
+    use aft_engine::test_bridge::display_data::surfaces::READY;
     let started = Instant::now();
     loop {
         let report = report(ctx).expect("the data layer is on");

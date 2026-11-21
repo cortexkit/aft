@@ -131,12 +131,12 @@ pub(super) fn extract(
     language: &str,
 ) -> Result<aft_store::content::ContentRecord, ManifestJoinError> {
     request(language)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if extraction_for_test(source) == Some(TestExtraction::Failure) {
         return Err(ManifestJoinError::UnsupportedLanguage(language.into()));
     }
     let record = super::content::extract(source, language);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let record = record.map(|mut record| {
         if extraction_for_test(source) == Some(TestExtraction::NoOutline) {
             if let aft_store::content::RecordBody::Parsed { body, .. } = &mut record.data {
@@ -148,15 +148,20 @@ pub(super) fn extract(
     record
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq)]
-pub(crate) enum TestExtraction {
-    Failure,
-    NoOutline,
-    MarkersOnly,
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod extraction_probe {
+    #[derive(Clone, Copy, PartialEq)]
+    pub enum TestExtraction {
+        Failure,
+        NoOutline,
+        MarkersOnly,
+    }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use extraction_probe::TestExtraction;
+
+#[cfg(any(test, feature = "test-support"))]
 fn extraction_overrides(
 ) -> &'static std::sync::Mutex<std::collections::HashMap<aft_store::ids::ContentKey, TestExtraction>>
 {
@@ -166,7 +171,7 @@ fn extraction_overrides(
     &OVERRIDES
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(super) fn extraction_for_test(source: &[u8]) -> Option<TestExtraction> {
     extraction_overrides()
         .lock()
@@ -176,7 +181,7 @@ pub(super) fn extraction_for_test(source: &[u8]) -> Option<TestExtraction> {
 }
 
 #[cfg(all(
-    test,
+    any(test, feature = "test-support"),
     feature = "wasm-grammars",
     feature = "test-hooks",
     not(all(target_os = "windows", target_arch = "aarch64"))

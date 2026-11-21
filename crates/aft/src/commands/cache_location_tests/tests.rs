@@ -1,5 +1,6 @@
-use crate::reader_floor::clean_old_for_test as clean_old;
-use crate::reader_floor::prepare_cache_root_for_test as prepare_cache_root;
+use aft_engine::test_bridge::display_data::reader_floor::{
+    clean_old_for_test as clean_old, prepare_cache_root_for_test as prepare_cache_root,
+};
 
 use crate::cache_location;
 use crate::cache_location::*;

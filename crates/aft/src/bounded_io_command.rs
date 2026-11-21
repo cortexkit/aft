@@ -86,8 +86,8 @@ pub(crate) fn command(
 fn test_helper_scope() -> Box<dyn std::any::Any> {
     Box::new((
         crate::commands::read::helper_state_scope(),
-        crate::hashline::snapshot::helper_state_scope(),
-        crate::search_index::helper_state_scope(),
+        aft_engine::test_bridge::search_misc::hashline_helper_state_scope(),
+        crate::executor::audit::helper_state_scope(),
     ))
 }
 

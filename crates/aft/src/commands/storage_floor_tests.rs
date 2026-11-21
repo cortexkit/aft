@@ -103,7 +103,7 @@ fn audit1432_mixed_floor_and_ceiling_grep_preserves_both_omissions() {
     let large = std::fs::canonicalize(&large).unwrap();
     assert!(
         skipped.iter().any(|entry| entry["file"] == json!(large)
-            && entry["reason"] == crate::large_read::WHOLE_READ_SKIP_REASON),
+            && entry["reason"] == crate::large_read_counts::WHOLE_READ_SKIP_REASON),
         "{response:?}"
     );
     assert_eq!(response.data["complete"], false);
@@ -111,7 +111,7 @@ fn audit1432_mixed_floor_and_ceiling_grep_preserves_both_omissions() {
     let text = response.data["text"].as_str().unwrap();
     assert!(text.contains("denied_floor"), "{text}");
     assert!(
-        text.contains(crate::large_read::WHOLE_READ_SKIP_REASON),
+        text.contains(crate::large_read_counts::WHOLE_READ_SKIP_REASON),
         "{text}"
     );
 }
