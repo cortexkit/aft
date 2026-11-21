@@ -741,7 +741,11 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
         assert!(response.data.get("view").is_none());
         assert!(response.data.get("record").is_none());
-        let (record, _) = file_bodies(&f.capture.lock().unwrap(), true);
+        handler_ready(Some(&f.key), &response);
+        reply(&f.key, false, false, None);
+        let writes = publications();
+        let record = &writes[0].body;
+        assert_eq!(record["outcome"], "success", "{tool}: {record}");
         assert_eq!(record["fileCount"], 1, "{tool}: {record}");
         assert_eq!(
             record[if tool == "write" {
@@ -752,6 +756,51 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
             1
         );
     }
+}
+
+#[test]
+fn native_partial_patch_publishes_only_the_applied_files() {
+    let f = fixture("apply_patch", "display-partial-patch");
+    let ctx = crate::subc::test_support::test_ctx();
+    ctx.update_config(|config| {
+        config.project_root = Some(f._dir.path().into());
+        config.storage_dir = Some(f._dir.path().join("storage"));
+        config.format_on_edit = false;
+    });
+    let first = f._dir.path().join("first.txt");
+    let second = f._dir.path().join("second.txt");
+    let third = f._dir.path().join("third.txt");
+    for path in [&first, &second, &third] {
+        std::fs::write(path, "old\n").unwrap();
+    }
+    let patch_text = format!(
+        "*** Begin Patch\n\
+         *** Update File: {}\n@@\n-old\n+new\n\
+         *** Update File: {}\n@@\n-missing\n+new\n\
+         *** Update File: {}\n@@\n-old\n+new\n\
+         *** End Patch",
+        first.display(),
+        second.display(),
+        third.display()
+    );
+    let request = serde_json::from_value(json!({
+        "id":"native","command":"apply_patch","patch_text":patch_text
+    }))
+    .unwrap();
+    let _active = enter(Some(&f.key));
+    let response = crate::commands::apply_patch::handle_apply_patch(&request, &ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["partial"], true);
+    assert_eq!(std::fs::read_to_string(first).unwrap(), "new\n");
+    assert_eq!(std::fs::read_to_string(second).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(third).unwrap(), "new\n");
+
+    handler_ready(Some(&f.key), &response);
+    reply(&f.key, false, false, None);
+    let writes = publications();
+    let record = &writes[0].body;
+    assert_eq!(record["outcome"], "partial");
+    assert_eq!(record["fileCount"], 2);
 }
 
 #[test]

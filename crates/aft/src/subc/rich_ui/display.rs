@@ -1320,6 +1320,14 @@ pub(crate) fn handler_ready(
             }
             if capture.tool != "bash" && capture.file_snapshot.is_none() {
                 let (mut record, detail) = file_bodies(&capture, response.success);
+                // When an edit skips files, it sets `complete: false` instead of `partial: true`.
+                if response.success
+                    && (response.data["partial"].as_bool() == Some(true)
+                        || (capture.tool == "edit"
+                            && response.data["complete"].as_bool() == Some(false)))
+                {
+                    record["outcome"] = json!("partial");
+                }
                 if capture.tool == "edit" && response.data["syntax_valid"].as_bool() == Some(false)
                 {
                     record["reason"] = json!("invalid_syntax");
