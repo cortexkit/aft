@@ -60,7 +60,7 @@ async fn agent_selected_bindings_without_a_row_refuse_with_a_specific_detail() {
     let ticket = call_ticket(&fixture).await;
     let speech =
         aft_engine::test_bridge::bash_remote::speech_for_ticket(ticket.value().unwrap()).unwrap();
-    let denial = speech.prepared.denial.as_ref().unwrap();
+    let denial = speech.prepared().denial().unwrap();
     assert_eq!(denial.code, Code::AuthorityUnavailable);
     assert_eq!(denial.reason, "binding_unverifiable");
     assert!(denial
@@ -86,11 +86,11 @@ async fn agent_selected_bindings_reject_even_a_signed_row_for_another_agent() {
     reply["bindings"].as_array_mut().unwrap().push(json!({
         "repository":other_repo, "agent_id":other_agent, "app_handle_id":"another-handle"
     }));
-    fixture.partners(|partners| partners.bindings = Arc::new(move |_, _| Ok(reply.clone())));
+    fixture.partners(|partners| *partners.bindings_mut() = Arc::new(move |_, _| Ok(reply.clone())));
     let ticket = call_ticket(&fixture).await;
     let speech =
         aft_engine::test_bridge::bash_remote::speech_for_ticket(ticket.value().unwrap()).unwrap();
-    let denial = speech.prepared.denial.as_ref().unwrap();
+    let denial = speech.prepared().denial().unwrap();
     assert_eq!(denial.code, Code::IdentityConflict);
     assert_eq!(denial.reason, "binding_changed");
     let detail = denial.detail.as_deref().unwrap();
@@ -113,19 +113,19 @@ async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
         fixture.params["ticket"].as_str().unwrap(),
     )
     .unwrap();
-    let context = warm.prepared.context.clone();
+    let context = warm.prepared().context().clone();
     assert_eq!(
-        context.prepare().denial.unwrap().detail.as_deref(),
+        context.test_prepare().denial().unwrap().detail.as_deref(),
         Some("inside_tokio_runtime")
     );
     let dir = tempfile::tempdir().unwrap();
     crate::db::open(&dir.path().join("aft.db")).unwrap();
-    let context = crate::gh_shim_speech::service::LaunchContext {
-        seed: context.seed,
-        service: aft_engine::test_bridge::bash_remote::record_service(dir.path()),
-    };
+    let context = aft_engine::test_bridge::bash_remote::LaunchContext::for_test(
+        context.seed().clone(),
+        aft_engine::test_bridge::bash_remote::record_service(dir.path()),
+    );
     assert_eq!(
-        context.prepare().denial.unwrap().detail.as_deref(),
+        context.test_prepare().denial().unwrap().detail.as_deref(),
         Some("no_runtime")
     );
 }
@@ -135,8 +135,14 @@ async fn call_ticket(fixture: &Fixture) -> crate::gh_shim_ticket::ScopedTicket {
         fixture.params["ticket"].as_str().unwrap(),
     )
     .unwrap();
-    let seed = speech.prepared.context.seed.clone();
-    let root = fixture.service.store.path().parent().unwrap().to_path_buf();
+    let seed = speech.prepared().context().seed().clone();
+    let root = fixture
+        .service
+        .store
+        .test_path()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let session = fixture.session.clone();
     let project = seed.project_root.clone();
     // Ticket capture obtains authenticated bindings on a plain executor thread,
@@ -188,8 +194,8 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
         let guarded = Arc::new(Mutex::new(Vec::new()));
         let seen = guarded.clone();
         fixture.partners(|partners| {
-            let reserve = partners.reserve.clone();
-            partners.reserve = Arc::new(move |project, session, scope, body| {
+            let reserve = partners.reserve().clone();
+            *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
                 seen.lock().unwrap().push(body["arguments"].clone());
                 reserve(project, session, scope, body)
             });
@@ -237,8 +243,8 @@ async fn foreground_launch_uses_its_live_origin_despite_other_session_routes() {
         params["ticket"] = json!(ticket.value().unwrap());
         let captured = fixture.launch.authority.clone();
         fixture.partners(|partners| {
-            let reserve = partners.reserve.clone();
-            partners.reserve = Arc::new(move |project, session, scope, body| {
+            let reserve = partners.reserve().clone();
+            *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
                 assert_eq!(scope, &captured, "dispatch must use the captured authority");
                 reserve(project, session, scope, body)
             });
@@ -488,8 +494,8 @@ async fn production_relay_requires_the_captured_binding_after_policy_mapping() {
     let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let seen = reads.clone();
     fixture.partners(|partners| {
-        let binding_read = partners.bindings.clone();
-        partners.bindings = Arc::new(move |project, session| {
+        let binding_read = partners.bindings().clone();
+        *partners.bindings_mut() = Arc::new(move |project, session| {
             seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             binding_read(project, session)
         });
@@ -531,7 +537,7 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
     let storage_alias = fixture._dir.path().join("storage-alias");
     std::os::unix::fs::symlink(&canonical_project, &project_alias).unwrap();
     std::os::unix::fs::symlink(
-        fixture.service.store.path().parent().unwrap(),
+        fixture.service.store.test_path().parent().unwrap(),
         &storage_alias,
     )
     .unwrap();
@@ -541,7 +547,7 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
         fixture.params["ticket"].as_str().unwrap(),
     )
     .unwrap();
-    let template = speech.prepared.context.seed.clone();
+    let template = speech.prepared().context().seed().clone();
     for (seed_project, ticket_project) in [
         (
             canonical_project.display().to_string(),
@@ -581,9 +587,12 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
         for raw in [pending.value().unwrap(), call.value().unwrap()] {
             let attached = aft_engine::test_bridge::bash_remote::speech_for_ticket(raw)
                 .expect("equivalent existing path aliases must retain launch context");
-            assert!(attached.failure.lock().unwrap().is_none());
-            assert!(attached.prepared.policy.is_some());
-            assert_eq!(attached.prepared.context.seed.project_root, seed_project);
+            assert!(attached.failure().unwrap().is_none());
+            assert!(attached.prepared().policy().is_some());
+            assert_eq!(
+                attached.prepared().context().seed().project_root,
+                seed_project
+            );
             assert_eq!(
                 crate::gh_shim_ticket::redeem(raw).unwrap().project_root,
                 ticket_project
@@ -595,7 +604,7 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
             fixture
                 .service
                 .store
-                .get(&attached.incarnation)
+                .get(&attached.incarnation())
                 .unwrap()
                 .record
                 .project_root,

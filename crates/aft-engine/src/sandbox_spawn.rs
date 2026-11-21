@@ -3948,7 +3948,7 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
         }
     }
     let command = crate::effective_path::new_command("git");
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let mut command = command;
     #[cfg(test)]
     if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
@@ -4099,7 +4099,7 @@ fn resolve_git_policy_uncached(
     #[cfg(any(test, feature = "test-support"))]
     let test_gate =
         with_git_policy_test_state(project_root, |state| state.uncached_gate.take()).flatten();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(gate) = test_gate {
         let _ = gate.entered.send(());
         if gate.release.recv().unwrap() {

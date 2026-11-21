@@ -6152,8 +6152,3 @@ pub(crate) mod seams;
 #[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
-#[cfg(all(unix, any(test, feature = "test-support")))]
-pub(crate) use fixture::{
-    captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
-    uncaptured_unknown_before_render_for_test,
-};

@@ -15610,7 +15610,7 @@ impl BgTaskRegistry {
 
     /// Test access to a task's shared state, so a test can hold its state
     /// mutex the way the watchdog does while it persists the task.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn task_for_test(&self, task_id: &str) -> Option<Arc<BgTask>> {
         self.task(task_id)
     }

@@ -6,7 +6,13 @@ async fn crash_after_bound_commit_child() {
         return;
     }
     let fixture = Fixture::new(false).await;
-    let root = fixture.service.store.path().parent().unwrap().to_path_buf();
+    let root = fixture
+        .service
+        .store
+        .test_path()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     fixture.plex.state.lock().unwrap().post_log = Some(root.join("provider-posted"));
     let mut params = fixture.params.clone();
     params["request_nonce"] = json!("crash-committed");

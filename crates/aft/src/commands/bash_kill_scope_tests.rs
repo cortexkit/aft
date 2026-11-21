@@ -441,7 +441,8 @@ fn bash_kill_scope_stops_saved_task_before_its_project_binds() {
 
 #[test]
 fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
-    use crate::gh_shim_speech::model::{AuthorityRecord, ExecutionSeal, LaunchAuthority};
+    use crate::gh_shim_speech::model::LaunchAuthority;
+    use aft_engine::test_bridge::bash_remote::{AuthorityRecord, ExecutionSeal};
     let storage = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     let harness_dir = storage.path().join("opencode");
@@ -478,19 +479,15 @@ fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
     let pid = read_pid(&pid_file);
     let store = crate::gh_shim_speech::store::Store::new(&db_path);
     store
-        .capture(&AuthorityRecord {
-            incarnation: "recovered-main-store".into(),
-            minting_run: "old-forwarder".into(),
-            harness: "opencode".into(),
-            session_id: "session".into(),
-            task_id: task.clone(),
-            project_root: project.path().display().to_string(),
-            launch: LaunchAuthority::classic(stamp.clone(), None).unwrap(),
-            policy: None,
-            bindings: std::collections::BTreeMap::new(),
-            seal: None,
-            ineligible_reason: None,
-        })
+        .test_capture(&AuthorityRecord::unsealed_for_test(
+            "recovered-main-store".into(),
+            "old-forwarder".into(),
+            "opencode".into(),
+            "session".into(),
+            task.clone(),
+            project.path().display().to_string(),
+            LaunchAuthority::classic(stamp.clone(), None).unwrap(),
+        ))
         .unwrap();
     previous.detach();
     assert!(!harness_dir.join("aft.db").exists());
@@ -506,20 +503,19 @@ fn recovered_harness_scope_cancel_records_revoked_in_the_module_database() {
     let restarted = crate::gh_shim_speech::store::Store::new(&db_path);
     assert_eq!(
         restarted
-            .seal(
+            .test_seal(
                 "recovered-main-store",
-                &ExecutionSeal {
-                    child_pid: 123,
-                    child_start_time_ms: 456,
-                    birth_identity: "birth".into()
-                }
+                &ExecutionSeal::for_test(123, 456, "birth".into()),
             )
             .unwrap_err()
             .reason,
         "revoked"
     );
     assert_eq!(
-        restarted.get("recovered-main-store").unwrap_err().reason,
+        restarted
+            .test_get("recovered-main-store")
+            .unwrap_err()
+            .reason,
         "revoked"
     );
     assert!(

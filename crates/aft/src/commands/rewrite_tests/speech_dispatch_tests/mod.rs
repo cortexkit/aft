@@ -1,12 +1,13 @@
 use crate::db::access_grants::ScopeKey;
-use crate::gh_shim::tests::speech_dispatch_support::SpeechManifest;
 use crate::gh_shim_relay::{
     RelayCall, RelayReply, RelayTransport, RouteScopes, TransportError, BOT_REQUEST_OPERATION,
 };
-use crate::gh_shim_speech::model::Binding;
-use crate::gh_shim_speech::partner::{QueuedBotResponse, ReservedBotRequest};
-use crate::gh_shim_speech::service::{LaunchSeed, Service, TestPartners};
+use crate::gh_shim_speech::service::{LaunchSeed, Service};
 use crate::gh_shim_speech::{Code, Refusal};
+use aft_engine::test_bridge::bash_remote::Binding;
+use aft_engine::test_bridge::bash_remote::SpeechManifest;
+use aft_engine::test_bridge::bash_remote::TestPartners;
+use aft_engine::test_bridge::bash_remote::{QueuedBotResponse, ReservedBotRequest};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
@@ -187,18 +188,18 @@ impl FakePlex {
             let Ok(expect) = serde_json::from_value::<Binding>(args["expect"].clone()) else {
                 return refused("invalid_request", "route");
             };
-            if expect.app_handle_id != state.handle {
+            if expect.app_handle_id() != state.handle {
                 let mut reply = refused("stale_authority", "route");
                 reply["dimension"] = json!("expected_handle");
                 return reply;
             }
-            if expect.repo_binding_generation != state.generation {
+            if expect.repo_binding_generation() != state.generation {
                 let mut reply = refused("stale_authority", "route");
                 reply["dimension"] = json!("expected_binding");
                 return reply;
             }
             if let Some(run) = args.get("run_scope") {
-                if serde_json::from_value::<crate::gh_shim_speech::partner::RunSelector>(
+                if serde_json::from_value::<aft_engine::test_bridge::bash_remote::RunSelector>(
                     run.clone(),
                 )
                 .is_err()
@@ -260,11 +261,13 @@ impl FakePlex {
             .map_err(|_| Refusal::new(Code::AuthorityUnavailable, "dispatch_queue_full"))?;
         let plex = self.clone();
         let scope = scope.clone();
-        Ok(ReservedBotRequest::for_test(move || {
-            let reply = plex.send(&scope, body["arguments"].clone(), true);
-            drop(slot);
-            Ok(QueuedBotResponse::for_test(reply))
-        }))
+        Ok(
+            aft_engine::test_bridge::bash_remote::reserved_bot_request_for_test(move || {
+                let reply = plex.send(&scope, body["arguments"].clone(), true);
+                drop(slot);
+                Ok(aft_engine::test_bridge::bash_remote::queued_bot_response_for_test(reply))
+            }),
+        )
     }
 }
 
@@ -496,12 +499,12 @@ impl Fixture {
         let reserve = plex.clone();
         let binding_outages = Mutex::new(options.initial_binding_outages);
         if !options.sdk_daemon {
-            service.install_test_partners(Arc::new(TestPartners {
-                seal_failure: options.seal_failure.clone(),
-                expect_placed: Some("fake-atomic-expect"),
-                run_placed: Some("fake-atomic-run"),
-                reserved_send_placed: true,
-                bindings: Arc::new(move |_, _| {
+            service.test_install_partners(Arc::new(TestPartners::for_test(
+                options.seal_failure.clone(),
+                Some("fake-atomic-expect"),
+                Some("fake-atomic-run"),
+                true,
+                Arc::new(move |_, _| {
                     let mut left = binding_outages.lock().unwrap();
                     if *left > 0 {
                         *left -= 1;
@@ -516,9 +519,9 @@ impl Fixture {
                         Ok(read.bindings())
                     }
                 }),
-                reserve: Arc::new(move |_, _, scope, body| reserve.reserve(scope, body)),
-                before_final_gate: None,
-            }));
+                Arc::new(move |_, _, scope, body| reserve.reserve(scope, body)),
+                None,
+            )));
         }
         let mut config = crate::config::Config::default();
         config.project_root = Some(project.clone());
@@ -537,7 +540,7 @@ impl Fixture {
                 .install_pty_seal_pause_for_test(arrived, release);
         }
         if options.fail_revocation {
-            service.store.connect().unwrap().execute_batch("CREATE TRIGGER reject_pty_revocation BEFORE INSERT ON gh_speech_task_revocations BEGIN SELECT RAISE(ABORT,'simulated revocation failure'); END;").unwrap();
+            service.store.test_connect().unwrap().execute_batch("CREATE TRIGGER reject_pty_revocation BEFORE INSERT ON gh_speech_task_revocations BEGIN SELECT RAISE(ABORT,'simulated revocation failure'); END;").unwrap();
         }
         let origin = crate::gh_shim_speech::model::RouteOrigin {
             run_nonce: crate::gh_shim_speech::service::run_nonce().unwrap().into(),
@@ -658,7 +661,7 @@ impl Fixture {
         let (task, startup_error) = match started {
             Ok(task) => (task, None),
             Err(error) => {
-                let conn = service.store.connect().unwrap();
+                let conn = service.store.test_connect().unwrap();
                 let task: String = conn
                     .query_row(
                         "SELECT task_id FROM gh_speech_authorities WHERE incarnation=?1",
@@ -672,9 +675,9 @@ impl Fixture {
         if startup_error.is_none() && options.seal_failure.is_none() && !options.foreground {
             let warm = aft_engine::test_bridge::bash_remote::speech_for_ticket(&ticket).unwrap();
             assert!(
-                warm.active.load(std::sync::atomic::Ordering::SeqCst),
+                warm.is_active(),
                 "fixture must acquire genuine durable authority: {:?}",
-                warm.failure.lock().unwrap()
+                warm.failure().unwrap()
             );
         }
         let args: Vec<OsString> = [
@@ -758,9 +761,9 @@ impl Drop for Fixture {
 
 impl Fixture {
     fn partners(&self, change: impl FnOnce(&mut TestPartners)) {
-        let mut partners = (*self.service.test_partners().unwrap()).clone();
+        let mut partners = (*self.service.test_partners_for_fixture().unwrap()).clone();
         change(&mut partners);
-        self.service.install_test_partners(Arc::new(partners));
+        self.service.test_install_partners(Arc::new(partners));
     }
 }
 
@@ -768,34 +771,36 @@ impl Fixture {
 async fn captured_dispatch_reaches_the_real_gate_with_a_precommitted_pinned_nonce() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    assert!(crate::gh_shim_speech::partner::require_reserved_send().is_ok());
-    let path = fixture.service.store.path().to_path_buf();
+    assert!(aft_engine::test_bridge::bash_remote::require_reserved_send().is_ok());
+    let path = fixture.service.store.test_path().to_path_buf();
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             let nonce = body["arguments"]["request_nonce"]
                 .as_str()
                 .unwrap()
                 .to_string();
             let slot = reserve(project, session, scope, body)?;
             let path = path.clone();
-            Ok(ReservedBotRequest::for_test(move || {
-                let conn = crate::gh_shim_speech::store::Store::new(path)
-                    .connect()
-                    .unwrap();
-                let expect: String = conn
-                    .query_row(
-                        "SELECT expect_json FROM gh_speech_requests WHERE request_nonce=?1",
-                        [&nonce],
-                        |row| row.get(0),
-                    )
-                    .unwrap();
-                assert_eq!(
-                    serde_json::from_str::<Value>(&expect).unwrap(),
-                    json!({"app_handle_id":"app-original","repo_binding_generation":4})
-                );
-                slot.send()
-            }))
+            Ok(
+                aft_engine::test_bridge::bash_remote::reserved_bot_request_for_test(move || {
+                    let conn = crate::gh_shim_speech::store::Store::new(path)
+                        .connect()
+                        .unwrap();
+                    let expect: String = conn
+                        .query_row(
+                            "SELECT expect_json FROM gh_speech_requests WHERE request_nonce=?1",
+                            [&nonce],
+                            |row| row.get(0),
+                        )
+                        .unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<Value>(&expect).unwrap(),
+                        json!({"app_handle_id":"app-original","repo_binding_generation":4})
+                    );
+                    slot.test_send()
+                }),
+            )
         });
     });
     let answer = fixture.post(false, "captured-live").await;
@@ -811,10 +816,10 @@ async fn captured_dispatch_rechecks_cache_age_after_reserving_the_send_slot() {
     let fixture = Fixture::new(false).await;
     let service = Arc::downgrade(&fixture.service);
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             let slot = reserve(project, session, scope, body)?;
-            service.upgrade().unwrap().expire_test_scope_cache();
+            service.upgrade().unwrap().test_expire_scope_cache();
             Ok(slot)
         });
     });
@@ -837,8 +842,8 @@ async fn captured_dispatch_pins_handle_and_expect_generation_without_nonce_rebin
     fixture.plex.state.lock().unwrap().handle = "app-original".into();
     let plex = fixture.plex.clone();
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             let slot = reserve(project, session, scope, body)?;
             plex.state.lock().unwrap().generation += 1;
             Ok(slot)
@@ -975,11 +980,17 @@ fn cancel_from_sibling(root: &Path, scope: &ScopeStamp) -> Value {
 async fn bound_background_cancel_committed_before_sdk_send_is_refused() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let root = fixture.service.store.path().parent().unwrap().to_path_buf();
+    let root = fixture
+        .service
+        .store
+        .test_path()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let scope = fixture.head.clone();
     let incarnation = fixture.incarnation.clone();
     fixture.partners(|partners| {
-        partners.before_final_gate = Some(Arc::new(move || {
+        *partners.before_final_gate_mut() = Some(Arc::new(move || {
             let receipt = cancel_from_sibling(&root, &scope);
             assert_eq!(receipt["success"], true);
             assert_eq!(
@@ -1013,24 +1024,34 @@ async fn bound_background_cancel_committed_before_sdk_send_is_refused() {
 async fn bound_sdk_send_precedes_cancel_without_a_legacy_mailbox() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let root = fixture.service.store.path().parent().unwrap().to_path_buf();
+    let root = fixture
+        .service
+        .store
+        .test_path()
+        .parent()
+        .unwrap()
+        .to_path_buf();
     let scope = fixture.head.clone();
     let receipt = Arc::new(Mutex::new(None));
     let captured = receipt.clone();
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, head, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, head, body| {
             let slot = reserve(project, session, head, body)?;
             let root = root.clone();
             let scope = scope.clone();
             let captured = captured.clone();
-            Ok(ReservedBotRequest::new(move || {
-                let queued = slot.send()?;
-                Ok(QueuedBotResponse::new(async move {
-                    *captured.lock().unwrap() = Some(cancel_from_sibling(&root, &scope));
-                    queued.response().await
-                }))
-            }))
+            Ok(aft_engine::test_bridge::bash_remote::reserved_bot_request(
+                move || {
+                    let queued = slot.test_send()?;
+                    Ok(aft_engine::test_bridge::bash_remote::queued_bot_response(
+                        async move {
+                            *captured.lock().unwrap() = Some(cancel_from_sibling(&root, &scope));
+                            queued.test_response().await
+                        },
+                    ))
+                },
+            ))
         });
     });
     let answer = fixture.post(true, "cancel-after").await;
@@ -1052,7 +1073,7 @@ async fn bound_sdk_reservation_queue_full_does_not_prepare_or_send() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     fixture.partners(|partners| {
-        partners.reserve = Arc::new(|_, _, _, _| {
+        *partners.reserve_mut() = Arc::new(|_, _, _, _| {
             Err(Refusal::new(
                 Code::AuthorityUnavailable,
                 "dispatch_queue_full",
@@ -1063,7 +1084,7 @@ async fn bound_sdk_reservation_queue_full_does_not_prepare_or_send() {
     assert_eq!(answer.data["refusal_code"], "task_gh_authority_unavailable");
     assert_eq!(answer.data["reason"], "dispatch_queue_full");
     assert_eq!(answer.data["message"], "bot writes from background commands are briefly unavailable (dispatch_queue_full); retry in a few seconds.");
-    let conn = fixture.service.store.connect().unwrap();
+    let conn = fixture.service.store.test_connect().unwrap();
     let prepared: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM gh_speech_requests WHERE request_nonce='full-bound'",
@@ -1080,7 +1101,7 @@ async fn historical_legacy_dispatch_cannot_be_resent_by_the_relay() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     seed_historical_dispatch(&fixture, "lost-consumer");
-    let recovered = crate::gh_shim_speech::store::Store::new(fixture.service.store.path());
+    let recovered = crate::gh_shim_speech::store::Store::new(fixture.service.store.test_path());
     assert_eq!(
         recovered
             .pending_legacy_for_identity(&fixture.session, &fixture.task)
@@ -1102,7 +1123,7 @@ fn seed_historical_dispatch(fixture: &Fixture, nonce: &str) {
         &serde_json::to_vec(&fixture.params["request"]).unwrap(),
     );
     store
-        .prepare_request(nonce, &fixture.incarnation, &payload, "legacy-bound")
+        .test_prepare_request(nonce, &fixture.incarnation, &payload, "legacy-bound")
         .unwrap();
     store
         .final_legacy_gate(
@@ -1124,8 +1145,8 @@ async fn qualified_provider_end_is_fenced_without_a_followup_describe() {
     let plex = fixture.plex.clone();
     let key = ScopeKey::from_stamp(&fixture.head);
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             let slot = reserve(project, session, scope, body)?;
             let mut state = plex.state.lock().unwrap();
             state.scopes.remove(&key);
@@ -1155,8 +1176,8 @@ async fn qualified_program_end_fences_the_program_not_its_live_head() {
     let run = fixture.run.as_ref().unwrap().clone();
     let key = ScopeKey::from_stamp(&run);
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             let slot = reserve(project, session, scope, body)?;
             let mut state = plex.state.lock().unwrap();
             state.scopes.remove(&key);
@@ -1193,7 +1214,7 @@ async fn typed_reservation_route_end_fences_captured_background_without_describe
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     fixture.partners(|partners| {
-        partners.reserve = Arc::new(|_, _, _, _| {
+        *partners.reserve_mut() = Arc::new(|_, _, _, _| {
             Err(Refusal::scoped(
                 Code::ScopeEnded,
                 "ended",
@@ -1226,7 +1247,7 @@ async fn captured_dispatch_survives_unscoped_head_reconnect_via_sdk_without_test
         fixture.startup_error
     );
     assert!(
-        fixture.service.test_partners().is_none(),
+        fixture.service.test_partners_for_fixture().is_none(),
         "the real service/reserve delegation must be exercised"
     );
     let mut routes = RouteScopes::default();
@@ -1307,9 +1328,9 @@ async fn captured_dispatch_retries_unreachable_bindings_once_but_not_missing_row
             error
         };
         fixture.partners(|partners| {
-            let read = partners.bindings.clone();
+            let read = partners.bindings().clone();
             let error = expected.clone();
-            partners.bindings = Arc::new(move |project, session| {
+            *partners.bindings_mut() = Arc::new(move |project, session| {
                 let attempt = attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if recover && attempt == 1 {
                     read(project, session)
@@ -1336,7 +1357,7 @@ async fn captured_dispatch_retries_unreachable_bindings_once_but_not_missing_row
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts = calls.clone();
     fixture.partners(|partners| {
-        partners.bindings = Arc::new(move |_, _| {
+        *partners.bindings_mut() = Arc::new(move |_, _| {
             attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(json!({"result":{"repo_binding_generation":4,"bindings":[]}}))
         });
@@ -1359,8 +1380,8 @@ async fn captured_dispatch_retries_unreachable_reservation_before_sending_once()
     let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let attempts = calls.clone();
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 let mut error = Refusal::new(Code::AuthorityUnavailable, "module_warming");
                 error.retry_before_send = true;
@@ -1383,17 +1404,21 @@ async fn captured_dispatch_scope_end_interrupts_a_long_post_send_wait() {
     let sent = Arc::new(tokio::sync::Notify::new());
     let waiting = sent.clone();
     fixture.partners(|partners| {
-        let reserve = partners.reserve.clone();
-        partners.reserve = Arc::new(move |project, session, scope, body| {
+        let reserve = partners.reserve().clone();
+        *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             let slot = reserve(project, session, scope, body)?;
             let sent = sent.clone();
-            Ok(ReservedBotRequest::for_test(move || {
-                let _queued = slot.send()?;
-                Ok(QueuedBotResponse::new(async move {
-                    sent.notify_one();
-                    std::future::pending().await
-                }))
-            }))
+            Ok(
+                aft_engine::test_bridge::bash_remote::reserved_bot_request_for_test(move || {
+                    let _queued = slot.test_send()?;
+                    Ok(aft_engine::test_bridge::bash_remote::queued_bot_response(
+                        async move {
+                            sent.notify_one();
+                            std::future::pending().await
+                        },
+                    ))
+                }),
+            )
         });
     });
     let end = async {
@@ -1405,7 +1430,7 @@ async fn captured_dispatch_scope_end_interrupts_a_long_post_send_wait() {
         );
         fixture
             .service
-            .record_rpc_end(
+            .test_record_rpc_end(
                 &fixture.head,
                 crate::gh_shim_speech::ScopeRole::Authority,
                 &selector,
