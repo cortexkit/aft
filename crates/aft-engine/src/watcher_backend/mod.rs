@@ -148,7 +148,8 @@ pub(crate) const BACKEND_EXCLUSION_COVERAGE: crate::watcher_filter::WatcherExclu
     };
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-pub(crate) struct ProjectWatcher {
+#[doc(hidden)]
+pub struct ProjectWatcher {
     _watcher: notify::RecommendedWatcher,
 }
 

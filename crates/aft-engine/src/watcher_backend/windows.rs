@@ -98,7 +98,8 @@ impl Drop for CompletionPort {
     }
 }
 
-pub(crate) struct ProjectWatcher {
+#[doc(hidden)]
+pub struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     completion_port: Arc<CompletionPort>,
     join: Option<JoinHandle<()>>,
