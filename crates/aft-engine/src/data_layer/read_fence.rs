@@ -183,7 +183,8 @@ mod ignore_probe_tests {
 }
 
 /// Carry omission reporting through the same helper-thread scope as read policy.
-pub(crate) fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response {
+#[doc(hidden)]
+pub fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response {
     let omissions = Arc::new(parking_lot::Mutex::new(FloorOmissions::default()));
     let mut fence = capture();
     fence.floor_omissions = Some(omissions.clone());
@@ -210,7 +211,8 @@ pub(crate) fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response 
     response
 }
 
-pub(crate) fn set_floor_filter(root: &Path, filter: &crate::search_index::PathFilters) {
+#[doc(hidden)]
+pub fn set_floor_filter(root: &Path, filter: &crate::search_index::PathFilters) {
     FENCE.with(|fence| {
         if let Some(omissions) = &fence.borrow().floor_omissions {
             omissions.lock().filter = Some((root.to_path_buf(), filter.clone()));
@@ -264,7 +266,8 @@ pub fn active() -> bool {
     FENCE.with(|fence| fence.borrow().active())
 }
 
-pub(crate) fn remote_mutation() -> bool {
+#[doc(hidden)]
+pub fn remote_mutation() -> bool {
     FENCE.with(|fence| fence.borrow().remote_mutation)
 }
 
@@ -277,7 +280,8 @@ pub(crate) fn admits_path_metadata(identity: &Path) -> bool {
     }
 }
 
-pub(crate) fn with_remote_mutation<T>(mutation: bool, run: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_remote_mutation<T>(mutation: bool, run: impl FnOnce() -> T) -> T {
     if mutation {
         let mut fence = capture();
         fence.remote_mutation = true;
@@ -291,7 +295,8 @@ pub(crate) fn for_request(id: &str) -> bool {
     FENCE.with(|fence| fence.borrow().requests.iter().any(|request| request == id))
 }
 
-pub(crate) fn capture() -> Fence {
+#[doc(hidden)]
+pub fn capture() -> Fence {
     FENCE.with(|fence| fence.borrow().clone())
 }
 
@@ -358,7 +363,8 @@ pub(crate) fn denied_count() -> usize {
 /// Say in a walk's reply how many paths the read policy kept out of it, so a
 /// skipped file is never silent: `skipped_denied` carries the count and the
 /// text gains a note. Only the count is reported; a denied path's name is not.
-pub(crate) fn disclose_denied(body: &mut Value) {
+#[doc(hidden)]
+pub fn disclose_denied(body: &mut Value) {
     let count = denied_count();
     if count == 0 {
         return;
@@ -393,7 +399,8 @@ pub(crate) fn disclose_denied(body: &mut Value) {
 /// from starting outside the fence when a caller skipped that check.
 /// Unconfined walks always may start. A refused root is not counted among the
 /// call's skipped entries, because the call is refused rather than trimmed.
-pub(crate) fn admits_walk_root(root: &Path) -> bool {
+#[doc(hidden)]
+pub fn admits_walk_root(root: &Path) -> bool {
     FENCE.with(|fence| {
         let fence = fence.borrow();
         // A confined thread without its read policy fails closed.
@@ -403,7 +410,8 @@ pub(crate) fn admits_walk_root(root: &Path) -> bool {
 
 /// [`admits_walk_root`] as a request result: a refused root gets the same
 /// refusal the confined path check gives.
-pub(crate) fn check_walk_root(id: &str, root: &Path) -> Result<(), Response> {
+#[doc(hidden)]
+pub fn check_walk_root(id: &str, root: &Path) -> Result<(), Response> {
     if admits_walk_root(root) {
         Ok(())
     } else {
@@ -411,7 +419,8 @@ pub(crate) fn check_walk_root(id: &str, root: &Path) -> Result<(), Response> {
     }
 }
 
-pub(crate) fn refusal(id: &str, input: &Path) -> Response {
+#[doc(hidden)]
+pub fn refusal(id: &str, input: &Path) -> Response {
     Response::error(
         id,
         "path_outside_confined_root",
@@ -438,7 +447,8 @@ pub(crate) fn with_root<R>(
 
 /// Validate original spellings before translation can join them onto a root or
 /// reinterpret an absent file as a repository selector or remote resource.
-pub(crate) fn preflight(
+#[doc(hidden)]
+pub fn preflight(
     ctx: &dyn ReadPolicy,
     id: &str,
     session: &str,
@@ -486,7 +496,8 @@ pub(crate) fn preflight(
 /// precedence first. As in the `ignore` crate, the first family with a
 /// matching rule decides, and within a family the deepest directory's rule
 /// wins; `.gitignore` rules stop at the nearest directory holding `.git`.
-pub(crate) struct ConfinedIgnoreRules {
+#[doc(hidden)]
+pub struct ConfinedIgnoreRules {
     fence: Fence,
     names: &'static [&'static str],
     directories: parking_lot::Mutex<HashMap<PathBuf, Arc<DirectoryRules>>>,
@@ -499,11 +510,14 @@ struct DirectoryRules {
 }
 
 /// The ignore families a confined grep or glob walk honors.
-pub(crate) const SEARCH_IGNORE_FILES: &[&str] = &[".aftignore", ".ignore", ".gitignore"];
+#[doc(hidden)]
+pub const SEARCH_IGNORE_FILES: &[&str] = &[".aftignore", ".ignore", ".gitignore"];
 /// The ignore families a confined outline directory walk honors.
-pub(crate) const OUTLINE_IGNORE_FILES: &[&str] = &[".ignore", ".gitignore"];
+#[doc(hidden)]
+pub const OUTLINE_IGNORE_FILES: &[&str] = &[".ignore", ".gitignore"];
 /// The ignore family a confined outline files-mode walk honors.
-pub(crate) const OUTLINE_FILES_IGNORE_FILES: &[&str] = &[".gitignore"];
+#[doc(hidden)]
+pub const OUTLINE_FILES_IGNORE_FILES: &[&str] = &[".gitignore"];
 
 /// Largest ignore file a confined walk reads; a larger one is not applied.
 const MAX_IGNORE_FILE_BYTES: u64 = 1024 * 1024;
