@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser};
@@ -93,7 +94,9 @@ fn is_test_item(attrs: &[Node<'_>], node: Node<'_>, source: &str) -> bool {
             && attribute(*it).is_some_and(|attr| {
                 test_cfg(attr, source)
                     || (node.kind() == "function_item"
-                        && matches!(text(attr, source), "test" | "tokio::test"))
+                        && attr.named_child(0).is_some_and(|name| {
+                            matches!(text(name, source), "test" | "tokio::test")
+                        }))
             })
     })
 }
@@ -102,7 +105,13 @@ fn forbidden(path: &[&str]) -> bool {
     fn segment(part: &str) -> &str {
         part.strip_prefix("r#").unwrap_or(part)
     }
-    path.windows(2).any(|pair| {
+    path.windows(3).any(|parts| {
+        parts
+            .iter()
+            .copied()
+            .map(segment)
+            .eq(["bash_rewrite", "dispatch", "register"])
+    }) || path.windows(2).any(|pair| {
         let (owner, name) = (segment(pair[0]), segment(pair[1]));
         (owner == "trace_measure" && name == "run")
             || (matches!(owner, "crate" | "super" | "aft" | "agent_file_tools")
@@ -112,7 +121,7 @@ fn forbidden(path: &[&str]) -> bool {
 
 fn token_paths(node: Node<'_>, source: &str) -> bool {
     let mut cursor = node.walk();
-    let mut segment = None;
+    let mut path = Vec::new();
     let mut separator = false;
     for token in node.children(&mut cursor) {
         if matches!(token.kind(), "line_comment" | "block_comment") {
@@ -120,15 +129,18 @@ fn token_paths(node: Node<'_>, source: &str) -> bool {
         }
         let word = text(token, source);
         if matches!(token.kind(), "identifier" | "crate" | "super" | "self") {
-            if separator && segment.is_some_and(|owner| forbidden(&[owner, word])) {
+            if !separator {
+                path.clear();
+            }
+            path.push(word);
+            if forbidden(&path) {
                 return true;
             }
-            segment = Some(word);
             separator = false;
         } else if word == "::" {
             separator = true;
         } else {
-            segment = None;
+            path.clear();
             separator = false;
         }
     }
@@ -167,12 +179,15 @@ fn ignored_file(path: &Path) -> bool {
     name == "tests.rs" || name.ends_with("_tests.rs") || path.iter().any(|part| part == "tests")
 }
 
-fn included_rust(node: Node<'_>, source: &str) -> Option<String> {
-    if node.kind() != "macro_invocation"
-        || text(node.child_by_field_name("macro")?, source) != "include"
-    {
+fn included_rust(node: Node<'_>, source: &str) -> Option<(String, bool)> {
+    if node.kind() != "macro_invocation" {
         return None;
     }
+    let expands = match text(node.child_by_field_name("macro")?, source) {
+        "include" => true,
+        "include_str" | "include_bytes" => false,
+        _ => return None,
+    };
     let args = children(node)
         .into_iter()
         .find(|child| child.kind() == "token_tree")?;
@@ -183,6 +198,7 @@ fn included_rust(node: Node<'_>, source: &str) -> Option<String> {
     serde_json::from_str::<String>(text(arg, source))
         .ok()
         .filter(|path| path.ends_with(".rs"))
+        .map(|path| (path, expands))
 }
 
 fn context_aliases<'a>(node: Node<'_>, source: &'a str, aliases: &mut Vec<&'a str>) {
@@ -241,7 +257,7 @@ fn constructs_context(node: Node<'_>, source: &str, aliases: &[&str]) -> bool {
 
 #[derive(Clone, Copy)]
 enum Scan {
-    EngineProduction,
+    Engine,
     UpperRegistration,
 }
 
@@ -260,6 +276,7 @@ struct Guard {
     facade: usize,
     scan: Scan,
     helper_calls: usize,
+    upper_files: HashSet<PathBuf>,
 }
 
 impl Guard {
@@ -275,20 +292,31 @@ impl Guard {
             facade: 0,
             scan,
             helper_calls: 0,
+            upper_files: HashSet::new(),
         }
     }
 
-    fn file(&mut self, path: &Path, module_dir: &Path, scope: Scope) {
+    fn file(&mut self, path: &Path, module_dir: &Path, scope: Scope, aliases: &[&str]) {
         let source =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        self.source(path, module_dir, scope, &source);
+        if scope.upper {
+            self.upper_files.insert(path.canonicalize().unwrap());
+        }
+        self.source(path, module_dir, scope, &source, aliases);
     }
 
-    fn source(&mut self, path: &Path, module_dir: &Path, mut scope: Scope, source: &str) {
+    fn source(
+        &mut self,
+        path: &Path,
+        module_dir: &Path,
+        mut scope: Scope,
+        source: &str,
+        aliases: &[&str],
+    ) {
         scope.test |= ignored_file(path.strip_prefix(&self.root).unwrap_or(path));
         scope.inline = false;
         let syntax = self.parser.parse(source, None).unwrap();
-        self.walk(syntax.root_node(), path, module_dir, scope, source, &[]);
+        self.walk(syntax.root_node(), path, module_dir, scope, source, aliases);
     }
 
     fn walk(
@@ -327,17 +355,32 @@ impl Guard {
             let mut child_scope = scope;
             child_scope.test |= is_test_item(&attrs, child, source);
             if child.kind() == "mod_item" {
-                self.module(child, path, module_dir, child_scope, source, &attrs);
+                self.module(
+                    child,
+                    path,
+                    module_dir,
+                    child_scope,
+                    source,
+                    &attrs,
+                    &aliases,
+                );
             } else {
-                child_scope.upper |= scope.root && child_scope.test;
                 child_scope.root = false;
                 if self.visits(child_scope) {
-                    if let Some(included) = included_rust(child, source) {
+                    if let Some((included, expands)) = included_rust(child, source) {
                         let file = path.parent().unwrap().join(included);
-                        self.file(&file, module_dir, child_scope);
+                        let upper = matches!(self.scan, Scan::Engine)
+                            && file
+                                .canonicalize()
+                                .is_ok_and(|file| self.upper_files.contains(&file));
+                        if upper {
+                            self.report(child, path, source);
+                        } else if expands {
+                            self.file(&file, module_dir, child_scope, &aliases);
+                        }
                     }
                     match self.scan {
-                        Scan::EngineProduction => self.check(child, path, source),
+                        Scan::Engine => self.check(child, path, source),
                         Scan::UpperRegistration if child_scope.test => {
                             self.check_registration(child, path, source, &aliases);
                         }
@@ -358,6 +401,7 @@ impl Guard {
         mut scope: Scope,
         source: &str,
         attrs: &[Node<'_>],
+        aliases: &[&str],
     ) {
         let name = text(node.child_by_field_name("name").unwrap(), source);
         scope.upper |= scope.root && UPPER.contains(&name);
@@ -384,10 +428,10 @@ impl Guard {
         if let Some(body) = node.child_by_field_name("body") {
             let nested = override_path.map_or(default_dir, |name| override_base.join(name));
             scope.inline = true;
-            self.walk(body, path, &nested, scope, source, &[]);
+            self.walk(body, path, &nested, scope, source, aliases);
         } else if let Some(value) = override_path {
             let file = override_base.join(value);
-            self.file(&file, file.parent().unwrap(), scope);
+            self.file(&file, file.parent().unwrap(), scope, aliases);
         } else {
             let flat = module_dir.join(format!("{name}.rs"));
             let file = if flat.is_file() {
@@ -395,13 +439,13 @@ impl Guard {
             } else {
                 default_dir.join("mod.rs")
             };
-            self.file(&file, &default_dir, scope);
+            self.file(&file, &default_dir, scope, aliases);
         }
     }
 
     fn visits(&self, scope: Scope) -> bool {
         match self.scan {
-            Scan::EngineProduction => !scope.test && !scope.upper,
+            Scan::Engine => !scope.upper,
             Scan::UpperRegistration => scope.root || scope.upper,
         }
     }
@@ -476,16 +520,8 @@ fn production_engine_sources_do_not_reach_the_upper_crate() {
         root: true,
         ..Scope::default()
     };
-    let mut guard = Guard::new(&root, Scan::EngineProduction);
-    guard.file(&root.join("lib.rs"), &root, scope);
-    assert!(guard.findings.is_empty(), "{}", guard.findings.join("\n"));
-    assert_eq!(
-        guard.facade, 1,
-        "the only exception is the public trace facade"
-    );
-
     let mut registration = Guard::new(&root, Scan::UpperRegistration);
-    registration.file(&root.join("lib.rs"), &root, scope);
+    registration.file(&root.join("lib.rs"), &root, scope, &[]);
     assert!(
         registration.findings.is_empty(),
         "use crate::test_context in upper library tests:\n{}",
@@ -494,6 +530,15 @@ fn production_engine_sources_do_not_reach_the_upper_crate() {
     assert_eq!(
         registration.helper_calls, 1,
         "the helper builds one context"
+    );
+
+    let mut guard = Guard::new(&root, Scan::Engine);
+    guard.upper_files = registration.upper_files;
+    guard.file(&root.join("lib.rs"), &root, scope, &[]);
+    assert!(guard.findings.is_empty(), "{}", guard.findings.join("\n"));
+    assert_eq!(
+        guard.facade, 1,
+        "the only exception is the public trace facade"
     );
 }
 
@@ -511,36 +556,46 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
             crate::commands::real();
         }
         #[test]
-        fn standalone() { crate::commands::register(); }
+        fn standalone() { crate::bash_rewrite::dispatch::register(); }
         #[cfg(any(test, unix))]
         fn mixed() { super::super::commands::mixed(); }
         fn relative() { trace_measure::run(); }
-        fn allowed() { crate::subc_fake::call(); trace_measure::build(); }
+        fn allowed() { crate::subc_fake::call(); trace_measure::build(); AppContext::new(); }
+        const UPPER_INPUT: &str = include_str!("commands.rs");
     "#;
     std::fs::write(root.join("test_only.rs"), "use crate::commands::test_only;").unwrap();
     std::fs::write(root.join("sibling.rs"), "use crate::{commands::sibling};").unwrap();
+    std::fs::write(root.join("commands.rs"), "").unwrap();
     let scope = Scope {
         root: true,
         ..Scope::default()
     };
-    let mut guard = Guard::new(root, Scan::EngineProduction);
-    guard.source(&root.join("lib.rs"), root, scope, source);
-    assert_eq!(guard.findings.len(), 4, "{:?}", guard.findings);
+    let mut guard = Guard::new(root, Scan::Engine);
+    guard
+        .upper_files
+        .insert(root.join("commands.rs").canonicalize().unwrap());
+    guard.source(&root.join("lib.rs"), root, scope, source, &[]);
+    assert_eq!(guard.findings.len(), 8, "{:?}", guard.findings);
     for (finding, expected) in guard.findings.iter().zip([
+        "commands::test_only",
         "commands::sibling",
+        "commands::register",
         "commands::real",
+        "dispatch::register",
         "commands::mixed",
         "trace_measure::run",
+        "include_str!",
     ]) {
         assert!(finding.contains(expected), "{finding}");
     }
 
-    let mut guard = Guard::new(root, Scan::EngineProduction);
+    let mut guard = Guard::new(root, Scan::Engine);
     guard.source(
         &root.join("data_layer/trace_measure.rs"),
         root,
         Scope::default(),
         "pub use crate::trace_measure_run::run;\nuse crate::{trace_measure_run::{run as again}};",
+        &[],
     );
     assert_eq!(guard.facade, 1);
     assert_eq!(guard.findings.len(), 1, "{:?}", guard.findings);
@@ -554,11 +609,14 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
         r#"
         mod commands {
             fn production() { AppContext::new(); }
+            use crate::context::AppContext as Outer;
             #[cfg(test)]
             mod tests {
+                use super::*;
                 use crate::{context::AppContext as Alias};
                 fn direct() { crate::context::AppContext::new(); }
                 fn alias() { Alias::new(); }
+                fn inherited_alias() { Outer::new(); }
                 fn helper() { crate::test_context(); }
             }
             #[test]
@@ -567,16 +625,18 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
         #[cfg(test)]
         mod engine_tests { fn keep() { AppContext::new(); } }
         "#,
+        &[],
     );
     assert_eq!(
         registration.findings.len(),
-        3,
+        4,
         "{:?}",
         registration.findings
     );
     for (finding, expected) in registration.findings.iter().zip([
         "crate::context::AppContext::new()",
         "Alias::new()",
+        "Outer::new()",
         "aft::context::AppContext::new()",
     ]) {
         assert!(finding.contains(expected), "{finding}");
