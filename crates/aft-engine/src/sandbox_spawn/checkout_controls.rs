@@ -52,7 +52,8 @@ pub(super) fn checkout_control_denies(
     Ok(denies)
 }
 
-pub(crate) fn remote_control_denies(root: &Path) -> Result<Vec<PathBuf>, String> {
+#[doc(hidden)]
+pub fn remote_control_denies(root: &Path) -> Result<Vec<PathBuf>, String> {
     #[cfg(unix)]
     let mut denies = protected_paths(&checkout_control_denies(
         root,

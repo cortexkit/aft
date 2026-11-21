@@ -15,7 +15,8 @@ pub(super) struct RefreshCounters {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct RefreshCounts {
+#[doc(hidden)]
+pub struct RefreshCounts {
     pub(crate) refreshes: u64,
     pub(crate) guard_fallbacks: u64,
     pub(crate) precheck_fallbacks: u64,

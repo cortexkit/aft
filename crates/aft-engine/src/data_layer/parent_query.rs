@@ -114,7 +114,8 @@ pub(crate) fn attach_gaps(body: &mut Value, gaps: Vec<Value>) {
 }
 
 /// Search gaps precede the counts: an unsearched child is not a negative result.
-pub(crate) fn attach_search_gaps(body: &mut Value, gaps: Vec<Value>) {
+#[doc(hidden)]
+pub fn attach_search_gaps(body: &mut Value, gaps: Vec<Value>) {
     attach_gaps_in_order(body, gaps, true);
 }
 

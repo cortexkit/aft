@@ -207,7 +207,8 @@ pub(crate) fn view_load_failure_message(error: impl std::fmt::Display) -> String
 
 /// Render an index read failure as the call's error. No other index or
 /// filesystem walk answers in its place.
-pub(crate) fn view_load_error_response(id: &str, message: String) -> crate::protocol::Response {
+#[doc(hidden)]
+pub fn view_load_error_response(id: &str, message: String) -> crate::protocol::Response {
     crate::protocol::Response::error(id, "internal_error", message)
 }
 

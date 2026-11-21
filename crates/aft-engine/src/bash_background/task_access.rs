@@ -227,7 +227,8 @@ use crate::task_temp_reads::{is_task_environment, task_directory};
 
 /// Recursive readers must not bypass the explicit-path check by entering a
 /// bundle through its directory. Do not follow links or credential payloads.
-pub(crate) fn safe_task_entry(path: &Path) -> bool {
+#[doc(hidden)]
+pub fn safe_task_entry(path: &Path) -> bool {
     if task_directory(path).is_none() {
         return true;
     }

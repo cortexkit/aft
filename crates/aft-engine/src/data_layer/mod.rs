@@ -31,7 +31,8 @@ pub mod outline;
 pub(crate) mod overlay;
 #[doc(hidden)]
 pub mod parent;
-pub(crate) mod parent_query;
+#[doc(hidden)]
+pub mod parent_query;
 pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;

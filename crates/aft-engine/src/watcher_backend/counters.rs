@@ -44,7 +44,8 @@ pub(crate) struct WatcherExclusionPlanningSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-pub(crate) struct WatcherCountersSnapshot {
+#[doc(hidden)]
+pub struct WatcherCountersSnapshot {
     /// None on backends that do not plan exclusions. The exhausted retry budget
     /// and last planning failure remain visible without further filesystem events.
     pub(crate) exclusion_planning: Option<WatcherExclusionPlanningSnapshot>,
@@ -646,7 +647,8 @@ static WATCHER_COUNTERS_BY_ROOT: std::sync::OnceLock<
     Mutex<BTreeMap<PathBuf, Arc<WatcherCounters>>>,
 > = std::sync::OnceLock::new();
 
-pub(crate) fn watcher_counters_for_root(root: &Path) -> Arc<WatcherCounters> {
+#[doc(hidden)]
+pub fn watcher_counters_for_root(root: &Path) -> Arc<WatcherCounters> {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let registry = WATCHER_COUNTERS_BY_ROOT.get_or_init(|| Mutex::new(BTreeMap::new()));
     let mut registry = registry

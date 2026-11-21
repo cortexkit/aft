@@ -29,7 +29,8 @@ pub struct RequestedPlanes {
 }
 
 /// One child plane as seen by queries.
-pub(crate) enum Plane<T> {
+#[doc(hidden)]
+pub enum Plane<T> {
     Loading,
     Ready(Arc<T>),
     Gap(String),
@@ -150,7 +151,8 @@ pub fn session_for_root(root: &Path) -> Option<Arc<dyn ParentView>> {
     (!session.stopped()).then_some(session)
 }
 
-pub(crate) fn display_relative(root: &Path, path: &Path) -> String {
+#[doc(hidden)]
+pub fn display_relative(root: &Path, path: &Path) -> String {
     let relative = path.strip_prefix(root).unwrap_or(path);
     let text = relative.to_string_lossy().replace('\\', "/");
     if text.is_empty() {

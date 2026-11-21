@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
-pub(crate) use crate::project_walk::apply_project_ignore_rules;
+#[doc(hidden)]
+pub use crate::project_walk::apply_project_ignore_rules;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct IgnoreInput {

@@ -55,7 +55,8 @@ impl InvalidationCause {
 
 /// Process-lifetime counters for one physical checkout, across configuration keys.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
-pub(crate) struct ApplicabilityMetrics {
+#[doc(hidden)]
+pub struct ApplicabilityMetrics {
     pub hits: u64,
     pub misses: u64,
     pub coalesced_hits: u64,
