@@ -2746,7 +2746,7 @@ fn git_entry_signature(project_root: &Path) -> GitEntrySignature {
 struct WatcherRuntimeIdentity {
     root: PathBuf,
     gitignore_generation: u64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     thread_id: Option<std::thread::ThreadId>,
 }
 
@@ -8227,7 +8227,7 @@ impl AppContext {
         *self.watcher_runtime_identity.lock() = Some(WatcherRuntimeIdentity {
             root,
             gitignore_generation,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             thread_id: _thread_id,
         });
     }
