@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import {
   type AftConfigFileMigrationResult,
   CALLGRAPH_CHUNK_KEY,
@@ -12,6 +12,7 @@ import {
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
   hasMalformedCacheDirChoice,
+  hasPendingWindowsUserConfigMove,
   IDLE_CHECKOUT_HOURS_MAX,
   IDLE_CHECKOUT_HOURS_MIN,
   isBlockedBashEnvKey,
@@ -34,6 +35,7 @@ import {
   readConfigTiers,
   removedConfigKeyErrors,
   resolveCortexKitConfigPaths,
+  resolveCortexKitUserConfigReadPath,
   resolveIndexes,
   resolveLegacyAftConfigSources,
   resolveProjectConfigReadPath,
@@ -2306,6 +2308,7 @@ export function migrateAftConfigLocations(
   projectDirectory: string,
   logger: Logger = { log, warn },
 ): AftConfigFileMigrationResult[] {
+  if (hasPendingWindowsUserConfigMove()) return [];
   const paths = resolveCortexKitConfigPaths(projectDirectory);
   const legacy = resolveLegacyAftConfigSources(projectDirectory);
   return [
@@ -2321,7 +2324,7 @@ export function migrateAftConfigLocations(
 
 export function resolveAftConfigPaths(projectDirectory: string): ResolvedAftConfigPaths {
   return {
-    ...resolveCortexKitConfigPaths(projectDirectory),
+    userConfigPath: resolveCortexKitUserConfigReadPath(),
     projectConfigPath: resolveProjectConfigReadPath(projectDirectory, ACTIVE_HARNESS),
   };
 }
@@ -2348,7 +2351,7 @@ export function buildConfigTierConfigureParams(
           ),
         }
       : {}),
-    cortexkit_user_config_path: paths.userConfigPath,
+    cortexkit_user_config_path: resolve(paths.userConfigPath),
     config: readConfigTiers(paths),
   };
 }

@@ -139,9 +139,9 @@ mod program_approvals {
 
     fn stamp_scope(name: &str, parent: &str) -> subc_protocol::scope::ScopeStamp {
         serde_json::from_value(json!({
-            "owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":name,"scope_epoch":7,
+            "owner":{"kind":"reserved","module_id":"prefrontal"},"ref":name,"scope_epoch":7,
             "kind":"ephemeral","owner_authorized":true,"parent_state":"linked",
-            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":parent,"scope_epoch":7}
+            "parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":parent,"scope_epoch":7}
         })).unwrap()
     }
 
@@ -839,12 +839,12 @@ impl ConsentTransport for SharedFake {
 
 fn stamp(name: &str, kind: &str, parent: Option<&str>) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": name,
         "scope_epoch": 7,
         "kind": kind,
         "parent": parent.map(|parent| json!({
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": parent,
             "scope_epoch": 7,
         })),
@@ -1507,10 +1507,10 @@ async fn consent_qualifying_hosts_and_codemode_runs_can_save_scope_grants() {
             run_id: run_id.into(),
             task_identity: None,
             owner_route: parent.clone(),
-            owner_route_channel: RouteChannel {
+            owner_route_channel: Some(RouteChannel {
                 channel: 41,
                 epoch: 1,
-            },
+            }),
             run_route: RouteChannel {
                 channel: 42,
                 epoch: 1,
@@ -2536,11 +2536,11 @@ async fn consent_folder_grant_leaves_uncovered_asks_pending() {
         std::fs::write(&a, "a contents\n").unwrap();
         std::fs::write(&b, "b contents\n").unwrap();
         let epoch8: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": "worker",
             "scope_epoch": 8,
             "kind": "worker",
-            "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal-core"}, "ref": "head", "scope_epoch": 7},
+            "parent": {"owner": {"kind": "reserved", "module_id": "prefrontal"}, "ref": "head", "scope_epoch": 7},
             "owner_authorized": true,
         }))
         .unwrap();
@@ -6387,74 +6387,9 @@ fn consent_vectors_settled_allow_without_answered_by_is_the_head() {
     assert!(decode_result(br#"{"elicitation_id":"acc_1"}"#).is_err());
 }
 
-#[cfg(unix)]
-#[test]
-fn consent_vectors_folder_grant_withdraw() {
-    // Owner withdraws settle as `access_withdrawn` on AFT's normal route;
-    // withdrawing an already-settled ask returns its own settled record for
-    // the race guard; a non-owner gets `elicitation_not_owner`.
-    for (name, id) in [
-        ("scope-owner-withdraw-request.json", "acc_5"),
-        ("non-owner-withdraw-request.json", "acc_5"),
-        ("settled-withdraw-request.json", "acc_4"),
-    ] {
-        assert_eq!(
-            encode("consent.withdraw", &json!({"elicitation_id": id})).unwrap(),
-            vector(name),
-            "{name}"
-        );
-    }
-    assert_eq!(
-        decode_record(&decode_result(&vector("scope-owner-withdraw-reply.json")).unwrap()).unwrap(),
-        Settlement::Refused("access_withdrawn".into())
-    );
-    assert_eq!(
-        decode_record(&decode_result(&vector("settled-withdraw-reply.json")).unwrap()).unwrap(),
-        Settlement::Allow {
-            scope: false,
-            by_user: true
-        }
-    );
-    let refusal: Value =
-        serde_json::from_slice(&vector("non-owner-withdraw-refusal.json")).unwrap();
-    assert_eq!(refusal["code"], json!("elicitation_not_owner"));
-    let notice = vector_json("notice-owner-withdrawn.json");
-    assert_eq!(notice["purpose"], json!("withdrawn"));
-    assert_eq!(notice["elicitation_id"], json!("acc_5"));
-    assert_eq!(notice["asker"]["scope_ref"], json!("worker"));
-    assert_eq!(notice["asker"]["scope_epoch"], json!(3));
-    let stamps = vector_json("withdraw-bind-stamps.json");
-    assert_eq!(
-        stamps["scope-owner-withdraw"],
-        json!("reserved:prefrontal-core")
-    );
-    assert_eq!(stamps["non-owner-withdraw"], json!("reserved:basal"));
-    assert_eq!(
-        stamps["settled-withdraw"],
-        json!("reserved:prefrontal-core")
-    );
-}
-
-#[cfg(unix)]
-#[test]
-fn consent_vectors_bind_stamps_route_asks_under_the_worker_stamp() {
-    let stamps = vector_json("bind-stamps.json");
-    let worker: subc_protocol::scope::ScopeStamp =
-        serde_json::from_value(stamps["worker"]["scope"].clone()).unwrap();
-    let head: subc_protocol::scope::ScopeStamp =
-        serde_json::from_value(stamps["head"]["scope"].clone()).unwrap();
-    assert_eq!(stamps["worker"]["principal"], "reserved:aft");
-    let dir = tempfile::tempdir().unwrap();
-    let worker_identity = identity(dir.path(), Some(worker.clone()));
-    let head_identity = identity(dir.path(), Some(head));
-    assert!(access_grants::alfonso_worker(&worker_identity));
-    assert!(!access_grants::alfonso_worker(&head_identity));
-    // Asks go out under the asking worker's own stamp.
-    let sent = selector(&worker);
-    assert_eq!(sent.scope_ref, "worker");
-    assert_eq!(sent.scope_epoch, Some(3));
-    assert_eq!(sent.owner, worker.owner);
-}
+#[cfg(all(test, unix))]
+#[path = "consent_scope_stamp_vector_tests.rs"]
+mod scope_stamp_vectors;
 
 fn jail_context(root: &Path, sandbox: bool) -> AppContext {
     let mut config = crate::config::Config::default();

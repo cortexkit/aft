@@ -717,7 +717,7 @@ fn bound_codemode(
     // `resolve_owner` only compares the bound head's owner with the run's
     // parent owner, so another authorized owner could otherwise bind a route
     // that reaches a non-prefrontal head stamp. Authorization re-checks the
-    // head here; that is what makes the run prefrontal-core.
+    // head here; that is what makes the run Prefrontal-owned.
     if !alfonso_of_kind(head_stamp, &[ScopeKind::Head]) {
         return Err(Ineligibility::HeadScopeNotAlfonso);
     }
@@ -998,10 +998,10 @@ pub(crate) fn with_secret_bound_identity_for_test<R>(
         run_id: "secret-run".into(),
         task_identity: None,
         owner_route: head.clone(),
-        owner_route_channel: super::RouteChannel {
+        owner_route_channel: Some(super::RouteChannel {
             channel: 1,
             epoch: 1,
-        },
+        }),
         run_route: super::RouteChannel {
             channel: 7,
             epoch: 1,

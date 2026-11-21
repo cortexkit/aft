@@ -1346,6 +1346,8 @@ impl ModuleProcess {
             .stderr(Stdio::null());
         command.envs(env.iter().copied());
         crate::test_helpers::assert_child_storage_isolated(&command);
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
+        crate::test_helpers::subc_pin::prepare(&command).expect("prepare module fixture pin");
         // Own process group, so Drop can kill the module and any bash children.
         unsafe {
             command.pre_exec(|| {

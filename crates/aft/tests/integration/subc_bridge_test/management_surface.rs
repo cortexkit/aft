@@ -58,7 +58,7 @@ pub(super) async fn drive_management_surface_daemon(input: FakeDaemonInput) {
         321,
         &root2,
         Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
     )
     .await;
@@ -207,7 +207,7 @@ pub(super) async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(app.watcher_count(), watcher_count);
 
     let owner = Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     };
     let stamp = subc_protocol::scope::ScopeStamp::new(
         owner.clone(),
@@ -252,11 +252,11 @@ pub(super) async fn drive_management_surface_daemon(input: FakeDaemonInput) {
     );
     assert_eq!(
         ownership["roots"][0]["routes"][1]["scope"],
-        json!({"owner":"reserved:prefrontal-core","ref":"census-scope","epoch":7})
+        json!({"owner":"reserved:prefrontal","ref":"census-scope","epoch":7})
     );
     assert_eq!(
         ownership["roots"][0]["routes"][1]["principal"],
-        "reserved:prefrontal-core"
+        "reserved:prefrontal"
     );
     send_route_goodbye(&mut stream, 6, 342).await;
     send_management_request(&mut stream, 2, 343, json!({"op":"memory.census"})).await;

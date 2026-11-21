@@ -257,7 +257,7 @@ mod tests {
     fn prepared_migration_rereads_use_the_same_read_time_bound() {
         let source = include_str!("../config_fix.rs");
         let body = source
-            .split_once("pub(crate) fn auto_migrate_user_config_bounded(")
+            .split_once("pub(crate) fn migrate_user_config_to(")
             .unwrap()
             .1
             .split_once("fn auto_migrate_user_config_with_reader(")

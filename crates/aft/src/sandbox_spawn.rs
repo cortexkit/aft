@@ -61,6 +61,7 @@ pub mod checkout_controls;
 #[cfg(unix)]
 use checkout_controls::checkout_control_denies;
 pub(crate) use checkout_controls::remote_control_denies;
+mod launcher_image;
 pub(crate) mod remote;
 #[doc(hidden)]
 pub mod remote_shell_guard;
@@ -441,6 +442,7 @@ pub enum SpawnPlan {
     Launcher {
         profile: SandboxProfile,
         launcher_path: PathBuf,
+        task_launcher: Option<PathBuf>,
     },
     #[cfg(unix)]
     Prepared {
@@ -678,6 +680,7 @@ impl SpawnPlan {
         Self::Launcher {
             profile,
             launcher_path,
+            task_launcher: None,
         }
     }
 
@@ -1658,6 +1661,8 @@ fn resolve_sandbox_spawn_with_mode(
             SpawnPlan::Launcher {
                 profile,
                 launcher_path,
+                task_launcher: cfg!(target_os = "linux")
+                    .then(|| crate::pinned_executable::task_executable(task_bundle_dir)),
             }
         });
         match resolved {
@@ -2061,22 +2066,7 @@ fn build_native_profile(
         refuse_store_overlap(&profile, &session_store, &task_io_dir)?;
 
         #[cfg(target_os = "linux")]
-        let profile = {
-            let git_read_roots = git_policies
-                .iter()
-                .flat_map(|policy| policy.read_roots.iter().cloned())
-                .collect::<Vec<_>>();
-            profile = build_linux_profile(profile, &home, &git_read_roots)?;
-            profile = profile
-                .canonicalize_for_launch()
-                .map_err(|error| error.to_string())?;
-            validate_final_read_rules(&profile.read_allow, &profile.read_deny)?;
-            assert!(
-                validate_final_read_rules(&profile.read_allow, &profile.read_deny).is_ok(),
-                "final Landlock read grants overlap a denied path"
-            );
-            profile
-        };
+        let profile = launcher_image::finish_linux_profile(profile, &home, &git_policies)?;
         verify_worker_gh_fence(&profile)?;
 
         Ok(profile)
@@ -6244,10 +6234,14 @@ fn isolated_environment_for_plan(
         SpawnPlan::Launcher {
             profile,
             launcher_path,
+            task_launcher,
         } => {
             let mut environment =
                 sandboxed_child_environment(request_environment, &profile.temp_dir);
-            crate::pinned_executable::task_environment(launcher_path, &mut environment);
+            crate::pinned_executable::task_environment(
+                task_launcher.as_deref().unwrap_or(launcher_path),
+                &mut environment,
+            );
             #[cfg(target_os = "macos")]
             if profile.temp_dir.join(".worker-bin/mktemp").is_file() {
                 let mut paths = vec![profile.temp_dir.join(".worker-bin")];
@@ -6651,6 +6645,7 @@ fn command_argv_for_plan(
         SpawnPlan::Launcher {
             profile,
             launcher_path,
+            ..
         } => {
             #[cfg(unix)]
             {
@@ -10997,6 +10992,7 @@ mod policy_tests {
             SpawnPlan::Launcher {
                 profile,
                 launcher_path,
+                ..
             } => {
                 *launcher_path = launcher;
                 profile.temp_dir.clone()

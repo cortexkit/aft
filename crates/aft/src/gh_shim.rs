@@ -85,7 +85,7 @@ const RECENTLY_REACHABLE_WINDOW: Duration = Duration::from_secs(300);
 const ISSUED_AT_FUTURE_SKEW: Duration = Duration::from_secs(300);
 const ROUTING_OPERATION: &str = "gh.route";
 #[cfg(test)]
-const ROUTING_HOLDER_MODULE_ID: &str = crate::access_policy::prefrontal::LEGACY_MODULE_ID;
+const ROUTING_HOLDER_MODULE_ID: &str = crate::access_policy::prefrontal::MODULE_ID;
 const MANIFEST_ARTIFACT_ID: &str = "gh-routing-manifest";
 const V1_GOVERNED_TUPLES: &[&str] = &["issue comment", "pr comment", "pr review", "issue reaction"];
 const V1_ADMIN_TUPLES: &[&str] = &["issue close", "pr close", "pr merge", "release create"];
@@ -3103,16 +3103,21 @@ fn determine_rung_for_target(
 }
 
 pub fn configured_connection_file() -> Option<PathBuf> {
-    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-    let home = crate::environment::non_empty_os_var("HOME")
-        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"));
-    configured_connection_file_from(xdg_config_home.as_deref(), home.as_deref())
+    connection_file_from_user_config(&crate::subc_config::cortexkit_user_config_path()?)
 }
 
+#[cfg(test)]
 fn configured_connection_file_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
+    connection_file_from_user_config(&crate::subc_config::user_config_path_from(
+        xdg_config_home,
+        home,
+    )?)
+}
+
+fn connection_file_from_user_config(config_path: &Path) -> Option<PathBuf> {
     // This reader becomes `subc_transport::connection_file::discover(explicit)`
     // when the transport API reaches AFT. That call replaces these ordered rungs:
     // explicit (exclusive); non-empty SUBC_CONNECTION_FILE (exclusive); non-empty
@@ -3124,7 +3129,6 @@ fn configured_connection_file_from(
     // and resolve `CONNECTION_FILE_NAME` and `PROD_CONNECTION_RELATIVE_PATH`.
     // Until the call lands here, only trusted user config can provide the explicit
     // path; invalid or unreadable paths resolve to `None` for the rung classifier.
-    let config_path = crate::subc_config::user_config_path_from(xdg_config_home, home)?;
     let doc = fs::read_to_string(config_path).ok()?;
     connection_file_from_config_doc(&doc).filter(|path| path.is_file())
 }
@@ -3133,11 +3137,7 @@ fn configured_connection_file_from(
 /// `None` means the config file was absent or unreadable, which the rung
 /// determination treats as "no user config" (structural rungs decide).
 fn read_user_config_doc() -> Option<String> {
-    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME");
-    let home = crate::environment::non_empty_os_var("HOME")
-        .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"));
-    let config_path =
-        crate::subc_config::user_config_path_from(xdg_config_home.as_deref(), home.as_deref())?;
+    let config_path = crate::subc_config::cortexkit_user_config_path()?;
     fs::read_to_string(config_path).ok()
 }
 
@@ -8453,9 +8453,11 @@ mod tests {
             assert_eq!(read_user_config_doc(), Some(doc));
             assert!(crate::parent_search::discover(&profile, 1).is_none());
 
-            // With neither home available, do not read a config relative to cwd.
             std::env::set_var("USERPROFILE", "");
-            assert_eq!(crate::subc_config::cortexkit_user_config_path(), None);
+            assert_eq!(
+                crate::subc_config::cortexkit_user_config_path(),
+                Some(PathBuf::from(".config/cortexkit/aft.jsonc"))
+            );
             assert_eq!(configured_connection_file(), None);
             assert_eq!(read_user_config_doc(), None);
             return;
@@ -8479,7 +8481,9 @@ mod tests {
             .env(CHILD, &profile)
             .env("HOME", "")
             .env("USERPROFILE", &profile)
+            .env_remove("APPDATA")
             .env_remove("XDG_CONFIG_HOME")
+            .current_dir(temp.path())
             .output()
             .unwrap();
         assert!(
@@ -9089,14 +9093,17 @@ mod tests {
     }
 
     #[test]
-    fn prefrontal_rename_gh_route_catalog_accepts_only_aliases() {
-        for module in crate::access_policy::prefrontal::MODULE_IDS {
-            let holder = select_route_holder([module.to_string(), "other".into()]);
-            assert_eq!(holder.module_id.as_deref(), Some(module));
-            assert_eq!(holder.unexpected_advertisers, ["other"]);
-        }
-        let holder = select_route_holder(["prefrontal-core".into(), "prefrontal".into()]);
+    fn prefrontal_gh_route_catalog_refuses_legacy_and_unknown_advertisers() {
+        let others = ["prefrontal-core".into(), "other".into()];
+        let without = select_route_holder(others.clone());
+        assert_eq!(without.module_id, None);
+        assert_eq!(without.unexpected_advertisers, ["other", "prefrontal-core"]);
+        let holder = select_route_holder(["prefrontal".into()].into_iter().chain(others));
         assert_eq!(holder.module_id.as_deref(), Some("prefrontal"));
+        assert_eq!(
+            holder.unexpected_advertisers,
+            without.unexpected_advertisers
+        );
     }
 
     #[test]

@@ -3,52 +3,6 @@
 use super::*;
 
 impl BgTaskRegistry {
-    /// Persist a confirmed rename only in process-lifetime tracking. The spawn
-    /// scope and terminal execution facts remain unchanged for audit and speech.
-    pub(crate) fn rehome_scope(
-        &self,
-        from: &subc_protocol::scope::ScopeStamp,
-        to: &subc_protocol::scope::ScopeStamp,
-    ) -> std::io::Result<usize> {
-        if crate::access_policy::prefrontal::counterpart_owner(&from.owner).as_ref()
-            != Some(&to.owner)
-            || from.scope_ref != to.scope_ref
-        {
-            return Err(std::io::Error::other("not a prefrontal scope continuation"));
-        }
-        let mut changed = 0;
-        for task in self.task_arcs() {
-            if task.is_terminal() && !self.has_live_task_processes(&task.task_id, &task.session_id)
-            {
-                continue;
-            }
-            let mut db = DeferredDbWrites::new(self, &task);
-            let mut state = task
-                .lock_state()
-                .map_err(|_| std::io::Error::other("background task lock poisoned"))?;
-            let matches = |metadata: &PersistedTask| {
-                metadata.lifecycle_scope().is_some_and(|scope| {
-                    scope.owner == from.owner
-                        && scope.scope_ref == from.scope_ref
-                        && scope.scope_epoch == from.scope_epoch
-                })
-            };
-            if !matches(&state.metadata) {
-                continue;
-            }
-            state.metadata = self.update_task_metadata_locked(&task, &mut db, |metadata| {
-                if matches(metadata) {
-                    metadata.lifecycle_scope = Some(to.clone());
-                }
-            })?;
-            changed += 1;
-        }
-        if changed > 0 {
-            aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
-        }
-        Ok(changed)
-    }
-
     /// Find held task scopes, including published tasks whose process is still
     /// starting. Run away from daemon frame dispatch: acquiring registry locks
     /// and checking whether descendant processes remain alive can block.

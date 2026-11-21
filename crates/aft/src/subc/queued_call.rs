@@ -404,6 +404,7 @@ mod tests {
             &Arc::new(Notify::new()),
             1024 * 1024,
             None,
+            &RouteDeliverySessions::default(),
         )
         .await
         .unwrap();

@@ -6,6 +6,7 @@ import {
   execSync,
   resolveAftLogPath,
   resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
   spawnSync,
 } from "@cortexkit/aft-bridge";
 
@@ -198,16 +199,15 @@ export class PiAdapter implements HarnessAdapter {
     }
   }
 
-  detectConfigPaths(): HarnessConfigPaths {
+  detectConfigPaths(purpose: "read" | "write" = "read"): HarnessConfigPaths {
     const configDir = getPiAgentDir();
     // Pi doesn't have a user-editable "harness config" analogous to opencode.jsonc;
     // point at the likely extensions index for diagnostic purposes only.
     const index = readPiExtensionIndex();
     // AFT config lives in the shared CortexKit location since the v0.40.0
-    // consolidation, not ~/.pi/agent. Use the bridge's canonical path so the CLI
-    // and the plugin agree byte-for-byte (and so a fresh `setup` creates
-    // aft.jsonc, the only name the plugin reads).
-    const aftConfigPath = resolveCortexKitUserConfigPath();
+    // consolidation, not ~/.pi/agent.
+    const aftConfigPath =
+      purpose === "write" ? resolveCortexKitUserConfigPath() : resolveCortexKitUserConfigReadPath();
     const aftConfigExists = existsSync(aftConfigPath);
     return {
       configDir,

@@ -9,7 +9,7 @@ async fn scope_watch_route_binds_and_live_reopens_make_zero_describes() {
             .map(|index| {
                 let mut scope = stamp(index);
                 scope.owner = Principal::Reserved {
-                    module_id: "prefrontal-core".into(),
+                    module_id: "prefrontal".into(),
                 };
                 scope.owner_authorized = true;
                 scope

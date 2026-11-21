@@ -175,7 +175,7 @@ async fn program_running_hold_survives_drain_and_finishes_once_for_head_and_work
         let row = ledger::get(&conn, &key).unwrap().unwrap();
         let scope = row.scope.unwrap();
         let custodian = row.custodian.unwrap();
-        assert_eq!(scope.owner, "reserved:prefrontal-core");
+        assert_eq!(scope.owner, "reserved:prefrontal");
         assert_eq!(custodian, "reserved:basal");
         let page = ledger::late_results(
             &conn,
@@ -292,7 +292,7 @@ async fn drained_head_shell(f: &Fixture, extra: Value, corr: u64) -> (String, Va
     // `background` launch is answered with its task at once (see
     // `runner_head_route`), so only another head route still holds it.
     if let AuthenticatedPrincipal::RouteBind { principal_id, .. } = &mut data.spawn_principal {
-        *principal_id = Some("reserved:prefrontal-core".into());
+        *principal_id = Some("reserved:prefrontal".into());
     }
     let (command, _) = gated_command(&head.project_root);
     let mut arguments = json!({"command":command,"timeout":30_000});

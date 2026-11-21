@@ -1,6 +1,5 @@
 //! Reconcile saved grants with daemon lifecycle state, away from tool calls.
 use super::super::{readiness, scope_describe, DispatchPathMetrics, Executor};
-use crate::access_policy::prefrontal::{self, Continuation, CounterpartReply};
 use crate::db::{access_grants as store, TrackedConnection};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
@@ -56,7 +55,7 @@ where
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
 {
-    tick_unwatched(db, cursor, describe, |_| false, |_| false).await
+    tick_unwatched(db, cursor, describe, |_| false).await
 }
 
 #[cfg(all(test, unix))]
@@ -71,27 +70,21 @@ where
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
 {
-    tick_unwatched(
-        db,
-        &mut None,
-        describe,
-        |stamp| covered.covers_reference(stamp),
-        |_| false,
-    )
+    tick_unwatched(db, &mut None, describe, |stamp| {
+        covered.covers_reference(stamp)
+    })
     .await
 }
 
-async fn tick_unwatched<F, Fut, C, D>(
+async fn tick_unwatched<F, Fut, C>(
     db: Db,
     cursor: &mut Option<store::ScopeKey>,
     describe: F,
     covered: C,
-    counterpart_configured: D,
 ) -> Stats
 where
     F: Fn(ScopeStamp) -> Fut,
     C: Fn(&ScopeStamp) -> bool,
-    D: Fn(&ScopeStamp) -> bool,
     Fut: std::future::Future<
         Output = Result<ModuleControlResponseToModule, readiness::ControlError>,
     >,
@@ -139,48 +132,9 @@ where
             )
             .await
             .unwrap_or(Err(readiness::ControlError::Timeout));
-            let source_ended = reply
+            let ends = reply
                 .as_ref()
                 .is_ok_and(scope_describe::describe_answer_ends_scope);
-            let mut ends = source_ended;
-            if source_ended
-                || reply
-                    .as_ref()
-                    .is_ok_and(|reply| prefrontal::retired(&request, reply))
-            {
-                if let Some(other) = prefrontal::counterpart(&request) {
-                    let answer = if counterpart_configured(&request) {
-                        Some(
-                            tokio::time::timeout(
-                                scope_describe::describe_timeout(),
-                                describe(other.clone()),
-                            )
-                            .await
-                            .unwrap_or(Err(readiness::ControlError::Timeout)),
-                        )
-                    } else {
-                        None
-                    };
-                    let answer = match answer.as_ref() {
-                        Some(reply) => CounterpartReply::Describe(reply.as_ref().ok()),
-                        None => CounterpartReply::NotInCatalog,
-                    };
-                    let (ended, outcome) =
-                        match prefrontal::continuation(&other, answer, source_ended) {
-                            Continuation::Live(_) => (false, "continuation"),
-                            Continuation::Hold(outcome) => (false, outcome),
-                            Continuation::End(outcome) => (true, outcome),
-                        };
-                    prefrontal::log_continuation(&request, &other, outcome);
-                    ends = ended;
-                }
-            } else if let Some(other) = prefrontal::counterpart(&request) {
-                prefrontal::log_continuation(
-                    &request,
-                    &other,
-                    prefrontal::retained_outcome(reply.as_ref().ok()),
-                );
-            }
             match &reply {
                 Ok(_) if ends => stats.ended += 1,
                 Ok(ModuleControlResponseToModule::ScopeDescribe {
@@ -216,7 +170,6 @@ pub(in crate::subc) async fn run(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,
     mut covered: tokio::sync::watch::Receiver<super::super::scope_watch::Coverage>,
-    catalog: tokio::sync::watch::Receiver<Vec<String>>,
 ) {
     let mut cursors = HashMap::new();
     let mut database = 0usize;
@@ -259,12 +212,6 @@ pub(in crate::subc) async fn run(
                         // being read. Check coverage at the actual RPC boundary.
                         let latest = covered.borrow();
                         latest.covers_reference(stamp)
-                    },
-                    |stamp| {
-                        crate::access_policy::prefrontal::counterpart_in_catalog(
-                            stamp,
-                            catalog.borrow().as_slice(),
-                        )
                     },
                 )
                 .await;

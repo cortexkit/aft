@@ -959,6 +959,7 @@ mod tests {
         let mut plan = SpawnPlan::Launcher {
             profile,
             launcher_path: "/unused".into(),
+            task_launcher: None,
         };
         let path = std::env::join_paths([inside.path(), outside, &link]).unwrap();
         crate::sandbox_spawn::allow_provider_path(&mut plan, path.to_str());

@@ -545,7 +545,7 @@ fn main() {
         // threaded into the per-bind tier composition (W5). Under the gateway
         // there is no plugin to relay on-disk config, so this is how a gateway
         // user's aft.jsonc reaches AFT.
-        let user_config_path = aft::subc_config::cortexkit_user_config_path();
+        let user_config_path = aft::subc_config::startup_cortexkit_user_config_path();
         // AFT_TEST_HOLD_ORT_SECTION holds an ORT section open during shutdown,
         // without loading ORT or relying on inference speed. Release builds
         // ignore the environment variable.
@@ -4881,7 +4881,7 @@ mod policy_environment_startup_tests {
         for (call, expected_count) in [
             ("parse_subc_arg(", 1),
             ("cli::fix_config::run(", 1),
-            ("aft::subc_config::cortexkit_user_config_path(", 1),
+            ("aft::subc_config::startup_cortexkit_user_config_path(", 1),
             ("AppContext::from_app(", 2),
             ("Config::default(", 2),
         ] {

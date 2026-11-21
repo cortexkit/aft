@@ -16,7 +16,7 @@ const YIELD_CONSUMER: [&str; 3] = ["tool-result/v1", "held-reply/v1", "call-yiel
 
 fn head_stamp() -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": "yield-head-scope", "scope_epoch": 1, "kind": "head",
         "attributes": {"agent_id": "agent-yield"},
         "owner_authorized": true
@@ -859,9 +859,9 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
 
 fn restart_worker_stamp() -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind":"reserved", "module_id":"prefrontal-core"},
+        "owner": {"kind":"reserved", "module_id":"prefrontal"},
         "ref":"restart-worker", "scope_epoch":1, "kind":"worker",
-        "parent": {"owner":{"kind":"reserved", "module_id":"prefrontal-core"}, "ref":"yield-head-scope", "scope_epoch":1},
+        "parent": {"owner":{"kind":"reserved", "module_id":"prefrontal"}, "ref":"yield-head-scope", "scope_epoch":1},
         "parent_state":"linked", "owner_authorized":true
     })).unwrap()
 }

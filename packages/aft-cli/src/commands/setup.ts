@@ -1,3 +1,4 @@
+import { hasPendingWindowsUserConfigMove } from "@cortexkit/aft-bridge";
 import { OpenCodeAdapter } from "../adapters/opencode.js";
 import type { HarnessAdapter } from "../adapters/types.js";
 import { type BinaryDownloader, obtainAftBinary } from "../lib/binary-install.js";
@@ -169,9 +170,10 @@ async function configureAdapter(
 
   // Ensure aft.jsonc has $schema pointing at the generated JSON Schema so
   // editors get autocomplete + validation for AFT config fields.
+  if (hasPendingWindowsUserConfigMove()) return failed ? "failed" : "ok";
   let aftConfigPath: string | undefined;
   try {
-    const { aftConfig, aftConfigFormat } = adapter.detectConfigPaths();
+    const { aftConfig, aftConfigFormat } = adapter.detectConfigPaths("write");
     aftConfigPath = aftConfig;
     const schemaResult = ensureAftSchemaUrl(aftConfig, aftConfigFormat);
     if (schemaResult.action === "added" || schemaResult.action === "updated") {

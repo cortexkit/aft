@@ -3531,16 +3531,24 @@ async fn wait_for_bash_reply_deadline(
     if std::env::var("AFT_TEST_SUBC_BASH_REPLY_TIMER").as_deref() == Ok("held") {
         return std::future::pending::<()>().await;
     }
-    reply_budget.sleep_until(deadline).await;
-    // Promotion probes require the executor job to start before racing its held
-    // result against this timer. The two-second reply assertion includes this
-    // rendezvous; calls without timing hooks keep the ordinary deadline.
     #[cfg(any(test, feature = "test-timing-hooks"))]
-    if std::env::var_os("AFT_TEST_SUBC_BASH_PROMOTION_WAIT_MS").is_some() {
-        if let Ok(path) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE") {
-            while !std::path::Path::new(&path).exists() {
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
+    let promotion_gate =
+        std::env::var_os("AFT_TEST_SUBC_BASH_PROMOTE_GATE_DIR").map(std::path::PathBuf::from);
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    if promotion_gate.is_some() {
+        assert!(
+            deadline < reply_budget.deadline,
+            "started promotion selected reply deadline {deadline:?}, not before the transport budget's deadline {:?}",
+            reply_budget.deadline,
+        );
+    }
+    reply_budget.sleep_until(deadline).await;
+    // The fixture tests a promotion after its executor job has started.
+    #[cfg(any(test, feature = "test-timing-hooks"))]
+    if let Some(dir) = promotion_gate {
+        let started = dir.join("started");
+        while !started.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
 }
@@ -4408,8 +4416,15 @@ async fn submit_bash_promote(
             );
             log_ctx::with_session(Some(session_for_promote.clone()), || {
                 #[cfg(any(test, feature = "test-timing-hooks"))]
-                if let Ok(path) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE") {
-                    std::fs::write(path, b"started").expect("write promotion start marker");
+                if let Some(dir) = std::env::var_os("AFT_TEST_SUBC_BASH_PROMOTE_GATE_DIR") {
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::write(dir.join("started"), b"started")
+                        .expect("write promotion start marker");
+                    let release = dir.join("release");
+                    // The fake daemon releases the job only after checking the reply.
+                    while !release.exists() && dir.is_dir() {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
                 }
                 #[cfg(any(test, feature = "test-timing-hooks"))]
                 if let Some(delay) = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS")
@@ -5193,7 +5208,7 @@ mod grant_path_tests {
         let executor = Arc::new(Executor::new());
         executor.register_actor(root.clone(), ctx);
         let metrics = Arc::new(DispatchPathMetrics::new());
-        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","kind":"worker","scope_epoch":1,"owner_authorized":true})).unwrap();
+        let stamp: subc_protocol::scope::ScopeStamp = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","kind":"worker","scope_epoch":1,"owner_authorized":true})).unwrap();
         for (stamped, resumed) in [(true, false), (true, true), (false, false)] {
             let (tx, mut rx) = mpsc::channel(8);
             let (touch, _touch_rx) = mpsc::channel(8);

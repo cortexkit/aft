@@ -26,20 +26,8 @@ pub use prepared::{
     PreparedBindConfig,
 };
 
-/// CortexKit user config home: `$XDG_CONFIG_HOME/cortexkit/aft.jsonc`, falling
-/// back to `~/.config/cortexkit/aft.jsonc`. Matches the shared CortexKit
-/// convention (`~/.config/cortexkit/<module>.jsonc`) alongside `subc.jsonc` and
-/// `mcp.jsonc`. Pure over its env inputs so it is testable without mutating
-/// process-global env vars (which race under the parallel test runner).
-///
-/// This copy becomes the daemon's config-home callable when that API is available.
-/// The call replaces these ordered daemon rungs: non-empty XDG_CONFIG_HOME;
-/// Windows-only non-empty APPDATA; Windows-only non-empty USERPROFILE joined with
-/// `AppData/Roaming`; non-empty HOME joined with `.config`; relative `.config`.
-/// Last re-derived 2026-09-06 against subconscious
-/// d5e09914b0791a66f2a5a00a9bb3422860ade95e: compare `(rung, guard)` pairs with
-/// `subc-core/src/daemon_config.rs::default_config_path` and resolve
-/// `DAEMON_CONFIG_RELATIVE_PATH` before editing this temporary copy.
+/// Legacy AFT config lookup, kept to find files written before AFT used the
+/// daemon's shared config-home resolver.
 pub fn user_config_path_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
@@ -53,15 +41,77 @@ pub fn user_config_path_from(
     Some(base.join("cortexkit").join("aft.jsonc"))
 }
 
-/// Resolve the production CortexKit user config path from the process env. This
-/// is the only env-reading entry; it is called once at the subc boundary and the
-/// resolved path is threaded down, so the per-bind composition stays pure (and
-/// the integration tests inject a path instead of mutating env, which races).
-pub fn cortexkit_user_config_path() -> Option<PathBuf> {
+fn user_config_paths() -> (PathBuf, Option<PathBuf>) {
+    let canonical = PathBuf::from(cortexkit_store_types::resolve_config_home())
+        .join("cortexkit")
+        .join("aft.jsonc");
     let xdg = std::env::var_os("XDG_CONFIG_HOME");
     let home = crate::environment::non_empty_os_var("HOME")
         .or_else(|| crate::environment::non_empty_os_var("USERPROFILE"));
-    user_config_path_from(xdg.as_deref(), home.as_deref())
+    let legacy =
+        user_config_path_from(xdg.as_deref(), home.as_deref()).filter(|path| path != &canonical);
+    (canonical, legacy)
+}
+
+fn missing(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+}
+
+fn selected_user_config_path(canonical: &Path, legacy: Option<&Path>) -> PathBuf {
+    if let Some(legacy) = legacy.filter(|legacy| missing(canonical) && !missing(legacy)) {
+        return legacy.to_path_buf();
+    }
+    canonical.to_path_buf()
+}
+
+/// Prefer the daemon's canonical path. Read a legacy path only while the
+/// canonical file is absent, never when it is unreadable or invalid.
+pub fn cortexkit_user_config_path() -> Option<PathBuf> {
+    let (canonical, legacy) = user_config_paths();
+    Some(selected_user_config_path(&canonical, legacy.as_deref()))
+}
+
+pub(crate) fn is_legacy_user_config_path(path: &Path) -> bool {
+    user_config_paths().1.as_deref() == Some(path)
+}
+
+/// Try relocation once before startup passes the selected path to its readers.
+pub fn startup_cortexkit_user_config_path() -> Option<PathBuf> {
+    let (canonical, legacy) = user_config_paths();
+    Some(relocate_user_config(
+        &canonical,
+        legacy.as_deref(),
+        |path| std::fs::remove_file(path),
+    ))
+}
+
+fn relocate_user_config(
+    canonical: &Path,
+    legacy: Option<&Path>,
+    remove_legacy: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> PathBuf {
+    let source = selected_user_config_path(canonical, legacy);
+    if source == canonical {
+        return source;
+    }
+    match crate::config_fix::migrate_user_config_to(
+        &source,
+        canonical,
+        CONFIG_READ_LIMIT,
+        remove_legacy,
+    ) {
+        Ok(Some(outcome)) if !outcome.notice().is_empty() => {
+            crate::slog_warn!("config user: {}", outcome.notice())
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            crate::slog_warn!(
+                "config user {}: read source at /: {error}",
+                source.display()
+            );
+        }
+        _ => {}
+    }
+    selected_user_config_path(canonical, legacy)
 }
 
 /// CortexKit project config: `<root>/.cortexkit/aft.jsonc`.
@@ -107,7 +157,7 @@ pub fn legacy_project_config_location_notice(project_root: &Path, path: &Path) -
 
 /// Largest configuration file the plain readers below accept, matching the
 /// bound the prepared bind reader uses.
-const CONFIG_READ_LIMIT: usize = 1024 * 1024;
+pub(crate) const CONFIG_READ_LIMIT: usize = 1024 * 1024;
 
 /// Rewrite the user file's retired keys before it is read (see
 /// [`crate::config_fix::auto_migrate_user_config`]) and log the outcome. A
@@ -237,6 +287,7 @@ pub fn catalog_disabled_tools(user_config_path: Option<&Path>) -> Vec<String> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::config_fix::with_backup_dir_for_test;
     use crate::config_resolve::resolve_config_onto;
 
     // ---- path resolution (pure, no env mutation) ----
@@ -285,6 +336,183 @@ mod tests {
         assert_eq!(user_config_path_from(None, None), None);
     }
 
+    #[test]
+    fn settings_config_home_matches_daemon_across_platforms() {
+        const EXPECTED: &str = "AFT_TEST_CANONICAL_SETTINGS_HOME";
+        if let Some(expected) = std::env::var_os(EXPECTED) {
+            assert_eq!(
+                user_config_paths().0,
+                PathBuf::from(expected).join("cortexkit/aft.jsonc")
+            );
+            return;
+        }
+
+        // Exercise the shared resolver in a child so changing its environment
+        // does not affect settings reads from other tests.
+        let dir = tempfile::tempdir().unwrap();
+        let profile = dir.path().join("profile");
+        let home = dir.path().join("home");
+        let roaming = dir.path().join("roaming");
+        let vars = ["XDG_CONFIG_HOME", "APPDATA", "USERPROFILE", "HOME"];
+        let check = |values: [Option<&Path>; 4], expected: &Path| {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .current_dir(dir.path())
+                .args([
+                    "--exact",
+                    "subc_config::tests::settings_config_home_matches_daemon_across_platforms",
+                ])
+                .env(EXPECTED, expected);
+            for (name, value) in vars.into_iter().zip(values) {
+                match value {
+                    Some(value) => {
+                        child.env(name, value);
+                    }
+                    None => {
+                        child.env_remove(name);
+                    }
+                }
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        };
+        check(
+            [
+                Some(Path::new("relative")),
+                Some(&roaming),
+                Some(&profile),
+                Some(&home),
+            ],
+            Path::new("relative"),
+        );
+        #[cfg(windows)]
+        {
+            check(
+                [None, Some(&roaming), Some(&profile), Some(&home)],
+                &roaming,
+            );
+            check(
+                [None, Some(Path::new("")), Some(&profile), Some(&home)],
+                &profile.join("AppData/Roaming"),
+            );
+        }
+        #[cfg(not(windows))]
+        check(
+            [None, Some(&roaming), Some(&profile), Some(&home)],
+            &home.join(".config"),
+        );
+        check([None, None, None, Some(&home)], &home.join(".config"));
+        check([None, None, None, None], Path::new(".config"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_config_startup_moves_home_settings_to_appdata() {
+        const FIXTURE: &str = "AFT_TEST_WINDOWS_SETTINGS_RELOCATION";
+        const ORIGINAL: &str = "{\r\n  // keep this setting\r\n  \"bash\": true\r\n}\r\n";
+        if let Some(root) = std::env::var_os(FIXTURE).map(PathBuf::from) {
+            let legacy = root.join("home/.config/cortexkit/aft.jsonc");
+            let canonical = root.join("roaming/cortexkit/aft.jsonc");
+            let data = root.join("data");
+            assert_eq!(cortexkit_user_config_path(), Some(legacy.clone()));
+            assert_eq!(
+                startup_cortexkit_user_config_path(),
+                Some(canonical.clone())
+            );
+            assert!(
+                missing(&legacy),
+                "the production move must delete the old path"
+            );
+            let converted = std::fs::read_to_string(&canonical).unwrap();
+            assert!(converted.contains("// keep this setting\r\n"));
+            let strict = subc_jsonc::jsonc_to_json(&converted).unwrap();
+            let settings: serde_json::Value = serde_json::from_str(&strict).unwrap();
+            assert_eq!(settings["bash"]["enabled"], true);
+            assert_eq!(cortexkit_user_config_path(), Some(canonical.clone()));
+            assert_eq!(startup_cortexkit_user_config_path(), Some(canonical));
+            let backups: Vec<_> = std::fs::read_dir(data)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            assert_eq!(backups.len(), 1);
+            assert_eq!(std::fs::read(&backups[0]).unwrap(), ORIGINAL.as_bytes());
+            return;
+        }
+
+        // Exercise filesystem operations and path resolution with real child
+        // environment variables; parallel tests keep their own environment.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let legacy = root.join("home/.config/cortexkit/aft.jsonc");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(legacy, ORIGINAL).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "subc_config::tests::windows_config_startup_moves_home_settings_to_appdata",
+            ])
+            .env(FIXTURE, root)
+            .env("HOME", root.join("home"))
+            .env("APPDATA", root.join("roaming"))
+            .env("AFT_STORAGE_DIR", root.join("data"))
+            .env_remove("XDG_CONFIG_HOME")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn settings_relocation_uses_canonical_file_even_if_legacy_delete_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("old/cortexkit/aft.jsonc");
+        let canonical = dir.path().join("canonical/cortexkit/aft.jsonc");
+        let data = dir.path().join("data");
+        let original = r#"{"bash": true}"#;
+        std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+        std::fs::write(&old, original).unwrap();
+        let attempted = std::cell::Cell::new(0);
+        let start = || {
+            with_backup_dir_for_test(&data, || {
+                relocate_user_config(&canonical, Some(&old), |path| {
+                    assert_eq!(path, old);
+                    attempted.set(attempted.get() + 1);
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "legacy delete denied",
+                    ))
+                })
+            })
+        };
+        let selected = start();
+        assert_eq!(selected, canonical);
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), original);
+        let (tiers, migration) =
+            read_tiers_from(Some(&selected), &dir.path().join("project.jsonc"));
+        assert_eq!(tiers[0].source, canonical.to_string_lossy());
+        assert!(tiers[0].doc.contains("\"enabled\": true"));
+        assert_eq!(migration, None);
+        assert_eq!(start(), canonical);
+        assert_eq!(attempted.get(), 1);
+        assert_eq!(std::fs::read_to_string(&canonical).unwrap(), tiers[0].doc);
+        let backups: Vec<_> = std::fs::read_dir(data)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(&backups[0]).unwrap(), original);
+    }
+
     // ---- local file read ----
 
     #[test]
@@ -320,8 +548,9 @@ mod tests {
         std::fs::write(&user, user_text).unwrap();
         std::fs::write(&project, project_text).unwrap();
 
-        let (tiers, migration) =
-            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
+        let (tiers, migration) = with_backup_dir_for_test(&dir.path().join("data"), || {
+            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root)
+        });
         assert!(matches!(
             migration,
             Some(crate::config_fix::UserConfigMigration::Migrated { .. })
@@ -360,8 +589,9 @@ mod tests {
         let project_text = "{\n // shared settings\n \"experimental_bash_compress\": false\n}\n";
         std::fs::write(&user, user_text).unwrap();
         std::fs::write(&project, project_text).unwrap();
-        let (tiers, migration) =
-            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root);
+        let (tiers, migration) = with_backup_dir_for_test(&dir.path().join("data"), || {
+            read_local_cortexkit_config_tiers_with_migration(Some(&user), &project_root)
+        });
         assert!(matches!(
             migration,
             Some(UserConfigMigration::Migrated { .. })

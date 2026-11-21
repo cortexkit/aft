@@ -1582,9 +1582,9 @@ async fn shells_v1_real_route_refusals_unknown_agent_watch_cancel_and_drain() {
         46,
         bind(
             46,
-            "prefrontal-core",
+            "prefrontal",
             subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             },
         ),
     )

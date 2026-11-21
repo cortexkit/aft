@@ -8,6 +8,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
+#[cfg(target_os = "linux")]
+mod linux_image;
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+pub use linux_image::prepare_fixture_pin;
+
 #[rustfmt::skip]
 test_support_visibility! {
 struct PinnedExecutable {
@@ -27,6 +32,10 @@ struct PinState {
     owner: Option<std::fs::File>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     source: std::fs::File,
+    #[cfg(target_os = "linux")]
+    image_key: linux_image::ImageKey,
+    #[cfg(target_os = "linux")]
+    pin_identity: linux_image::PinIdentity,
 }
 
 #[rustfmt::skip]
@@ -95,9 +104,9 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
     // Landlock shells cannot dereference an unsandboxed daemon's procfs exe
     // link. Materialize that kernel-held image once, rather than per command.
     #[cfg(target_os = "linux")]
-    let source_path = linux_image_path();
+    let source_file = std::fs::File::open(linux_image_path())?;
     #[cfg(target_os = "linux")]
-    let mut source_file = std::fs::File::open(&source_path)?;
+    let image_key = linux_image::ImageKey::new(&source_file)?;
 
     crate::private_storage::open_root(storage)?;
     let storage = storage.canonicalize()?;
@@ -123,11 +132,12 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
 
     let result = (|| {
         let owner = owner_lock(&directory)?;
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        let (executable, pin_identity) = image_key.pin(&run, &source_file)?;
+        #[cfg(target_os = "macos")]
         let executable = {
             let destination = directory.join("aft");
             materialize(&source_path, &mut source_file, &destination, link_image)?;
-            #[cfg(target_os = "macos")]
             warm_new_image(&destination);
             destination
         };
@@ -143,6 +153,10 @@ fn prepare(storage: &Path) -> io::Result<PinnedExecutable> {
                 owner: Some(owner),
                 #[cfg(any(target_os = "linux", target_os = "macos"))]
                 source: source_file,
+                #[cfg(target_os = "linux")]
+                image_key,
+                #[cfg(target_os = "linux")]
+                pin_identity,
             }),
         })
     })();
@@ -192,7 +206,11 @@ fn cleanup(run: &Path) -> io::Result<()> {
             // Windows cannot unlink an open lock file. The owner is already
             // dead and pin names are never reused, so release before removal.
             drop(lease);
-            std::fs::remove_dir_all(entry.path())?;
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
         }
     }
     Ok(())
@@ -211,7 +229,14 @@ fn owner_lock(directory: &Path) -> io::Result<std::fs::File> {
 impl PinnedExecutable {
     fn path(&self) -> io::Result<PathBuf> {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        if self.executable.is_file() && self.directory.is_dir() {
+        #[cfg(target_os = "linux")]
+        let has_image = self
+            .executable
+            .symlink_metadata()
+            .is_ok_and(|metadata| state.pin_identity.matches(&metadata));
+        #[cfg(not(target_os = "linux"))]
+        let has_image = self.executable.is_file();
+        if has_image && self.directory.is_dir() {
             return Ok(self.executable.clone());
         }
         crate::slog_warn!(
@@ -222,7 +247,14 @@ impl PinnedExecutable {
         if !self.directory.join(OWNER_LOCK).try_exists()? {
             state.owner = Some(owner_lock(&self.directory)?);
         }
-        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        {
+            (_, state.pin_identity) = state.image_key.pin(
+                self.directory.parent().expect("pin owner directory in run"),
+                &state.source,
+            )?;
+        }
+        #[cfg(target_os = "macos")]
         {
             let temporary = self.directory.join("aft.repin");
             let _ = std::fs::remove_file(&temporary);
@@ -254,10 +286,15 @@ impl PinnedExecutable {
         let destination = task_executable(task_io);
         #[cfg(unix)]
         {
-            let mut source = std::fs::File::open(&executable)?;
-            materialize(&executable, &mut source, &destination, |from, to| {
-                std::fs::hard_link(from, to)
-            })?;
+            #[cfg(target_os = "linux")]
+            std::os::unix::fs::symlink(&executable, &destination)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let mut source = std::fs::File::open(&executable)?;
+                materialize(&executable, &mut source, &destination, |from, to| {
+                    std::fs::hard_link(from, to)
+                })?;
+            }
             let shims = self.directory.join("shims");
             if shims.join("gh").is_symlink() {
                 let target = std::fs::read_link(shims.join("gh"))?;
@@ -401,50 +438,22 @@ fn owner(name: &str) -> Option<(u32, u64)> {
     Some((pid.parse().ok()?, start.parse().ok()?))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn link_image(source: &Path, destination: &Path) -> io::Result<()> {
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let source =
-            std::ffi::CString::new(source.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        let destination =
-            std::ffi::CString::new(destination.as_os_str().as_bytes()).map_err(io::Error::other)?;
-        // SAFETY: both absolute path strings are valid and NUL-terminated.
-        // Follow procfs's exe link to the held executable, not the symlink inode.
-        let result = unsafe {
-            libc::linkat(
-                libc::AT_FDCWD,
-                source.as_ptr(),
-                libc::AT_FDCWD,
-                destination.as_ptr(),
-                libc::AT_SYMLINK_FOLLOW,
-            )
-        };
-        if result != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
-    }
-    // Never give the running daemon's executable a second name on macOS. The
-    // privacy controls name the program that asks for protected files (a
-    // removable volume, Documents, ...) by the path the kernel reports for the
-    // responsible process's executable, and with several hard links that can
-    // be any of them. Every task image then looked like a different "aft", so
-    // an Allow never stuck and the prompt blocked the volume until someone
-    // answered. Returning an error makes `materialize` clone or copy the held
-    // image into a separate file, leaving the daemon at its one placed path.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = (source, destination);
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the daemon's executable is never hard-linked on macOS",
-        ))
-    }
+    // The privacy controls name the program that asks for protected
+    // files (a removable volume, Documents, ...) by the path the kernel
+    // reports for the responsible process's executable, and with several hard
+    // links that can be any of them. Every task image then looked like a
+    // different "aft", so an Allow never stuck and the prompt blocked the
+    // volume until someone answered. Clone or copy the held image instead.
+    let _ = (source, destination);
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "the daemon's executable is never hard-linked",
+    ))
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn materialize(
     source_path: &Path,
     source: &mut std::fs::File,
@@ -469,8 +478,9 @@ fn materialize(
             if clone_held_image(source, destination).is_ok() {
                 return Ok(());
             }
-            // Storage may be on another volume. Stream the already-open image
-            // unchanged so embedded code signatures on macOS remain valid.
+            // The pin is never a link (`link_image`), and storage may be on
+            // another volume. Stream the already-open image unchanged so
+            // embedded code signatures on macOS remain valid.
             let mut output = crate::private_storage::executable_options()
                 .write(true)
                 .create_new(true)
@@ -578,7 +588,7 @@ fn clone_held_image(source: &std::fs::File, destination: &Path) -> io::Result<()
     Ok(())
 }
 
-/// Remove this daemon's pin on a controlled exit, including exits that skip Drop.
+/// Remove this daemon's private launch directory, including exits that skip Drop.
 /// Startup cleanup handles crashes and any best-effort removal failures.
 pub fn cleanup_at_exit() {
     if let Some(pin) = PINNED.get() {
@@ -610,6 +620,9 @@ pub fn startup_image_metadata() -> Option<std::fs::Metadata> {
 /// Return the daemon's startup pin, or normal executable discovery for standalone
 /// and library-only hosts that have not initialized a pin.
 pub fn path() -> io::Result<PathBuf> {
+    // On Linux the task-local path is only for the task's environment. The
+    // daemon always launches the private pin, not a mutable task artifact.
+    #[cfg(not(target_os = "linux"))]
     if let Some(directory) = TASK_IMAGE.with(|slot| slot.borrow().clone()) {
         return Ok(directory.join(if cfg!(windows) { "aft.exe" } else { "aft" }));
     }
@@ -617,6 +630,17 @@ pub fn path() -> io::Result<PathBuf> {
         return pin.path();
     }
     std::env::current_exe()
+}
+
+/// A native profile may read and execute the task's exact launcher, not its
+/// containing cache. Outside launch setup there is no task grant to add.
+#[cfg(target_os = "linux")]
+pub fn linux_task_pin() -> io::Result<Option<PathBuf>> {
+    if TASK_IMAGE.with(|slot| slot.borrow().is_some()) {
+        PINNED.get().map(PinnedExecutable::path).transpose()
+    } else {
+        Ok(None)
+    }
 }
 
 pub fn shims_dir(storage: &Path) -> PathBuf {
@@ -793,6 +817,8 @@ pub mod tests {
             .seek(io::SeekFrom::End(0))
             .unwrap();
         std::fs::remove_dir_all(&pin.directory).unwrap();
+        #[cfg(target_os = "linux")]
+        std::fs::remove_file(&pin.executable).unwrap();
         assert_eq!(pin.path().unwrap(), pin.executable);
         assert_eq!(original, digest(&pin.executable));
         assert!(pin.directory.join(OWNER_LOCK).exists());
@@ -823,7 +849,7 @@ pub mod tests {
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
     }
 
-    #[cfg(unix)]
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn pinned_executable_cross_volume_fallback_preserves_signed_bytes_and_executes() {
         use sha2::{Digest, Sha256};
@@ -858,7 +884,7 @@ pub mod tests {
     /// file, so macOS cannot report the daemon by a pin or task-image path.
     #[cfg(target_os = "macos")]
     #[test]
-    fn pinned_executable_macos_pin_is_a_separate_file_from_the_running_image() {
+    fn pinned_executable_pin_is_a_separate_file_from_the_running_image() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let storage = tempfile::tempdir().unwrap();
         let executable = storage.path().join("deploy");
@@ -882,7 +908,42 @@ pub mod tests {
         assert!(output.status.success(), "{output:?}");
     }
 
-    #[cfg(unix)]
+    /// Linking the running image, even once, changes its inode change time and
+    /// link count. Keep the storage on the test binary's own mount so that a
+    /// hard link would succeed if `prepare` or `task_image` made one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_executable_prepare_and_task_image_leave_the_running_image_unchanged() {
+        use std::os::unix::fs::MetadataExt;
+        let image = linux_image_path();
+        let beside = std::env::current_exe().unwrap();
+        let beside = beside.parent().unwrap();
+        let storage = tempfile::tempdir_in(beside).unwrap();
+        let task = tempfile::tempdir_in(beside).unwrap();
+        let before = std::fs::metadata(&image).unwrap();
+        let pin = prepare(storage.path()).unwrap();
+        pin.task_image(task.path()).unwrap();
+        let pinned = std::fs::metadata(&pin.executable).unwrap();
+        let after = std::fs::metadata(&image).unwrap();
+        assert_ne!(
+            (before.dev(), before.ino()),
+            (pinned.dev(), pinned.ino()),
+            "the pin is a hard link to the running image"
+        );
+        assert_eq!(
+            before.nlink(),
+            after.nlink(),
+            "the running image gained a name"
+        );
+        assert_eq!(
+            (before.ctime(), before.ctime_nsec()),
+            (after.ctime(), after.ctime_nsec()),
+            "the running image's inode change time moved"
+        );
+        pin.cleanup_at_exit();
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
     #[test]
     fn pinned_executable_hard_link_holds_original_inode_after_replacement() {
         use std::os::unix::fs::MetadataExt;

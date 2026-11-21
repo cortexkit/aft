@@ -778,7 +778,7 @@ fn audit_repository_snapshot_survives_origin_rewrite_after_ticket_mint() {
         Some(
             ScopeStamp::new(
                 subc_protocol::Principal::Reserved {
-                    module_id: "prefrontal-core".into(),
+                    module_id: "prefrontal".into(),
                 },
                 "worker",
                 1,

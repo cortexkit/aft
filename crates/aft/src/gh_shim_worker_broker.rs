@@ -156,7 +156,7 @@ pub(crate) fn with_available_service_for_test<R>(root: &Path, run: impl FnOnce()
     };
     let scope = ScopeStamp::new(
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "optional-spawn-scope",
         1,

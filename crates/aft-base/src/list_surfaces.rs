@@ -632,6 +632,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Keyset pagination bounds background lifecycle probes, not permissions.list; every live grant remains listed and later maintenance ticks continue after the saved cursor.",
     },
     ExclusionEntry {
+        file: "db/codemode_owners.rs",
+        enclosing_item: "save",
+        location_or_primitive: "MAX_ROWS (4,096), SQL LIMIT/OFFSET",
+        reason: "Eviction bounds the optional local route identity cache, not a list returned by a tool.",
+    },
+    ExclusionEntry {
         file: "subc/consent_expiry.rs",
         enclosing_item: "candidates, Sweep::run",
         location_or_primitive: "SQL LIMIT, ROW_LIMIT (32)",

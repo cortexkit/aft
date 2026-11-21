@@ -23,10 +23,10 @@ fn stamp(
     parent: Option<&str>,
 ) -> subc_protocol::scope::ScopeStamp {
     serde_json::from_value(json!({
-        "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+        "owner": {"kind": "reserved", "module_id": "prefrontal"},
         "ref": name, "kind": kind, "scope_epoch": epoch, "owner_authorized": true,
         "parent": parent.map(|name| json!({
-            "owner": {"kind": "reserved", "module_id": "prefrontal-core"},
+            "owner": {"kind": "reserved", "module_id": "prefrontal"},
             "ref": name, "scope_epoch": epoch
         }))
     }))

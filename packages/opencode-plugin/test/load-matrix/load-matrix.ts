@@ -1904,7 +1904,7 @@ await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
     );
     const rpc = location.rpcRegistrations.find(({ definition }) => definition.id === "aft");
     if (!rpc) throw new Error("enabled V2 effect did not register AftRpc");
-    if (Object.keys(rpc.definition.methods).join(",") !== "getStatus") {
+    if (Object.keys(rpc.definition.methods).join(",") !== "getStatus,getBackgroundTasks,stopBackgroundTask") {
       throw new Error("enabled V2 effect registered unexpected AftRpc methods");
     }
     const status = yield* rpc.handlers.getStatus({ sessionID: "lifecycle-" + index });
@@ -2899,6 +2899,25 @@ export default { id: original.id, effect };
     expect(result.status).toBe(0);
   }, 300_000);
 
+  test.skipIf(process.platform === "win32")(
+    "GA host lists, refreshes and stops AFT background tasks",
+    async () => {
+      const { v2 } = await ensureHostInstalls();
+      const result = await withOperatorCanary("v2-background-tasks", () =>
+        run("bun", ["test", "src/__tests__/e2e/v2-background-tasks.test.ts"], pluginRoot, {
+          env: { ...process.env, AFT_V2_HOST_BINARY: v2Binary(v2) },
+          timeoutMs: 120_000,
+        }),
+      );
+      const transcript = `${result.stdout}\n${result.stderr}`;
+      console.log(`[v2-background-tasks-host-transcript]\n${transcript}`);
+      expect(transcript).toContain("1 pass");
+      expect(transcript).toContain("0 fail");
+      expect(result.status).toBe(0);
+    },
+    150_000,
+  );
+
   // The subc daemon serves every head bound to a project from one AFT module,
   // so this row binds an OpenCode 1-style head beside the GA host's session on
   // one root and checks each keeps its own tool names. The e2e test starts its
@@ -3439,6 +3458,7 @@ export default entry;
       "v2-synthetic-completion",
       "v2-completion-detach",
       "v2-host-tool-names",
+      "v2-background-tasks",
       "v2-subc-tool-names",
       "v2-tui-keymap",
       "v2-tui-late-service",

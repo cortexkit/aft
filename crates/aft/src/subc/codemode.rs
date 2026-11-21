@@ -13,12 +13,13 @@
 //!   that agent's authority, consent, secrets, tasks or handles.
 //!
 //! The stamped parent link is used only to find the owning scope. AFT then
-//! finds its own live route bound under that scope (for an agent run, one whose
+//! finds a live runner route bound under that scope (for an agent run, one whose
 //! stamp carries the same `agent_id` as the run; for a worker run, one whose
 //! scope is a worker's) and runs the call with that route's root, session,
 //! policy, grants, config, disabled tools, sandbox profile and confinement. The
 //! run route's own bind root and session are configuration, never authority,
-//! and so are the call's arguments.
+//! and so are the call's arguments. Without a live runner route, AFT may use a
+//! saved runner identity after the daemon confirms the parent scope and epoch.
 //!
 //! A run whose owning route can't be found this way is refused with
 //! `run_owner_not_bound`, and the refusal's `detail.reason` names why. A worker
@@ -40,17 +41,19 @@ pub(super) enum RunKind {
     Worker { on_behalf_of_agent: String },
 }
 
-/// The route a codemode call takes its access from, resolved from the run's stamp.
+/// The bind a codemode call takes its access from, located by the parent scope
+/// named in the daemon's authenticated run stamp.
 #[derive(Debug)]
 pub(super) struct RunOwner {
     pub(super) kind: RunKind,
     pub(super) run_id: String,
-    /// The live route whose access the call runs with: the head agent's route
+    /// The bind whose access the call runs with: the head agent's route
     /// for an agent run, the worker's own route for a worker run. Authority
     /// keyed by route identity (grant scope, confinement key, frozen worker
     /// params) is read from it, never from the run route.
     pub(super) owner_route: RouteIdentity,
-    pub(super) owner_route_channel: RouteChannel,
+    /// A saved bind's historical channel must never be used as a live route.
+    pub(super) owner_route_channel: Option<RouteChannel>,
     /// Catalog-attested worker ownership for shell tasks, not spawn authority.
     pub(super) task_identity: Option<crate::bash_background::TaskIdentity>,
     /// The run route the call arrived on, for audit lines.
@@ -96,6 +99,8 @@ pub(super) enum Admission {
     Owner(RouteIdentity),
     /// Candidate policies need a bounded read off the frame loop.
     AwaitPolicies(Vec<RouteIdentity>),
+    /// Wait for a saved bind without blocking other incoming protocol requests.
+    AwaitOwner(subc_protocol::scope::ScopeParent),
     /// A codemode tool call that must not run. The error is terminal.
     Refused(subc_protocol::ErrorBody),
 }
@@ -151,14 +156,24 @@ pub(super) fn launches_shell_task(body: Option<&Value>) -> bool {
         .is_some_and(|name| matches!(name, "bash" | "powershell"))
 }
 
-/// Decide how the request on `route` is admitted. Only codemode tool calls
-/// are affected. The order follows the contract: whether the tool serves
-/// codemode at all, then whether the run's stamp names a live owner route (the
-/// same agent's head route, or a worker run's own worker route).
+#[cfg(test)]
 pub(super) fn admit(
     routes: &HashMap<RouteChannel, RouteIdentity>,
     route: RouteChannel,
     body: Option<&Value>,
+    saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
+) -> Admission {
+    admit_with_saved(routes, route, body, Some(&[]), |_| true, saved_policy)
+}
+
+/// Admit only codemode tool calls. Check tool support before looking for the
+/// owning scope's runner. A live runner takes precedence over any saved bind.
+pub(super) fn admit_with_saved(
+    routes: &HashMap<RouteChannel, RouteIdentity>,
+    route: RouteChannel,
+    body: Option<&Value>,
+    saved: Option<&[(RouteChannel, RouteIdentity)]>,
+    saved_root_active: impl FnOnce(&ProjectRootId) -> bool,
     saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
 ) -> Admission {
     let Some(run) = routes.get(&route) else {
@@ -173,7 +188,15 @@ pub(super) fn admit(
     if let Err(error) = tool_provider::admit_call_mode(name, &run.call_mode) {
         return Admission::Refused(error);
     }
-    match resolve_owner(routes, route, run, launches_shell_task(body), saved_policy) {
+    match resolve_owner(
+        routes,
+        route,
+        run,
+        launches_shell_task(body),
+        saved,
+        saved_root_active,
+        saved_policy,
+    ) {
         Ok(admission) => admission,
         Err(error) => {
             crate::slog_warn!(
@@ -246,18 +269,20 @@ pub(super) fn run_kind(
     })
 }
 
-/// Whether a head route's scope owner is the run parent's owner. A runner that
-/// adopted its head before the prefrontal module rename keeps binding that
-/// head's routes under the old owner name, with the same scope ref and epoch
-/// the new owner registered. Both names are the same module, so either one
-/// owns the head.
-fn same_owner(
-    route_owner: &subc_protocol::Principal,
-    parent_owner: &subc_protocol::Principal,
-) -> bool {
-    route_owner == parent_owner
-        || crate::access_policy::prefrontal::counterpart_owner(route_owner).as_ref()
-            == Some(parent_owner)
+/// Scope owners can bind routes to keep a scope live or make their own calls.
+/// Those binds must not lend the owner's grants or sandbox settings to the runner.
+pub(super) fn is_scope_owner_route(identity: &RouteIdentity) -> bool {
+    let Some(scope) = &identity.scope else {
+        return false;
+    };
+    let AuthenticatedPrincipal::RouteBind {
+        principal_id: Some(id),
+        ..
+    } = &identity.spawn_principal
+    else {
+        return false;
+    };
+    principal_id(&Some(scope.owner.clone())).as_deref() == Some(id.as_str())
 }
 
 fn resolve_owner(
@@ -265,9 +290,11 @@ fn resolve_owner(
     route: RouteChannel,
     run: &RouteIdentity,
     launches_shell_task: bool,
+    saved: Option<&[(RouteChannel, RouteIdentity)]>,
+    saved_root_active: impl FnOnce(&ProjectRootId) -> bool,
     mut saved_policy: impl FnMut(&RouteIdentity) -> Option<SavedPolicyRead>,
 ) -> Result<Admission, subc_protocol::ErrorBody> {
-    use subc_protocol::scope::{ParentState, ScopeKind};
+    use subc_protocol::scope::ParentState;
     let Some(stamp) = run.scope.as_ref() else {
         return Err(not_bound(
             "run_scope_missing",
@@ -335,87 +362,35 @@ fn resolve_owner(
             ));
         }
     }
-    // Every live classic route bound under the parent scope. Neither a route
-    // acting for a run nor a codemode route is ever an owner.
-    let under_parent = routes.iter().filter(|(channel, identity)| {
-        **channel != route
-            && identity.run_owner.is_none()
-            && identity.call_mode == subc_protocol::call_mode::CallMode::Classic
-            && identity.scope.as_ref().is_some_and(|scope| {
-                scope.owner_authorized
-                    && same_owner(&scope.owner, &parent.owner)
-                    && scope.scope_ref == parent.scope_ref
-                    && scope.scope_epoch == parent.scope_epoch
-            })
-    });
-    let of_kind = |kind: ScopeKind| {
-        move |(_, identity): &(&RouteChannel, &RouteIdentity)| {
-            identity
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.kind == kind)
+    let mut owners = codemode_owners::live_candidates(routes, route, &kind, parent)
+        .map_err(|(reason, message)| refuse(reason, message))?;
+    let no_runner = || {
+        if worker_run {
+            refuse(
+                "worker_route_not_bound",
+                "no live runner route of the worker scope is bound to AFT yet",
+            )
+        } else {
+            refuse(
+                "head_route_not_bound",
+                "no live route of the run's head scope is bound to AFT",
+            )
         }
     };
-    let mut owners: Vec<(&RouteChannel, &RouteIdentity)> = match &kind {
-        RunKind::Agent { agent_id } => {
-            let heads: Vec<_> = under_parent.filter(of_kind(ScopeKind::Head)).collect();
-            if heads.is_empty() {
-                return Err(refuse(
-                    "head_route_not_bound",
-                    "no live route of the run's head scope is bound to AFT",
-                ));
-            }
-            heads
-                .into_iter()
-                .filter(|(_, identity)| {
-                    identity
-                        .scope
-                        .as_ref()
-                        .and_then(|head| head.attributes.agent_id.as_deref())
-                        == Some(agent_id.as_str())
-                })
-                .collect()
+    let using_saved = owners.is_empty();
+    if using_saved {
+        if run
+            .run_scope
+            .get()
+            .is_some_and(|run| run.saved_owner_ended(parent))
+        {
+            return Err(no_runner());
         }
-        RunKind::Worker { .. } => {
-            let candidates: Vec<_> = under_parent.collect();
-            if candidates.is_empty() {
-                return Err(refuse(
-                    "worker_route_not_bound",
-                    "no live runner route of the worker scope is bound to AFT yet",
-                ));
-            }
-            // A worker run under a head (or any non-worker) scope would run
-            // with that scope's authority, which a worker run never carries.
-            let mut workers: Vec<_> = candidates
-                .into_iter()
-                .filter(of_kind(ScopeKind::Worker))
-                .collect();
-            if workers.is_empty() {
-                return Err(refuse(
-                    "parent_not_worker",
-                    "the worker run's parent scope is not a worker's scope",
-                ));
-            }
-            // The scope owner's routes keep the worker scope leased; only runner
-            // routes carry the worker's saved tool settings, keyed by runner principal.
-            // Exclude owner-principal routes regardless of tool-call history.
-            let scope_owner = super::principal_id(&Some(parent.owner.clone()));
-            workers.retain(|(_, identity)| {
-                !matches!(
-                    &identity.spawn_principal,
-                    AuthenticatedPrincipal::RouteBind { principal_id: Some(id), .. }
-                        if Some(id.as_str()) == scope_owner.as_deref()
-                )
-            });
-            if workers.is_empty() {
-                return Err(refuse(
-                    "worker_route_not_bound",
-                    "no live runner route of the worker scope is bound to AFT yet",
-                ));
-            }
-            workers
-        }
-    };
+        let Some(saved) = saved else {
+            return Ok(Admission::AwaitOwner(parent.clone()));
+        };
+        owners = codemode_owners::saved_candidates(saved, &kind, parent);
+    }
     // Plugins cache a session's routes per project root. Prefer the owner routes
     // at the run's root, so a route opened while working in another checkout
     // does not compete with this checkout's owner. A run may also bind elsewhere:
@@ -427,10 +402,7 @@ fn resolve_owner(
     }
     owners.sort_by_key(|(channel, _)| (channel.channel, channel.epoch));
     let Some((owner_channel, owner)) = owners.first() else {
-        return Err(refuse(
-            "agent_mismatch",
-            "the head route's agent is not the agent the run is on",
-        ));
+        return Err(no_runner());
     };
     let mut policies = Vec::new();
     for (other_channel, other) in &owners {
@@ -445,6 +417,9 @@ fn resolve_owner(
             ));
         }
         policies.push(saved_policy(other));
+    }
+    if using_saved && !saved_root_active(&owner.root) {
+        return Err(no_runner());
     }
     let mut task_identity = None;
     if owners.len() > 1 || worker_run {
@@ -486,7 +461,7 @@ fn resolve_owner(
         kind,
         run_id,
         route,
-        **owner_channel,
+        (!using_saved).then_some(**owner_channel),
         task_identity,
     )))
 }
@@ -752,7 +727,7 @@ fn effective_identity(
     kind: RunKind,
     run_id: &str,
     route: RouteChannel,
-    owner_route_channel: RouteChannel,
+    owner_route_channel: Option<RouteChannel>,
     task_identity: Option<crate::bash_background::TaskIdentity>,
 ) -> RouteIdentity {
     let run_scope = OnceLock::new();

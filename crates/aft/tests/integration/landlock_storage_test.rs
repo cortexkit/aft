@@ -231,7 +231,7 @@ async fn storage_lease_starts_without_reading_root_under_landlock() {
             "daemon did not hold its storage lease"
         );
         assert!(
-            fs::read_dir(storage.join("run"))
+            fs::read_dir(storage.join("run/aft-images"))
                 .unwrap()
                 .any(|entry| { entry.unwrap().path().join("aft").is_file() }),
             "daemon did not materialize its startup image"

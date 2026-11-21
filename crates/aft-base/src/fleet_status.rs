@@ -38,8 +38,7 @@ const DISCOVERY_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
 const DISCOVERY_MAX_BACKOFF: Duration = Duration::from_secs(60);
 const STATUS_PUBLISH_TTL_MS: u64 = 7_500;
 const STATUS_MODULE: &str = "aft";
-#[cfg(any(test, feature = "test-support"))]
-const STATUS_HOLDER_MODULE: &str = crate::prefrontal::LEGACY_MODULE_ID;
+const STATUS_HOLDER_MODULE: &str = crate::prefrontal::MODULE_ID;
 const STATUS_LINE_OPERATION: &str = "status.line";
 
 #[cfg(any(test, feature = "test-support"))]
@@ -743,7 +742,6 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         std::collections::VecDeque::new();
 
     let mut route: Option<C::Route> = None;
-    let mut route_module = None;
     let mut route_events = None;
     let mut catalog_watch = None;
     let mut catalog_generation = None;
@@ -772,22 +770,10 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         };
         if tokio::time::Instant::now() >= next_discovery_at {
             let catalog = consumer.catalog_list().await;
-            if let Ok(catalog) = &catalog {
-                crate::prefrontal::observe_catalog(
-                    catalog.modules.iter().map(|entry| entry.module_id.as_str()),
-                );
-            }
             match catalog {
                 Ok(catalog) if status_holder(&catalog.modules).is_some() => {
-                    let holder = status_holder(&catalog.modules).expect("advertised status holder");
+                    let holder = STATUS_HOLDER_MODULE;
                     catalog_generation = Some(catalog.generation);
-                    if route_module != Some(holder) {
-                        if let Some(opened_route) = route.take() {
-                            let _ = consumer.close_handle(&opened_route).await;
-                            client.set_route_live(false);
-                        }
-                        route_events = None;
-                    }
                     if route.is_none()
                         && reopen_forbidden.is_none()
                         && !refused_identities.contains(&route_identity)
@@ -813,7 +799,6 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                                     last_route_channel =
                                         Some(consumer.route_channel(&opened_route));
                                     route = Some(opened_route);
-                                    route_module = Some(holder);
                                     discovery_backoff = DISCOVERY_INITIAL_BACKOFF;
                                 }
                                 Err(error) => {
@@ -1066,12 +1051,10 @@ fn complete_status_publish_call(request: StatusWireRequest, body: &[u8]) -> bool
 }
 
 fn status_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<&'static str> {
-    let holder =
-        crate::prefrontal::catalog_module(entries.iter().map(|entry| entry.module_id.as_str()));
     entries
         .iter()
         .any(|entry| {
-            entry.module_id == holder && entry.roles.iter().any(|role| {
+            entry.module_id == STATUS_HOLDER_MODULE && entry.roles.iter().any(|role| {
             matches!(
                 role,
                 ProviderRole::ManagementSurface { operations, .. }
@@ -1079,7 +1062,7 @@ fn status_holder(entries: &[subc_client_rs::CatalogEntry]) -> Option<&'static st
             )
         })
         })
-        .then_some(holder)
+        .then_some(STATUS_HOLDER_MODULE)
 }
 
 /// Room for the daemon's control pushes between two turns of the dial loop.
@@ -1249,7 +1232,7 @@ pub mod tests {
     #[derive(Default)]
     pub struct FakeCatalogWatch {
         available: std::sync::atomic::AtomicBool,
-        renamed: std::sync::atomic::AtomicBool,
+        legacy_only: std::sync::atomic::AtomicBool,
         targets: parking_lot::Mutex<Vec<String>>,
         generation: AtomicU64,
         sender: parking_lot::Mutex<Option<mpsc::Sender<u64>>>,
@@ -1295,8 +1278,8 @@ pub mod tests {
                 generation: self.watch.generation.load(Ordering::Relaxed).max(1),
                 modules: if self.advertises_status_line {
                     vec![status_catalog_entry(
-                        if self.watch.renamed.load(Ordering::Relaxed) {
-                            "prefrontal"
+                        if self.watch.legacy_only.load(Ordering::Relaxed) {
+                            "prefrontal-core"
                         } else {
                             STATUS_HOLDER_MODULE
                         },
@@ -1406,14 +1389,14 @@ pub mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn prefrontal_rename_status_redials_on_catalog_change_without_restart() {
+    async fn status_dial_ignores_the_legacy_advertiser_on_catalog_change() {
         let (task, _, watch, _) = watch_dial(1).await;
-        assert_eq!(*watch.targets.lock(), ["prefrontal-core"]);
-        watch.renamed.store(true, Ordering::Relaxed);
+        assert_eq!(*watch.targets.lock(), ["prefrontal"]);
+        watch.legacy_only.store(true, Ordering::Relaxed);
         watch.generation.store(2, Ordering::Relaxed);
         watch.sender.lock().as_ref().unwrap().try_send(2).unwrap();
         settle_dial().await;
-        assert_eq!(*watch.targets.lock(), ["prefrontal-core", "prefrontal"]);
+        assert_eq!(*watch.targets.lock(), ["prefrontal"]);
         task.abort();
         let _ = task.await;
     }
@@ -1460,18 +1443,22 @@ pub mod tests {
     }
 
     #[test]
-    fn prefrontal_rename_status_discovery_and_close_push_accept_both() {
-        for module in crate::prefrontal::MODULE_IDS {
+    fn status_discovery_and_close_push_accept_only_prefrontal() {
+        for module in ["prefrontal", "prefrontal-core", "other"] {
+            let accepted = module == "prefrontal";
             assert_eq!(
                 status_holder(&[status_catalog_entry(module, STATUS_LINE_OPERATION)]),
-                Some(module)
+                accepted.then_some(module)
             );
             let push = ControlPush {
                 op: "route.closed".into(),
                 body: json!({"op":"route.closed", "module_id":module, "reason":"scope_ended"}),
             };
             let mut forbidden = None;
-            assert!(record_forbidden_reopen(&push, None, &mut forbidden));
+            assert_eq!(
+                record_forbidden_reopen(&push, None, &mut forbidden),
+                accepted
+            );
         }
     }
 

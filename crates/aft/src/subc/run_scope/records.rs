@@ -49,6 +49,7 @@ impl Registry {
             stamp: stamp.clone(),
             control: control.clone(),
             describe_lock: tokio::sync::Mutex::new(()),
+            saved_owner_proofs: Default::default(),
             budget: StdMutex::new(None),
             revoked: AtomicBool::new(records.ended.contains(&key)),
             authorization: StdMutex::new(()),
@@ -88,6 +89,17 @@ pub(super) struct Registration {
 }
 
 impl Registration {
+    pub(super) fn parent_ended(&self, parent: &subc_protocol::scope::ScopeParent) -> bool {
+        self.registry.upgrade().is_some_and(|registry| {
+            let records = registry.lock().unwrap();
+            principal_id(&Some(parent.owner.clone())).is_some_and(|id| {
+                records
+                    .ended
+                    .contains(&(id, parent.scope_ref.clone(), parent.scope_epoch))
+            })
+        })
+    }
+
     pub(super) fn keep_parked(&self, scope: &Arc<RunScope>) {
         if let Some(registry) = self.registry.upgrade() {
             registry

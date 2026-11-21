@@ -1308,7 +1308,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn prefrontal_scope_background_tasks_lists_rehomed_lifecycle_not_spawn_owner() {
+    fn prefrontal_scope_background_tasks_reads_persisted_lifecycle_not_spawn_owner() {
         use crate::bash_background::{
             persistence, registry::with_scope_spawn, BashShell, BgTaskRegistry, HardKill, TaskSlot,
         };
@@ -1324,7 +1324,10 @@ mod tests {
             old.epoch,
             subc_protocol::scope::ScopeKind::Worker,
         );
-        let live = crate::access_policy::prefrontal::counterpart(&stamp).unwrap();
+        let mut live = stamp.clone();
+        live.owner = Principal::Reserved {
+            module_id: "prefrontal".into(),
+        };
         let new = Selector {
             owner: live.owner.clone(),
             scope_ref: live.scope_ref.clone(),
@@ -1359,13 +1362,12 @@ mod tests {
             )
         };
         assert_eq!(observe(&old).data["running"][0]["task_id"], id);
-        assert_eq!(registry.rehome_scope(&stamp, &live).unwrap(), 1);
-        assert_eq!(observe(&new).data["running"][0]["task_id"], id);
-        assert_eq!(observe(&old).data["running"], json!([]));
         let paths = persistence::task_paths(dir.path(), "session", &id).unwrap();
         let layout = persistence::resolve_task_layout(&paths.session_dir, &id).unwrap();
         let paths = &layout.paths;
-        let metadata = persistence::read_task_at(&layout).unwrap();
+        let mut metadata = persistence::read_task_at(&layout).unwrap();
+        metadata.lifecycle_scope = Some(live);
+        persistence::write_task_at(&layout, &metadata).unwrap();
         assert_eq!(metadata.scope.as_ref(), Some(&stamp));
         let sessions = [paths.session_dir.clone()];
         for selected in [&old, &new] {

@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn stamp() -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         },
         "worker-broker",
         7,

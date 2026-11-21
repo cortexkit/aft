@@ -10,12 +10,19 @@ import {
   registerNotificationSink,
   registerStatusChangeSink,
 } from "../shared/rpc-notifications";
+import { getSessionDirectoryForEvent } from "../shared/session-directory";
 import { NOT_STARTED_STATUS_TEXT } from "../shared/status";
+import { callBashBridge } from "../tools/_shared";
+import type { PluginContext } from "../types";
 import {
+  type AftBackgroundTask,
+  type AftBackgroundTaskSession,
   type AftHostToolOverlapNotice,
   type AftIndexProgress,
   AftRpc,
   type AftRpcSession,
+  type AftStopBackgroundTaskInput,
+  type AftStopBackgroundTaskResult,
 } from "./contract";
 
 type RpcRegistration = {
@@ -29,11 +36,19 @@ type RpcRegistration = {
 };
 
 export type AftRpcContext = {
+  location?: AftRpcLocation;
+  session?: { get?: unknown };
   rpc: {
     register(
       definition: typeof AftRpc,
       handlers: {
         getStatus(input: AftRpcSession): Effect.Effect<Record<string, unknown>, unknown>;
+        getBackgroundTasks(
+          input: AftBackgroundTaskSession,
+        ): Effect.Effect<AftBackgroundTask[], unknown>;
+        stopBackgroundTask(
+          input: AftStopBackgroundTaskInput,
+        ): Effect.Effect<AftStopBackgroundTaskResult, unknown>;
       },
     ): Effect.Effect<RpcRegistration, unknown, Scope.Scope>;
   };
@@ -41,6 +56,7 @@ export type AftRpcContext = {
 
 export type AftRpcLocation = {
   directory: string;
+  workspaceID?: string;
 };
 
 export type RegisteredAftRpc = {
@@ -141,10 +157,36 @@ function restoreOwnProperty(
   else Reflect.deleteProperty(target, key);
 }
 
+function taskSnapshot(reply: Record<string, unknown>, taskID: string, command: string) {
+  if (
+    reply.success === false &&
+    (reply.code === "task_not_found" || reply.code === "task_erased")
+  ) {
+    return;
+  }
+  const { status } = reply;
+  if (reply.success === true && reply.task_id === taskID) {
+    switch (status) {
+      case "starting":
+      case "running":
+      case "killing":
+        return { active: true, status } as const;
+      case "completed":
+      case "failed":
+      case "killed":
+      case "timed_out":
+      case "fate_unknown":
+        return { active: false, status } as const;
+    }
+  }
+  throw new Error(`${command} did not return a task snapshot`);
+}
+
 export function registerAftRpc(
   context: AftRpcContext,
   location: AftRpcLocation,
   pool: AftTransportPool,
+  toolContext?: PluginContext,
 ): Effect.Effect<RegisteredAftRpc, unknown, Scope.Scope> {
   return Effect.gen(function* () {
     const root = locationRoot(location);
@@ -198,7 +240,83 @@ export function registerAftRpc(
         );
       });
 
-    registration = yield* context.rpc.register(AftRpc, { getStatus });
+    // Only the bound session's active task IDs may reach the status and kill
+    // commands; those commands also support broader task lookups for agents.
+    const ownedTasks = async (sessionID: string, signal: AbortSignal) => {
+      if (
+        !toolContext ||
+        typeof context.session?.get !== "function" ||
+        context.location?.directory !== root ||
+        context.location.workspaceID !== location.workspaceID
+      ) {
+        throw new Error("AFT background task session could not be verified");
+      }
+      const directory = await getSessionDirectoryForEvent(context, sessionID, root);
+      if (directory !== root) throw new Error("AFT background task session could not be verified");
+      const runtime = { sessionID, directory, directoryIsSessionRoot: true, effectAbort: signal };
+      const { success, task_ids: ids } = await callBashBridge(
+        toolContext,
+        runtime,
+        "bash_owned_tasks",
+      );
+      if (
+        success !== true ||
+        !Array.isArray(ids) ||
+        !ids.every((id): id is string => !!nonEmptyString(id))
+      ) {
+        throw new Error("bash_owned_tasks did not return active task IDs");
+      }
+      const status = (id: string) =>
+        callBashBridge(toolContext, { ...runtime, observeBashStatus: true }, "bash_status", {
+          task_id: id,
+        });
+      return { ids, runtime, status, context: toolContext };
+    };
+
+    registration = yield* context.rpc.register(AftRpc, {
+      getStatus,
+      getBackgroundTasks: ({ sessionID }) =>
+        Effect.tryPromise(async (signal) => {
+          const { ids, status } = await ownedTasks(sessionID, signal);
+          const tasks = await Promise.all(
+            ids.map(async (id): Promise<AftBackgroundTask | undefined> => {
+              const reply = await status(id);
+              if (!taskSnapshot(reply, id, "bash_status")?.active) return;
+              const command = nonEmptyString(reply.command);
+              const workdir = nonEmptyString(reply.workdir);
+              const elapsedMs = finiteNumber(reply.elapsed_ms);
+              return {
+                id,
+                ...(command === undefined ? {} : { command }),
+                ...(workdir === undefined ? {} : { workdir }),
+                ...(elapsedMs === undefined || elapsedMs < 0 ? {} : { elapsedMs }),
+              };
+            }),
+          );
+          return tasks.filter((task) => task !== undefined);
+        }),
+      stopBackgroundTask: ({ sessionID, taskID }) =>
+        Effect.tryPromise(async (signal): Promise<AftStopBackgroundTaskResult> => {
+          const { ids, runtime, status, context } = await ownedTasks(sessionID, signal);
+          if (!ids.includes(taskID)) return { outcome: "not-active" };
+          const before = taskSnapshot(await status(taskID), taskID, "bash_status");
+          if (!before) return { outcome: "not-active" };
+          if (before.status === "fate_unknown") {
+            throw new Error("Background task outcome is unknown");
+          }
+          if (!before.active) return { outcome: "finished" };
+
+          const reply = await callBashBridge(context, runtime, "bash_kill", { task_id: taskID });
+          const after = taskSnapshot(reply, taskID, "bash_kill");
+          if (!after) return { outcome: "not-active" };
+          // A pending remote cancel isn't confirmation, and a natural exit can
+          // win the race with the kill. Use the terminal result, not `success`.
+          if (after.active || after.status === "fate_unknown") {
+            throw new Error("Background task stop was not confirmed");
+          }
+          return { outcome: after.status === "killed" ? "stopped" : "finished" };
+        }),
+    });
 
     const ownGetBridge = Object.getOwnPropertyDescriptor(pool, "getBridge");
     const ownToolCall = Object.getOwnPropertyDescriptor(pool, "toolCall");
@@ -275,6 +393,8 @@ export function registerAftConfigErrorRpc(
     let disposed = false;
     const registration = yield* context.rpc.register(AftRpc, {
       getStatus: () => Effect.succeed(configErrorStatusSnapshot(message)),
+      getBackgroundTasks: () => Effect.fail(new Error("AFT background tasks unavailable")),
+      stopBackgroundTask: () => Effect.fail(new Error("AFT background tasks unavailable")),
     });
     const emit = async (
       name: keyof typeof AftRpc.events,

@@ -96,12 +96,12 @@
     }
   },
   "nothing_running": {
-    "principal": { "kind": "reserved", "module_id": "prefrontal-core" },
+    "principal": { "kind": "reserved", "module_id": "prefrontal" },
     "request": {
       "op": "bash.kill_scope",
       "params": {
         "scope": {
-          "owner": { "kind": "reserved", "module_id": "prefrontal-core" },
+          "owner": { "kind": "reserved", "module_id": "prefrontal" },
           "ref": "empty-scope",
           "scope_epoch": 1,
           "kind": "worker",

@@ -1,0 +1,1 @@
+- On Linux, AFT commands no longer change the installed daemon file's metadata, which made file-integrity checks report a change after every command (#1422).

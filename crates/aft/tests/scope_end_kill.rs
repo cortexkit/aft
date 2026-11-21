@@ -904,9 +904,9 @@ async fn first_party_worker_bash_runs_with_default_relaxed_and_reports_unenforce
     .unwrap();
     std::fs::write(root.join("project/worker-proof.txt"), "relaxed-worker-ran").unwrap();
     let scope = serde_json::from_value(json!({
-        "owner": {"kind":"reserved","module_id":"prefrontal-core"},
+        "owner": {"kind":"reserved","module_id":"prefrontal"},
         "ref":"worker-scope", "scope_epoch":1, "kind":"worker",
-        "parent": {"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"head-scope","scope_epoch":1},
+        "parent": {"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"head-scope","scope_epoch":1},
         "owner_authorized":true
     })).unwrap();
     daemon.bind(1, 1, "broca", Some(scope), false).await;
@@ -1556,17 +1556,20 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        std::fs::read_dir(root.join("data/cortexkit/aft/run"))
-            .unwrap()
-            .count(),
-        0
-    );
+    let run = root.join("data/cortexkit/aft/run");
+    // Exit removes the daemon's owner directory, not Linux's shared image.
+    assert!(!std::fs::read_dir(&run).unwrap().any(|entry| entry
+        .unwrap()
+        .file_name()
+        .to_string_lossy()
+        .starts_with("aft-pinned-")));
+    #[cfg(target_os = "linux")]
+    assert!(run.join("aft-images").is_dir());
     std::fs::write(root.join("sandbox-start"), b"run").unwrap();
     while !root.join("project/started").exists() {
         assert!(
             tokio::time::Instant::now() < until,
-            "detached sandbox never started after its daemon removed the startup pin: {:?}",
+            "detached sandbox never started after its daemon exited: {:?}",
             task_metadata(&root)
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1602,7 +1605,7 @@ async fn connection_loss_preserves_pin_until_delayed_sandbox_and_shim_run() {
 // than a `{name, arguments, call_key}` tool-call envelope.
 fn flow_owner() -> Principal {
     Principal::Reserved {
-        module_id: "prefrontal-core".into(),
+        module_id: "prefrontal".into(),
     }
 }
 fn flow_head_stamp() -> subc_protocol::scope::ScopeStamp {

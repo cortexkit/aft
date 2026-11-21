@@ -10,9 +10,14 @@ import {
   resolveCortexKitConfigPaths,
   resolveCortexKitProjectConfigPath,
   resolveCortexKitUserConfigPath,
+  resolveCortexKitUserConfigReadPath,
   resolveHarnessStoragePath,
   shouldShowAnnouncement,
 } from "../paths.js";
+import {
+  enterWindowsUserConfigFixture,
+  writeSettingsFixture,
+} from "./test-utils/windows-user-config.js";
 
 const tempRoots = new Set<string>();
 
@@ -30,43 +35,83 @@ afterEach(() => {
 });
 
 describe("CortexKit config paths", () => {
-  const originalHome = process.env.HOME;
-  const originalUserProfile = process.env.USERPROFILE;
-  const originalXdg = process.env.XDG_CONFIG_HOME;
-
-  // `process.env.KEY = undefined` stores the string "undefined"; a variable that
-  // was unset before the test must be deleted so later-spawned processes do not
-  // inherit USERPROFILE=undefined (or XDG_CONFIG_HOME=undefined on macOS).
-  const restoreEnv = (key: string, value: string | undefined) => {
-    if (value === undefined) {
-      delete process.env[key];
-    } else {
-      process.env[key] = value;
+  test("user config honors absolute and relative XDG_CONFIG_HOME on every platform", () => {
+    const posixEnv = { XDG_CONFIG_HOME: "/operator/xdg", HOME: "/operator/home" };
+    for (const platform of ["darwin", "linux"] as const) {
+      expect(resolveCortexKitUserConfigPath(posixEnv, platform)).toBe(
+        "/operator/xdg/cortexkit/aft.jsonc",
+      );
+      expect(
+        resolveCortexKitUserConfigPath({ ...posixEnv, XDG_CONFIG_HOME: "rel" }, platform),
+      ).toBe("rel/cortexkit/aft.jsonc");
     }
-  };
-
-  afterEach(() => {
-    restoreEnv("HOME", originalHome);
-    restoreEnv("USERPROFILE", originalUserProfile);
-    restoreEnv("XDG_CONFIG_HOME", originalXdg);
-  });
-
-  test("user config honors absolute XDG_CONFIG_HOME", () => {
-    const root = createStorageRoot();
-    process.env.HOME = join(root, "home");
-    process.env.XDG_CONFIG_HOME = join(root, "xdg");
-
-    expect(resolveCortexKitUserConfigPath()).toBe(join(root, "xdg", "cortexkit", "aft.jsonc"));
-  });
-
-  test("user config falls back to home .config when XDG_CONFIG_HOME is relative", () => {
-    const root = createStorageRoot();
-    process.env.HOME = join(root, "home");
-    process.env.XDG_CONFIG_HOME = "relative-xdg";
-
-    expect(resolveCortexKitUserConfigPath()).toBe(
-      join(root, "home", ".config", "cortexkit", "aft.jsonc"),
+    const windowsEnv = { XDG_CONFIG_HOME: "C:\\xdg", APPDATA: "C:\\roaming" };
+    expect(resolveCortexKitUserConfigPath(windowsEnv, "win32")).toBe(
+      "C:\\xdg\\cortexkit\\aft.jsonc",
     );
+    expect(resolveCortexKitUserConfigPath({ ...windowsEnv, XDG_CONFIG_HOME: "rel" }, "win32")).toBe(
+      "rel\\cortexkit\\aft.jsonc",
+    );
+  });
+
+  test("Windows falls through APPDATA, USERPROFILE roaming and then HOME", () => {
+    const env = {
+      XDG_CONFIG_HOME: "",
+      APPDATA: "D:\\settings",
+      USERPROFILE: "C:\\me",
+      HOME: "C:\\home",
+    };
+    expect(resolveCortexKitUserConfigPath(env, "win32")).toBe("D:\\settings\\cortexkit\\aft.jsonc");
+    expect(resolveCortexKitUserConfigPath({ ...env, APPDATA: "" }, "win32")).toBe(
+      "C:\\me\\AppData\\Roaming\\cortexkit\\aft.jsonc",
+    );
+    expect(resolveCortexKitUserConfigPath({ ...env, APPDATA: "", USERPROFILE: "" }, "win32")).toBe(
+      "C:\\home\\.config\\cortexkit\\aft.jsonc",
+    );
+  });
+
+  test("POSIX ignores Windows vars, and missing homes leave a relative .config", () => {
+    const env = {
+      XDG_CONFIG_HOME: "",
+      APPDATA: "/roaming",
+      USERPROFILE: "/profile",
+      HOME: "/home/me",
+    };
+    for (const platform of ["darwin", "linux"] as const) {
+      expect(resolveCortexKitUserConfigPath(env, platform)).toBe(
+        "/home/me/.config/cortexkit/aft.jsonc",
+      );
+      expect(resolveCortexKitUserConfigReadPath(env, platform)).toBe(
+        "/home/me/.config/cortexkit/aft.jsonc",
+      );
+      expect(resolveCortexKitUserConfigPath({ ...env, HOME: "" }, platform)).toBe(
+        ".config/cortexkit/aft.jsonc",
+      );
+    }
+    expect(resolveCortexKitUserConfigPath({}, "win32")).toBe(".config\\cortexkit\\aft.jsonc");
+  });
+
+  test("Windows reads the old HOME file only until canonical settings exist", () => {
+    const { env, legacy, canonical, restore } = enterWindowsUserConfigFixture(createStorageRoot());
+    try {
+      expect(resolveCortexKitUserConfigPath(env, "win32")).toBe(canonical);
+      const readPath = () => resolveCortexKitUserConfigReadPath(env, "win32");
+      expect(readPath()).toBe(canonical);
+
+      writeSettingsFixture(legacy, "{ /* old */ }");
+      expect(readPath()).toBe(legacy);
+      expect(existsSync(canonical)).toBe(false);
+      expect(readFileSync(legacy, "utf8")).toBe("{ /* old */ }");
+
+      writeSettingsFixture(canonical, "{ /* new */ }");
+      expect(readPath()).toBe(canonical);
+      expect(readFileSync(legacy, "utf8")).toBe("{ /* old */ }");
+
+      rmSync(legacy);
+      expect(readPath()).toBe(canonical);
+    } finally {
+      restore();
+    }
   });
 
   test("project config lives under .cortexkit", () => {

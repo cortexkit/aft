@@ -18,7 +18,7 @@ async fn fenced_end_retries_one_failed_read_and_kills_tasks_with_scope_revoked_r
     let db_path = ctx.storage_dir().join("aft.db");
     ctx.set_db(Arc::new(StdMutex::new(crate::db::open(&db_path).unwrap())));
     let stamp: ScopeStamp = serde_json::from_value(json!({
-        "owner":{"kind":"reserved","module_id":"prefrontal-core"},
+        "owner":{"kind":"reserved","module_id":"prefrontal"},
         "ref":"fenced-read-error", "scope_epoch":10, "kind":"head", "owner_authorized":true
     }))
     .unwrap();

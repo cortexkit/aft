@@ -70,7 +70,7 @@ async fn capture() -> Value {
         &f,
         TASK,
         "session",
-        "reserved:prefrontal-core",
+        "reserved:prefrontal",
         VIEWED_CALL,
         false,
         false,

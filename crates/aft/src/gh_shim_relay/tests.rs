@@ -533,12 +533,11 @@ fn facade_reply_prefers_direct_fields_over_inner_result_content() {
     }
 }
 
-/// A stamp as the daemon puts it on a head's tool route, owned by
-/// prefrontal-core.
+/// A Prefrontal-owned stamp as the daemon puts it on a head's tool route.
 fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeStamp {
     ScopeStamp::new(
         subc_protocol::Principal::Reserved {
-            module_id: "prefrontal-core".to_string(),
+            module_id: "prefrontal".to_string(),
         },
         "head-ref-1",
         7,
@@ -557,14 +556,14 @@ fn delegating_stamp() -> ScopeStamp {
 }
 
 #[test]
-fn prefrontal_rename_relay_and_secret_scope_admission() {
+fn prefrontal_relay_and_secret_scope_admission_refuses_other_owners() {
     use subc_protocol::{scope::ScopeKind, Principal};
     for module in ["prefrontal", "prefrontal-core", "other"] {
         let mut stamp = delegating_stamp();
         stamp.owner = Principal::Reserved {
             module_id: module.into(),
         };
-        let admitted = module != "other";
+        let admitted = module == "prefrontal";
         assert_eq!(head_scope(&stamp), admitted);
         assert_eq!(
             crate::secret::eligibility::alfonso_of_kind(&stamp, &[ScopeKind::Head]),
@@ -918,7 +917,7 @@ fn a_delegating_stamped_route_sends_the_write_under_its_scope() {
         transport.plexus_scopes(),
         vec![Some(ScopeSelector::new(
             subc_protocol::Principal::Reserved {
-                module_id: "prefrontal-core".to_string(),
+                module_id: "prefrontal".to_string(),
             },
             "head-ref-1",
             Some(7),

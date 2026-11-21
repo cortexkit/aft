@@ -19,13 +19,13 @@ import { createAftTransportPool } from "../transport-factory.js";
 import { TEST_OTHER_ROOT, TEST_PROJECT_ROOT } from "./subc-test-roots.js";
 
 const scope: RouteScope = {
-  owner: { kind: "reserved", module_id: "prefrontal-core" },
+  owner: { kind: "reserved", module_id: "prefrontal" },
   ref: "head-scope",
   scopeEpoch: 7,
 };
 
 class HostClient implements SubcClientLike {
-  catalogModuleIds = ["prefrontal-core"];
+  catalogModuleIds = ["prefrontal"];
   readonly opens: Array<{ target: RouteTarget; identity: BindIdentity; opts?: RouteOpenOptions }> =
     [];
   readonly reads: unknown[] = [];
@@ -73,6 +73,9 @@ class HostClient implements SubcClientLike {
     this.opens.push({ target, identity, opts });
     const channel = this.opens.length;
     if (target.kind === "management_surface" && this.scopeOpenError) throw this.scopeOpenError;
+    if (target.kind === "management_surface" && !this.catalogModuleIds.includes(target.module_id)) {
+      throw new SubcError("management route unavailable", "target_unavailable");
+    }
     if (target.kind === "management_surface") await this.scopeOpenGate;
     if (target.module_id === "aft") {
       await this.toolOpenGate;
@@ -303,40 +306,44 @@ async function settle() {
   for (let turn = 0; turn < 64; turn++) await Promise.resolve();
 }
 
-test("prefrontal rename chooses both catalog states and retains the daemon owner", async () => {
-  for (const [catalog, module] of [
-    [["prefrontal-core"], "prefrontal-core"],
-    [["prefrontal"], "prefrontal"],
-    [["prefrontal-core", "prefrontal"], "prefrontal"],
-    [["other"], "prefrontal-core"],
+test("host-scope lookup ignores legacy and unknown providers and owners", async () => {
+  for (const [catalog, answeredBy, supported] of [
+    [["prefrontal"], "prefrontal", true],
+    [["prefrontal-core", "prefrontal"], "prefrontal", true],
+    [["prefrontal"], "prefrontal-core", false],
+    [["prefrontal"], "other", false],
+    [["prefrontal-core"], "prefrontal-core", false],
+    [["other"], "other", false],
   ] as const) {
     const { client, pool } = setup();
     client.catalogModuleIds = [...catalog];
-    const expected = { ...scope, owner: { kind: "reserved", module_id: module } };
-    client.answer = { owner: expected.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+    client.answer = {
+      owner: { kind: "reserved", module_id: answeredBy },
+      ref: scope.ref,
+      scope_epoch: scope.scopeEpoch,
+    };
     await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
-    expect(client.opens[0].target).toEqual({ kind: "management_surface", module_id: module });
-    expect(client.opens.find((open) => open.target.module_id === "aft")?.opts?.scope).toEqual(
-      expected,
-    );
+    expect(client.opens[0].target).toEqual({ kind: "management_surface", module_id: "prefrontal" });
+    const bind = client.opens.find((open) => open.target.module_id === "aft");
+    expect(bind).toBeDefined();
+    expect(bind?.opts?.scope).toEqual(supported ? scope : undefined);
     await pool.shutdown();
   }
 });
 
-test("prefrontal rename refreshes a removed scope carrier without restarting AFT", async () => {
+test("refreshes a removed scope carrier without restarting AFT", async () => {
   const { client, pool, push } = setup();
   await pool.getBridge(TEST_PROJECT_ROOT).toolCall("head", "read", {});
-  client.catalogModuleIds = ["prefrontal"];
-  const renamed = { ...scope, owner: { kind: "reserved", module_id: "prefrontal" } };
-  client.answer = { owner: renamed.owner, ref: scope.ref, scope_epoch: scope.scopeEpoch };
+  const rebound = { ...scope, scopeEpoch: scope.scopeEpoch + 1 };
+  client.bumpScopeEpoch(rebound.scopeEpoch, 0);
   push({ op: "route.closed", body: { module_id: "aft", reason: "scope_carrier_removed" } });
   await pool.getBridge(TEST_OTHER_ROOT).toolCall("head", "read", {});
   expect(
     client.opens
       .filter((open) => open.target.kind === "management_surface")
       .map((open) => open.target.module_id),
-  ).toEqual(["prefrontal-core", "prefrontal"]);
-  expect(client.opens.at(-1)?.opts?.scope).toEqual(renamed);
+  ).toEqual(["prefrontal", "prefrontal"]);
+  expect(client.opens.at(-1)?.opts?.scope).toEqual(rebound);
 });
 
 test("module restart reopens every head route with its cached scope through reload refusals", async () => {
@@ -483,9 +490,7 @@ test("a cached head scope refusal rechecks core before binding unscoped", async 
   client.scopeOpenError = new SubcError("core restarting", "module_reloading");
   const other = pool.getBridge(TEST_OTHER_ROOT);
   await other.toolCall("head", "read", {});
-  expect(client.opens.filter((open) => open.target.module_id === "prefrontal-core")).toHaveLength(
-    2,
-  );
+  expect(client.opens.filter((open) => open.target.module_id === "prefrontal")).toHaveLength(2);
   expect(client.opens[client.toolChannels.at(-1)! - 1].opts?.scope).toBeUndefined();
   expect(clock.pending.size).toBe(1);
   client.refusal = undefined;
@@ -534,9 +539,9 @@ test("client reconnect waits for a fresh scope when the old lookup is cancelled"
   try {
     await settle();
     expect(replacement.opens.filter((open) => open.target.module_id === "aft")).toHaveLength(0);
-    expect(
-      replacement.opens.filter((open) => open.target.module_id === "prefrontal-core"),
-    ).toHaveLength(1);
+    expect(replacement.opens.filter((open) => open.target.module_id === "prefrontal")).toHaveLength(
+      1,
+    );
   } finally {
     releaseOld();
     releaseNew();

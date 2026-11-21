@@ -36,7 +36,6 @@ struct Fixture {
     frames: mpsc::Receiver<WriterFrame>,
     ended: mpsc::UnboundedReceiver<EndedScope>,
     worker: JoinHandle<()>,
-    catalog: tokio::sync::watch::Sender<Vec<String>>,
     metrics: Arc<DispatchPathMetrics>,
     task: String,
 }
@@ -74,7 +73,6 @@ impl Fixture {
             "rename-speech-generation".into(),
             true,
         );
-        let (catalog, changes) = tokio::sync::watch::channel(Vec::new());
         let (handle, ended, worker) = start_with_scope_source_impl(
             control,
             executor,
@@ -82,7 +80,6 @@ impl Fixture {
             move || work_scopes(source_executor.clone(), watched_runs.clone()),
             Some(speech),
             Some(runs),
-            changes,
         );
         let task = spawn_scoped(&ctx, &root, scope, "sleep 30");
         Self {
@@ -94,7 +91,6 @@ impl Fixture {
             frames,
             ended,
             worker,
-            catalog,
             metrics,
             task,
         }
@@ -126,19 +122,11 @@ impl Fixture {
         persistence::read_task_at(&layout).unwrap()
     }
 
-    async fn opened(&mut self, _scope: &ScopeStamp) -> WriterFrame {
+    async fn opened(&mut self) -> WriterFrame {
         let watch = request(&mut self.frames, "scope.watch").await;
         snapshot(&self.pending, &watch);
         turns().await;
         watch
-    }
-
-    async fn list_both_owners(&mut self, current: &ScopeStamp) {
-        self.catalog
-            .send_replace(vec!["prefrontal-core".into(), "prefrontal".into()]);
-        self.reply(current, described(ScopeStatus::Live, true, true))
-            .await;
-        turns().await;
     }
 
     async fn reply(&mut self, expected: &ScopeStamp, reply: ModuleControlResponseToModule) {
@@ -166,29 +154,40 @@ impl Fixture {
         stage: &str,
         expected: &ScopeStamp,
         reply: ModuleControlResponseToModule,
-    ) -> Option<WriterFrame> {
-        let mut reopened = None;
+    ) {
+        // Fallback polling and the watch retry can send their requests in either
+        // order. Answer the reopen first: a describe reply with owner_configured
+        // false cancels that watch but does not remove its queued request.
         let query = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
+            let mut reopened = false;
+            let mut query = None;
+            while !reopened || query.is_none() {
                 let frame = self.frames.recv().await.unwrap();
                 if frame.header.ty == FrameType::Cancel {
                     continue;
                 }
                 let body: Value = serde_json::from_slice(&frame.body).unwrap();
-                if body["op"] == "scope.watch" {
-                    snapshot(&self.pending, &frame);
-                    reopened = Some(frame);
-                    continue;
+                match body["op"].as_str() {
+                    Some("scope.watch") => {
+                        assert!(!reopened, "duplicate scope.watch {stage}");
+                        snapshot(&self.pending, &frame);
+                        reopened = true;
+                    }
+                    Some("scope.describe") => {
+                        assert!(
+                            query.replace(frame).is_none(),
+                            "duplicate scope.describe {stage}"
+                        );
+                    }
+                    _ => panic!("unexpected control frame {stage}: {body}"),
                 }
-                assert_eq!(body["op"], "scope.describe");
-                break frame;
             }
+            query.unwrap()
         })
         .await
-        .unwrap_or_else(|error| panic!("missing scope.describe {stage}: {error}"));
+        .unwrap_or_else(|error| panic!("missing scope.watch or scope.describe {stage}: {error}"));
         self.respond_to_describe(&query, expected, reply);
         turns().await;
-        reopened
     }
 
     fn continuity_holds(&self) -> Value {
@@ -198,20 +197,6 @@ impl Fixture {
             .unwrap()
             .scope_watch_health()["prefrontal_continuity_holds"]
             .clone()
-    }
-
-    async fn rehomed(&mut self, live: &ScopeStamp) -> WriterFrame {
-        let watch = request(&mut self.frames, "scope.watch").await;
-        let body: Value = serde_json::from_slice(&watch.body).unwrap();
-        assert_eq!(
-            body["scopes"][0]["scope_ref"]["owner"],
-            serde_json::to_value(&live.owner).unwrap()
-        );
-        snapshot(&self.pending, &watch);
-        turns().await;
-        assert_eq!(self.status(), BgTaskStatus::Running);
-        assert_eq!(self.metadata().lifecycle_scope(), Some(live));
-        watch
     }
 
     async fn killed(&mut self) {
@@ -227,13 +212,11 @@ impl Fixture {
     }
 }
 
-#[tokio::test]
-async fn prefrontal_scope_watch_holds_rename_gap_through_rollback_until_confirmed_end() {
-    let old = named("prefrontal-core");
-    let new = named("prefrontal");
+#[tokio::test(start_paused = true)]
+async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
+    let old = named("prefrontal");
     let mut f = Fixture::new(&old).await;
-    f.catalog.send_replace(vec!["prefrontal-core".into()]);
-    let watch = f.opened(&old).await;
+    let watch = f.opened().await;
     let db = f.ctx.db().unwrap();
     let scope_key = grants::ScopeKey::for_grants(&old);
     let policy_key = remote_exec::PolicyKey {
@@ -297,7 +280,6 @@ async fn prefrontal_scope_watch_holds_rename_gap_through_rollback_until_confirme
     };
     assert_survives(&f);
 
-    f.catalog.send_replace(vec![]);
     push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
     f.reply(&old, described(ScopeStatus::Live, false, true))
         .await;
@@ -309,53 +291,24 @@ async fn prefrontal_scope_watch_holds_rename_gap_through_rollback_until_confirme
     assert_eq!(f.task_status(&second), BgTaskStatus::Running);
 
     f.reply_through_watch_reopen(
-        "during the catalog gap",
+        "while the owner is unconfigured",
         &old,
-        described(ScopeStatus::Live, false, true),
-    )
-    .await;
-    assert_survives(&f);
-
-    f.catalog.send_replace(vec!["prefrontal".into()]);
-    f.reply_through_watch_reopen(
-        "after the counterpart appears",
-        &old,
-        described(ScopeStatus::Live, false, true),
-    )
-    .await;
-    f.reply_through_watch_reopen(
-        "against the unsynced counterpart",
-        &new,
-        described(ScopeStatus::NotLive, true, false),
+        described(ScopeStatus::Ended, false, true),
     )
     .await;
     assert_survives(&f);
     assert_eq!(f.continuity_holds(), 1);
     assert!(f.ended.try_recv().is_err());
 
-    f.catalog.send_replace(vec!["prefrontal-core".into()]);
-    let reopened = f
-        .reply_through_watch_reopen(
-            "after rollback",
-            &old,
-            described(ScopeStatus::Live, true, true),
-        )
-        .await;
-    assert_survives(&f);
-    assert_eq!(f.continuity_holds(), 0);
-    assert!(f.ended.try_recv().is_err());
-
-    let watch = match reopened {
-        Some(watch) => watch,
-        None => f.opened(&old).await,
-    };
-    push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
     f.reply_through_watch_reopen(
-        "after the real scope end",
+        "after a configured owner confirms the end",
         &old,
         described(ScopeStatus::Ended, true, true),
     )
     .await;
+    // Let the cleanup deadline use real time: database cleanup and process
+    // termination run on worker threads outside the paused Tokio runtime.
+    tokio::time::resume();
     f.killed().await;
     assert_eq!(f.task_status(&second), BgTaskStatus::Killed);
     assert_eq!(f.ctx.bash_background().with_live_scope(&old, || ()), None);
@@ -369,201 +322,21 @@ async fn prefrontal_scope_watch_holds_rename_gap_through_rollback_until_confirme
 }
 
 #[tokio::test]
-async fn prefrontal_scope_watch_continues_old_end_then_kills_new_end_despite_old_ghost() {
-    let old = named("prefrontal-core");
-    let new = named("prefrontal");
-    let mut f = Fixture::new(&old).await;
-    let watch = f.opened(&old).await;
-    f.list_both_owners(&old).await;
-    push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
-    f.reply(&old, described(ScopeStatus::Ended, true, true))
-        .await;
-    assert_eq!(f.status(), BgTaskStatus::Running);
-    f.reply(&new, described(ScopeStatus::Live, true, true))
-        .await;
-    let watch = f.rehomed(&new).await;
-    assert_eq!(f.metadata().scope.as_ref(), Some(&old));
-    assert!(f.ended.try_recv().is_err());
-    push(&f.pending, &watch, &new, ScopeWatchEvent::Ended);
-    f.reply(&new, described(ScopeStatus::Ended, true, true))
-        .await;
-    f.reply(&old, described(ScopeStatus::Live, false, true))
-        .await;
-    f.killed().await;
-}
+async fn prefrontal_scope_watch_does_not_treat_the_old_or_unknown_owner_as_prefrontal() {
+    for other in ["prefrontal-core", "third-module"] {
+        let original = named(other);
+        let prefrontal = named("prefrontal");
+        let mut f = Fixture::new(&original).await;
+        let watch = f.opened().await;
+        let mut identity = test_support::route_identity(&f.root, "watch-session");
+        Arc::get_mut(&mut identity.0).unwrap().scope = Some(prefrontal);
+        f.handle
+            .routes(&HashMap::from([(route_key(71, 1), identity)]));
 
-#[tokio::test]
-async fn prefrontal_scope_watch_holds_unsynced_counterpart_then_continues() {
-    let old = named("prefrontal-core");
-    let new = named("prefrontal");
-    let mut f = Fixture::new(&old).await;
-    let watch = f.opened(&old).await;
-    f.list_both_owners(&old).await;
-    push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
-    f.reply(&old, described(ScopeStatus::Ended, true, true))
-        .await;
-    f.reply(&new, described(ScopeStatus::NotLive, true, false))
-        .await;
-    turns().await;
-    assert_eq!(f.status(), BgTaskStatus::Running);
-    assert!(f.metadata().lifecycle_scope.is_none());
-    assert!(f.ended.try_recv().is_err());
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), f.frames.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if frame.header.ty == FrameType::Cancel {
-            continue;
-        }
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        if body["op"] == "scope.watch" {
-            snapshot(&f.pending, &frame);
-            continue;
-        }
-        assert_eq!(body["op"], "scope.describe");
-        response(
-            &f.pending,
-            &frame,
-            described(ScopeStatus::Ended, true, true),
-        );
-        break;
+        push(&f.pending, &watch, &original, ScopeWatchEvent::Ended);
+        f.reply(&original, described(ScopeStatus::Ended, true, true))
+            .await;
+        f.killed().await;
+        assert_eq!(f.metadata().lifecycle_scope(), Some(&original));
     }
-    f.reply(&new, described(ScopeStatus::Live, true, true))
-        .await;
-    f.rehomed(&new).await;
-    assert!(f.ended.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn prefrontal_scope_held_duplicate_end_still_checks_continuity_before_dedupe() {
-    let old = named("prefrontal-core");
-    let new = named("prefrontal");
-    let mut f = Fixture::new(&old).await;
-    f.opened(&old).await;
-    f.list_both_owners(&old).await;
-    f.handle.observed.send(old.clone()).unwrap();
-    f.reply(&old, described(ScopeStatus::Ended, true, true))
-        .await;
-    f.reply(&new, described(ScopeStatus::NotLive, true, false))
-        .await;
-    turns().await;
-    assert_eq!(f.status(), BgTaskStatus::Running);
-    assert!(!f
-        .handle
-        .completed
-        .lock()
-        .unwrap()
-        .contains(&stamp_key(&old)));
-    f.handle.observed.send(old.clone()).unwrap();
-    loop {
-        let frame = tokio::time::timeout(Duration::from_secs(2), f.frames.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if frame.header.ty == FrameType::Cancel {
-            continue;
-        }
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        if body["op"] == "scope.watch" {
-            snapshot(&f.pending, &frame);
-            continue;
-        }
-        assert_eq!(body["op"], "scope.describe");
-        assert_eq!(body["owner"], serde_json::to_value(&old.owner).unwrap());
-        response(
-            &f.pending,
-            &frame,
-            described(ScopeStatus::Ended, true, true),
-        );
-        break;
-    }
-    f.reply(&new, described(ScopeStatus::Live, true, true))
-        .await;
-    f.rehomed(&new).await;
-    assert!(!f
-        .handle
-        .completed
-        .lock()
-        .unwrap()
-        .contains(&stamp_key(&old)));
-    assert!(f.ended.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn prefrontal_scope_watch_end_before_window_sends_no_counterpart_describe() {
-    let old = named("prefrontal-core");
-    let mut f = Fixture::new(&old).await;
-    let watch = f.opened(&old).await;
-    f.catalog.send_replace(vec!["prefrontal-core".into()]);
-    push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
-    f.reply(&old, described(ScopeStatus::Ended, true, true))
-        .await;
-    f.killed().await;
-    turns().await;
-    while let Ok(frame) = f.frames.try_recv() {
-        if frame.header.ty == FrameType::Cancel {
-            continue;
-        }
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_ne!(
-            body["op"], "scope.describe",
-            "pre-window end sent another describe: {body}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn prefrontal_scope_watch_third_owner_keeps_existing_end_behavior() {
-    let other = named("third-module");
-    let mut f = Fixture::new(&other).await;
-    let watch = f.opened(&other).await;
-    push(&f.pending, &watch, &other, ScopeWatchEvent::Ended);
-    f.reply(&other, described(ScopeStatus::Ended, true, true))
-        .await;
-    f.killed().await;
-}
-
-#[tokio::test]
-async fn prefrontal_scope_bound_counterpart_rehomes_without_an_end_signal() {
-    let old = named("prefrontal-core");
-    let new = named("prefrontal");
-    let mut f = Fixture::new(&old).await;
-    f.opened(&old).await;
-    let mut identity = test_support::route_identity(&f.root, "watch-session");
-    Arc::get_mut(&mut identity.0).unwrap().scope = Some(new.clone());
-    f.handle
-        .routes(&HashMap::from([(route_key(71, 1), identity)]));
-    f.rehomed(&new).await;
-    assert_eq!(f.metadata().scope.as_ref(), Some(&old));
-    assert!(f.ended.try_recv().is_err());
-}
-
-#[tokio::test]
-async fn prefrontal_scope_catalog_reconciles_retired_ghost_once() {
-    let old = named("prefrontal-core");
-    let new = named("prefrontal");
-    let mut f = Fixture::new(&old).await;
-    f.opened(&old).await;
-    f.catalog.send_replace(vec!["prefrontal".into()]);
-    f.reply(&old, described(ScopeStatus::Live, false, true))
-        .await;
-    f.reply(&new, described(ScopeStatus::Live, true, true))
-        .await;
-    f.rehomed(&new).await;
-    turns().await;
-    f.catalog.send_replace(vec!["prefrontal".into()]);
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    while let Ok(frame) = f.frames.try_recv() {
-        if frame.header.ty == FrameType::Cancel {
-            continue;
-        }
-        let body: Value = serde_json::from_slice(&frame.body).unwrap();
-        assert_ne!(
-            body["op"], "scope.describe",
-            "an unchanged catalog must not repeat the pass: {body}"
-        );
-    }
-    assert_eq!(f.status(), BgTaskStatus::Running);
-    assert!(f.ended.try_recv().is_err());
 }

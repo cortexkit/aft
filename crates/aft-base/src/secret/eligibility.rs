@@ -67,7 +67,7 @@ pub enum Ineligibility {
     Standalone,
     /// The route serves a plugin's own calls, which have no Alfonso stamp.
     PluginOnlyRoute,
-    /// The stamp's owner is not prefrontal-core.
+    /// The stamp's owner is not Prefrontal.
     OtherOwner,
     /// The call reads a scheduled flow, which is not a command lifetime.
     FlowRead,
@@ -79,7 +79,7 @@ pub enum Ineligibility {
     NotACommandScope,
     /// A codemode call the daemon did not bind to a live head route.
     RunNotBound,
-    /// The bound head route's stamp is not a prefrontal-core head.
+    /// The bound head route's stamp is not a Prefrontal head.
     HeadScopeNotAlfonso,
 }
 
@@ -90,7 +90,7 @@ impl Ineligibility {
     }
 }
 
-/// Whether `stamp` is a prefrontal-core stamp of one of `kinds`.
+/// Whether `stamp` is a Prefrontal stamp of one of `kinds`.
 ///
 /// This is `access_grants::alfonso`, the daemon-facing predicate the rest of the
 /// route policy uses, narrowed to the kinds a command runs under. It is

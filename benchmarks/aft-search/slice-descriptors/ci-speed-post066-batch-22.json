@@ -1,0 +1,11 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "harness-goldens",
+    "profile-grammar",
+    "paging"
+  ],
+  "note": "Post-0.66 batch 22 changes no RANKING_FENCE_PREFIXES path. It carries code-mode head-route selection, program calls right after a restart, per-root connection bookkeeping, settings file conversion, the Linux private startup image (#1422), retirement of the old prefrontal-core name, the OpenCode 2 /aft-tasks command (#1475) and test fixture updates. No ranking or count difference is authorized."
+}

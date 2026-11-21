@@ -149,6 +149,7 @@ pub(super) struct RunScope {
     stamp: subc_protocol::scope::ScopeStamp,
     control: Arc<readiness::DaemonControl>,
     describe_lock: tokio::sync::Mutex<()>,
+    saved_owner_proofs: codemode_owners::Proofs,
     budget: StdMutex<Option<RunBudget>>,
     revoked: AtomicBool,
     authorization: StdMutex<()>,
@@ -160,6 +161,17 @@ pub(super) struct RunScope {
 }
 
 impl RunScope {
+    pub(super) async fn confirm_saved_owner(
+        &self,
+        parent: subc_protocol::scope::ScopeParent,
+    ) -> bool {
+        self.saved_owner_proofs.confirm(&self.control, parent).await
+    }
+
+    pub(super) fn saved_owner_ended(&self, parent: &subc_protocol::scope::ScopeParent) -> bool {
+        self.registration.parent_ended(parent)
+    }
+
     /// Whether scope.describe confirmed that the run's scope ended.
     pub(super) fn revoked(&self) -> bool {
         self.revoked.load(Ordering::Acquire)
@@ -546,6 +558,7 @@ impl RunScope {
             .unwrap(),
             control: scopes.control,
             describe_lock: tokio::sync::Mutex::new(()),
+            saved_owner_proofs: Default::default(),
             budget: StdMutex::new(Some(RunBudget {
                 deadline,
                 now_for_test: now,

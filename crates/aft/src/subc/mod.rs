@@ -220,6 +220,7 @@ mod bash_grant_tests;
 #[cfg(test)]
 mod bash_selector_tests;
 mod codemode;
+mod codemode_owners;
 mod consent;
 #[cfg(all(test, unix))]
 mod deleted_root_reclaim_tests;
@@ -248,6 +249,10 @@ mod idle_root_retention_tests;
 mod ledger_lane_tests;
 mod perf_sweep;
 mod route_census;
+mod route_delivery;
+use crate::bash_background::registry::RouteDeliverySessions;
+#[cfg(test)]
+use route_delivery::sync_all_callgraph_refresh_policies as sync_bg_live_delivery_sessions;
 mod secret_consent;
 mod settings;
 pub use settings::requested as settings_gate_requested;
@@ -578,8 +583,8 @@ struct DecodedFrame {
     /// The route's confinement answer from memory or an off-loop database read
     /// by `persistence::DatabaseWaits::read_confinement`. `None` until checked.
     confinement: Option<remote_policy::CarriedConfinement>,
-    /// Candidate head policies read off-loop before codemode chooses an owner.
-    codemode_policies: Option<Result<codemode::SavedPolicies, subc_protocol::ErrorBody>>,
+    /// Saved owner candidates and policies read off-loop for code-mode admission.
+    codemode_policies: Option<codemode_owners::CallRead>,
     /// Result of restoring launch grants for this frame; retain it so later
     /// admission waits do not repeat restoration.
     launch_restore: Option<Result<(), subc_protocol::ErrorBody>>,
@@ -1770,7 +1775,7 @@ fn speech_launch_seed(
                         head,
                         lifecycle.clone(),
                         origin(route),
-                        origin(owner.owner_route_channel),
+                        owner.owner_route_channel.and_then(origin),
                     )
                 })
         }
@@ -2301,8 +2306,7 @@ fn quiesce_unbound_root_with(
             }
             QuiescedLsp::LeaveForExitSweep => ctx.lsp().close_start_admission(),
         }
-        ctx.bash_background()
-            .replace_live_delivery_sessions(HashSet::new());
+        ctx.bash_background().clear_live_delivery_sessions();
     }
     // A bind replayed by the identity retry is this root's bind in flight.
     // Cancel it as route teardown cancels a route's own pending bind: queued,
@@ -2353,6 +2357,7 @@ fn quiesce_connection_roots(
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
     executor: &Arc<Executor>,
+    delivery: &RouteDeliverySessions,
     lsp: QuiescedLsp,
 ) {
     cancel_all_active_tool_calls(active_tool_calls, executor, "connection teardown");
@@ -2386,6 +2391,7 @@ fn quiesce_connection_roots(
         runner_notices::route_unbound(route);
     }
     routes.clear();
+    route_delivery::publish_sessions(delivery, routes);
     root_channels.clear();
     installed_route_epochs.clear();
 }
@@ -3100,6 +3106,7 @@ fn purge_deleted_root_residents(
     bg_wake_epoch: &mut HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64>,
     pending_bash_asks: &mut HashMap<ReverseCorrKey, PendingBashAsk>,
     metrics: &DispatchPathMetrics,
+    delivery: &RouteDeliverySessions,
 ) -> Vec<Frame> {
     push::purge_completion_root(metrics, root_id, push_buffer, retry_buffer);
     let mut terminals = Vec::new();
@@ -3175,7 +3182,8 @@ fn purge_deleted_root_residents(
         false
     });
     bg_sub_by_session.retain(|(root, _), _| root != root_id);
-    sync_bg_live_delivery_sessions(executor, routes, Some(root_id), None);
+    route_delivery::publish_sessions(delivery, routes);
+    route_delivery::sync_all_callgraph_refresh_policies(executor, routes, Some(root_id), None);
 
     log::info!(
         "subc attach: fully forgot deleted root {}; cause=absence_reclaim; ended {} held request(s)",
@@ -3919,69 +3927,6 @@ fn release_semantic_opener_if_unrouted(
     }
 }
 
-fn sync_bg_live_delivery_sessions(
-    executor: &Executor,
-    routes: &HashMap<RouteChannel, RouteIdentity>,
-    additional_root: Option<&ProjectRootId>,
-    metrics: Option<&DispatchPathMetrics>,
-) {
-    // The loop-owned installed-route table is the lifecycle source of truth:
-    // an originating session is live exactly while the daemon has an installed,
-    // bash-observation-capable route whose identity names that session.
-    let sessions = routes
-        .values()
-        .filter(|identity| identity.trust.allows_bash_observation())
-        .map(|identity| identity.session.clone())
-        .collect::<HashSet<_>>();
-    let mut roots = routes
-        .values()
-        .map(|identity| identity.root.clone())
-        .collect::<HashSet<_>>();
-    roots.extend(additional_root.cloned());
-    for root in roots {
-        if let Some(metrics) = metrics {
-            metrics.mark_frame_loop_wait_for_root(
-                "executor.scheduler/actor_context",
-                &root,
-                executor.scheduler_lock_diagnostics(),
-            );
-        }
-        if let Some(ctx) = executor.actor_context(&root) {
-            sync_callgraph_refresh_policy(&ctx, routes, &root);
-            if let Some(metrics) = metrics {
-                metrics.mark_frame_loop_wait_for_root(
-                    "bash.live_delivery_sessions",
-                    &root,
-                    ctx.bash_background().live_delivery_lock_diagnostics(),
-                );
-            }
-            ctx.bash_background()
-                .replace_live_delivery_sessions(sessions.clone());
-        }
-    }
-}
-
-/// Recompute from installed routes so adding or removing a non-worker route
-/// changes the checkout's maintenance policy without rebinding the checkout.
-fn sync_callgraph_refresh_policy(
-    ctx: &AppContext,
-    routes: &HashMap<RouteChannel, RouteIdentity>,
-    root: &ProjectRootId,
-) {
-    let mut bound = routes
-        .values()
-        .filter(|identity| &identity.root == root)
-        .peekable();
-    let worker_only = bound.peek().is_some()
-        && bound.all(|identity| {
-            identity
-                .scope
-                .as_ref()
-                .is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)
-        });
-    ctx.set_worker_only_routes(worker_only);
-}
-
 fn insert_bg_subscription_index(
     bg_sub_by_session: &mut BgSubsBySession,
     root: ProjectRootId,
@@ -4119,6 +4064,7 @@ async fn teardown_installed_route(
     shutdown: &Arc<Notify>,
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+    delivery: &RouteDeliverySessions,
 ) -> Result<(), SubcError> {
     queued_call::close_admissions(channel, tx, metrics, ledger, run_scopes).await?;
     // A replacement project route keeps replayable calls, even those still
@@ -4244,7 +4190,14 @@ async fn teardown_installed_route(
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
         metrics.completion_delivery.route_closed(channel);
-        sync_bg_live_delivery_sessions(executor, routes, Some(&identity.root), Some(metrics));
+        route_delivery::sync_route_change(
+            executor,
+            delivery,
+            routes,
+            root_channels,
+            &identity.root,
+            metrics,
+        );
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);
         }
@@ -4972,6 +4925,7 @@ async fn drain_pending_route_bind_completions(
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+    delivery: &Arc<RouteDeliverySessions>,
 ) -> Result<usize, SubcError> {
     let mut drained = 0;
     while let Ok(completion) = control_completion_rx
@@ -4995,6 +4949,7 @@ async fn drain_pending_route_bind_completions(
             shutdown,
             metrics,
             lifecycle_probe,
+            delivery,
         )
         .await?;
         drained += 1;
@@ -5447,6 +5402,7 @@ where
             &shutdown,
             &dispatch_path_metrics,
             lifecycle_probe.as_ref(),
+            &shared_app.route_delivery_sessions,
         )
         .await
         {
@@ -5679,6 +5635,7 @@ where
                     &shutdown,
                     &dispatch_path_metrics,
                     lifecycle_probe.as_ref(),
+                    &shared_app.route_delivery_sessions,
                 )
                 .await
                 {
@@ -5816,6 +5773,7 @@ where
                             &shutdown,
                             tool_response_body_limit,
                             lifecycle_probe.as_ref(),
+                            &shared_app.route_delivery_sessions,
                         )
                         .await
                         {
@@ -6032,36 +5990,14 @@ where
                         // every step below sees the owner-derived identity.
                         let codemode_routes;
                         ledger_edge.note_received(&decoded, &routes);
-                        let (routes_for_call, codemode_call) = match codemode::admit(&routes, route, decoded.body().ok(), |identity| {
-                            let Some(ctx) = executor.actor_context(&identity.root) else {
-                                return Some(Err(remote_policy::policy_unavailable()));
-                            };
-                            if ctx.database_runtime_unconfigured() || (remote_policy::key(identity, Some("worker")).is_none()
-                                && !identity.scope.as_ref().is_some_and(|scope| scope.kind == subc_protocol::scope::ScopeKind::Worker)) {
-                                return Some(Ok(codemode::EffectiveSavedPolicy::default()));
-                            }
-                            match decoded.codemode_policies.as_ref()? {
-                                Ok(policies) => policies.get(&ctx, identity),
-                                Err(error) => Some(Err(error.clone())),
-                            }
-                        }) {
-                            codemode::Admission::Unchanged => (&routes, false),
-                            codemode::Admission::Owner(effective) => {
+                        let (decoded, routes_for_call, codemode_call) = match codemode_owners::admit_frame(&routes, route, decoded, &mut database_waits, &executor) {
+                            codemode_owners::FrameAdmission::Ready(decoded, None) => (decoded, &routes, false),
+                            codemode_owners::FrameAdmission::Ready(decoded, Some(effective)) => {
                                 codemode_routes = codemode::overlay(&routes, route, effective);
-                                (&codemode_routes, true)
+                                (decoded, &codemode_routes, true)
                             }
-                            codemode::Admission::AwaitPolicies(heads) => {
-                                match database_waits.read_codemode_policies(decoded, heads, &executor) {
-                                    Ok(()) => continue,
-                                    Err(decoded) => {
-                                        if let Err(error) = send_provider_error(&writer_tx, &dispatch_path_metrics, &decoded.frame, remote_policy::policy_unavailable()).await {
-                                            break Err(error);
-                                        }
-                                        continue;
-                                    }
-                                }
-                            }
-                            codemode::Admission::Refused(error) => {
+                            codemode_owners::FrameAdmission::Deferred => continue,
+                            codemode_owners::FrameAdmission::Refused(decoded, error) => {
                                 if let Some(run) = routes.get(&route) {
                                     note_route_tool_call(run, &dispatch_path_metrics);
                                 }
@@ -6783,6 +6719,7 @@ where
                         &mut bg_wake_epoch,
                         &mut pending_bash_asks,
                         &dispatch_path_metrics,
+                        &shared_app.route_delivery_sessions,
                     );
                     for frame in reclaim_frames {
                         if frame.header.ty == FrameType::Goodbye {
@@ -6966,6 +6903,7 @@ where
         &mut route_bash_cancels,
         &active_tool_calls,
         &executor,
+        &shared_app.route_delivery_sessions,
         connection_end_lsp,
     );
 
@@ -7611,6 +7549,7 @@ async fn handle_route_bind_completion(
     shutdown: &Arc<Notify>,
     metrics: &Arc<DispatchPathMetrics>,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
+    delivery: &Arc<RouteDeliverySessions>,
 ) -> Result<(), SubcError> {
     let route_id = completion.route;
     if completion.configure_response.success
@@ -7801,12 +7740,15 @@ async fn handle_route_bind_completion(
     remember_session_identity(session_identity, &completion.identity);
     let replay_key = push::ReplayKey::from_identity(&completion.identity);
     let bind_trust = completion.identity.trust;
-    insert_route_channel(routes, root_channels, route_id, completion.identity);
-    sync_bg_live_delivery_sessions(
+    route_delivery::install_route(
         executor,
+        delivery,
         routes,
-        Some(&completion.bind_root_id),
-        Some(metrics),
+        root_channels,
+        route_id,
+        completion.identity,
+        &completion.bind_root_id,
+        metrics,
     );
     live_roots
         .entry(completion.bind_root_id.clone())
@@ -7850,6 +7792,7 @@ async fn handle_route_bind_completion(
                 );
                 match access_grants::register(&identity, ctx) {
                     Ok(()) => {
+                        codemode_owners::save(ctx, &identity);
                         // After a restart, asks this worker left open are sent
                         // again under their original call keys, never withdrawn.
                         if let Some(ctx) = consent_executor.actor_context(&identity.root) {
@@ -8340,6 +8283,7 @@ async fn handle_control_request(
                         shutdown,
                         tool_response_body_limit,
                         lifecycle_probe,
+                        &shared_app.route_delivery_sessions,
                     )
                     .await?;
                 }
@@ -8473,6 +8417,7 @@ async fn handle_control_request(
                     shutdown,
                     tool_response_body_limit,
                     lifecycle_probe,
+                    &shared_app.route_delivery_sessions,
                 )
                 .await?;
                 bind_root_id = Some(replacement_root);
@@ -8665,7 +8610,14 @@ async fn handle_control_request(
                 storage_dir,
             );
 
-            sync_bg_live_delivery_sessions(executor, routes, Some(&bind_root_id), Some(metrics));
+            route_delivery::prepare_bind(
+                executor,
+                &shared_app.route_delivery_sessions,
+                routes,
+                root_channels,
+                &bind_root_id,
+                metrics,
+            );
             let configure_request_id = configure_req.id.clone();
             let expected_snapshot_id = prepared_config.as_ref().map(|snapshot| snapshot.id());
             let applied_snapshot = Arc::new(AtomicU64::new(0));
@@ -16345,6 +16297,7 @@ mod tests {
             &mut bg_wake_epoch,
             &mut pending_bash_asks,
             &metrics,
+            &RouteDeliverySessions::default(),
         );
 
         assert!(routes.is_empty());
@@ -16470,6 +16423,7 @@ mod tests {
             &mut HashMap::new(),
             &mut asks,
             &DispatchPathMetrics::new(),
+            &RouteDeliverySessions::default(),
         );
         assert!(asks.is_empty());
         assert!(active.lock().unwrap().is_empty());
@@ -17141,6 +17095,7 @@ mod tests {
             &mut route_bash_cancels,
             &active_tool_calls,
             &executor,
+            &RouteDeliverySessions::default(),
             QuiescedLsp::ReapInBackground,
         );
         assert!(live_roots[&root].unbound_quiesced);
@@ -17188,6 +17143,7 @@ mod tests {
                 &mut bg_wake_epoch,
                 &mut pending_bash_asks,
                 &metrics,
+                &RouteDeliverySessions::default(),
             );
             assert!(terminals.is_empty());
         }
@@ -17430,6 +17386,7 @@ mod tests {
             &mut HashMap::new(),
             &Arc::new(StdMutex::new(HashMap::new())),
             executor,
+            &RouteDeliverySessions::default(),
             lsp,
         );
     }
@@ -18637,13 +18594,7 @@ mod tests {
         // single entry (the rename hazard) reddens exactly the missing name.
         // Both halves of each transitional rename pair stay listed until the
         // flip settles (see the allowlist comment).
-        for module_id in [
-            "llm-runner",
-            "aft",
-            "broca",
-            "prefrontal",
-            "prefrontal-core",
-        ] {
+        for module_id in ["llm-runner", "aft", "broca", "prefrontal"] {
             assert_eq!(
                 trust_for_principal(&Some(Principal::Reserved {
                     module_id: module_id.to_string(),
@@ -18664,12 +18615,14 @@ mod tests {
             })),
             BindTrust::Untrusted
         );
-        assert_eq!(
-            trust_for_principal(&Some(Principal::Reserved {
-                module_id: "anything-unknown".to_string(),
-            })),
-            BindTrust::Untrusted
-        );
+        for module_id in ["anything-unknown", "prefrontal-core"] {
+            assert_eq!(
+                trust_for_principal(&Some(Principal::Reserved {
+                    module_id: module_id.into()
+                })),
+                BindTrust::Untrusted
+            );
+        }
         assert_eq!(
             trust_for_principal(&Some(Principal::Unverified)),
             BindTrust::Untrusted
@@ -19032,24 +18985,19 @@ mod tests {
                 BindTrust::FirstParty,
                 "direct must stay first-party on {harness}"
             );
-            for module_id in [
-                "llm-runner",
-                "aft",
-                "broca",
-                "prefrontal",
-                "prefrontal-core",
-            ] {
+            for module_id in ["llm-runner", "aft", "broca", "prefrontal"] {
                 assert_eq!(
                     trust_for_bind(harness, &reserved(module_id)),
                     BindTrust::FirstParty,
                     "reserved module id {module_id:?} must stay first-party on {harness}"
                 );
             }
-            assert_eq!(
-                trust_for_bind(harness, &reserved("alfonso-core")),
-                BindTrust::Untrusted,
-                "retired module id alfonso-core must not be first-party on {harness}"
-            );
+            for module_id in ["alfonso-core", "prefrontal-core", "anything-unknown"] {
+                assert_eq!(
+                    trust_for_bind(harness, &reserved(module_id)),
+                    BindTrust::Untrusted
+                );
+            }
         }
     }
 
@@ -19237,6 +19185,7 @@ mod tests {
             &Arc::new(Notify::new()),
             &metrics,
             None,
+            &Arc::default(),
         )
         .await
         .unwrap();
@@ -19272,6 +19221,7 @@ mod tests {
             &Arc::new(Notify::new()),
             &metrics,
             None,
+            &Arc::default(),
         )
         .await
         .unwrap();
@@ -19368,6 +19318,7 @@ mod tests {
             &Arc::new(Notify::new()),
             &metrics,
             None,
+            &Arc::default(),
         )
         .await
         .unwrap();
@@ -22525,6 +22476,7 @@ mod terminal_lifecycle_tests {
                         &shutdown_signal,
                         MAX_FRAME_BODY_LEN as usize,
                         None,
+                        &RouteDeliverySessions::default(),
                     )
                     .await
                     .unwrap();

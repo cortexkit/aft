@@ -58,7 +58,7 @@ impl SecretVault for Vault {
             }
         }
         assert_eq!(scope.reference(), "secret-bash");
-        assert_eq!(scope.owner(), "reserved:prefrontal-core");
+        assert_eq!(scope.owner(), "reserved:prefrontal");
         assert_eq!(
             scope.stamp().scope_epoch,
             self.expected_epoch.load(Ordering::SeqCst)
@@ -77,7 +77,7 @@ impl SecretVault for Vault {
         }
         self.materials.fetch_add(1, Ordering::SeqCst);
         assert_eq!(scope.reference(), "secret-bash");
-        assert_eq!(scope.owner(), "reserved:prefrontal-core");
+        assert_eq!(scope.owner(), "reserved:prefrontal");
         assert_eq!(
             scope.stamp().scope_epoch,
             self.expected_epoch.load(Ordering::SeqCst)
@@ -137,7 +137,7 @@ fn request(command: &str) -> RawRequest {
 
 #[cfg(unix)]
 fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
-    serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","kind":kind,"scope_epoch":1,"owner_authorized":true})).unwrap()
+    serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","kind":kind,"scope_epoch":1,"owner_authorized":true})).unwrap()
 }
 
 #[cfg(unix)]
@@ -1053,7 +1053,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
         let mut lifetime = stamp("worker");
         lifetime.scope_epoch = index as u64 + 1;
         if pty {
-            lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-run","kind":"ephemeral","scope_epoch":index as u64 + 1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
+            lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-run","kind":"ephemeral","scope_epoch":index as u64 + 1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
         }
         let launch = || {
             super::super::registry::with_scope_spawn(Some(lifetime.clone()), || {
@@ -1196,7 +1196,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
     assert_eq!(audits.len(), expected_requests);
     for (index, record) in audits.iter().enumerate() {
         let scope = record.scope.as_ref().unwrap();
-        assert_eq!(scope.owner, "reserved:prefrontal-core");
+        assert_eq!(scope.owner, "reserved:prefrontal");
         assert_eq!(scope.reference, "secret-bash");
         assert_eq!(
             scope.kind,

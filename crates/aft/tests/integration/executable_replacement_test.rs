@@ -11,6 +11,10 @@ use super::subc_detach_test::{
     tool_response_json, write_connection_file, ModuleProcess,
 };
 
+#[cfg(target_os = "linux")]
+#[path = "linux_executable_pin_test.rs"]
+mod linux_executable_pin_test;
+
 struct Daemon {
     module: ModuleProcess,
     stream: TcpStream,
@@ -53,6 +57,10 @@ impl Daemon {
     }
 
     async fn call(&mut self, arguments: Value) -> Value {
+        self.tool_call("bash", arguments).await
+    }
+
+    async fn tool_call(&mut self, name: &str, arguments: Value) -> Value {
         self.corr += 1;
         send_frame(
             &mut self.stream,
@@ -62,7 +70,7 @@ impl Daemon {
                 1,
                 self.epoch,
                 self.corr,
-                serde_json::to_vec(&json!({ "name": "bash", "arguments": arguments })).unwrap(),
+                serde_json::to_vec(&json!({ "name": name, "arguments": arguments })).unwrap(),
             )
             .unwrap(),
         )
@@ -105,10 +113,14 @@ async fn configure(aft: &mut Daemon, home: &Path, project: &Path, storage: &Path
 }
 
 async fn foreground(aft: &mut Daemon, command: &str) -> Value {
-    let mut arguments = json!({
+    let arguments = json!({
         "command": command, "foreground_orchestrate": true,
         "permissions_requested": true, "compressed": false,
     });
+    call_with_permissions(aft, arguments).await
+}
+
+async fn call_with_permissions(aft: &mut Daemon, mut arguments: Value) -> Value {
     let response = aft.call(arguments.clone()).await;
     if response["code"] != "permission_required" {
         return response;
@@ -278,33 +290,36 @@ async fn pinned_executable_real_server_survives_binary_replacement_and_cleans_de
         }
     };
     let pinned_metadata = pinned_image.metadata().unwrap();
-    // Linux pins the server's own inode. macOS pins a separate file with the
-    // same bytes, so the running server keeps a single name: the privacy
-    // controls name a program by whichever link the kernel reports.
-    #[cfg(not(target_os = "macos"))]
-    assert_eq!(
+    // The pin is a separate file with the same bytes, so the running server
+    // keeps a single name: macOS privacy controls name a program by whichever
+    // link the kernel reports, and on Linux each link changes the inode's
+    // change time and link count.
+    assert!(pinned_image.starts_with(&storage));
+    assert_ne!(
         (pinned_metadata.dev(), pinned_metadata.ino()),
         (original.dev(), original.ino()),
-        "the initial shim must reference the server's original inode"
+        "the pin is a hard link"
     );
-    #[cfg(target_os = "macos")]
-    {
-        assert!(pinned_image.starts_with(&storage));
-        assert_ne!(
-            pinned_metadata.ino(),
-            original.ino(),
-            "the pin is a hard link"
-        );
-        assert_eq!(
-            std::fs::metadata(&deploy).unwrap().nlink(),
-            1,
-            "the server's image gained a second name"
-        );
-        assert_eq!(
-            std::fs::read(&pinned_image).unwrap(),
-            std::fs::read(&deploy).unwrap()
-        );
-    }
+    assert_eq!(
+        std::fs::metadata(&deploy).unwrap().nlink(),
+        1,
+        "the server's image gained a second name"
+    );
+    assert_eq!(
+        std::fs::read(&pinned_image).unwrap(),
+        std::fs::read(&deploy).unwrap()
+    );
+    #[cfg(target_os = "linux")]
+    linux_executable_pin_test::check_shell_pin_protection(
+        &mut aft,
+        &home,
+        &project,
+        &storage,
+        &deploy,
+        &pinned_image,
+        &original,
+    )
+    .await;
 
     std::fs::rename(&marker, &deploy).unwrap();
     let decoy = Command::new(&deploy).output().unwrap();

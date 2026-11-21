@@ -7,7 +7,10 @@ use crate::subc::test_support::{route_identity, test_root};
 use subc_protocol::call_mode::CallMode;
 use subc_protocol::scope::ScopeStamp;
 
-const OWNER: &str = "prefrontal-core";
+const OWNER: &str = "prefrontal";
+
+#[path = "codemode_restart_tests.rs"]
+mod restart;
 
 fn head_stamp(scope_ref: &str, agent: &str) -> ScopeStamp {
     serde_json::from_value(json!({
@@ -108,7 +111,7 @@ fn refusal(admission: Admission) -> subc_protocol::ErrorBody {
         Admission::Refused(error) => error,
         Admission::Owner(identity) => panic!("admitted as {}", identity.session),
         Admission::Unchanged => panic!("admission left the call unchanged"),
-        Admission::AwaitPolicies(_) => panic!("policies were not read"),
+        Admission::AwaitPolicies(_) | Admission::AwaitOwner(_) => panic!("admission is pending"),
     }
 }
 
@@ -117,7 +120,7 @@ fn owner(admission: Admission) -> RouteIdentity {
         Admission::Owner(identity) => identity,
         Admission::Refused(error) => panic!("refused: {} {:?}", error.code, error.detail),
         Admission::Unchanged => panic!("admission left the call unchanged"),
-        Admission::AwaitPolicies(_) => panic!("policies were not read"),
+        Admission::AwaitPolicies(_) | Admission::AwaitOwner(_) => panic!("admission is pending"),
     }
 }
 
@@ -561,10 +564,7 @@ fn codemode_head_with_another_scope_owner_is_not_the_runs_head() {
 }
 
 #[test]
-fn codemode_head_bound_under_the_other_prefrontal_name_is_the_runs_head() {
-    // The run's parent names one prefrontal module name and the head route
-    // carries the other, with the same ref and epoch: the case of a head that a
-    // runner adopted before the prefrontal-core -> prefrontal rename.
+fn codemode_head_and_parent_must_match_even_if_one_uses_the_legacy_name() {
     for (route_owner, parent_owner) in [
         ("prefrontal-core", "prefrontal"),
         ("prefrontal", "prefrontal-core"),
@@ -579,13 +579,6 @@ fn codemode_head_bound_under_the_other_prefrontal_name_is_the_runs_head() {
                 module_id: route_owner.into(),
             };
         });
-        let body = call("read", json!({"path": "notes.txt"}));
-        let session = owner(admit(&f.routes, channel(9), Some(&body)))
-            .session
-            .clone();
-        assert_eq!(session, "head-a-session", "{route_owner} -> {parent_owner}");
-        // Ref and epoch must still match exactly across the two names.
-        edit_head_stamp(&mut f, |stamp| stamp.scope_epoch += 1);
         assert_eq!(refusal_reason(&f), "head_route_not_bound");
     }
 }
@@ -640,7 +633,7 @@ fn codemode_identity_acting_for_a_run_is_not_the_runs_head() {
             run_id: "earlier-run".into(),
             task_identity: None,
             owner_route: other,
-            owner_route_channel: channel(2),
+            owner_route_channel: Some(channel(2)),
             run_route: channel(5),
             run_principal: other_principal,
         }));
@@ -685,6 +678,56 @@ fn second_head(f: &mut Fixture, root: &ProjectRootId, session: &str, trust: Bind
         data.call_mode = CallMode::Classic;
     }
     f.routes.insert(channel(3), identity);
+}
+
+fn head_with_scope_owner_route() -> Fixture {
+    let scope_owner = Principal::Reserved {
+        module_id: "prefrontal".into(),
+    };
+    let mut run = run_stamp("agent-a", "head-a", Some("linked"));
+    run.parent.as_mut().unwrap().owner = scope_owner.clone();
+    let mut f = fixture(run);
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
+    for (ch, principal_id, raw_harness) in [
+        (1, "reserved:broca", "broca"),
+        (3, "reserved:prefrontal", "runner"),
+    ] {
+        let data = Arc::get_mut(&mut f.routes.get_mut(&channel(ch)).unwrap().0).unwrap();
+        data.scope.as_mut().unwrap().owner = scope_owner.clone();
+        // Binds canonicalize the route label but preserve the principal's raw label.
+        data.harness = "runner".into();
+        let AuthenticatedPrincipal::RouteBind {
+            harness,
+            principal_id: id,
+            ..
+        } = &mut data.spawn_principal
+        else {
+            panic!("expected a route bind principal");
+        };
+        *harness = raw_harness.into();
+        *id = Some(principal_id.into());
+    }
+    f
+}
+
+#[test]
+fn codemode_head_inherits_runner_route_instead_of_scope_owner() {
+    let f = head_with_scope_owner_route();
+    let body = call("edit", json!({"path": "notes.txt"}));
+    let effective = owner(admit(&f.routes, channel(9), Some(&body)));
+    let runner = &f.routes[&channel(1)];
+    assert_eq!(effective.spawn_principal, runner.spawn_principal);
+    let run_owner = effective.run_owner.as_ref().unwrap();
+    assert_eq!(run_owner.owner_route_channel, Some(channel(1)));
+    assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
+}
+
+#[test]
+fn codemode_head_with_only_scope_owner_route_refuses() {
+    let mut f = head_with_scope_owner_route();
+    f.routes.remove(&channel(1));
+    assert_eq!(refusal_reason(&f), "head_route_not_bound");
 }
 
 fn assert_ambiguous_field(f: &Fixture, field: &str) {
@@ -758,10 +801,7 @@ fn codemode_head_routes_that_disagree_on_spawn_principal_are_ambiguous() {
 
 #[test]
 fn codemode_head_routes_with_equivalent_first_party_principals_are_served() {
-    for (first, second) in [
-        ("direct", "reserved:prefrontal-core"),
-        ("reserved:prefrontal-core", "direct"),
-    ] {
+    for (first, second) in [("direct", "reserved:broca"), ("reserved:broca", "direct")] {
         let mut f = linked_fixture();
         let root = f.head_root.clone();
         second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
@@ -789,7 +829,7 @@ fn saved_policy_fixture() -> (Fixture, tempfile::TempDir, Arc<AppContext>) {
     let root = f.head_root.clone();
     second_head(&mut f, &root, "head-a-session", BindTrust::FirstParty);
     with_principal_id(&mut f.routes, channel(1), "direct");
-    with_principal_id(&mut f.routes, channel(3), "reserved:prefrontal-core");
+    with_principal_id(&mut f.routes, channel(3), "reserved:broca");
     let storage = tempfile::tempdir().unwrap();
     let ctx = AppContext::new(
         Box::new(crate::parser::TreeSitterProvider::new()),
@@ -890,7 +930,7 @@ fn codemode_head_routes_ignore_preexisting_worker_policies() {
                 project_root: head.project_root.display().to_string(),
                 harness: head.harness.clone(),
                 session: head.session.clone(),
-                principal: "reserved:prefrontal-core".into(),
+                principal: "reserved:broca".into(),
                 owner: serde_json::to_string(&scope.owner).unwrap(),
                 scope_ref: scope.scope_ref.clone(),
                 epoch: scope.scope_epoch - u64::from(older_epoch),
@@ -1391,7 +1431,7 @@ fn codemode_worker_runner_route_is_inherited_instead_of_owner_lease() {
         assert_eq!(effective.harness, runner.harness);
         assert_eq!(effective.disabled_tools, runner.disabled_tools);
         let run_owner = effective.run_owner.as_ref().unwrap();
-        assert_eq!(run_owner.owner_route_channel, channel(4));
+        assert_eq!(run_owner.owner_route_channel, Some(channel(4)));
         assert!(Arc::ptr_eq(&run_owner.owner_route.0, &runner.0));
     }
 }

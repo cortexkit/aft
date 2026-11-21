@@ -2414,6 +2414,8 @@ pub struct App {
     /// The authenticated module connection's endpoint, independent of model
     /// backend configuration. Consumer routes must use this same daemon.
     subc_connection_file: parking_lot::RwLock<Option<PathBuf>>,
+    pub(crate) route_delivery_sessions:
+        Arc<crate::bash_background::registry::RouteDeliverySessions>,
     lifecycle_census: crate::lifecycle_census::LifecycleCensusCache,
     active_watchers: AtomicUsize,
     active_actor_roots: AtomicUsize,
@@ -2430,16 +2432,11 @@ pub struct App {
 }
 
 impl App {
-    pub(crate) fn set_subc_connection_file(&self, path: PathBuf) {
-        *self.subc_connection_file.write() = Some(path);
-    }
-    pub(crate) fn subc_connection_file(&self) -> Option<PathBuf> {
-        self.subc_connection_file.read().clone()
-    }
     pub fn new(provider_factory: LanguageProviderFactory) -> Self {
         Self {
             db: parking_lot::Mutex::new(None),
             subc_connection_file: parking_lot::RwLock::new(None),
+            route_delivery_sessions: Arc::default(),
             lifecycle_census: crate::lifecycle_census::LifecycleCensusCache::default(),
             active_watchers: AtomicUsize::new(0),
             active_actor_roots: AtomicUsize::new(0),

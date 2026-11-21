@@ -3754,12 +3754,11 @@ fn slow_shell_startup_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
 #[test]
 fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
-    let started = probe.path().join("started");
     run_subc_bridge_test_with_env(
         "subc_bridge_bash_promote_panic_triggers_fatal_teardown",
         Duration::from_secs(45),
         || {
-            let mut guards = started_promotion_env(&started);
+            let mut guards = started_promotion_env(probe.path());
             guards.push(set_test_force_bash_promote_panic());
             guards
         },
@@ -3769,18 +3768,15 @@ fn subc_bridge_bash_promote_panic_triggers_fatal_teardown() {
 }
 
 #[cfg(feature = "test-timing-hooks")]
-fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
+fn started_promotion_env(gate_dir: &std::path::Path) -> Vec<EnvVarGuard> {
     vec![
         // Keep the production startup budget while making promotion due quickly.
         // The generic foreground override would also refuse shell startup at 200ms.
         set_test_env("AFT_TEST_SUBC_BASH_PROMOTION_WAIT_MS", "200"),
-        // Delay the job that moves foreground bash to background after it starts,
-        // beyond the foreground wait plus reply timer. The marker distinguishes
-        // a running job from one merely queued behind a writer.
-        set_test_env("AFT_TEST_SUBC_BASH_PROMOTE_DELAY_MS", "3000"),
+        // Keep the started promotion pending until the daemon checks the handoff.
         set_test_env(
-            "AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE",
-            started.to_str().expect("probe path"),
+            "AFT_TEST_SUBC_BASH_PROMOTE_GATE_DIR",
+            gate_dir.to_str().expect("promotion gate path"),
         ),
     ]
 }
@@ -3789,11 +3785,10 @@ fn started_promotion_env(started: &std::path::Path) -> Vec<EnvVarGuard> {
 #[test]
 fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
-    let started = probe.path().join("started");
     run_subc_bridge_test_inner(
         "subc_bridge_bash_started_promotion_hands_off_before_transport_deadline",
         Duration::from_secs(45),
-        || started_promotion_env(&started),
+        || started_promotion_env(probe.path()),
         |input| drive_started_promotion_daemon(input, false),
         |_, _, _| {},
         true,
@@ -3809,8 +3804,7 @@ fn subc_bridge_bash_started_promotion_hands_off_before_transport_deadline() {
 #[cfg(feature = "test-timing-hooks")]
 fn slow_started_promotion_dispatch(req: RawRequest, ctx: &AppContext) -> Response {
     if req.command == "bash" {
-        // Model shell setup under load, beyond the short promotion wait but
-        // within the unchanged two-second end-to-end reply assertion.
+        // Model shell setup under load that finishes after the short promotion wait.
         thread::sleep(Duration::from_millis(600));
     }
     bridge_dispatch(req, ctx)
@@ -3820,12 +3814,11 @@ fn slow_started_promotion_dispatch(req: RawRequest, ctx: &AppContext) -> Respons
 #[test]
 fn subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive() {
     let probe = tempfile::tempdir().expect("promotion probe dir");
-    let started = probe.path().join("started");
     run_subc_bridge_test_inner(
         "subc_bridge_bash_late_promote_failure_keeps_deadline_handoff_and_module_alive",
         Duration::from_secs(45),
         || {
-            let mut guards = started_promotion_env(&started);
+            let mut guards = started_promotion_env(probe.path());
             guards.push(set_test_force_bash_promote_error());
             guards
         },
@@ -6203,10 +6196,14 @@ async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bo
         mut stream, root1, ..
     } = open_fake_daemon_session(input).await;
     bind_route1(&mut stream, &root1).await;
+    let gate_dir = std::path::PathBuf::from(
+        std::env::var_os("AFT_TEST_SUBC_BASH_PROMOTE_GATE_DIR").expect("promotion gate directory"),
+    );
+    let promote_release = gate_dir.join("release");
+    let _promote_release_guard = ReleaseOnDrop::new(promote_release.clone());
     let marker = root1.join("promote-panic-started");
     let release = root1.join("promote-panic-release");
     let _release_guard = ReleaseOnDrop::new(release.clone());
-    let sent_at = Instant::now();
     send_tool_call(
         &mut stream,
         1,
@@ -6219,32 +6216,10 @@ async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bo
         }),
     )
     .await;
-    let probe = std::env::var("AFT_TEST_SUBC_BASH_PROMOTE_STARTED_FILE").expect("promotion probe");
-    // Observe the reply while waiting for admission, so an early startup refusal
-    // reports its actual error rather than looking like a lost executor marker.
-    // Both the started-job marker and the original end-to-end bound are required.
-    let (_, frame) = tokio::join!(
-        wait_for_file(
-            std::path::Path::new(&probe),
-            "executor promotion start marker"
-        ),
-        async {
-            let remaining = Duration::from_secs(2).saturating_sub(sent_at.elapsed());
-            let frame = read_frame_within(&mut stream, remaining, "started promotion deadline handoff")
-                .await.expect("a started promotion must not hold its reply past the 2s test bound (25s transport budget)");
-            assert!(
-                !tool_result_is_error(&frame),
-                "bash failed before the promotion marker: {}",
-                tool_result_text(&frame),
-            );
-            assert!(
-                std::path::Path::new(&probe).exists(),
-                "the deadline handoff must exercise an already-started promotion job",
-            );
-            frame
-        },
-    );
-    std::fs::write(&release, b"release").expect("release panic command");
+    // The fixture checks the selected deadline against the transport budget on
+    // the module side. This read's timeout only guards against a stuck test.
+    let frame = read_frame_timeout(&mut stream, "handoff while the promotion job is held").await;
+    assert_eq!(frame.header.ty, FrameType::Response);
     assert_eq!(frame.header.channel, 1);
     assert_eq!(frame.header.corr, 116);
     assert!(
@@ -6253,11 +6228,17 @@ async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bo
         frame.header,
         String::from_utf8_lossy(&frame.body),
     );
+    assert!(
+        gate_dir.join("started").exists(),
+        "the deadline handoff must exercise an already-started promotion job",
+    );
     let text = tool_result_text(&frame);
     assert!(
         text.contains("promoted to background"),
         "expected deadline handoff, got {text:?}"
     );
+    std::fs::write(&release, b"release").expect("release promoted command");
+    std::fs::write(&promote_release, b"release").expect("release promotion job");
 
     if !expect_fatal {
         // This read cannot finish until the background-promotion job leaves the
@@ -6274,8 +6255,8 @@ async fn drive_started_promotion_daemon(input: FakeDaemonInput, expect_fatal: bo
         return;
     }
 
-    // The handed-off command may complete before the delayed panic. Its normal
-    // background pushes do not replace either ordered fatal Goodbye.
+    // The command may finish before the promotion panics. Its normal background
+    // pushes do not replace either ordered fatal Goodbye.
     let route_goodbye = read_frame_timeout(&mut stream, "late promote panic route goodbye").await;
     assert_eq!(route_goodbye.header.ty, FrameType::Goodbye);
     assert_eq!(route_goodbye.header.channel, 1);
@@ -8701,7 +8682,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
                 "op": "catalog.list",
                 "generation": 7,
                 "modules": [{
-                    "module_id": "prefrontal-core",
+                    "module_id": "prefrontal",
                     "roles": [{
                         "role": "management_surface",
                         "operations": [{ "name": "status.line", "kind": "query" }],
@@ -8725,7 +8706,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     assert_eq!(route_open_body["op"], "route.open");
     assert_eq!(
         route_open_body["target"],
-        json!({ "kind": "management_surface", "module_id": "prefrontal-core" })
+        json!({ "kind": "management_surface", "module_id": "prefrontal" })
     );
     assert_eq!(
         route_open_body["consumer_identity"],
@@ -8890,7 +8871,7 @@ async fn drive_discovered_status_line_surface_daemon(input: FakeDaemonInput) {
     send_connection_goodbye(&mut stream).await;
 }
 
-/// A fleet status holder (`prefrontal-core`) played by the test. It answers the
+/// A fleet status holder (`prefrontal`) played by the test. It answers the
 /// module's consumer connection: catalog discovery, the status route bind, and
 /// each `status.publish` with an ack whose `last_read_at_ms` says how recently
 /// something read this project's fleet line.
@@ -8916,7 +8897,7 @@ impl FakeStatusHolder {
         assert_eq!(route_open_body["op"], "route.open");
         assert_eq!(
             route_open_body["target"],
-            json!({ "kind": "management_surface", "module_id": "prefrontal-core" })
+            json!({ "kind": "management_surface", "module_id": "prefrontal" })
         );
         assert_eq!(
             route_open_body["identity"],
@@ -8985,7 +8966,7 @@ fn holder_catalog() -> Value {
         "op": "catalog.list",
         "generation": 7,
         "modules": [{
-            "module_id": "prefrontal-core",
+            "module_id": "prefrontal",
             "roles": [{
                 "role": "management_surface",
                 "operations": [{ "name": "status.line", "kind": "query" }],

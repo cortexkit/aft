@@ -850,7 +850,7 @@ mod url_tests {
         }
 
         fn stamp() -> subc_protocol::scope::ScopeStamp {
-            serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal-core"},"ref":"secret-fetch","kind":"head","scope_epoch":1,"owner_authorized":true})).unwrap()
+            serde_json::from_value(serde_json::json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-fetch","kind":"head","scope_epoch":1,"owner_authorized":true})).unwrap()
         }
 
         struct Fixture {

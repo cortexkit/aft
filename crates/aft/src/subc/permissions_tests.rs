@@ -4,7 +4,7 @@ use crate::config::Config;
 use crate::db::access_grants::{self as store, ScopeKey};
 use std::sync::Mutex;
 
-const OWNER: &str = r#"{"kind":"reserved","module_id":"prefrontal-core"}"#;
+const OWNER: &str = r#"{"kind":"reserved","module_id":"prefrontal"}"#;
 
 fn key(scope_ref: &str, epoch: u64) -> ScopeKey {
     ScopeKey {
@@ -422,7 +422,7 @@ fn permissions_refuse_callers_other_than_cingulate_and_direct() {
             module_id: "plexus".into(),
         }),
         Some(Principal::Reserved {
-            module_id: "prefrontal-core".into(),
+            module_id: "prefrontal".into(),
         }),
         Some(Principal::Reserved {
             module_id: "aft".into(),
@@ -918,7 +918,7 @@ async fn permissions_cingulate_route_serves_only_permissions_operations() {
         bind(
             42,
             Some(Principal::Reserved {
-                module_id: "prefrontal-core".into(),
+                module_id: "prefrontal".into(),
             }),
         ),
     )
