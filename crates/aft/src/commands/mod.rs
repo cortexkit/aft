@@ -41,12 +41,16 @@ mod cache_location_tests;
 pub(crate) use crate::blocking_wait;
 pub mod call_tree;
 pub mod callers;
+#[cfg(test)]
+mod callers_runtime_tests;
 pub use crate::data_layer::{callgraph_roots, callgraph_store_adapter};
 pub mod checkpoint;
 pub mod configure;
 #[cfg(test)]
 mod configure_test_env;
 pub mod conflicts;
+#[cfg(test)]
+mod data_surface_tests;
 pub mod delete_file;
 pub(crate) mod delete_tree;
 #[cfg(test)]
