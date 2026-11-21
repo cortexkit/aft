@@ -333,4 +333,4 @@ fn deleted_root_task_registry_contention_is_censused_without_kill_threads() {
 }
 
 #[cfg(test)]
-use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, BgTaskTestExt as _};

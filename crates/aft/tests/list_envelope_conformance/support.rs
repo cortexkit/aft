@@ -2600,24 +2600,25 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let source_dir = aft_src_dir();
+    let engine_dir = crate::test_helpers::manifest_dir().join("../aft-engine/src");
     let base_dir = base_src_dir();
     let mut paths = collect_rs_files(&source_dir.join("commands"));
-    paths.extend(collect_rs_files(&source_dir.join("search_state")));
-    paths.extend(collect_rs_files(&source_dir.join("search_index")));
-    paths.push(source_dir.join("data_layer/callgraph_store_adapter.rs"));
-    paths.push(source_dir.join("bash_background/scoped_tasks.rs"));
-    paths.push(source_dir.join("bash_changed_files.rs"));
+    paths.extend(collect_rs_files(&engine_dir.join("search_state")));
+    paths.extend(collect_rs_files(&engine_dir.join("search_index")));
+    paths.push(engine_dir.join("data_layer/callgraph_store_adapter.rs"));
+    paths.push(engine_dir.join("bash_background/scoped_tasks.rs"));
+    paths.push(engine_dir.join("bash_changed_files.rs"));
     paths.push(source_dir.join("run_tool_call.rs"));
     paths.push(source_dir.join("subc_format.rs"));
     paths.push(source_dir.join("tool_output.rs"));
-    paths.push(source_dir.join("output_store.rs"));
-    paths.push(source_dir.join("file_read_exact.rs"));
+    paths.push(engine_dir.join("output_store.rs"));
+    paths.push(engine_dir.join("file_read_exact.rs"));
     paths.push(source_dir.join("subc/bind_log.rs"));
     paths.push(source_dir.join("subc/diagnostics_findings.rs"));
-    paths.push(source_dir.join("runtime_drain.rs"));
+    paths.push(engine_dir.join("runtime_drain.rs"));
     paths.push(source_dir.join("parser/todo_markers.rs"));
     paths.push(source_dir.join("parser/dead_code_facts.rs"));
-    paths.push(source_dir.join("bash_permissions/scan.rs"));
+    paths.push(engine_dir.join("bash_permissions/scan.rs"));
     paths.extend(collect_rs_files(&base_dir.join("compress")));
     let primitives = [
         "budget.exhausted()",
@@ -2648,6 +2649,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         let source = fs::read_to_string(&path).unwrap_or_default();
         let file = registry_file_key(
             path.strip_prefix(&source_dir)
+                .or_else(|_| path.strip_prefix(&engine_dir))
                 .or_else(|_| path.strip_prefix(&base_dir))
                 .unwrap_or(&path),
         );

@@ -252,7 +252,6 @@ pub mod surfaces {
         surfaces::disclose_parse_gaps(view, roots, response);
     }
 
-    #[cfg(target_os = "linux")]
     pub fn shared_memory_estimate(ctx: &AppContext) -> Option<crate::memory::MemoryEstimate> {
         surfaces::memory_estimate(ctx).map(|memory| memory.shared)
     }
@@ -270,17 +269,17 @@ pub fn project_status(
     crate::status_push::project(ctx, snapshot)
 }
 
-#[cfg(target_os = "linux")]
 pub mod memory_profile {
-    use crate::data_layer::{checkout::DataLayer, runtime};
-    use std::sync::Arc;
+    use crate::data_layer::runtime;
     use std::time::Instant;
 
     pub fn with_memory_walk_clock_for_test<T>(now: Instant, refresh: impl FnOnce() -> T) -> T {
         crate::context::with_memory_walk_clock_for_test(now, refresh)
     }
 
-    pub fn memory_profile_layer_for_test() -> Arc<DataLayer> {
+    #[cfg(target_os = "linux")]
+    pub fn memory_profile_layer_for_test() -> std::sync::Arc<crate::data_layer::checkout::DataLayer>
+    {
         runtime::memory_profile_layer_for_test()
     }
 
@@ -288,6 +287,7 @@ pub mod memory_profile {
         runtime::memory_figure_walks_for_test()
     }
 
+    #[cfg(target_os = "linux")]
     pub fn with_memory_figure_baseline_for_test<T>(baseline: bool, run: impl FnOnce() -> T) -> T {
         runtime::with_memory_figure_baseline_for_test(baseline, run)
     }
