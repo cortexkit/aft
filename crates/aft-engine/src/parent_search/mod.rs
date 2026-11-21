@@ -698,7 +698,7 @@ pub struct Child {
     view: Arc<crate::data_layer::parent_session::Child>,
     /// The search engine context that runs `aft_search` over this child's
     /// loaded indexes; see [`engine`].
-    pub(crate) engine: Mutex<Option<engine::ChildEngine>>,
+    pub engine: Mutex<Option<engine::ChildEngine>>,
 }
 
 impl Child {

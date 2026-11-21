@@ -799,7 +799,7 @@ pub struct GrepMatch {
 pub struct GrepResult {
     /// Index sources whose posting evidence could not be read. Successful
     /// sources may still supply matches, but their merged reply is incomplete.
-    pub(crate) index_sources_unavailable: bool,
+    pub index_sources_unavailable: bool,
     pub index_read_gaps: Vec<String>,
     pub matches: Vec<GrepMatch>,
     pub total_matches: usize,

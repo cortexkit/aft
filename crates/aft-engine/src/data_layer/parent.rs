@@ -268,7 +268,7 @@ pub fn callgraph_plane(ctx: &impl IndexHost, parent: &Path, child: &Path) -> Pla
 pub(crate) struct ChildSearch {
     /// Its checkout, which the child's search engine answers from; `None`
     /// when it could not be bound, and `text` says why.
-    pub(crate) checkout: Option<Arc<DataCheckout>>,
+    pub checkout: Option<Arc<DataCheckout>>,
     /// Its text plane, as grep reads it.
     pub(crate) text: Plane<CheckoutView>,
     /// Why its meaning search has nothing to answer from, when it has not.
