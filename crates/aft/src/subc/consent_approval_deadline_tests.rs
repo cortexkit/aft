@@ -1,3 +1,4 @@
+/// The approval wait never runs into the time the approved run needs.
 #[test]
 fn standalone_approval_deadline_leaves_the_rerun_margin() {
     let now = Instant::now();

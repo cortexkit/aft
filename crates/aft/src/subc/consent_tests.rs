@@ -8476,7 +8476,6 @@ async fn standalone_unanswered_approval_ends_with_access_pending() {
     f.connection_cancel.cancel();
 }
 
-/// The approval wait never runs into the time the approved run needs.
 include!("consent_approval_deadline_tests.rs");
 #[cfg(unix)]
 #[path = "secret_fetch_cancellation_tests.rs"]

@@ -73,7 +73,7 @@ mod shared_db_tests {
 
         // A fresh store must recover the persisted backup rather than reuse
         // the original store's in-memory backup entries.
-        let mut recovered = BackupStore::new();
+        let mut recovered = aft_engine::test_bridge::search_misc::backup::new_for_test();
         recovered.set_storage_dir(storage.to_path_buf(), 72);
         recovered.set_db_harness(crate::harness::Harness::Opencode);
         recovered.set_db_project_key(crate::path_identity::project_scope_key(root));

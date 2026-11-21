@@ -78,6 +78,9 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft-engine/src/search_state/generation_token.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/mod.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/entry.rs"),
+                FenceRule::Exact(
+                    "crates/aft/src/commands/semantic_search/entry/external_hook_tests.rs",
+                ),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/nearest_names.rs"),
                 FenceRule::Exact("crates/aft-engine/src/search_b2/plan_table.rs"),
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/recall_audit.rs"),
@@ -127,6 +130,9 @@ fn slices() -> Vec<Slice> {
                 FenceRule::Exact("crates/aft/src/commands/semantic_search/exact_lane.rs"),
                 FenceRule::Exact("crates/aft-engine/src/search_index/exact_lane.rs"),
                 FenceRule::Exact("crates/aft-engine/src/search_state/memo.rs"),
+                FenceRule::Exact(
+                    "crates/aft-engine/src/search_state/path_order_held_rows_for_test.rs",
+                ),
                 FenceRule::Exact("crates/aft-engine/src/search_index.rs"),
                 FenceRule::Exact("crates/aft-engine/src/search_state/mod.rs"),
                 FenceRule::Exact("crates/aft/tests/engine_content_binding_test.rs"),
