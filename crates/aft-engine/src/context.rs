@@ -1233,9 +1233,7 @@ pub(crate) mod pending_capture_fixture;
 #[cfg(any(test, feature = "test-support"))]
 use pending_capture_fixture::pending_capture_boundary_for_test;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use pending_capture_fixture::{
-    install_pending_capture_hook_for_test, PendingCaptureBoundary,
-};
+pub(crate) use pending_capture_fixture::PendingCaptureBoundary;
 
 /// Counts a watcher drain while it runs. The second counter advances when a
 /// drain starts and again when it ends, so a pending-changes capture can tell

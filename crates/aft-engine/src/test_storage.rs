@@ -1,4 +1,6 @@
-pub use aft_base::test_storage::*;
+pub use aft_base::test_storage::{
+    assert_context, assert_database, assert_root, live_storage_root_from, live_storage_roots,
+};
 
 #[cfg(feature = "test-support")]
 thread_local! {

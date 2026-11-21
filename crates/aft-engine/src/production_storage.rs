@@ -1,4 +1,10 @@
-pub use aft_base::production_storage::*;
+#[cfg(any(unix, windows))]
+pub use aft_base::production_storage::account_home;
+#[cfg(any(test, feature = "test-support"))]
+pub use aft_base::production_storage::with_test_account;
+pub use aft_base::production_storage::{
+    canonicalized_with, protected, refuse_write, resolve_account_home_dir,
+};
 
 #[cfg(test)]
 #[allow(unused_imports)]

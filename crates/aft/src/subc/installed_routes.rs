@@ -163,7 +163,6 @@ mod tests {
 
     #[test]
     fn status_kv_tracks_installed_routes_and_channel_replacement() {
-        use crate::late_result_bus::status;
         let (_dir, root) = test_root("status-kv-routes");
         let session = "status-kv:installed/runner";
         let other = "status-kv:replacement/runner";

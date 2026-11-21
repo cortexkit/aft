@@ -216,12 +216,15 @@ pub fn is_large(size: u64) -> bool {
 // ---------------------------------------------------------------------------
 // Step reading
 
-/// A source of file bytes read in steps: an opened file, or a test's bytes.
-pub(crate) trait StepSource {
-    /// Append at most `size` more bytes to `buffer`. Fewer bytes than asked
-    /// is not the end of the file; only an append of no bytes is.
-    fn append(&mut self, buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>>;
+mod step_source {
+    /// A source of file bytes read in steps: an opened file, or a test's bytes.
+    pub trait StepSource {
+        /// Append at most `size` more bytes to `buffer`. Fewer bytes than asked
+        /// is not the end of the file; only an append of no bytes is.
+        fn append(&mut self, buffer: Vec<u8>, size: usize) -> std::io::Result<Vec<u8>>;
+    }
 }
+use step_source::StepSource;
 
 impl StepSource for crate::bounded_io::Reader {
     fn append(&mut self, buffer: Vec<u8>, size: usize) -> io::Result<Vec<u8>> {

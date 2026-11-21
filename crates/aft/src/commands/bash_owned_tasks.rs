@@ -63,7 +63,6 @@ mod tests {
     use super::*;
     use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
     use crate::config::Config;
-    use crate::context::App;
     use crate::db::{bash_tasks, TrackedConnection};
     use crate::harness::Harness;
     use crate::protocol::BgTaskStatus;

@@ -68,9 +68,9 @@ fn encode(segment: &str, generation: u64) -> Vec<u8> {
 pub use aft_base::runner_status_state::{route_bound, route_unbound};
 
 pub(crate) use aft_base::runner_status_state::initialize;
-use aft_base::runner_status_state::{notifier, snapshot_segments, Snapshot};
 #[cfg(any(test, feature = "test-support"))]
-use aft_base::runner_status_state::{segment_for_test, Sessions};
+use aft_base::runner_status_state::segment_for_test;
+use aft_base::runner_status_state::{notifier, snapshot_segments, Snapshot};
 
 trait Writer {
     async fn put(&mut self, key: &str, value: Bytes) -> Result<(), &'static str>;
