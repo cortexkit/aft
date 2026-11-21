@@ -8417,7 +8417,7 @@ pub(in crate::subc) mod route_tests {
             let before = std::fs::read(&task.paths().json).unwrap();
             let before_limit = read_task(&task.paths().json).unwrap().timeout_ms.unwrap();
             let ctx = Arc::new(ctx);
-            let mut arguments = json!({"taskId":task.task_id});
+            let mut arguments = json!({"taskId":task.task_id()});
             if name == "bash_watch" {
                 arguments["timeoutMs"] = json!(1);
             }
@@ -8449,7 +8449,7 @@ pub(in crate::subc) mod route_tests {
                     "carrier {name} changed the live deadline"
                 );
                 assert_eq!(
-                    std::fs::read(&task.paths.json).unwrap(),
+                    std::fs::read(&task.paths().json).unwrap(),
                     before,
                     "carrier {name} rewrote task metadata"
                 );
@@ -8494,7 +8494,7 @@ pub(in crate::subc) mod route_tests {
             }
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let reply = exchange_with_actor(
-                json!({"name":"bash_watch","preset":"worker","arguments":{"taskId":task.task_id,"timeoutMs":1}}),
+                json!({"name":"bash_watch","preset":"worker","arguments":{"taskId":task.task_id(),"timeoutMs":1}}),
                 task_poll_identity(&root, &task.session_id(), carrier), Arc::new(ctx),
                 &Arc::new(DispatchPathMetrics::new()),
                 |_, _| panic!("watch uses the deferred handler"),
@@ -8502,7 +8502,7 @@ pub(in crate::subc) mod route_tests {
             let body: Value = serde_json::from_slice(&reply.body).unwrap();
             assert_eq!(body["isError"], false, "{body}");
             assert_eq!(
-                read_task(&task.paths.json).unwrap().completion_delivered,
+                read_task(&task.paths().json).unwrap().completion_delivered,
                 !carrier,
                 "only the worker's watch may acknowledge its completion"
             );
@@ -8524,7 +8524,7 @@ pub(in crate::subc) mod route_tests {
             ));
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let before = std::fs::read(&task.paths().json).unwrap();
-            let mut arguments = json!({"taskId":task.task_id});
+            let mut arguments = json!({"taskId":task.task_id()});
             if name == "bash_watch" {
                 arguments["pattern"] = json!("observed-output-marker");
                 arguments["timeoutMs"] = json!(100);
@@ -8549,11 +8549,13 @@ pub(in crate::subc) mod route_tests {
                 assert!(body.to_string().contains("running"), "{name}: {body}");
             }
             assert!(
-                ctx.bash_background().task_for_test(&task.task_id).is_none(),
+                ctx.bash_background()
+                    .task_for_test(&task.task_id())
+                    .is_none(),
                 "carrier {name} registered the task and could re-arm its durable watches"
             );
             assert_eq!(
-                std::fs::read(&task.paths.json).unwrap(),
+                std::fs::read(&task.paths().json).unwrap(),
                 before,
                 "carrier {name} rewrote the task bundle"
             );

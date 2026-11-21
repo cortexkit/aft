@@ -916,7 +916,10 @@ fn scratch_read_context() -> (
         .bash_background()
         .test_task("bash-0123456789abcdef")
         .unwrap();
-    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
+    task.test_lock_state()
+        .unwrap()
+        .metadata_mut()
+        .sandbox_temp_dir = Some(scratch.clone());
     let db = std::sync::Arc::new(std::sync::Mutex::new(
         crate::db::open(&directory.path().join("grants.db")).unwrap(),
     ));
@@ -1155,7 +1158,10 @@ fn scratch_read_bridge_capability_is_session_scoped() {
         .bash_background()
         .test_task("bash-0123456789abcdef")
         .unwrap();
-    task.lock_state().unwrap().metadata.sandbox_temp_dir = None;
+    task.test_lock_state()
+        .unwrap()
+        .metadata_mut()
+        .sandbox_temp_dir = None;
     assert!(!ctx
         .bash_background()
         .is_session_owned_scratch_path("policy-session", &scratch));
@@ -1419,11 +1425,14 @@ fn scratch_read_allocator_path_uses_the_task_record() {
         .test_task("bash-0123456789abcdef")
         .unwrap();
     let allocated = Cleanup(
-        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap(),
+        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths().io_dir).unwrap(),
     );
     let file = allocated.0.join("worker.diff");
     std::fs::write(&file, "own scratch diff\n").unwrap();
-    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(allocated.0.clone());
+    task.test_lock_state()
+        .unwrap()
+        .metadata_mut()
+        .sandbox_temp_dir = Some(allocated.0.clone());
     let response =
         crate::commands::read::handle_read(&request("read", json!({"file": file})), &ctx);
     assert!(response.success, "{:?}", response.data);
@@ -1449,8 +1458,11 @@ fn scratch_read_right_after_command_exit_reads_kept_scratch_without_ask() {
         .test_task("bash-0123456789abcdef")
         .unwrap();
     let scratch =
-        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap();
-    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
+        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths().io_dir).unwrap();
+    task.test_lock_state()
+        .unwrap()
+        .metadata_mut()
+        .sandbox_temp_dir = Some(scratch.clone());
     let written = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg("printf 'fn kept_scratch() {}\\n' > \"$TMPDIR/kept.rs\"")
@@ -1530,8 +1542,11 @@ fn scratch_read_after_command_exit_is_not_found_without_ask() {
         .test_task("bash-0123456789abcdef")
         .unwrap();
     let scratch =
-        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap();
-    task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
+        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths().io_dir).unwrap();
+    task.test_lock_state()
+        .unwrap()
+        .metadata_mut()
+        .sandbox_temp_dir = Some(scratch.clone());
     let written = std::process::Command::new("/bin/sh")
         .arg("-c")
         .arg("printf 'fn worker_scratch() {}\\n' > \"$TMPDIR/ict.rs\"")
@@ -1576,9 +1591,9 @@ fn scratch_read_after_command_exit_is_not_found_without_ask() {
     }
     assert!(!scratch.exists(), "cleanup must remove the scratch");
     assert!(task
-        .lock_state()
+        .test_lock_state()
         .unwrap()
-        .metadata
+        .metadata()
         .sandbox_temp_dir
         .is_none());
 

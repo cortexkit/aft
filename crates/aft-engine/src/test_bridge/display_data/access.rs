@@ -15,10 +15,12 @@ use std::time::Duration;
 macro_rules! test_methods {
     ($extension:ident for $engine:ty { $( $(#[$attr:meta])* fn $name:ident $(<$parameter:ident>)? (&self $(, $arg:ident: $ty:ty)*) $(-> $result:ty)?; )* }
         $(associated { $(fn $static_name:ident($($static_arg:ident: $static_ty:ty),*) -> $static_result:ty;)* })?
+        $(arc { $(fn $arc_name:ident(self: &Arc<Self>);)* })?
     ) => {
         pub trait $extension {
             $( $(#[$attr])* fn $name $(<$parameter>)? (&self $(, $arg: $ty)*) $(-> $result)?; )*
             $($(fn $static_name($($static_arg: $static_ty),*) -> $static_result;)*)?
+            $($(fn $arc_name(self: &Arc<Self>);)*)?
         }
         impl $extension for $engine {
             $( $(#[$attr])* fn $name $(<$parameter>)? (&self $(, $arg: $ty)*) $(-> $result)? {
@@ -26,6 +28,9 @@ macro_rules! test_methods {
             } )*
             $($(fn $static_name($($static_arg: $static_ty),*) -> $static_result {
                 <$engine>::$static_name($($static_arg),*)
+            })*)?
+            $($(fn $arc_name(self: &Arc<Self>) {
+                <$engine>::$arc_name(self);
             })*)?
         }
     };
@@ -54,6 +59,8 @@ test_methods! { AppContextTestExt for AppContext {
     fn hold_data_checkout_slot_for_test(&self) -> impl Drop + '_;
     fn data_note_paths(&self, paths: &[PathBuf]);
     fn try_build_status_push_snapshot(&self) -> Option<crate::protocol::StatusPayload>;
+    fn try_build_status_snapshot(&self) -> Option<crate::protocol::StatusPayload>;
+    fn validate_read_path_without_approval(&self, req_id: &str, session_id: &str, path: &Path) -> Result<PathBuf, crate::protocol::Response>;
     fn callgraph_executor_for_test(&self) -> Option<crate::executor::RootMaintenanceExecutor>;
     fn note_launch_restore_attempt(&self);
     fn launch_restore_attempts(&self) -> usize;
@@ -65,6 +72,8 @@ test_methods! { AppContextTestExt for AppContext {
     fn lsp_post_edit_worker_running_for_test(&self) -> bool;
 } associated {
     fn ignore_walks_on_current_thread_for_test() -> u64;
+} arc {
+    fn bind_status_context(self: &Arc<Self>);
 }}
 
 test_methods! { ConfigLiveStateTestExt for crate::config_live::ConfigLiveState {
@@ -86,6 +95,7 @@ test_methods! { DataCheckoutTestExt for DataCheckout {
     fn root(&self) -> &Path;
     fn note_outcome_for_test<T>(&self, stage: &'static str, result: &Result<T, DataError>);
     fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>);
+    fn filling(&self) -> bool;
     #[cfg(all(feature = "wasm-grammars", feature = "test-hooks", not(all(target_os = "windows", target_arch = "aarch64"))))]
     fn grammar_driver_running_for_test(&self) -> bool;
 } associated {
@@ -100,6 +110,7 @@ test_methods! { ChildCheckoutsTestExt for crate::data_layer::parent::ChildChecko
 
 test_methods! { CheckoutTestExt for Checkout {
     fn has_unpublished_luau_changes(&self) -> bool;
+    fn publish_text_first(&self) -> Result<bool, DataError>;
     #[cfg(feature = "wasm-grammars")]
     fn retry_grammar_gaps(&self) -> Result<bool, DataError>;
 }}
@@ -111,7 +122,17 @@ test_methods! { SnapshotStoreTestExt for crate::page_collect::snapshot::Snapshot
 }}
 
 pub use crate::data_layer::host::IndexHost;
-pub use crate::executor::{ExecutorApp, ExecutorContext};
+pub use crate::executor::ExecutorApp;
+
+pub trait ExternalSearchTestExt {
+    fn engine(&self) -> &AppContext;
+}
+
+impl ExternalSearchTestExt for crate::parent_search::external::ExternalSearch {
+    fn engine(&self) -> &AppContext {
+        &self.engine
+    }
+}
 
 test_methods! { VectorPlaneTestExt for crate::data_layer::vectors::VectorPlane {
     fn cached_snapshot(&self, view: &CheckoutView) -> Option<crate::data_layer::vectors::MeaningSnapshot>;

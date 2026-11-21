@@ -3218,7 +3218,7 @@ pub(crate) mod tests {
             scope_hash: Some("scope-2".into())
         }));
     }
-    fn foreign_writer(
+    pub(crate) fn foreign_writer(
         root: &Path,
         inspect_dir: &Path,
         snapshot: bool,

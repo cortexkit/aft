@@ -371,9 +371,9 @@ fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
         .bash_background()
         .test_task("bash-a2f0123456789012")
         .unwrap()
-        .lock_state()
+        .test_lock_state()
         .unwrap()
-        .metadata
+        .metadata_mut()
         .sandbox_temp_dir = Some(scratch.clone());
     let target = scratch.join("foreign.txt");
     std::fs::write(&target, "foreign secret").unwrap();
@@ -686,9 +686,9 @@ fn registered_scratch(f: &Fixture, session: &str, task: &str) -> (PathBuf, Scrat
         .bash_background()
         .test_task(task)
         .unwrap()
-        .lock_state()
+        .test_lock_state()
         .unwrap()
-        .metadata
+        .metadata_mut()
         .sandbox_temp_dir = Some(scratch.clone());
     (scratch.clone(), ScratchCleanup(scratch))
 }

@@ -104,7 +104,7 @@ fn deleted_root_delivered_completions_settle_once_after_descendants_exit() {
         ("bash-0000000000000092", BgTaskStatus::Failed),
     ] {
         let group = OwnedGroup::spawn();
-        fixture.task(id, fixture.root.as_path(), status, Some(group.0.id()));
+        fixture.task(id, fixture.root.as_path(), status, Some(group.child().id()));
         deliver_terminal_and_remove_output(&registry, id);
         // Completion sampled a live group member. Its later exit leaves the
         // saved descendant list stale, just as a short-lived child can exit
@@ -152,7 +152,7 @@ fn deleted_root_reused_group_is_not_signaled_and_does_not_block_reclaim() {
         id,
         fixture.root.as_path(),
         BgTaskStatus::Completed,
-        Some(group.0.id()),
+        Some(group.child().id()),
     );
     deliver_terminal_and_remove_output(&registry, id);
     // Keep the group number but make every saved start time differ from the
@@ -162,7 +162,7 @@ fn deleted_root_reused_group_is_not_signaled_and_does_not_block_reclaim() {
     fixture.wait_for_kill();
     let outcome = fixture.sweep();
     fixture.assert_reclaimed(outcome);
-    assert!(group.0.try_wait().unwrap().is_none());
+    assert!(group.child_mut().try_wait().unwrap().is_none());
     assert_eq!(completion_attempts(&registry), 1);
 }
 
@@ -185,7 +185,7 @@ fn assert_terminal_survivor_reclaimed(clear_sample: bool) {
         "bash-0000000000000001",
         fixture.root.as_path(),
         BgTaskStatus::Completed,
-        Some(group.0.id()),
+        Some(group.child().id()),
     );
     if clear_sample {
         clear_descendant_sample(fixture.ctx.bash_background(), "bash-0000000000000001");
@@ -198,7 +198,7 @@ fn assert_terminal_survivor_reclaimed(clear_sample: bool) {
     // is bounded so a group that survived fails the test instead of hanging it.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let status = loop {
-        if let Some(status) = group.0.try_wait().unwrap() {
+        if let Some(status) = group.child_mut().try_wait().unwrap() {
             break status;
         }
         assert!(
@@ -224,7 +224,7 @@ fn deleted_root_is_not_blocked_by_another_roots_running_task() {
         "bash-0000000000000002",
         other.path(),
         BgTaskStatus::Running,
-        Some(group.0.id()),
+        Some(group.child().id()),
     );
     // Actor retirement detaches its registry. Keep the task itself so the
     // assertion observes its state rather than racing the registry teardown.
@@ -237,7 +237,7 @@ fn deleted_root_is_not_blocked_by_another_roots_running_task() {
     fixture.assert_reclaimed(outcome);
     assert!(foreign.is_running());
     assert!(
-        group.0.try_wait().unwrap().is_none(),
+        group.child_mut().try_wait().unwrap().is_none(),
         "foreign task must not be signaled"
     );
     assert_eq!(kill_attempts(fixture.ctx.bash_background()), 0);
@@ -288,7 +288,7 @@ fn deleted_root_running_task_is_killed_before_reclaim() {
         "bash-0000000000000004",
         fixture.root.as_path(),
         BgTaskStatus::Running,
-        Some(group.0.id()),
+        Some(group.child().id()),
     );
     assert_eq!(fixture.sweep().evicted, 0);
     assert_eq!(
@@ -298,7 +298,7 @@ fn deleted_root_running_task_is_killed_before_reclaim() {
     assert!(fixture.roots.contains_key(&fixture.root));
     fixture.wait_for_kill();
     assert!(
-        group.0.try_wait().unwrap().is_some(),
+        group.child_mut().try_wait().unwrap().is_some(),
         "running task survived reclaim"
     );
     assert_eq!(
