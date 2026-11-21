@@ -1513,7 +1513,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bash_permissions_roundtrip_unix_temp_aliases() {
-        use crate::bash_permissions::{is_system_temp_path, PermissionKind};
+        use crate::bash_permissions::PermissionKind;
+        use aft_engine::test_bridge::bash_remote::is_system_temp_path;
         let scratch = std::env::current_dir()
             .unwrap()
             .join("target/bash-roundtrip");
@@ -1569,7 +1570,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn bash_permissions_roundtrip_windows_temp_short_and_long() {
-        use crate::bash_permissions::{is_system_temp_path, PermissionKind};
+        use crate::bash_permissions::PermissionKind;
+        use aft_engine::test_bridge::bash_remote::is_system_temp_path;
         use std::os::windows::ffi::{OsStrExt, OsStringExt};
         use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
         let temp = tempfile::Builder::new()
@@ -1878,7 +1880,8 @@ mod tests {
     #[test]
     fn windows_shell_args_match_each_shells_invocation_contract() {
         let cmd = "echo hello";
-        let pwsh_args = WindowsShell::Pwsh.args(cmd);
+        let pwsh_args =
+            aft_engine::test_bridge::bash_remote::windows_shell_args(&WindowsShell::Pwsh, cmd);
         assert!(
             pwsh_args.contains(&"-Command"),
             "pwsh args missing -Command: {pwsh_args:?}"
@@ -1889,13 +1892,17 @@ mod tests {
             "pwsh args missing -NonInteractive (would hang on prompts)"
         );
 
-        let ps_args = WindowsShell::Powershell.args(cmd);
+        let ps_args = aft_engine::test_bridge::bash_remote::windows_shell_args(
+            &WindowsShell::Powershell,
+            cmd,
+        );
         assert_eq!(
             pwsh_args, ps_args,
             "pwsh and powershell share the same arg set"
         );
 
-        let cmd_args = WindowsShell::Cmd.args(cmd);
+        let cmd_args =
+            aft_engine::test_bridge::bash_remote::windows_shell_args(&WindowsShell::Cmd, cmd);
         assert_eq!(
             cmd_args,
             vec!["/D", "/C", cmd],
@@ -1913,9 +1920,18 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_shell_binary_names_have_exe_suffix() {
-        assert_eq!(WindowsShell::Pwsh.binary(), "pwsh.exe");
-        assert_eq!(WindowsShell::Powershell.binary(), "powershell.exe");
-        assert_eq!(WindowsShell::Cmd.binary(), "cmd.exe");
+        assert_eq!(
+            aft_engine::test_bridge::bash_remote::windows_shell_binary(&WindowsShell::Pwsh),
+            "pwsh.exe"
+        );
+        assert_eq!(
+            aft_engine::test_bridge::bash_remote::windows_shell_binary(&WindowsShell::Powershell),
+            "powershell.exe"
+        );
+        assert_eq!(
+            aft_engine::test_bridge::bash_remote::windows_shell_binary(&WindowsShell::Cmd),
+            "cmd.exe"
+        );
     }
 
     /// Issue #27 P2 test gap: foreground retry path. When the first
@@ -2191,7 +2207,8 @@ mod tests {
 
     #[test]
     fn synthetic_load_role_gate_refuses_worker_not_head() {
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+        use crate::sandbox_spawn::SpawnPlan;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -2952,7 +2969,8 @@ mod tests {
         mode: crate::config::SandboxMode,
         principal: crate::sandbox_spawn::AuthenticatedPrincipal,
     ) {
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail, SpawnPlan};
+        use crate::sandbox_spawn::{with_worker_jail, SpawnPlan};
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -3284,7 +3302,8 @@ mod tests {
 
     #[test]
     fn refused_test_plan_fails_closed_before_process_creation() {
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+        use crate::sandbox_spawn::SpawnPlan;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -3356,7 +3375,8 @@ mod tests {
         use std::time::{Duration, Instant};
 
         use crate::sandbox_profile::SandboxProfile;
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+        use crate::sandbox_spawn::SpawnPlan;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -3445,7 +3465,8 @@ exec "$@"
 
         use crate::response_finalize::DispatchOutcome;
         use crate::sandbox_profile::SandboxProfile;
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, SpawnPlan};
+        use crate::sandbox_spawn::SpawnPlan;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();

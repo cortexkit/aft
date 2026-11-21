@@ -31,15 +31,11 @@ pub(crate) fn require_reserved_send() -> Result<(), Refusal> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct RunSelector {
-    pub(crate) owner: String,
-    #[serde(rename = "ref")]
-    pub(crate) scope_ref: String,
-    pub(crate) epoch: u64,
-}
-
+#[path = "partner_types.rs"]
+pub(crate) mod partner_types;
+pub(crate) use partner_types::{
+    QueuedBotResponse, QueuedResponseError, ReservedBotRequest, RunSelector,
+};
 impl RunSelector {
     pub(crate) fn from_stamp(stamp: &ScopeStamp) -> Self {
         let owner = match &stamp.owner {
@@ -108,11 +104,6 @@ impl BotRequest {
     }
 }
 
-/// The closure may only be built around the partner's real reserved queue slot.
-pub(crate) struct ReservedBotRequest {
-    commit: Box<dyn FnOnce() -> Result<QueuedBotResponse, Refusal> + Send>,
-}
-
 impl ReservedBotRequest {
     pub(crate) fn new(
         commit: impl FnOnce() -> Result<QueuedBotResponse, Refusal> + Send + 'static,
@@ -121,7 +112,11 @@ impl ReservedBotRequest {
             commit: Box::new(commit),
         }
     }
-    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(crate) fn for_test(
         commit: impl FnOnce() -> Result<QueuedBotResponse, Refusal> + Send + 'static,
     ) -> Self {
@@ -135,16 +130,6 @@ impl ReservedBotRequest {
     }
 }
 
-pub(crate) struct QueuedBotResponse {
-    response: Pin<Box<dyn Future<Output = Result<Value, QueuedResponseError>> + Send>>,
-}
-
-#[derive(Debug)]
-pub(crate) enum QueuedResponseError {
-    NotSent(Refusal),
-    Unknown(String),
-}
-
 impl QueuedBotResponse {
     pub(crate) fn new(
         response: impl Future<Output = Result<Value, QueuedResponseError>> + Send + 'static,
@@ -153,7 +138,11 @@ impl QueuedBotResponse {
             response: Box::pin(response),
         }
     }
-    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(crate) fn for_test(reply: Value) -> Self {
         Self {
             response: Box::pin(async move { Ok(reply) }),

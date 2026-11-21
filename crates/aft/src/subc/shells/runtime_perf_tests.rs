@@ -1,6 +1,6 @@
 use super::*;
 use crate::bash_background::persistence::{read_task_at, TaskPaths};
-use aft_engine::test_bridge::bash_remote::ARTIFACT_OPENS;
+use aft_engine::test_bridge::bash_remote::with_artifact_opens;
 use std::io::Write;
 
 fn cpu_ns() -> u64 {
@@ -95,7 +95,7 @@ fn shells_watch_collection_fixture() {
             for paths in &active {
                 append(paths);
             }
-            ARTIFACT_OPENS.with(|count| count.set(0));
+            with_artifact_opens(|count| count.set(0));
             aft_engine::test_bridge::bash_remote::work_counts::reset();
             FACTS_SQL_TRACE.with(|trace| trace.borrow_mut().clear());
             let start = std::time::Instant::now();
@@ -105,7 +105,7 @@ fn shells_watch_collection_fixture() {
             wall += start.elapsed();
             assert_eq!(collected.rows.len(), 300);
             facts = collected.db;
-            opens += ARTIFACT_OPENS.with(|count| count.get());
+            opens += with_artifact_opens(|count| count.get());
             file_opens += aft_engine::test_bridge::bash_remote::work_counts::get().opens;
             queries += FACTS_SQL_TRACE.with(|trace| trace.borrow().len());
         }

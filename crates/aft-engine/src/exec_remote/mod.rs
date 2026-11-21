@@ -186,6 +186,8 @@ pub fn grade(terminal: &TerminalRecord) -> Verdict {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+mod return_vector_fixture;
 #[cfg(test)]
 pub(crate) mod return_vectors;
 #[cfg(test)]

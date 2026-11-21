@@ -17,7 +17,7 @@ pub(crate) struct PtyRuntime {
     /// ConPTY needs an explicit close before its output pipe can reach EOF.
     /// Unix runtimes leave this unset; tests can exercise the Windows policy
     /// with a channel-controlled reader on any host.
-    #[cfg(any(windows, test))]
+    #[cfg(any(windows, test, feature = "test-support"))]
     pub(crate) output_drain: Option<PtyOutputDrain>,
 }
 
@@ -59,7 +59,7 @@ impl PtyRuntime {
     }
 }
 
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "test-support"))]
 #[derive(Default)]
 pub(crate) struct PtyOutputDrain {
     pub(crate) deadline: Option<std::time::Instant>,

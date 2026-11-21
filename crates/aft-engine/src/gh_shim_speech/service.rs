@@ -88,27 +88,11 @@ fn log_no_binding_row_refusal(logged: &mut HashSet<String>, agent: &str, detail:
     );
 }
 
-#[cfg(test)]
-#[derive(Clone)]
-pub(crate) struct TestPartners {
-    pub(crate) seal_failure: Option<Refusal>,
-    pub(crate) expect_placed: Option<&'static str>,
-    pub(crate) run_placed: Option<&'static str>,
-    pub(crate) reserved_send_placed: bool,
-    pub(crate) bindings: Arc<dyn Fn(&str, &str) -> Result<Value, Refusal> + Send + Sync>,
-    pub(crate) reserve: Arc<
-        dyn Fn(
-                &str,
-                &str,
-                &ScopeStamp,
-                Value,
-            ) -> Result<super::partner::ReservedBotRequest, Refusal>
-            + Send
-            + Sync,
-    >,
-    pub(crate) before_final_gate: Option<Arc<dyn Fn() + Send + Sync>>,
-}
-
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_partners_fixture::TestPartners;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "test_partners_fixture.rs"]
+pub(crate) mod test_partners_fixture;
 static RUN: OnceLock<Option<String>> = OnceLock::new();
 #[doc(hidden)]
 pub fn run_nonce() -> Option<&'static str> {
@@ -176,7 +160,7 @@ pub struct Service {
     lifecycle: Mutex<lifecycle::State>,
     pending_tasks: Mutex<HashSet<String>>,
     pending_ids: Mutex<HashSet<(String, String)>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     test_partners: Mutex<Option<Arc<TestPartners>>>,
     pending_scopes: Mutex<HashSet<ScopeKey>>,
     pub(crate) admission: Mutex<()>,
@@ -200,7 +184,7 @@ fn new_service(root: PathBuf) -> Arc<Service> {
         lifecycle: Mutex::new(Default::default()),
         pending_tasks: Mutex::new(HashSet::new()),
         pending_ids: Mutex::new(HashSet::new()),
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_partners: Mutex::new(None),
         pending_scopes: Mutex::new(HashSet::new()),
         admission: Mutex::new(()),
@@ -927,7 +911,7 @@ impl Service {
         session: &str,
         agent: &str,
     ) -> Result<Value, Refusal> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(partners) = self.test_partners() {
             return (partners.bindings)(project, session);
         }
@@ -959,7 +943,7 @@ impl Service {
         body: Value,
         deadline: tokio::time::Instant,
     ) -> Result<super::partner::ReservedBotRequest, Refusal> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(partners) = self.test_partners() {
             return (partners.reserve)(project, session, scope, body);
         }
@@ -1102,7 +1086,7 @@ impl Service {
 
 impl Service {
     pub(crate) fn require_posting_guards(&self, codemode: bool) -> Result<(), Refusal> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(partners) = self.test_partners() {
             return if partners.expect_placed.is_some()
                 && (!codemode || partners.run_placed.is_some())
@@ -1120,13 +1104,17 @@ impl Service {
         super::partner::require_reserved_send()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_seal_failure(&self) -> Option<Refusal> {
         self.test_partners()
             .and_then(|partners| partners.seal_failure.clone())
     }
 
-    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(crate) fn install_test_partners(&self, partners: Arc<TestPartners>) {
         *self
             .test_partners
@@ -1134,7 +1122,7 @@ impl Service {
             .unwrap_or_else(|error| error.into_inner()) = Some(partners);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_partners(&self) -> Option<Arc<TestPartners>> {
         self.test_partners
             .lock()
@@ -1142,7 +1130,11 @@ impl Service {
             .clone()
     }
 
-    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(crate) fn expire_test_scope_cache(&self) {
         for cached in self
             .cache
@@ -1154,7 +1146,7 @@ impl Service {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn test_before_final_gate(&self) {
         if let Some(partners) = self.test_partners() {
             if let Some(hook) = &partners.before_final_gate {

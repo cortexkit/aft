@@ -2,9 +2,11 @@
 pub(crate) mod tests;
 
 #[cfg(unix)]
+use aft_engine::test_bridge::bash_remote::remote_support::*;
+#[cfg(unix)]
 use reg::*;
 #[cfg(unix)]
-use remote::{seams::*, *};
+use remote::*;
 #[cfg(unix)]
 use {
     crate::bash_background::persistence::{

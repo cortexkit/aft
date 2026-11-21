@@ -25,17 +25,17 @@ fn carrier_status_never_renews_a_registered_workers_hard_kill() {
     let (_dir, ctx, task) = default_kill_tests::wait_fixture(None);
     let before = ctx
         .bash_background()
-        .hard_kill_deadline(&task.task_id, &task.session_id)
+        .hard_kill_deadline(task.task_id(), task.session_id())
         .unwrap()
         .limit_ms;
-    let req = request(&task.task_id, &task.session_id);
+    let req = request(task.task_id(), task.session_id());
     for _ in 0..2 {
         let response = crate::commands::bash_status::handle_with_observation_only(&req, &ctx, true);
         assert!(response.success, "{:?}", response.data);
     }
     assert_eq!(
         ctx.bash_background()
-            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .hard_kill_deadline(task.task_id(), task.session_id())
             .unwrap()
             .limit_ms,
         before
@@ -44,7 +44,7 @@ fn carrier_status_never_renews_a_registered_workers_hard_kill() {
     assert!(response.success);
     assert!(
         ctx.bash_background()
-            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .hard_kill_deadline(task.task_id(), task.session_id())
             .unwrap()
             .limit_ms
             > before,

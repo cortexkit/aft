@@ -236,7 +236,7 @@ pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::Persist
     if !speech.stored.load(Ordering::SeqCst) {
         return;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(error) = speech.prepared.context.service.test_seal_failure() {
         *speech
             .failure

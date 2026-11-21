@@ -9,14 +9,14 @@ impl StopOnDrop {
 }
 impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        if let Ok(Some(scope)) = super::super::task_scope::lookup(&self.0) {
+        if let Ok(Some(scope)) = crate::bash_background::task_scope::lookup(&self.0) {
             let _ = scope.stop();
         }
     }
 }
 
 pub fn require_manager() {
-    super::super::task_scope::probe_user_manager(Duration::from_secs(1))
+    crate::bash_background::task_scope::probe_user_manager(Duration::from_secs(1))
         .expect("requires a systemd user manager");
 }
 
