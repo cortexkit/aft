@@ -1379,7 +1379,7 @@ async fn post_captured_inner(
         &body.expect_json(),
     )?;
     let dispatch_generation = service.generation();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     service.test_before_final_gate();
     let queued = {
         let _local = service
