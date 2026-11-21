@@ -18299,6 +18299,10 @@ mod spawn_tests;
 mod task_scope_tests;
 
 #[cfg(test)]
+pub(crate) mod test_support {
+    include!("registry_test_support.rs");
+}
+#[cfg(test)]
 #[path = "default_kill_test.rs"]
 pub(crate) mod default_kill_tests;
 
