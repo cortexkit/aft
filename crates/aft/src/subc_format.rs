@@ -6185,3 +6185,5 @@ mod bot_kill_warning_tests {
         assert!(!text.contains("clean cancellation"));
     }
 }
+#[cfg(test)]
+mod bash_hints_tests;
