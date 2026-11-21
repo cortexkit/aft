@@ -2,8 +2,6 @@
 pub mod alert_render;
 #[path = "repeat_breaker.rs"]
 pub mod repeat_breaker;
-#[cfg(test)]
-mod repeat_state_tests;
 
 use std::path::Path;
 
@@ -1510,3 +1508,6 @@ mod callgraph_pending_tests {
 
 #[cfg(test)]
 mod context_tests;
+
+#[cfg(test)]
+mod repeat_state_tests;
