@@ -17,9 +17,9 @@ pub(super) fn run(
             .map_err(|e| e.to_string())
             .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial, timings)))
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let result = seams::capture_remote_launch_logs(&task, run);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let result = run();
     if let Err(mut error) = result {
         if task.state.lock().is_ok_and(|state| {
@@ -35,7 +35,7 @@ pub(super) fn run(
             task.remote_launch_ready.store(true, Ordering::Release);
             release_worker_owed_cancel_claim(&task.task_id);
             task.remote_worker_running.store(false, Ordering::Release);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             seams::note_remote_worker_exit(&task.task_id);
             return;
         }
@@ -65,6 +65,6 @@ pub(super) fn run(
     task.remote_launch_ready.store(true, Ordering::Release);
     release_worker_owed_cancel_claim(&task.task_id);
     task.remote_worker_running.store(false, Ordering::Release);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     seams::note_remote_worker_exit(&task.task_id);
 }
