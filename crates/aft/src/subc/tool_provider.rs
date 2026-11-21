@@ -8,10 +8,8 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
-use cortexkit_role_tool_provider::call::SchemaPin;
 use cortexkit_role_tool_provider::{
-    call::check_versioned_call,
+    call::{check_versioned_call, SchemaPin},
     catalog::{
         check_model_param, composition_digest, schema_digest, session_capabilities,
         system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
