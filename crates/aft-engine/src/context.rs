@@ -2846,7 +2846,7 @@ pub struct AppContext {
     /// Confirmed launch materializations shared by this root's routes. Missing
     /// params and failed restores are not cached, so later calls can retry.
     launch_grants_materialized: parking_lot::Mutex<HashSet<crate::db::access_grants::ScopeKey>>,
-    pub(crate) launch_grant_state: Arc<launch_grants::LaunchGrantState>,
+    pub launch_grant_state: Arc<launch_grants::LaunchGrantState>,
     #[cfg(test)]
     launch_restore_attempts: AtomicUsize,
     #[cfg(test)]

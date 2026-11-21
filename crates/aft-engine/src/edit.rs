@@ -2068,7 +2068,7 @@ pub struct WriteResult {
     pub(crate) final_text: Option<ObservedFinalText>,
     /// Warnings from writing the file itself (see [`SourceWriteOutcome`]),
     /// added to the reply's `warnings` array.
-    pub(crate) write_warnings: Vec<String>,
+    pub write_warnings: Vec<String>,
 }
 
 /// Render structured validation errors as a compact `line N: message` list for

@@ -164,7 +164,7 @@ impl PlaneReport {
 pub(crate) struct DataStoreReport {
     pub(crate) skipped_folders: usize,
     pub(crate) skipped_folder_note: Option<String>,
-    pub(crate) text: PlaneReport,
+    pub text: PlaneReport,
     pub(crate) callgraph: PlaneReport,
     /// Paths of the checkout as last published; `None` before anything is.
     pub(crate) files: Option<usize>,

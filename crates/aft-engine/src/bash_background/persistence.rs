@@ -365,15 +365,15 @@ pub struct PersistedCompletionPreview {
 pub struct PersistedTask {
     pub schema_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) shell_call: Option<super::shell_metadata::ShellCall>,
+    pub shell_call: Option<super::shell_metadata::ShellCall>,
     #[serde(default)]
-    pub(crate) shell_revision: u64,
+    pub shell_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) shell_fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) shell_remote_job_id: Option<String>,
+    pub shell_remote_job_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) shell_remote_host: Option<String>,
+    pub shell_remote_host: Option<String>,
     /// Storage namespace captured at spawn, independent of later route binds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness: Option<String>,
@@ -512,7 +512,7 @@ pub struct PersistedTask {
     pub schema_pin: Option<String>,
     /// Original display identity and once-only terminal publication fence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) display: Option<crate::bash_background::frames::TaskDisplay>,
+    pub display: Option<crate::bash_background::frames::TaskDisplay>,
     /// The daemon's scope owner, reference and epoch at spawn. A reconnect
     /// must not relabel a running command as belonging to the new route.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -522,7 +522,7 @@ pub struct PersistedTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lifecycle_scope: Option<subc_protocol::scope::ScopeStamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) remote: Option<super::registry::remote::RemoteTask>,
+    pub remote: Option<super::registry::remote::RemoteTask>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
