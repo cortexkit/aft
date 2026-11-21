@@ -14,7 +14,7 @@ use subc_protocol::ErrorBody;
 use super::{legacy_file_path_digests, served_tools, CallerRole, CatalogPreset, ServedTool};
 
 // Runners must read versioned schema pins (tp2) before AFT advertises tool versions.
-const PUBLISH_TOOL_VERSIONS: bool = false;
+const PUBLISH_TOOL_VERSIONS: bool = true;
 const INITIAL: ToolVersion = ToolVersion::new(1, 0, 0);
 const VERSIONS: &[(&str, ToolVersion)] = &[
     ("apply_patch", INITIAL),
