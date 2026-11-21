@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(test)]
+#[path = "task_scope_runtime/display_hook_tests.rs"]
+mod display_hook_tests;
+
 /// Entry point for `aft --subc <connection-file>`. Synchronous on the outside;
 /// owns an isolated current-thread tokio runtime on a dedicated, explicitly
 /// sized stack for the async transport. The caller joins that thread.
@@ -55,6 +59,11 @@ pub(super) fn run_subc_mode_with_probe(
     registration: Option<AdoptedRegistration>,
 ) -> Result<(), SubcError> {
     lower_hooks::register();
+    #[cfg(test)]
+    display_hook_tests::observe(
+        lifecycle_probe.as_ref(),
+        display_hook_tests::Step::Registered,
+    );
     // This entry point accepts only tools AFT advertises in its HELLO manifest.
     // A separate test entry point can also dispatch synthetic native commands.
     run_subc_mode_inner(
@@ -68,6 +77,27 @@ pub(super) fn run_subc_mode_with_probe(
         lifecycle_probe,
         registration,
     )
+}
+
+pub(super) fn start_publication_services(
+    connection: &Path,
+    app: &Arc<App>,
+    storage_dir: &Path,
+    _probe: Option<&SubcTestLifecycleProbe>,
+) -> Option<crate::late_result_bus::Worker> {
+    #[cfg(test)]
+    display_hook_tests::observe(_probe, display_hook_tests::Step::StartingBus);
+    let bus = crate::late_result_bus::start(
+        Arc::clone(app),
+        connection.to_path_buf(),
+        storage_dir.join("aft.db"),
+    );
+    #[cfg(target_os = "macos")]
+    consent::start_macos_permission_cleanup(Arc::clone(app), storage_dir.join("aft.db"));
+    rich_ui::display::start(connection, app, storage_dir);
+    #[cfg(test)]
+    display_hook_tests::observe(_probe, display_hook_tests::Step::StartedDisplay);
+    bus
 }
 
 // A current-thread runtime polls its root future on the thread calling

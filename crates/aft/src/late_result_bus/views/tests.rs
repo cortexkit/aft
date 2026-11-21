@@ -10,6 +10,16 @@ impl Writer for RecordingWriter {
 }
 
 #[tokio::test]
+async fn bus_views_without_hooks_put_no_keys() {
+    let mut writer = RecordingWriter::default();
+    Publication::new(&NoticeViewsReady::default())
+        .sync_with_hooks(&mut writer, None)
+        .await
+        .unwrap();
+    assert!(writer.0.is_empty());
+}
+
+#[tokio::test]
 async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowledged() {
     struct RejectLast(usize);
     impl Writer for RejectLast {

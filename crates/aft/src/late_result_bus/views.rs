@@ -6,10 +6,10 @@ use cortexkit_bus_client::BusClient;
 use cortexkit_bus_naming::{AccountNames, ModuleBucket, MODULE_BUCKETS};
 use serde::Serialize;
 
-use super::{backoff, HEALTH, IO_TIMEOUT};
+use super::{backoff, Hooks, HEALTH, IO_TIMEOUT};
 
 mod notice_ready;
-pub(crate) use notice_ready::{NoticeViewsReady, NOTICE_VIEWS_READY};
+pub(crate) use notice_ready::{NoticeViewsReady, PullRecord, NOTICE_VIEWS_READY};
 
 #[derive(Default, Serialize)]
 pub(super) struct ViewsHealth {
@@ -30,7 +30,7 @@ fn declaration() -> &'static ModuleBucket {
 
 /// Pins include tool identity and semantics as well as the schema digest.
 /// Encoding the full UTF-8 pin preserves those distinctions without KV's ':'.
-fn key(pin: &str) -> String {
+pub(crate) fn key(pin: &str) -> String {
     use std::fmt::Write;
     let mut key = String::with_capacity(pin.len() * 2);
     for byte in pin.bytes() {
@@ -57,7 +57,7 @@ fn status(attached: bool, reason: Option<&'static str>) {
     health.reason = reason;
 }
 
-trait Writer {
+pub(crate) trait Writer {
     async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str>;
 }
 
@@ -72,7 +72,7 @@ impl Writer for RealWriter {
     }
 }
 
-struct Publication<'a> {
+pub(crate) struct Publication<'a> {
     notice_views: &'a NoticeViewsReady,
     written: HashSet<(String, blake3::Hash)>,
     skipped: HashSet<(String, blake3::Hash)>,
@@ -87,11 +87,27 @@ impl<'a> Publication<'a> {
         }
     }
 
+    pub(crate) async fn sync_with_hooks(
+        &mut self,
+        writer: &mut impl Writer,
+        hooks: Option<&Hooks>,
+    ) -> Result<(), &'static str> {
+        match hooks {
+            Some(hooks) => self.sync(writer, (hooks.bus_snapshot)()).await,
+            None => Ok(()),
+        }
+    }
+
     async fn sync(
         &mut self,
         writer: &mut impl Writer,
         values: &[(String, Vec<u8>)],
     ) -> Result<(), &'static str> {
+        let notice_pins: Vec<_> = values
+            .iter()
+            .filter(|(pin, _)| pin.starts_with("nv1:"))
+            .map(|(pin, _)| pin.clone())
+            .collect();
         for (pin, bytes) in values {
             let identity = (pin.clone(), blake3::hash(bytes));
             if bytes.len() > declaration().max_value_bytes as usize {
@@ -117,7 +133,8 @@ impl<'a> Publication<'a> {
                 .map_err(|_| "views_put_timeout")??;
             self.written.insert(identity);
             if pin.starts_with("nv1:")
-                && crate::subc::tool_views::notice_view_pins()
+                && notice_pins
+                    .iter()
                     .all(|pin| self.written.iter().any(|(written, _)| written == pin))
             {
                 self.notice_views.confirm();
@@ -146,7 +163,7 @@ pub(super) async fn run(client: Arc<BusClient>) {
                 let mut writer = RealWriter(store);
                 loop {
                     match publication
-                        .sync(&mut writer, crate::subc::tool_views::bus_snapshot())
+                        .sync_with_hooks(&mut writer, super::hooks())
                         .await
                     {
                         Ok(()) => {

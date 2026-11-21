@@ -281,7 +281,7 @@ fn status_inventory_cache_is_freed_with_session_memory() {
 #[test]
 #[ignore = "manual status inventory component cost probe"]
 fn status_inventory_component_cost_probe() {
-    use crate::run_tool_call::ThreadCpuSample;
+    use crate::clock::ThreadCpuSample;
     let (mut store, _temp, paths) = store_with_files(256);
     for path in &paths {
         store.snapshot(SESSION, path, "probe").unwrap();

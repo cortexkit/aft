@@ -1080,14 +1080,14 @@ fn consumer_gauge_returns_to_zero_after_the_consumer_is_dropped() {
         .build()
         .unwrap();
     let consumer = runtime
-        .block_on(crate::subc::registration::connect_consumer(
+        .block_on(aft_base::registration::connect_consumer(
             OWNER,
             &daemon.path,
             subc_client_rs::ConsumerOptions::default(),
         ))
         .unwrap();
     assert_eq!(
-        crate::subc::registration::live_consumers().get(OWNER),
+        aft_base::registration::live_consumers().get(OWNER),
         Some(&1)
     );
     drop(consumer);
@@ -1095,7 +1095,7 @@ fn consumer_gauge_returns_to_zero_after_the_consumer_is_dropped() {
     // transport tasks have been dropped, which needs the runtime to run.
     runtime.block_on(async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        while crate::subc::registration::live_consumers().get(OWNER) != Some(&0) {
+        while aft_base::registration::live_consumers().get(OWNER) != Some(&0) {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the gauge still counts a dropped consumer"

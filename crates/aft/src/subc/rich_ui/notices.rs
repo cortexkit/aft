@@ -179,10 +179,7 @@ fn fit_preview(mut body: NoticeBody, preview: &str, cut: bool) -> Option<NoticeB
     }
 }
 
-pub(crate) struct PullRecord {
-    pub id: String,
-    pub bytes: Vec<u8>,
-}
+pub(crate) use crate::late_result_bus::PullRecord;
 
 pub(super) fn pull(
     runner: &str,

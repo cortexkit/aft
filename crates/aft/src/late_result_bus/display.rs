@@ -9,6 +9,25 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use super::{DisplayPublish, Hooks};
+
+pub(crate) fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
+    let mut claimants: Vec<_> = modules
+        .iter()
+        .filter(|module| {
+            module.capabilities.as_ref().is_some_and(|capabilities| {
+                capabilities.provides.iter().any(|capability| {
+                    capability == cortexkit_role_tool_display::TOOL_DISPLAY_CAPABILITY
+                })
+            })
+        })
+        .map(|module| module.module_id.clone())
+        .collect();
+    claimants.sort();
+    claimants.dedup();
+    (claimants.len() == 1).then(|| claimants.remove(0))
+}
+
 #[derive(Default)]
 struct ReaderCache {
     epoch: u64,
@@ -25,7 +44,7 @@ impl ReaderCache {
 
     fn update(&mut self, epoch: u64, modules: &[subc_client_rs::CatalogEntry]) {
         if self.epoch == epoch {
-            self.module = Some(crate::subc::rich_ui::display::declared_display(modules));
+            self.module = Some(declared_display(modules));
             self.notice_capable = modules.iter().any(|entry| {
                 self.module.as_ref().and_then(Option::as_deref) == Some(entry.module_id.as_str())
                     && entry.capabilities.as_ref().is_some_and(|caps| {
@@ -133,62 +152,70 @@ pub(super) async fn watch_reader(
     }
 }
 
-fn body(id: &str) -> Result<Vec<u8>, &'static str> {
+pub(crate) fn body(id: &str) -> Result<Vec<u8>, &'static str> {
     let notice = DisplayRecordReady::new(id);
     notice.validate().map_err(|_| "display_bus_id")?;
     serde_json::to_vec(&notice).map_err(|_| "display_bus_body")
 }
 
-pub(super) async fn publish_one(client: &BusClient) {
-    let Some((id, pull_bytes)) = crate::subc::rich_ui::display::with_outbox(|outbox| {
-        let now = std::time::Instant::now();
-        let id = outbox.reads.due(now)?;
-        let bytes = outbox.reads.read(&id, now)?;
-        Some((id, bytes))
-    })
-    .flatten() else {
-        return;
-    };
-    if crate::subc::rich_ui::notices::is_notice_id(&id)
-        && (crate::subc::rich_ui::notices::WRITER_CAPABILITY.is_none()
-            || notice_reader().ok().flatten().is_none())
-    {
-        return completed(&id, Err("notice_display_unavailable"));
-    }
-    let result = crate::subc::rich_ui::display::announce(id.clone(), pull_bytes, async {
-        match body(&id) {
-            Ok(bytes) => tokio::time::timeout(
-                super::IO_TIMEOUT,
-                client.publish_event(
-                    DISPLAY_RECORD_READY_EVENT,
-                    DISPLAY_RECORD_READY_VERSION as u32,
-                    None,
-                    &id,
-                    bytes,
-                ),
-            )
-            .await
-            .map_err(|_| "display_bus_timeout")
-            .and_then(|result| {
-                result
-                    .map(|_| ())
-                    .map_err(|error| super::error_code(&error))
-            }),
-            Err(code) => Err(code),
-        }
-    })
-    .await;
-    completed(&id, result);
+pub(crate) async fn announce(
+    hooks: Option<&Hooks>,
+    id: String,
+    pull_bytes: Vec<u8>,
+    publish: DisplayPublish<'_>,
+) -> Result<(), &'static str> {
+    let hooks = hooks.ok_or("display_store_not_started")?;
+    (hooks.announce)(id, pull_bytes, publish).await
 }
 
-fn completed(id: &str, result: Result<(), &'static str>) {
+pub(crate) trait ReadyPublisher {
+    fn ready(
+        &self,
+        id: &str,
+        bytes: Vec<u8>,
+    ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
+}
+
+impl ReadyPublisher for BusClient {
+    async fn ready(&self, id: &str, bytes: Vec<u8>) -> Result<(), &'static str> {
+        tokio::time::timeout(
+            super::IO_TIMEOUT,
+            self.publish_event(
+                DISPLAY_RECORD_READY_EVENT,
+                DISPLAY_RECORD_READY_VERSION as u32,
+                None,
+                id,
+                bytes,
+            ),
+        )
+        .await
+        .map_err(|_| "display_bus_timeout")?
+        .map(|_| ())
+        .map_err(|error| super::error_code(&error))
+    }
+}
+
+pub(crate) async fn publish_one(publisher: &(impl ReadyPublisher + Sync), hooks: Option<&Hooks>) {
+    let Some(hooks) = hooks else {
+        return;
+    };
+    let Some((id, pull_bytes)) = (hooks.take_due_read)() else {
+        return;
+    };
+    let result = announce(
+        Some(hooks),
+        id.clone(),
+        pull_bytes,
+        Box::pin(async { publisher.ready(&id, body(&id)?).await }),
+    )
+    .await;
+    completed(hooks, &id, result);
+}
+
+fn completed(hooks: &Hooks, id: &str, result: Result<(), &'static str>) {
     // Wake backoff is separate from Outbox::retry's push attempt budget.
     // A full store may defer a wake indefinitely without exhausting its pushes.
-    crate::subc::rich_ui::display::with_outbox(|outbox| {
-        outbox
-            .reads
-            .published(id, result.is_ok(), std::time::Instant::now());
-    });
+    (hooks.mark_read_published)(id, result.is_ok());
     let mut health = super::HEALTH.lock();
     match result {
         Ok(()) => {

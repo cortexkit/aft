@@ -114,6 +114,8 @@ pub use aft_base::effective_path;
 pub mod engram_catalog;
 #[doc(hidden)]
 pub use aft_base::environment;
+#[cfg(test)]
+mod engine_source_guard_tests;
 pub use aft_base::error;
 pub mod exec_remote;
 #[cfg(test)]
@@ -246,6 +248,7 @@ pub(crate) mod shell_env_provider;
 pub use aft_base::shell_format;
 pub mod standing_roots;
 pub(crate) mod status_push;
+pub(crate) mod status_snapshot;
 pub use aft_base::storage_path;
 #[cfg(all(test, unix))]
 mod storage_permissions_tests;
@@ -257,6 +260,7 @@ mod subc_fake;
 pub mod subc_format;
 pub mod subc_translate;
 pub mod symbol_diff;
+pub(crate) mod trace_measure_run;
 pub use aft_base::symbols;
 pub mod synapse_embed;
 pub(crate) use aft_base::system_temp;

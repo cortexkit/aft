@@ -4,7 +4,10 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio::time::Instant;
 
-use crate::subc::rich_ui::notices::PullRecord;
+pub(crate) struct PullRecord {
+    pub id: String,
+    pub bytes: Vec<u8>,
+}
 
 const MAX_PENDING: usize = 64;
 

@@ -472,8 +472,8 @@ pub(crate) struct Worker {
 
 /// Called only by subc startup after registration, never by a standalone shim.
 pub(crate) fn start(connection_file: PathBuf) -> Option<Worker> {
-    if !crate::subc::registration::module_consumer_allowed()
-        || crate::subc::registration::module_id().as_deref() != Some("aft")
+    if !aft_base::registration::module_consumer_allowed()
+        || aft_base::registration::module_id().as_deref() != Some("aft")
     {
         return None;
     }

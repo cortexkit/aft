@@ -72,7 +72,7 @@ pub(super) fn run(
     // Counted in the live-connection gauge line: a worker can
     // outlive its task's reported end while it waits for the
     // runner to confirm a cancel, and it holds its connection.
-    let _live_worker = crate::subc::registration::count_live("remote_worker_thread");
+    let _live_worker = aft_base::registration::count_live("remote_worker_thread");
     let run = || {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()

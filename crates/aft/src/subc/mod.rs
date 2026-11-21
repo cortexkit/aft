@@ -4888,14 +4888,12 @@ where
     consent::install_subc_transport(connection_file_path);
     let _expiry = consent::expiry::start(shared_app.clone(), storage_dir.join("aft.db"));
     let _manifest_sync = crate::gh_shim::manifest_sync::start(connection_file_path.to_path_buf());
-    let bus_worker = crate::late_result_bus::start(
-        Arc::clone(&shared_app),
-        connection_file_path.to_path_buf(),
-        storage_dir.join("aft.db"),
+    let bus_worker = task_scope_runtime::start_publication_services(
+        connection_file_path,
+        &shared_app,
+        storage_dir,
+        lifecycle_probe.as_ref(),
     );
-    #[cfg(target_os = "macos")]
-    consent::start_macos_permission_cleanup(Arc::clone(&shared_app), storage_dir.join("aft.db"));
-    rich_ui::display::start(connection_file_path, &shared_app, &storage_dir);
     runner_notices::install(connection_file_path.to_path_buf());
     let push_senders = PushSenders {
         lossy_tx,
