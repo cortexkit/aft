@@ -7118,7 +7118,11 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     impl BackupStore {
-        pub(crate) fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf> {
+        pub(crate) fn history_meta_path_for_test(
+            &self,
+            session: &str,
+            path: &Path,
+        ) -> Option<PathBuf> {
             Some(
                 self.session_dir(session)?
                     .join(Self::path_hash(&canonicalize_key(path)))

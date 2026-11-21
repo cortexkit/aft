@@ -33,7 +33,11 @@ pub(crate) struct Fixture {
 impl Fixture {
     pub(crate) fn assert_no_cached_failure(&self) {
         assert!(!self.manager.lock().failed_spawns.contains_key(&self.key));
-        assert!(!self.manager.lock().transient_backoff.contains_key(&self.key));
+        assert!(!self
+            .manager
+            .lock()
+            .transient_backoff
+            .contains_key(&self.key));
     }
 }
 
