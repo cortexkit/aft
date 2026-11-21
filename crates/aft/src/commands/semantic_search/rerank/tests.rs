@@ -1122,18 +1122,17 @@ fn score_pools_with_local_onnx_when_asked() {
     let profile_prefix = std::env::var("AFT_RERANK_SCORE_PROFILE")
         .ok()
         .map(|prefix| &*Box::leak(prefix.into_boxed_str()));
-    let tuning = onnx::SessionTuning {
+    let tuning = onnx::experimental_tuning(
         coreml,
-        length_buckets: std::env::var("AFT_RERANK_SCORE_BUCKETS").is_ok_and(|value| value == "1"),
+        std::env::var("AFT_RERANK_SCORE_BUCKETS").is_ok_and(|value| value == "1"),
         profile_prefix,
-        fixed_shape: std::env::var("AFT_RERANK_SCORE_FIXED_SHAPE")
+        std::env::var("AFT_RERANK_SCORE_FIXED_SHAPE")
             .ok()
             .map(|value| {
                 let (batch, length) = value.split_once('x').expect("BATCHxLENGTH");
                 (batch.parse().unwrap(), length.parse().unwrap())
             }),
-        ..onnx::SessionTuning::default()
-    };
+    );
     let pools: Vec<Pool> = serde_json::from_slice(&std::fs::read(input).unwrap()).unwrap();
     let limit = std::env::var("AFT_RERANK_SCORE_LIMIT")
         .ok()
@@ -1528,15 +1527,17 @@ fn recorder_captures_scores_that_the_fixture_backend_then_replays() {
 
 #[test]
 fn invalid_backend_configuration_fails_build_with_a_reason() {
-    let inputs = |rerank: RerankConfig| slot::BuildInputs {
-        cache_unavailable: false,
-        cache_lease: None,
-        cache_epoch: 0,
-        search: SearchConfig {
-            rerank: Some(rerank),
-        },
-        semantic: Default::default(),
-        under_subc: false,
+    let inputs = |rerank: RerankConfig| {
+        slot::BuildInputs::new_for_test(
+            SearchConfig {
+                rerank: Some(rerank),
+            },
+            Default::default(),
+            false,
+            false,
+            None,
+            0,
+        )
     };
     for (backend, reason) in [
         (
@@ -1568,20 +1569,20 @@ fn invalid_backend_configuration_fails_build_with_a_reason() {
 // ---- the backend slot ----------------------------------------------------
 
 fn onnx_inputs(model: Option<&str>) -> slot::BuildInputs {
-    slot::BuildInputs {
-        cache_unavailable: false,
-        cache_lease: None,
-        cache_epoch: 0,
-        search: SearchConfig {
+    slot::BuildInputs::new_for_test(
+        SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Onnx),
                 model: model.map(str::to_string),
                 ..RerankConfig::default()
             }),
         },
-        semantic: Default::default(),
-        under_subc: false,
-    }
+        Default::default(),
+        false,
+        false,
+        None,
+        0,
+    )
 }
 
 fn numbered_selected() -> SelectedBackend {
@@ -1627,14 +1628,14 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
             }
         })
     };
-    let mut all_inputs = vec![slot::BuildInputs {
-        cache_unavailable: false,
-        cache_lease: None,
-        cache_epoch: 0,
-        search: SearchConfig::default(),
-        semantic: Default::default(),
-        under_subc: false,
-    }];
+    let mut all_inputs = vec![slot::BuildInputs::new_for_test(
+        SearchConfig::default(),
+        Default::default(),
+        false,
+        false,
+        None,
+        0,
+    )];
     for backend in [
         RerankBackendKind::Off,
         RerankBackendKind::Onnx,
@@ -1642,19 +1643,19 @@ fn the_search_path_reads_the_slot_without_io_and_never_builds_on_its_thread() {
         RerankBackendKind::Synapse,
     ] {
         for under_subc in [false, true] {
-            all_inputs.push(slot::BuildInputs {
-                cache_unavailable: false,
-                cache_lease: None,
-                cache_epoch: 0,
-                search: SearchConfig {
+            all_inputs.push(slot::BuildInputs::new_for_test(
+                SearchConfig {
                     rerank: Some(RerankConfig {
                         backend: Some(backend),
                         ..RerankConfig::default()
                     }),
                 },
-                semantic: Default::default(),
+                Default::default(),
                 under_subc,
-            });
+                false,
+                None,
+                0,
+            ));
         }
     }
     for model in onnx::ALLOWED_MODELS.iter().map(|model| model.name()) {
@@ -2189,26 +2190,26 @@ fn onnx_cost_profile_when_available() {
             .unwrap_or(default)
     };
     let defaults = onnx::SessionTuning::default();
-    let tuning = onnx::SessionTuning {
-        intra_op_spinning: flag(
+    let tuning = onnx::profiling_tuning(
+        defaults,
+        flag(
             "AFT_RERANK_PROFILE_SPINNING",
             onnx::intra_op_spinning(&defaults),
         ),
-        memory_pattern: flag(
+        flag(
             "AFT_RERANK_PROFILE_MEMORY_PATTERN",
             onnx::memory_pattern(&defaults),
         ),
-        cpu_arena: flag("AFT_RERANK_PROFILE_CPU_ARENA", onnx::cpu_arena(&defaults)),
-        arena_shrinkage: flag(
+        flag("AFT_RERANK_PROFILE_CPU_ARENA", onnx::cpu_arena(&defaults)),
+        flag(
             "AFT_RERANK_PROFILE_ARENA_SHRINKAGE",
             onnx::arena_shrinkage(&defaults),
         ),
-        attention_units: number(
+        number(
             "AFT_RERANK_PROFILE_ATTENTION_UNITS",
             onnx::attention_units(&defaults),
         ),
-        ..defaults
-    };
+    );
     let doc_count = number("AFT_RERANK_PROFILE_DOCS", DEFAULT_TOP_N);
     let byte_budget = number("AFT_RERANK_PROFILE_BYTES", CANDIDATE_TEXT_BUDGET_BYTES);
     let threads = number("AFT_RERANK_PROFILE_THREADS", onnx::rerank_intra_threads());
@@ -2285,11 +2286,8 @@ fn onnx_cost_profile_when_available() {
 #[test]
 fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
     let (endpoint, server) = remote::serve(r#"[{"index":0,"score":0.7}]"#, 200, Duration::ZERO);
-    let inputs = slot::BuildInputs {
-        cache_unavailable: false,
-        cache_lease: None,
-        cache_epoch: 0,
-        search: SearchConfig {
+    let inputs = slot::BuildInputs::new_for_test(
+        SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Remote),
                 model: Some("served-model".into()),
@@ -2297,9 +2295,12 @@ fn remote_slot_factory_installs_ready_and_reports_bad_configuration() {
                 ..Default::default()
             }),
         },
-        semantic: Default::default(),
-        under_subc: false,
-    };
+        Default::default(),
+        false,
+        false,
+        None,
+        0,
+    );
     let slot = slot::BackendSlot::default();
     slot.reconcile(inputs.clone());
     wait_for(|| is_ready(&slot.read(inputs.clone())));
@@ -2352,20 +2353,20 @@ fn synapse_slot_factory_installs_pinned_ready_and_reports_failed_discovery() {
         ],
         true,
     );
-    let inputs = slot::BuildInputs {
-        cache_unavailable: false,
-        cache_lease: None,
-        cache_epoch: 0,
-        search: SearchConfig {
+    let inputs = slot::BuildInputs::new_for_test(
+        SearchConfig {
             rerank: Some(RerankConfig {
                 backend: Some(RerankBackendKind::Synapse),
                 model: Some("reranker".into()),
                 ..Default::default()
             }),
         },
-        semantic: synapse::config(path),
-        under_subc: true,
-    };
+        synapse::config(path),
+        true,
+        false,
+        None,
+        0,
+    );
     let slot = slot::BackendSlot::default();
     slot.reconcile(inputs.clone());
     wait_for(|| match slot.read(inputs.clone()) {

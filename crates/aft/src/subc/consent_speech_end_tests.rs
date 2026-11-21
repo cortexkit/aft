@@ -246,8 +246,8 @@ async fn audit_failed_speech_end_write_fences_received_approval_before_actor_adm
     describes.goodbye(stamp.clone());
     let request = end_control.next().await;
     end_control.reply(&request, subc_protocol::scope::ScopeStatus::Ended, &stamp);
-    let launch = LaunchAuthority {
-        authority: run
+    let launch = LaunchAuthority::new_for_test(
+        run
             .run_owner
             .as_ref()
             .unwrap()
@@ -255,10 +255,10 @@ async fn audit_failed_speech_end_write_fences_received_approval_before_actor_adm
             .scope
             .clone()
             .unwrap(),
-        run: Some(stamp.clone()),
-        origin: None,
-        head_origin: None,
-    };
+        Some(stamp.clone()),
+        None,
+        None,
+    );
     wait_for(|| {
         service
             .check_pending(None, &launch, &run.session, "local-read")
