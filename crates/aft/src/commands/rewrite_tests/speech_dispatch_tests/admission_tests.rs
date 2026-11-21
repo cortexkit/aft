@@ -4,6 +4,9 @@ use aft_engine::test_bridge::bash_remote::RefusalTestExt as _;
 use aft_engine::test_bridge::bash_remote::RouteScopesTestExt as _;
 use aft_engine::test_bridge::bash_remote::SpeechTicketTestExt as _;
 use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
+use aft_engine::test_bridge::bash_remote::{
+    AuthorityRecordTestExt as _, StoredAuthorityTestExt as _,
+};
 
 fn subconscious_options(sdk_daemon: bool) -> LaunchOptions {
     LaunchOptions {
@@ -215,7 +218,7 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
             .store
             .get(&fixture.incarnation)
             .unwrap()
-            .ticket_digest
+            .ticket_digest()
             .is_none());
         let answer = fixture.post(true, "unpromoted-guarded").await;
         assert!(answer.ok, "{:?}", answer.data);
@@ -539,7 +542,7 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
             .store
             .get(&fixture.incarnation)
             .unwrap()
-            .record
+            .record()
             .project_root,
         supplied_project.display().to_string()
     );
@@ -617,7 +620,7 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
                 .store
                 .get(&attached.incarnation())
                 .unwrap()
-                .record
+                .record()
                 .project_root,
             seed_project
         );

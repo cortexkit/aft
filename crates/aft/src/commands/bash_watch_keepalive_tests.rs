@@ -114,7 +114,7 @@ fn bash_watch_keepalive_quiet_worker_finishes_with_real_result() {
 fn bash_watch_keepalive_stalled_state_read_goes_silent() {
     let mut h = QuietWatch::start(Duration::from_secs(20));
     h.tick(30_000);
-    let task = h.ctx.bash_background().task_for_test(&h.task).unwrap();
+    let task = h.ctx.bash_background().test_task(&h.task).unwrap();
     let held = task.state.lock().unwrap();
     assert!(h.pushes.recv_timeout(Duration::from_millis(250)).is_err());
     h.clock.store(150_000, Ordering::SeqCst);

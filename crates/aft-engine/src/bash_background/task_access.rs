@@ -1,6 +1,6 @@
 use super::*;
 use crate::bash_background::persistence::{DirectorySnapshot, PinnedDir, TaskLayout};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 
 const TASK_READ_RECORD_CAPACITY: usize = 64;
@@ -215,7 +215,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Default)]
 pub(super) struct WorkCounters {
     owner_lookups: AtomicUsize,
@@ -317,7 +317,7 @@ impl BgTaskRegistry {
     }
 
     pub(super) fn task_namespaces(&self, storage: &Path) -> std::io::Result<fs::ReadDir> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner
             .task_access_work
             .namespace_reads
@@ -325,7 +325,7 @@ impl BgTaskRegistry {
         fs::read_dir(storage.join("bash-tasks"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reset_task_access_work(&self) {
         self.inner
             .task_access_work
@@ -341,7 +341,7 @@ impl BgTaskRegistry {
             .store(0, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn task_access_work(&self) -> (usize, usize, usize) {
         let work = &self.inner.task_access_work;
         (
@@ -365,7 +365,7 @@ impl BgTaskRegistry {
                 return Some(record);
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner
             .task_access_work
             .task_folder_reads
@@ -559,7 +559,7 @@ impl BgTaskRegistry {
 
     #[doc(hidden)]
     pub fn readable_worker_task_owner(&self, task_id: &str, storage: &Path) -> Option<String> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner
             .task_access_work
             .owner_lookups

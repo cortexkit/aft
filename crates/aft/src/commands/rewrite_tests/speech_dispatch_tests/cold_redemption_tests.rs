@@ -17,7 +17,7 @@ fn cold_redemption_probe_child() {
             crate::gh_shim_speech::service::run_nonce().unwrap(),
         )
         .unwrap();
-    let record = stored.record;
+    let record = stored.record().clone();
     let conn = store.connect().unwrap();
     let row = crate::db::bash_tasks::get_bash_task(
         &conn,

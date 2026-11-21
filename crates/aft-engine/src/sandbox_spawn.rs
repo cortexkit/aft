@@ -6810,7 +6810,7 @@ impl<'ctx> ToolLaunchPolicy<'ctx> {
     }
 
     /// This policy as one [`Self::with_current`] can install.
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     pub(crate) fn shared(&self) -> std::rc::Rc<RequestToolLaunch> {
         std::rc::Rc::clone(&self.request)
     }
@@ -6917,7 +6917,7 @@ impl<'ctx> ToolLaunchPolicy<'ctx> {
         Ok(command)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn unconfined_for_test() -> ToolLaunchPolicy<'static> {
         ToolLaunchPolicy {
             ctx: None,

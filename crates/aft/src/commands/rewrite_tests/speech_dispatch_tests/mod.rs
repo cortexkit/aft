@@ -12,6 +12,9 @@ use aft_engine::test_bridge::bash_remote::ServiceTestExt as _;
 use aft_engine::test_bridge::bash_remote::SpeechManifest;
 use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 use aft_engine::test_bridge::bash_remote::TestPartners;
+use aft_engine::test_bridge::bash_remote::{
+    BgTaskRegistryTestExt as _, RefusalTestExt as _, StoredAuthorityTestExt as _,
+};
 use aft_engine::test_bridge::bash_remote::{QueuedBotResponse, ReservedBotRequest};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -518,7 +521,7 @@ impl Fixture {
                             "binding_unverifiable",
                             "connection refused",
                         );
-                        error.retry_before_send = true;
+                        *error.retry_before_send_mut() = true;
                         Err(error)
                     } else {
                         Ok(read.bindings())
@@ -598,7 +601,7 @@ impl Fixture {
                     let incarnation = aft_engine::test_bridge::bash_remote::speech_for_ticket(&raw)
                         .unwrap()
                         .incarnation()
-                        .clone();
+                        .to_owned();
                     let _guard =
                         aft_engine::test_bridge::bash_remote::spawn_ticket_guard(Some(&raw));
                     aft_engine::test_bridge::bash_remote::mark_spawn_background(background);
@@ -726,9 +729,9 @@ impl Fixture {
         if bound {
             for (role, scope) in self.launch.required_scopes() {
                 let origin = if role == crate::gh_shim_speech::ScopeRole::Head {
-                    &self.launch.head_origin()
+                    self.launch.head_origin()
                 } else {
-                    &self.launch.origin()
+                    self.launch.origin()
                 };
                 routes.push_origin(origin.clone().unwrap(), Some(scope.clone()));
             }
@@ -1134,7 +1137,7 @@ fn seed_historical_dispatch(fixture: &Fixture, nonce: &str) {
         .final_legacy_gate(
             &fixture.incarnation,
             nonce,
-            stored.generation,
+            stored.generation(),
             policy_generation,
             &current,
             "historical-forwarder",
@@ -1329,7 +1332,7 @@ async fn captured_dispatch_retries_unreachable_bindings_once_but_not_missing_row
                 "binding_unverifiable",
                 "binding_read_transport: Unavailable(\"connection refused\")",
             );
-            error.retry_before_send = true;
+            *error.retry_before_send_mut() = true;
             error
         };
         fixture.partners(|partners| {
@@ -1389,7 +1392,7 @@ async fn captured_dispatch_retries_unreachable_reservation_before_sending_once()
         *partners.reserve_mut() = Arc::new(move |project, session, scope, body| {
             if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
                 let mut error = Refusal::new(Code::AuthorityUnavailable, "module_warming");
-                error.retry_before_send = true;
+                *error.retry_before_send_mut() = true;
                 Err(error)
             } else {
                 reserve(project, session, scope, body)
