@@ -282,6 +282,8 @@ pub trait BackupStoreTest {
     fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf);
     fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf);
     fn expire_discovery_for_tests(&mut self);
+    fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf>;
+    fn history_content_reads_for_test(&self) -> u64;
     fn uses_db_pool(
         &self,
         conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
@@ -301,6 +303,14 @@ impl BackupStoreTest for crate::backup::BackupStore {
         self.expire_discovery_for_tests();
     }
 
+    fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf> {
+        self.history_meta_path_for_test(session, path)
+    }
+
+    fn history_content_reads_for_test(&self) -> u64 {
+        self.history_content_reads_for_test()
+    }
+
     fn uses_db_pool(
         &self,
         conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
@@ -315,7 +325,8 @@ pub use BackupStoreTest as BackupStoreTestExt;
 
 mod watcher_counters;
 pub use watcher_counters::{
-    WatcherBackendExclusionsTestExt, WatcherCountersTestExt, WatcherRescanIntervalTestExt,
+    WatcherBackendExclusionsTestExt, WatcherCountersSnapshotTestExt, WatcherCountersTestExt,
+    WatcherExclusionPlanningSnapshotTestExt, WatcherRescanIntervalTestExt,
 };
 
 pub mod watcher_backend {
@@ -372,4 +383,32 @@ impl LspClientTestExt for crate::lsp::client::LspClient {
     }
 }
 
+pub use inspect::InspectCacheTest as InspectCacheTestExt;
 pub use rerank::BuildInputsTestExt;
+
+pub mod github_read;
+pub use github_read::{GithubReadDeferredTestExt, GithubReadEngineTestExt};
+
+pub mod search_index {
+    pub use aft_base::executor::audit::{audit_work, audit_work_reset};
+}
+
+pub trait ArtifactCacheKeyTimingsTestExt {
+    fn root_walks(&self) -> usize;
+}
+
+impl ArtifactCacheKeyTimingsTestExt for crate::root_identity::key::ArtifactCacheKeyTimings {
+    fn root_walks(&self) -> usize {
+        self.root_walks
+    }
+}
+
+pub trait ConfigReloadSignalTestExt {
+    fn due_at_ms(&self) -> &std::sync::atomic::AtomicU64;
+}
+
+impl ConfigReloadSignalTestExt for crate::watcher_filter::config_events::ConfigReloadSignal {
+    fn due_at_ms(&self) -> &std::sync::atomic::AtomicU64 {
+        &self.due_at_ms
+    }
+}

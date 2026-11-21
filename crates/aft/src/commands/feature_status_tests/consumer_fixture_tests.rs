@@ -342,6 +342,7 @@ fn data_layer_scenario(
 
 #[test]
 fn aft_zoom_callgraph_matches_the_shared_fixtures() {
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     for name in SCENARIOS {
         let expected = expected("aft_zoom.callgraph", name);
         let (root, _storage, ctx) = data_layer_scenario(name, &[EXAMPLE_FUNCTION]);
