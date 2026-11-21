@@ -2,6 +2,20 @@
 
 use super::*;
 
+pub(crate) fn preacceptance_submission_for_test(task_id: &str) -> KeyedSubmission {
+    KeyedSubmission {
+        key: format!("aft:{task_id}"),
+        created_at_ms: unix_millis(),
+        request_digest: "must-not-be-resubmitted".into(),
+        attempts: 1,
+        recovery_started_at_ms: None,
+        fresh_key_used: false,
+        resuming: false,
+        reattached: false,
+        refusal: None,
+    }
+}
+
 pub(super) fn reattach_budgets() -> &'static Mutex<HashMap<PathBuf, Duration>> {
     static BUDGETS: std::sync::OnceLock<Mutex<HashMap<PathBuf, Duration>>> =
         std::sync::OnceLock::new();
@@ -83,7 +97,7 @@ pub(super) fn after_local_fallback_marker(task: &str) {
 
 pub(super) type RemoteLaunchLogCapture = Arc<Mutex<Vec<String>>>;
 
-pub(super) fn remote_launch_log_captures(
+pub(crate) fn remote_launch_log_captures(
 ) -> &'static Mutex<HashMap<PathBuf, RemoteLaunchLogCapture>> {
     static CAPTURES: std::sync::OnceLock<Mutex<HashMap<PathBuf, RemoteLaunchLogCapture>>> =
         std::sync::OnceLock::new();
@@ -156,7 +170,7 @@ pub(super) fn cancellation_at_worker_start() -> &'static Mutex<HashMap<String, b
     CANCELLATIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(super) async fn wait_for<T>(reason: &str, mut probe: impl FnMut() -> Option<T>) -> T {
+pub(crate) async fn wait_for<T>(reason: &str, mut probe: impl FnMut() -> Option<T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), async {
         loop {
             if let Some(value) = probe() {
@@ -179,7 +193,7 @@ pub(super) fn draining_budget_ms(root: &Path) -> Option<u64> {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum DrainingClockEvent {
+pub(crate) enum DrainingClockEvent {
     Sleeping { from: u64, until: u64 },
     Stopped,
 }
@@ -238,7 +252,7 @@ pub(super) fn task_draining_clock(task: &BgTask) -> Option<Arc<DrainingClock>> {
     draining_clock(state.metadata.project_root.as_deref()?)
 }
 
-pub(super) fn stopped_draining_roots() -> &'static Mutex<HashSet<PathBuf>> {
+pub(crate) fn stopped_draining_roots() -> &'static Mutex<HashSet<PathBuf>> {
     static ROOTS: std::sync::OnceLock<Mutex<HashSet<PathBuf>>> = std::sync::OnceLock::new();
     ROOTS.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -256,7 +270,7 @@ pub(super) fn stop_draining_worker(root: &Path) -> bool {
 /// Points in a draining-retry worker where a test can hold it, so a pause can
 /// land exactly between two of the worker's own decisions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum DrainingGate {
+pub(crate) enum DrainingGate {
     /// After the worker found no cancellation intent, before it checks the
     /// retry budget and decides whether to resubmit.
     BeforeBudgetCheck,
@@ -283,7 +297,7 @@ pub(super) fn refused_resubmission_roots() -> &'static Mutex<HashSet<PathBuf>> {
 
 /// Make the next retry resubmission under `root` fail as a call that never
 /// reached the runner.
-pub(super) fn refuse_next_resubmission(root: &Path) {
+pub(crate) fn refuse_next_resubmission(root: &Path) {
     refused_resubmission_roots()
         .lock()
         .unwrap()
@@ -398,3 +412,22 @@ pub(super) fn lose_submission_replies(root: &Path) -> bool {
         .unwrap()
         .contains(&test_clock_key(root))
 }
+
+pub(crate) use super::tests::{
+    add_git_worktree, assert_no_retry_sleep, assert_one_saved_task_paused,
+    assert_owed_cancel_sent_once, assert_pause_settles_promptly, assert_paused,
+    assert_project_told_of_the_stop_once, assert_refused_pause_saved, assert_runon_refusal,
+    assert_saved_pause_reply, assert_saved_paused, assert_signer_retry_pause_saved,
+    assert_unsent_pause_saved, cancel_requests, cancel_unknown_terminal,
+    delivered_unknown_restart_fixture, ensure_git_fixture, exec_cancels, exec_runs, git_fixture,
+    grant_sibling_read, launch, orchestrated_request, owner_scope, pause_recorded,
+    persist_accepted_with_snapshot, plugin_transport_deadline, registry, remote_job_id_context,
+    remote_test_context, remote_test_context_with_runon, remote_worker_exited, remote_workers,
+    restarted_context, restarted_context_with_runon, retry_backoff_script, return_call,
+    return_daemon, runner_cancels, runon_restart_context, runon_restart_principal,
+    saved_due_draining_retry, saved_task_owing_a_cancel, seed_large_local_return_output,
+    shorten_draining_budget, shorten_hinted_retry_budget, signer_retry_script, start_runon_retry,
+    start_saved_term_ignoring_task, start_scoped_runon_retry, start_with_launch, terminal,
+    windows_daemon, HeldDrainingGate, PausedDrainingClock, PausedReattachClock, ReleaseOnDrop,
+    EXPECTED_REMOTE_JOB_HEADER, READ_ONLY_NOTE, RETURN_CLAIMS, SIGNER_REFUSED,
+};

@@ -14,6 +14,7 @@ use crate::exec_remote::{
 };
 #[cfg(unix)]
 use crate::inspect::thousands;
+pub use crate::protocol::RemoteOomKill;
 use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use std::ffi::OsStr;
@@ -22,8 +23,6 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 #[cfg(unix)]
 use worker::{resubmit, run_diagnosed};
-
-pub use crate::protocol::RemoteOomKill;
 
 pub(crate) trait RemoteOomKillText {
     fn message(&self) -> String;
@@ -65,7 +64,7 @@ pub(super) fn remote_oom_kill(metadata: &super::PersistedTask) -> Option<RemoteO
     })
 }
 
-fn rendered_refusal_reason(reason: &str, detail: Option<&str>) -> String {
+pub(crate) fn rendered_refusal_reason(reason: &str, detail: Option<&str>) -> String {
     let Some(detail) = detail else {
         return reason.to_owned();
     };
@@ -150,8 +149,7 @@ fn remote_refusal_message(reason: &str, detail: Option<&str>, remote: &RemoteTas
 /// this from the runner's Hello before sending the run, and an unchanged
 /// retry gets the same answer.
 const RETURN_PATHS_UNSUPPORTED_DETAIL: &str = "return_paths_unsupported";
-
-const RETURN_PATHS_UNSUPPORTED_MESSAGE: &str = "runon refused: return_paths is not supported on the runner that would take this job; the command was not run; an unchanged retry is refused the same way";
+pub(crate) const RETURN_PATHS_UNSUPPORTED_MESSAGE: &str = "runon refused: return_paths is not supported on the runner that would take this job; the command was not run; an unchanged retry is refused the same way";
 
 fn return_paths_unsupported(reason: &str, detail: Option<&str>) -> bool {
     reason == "request_rejected" && detail == Some(RETURN_PATHS_UNSUPPORTED_DETAIL)
@@ -188,7 +186,7 @@ fn workspace_owner_holders(detail: &str) -> Vec<Uuid> {
 /// Derive the error from persisted remote proof, never from command output.
 /// Keeping it in snapshots lets foreground and restarted/background readers
 /// report the same named refusal without changing older task records.
-pub(super) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::RemoteRefusal> {
+pub(crate) fn remote_refusal(metadata: &super::PersistedTask) -> Option<super::RemoteRefusal> {
     if metadata.status != super::BgTaskStatus::Failed {
         return None;
     }
@@ -245,7 +243,6 @@ fn recovery_queue_wait_allowance(run_timeout: Duration) -> Duration {
 /// without progress doubles it, up to [`REATTACH_BACKOFF_MAX`].
 #[cfg(unix)]
 const REATTACH_BACKOFF_FIRST: Duration = Duration::from_millis(100);
-
 #[cfg(unix)]
 const REATTACH_BACKOFF_MAX: Duration = Duration::from_secs(30);
 
@@ -539,7 +536,7 @@ fn remote_unknown_outcome(
 /// This machine's operating system as a reader names it, for the header of a
 /// run that fell back to it.
 #[cfg(unix)]
-fn local_os_name() -> &'static str {
+pub(crate) fn local_os_name() -> &'static str {
     match std::env::consts::OS {
         "macos" => "macOS",
         "linux" => "Linux",
@@ -799,8 +796,8 @@ fn duration_ms(duration: Duration) -> u64 {
 pub(crate) struct DrainingRetry {
     request_digest: String,
     attempts: u32,
-    first_refusal_at_ms: Option<u64>,
-    next_retry_at_ms: Option<u64>,
+    pub(crate) first_refusal_at_ms: Option<u64>,
+    pub(crate) next_retry_at_ms: Option<u64>,
     waited_ms: Option<u64>,
     /// When AFT last submitted the job again after a draining refusal, in
     /// Unix milliseconds. The runner's queue wait and run timeout count from
@@ -1011,13 +1008,13 @@ fn is_zero_u64(value: &u64) -> bool {
 pub(crate) struct KeyedSubmission {
     key: String,
     created_at_ms: u64,
-    request_digest: String,
+    pub(crate) request_digest: String,
     attempts: u8,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     recovery_started_at_ms: Option<u64>,
     fresh_key_used: bool,
     resuming: bool,
-    reattached: bool,
+    pub(crate) reattached: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     refusal: Option<TerminalRecord>,
 }
@@ -1387,7 +1384,7 @@ impl OutputProgress {
 }
 
 #[cfg(unix)]
-struct TaskSink {
+pub(crate) struct TaskSink {
     registry: BgTaskRegistry,
     task: Arc<BgTask>,
     stdout: fs::File,
@@ -1432,7 +1429,7 @@ const PROGRESS_CHECKPOINT_INTERVAL: Duration = Duration::from_secs(5);
 
 #[cfg(unix)]
 impl TaskSink {
-    fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> io::Result<Self> {
+    pub(crate) fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> io::Result<Self> {
         let (remote, workdir, project_root) = {
             let state = task
                 .state
@@ -2439,7 +2436,7 @@ fn retry_request_digest(task: &BgTask, bytes: &[u8]) -> String {
 }
 
 #[cfg(unix)]
-fn restore_retry_request(task: &BgTask, expected: &str) -> Result<RunRequest, String> {
+pub(crate) fn restore_retry_request(task: &BgTask, expected: &str) -> Result<RunRequest, String> {
     use std::io::Read;
     let layout =
         resolve_task_layout(&task.paths.session_dir, &task.task_id).map_err(|e| e.to_string())?;
@@ -2502,10 +2499,8 @@ impl std::fmt::Display for RemoteRequestError {
 
 #[cfg(unix)]
 const RUNON_CD_OUTSIDE_CHECKOUT_MESSAGE: &str = "runon refused: the command changes into <path>, which is outside the checkout the build server copies (<checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
-
 #[cfg(unix)]
 const RUNON_CD_WINDOWS_ABSOLUTE_MESSAGE: &str = "runon refused: the command changes into <path>, which is not valid on the Windows runner because absolute command paths are not translated (checkout <checkout root>); the command did not run. Set the bash tool's workdir to that folder instead of using cd.";
-
 #[cfg(unix)]
 const RUNON_EDITS_CHECKOUT_MESSAGE: &str = "runon refused: this command writes <path>, and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.";
 
@@ -4664,7 +4659,12 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    fn remote_terminal(&self, task: &Arc<BgTask>, verdict: Verdict, error: Option<String>) {
+    pub(crate) fn remote_terminal(
+        &self,
+        task: &Arc<BgTask>,
+        verdict: Verdict,
+        error: Option<String>,
+    ) {
         self.remote_terminal_with_note(task, verdict, error, None);
     }
 
@@ -5636,7 +5636,7 @@ pub(crate) fn return_paths_root(project_root: &Path, workdir: &Path) -> PathBuf 
 }
 
 #[cfg(unix)]
-fn worktree_root_containing(
+pub(crate) fn worktree_root_containing(
     path: &Path,
     kind: exec::DirectoryKind,
 ) -> Result<Option<PathBuf>, exec::Error> {
@@ -5808,13 +5808,13 @@ pub(crate) fn remote_report(
     }
 }
 
-/// [`remote_report`] for one terminal record. `copied_back` names files,
+/// [`remote_report`] for one terminal record. `copied` names files,
 /// relative to the checkout as the runner reports them, that were copied back
 /// to this machine; they are left out of the changed-files list. The
 /// untracked-files list is printed as sent: ck-motor does not send it, and
 /// the contract does not state its path base.
 #[cfg(unix)]
-fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Option<String> {
+pub(crate) fn render_terminal_report(terminal: &TerminalRecord, copied: &[&str]) -> Option<String> {
     // Paths come from another machine; escaping keeps one per line.
     fn path(path: &str) -> String {
         path.escape_default().to_string()
@@ -5836,7 +5836,7 @@ fn render_terminal_report(terminal: &TerminalRecord, copied_back: &[&str]) -> Op
             // Only render the displayed prefix; the remainder needs folder counts, not lines.
             for changed in changes
                 .iter()
-                .filter(|changed| !copied_back.contains(&changed.as_str()))
+                .filter(|changed| !copied.contains(&changed.as_str()))
             {
                 count += 1;
                 if count <= PATH_LIMIT {
@@ -6049,14 +6049,13 @@ fn proves_no_start(error: &exec::Error) -> bool {
 
 #[cfg(all(test, unix))]
 #[path = "remote_test_support.rs"]
-mod seams;
+pub(crate) mod seams;
 #[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
 #[cfg(all(test, unix))]
 pub(crate) use tests::{
-    assert_siblings_submit_refused_before_connect, captured_task_after_losing_replay_for_test,
-    submit_runon_for_test, uncaptured_terminal_before_render_for_test,
+    captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
     uncaptured_unknown_before_render_for_test,
 };
 
