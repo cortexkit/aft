@@ -4,17 +4,17 @@ use crate::bash_background::persistence::{task_paths, write_task};
 use crate::context::{App, AppContext};
 use std::sync::{MutexGuard, OnceLock};
 
-pub(crate) struct BusyRoot {
-    pub ctx: Arc<AppContext>,
-    pub app: Arc<App>,
-    pub contexts: Vec<Arc<AppContext>>,
-    pub root: PathBuf,
-    pub storage: PathBuf,
-    pub key: String,
+pub struct BusyRoot {
+    pub(crate) ctx: Arc<AppContext>,
+    pub(crate) app: Arc<App>,
+    pub(crate) contexts: Vec<Arc<AppContext>>,
+    pub(crate) root: PathBuf,
+    pub(crate) storage: PathBuf,
+    pub(crate) key: String,
     _dir: tempfile::TempDir,
 }
 
-pub(crate) fn busy_root() -> MutexGuard<'static, BusyRoot> {
+pub fn busy_root() -> MutexGuard<'static, BusyRoot> {
     static FIXTURE: OnceLock<Mutex<BusyRoot>> = OnceLock::new();
     FIXTURE
         .get_or_init(|| Mutex::new(build()))

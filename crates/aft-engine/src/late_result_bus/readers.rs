@@ -171,22 +171,22 @@ impl CardWatch {
 }
 
 fn attachment(_id: &str) -> watch::Receiver<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(sender) = TEST_ATTACHMENTS.lock().get(_id) {
         return sender.subscribe();
     }
     ATTACHED.subscribe()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_ATTACHMENTS: LazyLock<parking_lot::Mutex<HashMap<String, watch::Sender<bool>>>> =
     LazyLock::new(Default::default);
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct TestAttachment {
     id: String,
     pub(crate) state: watch::Sender<bool>,
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TestAttachment {
     pub(crate) fn new(id: &str, value: bool) -> Self {
         let state = watch::channel(value).0;
@@ -197,7 +197,7 @@ impl TestAttachment {
         }
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestAttachment {
     fn drop(&mut self) {
         TEST_ATTACHMENTS.lock().remove(&self.id);

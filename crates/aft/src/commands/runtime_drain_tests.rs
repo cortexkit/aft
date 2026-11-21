@@ -47,7 +47,7 @@ fn inspect_failure_drain_does_not_delay_unrelated_read() {
         assert_eq!(
             ctx.inspect_manager()
                 .tier2_builder_state(InspectCategory::Duplicates),
-            crate::inspect::InspectBuilderState::WaitingForCacheWriterLease
+            aft_engine::test_bridge::search_misc::inspect::InspectBuilderState::WaitingForCacheWriterLease
         );
     }
 }

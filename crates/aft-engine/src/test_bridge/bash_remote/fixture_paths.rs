@@ -127,6 +127,17 @@ pub mod bash_background {
         }
     }
 
+    #[cfg(unix)]
+    pub mod push_projection_fixture {
+        pub use crate::bash_background::registry::push_projection_fixture::{busy_root, BusyRoot};
+    }
+
+    pub mod frames {
+        pub fn registered() -> bool {
+            crate::bash_background::frames::registered()
+        }
+    }
+
     pub mod persistence {
         pub fn terminal_task_metadata_for_test(
             pin: Option<&str>,
@@ -152,6 +163,8 @@ pub mod bash_background {
 
 pub mod sandbox_spawn {
     pub use super::super::with_spawn_plan_for_test;
+    #[cfg(unix)]
+    pub use crate::sandbox_spawn::escalation_grant_type::EscalationGrantStore;
 
     #[cfg(target_os = "linux")]
     pub fn with_secret_ptrace_scope_for_test<R>(value: Option<&str>, run: impl FnOnce() -> R) -> R {

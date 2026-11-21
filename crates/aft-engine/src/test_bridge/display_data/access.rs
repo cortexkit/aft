@@ -61,6 +61,8 @@ test_methods! { AppContextTestExt for AppContext {
     fn try_build_status_push_snapshot(&self) -> Option<crate::protocol::StatusPayload>;
     fn try_build_status_snapshot(&self) -> Option<crate::protocol::StatusPayload>;
     fn validate_read_path_without_approval(&self, req_id: &str, session_id: &str, path: &Path) -> Result<PathBuf, crate::protocol::Response>;
+    #[cfg(unix)]
+    fn escalation_grants(&self) -> &parking_lot::Mutex<crate::test_bridge::bash_remote::sandbox_spawn::EscalationGrantStore>;
     fn callgraph_executor_for_test(&self) -> Option<crate::executor::RootMaintenanceExecutor>;
     fn note_launch_restore_attempt(&self);
     fn launch_restore_attempts(&self) -> usize;
@@ -214,14 +216,14 @@ impl StoredOutline {
 }
 
 pub struct PendingDatabaseOpen<'a>(&'a crate::database_open::DatabaseOpenRequest);
-impl PendingDatabaseOpen<'_> {
+impl<'a> PendingDatabaseOpen<'a> {
     pub fn epoch(&self) -> u64 {
         self.0.epoch
     }
     pub fn dispatched_at(&self) -> Option<std::time::Instant> {
         self.0.dispatched_at
     }
-    pub fn storage_root(&self) -> &PathBuf {
+    pub fn storage_root(&self) -> &'a PathBuf {
         &self.0.storage_root
     }
 }

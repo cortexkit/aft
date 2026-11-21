@@ -1,5 +1,7 @@
-use super::bindings_fixture::files;
-pub use super::bindings_fixture::*;
+#[path = "../gh_shim_relay/bindings_fixture.rs"]
+mod fixture;
+use fixture::files;
+pub use fixture::*;
 use serde_json::Value;
 
 #[test]

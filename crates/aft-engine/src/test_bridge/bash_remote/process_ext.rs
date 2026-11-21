@@ -21,6 +21,8 @@ use std::{
 };
 
 pub trait BgTaskRegistryTestExt: Sized {
+    fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool>;
+    fn cleanup_terminal_task_temp_at(&self, task: &BgTask, now_ms: u64) -> std::io::Result<bool>;
     fn reset_task_access_work(&self);
     fn task_access_work(&self) -> (usize, usize, usize);
     fn set_project_replay_scan_budget_for_test(&self, entries: usize, duration: Duration);
@@ -156,6 +158,12 @@ pub trait BgTaskRegistryTestExt: Sized {
 }
 
 impl BgTaskRegistryTestExt for BgTaskRegistry {
+    fn cleanup_terminal_task_temp(&self, task: &BgTask) -> std::io::Result<bool> {
+        Self::cleanup_terminal_task_temp(self, task)
+    }
+    fn cleanup_terminal_task_temp_at(&self, task: &BgTask, now_ms: u64) -> std::io::Result<bool> {
+        Self::cleanup_terminal_task_temp_at(self, task, now_ms)
+    }
     fn reset_task_access_work(&self) {
         Self::reset_task_access_work(self);
     }
@@ -566,6 +574,7 @@ impl RuntimeTestExt for crate::bash_background::secrets::Runtime {
 }
 
 pub trait PersistedTaskTestExt {
+    fn call_key_mut(&mut self) -> &mut Option<crate::bash_background::TaskCallKey>;
     fn memory_policy_mut(&mut self) -> &mut Option<crate::bash_background::MemoryPolicyForTest>;
     fn task_scope_runtime_ms_mut(&mut self) -> &mut Option<u64>;
     fn lifecycle_scope(&self) -> &Option<subc_protocol::scope::ScopeStamp>;
@@ -574,6 +583,9 @@ pub trait PersistedTaskTestExt {
 }
 
 impl PersistedTaskTestExt for PersistedTask {
+    fn call_key_mut(&mut self) -> &mut Option<crate::bash_background::TaskCallKey> {
+        &mut self.call_key
+    }
     fn memory_policy_mut(&mut self) -> &mut Option<crate::bash_background::MemoryPolicyForTest> {
         &mut self.memory_policy
     }
@@ -606,12 +618,19 @@ impl BgTaskStateTestExt for super::BgTaskState {
 }
 
 pub trait ToolLaunchPolicyTestExt {
+    fn resolve(ctx: &crate::context::AppContext)
+        -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
     fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
     #[cfg(unix)]
     fn shared(&self) -> std::rc::Rc<crate::sandbox_spawn::RequestToolLaunch>;
 }
 
 impl ToolLaunchPolicyTestExt for crate::sandbox_spawn::ToolLaunchPolicy<'_> {
+    fn resolve(
+        ctx: &crate::context::AppContext,
+    ) -> crate::sandbox_spawn::ToolLaunchPolicy<'static> {
+        Self::resolve(ctx)
+    }
     fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static> {
         Self::unconfined_for_test()
     }
@@ -656,5 +675,29 @@ pub trait TaskSinkTestExt: Sized {
 impl TaskSinkTestExt for crate::bash_background::registry::remote::TaskSink {
     fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> std::io::Result<Self> {
         Self::new(registry, task)
+    }
+}
+
+#[cfg(unix)]
+pub trait EscalationGrantStoreTestExt {
+    fn len_for_test(&self) -> usize;
+}
+
+#[cfg(unix)]
+impl EscalationGrantStoreTestExt for crate::sandbox_spawn::EscalationGrantStore {
+    fn len_for_test(&self) -> usize {
+        Self::len_for_test(self)
+    }
+}
+
+#[cfg(unix)]
+pub trait BusyRootTestExt {
+    fn ctx(&self) -> &Arc<crate::context::AppContext>;
+}
+
+#[cfg(unix)]
+impl BusyRootTestExt for crate::bash_background::registry::push_projection_fixture::BusyRoot {
+    fn ctx(&self) -> &Arc<crate::context::AppContext> {
+        &self.ctx
     }
 }
