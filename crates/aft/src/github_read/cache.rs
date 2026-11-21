@@ -875,7 +875,7 @@ pub fn sqlite_cache_store(database_path: impl AsRef<Path>) -> Arc<dyn GithubRead
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
     use super::*;
@@ -1591,9 +1591,12 @@ mod tests {
         release.send(()).unwrap();
     }
 
-    #[test]
-    fn a_read_still_running_at_the_deadline_without_a_cached_copy_is_pending() {
-        let (fetcher, release, _started) = running_fetch();
+    pub(crate) fn uncached_running_read() -> (
+        GithubReadStart,
+        std::sync::mpsc::SyncSender<()>,
+        std::sync::mpsc::Receiver<()>,
+    ) {
+        let (fetcher, release, started) = running_fetch();
         let engine = GithubReadEngine::new(
             Arc::new(MemoryCache::default()),
             fetcher,
@@ -1607,6 +1610,12 @@ mod tests {
                 GithubReadSelector::default(),
             )
             .unwrap();
+        (start, release, started)
+    }
+
+    #[test]
+    fn a_read_still_running_at_the_deadline_without_a_cached_copy_is_pending() {
+        let (start, release, _started) = crate::github_read::uncached_running_read();
         // The call budget, less the reply margin, bounds the wait.
         let _call = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
             std::time::Duration::from_millis(1_300),

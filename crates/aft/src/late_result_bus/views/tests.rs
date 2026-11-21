@@ -1,14 +1,5 @@
 use super::*;
 
-#[derive(Default)]
-struct RecordingWriter(Vec<(String, Vec<u8>)>);
-impl Writer for RecordingWriter {
-    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str> {
-        self.0.push((key.into(), value));
-        Ok(())
-    }
-}
-
 #[tokio::test]
 async fn bus_views_without_hooks_put_no_keys() {
     let mut writer = RecordingWriter::default();

@@ -111,7 +111,7 @@ impl Fixture {
     }
 }
 
-fn write(path: &Path, text: &str) {
+pub(crate) fn write(path: &Path, text: &str) {
     std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
     std::fs::write(path, text).expect("write config");
 }
@@ -120,19 +120,19 @@ fn write(path: &Path, text: &str) {
 fn staged_sources_are_cleared_at_entry_and_on_unwind() {
     // Observe staging directly rather than a later configure's successful overwrite.
     let fixture = Fixture::new("{}", None);
-    let sources = fixture.ctx.config_live().sources.lock().clone().unwrap();
+    let sources = fixture.ctx.config_live().sources().unwrap();
     stage_configure_sources(sources.clone());
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _scope = configure_sources_scope();
         assert!(
-            STAGED_SOURCES.with(|slot| slot.borrow().is_none()),
+            staged_sources_empty_for_test(),
             "new configure must discard old staging"
         );
         stage_configure_sources(sources);
         panic!("configure after staging");
     }));
     assert!(
-        STAGED_SOURCES.with(|slot| slot.borrow().is_none()),
+        staged_sources_empty_for_test(),
         "unwind must discard staging"
     );
 }
@@ -230,9 +230,13 @@ fn prepared_bind_watches_keep_the_captured_source() {
     });
     assert!(response.success, "{}", response.data);
     fixture.ctx.config_live().wait_for_watch_attachment();
-    let watches = fixture.ctx.config_live().watches.lock();
     assert_eq!(
-        watches.project_fallback.as_ref().unwrap().file(),
+        fixture
+            .ctx
+            .config_live()
+            .project_fallback_file_for_test()
+            .as_deref()
+            .unwrap(),
         legacy.as_path()
     );
 }
@@ -1710,15 +1714,11 @@ fn legacy_project_config_events_trigger_reload_with_an_existing_project_watcher(
             state.set_project_watcher_sees_config(true);
             sync_config_watches(&fixture.ctx);
             assert!(fixture.ctx.watcher_runtime_active());
-            assert!(state
-                .project_watcher_sees_config
-                .load(std::sync::atomic::Ordering::Acquire));
-            let watches = state.watches.lock();
+            assert!(state.project_watcher_sees_config_for_test());
             assert_eq!(
-                watches.project_fallback.as_ref().map(ConfigFileWatch::file),
+                state.project_fallback_file_for_test().as_deref(),
                 Some(legacy.as_path())
             );
-            drop(watches);
             assert!(!fixture.ctx.config().format_on_edit);
             // Drain setup events before observing the next write's reload request.
             std::thread::sleep(Duration::from_millis(500));
