@@ -26,7 +26,8 @@ pub(crate) const MAX_BUILD_BACKOFF: Duration = Duration::from_secs(60);
 
 /// Everything that decides which backend a context uses.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BuildInputs {
+#[doc(hidden)]
+pub struct BuildInputs {
     pub(crate) search: SearchConfig,
     /// The embedding connection settings; the Synapse reranker reuses them.
     pub(crate) semantic: SemanticBackendConfig,
@@ -65,7 +66,8 @@ pub(crate) type Constructor =
 
 /// What a search finds in the slot.
 #[derive(Clone)]
-pub(crate) enum Installed {
+#[doc(hidden)]
+pub enum Installed {
     /// Reranking is off: no rerank and no note.
     Off,
     /// No backend yet (a build is running, or the last build failed): the

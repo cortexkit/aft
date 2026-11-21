@@ -38,7 +38,7 @@ pub struct Follow {
 }
 
 #[doc(hidden)]
-pub struct FollowReceipt(pub(crate) Vec<tokio::sync::oneshot::Sender<()>>);
+pub struct FollowReceipt(pub Vec<tokio::sync::oneshot::Sender<()>>);
 impl FollowReceipt {
     pub(crate) fn applied(self) {
         for done in self.0 {
