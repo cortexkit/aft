@@ -77,6 +77,28 @@ fn backup_bookkeeping_native_and_wrapped_readers_complete_with_store_owned() {
 }
 
 #[test]
+fn standalone_version_and_ping_skip_backup_bookkeeping() {
+    let (_root, ctx) = fixture();
+    let owner = ctx.backup().lock();
+    let (tx, rx) = mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let worker = scope.spawn(|| {
+            let replies = ["version", "ping"]
+                .map(|command| dispatch(request(command, serde_json::Value::Null), &ctx));
+            tx.send(replies).unwrap();
+        });
+        let replies = rx.recv_timeout(Duration::from_secs(1));
+        drop(owner);
+        worker.join().unwrap();
+        let [version, ping] = replies.expect("standalone controls waited for BackupStore");
+        assert!(version.success);
+        assert_eq!(version.data["version"], env!("CARGO_PKG_VERSION"));
+        assert!(ping.success);
+        assert_eq!(ping.data["command"], "pong");
+    });
+}
+
+#[test]
 fn backup_bookkeeping_wrapped_write_keeps_undo_entry_and_post_state() {
     let (root, ctx) = fixture();
     let path = root.path().join("small.rs");
