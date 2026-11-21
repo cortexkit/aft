@@ -10184,3 +10184,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "configure_live_reload_tests.rs"]
+mod live_reload_tests;
