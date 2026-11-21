@@ -18,7 +18,8 @@ static HELD: LazyLock<(Mutex<HashMap<Key, usize>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(HashMap::new()), Condvar::new()));
 
 /// Owns admission, not a mutex guard: no registry mutex is held during I/O.
-pub(crate) struct FileLock(Vec<Key>);
+#[doc(hidden)]
+pub struct FileLock(Vec<Key>);
 
 impl Drop for FileLock {
     fn drop(&mut self) {
@@ -49,7 +50,8 @@ fn resolved(path: &Path) -> PathBuf {
 /// waiting for another. Native identities also serialize hard-link aliases;
 /// resolved names remain stable when an atomic rename changes the inode.
 /// Parent identities protect new names reached through directory aliases too.
-pub(crate) fn lock_files(paths: &[&Path]) -> Vec<FileLock> {
+#[doc(hidden)]
+pub fn lock_files(paths: &[&Path]) -> Vec<FileLock> {
     let mut entries: Vec<_> = paths
         .iter()
         .enumerate()
@@ -99,7 +101,8 @@ pub(crate) fn lock_files(paths: &[&Path]) -> Vec<FileLock> {
 /// Strong stat evidence on Unix; identity, time and bytes on other platforms.
 /// The bytes fallback also covers symlinks and filesystems without identities.
 #[derive(Clone)]
-pub(crate) struct Version {
+#[doc(hidden)]
+pub struct Version {
     exists: bool,
     resolved: PathBuf,
     stat: Option<crate::backup::DiskFileVersion>,
@@ -198,7 +201,8 @@ pub(crate) fn set_before_check(path: &Path, hook: Option<BeforeCheck>) {
     }
 }
 
-pub(crate) fn before_check(path: &Path) {
+#[doc(hidden)]
+pub fn before_check(path: &Path) {
     #[cfg(test)]
     {
         let hook = BEFORE_CHECK.lock().get(&resolved(path)).cloned();

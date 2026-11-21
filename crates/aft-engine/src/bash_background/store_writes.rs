@@ -59,12 +59,14 @@ impl Drop for Ticket {
     }
 }
 
-pub(crate) fn authoritative(storage: &Path) -> bool {
+#[doc(hidden)]
+pub fn authoritative(storage: &Path) -> bool {
     let state = state(storage);
     state.outstanding.load(Ordering::SeqCst) == 0 && !state.failed.load(Ordering::SeqCst)
 }
 
-pub(crate) fn snapshot() -> serde_json::Value {
+#[doc(hidden)]
+pub fn snapshot() -> serde_json::Value {
     let stores = stores()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

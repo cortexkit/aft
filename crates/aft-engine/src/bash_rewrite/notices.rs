@@ -4,9 +4,11 @@ use cortexkit_role_llm_runner::delivery_order::{Slot, Template};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
-pub(crate) use aft_base::pending_notices::{Notice, Target};
+#[doc(hidden)]
+pub use aft_base::pending_notices::{Notice, Target};
 
-pub(crate) fn append_text(text: &mut String, notice: &str) {
+#[doc(hidden)]
+pub fn append_text(text: &mut String, notice: &str) {
     if !text.is_empty() {
         text.push_str("\n\n");
     }
@@ -14,7 +16,8 @@ pub(crate) fn append_text(text: &mut String, notice: &str) {
 }
 
 /// Consume each decision once. Only this boundary chooses send versus append.
-pub(crate) fn deliver(response: &mut crate::protocol::Response, mut text: Option<&mut String>) {
+#[doc(hidden)]
+pub fn deliver(response: &mut crate::protocol::Response, mut text: Option<&mut String>) {
     for notice in std::mem::take(&mut response.notices.items) {
         if let Some(route) = &response.notices.route {
             route.send(&notice);
@@ -91,7 +94,8 @@ mod sink_tests {
     }
 }
 
-pub(crate) const CODE_SEARCH: &str = "aft.bash.code_search";
+#[doc(hidden)]
+pub const CODE_SEARCH: &str = "aft.bash.code_search";
 pub(crate) const PREFER_TOOL: &str = "aft.bash.prefer_tool";
 
 const SEARCH_REDIRECT: &str = "Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";
@@ -99,7 +103,8 @@ const GREP_REDIRECT: &str = "Use the `grep` tool instead (indexed and ranked).";
 const WORKER_SEARCH_REDIRECT: &str =
     "Use the `search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";
 
-pub(crate) fn enumeration(values: &[&str]) -> Slot {
+#[doc(hidden)]
+pub fn enumeration(values: &[&str]) -> Slot {
     Slot::Enum {
         values: values.iter().map(|s| (*s).to_owned()).collect(),
     }
@@ -109,7 +114,8 @@ fn shell_slot() -> Slot {
     enumeration(&["bash", "shell"])
 }
 
-pub(crate) fn bash_templates(worker: bool) -> Vec<Template> {
+#[doc(hidden)]
+pub fn bash_templates(worker: bool) -> Vec<Template> {
     vec![
         Template::new(
             CODE_SEARCH,
@@ -130,7 +136,8 @@ pub(crate) fn bash_templates(worker: bool) -> Vec<Template> {
     ]
 }
 
-pub(crate) fn code_search_slots(search_tool: Option<&str>, shell: &str) -> Value {
+#[doc(hidden)]
+pub fn code_search_slots(search_tool: Option<&str>, shell: &str) -> Value {
     json!({"shell": shell, "redirect": match search_tool {
         Some("search") => WORKER_SEARCH_REDIRECT,
         Some(_) => SEARCH_REDIRECT,

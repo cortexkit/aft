@@ -1081,7 +1081,7 @@ pub(crate) struct WorkspaceHolder {
 /// Where a remote job is, as far as its own stream has shown. Used to tell a
 /// caller whose blocking wait ended what the job is doing now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RemotePhase {
+pub enum RemotePhase {
     /// Inputs are still being submitted; the runner has not accepted the job.
     Submitting,
     /// Submitted, but the runner has not supplied queue or execution evidence.
@@ -1146,7 +1146,7 @@ impl RemotePhase {
 
 /// A remote task's job ID, once the runner assigned one, and its phase.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RemoteProgress {
+pub struct RemoteProgress {
     pub job_id: Option<Uuid>,
     pub phase: RemotePhase,
 }
@@ -5690,7 +5690,7 @@ fn build_remote_request(
 /// Use the same checkout boundary for submission checks and returned writes
 /// as the runner's workspace key. Non-git workdirs retain the project boundary;
 /// request construction separately refuses workdirs it cannot snapshot.
-pub(crate) fn return_paths_root(project_root: &Path, workdir: &Path) -> PathBuf {
+pub fn return_paths_root(project_root: &Path, workdir: &Path) -> PathBuf {
     worktree_root_containing(workdir, exec::DirectoryKind::WorkingDirectory)
         .ok()
         .flatten()

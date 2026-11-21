@@ -8,13 +8,15 @@ use std::io;
 
 /// Which helper thread is being started. Tests use it to refuse one kind.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Worker {
+#[doc(hidden)]
+pub enum Worker {
     PtyReader,
     PtyWaiter,
     Watch,
 }
 
-pub(crate) fn spawn(worker: Worker, run: impl FnOnce() + Send + 'static) -> io::Result<()> {
+#[doc(hidden)]
+pub fn spawn(worker: Worker, run: impl FnOnce() + Send + 'static) -> io::Result<()> {
     #[cfg(test)]
     if REFUSED.with(|refused| refused.get() == Some(worker)) {
         return Err(io::Error::other("injected worker admission failure"));

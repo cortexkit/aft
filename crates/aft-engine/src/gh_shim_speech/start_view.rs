@@ -43,7 +43,8 @@ impl Drop for StartView {
     }
 }
 
-pub(crate) fn inject(
+#[doc(hidden)]
+pub fn inject(
     ticket: Option<&str>,
     env: &mut HashMap<String, String>,
     fallback: &Path,

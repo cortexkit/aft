@@ -148,7 +148,8 @@ impl Drop for BuildTaskGuard {
 }
 
 /// What a reader that needs exact call-graph answers gets.
-pub(crate) enum Fresh {
+#[doc(hidden)]
+pub enum Fresh {
     /// A view whose call graph covers every recorded change.
     Ready(CheckoutView),
     /// The call graph is being built or refreshed and did not finish in
@@ -1978,7 +1979,8 @@ fn pending(checkout: &Checkout) -> bool {
 /// for what the rescan finds. The rescan job owns that state and ends it
 /// however it ends, even unrun; [`root_bound`] in the configure tail starts
 /// it again only if none is running. Binds nothing.
-pub(crate) fn rebind_configured(ctx: &dyn crate::data_layer::host::IndexHost) {
+#[doc(hidden)]
+pub fn rebind_configured(ctx: &dyn crate::data_layer::host::IndexHost) {
     use crate::data_layer::surfaces::DataCheckoutProbe;
     if let Some(DataCheckoutProbe::Bound(checkout)) = ctx.probe_data_checkout() {
         if checkout.bound_once.load(Ordering::Acquire) {
@@ -1997,7 +1999,8 @@ pub(crate) fn rebind_configured(ctx: &dyn crate::data_layer::host::IndexHost) {
 /// bind of the same checkout compares them again: files can change while the
 /// root is unbound and nothing watches it, or just before a configure whose
 /// watcher event has not arrived yet.
-pub(crate) fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
+#[doc(hidden)]
+pub fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
     #[cfg(feature = "wasm-grammars")]
     crate::grammar::configure(&ctx.config());
     use super::bound_checkouts::{note_root, RootKind};

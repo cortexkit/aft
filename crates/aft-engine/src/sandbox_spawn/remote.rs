@@ -44,7 +44,8 @@ impl Output {
 #[path = "remote_unix.rs"]
 mod unix;
 #[cfg(target_os = "linux")]
-pub(crate) use unix::prepare;
+#[doc(hidden)]
+pub use unix::prepare;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use unix::prepare_with_launcher;
 

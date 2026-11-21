@@ -22,7 +22,8 @@ mod legacy_dispatch;
 pub(crate) use legacy_dispatch::LegacyDispatchStatus;
 
 #[derive(Clone, Debug)]
-pub(crate) struct Store {
+#[doc(hidden)]
+pub struct Store {
     path: PathBuf,
     anchor: Arc<OnceLock<Arc<Anchor>>>,
 }

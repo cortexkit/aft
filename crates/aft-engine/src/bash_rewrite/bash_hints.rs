@@ -8,7 +8,8 @@ const HINT_PREFIX: &str = "DO NOT search code by running grep/rg in ";
 /// Split a bash reply into its body and the closing lines AFT adds after the
 /// command output: an optional `[task <id>]` line followed by `trailer` when
 /// one is present. The tail is returned with its own line breaks.
-pub(crate) fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
+#[doc(hidden)]
+pub fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&'a str, &'a str) {
     let mut tail_start = output.len();
     if let Some(trailer) = trailer.filter(|trailer| !trailer.is_empty()) {
         if output.ends_with(trailer) {
@@ -23,7 +24,8 @@ pub(crate) fn split_reply_tail<'a>(output: &'a str, trailer: Option<&str>) -> (&
     (&output[..tail_start], &output[tail_start..])
 }
 
-pub(crate) fn is_terminal_native_reply(response: &crate::protocol::Response) -> bool {
+#[doc(hidden)]
+pub fn is_terminal_native_reply(response: &crate::protocol::Response) -> bool {
     response.data.get("task_id").is_some()
         && response.data.get("exit_code").is_some()
         && matches!(
@@ -34,7 +36,8 @@ pub(crate) fn is_terminal_native_reply(response: &crate::protocol::Response) -> 
 
 /// Standalone hosts carry the steer in the result. Runner routes instead send
 /// the decision through session.send and must not call this delivery helper.
-pub(crate) fn append_nudge(response: &mut crate::protocol::Response, nudge: &str) {
+#[doc(hidden)]
+pub fn append_nudge(response: &mut crate::protocol::Response, nudge: &str) {
     let trailer = response
         .data
         .get(crate::list_surfaces::bash::WIRE_KEY)
@@ -55,7 +58,8 @@ pub(crate) fn append_nudge(response: &mut crate::protocol::Response, nudge: &str
 
 /// Decide whether a completed native shell call gets a nudge. Launch/status
 /// replies are excluded by callers; rewritten output already carries its steer.
-pub(crate) fn code_search_nudge(
+#[doc(hidden)]
+pub fn code_search_nudge(
     output: &str,
     command: &str,
     project_root: Option<&Path>,
@@ -77,12 +81,14 @@ pub(crate) fn code_search_nudge(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Rejection {
+#[doc(hidden)]
+pub enum Rejection {
     NotCodeSearch,
     Ineligible(&'static str),
 }
 
-pub(crate) fn code_search_decision(
+#[doc(hidden)]
+pub fn code_search_decision(
     output: &str,
     command: &str,
     project_root: Option<&Path>,

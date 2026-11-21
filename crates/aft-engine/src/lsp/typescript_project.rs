@@ -443,7 +443,8 @@ pub(crate) fn typescript_for_server(
 }
 
 /// Forget every memoized TypeScript server choice.
-pub(crate) fn clear_typescript_selection() {
+#[doc(hidden)]
+pub fn clear_typescript_selection() {
     // An in-flight lookup may finish after this clear. Its old-generation key
     // must not become a reusable answer about the changed installation.
     SELECTION_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel);

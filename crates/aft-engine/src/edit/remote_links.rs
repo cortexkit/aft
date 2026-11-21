@@ -4,7 +4,8 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::Path;
 
-pub(crate) fn refused(path: &Path) -> io::Error {
+#[doc(hidden)]
+pub fn refused(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::PermissionDenied,
         format!(
@@ -14,7 +15,8 @@ pub(crate) fn refused(path: &Path) -> io::Error {
     )
 }
 
-pub(crate) fn check_open(file: &File, path: &Path) -> io::Result<()> {
+#[doc(hidden)]
+pub fn check_open(file: &File, path: &Path) -> io::Result<()> {
     if crate::context::confinement::remote_mutation() {
         check_count(crate::file_identity::link_count(file)?, path)?;
     }
@@ -28,7 +30,8 @@ pub(crate) fn check_count(links: u64, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn check_path(path: &Path) -> io::Result<()> {
+#[doc(hidden)]
+pub fn check_path(path: &Path) -> io::Result<()> {
     if !crate::context::confinement::remote_mutation() {
         return Ok(());
     }
@@ -71,11 +74,8 @@ pub(crate) fn check_path(path: &Path) -> io::Result<()> {
 /// For a name-only operation, read the current entry relative to the same
 /// directory handle used by the syscall. POSIX has no unlink-by-inode API.
 #[cfg(unix)]
-pub(crate) fn check_at(
-    dir: std::os::fd::RawFd,
-    name: &std::ffi::CStr,
-    path: &Path,
-) -> io::Result<()> {
+#[doc(hidden)]
+pub fn check_at(dir: std::os::fd::RawFd, name: &std::ffi::CStr, path: &Path) -> io::Result<()> {
     if !crate::context::confinement::remote_mutation() {
         return Ok(());
     }
@@ -96,7 +96,8 @@ pub(crate) fn check_at(
     check_count(unsafe { stat.assume_init() }.st_nlink as u64, path)
 }
 
-pub(crate) fn unlink(path: &Path) -> io::Result<()> {
+#[doc(hidden)]
+pub fn unlink(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     if crate::context::confinement::remote_mutation() {
         let (dir, name) = pin_parent(path)?;
@@ -121,9 +122,8 @@ pub(crate) fn unlink(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-pub(crate) fn pin_parent(
-    path: &Path,
-) -> io::Result<(crate::pinned_dir::PinnedDir, std::ffi::CString)> {
+#[doc(hidden)]
+pub fn pin_parent(path: &Path) -> io::Result<(crate::pinned_dir::PinnedDir, std::ffi::CString)> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(refused(path));
     };
@@ -136,7 +136,8 @@ pub(crate) fn pin_parent(
 
 /// Rollback is also a source write. Keep local rollback's old behavior, but
 /// never truncate an unchecked descriptor when restoring a remote edit.
-pub(crate) fn restore(path: &Path, bytes: &[u8]) -> io::Result<()> {
+#[doc(hidden)]
+pub fn restore(path: &Path, bytes: &[u8]) -> io::Result<()> {
     if crate::context::confinement::remote_mutation() {
         return super::atomic_write_source(path, bytes).map(|_| ());
     }

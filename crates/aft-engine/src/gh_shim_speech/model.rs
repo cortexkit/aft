@@ -5,7 +5,8 @@ use super::{Code, Refusal, ScopeRole};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct RouteOrigin {
+#[doc(hidden)]
+pub struct RouteOrigin {
     pub(crate) run_nonce: String,
     pub(crate) connection_generation: String,
     pub(crate) channel: u32,
@@ -15,7 +16,8 @@ pub(crate) struct RouteOrigin {
 /// This value comes from the authenticated dispatch context, never tool arguments.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LaunchAuthority {
+#[doc(hidden)]
+pub struct LaunchAuthority {
     pub(crate) authority: ScopeStamp,
     pub(crate) run: Option<ScopeStamp>,
     pub(crate) origin: Option<RouteOrigin>,

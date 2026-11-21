@@ -51,20 +51,26 @@ pub mod reason {
     /// nothing is built.
     pub(crate) const NOT_BOUND: &str = "not_bound";
     /// The family store could not be opened for the checkout.
-    pub(crate) const BIND_FAILED: &str = "bind_failed";
+    #[doc(hidden)]
+    pub const BIND_FAILED: &str = "bind_failed";
     /// The checkout's build failed.
-    pub(crate) const BUILD_FAILED: &str = "build_failed";
+    #[doc(hidden)]
+    pub const BUILD_FAILED: &str = "build_failed";
     /// Resolving the edits recorded since the publication failed.
-    pub(crate) const REFRESH_FAILED: &str = "refresh_failed";
+    #[doc(hidden)]
+    pub const REFRESH_FAILED: &str = "refresh_failed";
     /// Another process held the family store's writer past the wait.
-    pub(crate) const STORE_BUSY: &str = "store_busy";
+    #[doc(hidden)]
+    pub const STORE_BUSY: &str = "store_busy";
     /// The store's disk has less free space than AFT's floor, so nothing
     /// new is written; the error is the approved pause sentence.
-    pub(crate) const DISK_RESERVE: &str = "disk_reserve";
+    #[doc(hidden)]
+    pub const DISK_RESERVE: &str = "disk_reserve";
     /// A newer build wrote a file of the family store in a format version
     /// above what this build reads, so the store is refused; the error is
     /// the refusal message. The same code today's stores use for theirs.
-    pub(crate) const REQUIRES_NEWER_READER: &str = crate::persisted_format::CODE;
+    #[doc(hidden)]
+    pub const REQUIRES_NEWER_READER: &str = crate::persisted_format::CODE;
     /// Configure leaves the root unindexed: it is too broad to index (a
     /// filesystem or volume root), or it is the home folder.
     pub(crate) const ROOT_TOO_BROAD: &str = crate::feature_status::cause::ROOT_TOO_BROAD;

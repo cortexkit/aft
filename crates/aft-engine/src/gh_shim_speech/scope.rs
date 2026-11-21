@@ -82,7 +82,8 @@ impl ValidatedEnd {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum Answer {
+#[doc(hidden)]
+pub enum Answer {
     Live(ScopeStamp),
     Ended(ValidatedEnd),
 }
@@ -103,7 +104,8 @@ fn security_matches(expected: &ScopeStamp, record: &ScopeStamp) -> bool {
 }
 
 /// Epoch is the cross-restart identity; connection generations only reject late replies.
-pub(crate) fn validate_scope_identity(
+#[doc(hidden)]
+pub fn validate_scope_identity(
     expected: &ScopeStamp,
     role: ScopeRole,
     reply: &ModuleControlResponseToModule,

@@ -21,9 +21,10 @@ use crate::secret::{SecretVault, UnavailableVault};
 #[cfg(unix)]
 use crate::secret_proxy::{ProxyConfig, SecretProxy};
 
-pub(crate) const REMOTE_REFUSED: &str =
-    "Secret placeholders stay local; remote commands cannot use them.";
-pub(crate) const ENV_CONFLICT: &str =
+#[doc(hidden)]
+pub const REMOTE_REFUSED: &str = "Secret placeholders stay local; remote commands cannot use them.";
+#[doc(hidden)]
+pub const ENV_CONFLICT: &str =
     "Secret placeholder commands cannot set proxy variables in env or bash.env.";
 #[cfg(unix)]
 pub(crate) const PROXY_UNAVAILABLE: &str =
@@ -40,7 +41,8 @@ pub(crate) const TRUST_KEYS: [&str; 5] = [
     "GIT_SSL_CAINFO",
 ];
 
-pub(crate) fn labels(command: &str) -> Vec<String> {
+#[doc(hidden)]
+pub fn labels(command: &str) -> Vec<String> {
     let mut labels = Vec::new();
     for placeholder in secret_rules::placeholder::scan(command) {
         if !labels.iter().any(|label| label == placeholder.label) {
@@ -50,14 +52,16 @@ pub(crate) fn labels(command: &str) -> Vec<String> {
     labels
 }
 
-pub(crate) fn env_conflicts(env: &HashMap<String, String>) -> bool {
+#[doc(hidden)]
+pub fn env_conflicts(env: &HashMap<String, String>) -> bool {
     PROXY_KEYS
         .iter()
         .chain(REMOVE_KEYS.iter())
         .any(|key| env.contains_key(*key))
 }
 
-pub(crate) fn vault() -> Arc<dyn SecretVault> {
+#[doc(hidden)]
+pub fn vault() -> Arc<dyn SecretVault> {
     #[cfg(test)]
     if let Some(vault) = TEST_VAULT.with(|slot| slot.borrow().clone()) {
         return vault;
@@ -68,7 +72,8 @@ pub(crate) fn vault() -> Arc<dyn SecretVault> {
     }
 }
 
-pub(crate) fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
+#[doc(hidden)]
+pub fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
     let vault = vault();
     let scope = crate::context::call_context::current_secret_audit_scope()
         .map(|scope| scope.to_scope_ref());
@@ -105,7 +110,8 @@ impl Drop for Preflight {
 }
 
 #[cfg(unix)]
-pub(crate) fn preflight(
+#[doc(hidden)]
+pub fn preflight(
     ctx: &AppContext,
     session: &str,
     pty: bool,
@@ -234,7 +240,8 @@ impl Drop for Launch {
 }
 
 #[cfg(unix)]
-pub(crate) fn authorize(
+#[doc(hidden)]
+pub fn authorize(
     id: &str,
     labels: &[String],
     mut preflight: Preflight,

@@ -9,7 +9,8 @@ use super::entry_points;
 use super::job::canonicalize_normalized;
 
 #[derive(Debug)]
-pub(crate) struct InspectInventory {
+#[doc(hidden)]
+pub struct InspectInventory {
     root: PathBuf,
     pub(crate) sources: Vec<PathBuf>,
     pub(crate) manifests: Vec<PathBuf>,
@@ -294,7 +295,8 @@ thread_local! {
     static CURRENT: RefCell<Option<Arc<InspectInventory>>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn current(root: &Path) -> Option<Arc<InspectInventory>> {
+#[doc(hidden)]
+pub fn current(root: &Path) -> Option<Arc<InspectInventory>> {
     CURRENT.with(|slot| {
         slot.borrow()
             .as_ref()

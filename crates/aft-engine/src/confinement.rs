@@ -1,10 +1,12 @@
 //! Runtime adapter for the request-local read fence.
 
-pub(crate) use crate::data_layer::read_fence::*;
+#[doc(hidden)]
+pub use crate::data_layer::read_fence::*;
 use crate::{context::AppContext, protocol::Response};
 use std::{path::Path, sync::Arc};
 
-pub(crate) fn with_root<R>(
+#[doc(hidden)]
+pub fn with_root<R>(
     ctx: &AppContext,
     id: &str,
     run: impl FnOnce() -> Result<R, Response>,

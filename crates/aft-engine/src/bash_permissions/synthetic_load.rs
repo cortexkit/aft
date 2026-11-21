@@ -9,7 +9,8 @@ type Words = [Option<String>];
 /// This is not a shell sandbox: dynamic command names and unparseable syntax
 /// retain their existing handling. Literal words are decoded by the rewrite
 /// parser, never searched inside arguments, scripts, or quoted prose.
-pub(crate) fn is_synthetic_load(source: &str) -> bool {
+#[doc(hidden)]
+pub fn is_synthetic_load(source: &str) -> bool {
     let Some(tree) = parse_tree(source) else {
         return false;
     };

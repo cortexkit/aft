@@ -224,11 +224,8 @@ fn not_ready(checkout: &DataCheckout) -> Plane<CheckoutView> {
 /// The call-graph plane of child `child` of the parent folder `parent`
 /// that `ctx` is bound to: a view whose call graph covers every recorded
 /// change, still loading, or the reason it cannot answer.
-pub(crate) fn callgraph_plane(
-    ctx: &impl IndexHost,
-    parent: &Path,
-    child: &Path,
-) -> Plane<CheckoutView> {
+#[doc(hidden)]
+pub fn callgraph_plane(ctx: &impl IndexHost, parent: &Path, child: &Path) -> Plane<CheckoutView> {
     let checkout = match checkouts(ctx, parent, &[child]).pop() {
         Some(Ok(checkout)) => checkout,
         Some(Err(error)) => return Plane::Gap(error),
@@ -275,7 +272,8 @@ pub(crate) const NO_VECTORS: &str = "no semantic view has been published for thi
 /// vectors the repository's store holds, whichever checkout embedded
 /// them, and never fills, since semantic search is not admitted for a
 /// repository no session has opened.
-pub(crate) fn search_children(
+#[doc(hidden)]
+pub fn search_children(
     ctx: &impl IndexHost,
     parent: &Path,
     children: &[&Path],

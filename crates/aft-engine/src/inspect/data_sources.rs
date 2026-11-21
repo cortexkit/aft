@@ -255,7 +255,8 @@ pub(crate) const TODOS_REPOSITORIES_NOT_INDEXED: &str =
 /// needs no `aft_inspect` request to have bound the checkout for dead code
 /// first, so background work such as the status bar's TODO refresh lists
 /// files from it too.
-pub(crate) fn bound_inventory(
+#[doc(hidden)]
+pub fn bound_inventory(
     project_root: &Path,
 ) -> Result<crate::inspect::inventory::InspectInventory, crate::inspect::inventory::StoreListMiss> {
     use crate::inspect::inventory::{InspectInventory, StoreListMiss};

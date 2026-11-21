@@ -41,7 +41,8 @@ pub(crate) enum ReturnOutcome {
 /// Why a requested path was not written locally.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum NotReturned {
+#[doc(hidden)]
+pub enum NotReturned {
     /// The runner's manifest named this failure cause (`missing`,
     /// `not_regular`, `escape`, `over_cap`, `read_error`, `expired`, or a
     /// cause this version does not know).
@@ -152,7 +153,8 @@ pub(crate) const LOCAL_RUN_NOTE: &str =
 /// Each is a file path relative to the command's workdir, without `..`,
 /// listed once, and there are at most [`MAX_RETURN_PATHS`]. Whether each
 /// resolves inside the project is checked separately against the filesystem.
-pub(crate) fn check_requested_paths(paths: &[String]) -> Result<(), String> {
+#[doc(hidden)]
+pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
     use std::path::{Component, Path};
     if paths.len() > MAX_RETURN_PATHS {
         return Err(format!(
@@ -257,7 +259,8 @@ pub(crate) fn resolve_parent(
 /// (which must itself be resolved). Nothing is created here. This is the
 /// check made before the job is submitted; placing the file later refuses a
 /// symlink at the path itself instead of following it.
-pub(crate) fn resolve_destination(
+#[doc(hidden)]
+pub fn resolve_destination(
     root: &std::path::Path,
     requested: &std::path::Path,
 ) -> Result<Destination, NotReturned> {

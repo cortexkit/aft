@@ -3,7 +3,8 @@
 pub(crate) mod fixture;
 pub(crate) mod onnx;
 pub(crate) mod remote;
-pub(crate) mod slot;
+#[doc(hidden)]
+pub mod slot;
 pub(crate) mod synapse;
 
 use std::sync::Arc;
@@ -27,20 +28,23 @@ pub(crate) const MAX_TIMEOUT_MS: u64 = 15_000;
 /// Names the candidate-text construction used by the search tool. Bump it
 /// whenever that construction changes, so memoized orders and recorded fixture
 /// scores made with the old text are never reused.
-pub(crate) const TEXT_POLICY_REVISION: &str = "path:line+name+lines/v2";
+#[doc(hidden)]
+pub const TEXT_POLICY_REVISION: &str = "path:line+name+lines/v2";
 /// Longest skip reason shown to the agent.
 const MAX_REASON_CHARS: usize = 80;
 
 /// Process environment variable naming a recorded score pack. When set, the
 /// fixture backend replaces whatever the config selects, and a score missing
 /// from the pack fails the search instead of silently keeping fused order.
-pub(crate) const FIXTURE_PACK_ENV: &str = "AFT_RERANK_FIXTURE_PACK";
+#[doc(hidden)]
+pub const FIXTURE_PACK_ENV: &str = "AFT_RERANK_FIXTURE_PACK";
 /// Process environment variable naming a pack file that the ONNX backend's
 /// scores are appended to while serving normally.
 pub(crate) const RECORD_PACK_ENV: &str = "AFT_RERANK_RECORD_PACK";
 
 /// One candidate document handed to a backend: the bounded candidate text.
-pub(crate) struct RerankDoc<'a> {
+#[doc(hidden)]
+pub struct RerankDoc<'a> {
     pub(crate) text: &'a str,
 }
 
@@ -48,7 +52,8 @@ pub(crate) struct RerankDoc<'a> {
 /// fingerprints must produce equal scores for equal inputs, so the fingerprint
 /// is part of every memoized ordering and every recorded fixture score.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct RerankFingerprint {
+#[doc(hidden)]
+pub struct RerankFingerprint {
     pub(crate) backend: &'static str,
     pub(crate) model: String,
     pub(crate) revision: String,
@@ -57,7 +62,8 @@ pub(crate) struct RerankFingerprint {
 /// Why a backend returned no scores. None of these is a search error: the
 /// caller keeps the fused order and reports one short note.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RerankError {
+#[doc(hidden)]
+pub enum RerankError {
     /// The backend cannot serve now (model not provisioned yet, runtime
     /// missing, worker busy, process shutting down).
     Unavailable(String),
@@ -133,7 +139,8 @@ impl RerankBackend for NoopRerankBackend {
 
 /// The `search.rerank` block after defaults and clamps.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RerankSettings {
+#[doc(hidden)]
+pub struct RerankSettings {
     pub(crate) backend: RerankBackendKind,
     pub(crate) model: Option<String>,
     pub(crate) top_n: usize,
@@ -168,12 +175,14 @@ impl RerankSettings {
 /// reranker, and a silent fallback to fused order would make that benchmark
 /// measure the engine without it.
 #[derive(Clone)]
-pub(crate) struct SelectedBackend {
+#[doc(hidden)]
+pub struct SelectedBackend {
     pub(crate) backend: Arc<dyn RerankBackend>,
     pub(crate) fail_closed: bool,
 }
 
-pub(crate) fn short_reason(reason: &str) -> String {
+#[doc(hidden)]
+pub fn short_reason(reason: &str) -> String {
     let line = reason.lines().next().unwrap_or_default().trim();
     match line.char_indices().nth(MAX_REASON_CHARS) {
         None => line.to_string(),

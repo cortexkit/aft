@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct ShellCall {
+#[doc(hidden)]
+pub struct ShellCall {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub session: String,
@@ -24,7 +25,8 @@ impl Drop for Guard {
     }
 }
 
-pub(crate) fn enter(call: ShellCall) -> Guard {
+#[doc(hidden)]
+pub fn enter(call: ShellCall) -> Guard {
     Guard(CURRENT.with(|slot| slot.replace(Some(call))))
 }
 
@@ -43,8 +45,10 @@ pub(crate) fn facts_changed() {
     changed();
 }
 
-pub(crate) fn facts_revision() -> u64 {
+#[doc(hidden)]
+pub fn facts_revision() -> u64 {
     FACTS_REVISION.load(std::sync::atomic::Ordering::Acquire)
 }
 
-pub(crate) use crate::db::bash_tasks::subscribe;
+#[doc(hidden)]
+pub use crate::db::bash_tasks::subscribe;

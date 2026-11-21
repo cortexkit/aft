@@ -30,7 +30,8 @@ use crate::callgraph_store::join::CallgraphBlob;
 
 /// The sections a call-graph segment holds.
 #[must_use]
-pub(crate) fn known_sections() -> Vec<KnownSection> {
+#[doc(hidden)]
+pub fn known_sections() -> Vec<KnownSection> {
     aft_store::content::KNOWN
         .into_iter()
         .chain(aft_store::graph::KNOWN)
@@ -182,7 +183,8 @@ fn call_target(file: &str, symbol: &str) -> Vec<u8> {
 /// # Errors
 ///
 /// When the segment cannot be written.
-pub(crate) fn write_segment(
+#[doc(hidden)]
+pub fn write_segment(
     path: &Path,
     meta: SegmentMeta,
     inputs: &CheckoutInputs,
@@ -670,7 +672,8 @@ struct Located {
 /// A read that fails (a checksum, a malformed record) is recorded in
 /// [`StoredSlices::failures`] and the file is treated as absent, because the
 /// slice source answers with options; callers fail on any recorded failure.
-pub(crate) struct StoredSlices {
+#[doc(hidden)]
+pub struct StoredSlices {
     /// Failed reads append counted strings after publication, without an edit.
     memory_epoch: std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>,
     segments: Vec<Arc<Segment>>,

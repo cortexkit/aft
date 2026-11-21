@@ -25,8 +25,8 @@ use crate::lsp::tsconfig_membership::TsconfigMembershipCache;
 /// by an edit's save, or by the server's first analysis) has not finished,
 /// or was expected and did not begin in time: the compiler errors it has
 /// published describe the files before the edit, or are missing.
-pub(crate) const RUST_CHECK_RUNNING_REASON: &str =
-    "rust-analyzer: cargo check still running; retry";
+#[doc(hidden)]
+pub const RUST_CHECK_RUNNING_REASON: &str = "rust-analyzer: cargo check still running; retry";
 
 /// Why diagnostics are unknown after inspect's own `cargo check` finished in
 /// this request but the follow-up check that the Rust inputs did not change
@@ -38,14 +38,16 @@ const EXPLICIT_CHECK_RUNNING_REASON: &str = "cargo check running for aft_inspect
 /// Reason for a file whose diagnostics don't yet match its current content.
 /// It names a coverage gap and is never used as a checked-clean fallback.
 /// Agents see this text, so changing it needs product approval.
-pub(crate) const CURRENT_CONTENT_UNVERIFIED_REASON: &str =
+#[doc(hidden)]
+pub const CURRENT_CONTENT_UNVERIFIED_REASON: &str =
     "no diagnostics for the current file content arrived in time; retry aft_inspect";
 
 /// The cargo check inspect runs itself for one Rust producer whose automatic
 /// checks are off. Its outcome arrives on `outcome`: `Ok` once the result is
 /// saved and certified current, or the reason it is unknown together with any
 /// compiler rows the check printed, which stay provisional.
-pub(crate) struct InspectRustCheck {
+#[doc(hidden)]
+pub struct InspectRustCheck {
     key: ServerKey,
     outcome: std::sync::mpsc::Receiver<(Result<(), String>, Vec<StoredDiagnostic>)>,
 }
@@ -58,7 +60,8 @@ pub(crate) struct InspectRustCheck {
 /// the check only after that wait left it a quarter of the request budget;
 /// side by side, the check gets the whole wait. The diagnostics phase collects
 /// the outcomes with [`run_diagnostics_category`].
-pub(crate) fn start_inspect_rust_checks(
+#[doc(hidden)]
+pub fn start_inspect_rust_checks(
     ctx: &AppContext,
     producers: &[ServerKey],
     deadline: Instant,
@@ -102,7 +105,8 @@ pub(crate) fn start_inspect_rust_checks(
 /// Whole-request server budget for blocking inspect. Every phase shares one
 /// absolute deadline derived from this value and capped below the interactive
 /// client deadline by the inspect command.
-pub(crate) fn inspect_request_timeout(config: &Config) -> Duration {
+#[doc(hidden)]
+pub fn inspect_request_timeout(config: &Config) -> Duration {
     Duration::from_millis(config.inspect.diagnostics_timeout_ms.clamp(
         MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
         MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
@@ -227,7 +231,8 @@ struct DiagnosticsCollection {
 /// terminal failure. When the blocking wait reaches its indexing budget,
 /// unfinished producers become named gaps and published rows remain explicitly
 /// provisional; other categories can still be returned.
-pub(crate) fn run_diagnostics_category(
+#[doc(hidden)]
+pub fn run_diagnostics_category(
     ctx: &AppContext,
     snapshot: &InspectSnapshot,
     scope: &JobScope,
@@ -931,7 +936,8 @@ pub(crate) struct ScopedCoverageCandidates {
 /// Track budget rejection separately from iterator exhaustion: both end a walk,
 /// but only exhaustion proves the inventory is complete.
 #[derive(Clone)]
-pub(crate) struct ScopeWalkBudget {
+#[doc(hidden)]
+pub struct ScopeWalkBudget {
     deadline: Instant,
     entry_limit: usize,
     visited: Arc<AtomicUsize>,
@@ -966,7 +972,8 @@ impl ScopeWalkBudget {
     }
 }
 
-pub(crate) fn scope_walk_gap() -> Value {
+#[doc(hidden)]
+pub fn scope_walk_gap() -> Value {
     serde_json::json!({
         "kind": "analysis_incomplete",
         "producer": "scoped file walk",
@@ -984,7 +991,8 @@ pub(crate) fn scope_walk_gap() -> Value {
 /// directories inevitably contain non-code files nobody expects diagnostics
 /// for. In-root files a tsconfig excludes are skipped. Explicit external files
 /// remain candidates so an excluded file is named as unchecked rather than clean.
-pub(crate) fn scoped_coverage_candidates(
+#[doc(hidden)]
+pub fn scoped_coverage_candidates(
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     config: &Config,
@@ -1058,10 +1066,8 @@ fn scoped_coverage_candidates_with_budget(
 }
 
 /// The language servers that would analyze the files of a request scope.
-pub(crate) fn scope_producer_keys(
-    snapshot: &InspectSnapshot,
-    scope: &JobScope,
-) -> HashSet<ServerKey> {
+#[doc(hidden)]
+pub fn scope_producer_keys(snapshot: &InspectSnapshot, scope: &JobScope) -> HashSet<ServerKey> {
     scoped_coverage_candidates(snapshot, scope, &snapshot.config, None)
         .files
         .iter()
