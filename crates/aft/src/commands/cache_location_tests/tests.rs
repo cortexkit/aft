@@ -733,8 +733,7 @@ fn first_enrollment_refuses_the_durable_storage_device() {
         .contains(CACHE_DIR_ON_STORAGE_DEVICE));
     assert!(!parent.join("aft").exists());
     assert!(!config.storage_dir.as_ref().unwrap().exists());
-    let ctx =
-        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let request = serde_json::from_value(
         serde_json::json!({"id":"device-warning","command":"memory.census"}),
     )
@@ -2122,8 +2121,7 @@ fn cache_location_context_keeps_retired_root_lease_across_reconfigure() {
     };
     assert!(prepare_cache_root(&mut next).is_none());
     let active = cache_root(&next);
-    let ctx =
-        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_config(next);
     let report = remove_inactive_cache_roots(&storage, &[active]);
     assert!(
