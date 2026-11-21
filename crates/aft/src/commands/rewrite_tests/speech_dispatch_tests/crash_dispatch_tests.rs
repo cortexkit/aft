@@ -66,7 +66,8 @@ async fn historical_mailbox_after_process_crash_recovers_as_unknown_not_success(
         std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "gh_shim::speech_dispatch_tests::crash::crash_after_bound_commit_child",
+                concat!(module_path!(), "::crash_after_bound_commit_child")
+                    .trim_start_matches("aft::"),
                 "--nocapture",
             ])
             .env("AFT_TEST_BOUND_CRASH", "1")

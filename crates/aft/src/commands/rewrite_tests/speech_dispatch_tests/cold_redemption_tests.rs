@@ -185,7 +185,8 @@ async fn cases(cases: &[&str]) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "gh_shim::speech_dispatch_tests::cold::cold_redemption_probe_child",
+                concat!(module_path!(), "::cold_redemption_probe_child")
+                    .trim_start_matches("aft::"),
                 "--nocapture",
             ])
             .env(

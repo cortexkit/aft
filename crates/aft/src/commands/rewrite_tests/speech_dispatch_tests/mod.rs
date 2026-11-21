@@ -1,6 +1,5 @@
-use super::*;
-use crate::gh_shim::tests::speech_dispatch_support::SpeechManifest;
 use crate::db::access_grants::ScopeKey;
+use crate::gh_shim::tests::speech_dispatch_support::SpeechManifest;
 use crate::gh_shim_relay::{
     RelayCall, RelayReply, RelayTransport, RouteScopes, TransportError, BOT_REQUEST_OPERATION,
 };
@@ -8,8 +7,13 @@ use crate::gh_shim_speech::model::Binding;
 use crate::gh_shim_speech::partner::{QueuedBotResponse, ReservedBotRequest};
 use crate::gh_shim_speech::service::{LaunchSeed, Service, TestPartners};
 use crate::gh_shim_speech::{Code, Refusal};
+use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use subc_protocol::scope::{ScopeAttributes, ScopeKind, ScopeStamp, ScopeStatus};
 
 #[path = "admission_tests.rs"]
@@ -519,7 +523,7 @@ impl Fixture {
         let mut config = crate::config::Config::default();
         config.project_root = Some(project.clone());
         config.storage_dir = Some(root.clone());
-        let ctx = Arc::new(crate::context::AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             config,
         ));
@@ -939,7 +943,7 @@ fn cancel_from_sibling(root: &Path, scope: &ScopeStamp) -> Value {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            "gh_shim::speech_dispatch_tests::cancel_child",
+            concat!(module_path!(), "::cancel_child").trim_start_matches("aft::"),
             "--nocapture",
         ])
         .env("AFT_TEST_DISPATCH_CANCEL_ROOT", root)
