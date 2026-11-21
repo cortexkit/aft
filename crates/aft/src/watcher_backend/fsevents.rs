@@ -1627,7 +1627,9 @@ mod tests {
             ids.as_ptr(),
         );
         crate::watcher_filter::EXCLUSION_TEST_LSTATS.with(|calls| assert_eq!(calls.get(), 0));
-        let batch = rx.try_recv().unwrap();
+        let Message::Events(batch) = rx.try_recv().unwrap() else {
+            panic!("callback did not send an event batch");
+        };
         assert_eq!(batch.len(), EVENTS);
         assert!(matches!(rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
         for (index, event) in batch.into_iter().enumerate() {
@@ -1658,12 +1660,10 @@ mod tests {
             flags.as_ptr(),
             ids.as_ptr(),
         );
-        let events: Vec<_> = rx
-            .try_recv()
-            .unwrap()
-            .into_iter()
-            .map(Result::unwrap)
-            .collect();
+        let Message::Events(batch) = rx.try_recv().unwrap() else {
+            panic!("callback did not send an event batch");
+        };
+        let events: Vec<_> = batch.into_iter().map(Result::unwrap).collect();
         assert_eq!(events.len(), 4);
         assert_eq!(events[0].kind, EventKind::Create(CreateKind::File));
         assert_eq!(
