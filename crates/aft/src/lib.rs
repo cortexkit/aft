@@ -104,7 +104,6 @@ pub use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
 pub use aft_base::disk_floor;
 pub(crate) use aft_base::durability;
-pub(crate) use aft_base::durable_dir;
 pub use aft_base::effective_path;
 #[doc(hidden)]
 pub use aft_base::environment;
@@ -112,12 +111,12 @@ pub use aft_base::error;
 #[cfg(test)]
 use aft_base::executable_cache;
 pub use aft_base::feature_config;
+#[cfg(test)]
 pub(crate) use aft_base::file_identity;
 pub use aft_base::fleet_status;
 pub use aft_base::gh_shim_paths;
 pub use aft_base::git_head;
 pub(crate) use aft_base::git_probe;
-pub(crate) use aft_base::git_revision;
 pub(crate) use aft_base::github_address;
 pub use aft_base::grammar_state;
 pub use aft_base::harness;
@@ -127,6 +126,7 @@ pub use aft_base::inspect_category;
 pub use aft_base::jsonc;
 pub use aft_base::jsonc_edit;
 pub use aft_base::language;
+#[cfg(test)]
 pub(crate) use aft_base::large_read_counts;
 #[doc(hidden)]
 pub use aft_base::launch_fds;
@@ -136,7 +136,6 @@ pub use aft_base::list_surfaces;
 pub(crate) use aft_base::lock_diagnostics;
 pub use aft_base::log_ctx;
 pub use aft_base::log_redact;
-pub(crate) use aft_base::native_stat;
 pub use aft_base::ndjson_text;
 pub(crate) use aft_engine::database_open;
 pub use aft_engine::db;
@@ -155,8 +154,6 @@ pub use aft_engine::gh_shim_relay;
 pub(crate) use aft_engine::gh_shim_speech;
 pub use aft_engine::gh_shim_ticket;
 pub(crate) use aft_engine::gh_shim_worker_broker;
-#[cfg(unix)]
-pub(crate) use aft_engine::gh_shim_worker_endpoints;
 pub use aft_engine::git_index_reader;
 pub(crate) use aft_engine::git_root_resolution;
 pub use aft_engine::github_read;
@@ -180,24 +177,20 @@ pub use aft_engine::memory;
 pub use aft_engine::memory_census;
 pub use aft_engine::native_route;
 pub use aft_parse::fuzzy_match;
-pub(crate) use aft_parse::line_matcher;
 #[cfg(test)]
 mod nested_worktree_tests;
 pub use aft_base::ort_lifecycle;
 pub use aft_base::pattern_compile;
 pub use aft_base::pending_response;
 pub(crate) use aft_base::pinned_dir;
-use aft_base::platform_tls;
 pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
 pub(crate) use aft_base::posix_spawn;
 use aft_base::privacy_spawn;
 #[doc(hidden)]
 pub use aft_base::private_storage;
-pub(crate) use aft_base::process_group;
 pub use aft_base::process_identity;
 pub use aft_base::process_io;
-pub(crate) use aft_base::process_spawn;
 pub use aft_base::project_walk;
 pub use aft_base::protocol;
 pub use aft_base::pty_render;
@@ -225,7 +218,6 @@ pub(crate) use aft_engine::revision_read;
 pub use aft_engine::root_cache;
 pub use aft_engine::root_identity;
 pub mod run_tool_call;
-pub(crate) use aft_base::shared_timer;
 pub use aft_base::shell_format;
 pub use aft_base::storage_path;
 pub use aft_db::sandbox_profile;
@@ -255,6 +247,7 @@ pub mod subc_translate;
 pub use aft_engine::symbol_diff;
 pub(crate) mod trace_measure_run;
 pub use aft_base::symbols;
+#[cfg(test)]
 pub(crate) use aft_base::system_temp;
 pub(crate) use aft_base::task_temp_reads;
 pub use aft_base::task_watch_lines;
@@ -271,7 +264,6 @@ use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
 pub(crate) use aft_base::walk_boundary;
-pub(crate) use aft_base::watcher_markers;
 pub use aft_base::write_counters;
 pub use aft_engine::url_fetch;
 pub use aft_engine::watcher;
@@ -317,4 +309,5 @@ use test_support as test_helpers;
 #[cfg(test)]
 #[path = "../tests/helpers/fake_lsp.rs"]
 pub(crate) mod fake_lsp_test_helper;
+#[cfg(test)]
 pub(crate) use aft_base::persistence_gate;
