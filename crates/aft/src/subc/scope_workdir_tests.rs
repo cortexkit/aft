@@ -90,7 +90,7 @@ fn bind_observed(
         .unwrap();
     let (reply, lines) = crate::logging::capture_log_lines(|| {
         runtime.block_on(async {
-            let app = App::default_shared();
+            let app = crate::test_app();
             let storage = tempfile::tempdir().unwrap();
             let executor = Arc::new(Executor::new());
             let metrics = Arc::new(DispatchPathMetrics::new());

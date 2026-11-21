@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub const WAIT: Duration = Duration::from_secs(30);
 
 thread_local! {
-    static MANAGER_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static MANAGER_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn locked<R>(f: &Fixture, operation: impl FnOnce(&mut LspManager) -> R) -> R {

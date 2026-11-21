@@ -35,7 +35,7 @@ fn snapshot(building: bool) -> Value {
 fn context() -> (tempfile::TempDir, Arc<AppContext>, Arc<Executor>) {
     let dir = tempfile::tempdir().unwrap();
     let ctx = Arc::new(AppContext::with_app_and_provider(
-        App::default_shared(),
+        crate::test_app(),
         Box::new(crate::language::StubProvider),
         crate::config::Config {
             project_root: Some(dir.path().into()),
@@ -770,7 +770,7 @@ async fn user_commands_real_management_routes_admit_only_occipital_and_keep_bodi
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join("storage");
     std::fs::create_dir_all(&storage).unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     app.open_db(&storage.join("aft.db")).unwrap();
     let (mut daemon, module) = tokio::io::duplex(64 * 1024);
     let thread = std::thread::spawn(move || {

@@ -13,15 +13,15 @@ use std::time::Duration;
 // Keep the test contract and its forwarding signature together. The calls in
 // the engine still resolve to their inherent methods.
 macro_rules! test_methods {
-    ($extension:ident for $engine:ty { $( $(#[$attr:meta])* fn $name:ident(&self $(, $arg:ident: $ty:ty)*) $(-> $result:ty)?; )* }
+    ($extension:ident for $engine:ty { $( $(#[$attr:meta])* fn $name:ident $(<$parameter:ident>)? (&self $(, $arg:ident: $ty:ty)*) $(-> $result:ty)?; )* }
         $(associated { $(fn $static_name:ident($($static_arg:ident: $static_ty:ty),*) -> $static_result:ty;)* })?
     ) => {
         pub trait $extension {
-            $( $(#[$attr])* fn $name(&self $(, $arg: $ty)*) $(-> $result)?; )*
+            $( $(#[$attr])* fn $name $(<$parameter>)? (&self $(, $arg: $ty)*) $(-> $result)?; )*
             $($(fn $static_name($($static_arg: $static_ty),*) -> $static_result;)*)?
         }
         impl $extension for $engine {
-            $( $(#[$attr])* fn $name(&self $(, $arg: $ty)*) $(-> $result)? {
+            $( $(#[$attr])* fn $name $(<$parameter>)? (&self $(, $arg: $ty)*) $(-> $result)? {
                 <$engine>::$name(self $(, $arg)*)
             } )*
             $($(fn $static_name($($static_arg: $static_ty),*) -> $static_result {
@@ -84,9 +84,18 @@ test_methods! { DataCheckoutTestExt for DataCheckout {
     fn request_refresh(&self);
     fn meaning_status(&self) -> crate::data_layer::meaning::MeaningState;
     fn root(&self) -> &Path;
+    fn note_outcome_for_test<T>(&self, stage: &'static str, result: &Result<T, DataError>);
+    fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>);
+    #[cfg(all(feature = "wasm-grammars", feature = "test-hooks", not(all(target_os = "windows", target_arch = "aarch64"))))]
+    fn grammar_driver_running_for_test(&self) -> bool;
 } associated {
     fn open(root: &Path, storage: &Path, executor: Option<crate::executor::RootMaintenanceExecutor>) -> Result<Arc<DataCheckout>, DataError>;
     fn open_planes(root: &Path, storage: &Path, executor: Option<crate::executor::RootMaintenanceExecutor>, planes: crate::data_layer::checkout::Planes) -> Result<Arc<DataCheckout>, DataError>;
+}}
+
+test_methods! { ChildCheckoutsTestExt for crate::data_layer::parent::ChildCheckouts {
+    fn insert_for_test(&self, parent: &Path, child: &Path, checkout: Arc<DataCheckout>);
+    fn bound_for_test(&self) -> Vec<Arc<DataCheckout>>;
 }}
 
 test_methods! { CheckoutTestExt for Checkout {
@@ -103,14 +112,6 @@ test_methods! { SnapshotStoreTestExt for crate::page_collect::snapshot::Snapshot
 
 pub use crate::data_layer::host::IndexHost;
 pub use crate::executor::{ExecutorApp, ExecutorContext};
-
-pub fn note_checkout_outcome_for_test<T>(
-    checkout: &DataCheckout,
-    stage: &'static str,
-    result: &Result<T, DataError>,
-) {
-    checkout.note_outcome_for_test(stage, result);
-}
 
 test_methods! { VectorPlaneTestExt for crate::data_layer::vectors::VectorPlane {
     fn cached_snapshot(&self, view: &CheckoutView) -> Option<crate::data_layer::vectors::MeaningSnapshot>;
@@ -188,5 +189,40 @@ pub struct StoredOutline(crate::data_layer::outline::StoredOutline);
 impl StoredOutline {
     pub fn symbols(&self) -> &[aft_store::content::OutlineSymbol] {
         &self.0.symbols
+    }
+}
+
+pub struct PendingDatabaseOpen<'a>(&'a crate::database_open::DatabaseOpenRequest);
+impl PendingDatabaseOpen<'_> {
+    pub fn epoch(&self) -> u64 {
+        self.0.epoch
+    }
+    pub fn dispatched_at(&self) -> Option<std::time::Instant> {
+        self.0.dispatched_at
+    }
+    pub fn storage_root(&self) -> &PathBuf {
+        &self.0.storage_root
+    }
+}
+
+pub trait DatabaseOpenSlotTestExt {
+    fn epoch(&self) -> u64;
+    fn committed_at(&self) -> std::time::Instant;
+    fn running(&self) -> bool;
+    fn pending(&self) -> Option<PendingDatabaseOpen<'_>>;
+}
+
+impl DatabaseOpenSlotTestExt for crate::database_open::DatabaseOpenSlot {
+    fn epoch(&self) -> u64 {
+        self.epoch
+    }
+    fn committed_at(&self) -> std::time::Instant {
+        self.committed_at
+    }
+    fn running(&self) -> bool {
+        self.running
+    }
+    fn pending(&self) -> Option<PendingDatabaseOpen<'_>> {
+        self.pending.as_ref().map(PendingDatabaseOpen)
     }
 }

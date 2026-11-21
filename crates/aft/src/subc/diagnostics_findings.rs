@@ -1107,7 +1107,7 @@ mod tests {
         // Module startup opens shared storage for the GitHub speech service before
         // any route binds. Keep it outside the project whose setup we forbid.
         let storage = dir.path().join("module-storage");
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Arc::new(Executor::new());
         let module_app = app.clone();
         let module_executor = executor.clone();

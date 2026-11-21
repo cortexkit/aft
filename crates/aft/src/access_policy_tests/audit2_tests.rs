@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::policy_path::policy_path;
 use crate::protocol::{RawRequest, Response};
+use aft_engine::test_bridge::search_misc::BackupStoreTest as _;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 
@@ -368,7 +369,7 @@ fn audit2_foreign_registered_scratch_cannot_be_read_written_or_deleted() {
     // while this fixture is checking access to the still-registered scratch.
     f.ctx
         .bash_background()
-        .task_for_test("bash-a2f0123456789012")
+        .test_task("bash-a2f0123456789012")
         .unwrap()
         .lock_state()
         .unwrap()
@@ -683,7 +684,7 @@ fn registered_scratch(f: &Fixture, session: &str, task: &str) -> (PathBuf, Scrat
         .unwrap();
     f.ctx
         .bash_background()
-        .task_for_test(task)
+        .test_task(task)
         .unwrap()
         .lock_state()
         .unwrap()

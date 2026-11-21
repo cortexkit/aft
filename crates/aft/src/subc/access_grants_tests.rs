@@ -221,6 +221,7 @@ fn grants_revoke_by_path_stops_only_shells_using_the_saved_grant() {
         registry::folder_grants::FOLDER_ACCESS_REVOKED_REASON, BgTaskStatus,
     };
     use crate::sandbox_spawn::SpawnPlan;
+    use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
     let (dir, ctx, head, _) = fixture();
     ctx.update_config(|config| {
         config.experimental_bash_background = true;
@@ -262,7 +263,7 @@ fn grants_revoke_by_path_stops_only_shells_using_the_saved_grant() {
     let spawn = |profile| {
         let plan = SpawnPlan::launcher_for_test(profile, "/bin/sh".into());
         let _scope = crate::access_policy::scope_guard(Some(key.clone()));
-        let response = crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+        let response = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(plan, || {
             crate::bash_background::spawn(
                 "path-revoke",
                 &head.session,
@@ -2908,3 +2909,4 @@ fn grants_catalog_validates_params_stored_by_a_concurrent_launch() {
     assert_head_not_held(&error, &unheld);
     assert!(worker_grants(&head, &ctx).is_empty());
 }
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

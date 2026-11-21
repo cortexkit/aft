@@ -163,7 +163,7 @@ mod shared_db_tests {
         let storage = tempdir().unwrap();
         let root_a = tempdir().unwrap();
         let root_b = tempdir().unwrap();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let a = bound_database_root(app.clone(), root_a.path(), storage.path());
         let b = bound_database_root(app.clone(), root_b.path(), storage.path());
         let shared = b.db().unwrap();
@@ -202,7 +202,7 @@ mod shared_db_tests {
     fn ready_root_reconfigure_repairs_each_detached_pool_without_another_open() {
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
-        let ctx = bound_database_root(App::default_shared(), root.path(), storage.path());
+        let ctx = bound_database_root(crate::test_app(), root.path(), storage.path());
         let shared = ctx.db().unwrap();
         ctx.backup().lock().clear_db_pool();
         ctx.begin_database_runtime(
@@ -228,7 +228,7 @@ mod shared_db_tests {
     fn ready_root_rebind_orders_pool_attach_after_release_and_before_late_release() {
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
-        let ctx = bound_database_root(App::default_shared(), root.path(), storage.path());
+        let ctx = bound_database_root(crate::test_app(), root.path(), storage.path());
         ctx.mark_subc_unbound();
 
         // Configure commits before the bound transition. Force idle release into
@@ -267,7 +267,7 @@ mod shared_db_tests {
         .unwrap();
         drop(conn);
         let ctx = AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -368,7 +368,7 @@ mod shared_db_tests {
         .unwrap();
         crate::reader_floor::prepare(storage.path());
         let ctx = AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -467,7 +467,7 @@ mod shared_db_tests {
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -660,7 +660,7 @@ mod shared_db_tests {
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -813,7 +813,7 @@ mod shared_db_tests {
         let storage = tempdir().unwrap();
         let root = tempdir().unwrap();
         let ctx = AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -878,7 +878,7 @@ mod shared_db_tests {
     #[test]
     fn database_retry_without_configured_root_refuses_without_panicking() {
         crate::commands::configure::register_runtime_hooks();
-        let ctx = AppContext::from_app(App::default_shared(), Config::default());
+        let ctx = AppContext::from_app(crate::test_app(), Config::default());
         assert!(ctx.canonical_cache_root_opt().is_none());
         ctx.finish_database_runtime_error("database busy".into(), true);
         assert!(ctx

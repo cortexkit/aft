@@ -35,7 +35,7 @@ pub(crate) struct Artifact {
 pub struct OutputFiles {
     pub(crate) files: Mutex<HashMap<PathBuf, Artifact>>,
     roots: Mutex<HashMap<PathBuf, PathBuf>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) canonicalizations: std::sync::atomic::AtomicUsize,
 }
 
@@ -253,7 +253,7 @@ impl OutputFiles {
     }
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.canonicalizations.fetch_add(1, Ordering::Relaxed);
         path.canonicalize()
     }

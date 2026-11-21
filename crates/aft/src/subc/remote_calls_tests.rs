@@ -120,7 +120,7 @@ async fn real_binds_enforce_admission_without_opening_a_workdir() {
         })
     };
     let executor = Arc::new(Executor::new());
-    let app = App::default_shared();
+    let app = crate::test_app();
     let (mut daemon, module) = tokio::io::duplex(1024 * 1024);
     let (read, write) = tokio::io::split(module);
     let connection = storage.path().join("connection.json");

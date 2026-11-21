@@ -788,7 +788,7 @@ async fn permissions_cingulate_route_serves_only_permissions_operations() {
 
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join("module-storage");
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let module_app = app.clone();
     let module_executor = executor.clone();

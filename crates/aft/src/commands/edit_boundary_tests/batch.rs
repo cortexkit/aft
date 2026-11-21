@@ -4,6 +4,8 @@ mod tests {
         attach_edit_diff, build_unbounded_unified_diff, read_edit_source,
         write_format_validate_observed,
     };
+    #[cfg(unix)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
     use aft_engine::test_bridge::search_misc::{A03_HANDLER_READS, A03_SYNTAX_PARSES};
 
     #[cfg(unix)]

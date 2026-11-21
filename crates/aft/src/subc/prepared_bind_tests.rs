@@ -83,7 +83,7 @@ async fn real_bind_dispatch_scope_survives_config_edits_before_executor_admissio
     std::fs::create_dir_all(project.parent().unwrap()).unwrap();
     std::fs::write(&user, r#"{"indexes":{"trigram":false,"semantic":false,"callgraph":false},"url_fetch_allow_private":true}"#).unwrap();
     std::fs::write(&project, r#"{"idle": {"checkout_hours": 7}}"#).unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let ctx = Arc::new(crate::context::AppContext::from_app(
         app.clone(),
         crate::config::Config {

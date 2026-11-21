@@ -1634,7 +1634,7 @@ impl DataCheckout {
     }
 
     #[cfg(all(
-        test,
+        any(test, feature = "test-support"),
         feature = "wasm-grammars",
         feature = "test-hooks",
         not(all(target_os = "windows", target_arch = "aarch64"))

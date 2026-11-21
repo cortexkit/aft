@@ -2,6 +2,9 @@
 mod tests {
     use crate::config::Config;
     use crate::edit::{check_created_file_syntax, validate_syntax_str};
+    #[cfg(unix)]
+    use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
     use aft_engine::test_bridge::search_misc::edit_bash::{
         find_bash, reported_line, with_runner, CheckOutcome, Runner, SYNTAX_ERROR_STATUS,
     };
@@ -85,7 +88,7 @@ mod tests {
                 ..config()
             },
         );
-        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
+        let policy = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(
             SpawnPlan::launcher_for_test(profile.clone(), launcher),
             || ToolLaunchPolicy::resolve(&ctx),
         )
@@ -139,7 +142,7 @@ mod tests {
                 ..config()
             },
         );
-        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
+        let policy = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(
             SpawnPlan::refused_for_test("sandbox_unavailable"),
             || ToolLaunchPolicy::resolve(&ctx),
         )

@@ -67,7 +67,7 @@ fn retained_aft_engines() {
     // forty real engines for this isolated profile rather than measuring empty slots.
     memory_profile_layer_for_test().set_engine_budget(16 << 30);
     memory_profile_layer_for_test().set_engine_idle(Duration::from_secs(3600));
-    let app = crate::context::App::default_shared();
+    let app = crate::test_app();
     let cache = HealthRollupCache::new();
     let mut contexts = Vec::new();
     let mut checkouts = Vec::new();
