@@ -459,7 +459,6 @@ impl Guard {
     }
 
     fn check(&mut self, node: Node<'_>, path: &Path, source: &str) {
-        let spelling = text(node, source);
         let found = match node.kind() {
             "use_declaration" => use_paths(
                 node.child_by_field_name("argument").unwrap(),

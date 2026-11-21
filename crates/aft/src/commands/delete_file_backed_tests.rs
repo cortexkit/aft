@@ -71,7 +71,7 @@ fn backed_delete_commits_one_full_sync_before_unlink_and_restores_after_restart(
     let response = fixture.delete();
     assert!(response.success, "{:?}", response.data);
     assert!(!fixture.tree.path().exists());
-    let mut reopened = crate::backup::BackupStore::new();
+    let mut reopened = aft_engine::test_bridge::search_misc::backup::new_for_test();
     reopened.set_storage_dir(fixture.storage.path().into(), 24);
     reopened
         .restore_last_operation(crate::protocol::DEFAULT_SESSION_ID)
@@ -147,7 +147,7 @@ fn assert_capture_expires(files: usize) {
             &fixture.tree.path().join("leaf-0")
         )
         .is_empty());
-    let mut reopened = crate::backup::BackupStore::new();
+    let mut reopened = aft_engine::test_bridge::search_misc::backup::new_for_test();
     reopened.set_storage_dir(fixture.storage.path().into(), 24);
     assert!(reopened
         .history(crate::protocol::DEFAULT_SESSION_ID, fixture.tree.path())

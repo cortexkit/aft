@@ -1064,7 +1064,7 @@ pub struct BackupStore {
     operation_paths: HashMap<BackupOperation, BTreeSet<PathBuf>>,
     /// Failed cleanup retains its exact paths until a later backup pass succeeds.
     pending_discards: VecDeque<PendingOperationDiscard>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     enforce_temp_path_policy: bool,
     #[cfg(any(test, feature = "test-support"))]
     disk_io_count: AtomicU64,
@@ -1166,8 +1166,8 @@ impl BackupStore {
             pending_post_states: Vec::new(),
             operation_paths: HashMap::new(),
             pending_discards: VecDeque::new(),
-            #[cfg(test)]
-            enforce_temp_path_policy: false,
+            #[cfg(any(test, feature = "test-support"))]
+            enforce_temp_path_policy: !cfg!(test),
             #[cfg(any(test, feature = "test-support"))]
             disk_io_count: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
@@ -4448,7 +4448,7 @@ impl BackupStore {
     }
 
     fn temp_path_policy_applies(&self) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if !self.enforce_temp_path_policy {
             return false;
         }

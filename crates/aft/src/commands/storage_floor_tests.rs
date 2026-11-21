@@ -193,7 +193,7 @@ fn storage_floor_separate_cache_root_refuses_tools_and_independent_snapshot() {
         )
     });
     let before = crate::file_identity::metadata(&f.store).unwrap();
-    let error = crate::backup::BackupStore::new()
+    let error = aft_engine::test_bridge::search_misc::backup::new_for_test()
         .snapshot("cache-floor", &f.store, "refused")
         .unwrap_err();
     assert_eq!(error.code(), "denied_floor");
@@ -383,7 +383,7 @@ fn storage_floor_ordinary_project_hard_links_still_work() {
     std::fs::remove_file(&alias).unwrap();
     std::fs::write(&f.neighbor, "changed").unwrap();
     std::fs::hard_link(&f.neighbor, &alias).unwrap();
-    let mut snapshots = crate::backup::BackupStore::new();
+    let mut snapshots = aft_engine::test_bridge::search_misc::backup::new_for_test();
     assert!(snapshots
         .snapshot("ordinary", &alias, "normal")
         .unwrap()

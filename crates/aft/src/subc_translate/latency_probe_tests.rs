@@ -185,7 +185,7 @@ fn edit_translate_timing_probe() {
 /// the depth a later one starts from.
 fn backup_store(root: &Path) -> crate::backup::BackupStore {
     std::fs::create_dir_all(root).expect("create store root");
-    let mut store = crate::backup::BackupStore::new();
+    let mut store = aft_engine::test_bridge::search_misc::backup::new_for_test();
     // The production layout: one storage directory holding per-session stacks.
     store.set_storage_dir(root.join("backups"), 24);
     store.set_db_project_key("edit-translate-probe".to_string());

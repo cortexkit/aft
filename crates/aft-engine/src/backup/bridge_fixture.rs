@@ -35,3 +35,12 @@ impl BackupStore {
         self.history_content_reads.load(Ordering::Relaxed)
     }
 }
+#[cfg(feature = "test-support")]
+impl super::BackupStore {
+    pub(crate) fn new_for_unit_test() -> Self {
+        Self {
+            enforce_temp_path_policy: false,
+            ..Self::new()
+        }
+    }
+}

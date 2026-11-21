@@ -1,4 +1,8 @@
 pub mod backup {
+    pub fn new_for_test() -> crate::backup::BackupStore {
+        crate::backup::BackupStore::new_for_unit_test()
+    }
+
     pub use crate::backup::{A03_FINGERPRINT_HASHES, A03_LIVE_FINGERPRINT_READS};
     use std::path::Path;
 

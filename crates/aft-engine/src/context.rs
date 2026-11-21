@@ -3267,6 +3267,14 @@ impl AppContext {
             }
         }
         let bash_compress_enabled = config.experimental_bash_compress;
+        #[cfg(feature = "test-support")]
+        let backup = if app.has_isolated_test_storage() {
+            BackupStore::new_for_unit_test()
+        } else {
+            BackupStore::new()
+        };
+        #[cfg(not(feature = "test-support"))]
+        let backup = BackupStore::new();
         let watcher_counters = config
             .project_root
             .as_deref()
@@ -3304,7 +3312,7 @@ impl AppContext {
         let context = AppContext {
             app: Arc::clone(&app),
             provider,
-            backup: parking_lot::Mutex::new(BackupStore::new()),
+            backup: parking_lot::Mutex::new(backup),
             checkpoint: parking_lot::Mutex::new(checkpoint_store),
             checkpoint_namespace_request,
             config: RwLock::new(Arc::new(config)),

@@ -5555,7 +5555,7 @@ mod tests {
                 crate::protocol::DEFAULT_SESSION_ID,
                 "safe-point",
                 vec![stale_target.clone()],
-                &crate::backup::BackupStore::new(),
+                &aft_engine::test_bridge::search_misc::backup::new_for_test(),
             )
             .expect("seed the other root's checkpoint");
         drop(other_root_store);
@@ -5655,7 +5655,7 @@ mod tests {
                 crate::protocol::DEFAULT_SESSION_ID,
                 "early",
                 vec![early_file.clone()],
-                &crate::backup::BackupStore::new(),
+                &aft_engine::test_bridge::search_misc::backup::new_for_test(),
             )
             .expect("checkpoint before configure");
 

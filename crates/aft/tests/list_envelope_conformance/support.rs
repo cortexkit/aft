@@ -27,6 +27,9 @@ use aft::list_surfaces::inspect::build_inspect_envelope;
 use aft::list_surfaces::outline::build_outline_files_envelope;
 use aft::list_surfaces::search::attach_projected_search_envelope;
 use aft::list_surfaces::{ExclusionEntry, ReasonKind, EXCLUSIONS, LIST_SURFACES};
+
+#[path = "../list_envelope/test_source_exclusions.rs"]
+mod test_source_exclusions;
 use aft::ndjson_text::build_ndjson_text;
 use aft::protocol::Response;
 use aft::subc_format::{format_response_with_context, FormatContext, OutlineMode};
@@ -2733,7 +2736,7 @@ pub fn resolve_cut(site: &DiscoveredCut) -> Result<&'static str, String> {
             return Ok(surface.list_id);
         }
     }
-    for exclusion in EXCLUSIONS {
+    for exclusion in EXCLUSIONS.iter().chain(test_source_exclusions::TEST_ONLY) {
         if (site.file == exclusion.file || site.file.ends_with(exclusion.file))
             && exclusion
                 .enclosing_item

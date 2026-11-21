@@ -3,6 +3,9 @@ use std::path::{Path, PathBuf};
 
 use aft::list_envelope::{render_trailer, ListEnvelope, Reason, Total, Unit};
 use aft::list_surfaces::{ExclusionEntry, EXCLUSIONS, LIST_SURFACES};
+
+#[path = "list_envelope/test_source_exclusions.rs"]
+mod test_source_exclusions;
 use serde_json::Value;
 
 use crate::list_cut_item::extract_item_name;
@@ -228,7 +231,7 @@ pub fn resolve_site(site: &DiscoveredCut) -> Result<&'static str, String> {
     }
 
     // 2. Match against EXCLUSIONS by file + enclosing_item
-    for excl in EXCLUSIONS {
+    for excl in EXCLUSIONS.iter().chain(test_source_exclusions::TEST_ONLY) {
         if (site.file == excl.file || site.file.ends_with(excl.file))
             && excl
                 .enclosing_item
@@ -326,6 +329,7 @@ fn registry_free_discovery_test_every_site_resolves() {
 fn exclusions_table_has_non_empty_written_reasons_for_all_entries() {
     assert!(!EXCLUSIONS.is_empty());
     validate_exclusions(EXCLUSIONS).expect("exclusions validation");
+    validate_exclusions(test_source_exclusions::TEST_ONLY).expect("fixture exclusions validation");
 }
 
 // -----------------------------------------------------------------------
