@@ -22305,9 +22305,11 @@ mod tests {
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::LspManagerTestExt as _;
     #[cfg(test)]
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;
 
     #[cfg(test)]
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::search_misc::WatcherExclusionPlanningSnapshotTestExt as _;
 }
 

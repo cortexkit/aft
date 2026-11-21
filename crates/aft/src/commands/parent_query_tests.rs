@@ -937,6 +937,3 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
 use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::IndexHost as _;
-
-#[cfg(test)]
-use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

@@ -66,10 +66,12 @@ impl Fixture {
         .unwrap();
     }
 
+    #[cfg(test)]
     pub(super) fn resolve(&self) -> (GitPolicy, usize) {
         self.resolve_at(&self.root)
     }
 
+    #[cfg(test)]
     pub(super) fn resolve_at(&self, root: &Path) -> (GitPolicy, usize) {
         self.register_root(root);
         let before = with_git_policy_test_state(root, |state| state.calls).unwrap();

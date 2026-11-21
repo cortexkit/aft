@@ -876,4 +876,5 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
 mod shell;
 
 #[cfg(test)]
+#[cfg(not(windows))]
 use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;

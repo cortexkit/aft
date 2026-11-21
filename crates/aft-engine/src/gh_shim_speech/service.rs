@@ -172,8 +172,6 @@ pub struct Service {
 
 static SERVICES: OnceLock<Mutex<HashMap<PathBuf, Arc<Service>>>> = OnceLock::new();
 pub(crate) mod lifecycle;
-#[cfg(all(test, unix))]
-pub(crate) use lifecycle::RuntimeGuard;
 
 fn new_service(root: PathBuf) -> Arc<Service> {
     Arc::new(Service {

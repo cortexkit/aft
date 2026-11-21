@@ -114,6 +114,7 @@ pub fn launch(connection: PathBuf) -> crate::bash_background::RemoteLaunch {
     }
 }
 
+#[cfg(test)]
 pub(super) fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) -> String {
     start_with_hard_kill(
         registry,
@@ -123,6 +124,7 @@ pub(super) fn start(registry: &BgTaskRegistry, dir: &Path, connection: PathBuf) 
     )
 }
 
+#[cfg(test)]
 pub(super) fn start_with_hard_kill(
     registry: &BgTaskRegistry,
     dir: &Path,

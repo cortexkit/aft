@@ -68,6 +68,7 @@ impl FakeDaemon {
 
     /// The routes closed so far, waiting briefly for the client's GOODBYE,
     /// which it sends without waiting for an answer.
+    #[cfg(test)]
     pub(super) async fn closes(&self, expected: usize) -> Vec<Value> {
         for _ in 0..200 {
             let closes = self.log.lock().unwrap().closes.clone();

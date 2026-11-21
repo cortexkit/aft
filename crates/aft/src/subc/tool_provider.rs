@@ -11179,6 +11179,7 @@ pub(in crate::subc) mod route_tests {
     #[cfg(test)]
     use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;
     #[cfg(test)]
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::display_data::AppContextTestExt as _;
@@ -12198,6 +12199,7 @@ mod ledger_terminal_tests {
     }
 
     #[cfg(test)]
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::bash_remote::PersistedTaskTestExt as _;
 }
 

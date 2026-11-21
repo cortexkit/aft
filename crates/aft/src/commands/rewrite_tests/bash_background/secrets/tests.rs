@@ -7,7 +7,9 @@ use crate::secret::SecretVault;
 use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
 use aft_engine::test_bridge::bash_remote::bash_background::secrets::{PROXY_KEYS, REMOVE_KEYS};
 use aft_engine::test_bridge::bash_remote::secrets_support::*;
+#[cfg(not(windows))]
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(not(windows))]
 use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
 #[cfg(unix)]
 use aft_engine::test_bridge::bash_remote::{PreflightTestExt as _, PreparedTaskTestExt as _};

@@ -1617,4 +1617,5 @@ async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
 }
 
 #[cfg(test)]
+#[cfg(not(windows))]
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

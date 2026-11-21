@@ -5,8 +5,6 @@ use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 use aft_engine::test_bridge::bash_remote::ScheduledTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::bash_remote::SchedulerTestExt as _;
-#[cfg(test)]
-use aft_engine::test_bridge::bash_remote::SchedulerTestExt as _;
 use aft_engine::test_bridge::bash_remote::{BgTaskTestExt as _, PersistedTaskTestExt as _};
 
 fn notice_route(session: &str) -> CodeSearchNotice {

@@ -182,6 +182,7 @@ mod nested_worktree_tests;
 pub use aft_base::ort_lifecycle;
 pub use aft_base::pattern_compile;
 pub use aft_base::pending_response;
+#[cfg(not(windows))]
 pub(crate) use aft_base::pinned_dir;
 pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
@@ -286,13 +287,9 @@ mod daemon_heap_probe;
 #[cfg(test)]
 pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
-pub(crate) use aft_base::search_hot_path_measurements as search_test_counts;
-#[cfg(test)]
 pub(crate) use aft_base::test_allocations;
 #[cfg(test)]
 pub(crate) use aft_base::test_gate;
-#[cfg(all(test, windows))]
-pub(crate) use aft_base::test_read_denial;
 #[cfg(test)]
 pub(crate) use aft_base::test_support;
 #[cfg(test)]

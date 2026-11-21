@@ -619,8 +619,8 @@ mod tests {
     fn status_push_busy_projection_is_root_local_and_small() {
         let fixture = busy_root();
         let full = fixture.ctx.build_status_snapshot();
-        assert_eq!(fixture.contexts.len(), 192);
-        assert_eq!(fixture.app.open_route_count(), 90);
+        assert_eq!(fixture._contexts.len(), 192);
+        assert_eq!(fixture._app.open_route_count(), 90);
         assert_eq!(
             full["lsp"]["applicability_by_root"]
                 .as_object()

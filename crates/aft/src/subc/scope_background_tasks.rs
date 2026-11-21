@@ -555,6 +555,7 @@ pub(super) fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::bash_remote::PersistedTaskTestExt as _;
     use sha2::{Digest, Sha256};
 

@@ -1,6 +1,5 @@
 use super::*;
 use aft_engine::test_bridge::bash_remote::RedeemedTestExt as _;
-use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 use aft_engine::test_bridge::bash_remote::{
     AuthorityRecordTestExt as _, ExecutionSealTestExt as _,
 };

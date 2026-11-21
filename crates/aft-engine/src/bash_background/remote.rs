@@ -1523,7 +1523,7 @@ impl TaskSink {
         Ok(sink)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     fn set_progress_clock_for_test(&mut self, clock: Arc<dyn Fn() -> Instant + Send + Sync>) {
         self.last_progress_persist = clock();
         self.progress_clock = Some(clock);

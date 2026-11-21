@@ -860,6 +860,7 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
 }
 
 #[cfg(test)]
+#[cfg(not(windows))]
 use aft_engine::test_bridge::display_data::CheckoutTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

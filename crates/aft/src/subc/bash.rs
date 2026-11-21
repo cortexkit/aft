@@ -312,6 +312,7 @@ mod progress_lifetime_tests {
 #[cfg(all(test, unix))]
 mod frame_loop_lock_tests {
     use super::*;
+    #[cfg(not(target_os = "linux"))]
     use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 
     #[tokio::test]
@@ -4986,7 +4987,9 @@ pub(super) async fn assert_deferred_wait_entrypoint_for_test(
 #[cfg(test)]
 mod grant_path_tests {
     use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::bash_remote::ReplyBudgetTestExt as _;
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::bash_remote::SpawnReceiptTestExt as _;
     #[cfg(unix)]
     #[tokio::test]
