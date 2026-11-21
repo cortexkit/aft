@@ -8,6 +8,8 @@ mod activity_tests;
 pub(crate) mod cookie;
 pub(crate) mod counters;
 pub(crate) mod flush;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod mailbox;
 
 // Directories inotify could not watch when it started. Recursive-handle
 // backends (FSEvents, Windows) watch the whole tree with one handle and have

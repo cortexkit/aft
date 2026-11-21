@@ -3306,6 +3306,7 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
 
 #[path = "context/runtime_handles.rs"]
 mod runtime_handles;
+mod watcher_matcher;
 
 impl AppContext {
     /// Register the owning handle without making the status worker retain a root.
@@ -4090,25 +4091,6 @@ impl AppContext {
         Arc::clone(&self.gitignore)
     }
 
-    /// Monotonic generation bumped after every matcher rebuild/clear. The
-    /// watcher filter thread uses it to wait until the main thread has rebuilt
-    /// ignore rules after it reports an ignore-file change.
-    pub fn gitignore_generation(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.gitignore_generation)
-    }
-
-    /// Whether any matcher (including a deliberate "no matcher") has been
-    /// published for this context since it was created.
-    ///
-    /// Every publication path (`rebuild_gitignore`, `clear_gitignore`, and the
-    /// unchanged-input acknowledgement that only runs after an earlier build)
-    /// bumps the generation, so generation zero means the ignore rules were
-    /// never loaded. A `None` matcher at generation zero is "not known yet",
-    /// not "this project ignores nothing".
-    pub(crate) fn gitignore_published(&self) -> bool {
-        self.gitignore_generation.load(Ordering::SeqCst) > 0
-    }
-
     fn set_gitignore(&self, matcher: Option<Arc<ignore::gitignore::Gitignore>>) {
         *self
             .gitignore
@@ -4116,7 +4098,7 @@ impl AppContext {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = matcher;
         let generation = self.gitignore_generation.load(Ordering::SeqCst) + 1;
         self.retire_ignored_pending_paths(generation);
-        self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+        self.bump_gitignore_generation();
     }
 
     fn retire_ignored_pending_paths(&self, generation: u64) {
@@ -4233,7 +4215,7 @@ impl AppContext {
 
     pub(crate) fn publish_gitignore_rescan(&self, prepared: PreparedGitignoreRebuild) {
         if matches!(prepared.change, IgnoreRuleChange::Unchanged) {
-            self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+            self.bump_gitignore_generation();
         } else {
             self.gitignore_matcher_rebuilds
                 .fetch_add(1, Ordering::SeqCst);
@@ -4264,7 +4246,7 @@ impl AppContext {
             // The watcher thread waits on this generation before it re-filters
             // the batch. A byte-identical write still needs an acknowledgement,
             // but it must not publish or rebuild a matcher.
-            self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+            self.bump_gitignore_generation();
             return IgnoreRuleChange::Unchanged;
         }
 
@@ -4273,7 +4255,7 @@ impl AppContext {
         IGNORE_WALKS_ON_THREAD.with(|walks| walks.set(walks.get() + 1));
         let inputs = gitignore_state::IgnoreInputSnapshot::collect(root, git_common_dir.as_deref());
         if inputs.has_same_effective_inputs(previous_inputs.as_ref()) {
-            self.gitignore_generation.fetch_add(1, Ordering::SeqCst);
+            self.bump_gitignore_generation();
             return IgnoreRuleChange::Unchanged;
         }
 

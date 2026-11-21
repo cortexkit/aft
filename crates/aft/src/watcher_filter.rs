@@ -1109,6 +1109,12 @@ pub(crate) enum WatcherExclusionUpdate {
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl WatcherExclusionRetry {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_at
+            .filter(|_| self.attempts < EXCLUSION_PLAN_MAX_ATTEMPTS)
+    }
+
     /// Install completed plans, or remove stale exclusions when a new matcher
     /// cannot be planned yet. Retrying the full plan keeps its own budget.
     pub(crate) fn replacement(

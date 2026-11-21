@@ -14,19 +14,19 @@ use notify::event::{
 };
 use notify::{Event, EventKind, RecursiveMode};
 
+use super::mailbox::{next_deadline, receive, Message};
 use crate::watcher_filter::{
     derive_watcher_exclusion_plan, watcher_exclusion_paths, SharedGitignore,
     WATCHER_EXCLUSION_LIMIT,
 };
 
 const FSEVENTS_LATENCY_SECONDS: f64 = 0.03;
-const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const FLUSH_RETRY_INTERVAL: Duration = Duration::from_millis(10);
 
 #[derive(Clone)]
 enum NativeEventSender {
     Events(mpsc::Sender<notify::Result<Event>>),
-    Batches(mpsc::Sender<Vec<notify::Result<Event>>>),
+    Batches(mpsc::Sender<Message>),
 }
 
 impl NativeEventSender {
@@ -41,7 +41,7 @@ impl NativeEventSender {
                 }
                 Ok(())
             }
-            Self::Batches(sender) => sender.send(events).map_err(|_| ()),
+            Self::Batches(sender) => sender.send(Message::Events(events)).map_err(|_| ()),
         }
     }
 
@@ -90,6 +90,7 @@ fn write_during_stream_handoff_for_test(root: &Path) {
 
 pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
+    wake: Arc<mpsc::Sender<Message>>,
     join: Option<JoinHandle<()>>,
     #[cfg(test)]
     raw_sender: NativeEventSender,
@@ -109,9 +110,11 @@ impl ProjectWatcher {
         // Same rule as the inotify backend: the exclusion set describes the
         // matcher at this generation, so the generation is captured beside it
         // rather than on the backend thread after spawn.
-        let generation = matcher_generation.load(Ordering::Acquire);
+        let (backend_tx, backend_rx) = mpsc::channel();
+        let wake = Arc::new(backend_tx.clone());
         let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
-        let flush_rx = counters.bash_flush.register_native();
+        let generation = counters.register_matcher_wake(&matcher_generation, &wake);
+        let flush_rx = counters.bash_flush.register_native(&wake);
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
             .attempt(&root, generation, &counters, || {
@@ -125,7 +128,6 @@ impl ProjectWatcher {
         let exclusion_paths = exclusion_state.paths();
         super::log_exclusions(&root, &exclusions, generation);
 
-        let (backend_tx, backend_rx) = mpsc::channel();
         let backend_tx = NativeEventSender::Batches(backend_tx);
         #[cfg(test)]
         let stream_sender_for_test = backend_tx.clone();
@@ -143,7 +145,7 @@ impl ProjectWatcher {
         )?;
         counters.set_backend_exclusions(
             observed_generation.unwrap_or(0),
-            exclusion_paths,
+            exclusion_paths.clone(),
             watcher_exclusion_paths(&plan.dropped),
         );
         // Auxiliary watches use the same stream owner as the recursive watch:
@@ -162,7 +164,7 @@ impl ProjectWatcher {
         let git_directory = root.join(".git");
         // Auxiliary streams have independent callback ordering. The marker must
         // share the recursive stream that observes the command's project writes.
-        let git_watched = !exclusion_state.paths().contains(&git_directory);
+        let git_watched = !exclusion_paths.contains(&git_directory);
         counters.bash_flush.set_marker_directory(
             if git_watched
                 && std::fs::symlink_metadata(&git_directory).is_ok_and(|metadata| metadata.is_dir())
@@ -185,6 +187,7 @@ impl ProjectWatcher {
                 let mut stream = stream;
                 let _external_watcher = external_watcher;
                 let mut exclusions = exclusions;
+                let mut installed_paths = exclusion_paths;
                 let mut exclusion_state = exclusion_state;
                 let mut dropped_paths = watcher_exclusion_paths(&plan.dropped);
                 let mut observed_generation = observed_generation;
@@ -221,7 +224,6 @@ impl ProjectWatcher {
                         next_flush = Instant::now() + FLUSH_RETRY_INTERVAL;
                     }
                     let generation = matcher_generation.load(Ordering::Acquire);
-                    let previous_paths = exclusion_state.paths();
                     if let Some(update) = planning.replacement(
                         &root,
                         generation,
@@ -255,7 +257,7 @@ impl ProjectWatcher {
                         // new stream's first callback. A new matcher generation alone
                         // does not require a new stream when its backend exclusions
                         // are unchanged.
-                        if replacement_paths != previous_paths {
+                        if replacement_paths != installed_paths {
                             if let Err(error) = replace_stream_exclusions(
                                 &mut stream,
                                 &root,
@@ -268,9 +270,10 @@ impl ProjectWatcher {
                             }
                         }
                         observed_generation = Some(generation);
+                        installed_paths = replacement_paths;
                         counters.set_backend_exclusions(
                             observed_generation.unwrap_or(0),
-                            replacement_paths,
+                            installed_paths.clone(),
                             dropped_paths.clone(),
                         );
                         if replacement_exclusions != exclusions {
@@ -281,15 +284,12 @@ impl ProjectWatcher {
 
                     #[cfg(test)]
                     super::activity_tests::note_backend_wait(&counters);
-                    let wait = if active_flushes.is_empty() {
-                        BACKEND_POLL_INTERVAL
-                    } else {
-                        next_flush
-                            .saturating_duration_since(Instant::now())
-                            .min(BACKEND_POLL_INTERVAL)
-                    };
-                    match backend_rx.recv_timeout(wait) {
-                        Ok(events) => {
+                    let deadline = next_deadline(
+                        (!active_flushes.is_empty()).then_some(next_flush),
+                        planning.retry_deadline(),
+                    );
+                    match receive(&backend_rx, deadline) {
+                        Ok(Message::Events(events)) => {
                             // The native callback only translates and hands off a
                             // batch. Filesystem topology probes belong here, once
                             // per distinct covering directory, off its run loop.
@@ -320,9 +320,10 @@ impl ProjectWatcher {
                                     let _ = tx.send(Err(error));
                                     return;
                                 }
+                                installed_paths = paths;
                                 counters.set_backend_exclusions(
                                     observed_generation.unwrap_or(0),
-                                    paths,
+                                    installed_paths.clone(),
                                     dropped_paths.clone(),
                                 );
                                 // Writes made while a newly local directory had
@@ -344,7 +345,7 @@ impl ProjectWatcher {
                                 }
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(Message::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
@@ -353,6 +354,7 @@ impl ProjectWatcher {
 
         Ok(Self {
             shutdown,
+            wake,
             join: Some(join),
             #[cfg(test)]
             raw_sender: stream_sender_for_test,
@@ -397,6 +399,7 @@ fn replace_stream_exclusions(
 impl Drop for ProjectWatcher {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        let _ = self.wake.send(Message::Wake);
         if let Some(join) = self.join.take() {
             let _ = join.join();
         }
@@ -1513,6 +1516,7 @@ mod tests {
             counters.begin_rescan(crate::watcher_filter::RescanReason::UserDropped);
             counters.finish_rescan(0, None);
             let published = generation.fetch_add(1, Ordering::AcqRel) + 1;
+            counters.wake_for_matcher(&generation);
             let deadline = Instant::now() + Duration::from_secs(5);
             while counters.backend_exclusions().matcher_generation != published {
                 assert!(
@@ -1840,6 +1844,7 @@ mod tests {
             observed_by_old: Arc::new(AtomicBool::new(false)),
         });
         generation.fetch_add(1, Ordering::SeqCst);
+        counters.wake_for_matcher(&generation);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while counters.backend_exclusions().matcher_generation != 1 && Instant::now() < deadline {
