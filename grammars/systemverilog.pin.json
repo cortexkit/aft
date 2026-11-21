@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "language": "systemverilog",
+  "extensions": ["sv", "svh", "v", "vh"],
+  "grammar": {
+    "repository": "https://github.com/gmlarumbe/tree-sitter-systemverilog",
+    "commit": "3390da8c76a976b6f47d19667accc43e81a1483b",
+    "abi": 15,
+    "license": "MIT",
+    "files": {
+      "LICENSE": "f4ceaa91e73e623d6b30895a3b644e0e277754a81c8b28655b75d7a9113f1ac4",
+      "src/parser.c": "33be40fa3de246ddc819def9d78f6b4c6ab0ffbe21ea6baf7c9246d5b44d2c59",
+      "src/tree_sitter/alloc.h": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea",
+      "src/tree_sitter/array.h": "31e60a1bff6f715afacce03b5b70efe42b58371b4f9595dd4af52a577ff9608c",
+      "src/tree_sitter/parser.h": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2"
+    }
+  },
+  "wasi_sdk": {
+    "release": "wasi-sdk-34",
+    "url": "https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-34/wasi-sdk-34.0-x86_64-linux.tar.gz",
+    "sha256": "b761e3a0721dbae9c09a0059e5fdb2bf917d1b4a8a7b430fb3b5aafb0984b2c4",
+    "root": "wasi-sdk-34.0-x86_64-linux"
+  },
+  "build": {
+    "flags": ["-fPIC", "-shared", "-Os", "-Wl,--export=tree_sitter_systemverilog", "-Wl,--max-memory=4294967296"],
+    "include": "src",
+    "sources": ["src/parser.c"]
+  },
+  "verifier": {
+    "release": "v0.27.1",
+    "url": "https://github.com/tree-sitter/tree-sitter/releases/download/v0.27.1/tree-sitter-linux-x64.gz",
+    "sha256": "d01042f94ba3d6827ddc9788e235f75d8366431be42bdf90ade534d960c98b7d"
+  },
+  "publication": {"repository": "cortexkit/aft", "tag": "grammars-1"},
+  "artifact": {
+    "sha256": "c1fc6f231bcc0513b25e0204b56b067d1d596c86b20a215c7127d4d3d07d486d",
+    "size": 23530921,
+    "sample": "grammars/corpus/systemverilog.sv"
+  }
+}
