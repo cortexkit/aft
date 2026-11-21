@@ -21,8 +21,8 @@ pub struct ExactRead {
 #[derive(Default)]
 #[doc(hidden)]
 pub struct ReadHooks {
-    #[cfg(test)]
-    pub mid_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) mid_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Runs after the path and policy checks, before the file is identified
     /// and opened, so tests can swap checkout entries inside that window.
     #[cfg(test)]
@@ -101,12 +101,12 @@ fn read_with(
     if metadata.len() > MAX_BYTES {
         return Err(ReadExactRefusal::TooLarge);
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let bytes = bounded_bytes(HookedRead {
         file: &mut file,
         hook: _hooks.mid_read,
     })?;
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let bytes = bounded_bytes(&mut *file)?;
     // Callers re-check the head's policy after the read; give them the place
     // the bytes actually came from rather than the path that was asked for.
@@ -124,13 +124,13 @@ pub fn open_no_follow(root: &Path, target: &Path) -> Result<OpenedFile, ReadExac
     aft_base::no_follow_file::open_no_follow(root, target).map_err(Into::into)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct HookedRead<'a> {
     file: &'a mut File,
     hook: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Read for HookedRead<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
         let count = self.file.read(bytes)?;

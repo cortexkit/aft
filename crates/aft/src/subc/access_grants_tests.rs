@@ -713,7 +713,7 @@ fn linked_worktree_reads_follow_only_the_authenticated_heads_repository() {
         let req = "linked-worktree-read";
         let read = operation == AccessOperation::Read;
         #[cfg(unix)]
-        let asks = aft_engine::test_bridge::display_data::context::confinement::ask_calls();
+        let asks = aft_engine::test_bridge::display_data::read_fence::ask_calls();
         let result = call_policy::with_tool_call_policy(
             &ctx,
             route,
@@ -736,7 +736,7 @@ fn linked_worktree_reads_follow_only_the_authenticated_heads_repository() {
                 #[cfg(unix)]
                 assert_eq!(
                     asks,
-                    aft_engine::test_bridge::display_data::context::confinement::ask_calls()
+                    aft_engine::test_bridge::display_data::read_fence::ask_calls()
                 );
             }
             (Err(error), Some(code)) => {

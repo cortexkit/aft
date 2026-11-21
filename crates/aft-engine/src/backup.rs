@@ -462,10 +462,10 @@ pub enum BackupEntryKind {
     HardLink,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static A03_FINGERPRINT_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static A03_LIVE_FINGERPRINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static A03_FINGERPRINT_HASHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static A03_LIVE_FINGERPRINT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Identity of what a path held at one moment, reduced to what undo needs to
@@ -483,7 +483,7 @@ pub enum PathFingerprint {
 
 impl PathFingerprint {
     fn of_bytes(bytes: &[u8]) -> Self {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         A03_FINGERPRINT_HASHES.with(|count| count.set(count.get() + 1));
         Self::Content(blake3::hash(bytes).to_hex().to_string())
     }
@@ -501,7 +501,7 @@ impl PathFingerprint {
                 .map(Self::Symlink)
                 .unwrap_or(Self::Other),
             Ok(metadata) if metadata.is_file() => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 A03_LIVE_FINGERPRINT_READS.with(|count| count.set(count.get() + 1));
                 std::fs::read(path)
                     .map(|bytes| Self::of_bytes(&bytes))
