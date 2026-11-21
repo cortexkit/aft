@@ -609,7 +609,7 @@ mod tests {
         std::fs::write(&task.paths().stderr, "").unwrap();
         let watch = registry
             .register_watch(
-                task.task_id().clone(),
+                task.task_id().to_owned(),
                 WatchPattern::Substring("secret pattern".into()),
                 false,
             )

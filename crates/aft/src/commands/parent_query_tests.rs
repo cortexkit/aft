@@ -2,6 +2,7 @@
 //! a checkout of each child repository, checked against what the fixture's
 //! files hold.
 
+use aft_engine::test_bridge::display_data::{ChildCheckoutsTestExt as _, DataCheckoutTestExt as _};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;

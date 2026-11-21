@@ -342,7 +342,7 @@ fn meaning_gap(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ChildCheckouts {
     /// Puts `checkout` in place as the bound checkout of `child`, so a test
     /// can give one child a state of its choosing.

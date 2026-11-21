@@ -12,6 +12,7 @@ mod tests {
         bind_for_test, configure_meaning_without_fill, reserve_build, root_fixture_config,
         settled, status_push, write, READY,
     };
+    use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
     use serde_json::{json, Value};
     use std::path::Path;
     #[cfg(target_os = "linux")]

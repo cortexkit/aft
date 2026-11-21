@@ -20448,11 +20448,12 @@ mod tests {
         let config = ctx.config();
         assert!(config.indexes.trigram && config.indexes.callgraph);
         assert!(ctx.cached_artifact_cache_key(&canonical_root).is_some());
-        assert!(
-            crate::root_identity::read(&canonical_root, configured.storage.path())
-                .unwrap()
-                .is_some()
-        );
+        assert!(aft_engine::test_bridge::search_misc::read_root_identity(
+            &canonical_root,
+            configured.storage.path()
+        )
+        .unwrap()
+        .is_some());
     }
 
     /// A standing-roots pass over every session actor meets one whose bind
@@ -20609,7 +20610,8 @@ mod tests {
             .artifact_identity_provisional_reason()
             .expect("an unreadable Git identity leaves the bind provisional");
         assert!(
-            reason.starts_with(crate::root_identity::key::GIT_IDENTITY_UNAVAILABLE_REASON),
+            reason
+                .starts_with(aft_engine::test_bridge::search_misc::GIT_IDENTITY_UNAVAILABLE_REASON),
             "{reason}"
         );
         assert!(!ctx.provisional_identity_retry().is_armed());
@@ -21312,17 +21314,18 @@ mod tests {
     /// holding. Other roots' unfinished opens matter because the dedicated
     /// database-open thread serves them in order.
     fn rebind_wait_diagnostics(executor: &Executor, fixture: &ConfiguredRoot) -> String {
+        use aft_engine::test_bridge::display_data::DatabaseOpenSlotTestExt as _;
         let (slot, _) = fixture.ctx.database_open_slot();
         let database = match slot.try_lock() {
             Some(slot) => format!(
                 "epoch={} committed_age_ms={} running={} pending={:?} ready_for={:?}",
-                slot.epoch,
-                slot.committed_at.elapsed().as_millis(),
-                slot.running,
-                slot.pending.as_ref().map(|request| (
-                    request.epoch,
-                    request.dispatched_at.map(|at| at.elapsed().as_millis()),
-                    &request.storage_root,
+                slot.epoch(),
+                slot.committed_at().elapsed().as_millis(),
+                slot.running(),
+                slot.pending().map(|request| (
+                    request.epoch(),
+                    request.dispatched_at().map(|at| at.elapsed().as_millis()),
+                    request.storage_root(),
                 )),
                 slot.ready_for,
             ),
@@ -21379,6 +21382,7 @@ mod tests {
             }),
         );
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        use aft_engine::test_bridge::display_data::DatabaseOpenSlotTestExt as _;
         let (slot, _) = fixture.ctx.database_open_slot();
         let locked = slot.lock();
         // The job snapshot is a non-blocking read; while the scheduler holds
