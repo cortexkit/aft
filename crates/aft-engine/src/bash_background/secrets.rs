@@ -165,7 +165,7 @@ impl Runtime {
     pub(crate) fn approval_status(&self) -> Vec<String> {
         self.proxy.approval_status()
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn address(&self) -> std::net::SocketAddr {
         self.proxy.address()
     }

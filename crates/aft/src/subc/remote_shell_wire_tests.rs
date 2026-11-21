@@ -154,7 +154,7 @@ async fn exercise_shell_lifetime() {
         b"#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec 3>&-\nexec \"$@\"\n",
     )
     .unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let db = app.open_db(&storage.path().join("aft.db")).unwrap();
     let save = |pairing: &str| {
         grants::save(

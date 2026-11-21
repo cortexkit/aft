@@ -4,6 +4,7 @@ use crate::sandbox_spawn::SpawnPlan;
 use aft_engine::test_bridge::bash_remote::registry_support::scopes::{
     require_manager, scope_stopped, until, StopOnDrop,
 };
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 use std::{
     collections::HashMap,
     path::PathBuf,

@@ -1474,7 +1474,7 @@ fn rejected_config_without_a_cache_path_fences_context_cache_writes() {
     let mut config = result.config;
     assert!(config.cache_dir.is_none());
     config.storage_dir = Some(temp.path().join("storage"));
-    let ctx = crate::context::AppContext::from_app(crate::context::App::default_shared(), config);
+    let ctx = crate::context::AppContext::from_app(crate::test_app(), config);
     assert!(ctx.cache_unavailable_reason().is_some());
     assert!(
         crate::private_storage::create_dir_all(ctx.storage_dir().join("blobs/new")).is_err(),

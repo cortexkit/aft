@@ -1,3 +1,6 @@
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::DrainingRetryTestExt as _;
+use aft_engine::test_bridge::bash_remote::KeyedSubmissionTestExt as _;
 #[tokio::test]
 async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart() {
     for started in [false, true] {
@@ -140,7 +143,7 @@ async fn runon_explicit_timeout_prevents_a_hinted_retry_at_the_queue_deadline() 
     let dir = tempfile::tempdir().unwrap();
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let first = clock.now();
     clock.expect_sleep(first, first + 30_000).await;
     let runs = exec_runs(&daemon);
@@ -175,7 +178,7 @@ async fn runon_draining_retry_only_draining() {
     let dir = tempfile::tempdir().unwrap();
     shorten_draining_budget(dir.path(), 300);
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(&refusal_response(done), "runner_disk_full (maintenance)");
@@ -217,7 +220,7 @@ async fn bash_kill_scope_settles_while_draining_retry_sleeps() {
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let scope = owner_scope("draining-sleep");
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 1000).await;
     assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
@@ -245,7 +248,7 @@ async fn bash_kill_scope_settles_when_paused_just_before_draining_resubmit() {
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let scope = owner_scope("draining-resubmit");
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 1000).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeResubmit);
@@ -279,7 +282,7 @@ async fn bash_kill_scope_settles_when_paused_as_draining_budget_runs_out() {
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let scope = owner_scope("draining-budget");
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 600).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeBudgetCheck);
@@ -316,10 +319,10 @@ async fn bash_kill_scope_settles_when_restored_draining_retry_cannot_reconnect()
     let original = registry();
     let scope = owner_scope("draining-reconnect");
     let task_id =
-        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection().clone(), &scope);
     clock.expect_event(DrainingClockEvent::Stopped).await;
     // The runner's connection file is gone by the time the module restarts.
-    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let json = original.test_task(&task_id).unwrap().paths().json.clone();
     let mut saved = read_task(&json).unwrap();
     saved.remote.as_mut().unwrap().connection_file = Some(dir.path().join("missing.json"));
     write_task(&json, &saved).unwrap();
@@ -415,7 +418,7 @@ async fn configure_sends_an_owed_runner_cancel_without_binding_its_project() {
     .await;
     assert_owed_cancel_sent_once(&daemon, job_id, &json);
     assert!(
-        ctx.bash_background().task_for_test(&task_id).is_none(),
+        ctx.bash_background().test_task(&task_id).is_none(),
         "the task's project was not bound"
     );
     assert_eq!(remote_workers(&task_id), (1, 1), "no worker was started");
@@ -437,7 +440,7 @@ async fn bash_kill_scope_stops_a_task_that_falls_back_to_local_between_its_passe
     ensure_git_fixture(dir.path());
     let task_id = reg::with_scope_spawn(Some(scope.clone()), || {
         registry.spawn_remote(
-            launch(daemon.connection.clone()),
+            launch(daemon.connection().clone()),
             SpawnPlan::Unsandboxed,
             &format!("printf x > '{}'", marker.display()),
             resolve_posix_shell(),
@@ -458,7 +461,7 @@ async fn bash_kill_scope_stops_a_task_that_falls_back_to_local_between_its_passe
     // The runner refuses the job; hold the worker after it received the
     // refusal, before it decides on the local fallback.
     let mut refusal = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeRefusalReport);
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     refusal.reached().await;
     let (between_passes, release_remote_pass) =
         crate::commands::bash_kill_scope::saved_recovery_gate::arm(
@@ -529,9 +532,9 @@ async fn bash_kill_scope_never_resubmits_a_due_saved_draining_retry() {
     let scope = owner_scope("saved-draining-retry");
     let original = registry();
     let task_id =
-        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection().clone(), &scope);
     clock.expect_event(DrainingClockEvent::Stopped).await;
-    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let json = original.test_task(&task_id).unwrap().paths().json.clone();
     original.detach();
     let (local_task, local_pid) = start_saved_term_ignoring_task(dir.path(), &scope).await;
     // The retry is due by the time the owner pauses the restarted module.
@@ -698,7 +701,7 @@ async fn bash_kill_scope_never_starts_a_saved_tasks_local_fallback() {
         let marker = dir.path().join("local-fallback-ran");
         let (original, task_id, paths) = persist_accepted_with_snapshot(
             dir.path(),
-            daemon.connection.clone(),
+            daemon.connection().clone(),
             &format!("printf x >> '{}'", marker.display()),
         );
         let scope = owner_scope("saved-local-fallback");
@@ -819,7 +822,7 @@ async fn assert_blocking_runon_limit_before_acceptance(timeout_ms: u64, cap_ms: 
     assert_eq!(runner_cancels(&daemon), 0);
     assert_eq!(exec_runs(&daemon).len(), 1);
     // Let AFT learn the job ID so cleanup can cancel the held-open stream.
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     let task_id = reply.data["task_id"].as_str().unwrap().to_string();
     wait_for(
         "released acceptance must be processed before cancellation",
@@ -846,7 +849,7 @@ async fn runon_missing_workdir_is_refused_by_name_before_dispatch() {
     let marker = project.path().join("must-not-run-locally");
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": format!("printf local-proof > '{}'", marker.display()),
             "runon": "linux",
@@ -869,8 +872,8 @@ async fn runon_missing_workdir_is_refused_by_name_before_dispatch() {
     );
     assert_eq!(done.child_pid, None);
     assert_eq!(done.remote_job_id, None);
-    let task = ctx.bash_background().task(task_id).unwrap();
-    assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+    let task = ctx.bash_background().test_task(task_id).unwrap();
+    assert!(!task.test_state().lock().unwrap().metadata().local_fallback_started);
     assert!(!marker.exists(), "a refused runon must never spawn locally");
     assert!(
         exec_runs(&daemon).is_empty(),
@@ -886,7 +889,7 @@ async fn runon_transport_failure_still_reports_remote_unavailable() {
     let marker = project.path().join("must-not-run-locally");
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": format!("printf local-proof > '{}'", marker.display()),
             "runon": "linux",
@@ -905,8 +908,8 @@ async fn runon_transport_failure_still_reports_remote_unavailable() {
             .starts_with("runon refused: remote execution is unavailable; command did not run: remote execution route: "),
         "{done:?}"
     );
-    let task = ctx.bash_background().task(task_id).unwrap();
-    assert!(!task.state.lock().unwrap().metadata.local_fallback_started);
+    let task = ctx.bash_background().test_task(task_id).unwrap();
+    assert!(!task.test_state().lock().unwrap().metadata().local_fallback_started);
     assert!(!marker.exists(), "a refused runon must never spawn locally");
     assert!(exec_runs(&daemon).is_empty());
 }
@@ -930,7 +933,7 @@ async fn runon_non_git_workdir_is_refused_by_name_before_dispatch() {
     let marker = workdir.path().join("must-not-run-locally");
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": format!("printf local-proof > '{}'", marker.display()),
             "runon": "linux",
@@ -977,7 +980,7 @@ async fn runon_cd_refusal_has_distinct_code_and_no_execution() {
     let marker = checkout.join("must-not-run-locally");
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": format!("cd '{}'; printf local-proof > '{}'", other.display(), marker.display()),
             "runon": "linux", "compressed": false,
@@ -1006,9 +1009,9 @@ async fn runon_cd_refusal_has_distinct_code_and_no_execution() {
         crate::subc_format::format_response("bash", &refusal, false),
         expected
     );
-    let task = ctx.bash_background().task(task_id).unwrap();
-    let state = task.state.lock().unwrap();
-    let persisted = serde_json::to_value(&state.metadata).unwrap();
+    let task = ctx.bash_background().test_task(task_id).unwrap();
+    let state = task.test_state().lock().unwrap();
+    let persisted = serde_json::to_value(&state.metadata()).unwrap();
     assert_eq!(
         persisted["remote"]["pre_start_refusal"]["code"],
         "runon_cd_outside_checkout"
@@ -1022,11 +1025,11 @@ async fn runon_cd_refusal_has_distinct_code_and_no_execution() {
     assert_eq!(restored_refusal.message, expected);
     assert!(!restored.local_fallback_started);
     let storage = crate::bash_background::task_storage_dir(&ctx);
-    let persisted_path = task.paths.json.clone();
+    let persisted_path = task.paths().json.clone();
     drop(state);
     drop(task);
     let restarted = registry();
-    assert!(restarted.task(task_id).is_none());
+    assert!(restarted.test_task(task_id).is_none());
     assert!(persisted_path.exists());
     restarted.replay_session(&storage, "session").unwrap();
     let replayed = terminal(&restarted, task_id).await;
@@ -1059,7 +1062,7 @@ async fn runon_cd_declared_siblings_are_allowed() {
         (&granted, "pushd ../commons/nested; printf remote"),
     ] {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
-        let mut policy = launch(daemon.connection.clone());
+        let mut policy = launch(daemon.connection().clone());
         policy.params.siblings = vec![sibling.to_str().unwrap().to_owned()];
         let response = handle_with_policy(
             &ctx,
@@ -1103,7 +1106,7 @@ async fn runon_cd_linked_worktree_sibling_alias_is_allowed() {
         "cd ../commons/nested && printf remote",
     ] {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
-        let mut policy = launch(daemon.connection.clone());
+        let mut policy = launch(daemon.connection().clone());
         policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
         let response = handle_with_policy(
             &ctx,
@@ -1145,7 +1148,7 @@ async fn runon_cd_windows_absolute_targets_are_refused() {
     let marker = checkout.join("must-not-run-locally");
     for target in [&checkout, &commons, &PathBuf::from("/tmp")] {
         let daemon = windows_daemon(Some(0), true).await;
-        let mut policy = launch(daemon.connection.clone());
+        let mut policy = launch(daemon.connection().clone());
         policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
         let response = handle_with_policy(
             &ctx,
@@ -1194,7 +1197,7 @@ async fn runon_cd_windows_relative_targets_are_allowed() {
         "cd ../commons && printf remote",
     ] {
         let daemon = windows_daemon(Some(0), true).await;
-        let mut policy = launch(daemon.connection.clone());
+        let mut policy = launch(daemon.connection().clone());
         policy.params.siblings = vec![commons.to_str().unwrap().to_owned()];
         let response = handle_with_policy(
             &ctx,
@@ -1246,7 +1249,7 @@ async fn runon_cd_system_and_missing_non_home_paths_are_allowed() {
         let line = format!("cd '{}' && printf remote", target.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({"command": line, "runon": "linux", "compressed": false}),
         );
         assert!(response.success, "{response:?}");
@@ -1284,7 +1287,7 @@ async fn runon_cd_other_local_checkout_outside_home_is_refused() {
     let marker = dir.path().join("must-not-run-locally");
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": format!("cd '{}'; printf local-proof > '{}'", outside.join("missing").display(), marker.display()),
             "runon": "linux", "compressed": false,
@@ -1332,7 +1335,7 @@ async fn runon_cd_outside_checkout_is_refused_before_submit() {
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({"command": command, "runon": "linux", "compressed": false}),
         );
         assert!(response.success, "{line}: {response:?}");
@@ -1389,7 +1392,7 @@ async fn runon_cd_unknown_set_keeps_known_folder_for_definite_exits() {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({
                 "command": format!("{line}; printf local-proof > '{}'", marker.display()), "runon": "linux", "compressed": false,
             }),
@@ -1448,7 +1451,7 @@ async fn runon_cd_unknown_mode_requires_both_resolutions_to_be_invalid() {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({
                 "command": line, "runon": "linux", "workdir": deep, "compressed": false,
             }),
@@ -1510,7 +1513,7 @@ async fn runon_cd_background_jobs_preserve_foreground_directory() {
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({
                 "command": command, "runon": "linux", "compressed": false,
             }),
@@ -1581,7 +1584,7 @@ async fn runon_cd_shell_physical_option_tracks_later_changes() {
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({
                 "command": command, "runon": "linux", "workdir": deep, "compressed": false,
             }),
@@ -1646,7 +1649,7 @@ async fn runon_cd_logical_symlinks_and_physical_mode_are_distinct() {
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({
                 "command": command, "runon": "linux", "workdir": deep, "compressed": false,
             }),
@@ -1713,7 +1716,7 @@ async fn runon_cd_skipped_changes_do_not_hide_checkout_exits() {
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({
                 "command": command, "runon": "linux", "compressed": false,
             }),
@@ -1783,7 +1786,7 @@ async fn runon_cd_sequences_use_existing_copied_directories() {
         ("cd missing || cd ../../outside", true),
     ] {
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
-        let mut policy = launch(daemon.connection.clone());
+        let mut policy = launch(daemon.connection().clone());
         policy.params.siblings = vec![sibling.to_str().unwrap().to_owned()];
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
@@ -1824,7 +1827,7 @@ async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
     let command = "python3 - <<'PY' && cargo nextest run\np = 'source.rs'\nt = 'source'\nopen(p, 'w').write(t)\nPY";
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": command, "runon": "linux", "compressed": false,
         }),
@@ -1839,9 +1842,9 @@ async fn runon_write_python_heredoc_refusal_never_submits_or_spawns() {
     assert_eq!(refusal.data["code"], "runon_edits_checkout");
     let expected = format!("runon refused: this command writes {}, and a build-server job's changes to checkout files are not copied back. Edit it in a local call, or name it in return_paths to regenerate it remotely.", dir.path().canonicalize().unwrap().join("source.rs").display());
     assert_eq!(refusal.data["message"], expected);
-    let task = ctx.bash_background().task(task_id).unwrap();
-    let state = task.state.lock().unwrap();
-    let persisted = serde_json::to_value(&state.metadata).unwrap();
+    let task = ctx.bash_background().test_task(task_id).unwrap();
+    let state = task.test_state().lock().unwrap();
+    let persisted = serde_json::to_value(&state.metadata()).unwrap();
     assert_eq!(persisted["remote"]["pre_start_refusal"]["ran"], "none");
     assert!(persisted["remote"]["job_id"].is_null());
     assert!(persisted["remote"]["terminal"].is_null());
@@ -1867,7 +1870,7 @@ async fn runon_write_check_never_refuses_without_runon() {
     let ctx = remote_test_context(dir.path());
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({
             "command": "printf source > source.rs", "compressed": false,
         }),
@@ -1912,7 +1915,7 @@ async fn runon_cd_sequential_targets_follow_the_shell_cwd() {
         let command = format!("{line}; printf local-proof > '{}'", marker.display());
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({"command": command, "runon": "linux", "compressed": false}),
         );
         assert!(response.success, "{line}: {response:?}");
@@ -1962,7 +1965,7 @@ async fn runon_cd_inside_checkout_and_unresolved_or_nested_targets_are_allowed()
         let daemon = daemon(Script::Plain, "exec-remote/v1").await;
         let response = handle_with_policy(
             &ctx,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             serde_json::json!({"command": line, "runon": "linux", "compressed": false}),
         );
         assert!(response.success, "{line}: {response:?}");
@@ -1999,7 +2002,7 @@ async fn runon_signer_hint_longer_than_the_admission_time_left_surfaces_the_refu
     shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let first = clock.now();
     clock.expect_sleep(first, first + 5000).await;
     clock.advance(5000);
@@ -2025,7 +2028,7 @@ async fn runon_operator_needed_signer_refusal_surfaces_at_once() {
     let dir = tempfile::tempdir().unwrap();
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(
@@ -2050,7 +2053,7 @@ async fn runon_signer_retries_stop_after_five_resubmissions() {
     let dir = tempfile::tempdir().unwrap();
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let first = clock.now();
     for resubmission in 0..5 {
         let from = first + resubmission * 5000;
@@ -2085,7 +2088,7 @@ async fn runon_signer_retry_that_wakes_after_the_deadline_surfaces_the_refusal()
     shorten_hinted_retry_budget(dir.path(), 6000);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let first = clock.now();
     clock.expect_sleep(first, first + 5000).await;
     // The worker wakes 10 s after the first submission, 4 s past its deadline.
@@ -2115,7 +2118,7 @@ async fn runon_signer_zero_hint_after_the_deadline_surfaces_the_refusal() {
     shorten_hinted_retry_budget(dir.path(), 0);
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
-    let task = start_runon_retry(&registry, dir.path(), daemon.connection.clone());
+    let task = start_runon_retry(&registry, dir.path(), daemon.connection().clone());
     let done = terminal(&registry, &task).await;
     assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");
     assert_runon_refusal(&refusal_response(done), SIGNER_REFUSED);
@@ -2133,7 +2136,7 @@ async fn bash_kill_scope_settles_while_signer_retry_waits() {
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let scope = owner_scope("signer-wait");
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 5000).await;
     assert_pause_settles_promptly(&registry, start_kill_scope(&registry, &scope), &task).await;
@@ -2145,7 +2148,7 @@ async fn bash_kill_scope_settles_while_signer_retry_waits() {
     clock.advance(5000);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
-    assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_signer_retry_pause_saved(&registry.test_task(&task).unwrap().paths().json);
 }
 
 /// The pause lands after the signer-retry wait ended but before the worker
@@ -2157,7 +2160,7 @@ async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
     let mut clock = PausedDrainingClock::new(dir.path());
     let registry = registry();
     let scope = owner_scope("signer-resubmit");
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 5000).await;
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeHintedResubmit);
@@ -2171,7 +2174,7 @@ async fn bash_kill_scope_settles_when_paused_just_before_signer_resubmit() {
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
-    assert_signer_retry_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_signer_retry_pause_saved(&registry.test_task(&task).unwrap().paths().json);
 }
 
 /// A signer-refusal retry is not resumable: its wait lives only in the worker,
@@ -2197,10 +2200,10 @@ async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
     let scope = owner_scope("saved-signer-refusal");
     let original = registry();
     let task_id =
-        start_scoped_runon_retry(&original, dir.path(), daemon.connection.clone(), &scope);
+        start_scoped_runon_retry(&original, dir.path(), daemon.connection().clone(), &scope);
     clock.expect_event(DrainingClockEvent::Stopped).await;
     remote_worker_exited(&task_id).await;
-    let json = original.task(&task_id).unwrap().paths.json.clone();
+    let json = original.test_task(&task_id).unwrap().paths().json.clone();
     // What survives the stop: the refusal, and no saved retry wait to resume.
     let saved = read_task(&json).unwrap();
     assert!(!saved.status.is_terminal(), "{saved:?}");
@@ -2215,7 +2218,7 @@ async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
     );
     let retry = remote.retry.as_ref().unwrap();
     assert_eq!(
-        (retry.first_refusal_at_ms, retry.next_retry_at_ms),
+        (retry.first_refusal_at_ms(), retry.next_retry_at_ms()),
         (None, None),
         "{saved:?}"
     );
@@ -2254,7 +2257,7 @@ async fn bash_kill_scope_settles_when_paused_as_a_refusal_is_reported() {
     let registry = registry();
     let scope = owner_scope("refusal-report");
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeRefusalReport);
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     gate.reached().await;
     let operation = start_kill_scope(&registry, &scope);
     pause_recorded(&registry, &task).await;
@@ -2264,7 +2267,7 @@ async fn bash_kill_scope_settles_when_paused_as_a_refusal_is_reported() {
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
     assert_refused_pause_saved(
-        &registry.task(&task).unwrap().paths.json,
+        &registry.test_task(&task).unwrap().paths().json,
         "runner_sign_missing",
     );
     assert_no_retry_sleep(&mut clock);
@@ -2282,7 +2285,7 @@ async fn bash_kill_scope_settles_when_paused_as_a_signer_resubmit_fails_unsent()
     let scope = owner_scope("signer-unsent");
     refuse_next_resubmission(dir.path());
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 5000).await;
     clock.advance(5000);
@@ -2294,7 +2297,7 @@ async fn bash_kill_scope_settles_when_paused_as_a_signer_resubmit_fails_unsent()
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
-    assert_unsent_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_unsent_pause_saved(&registry.test_task(&task).unwrap().paths().json);
     assert_no_retry_sleep(&mut clock);
 }
 
@@ -2316,7 +2319,7 @@ async fn bash_kill_scope_settles_when_paused_as_a_draining_resubmit_fails_unsent
     let scope = owner_scope("draining-unsent");
     refuse_next_resubmission(dir.path());
     let mut gate = HeldDrainingGate::arm(dir.path(), DrainingGate::BeforeNoStartRefusal);
-    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection.clone(), &scope);
+    let task = start_scoped_runon_retry(&registry, dir.path(), daemon.connection().clone(), &scope);
     let first = clock.now();
     clock.expect_sleep(first, first + 1000).await;
     clock.advance(5000);
@@ -2328,7 +2331,7 @@ async fn bash_kill_scope_settles_when_paused_as_a_draining_resubmit_fails_unsent
     remote_worker_exited(&task).await;
     assert_paused(&registry, &task);
     assert_eq!(exec_runs(&daemon).len(), 1, "never resubmitted");
-    assert_unsent_pause_saved(&registry.task(&task).unwrap().paths.json);
+    assert_unsent_pause_saved(&registry.test_task(&task).unwrap().paths().json);
     assert_no_retry_sleep(&mut clock);
 }
 
@@ -2367,7 +2370,7 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
         subc_protocol::scope::ScopeKind::Worker,
     );
     let task = reg::with_scope_spawn(Some(scope.clone()), || {
-        let mut launch = launch(daemon.connection.clone());
+        let mut launch = launch(daemon.connection().clone());
         launch.explicit_runon = true;
         start_with_launch(
             &registry,
@@ -2413,8 +2416,8 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     }
     assert_eq!(
         daemon
-            .log
-            .lock()
+            .log()
+()            .lock()
             .unwrap()
             .iter()
             .filter(|(_, body)| body["method"] == "exec.cancel")
@@ -2426,7 +2429,7 @@ async fn assert_bash_kill_scope_runon_cancel(script: Script, expected: &str) {
     assert_eq!(done.info.status_reason.as_deref(), Some("paused_by_owner"));
     // Owner pause stops the local task after the cancel acknowledgement; it
     // does not assert that the runner supplied a terminal or proved process exit.
-    let saved = read_task(&registry.task(&task).unwrap().paths.json).unwrap();
+    let saved = read_task(&registry.test_task(&task).unwrap().paths().json).unwrap();
     assert!(saved.remote.unwrap().terminal.is_none());
 }
 
@@ -2450,7 +2453,7 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
         subc_protocol::scope::ScopeKind::Worker,
     );
     let task = reg::with_scope_spawn(Some(scope.clone()), || {
-        let mut launch = launch(daemon.connection.clone());
+        let mut launch = launch(daemon.connection().clone());
         launch.explicit_runon = true;
         start_with_launch(
             &registry,
@@ -2476,9 +2479,9 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
     });
     wait_for("the pause must record its cancellation intent", || {
         registry
-            .task(&task)
+            .test_task(&task)
             .unwrap()
-            .state
+            .test_state()
             .lock()
             .unwrap()
             .metadata
@@ -2502,7 +2505,7 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
         reply.data["killed"][0]["remote"]["cancel"], "sent",
         "{reply:?}"
     );
-    let connects_at_settlement = *daemon.connects.borrow();
+    let connects_at_settlement = *daemon.connects().borrow();
     // Pass the job's own limits plus grace: a worker still trying to re-attach
     // gives up here and records its recovery failure.
     clock.advance(Duration::from_secs(12 * 60));
@@ -2513,16 +2516,16 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
         "the settled pause must not send the cancel again"
     );
     assert_eq!(
-        *daemon.connects.borrow(),
+        *daemon.connects().borrow(),
         connects_at_settlement,
         "the worker must not reconnect after the pause settled"
     );
     assert!(daemon.methods("exec.attach").is_empty());
     assert_eq!(daemon.methods("exec.run").len(), 1, "never resubmitted");
     let recorded = registry
-        .task(&task)
+        .test_task(&task)
         .unwrap()
-        .state
+        .test_state()
         .lock()
         .unwrap()
         .metadata
@@ -2557,7 +2560,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
         serde_json::from_value(fixture["unaccepted"]["request"]["params"]["scope"].clone())
             .unwrap();
     let mut tasks = Vec::new();
-    for (index, connection) in [first.connection.clone(), second.connection.clone()]
+    for (index, connection) in [first.connection().clone(), second.connection().clone()]
         .into_iter()
         .enumerate()
     {
@@ -2576,8 +2579,8 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
     for daemon in [&first, &second] {
         wait_for("remote route setup must be in flight", || {
             daemon
-                .log
-                .lock()
+                .log()
+()                .lock()
                 .unwrap()
                 .iter()
                 .any(|(_, body)| body["op"] == "route.open")
@@ -2653,16 +2656,16 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
             BgTaskStatus::Killed
         );
     }
-    first.acceptance_gate.notify_one();
-    second.acceptance_gate.notify_one();
+    first.acceptance_gate().notify_one();
+    second.acceptance_gate().notify_one();
     for (registry, task) in registries.iter().zip(&tasks) {
         wait_for(
             "paused submission must be withdrawn after route setup",
             || {
                 registry
-                    .task(task)
+                    .test_task(task)
                     .unwrap()
-                    .state
+                    .test_state()
                     .lock()
                     .unwrap()
                     .metadata
@@ -2692,7 +2695,7 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     let scope: subc_protocol::scope::ScopeStamp =
         serde_json::from_value(case["request"]["params"]["scope"].clone()).unwrap();
     let task = reg::with_scope_spawn(Some(scope.clone()), || {
-        let mut launch = launch(daemon.connection.clone());
+        let mut launch = launch(daemon.connection().clone());
         launch.explicit_runon = true;
         start_with_launch(
             &registry,
@@ -2712,9 +2715,9 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     });
     wait_for("owner pause intent must precede acceptance", || {
         registry
-            .task(&task)
+            .test_task(&task)
             .unwrap()
-            .state
+            .test_state()
             .lock()
             .unwrap()
             .metadata
@@ -2728,13 +2731,13 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     // Detaching a caller does not cancel the job. Retain the observation until
     // Accepted supplies an id, then send a real exec.cancel for the owner pause.
     assert!(!daemon
-        .log
+        .log()
         .lock()
         .unwrap()
         .iter()
         .any(|(header, _)| header.ty == subc_protocol::FrameType::Cancel));
     assert!(exec_cancels(&daemon).is_empty());
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     let reply = tokio::time::timeout(Duration::from_secs(2), operation)
         .await
         .expect("a real cancellation must settle after acceptance")
@@ -2780,7 +2783,7 @@ async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_co
         assert_eq!(fs::read(cwd.join("dist/hello.txt")).unwrap(), b"hello");
         assert!(!cwd.join("dist/absent.txt").exists());
         let task_id = reply.data["task_id"].as_str().unwrap();
-        let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+        let saved = read_task(&ctx.bash_background().test_task(task_id).unwrap().paths().json).unwrap();
         let report = saved.remote.unwrap().returned_files.unwrap();
         assert_eq!(
             report[0].checkout_path.as_deref(),
@@ -2793,7 +2796,7 @@ async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_co
         let mut refused = return_call(&["../../outside.txt"]);
         refused["workdir"] = serde_json::json!(cwd);
         let response = crate::bash_background::with_remote_policy(
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
             || crate::commands::bash::handle(&orchestrated_request(refused), &ctx),
         );
         assert!(!response.success, "{response:?}");
@@ -2807,7 +2810,7 @@ async fn runon_return_paths_side_worktree_uses_copied_checkout_for_submit_and_co
             let mut refused = return_call(&["link-to-main/escaped.txt"]);
             refused["workdir"] = serde_json::json!(cwd);
             let response = crate::bash_background::with_remote_policy(
-                Some(launch(daemon.connection.clone())),
+                Some(launch(daemon.connection().clone())),
                 || crate::commands::bash::handle(&orchestrated_request(refused), &ctx),
             );
             assert!(!response.success, "{response:?}");
@@ -2872,7 +2875,7 @@ async fn runon_return_paths_places_verified_files_and_lists_every_path() {
     assert_eq!(runs[0]["return_max_bytes"], 10_485_760);
     // The completion notice prints the same saved report.
     let task_id = reply.data["task_id"].as_str().unwrap();
-    let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+    let saved = read_task(&ctx.bash_background().test_task(task_id).unwrap().paths().json).unwrap();
     assert!(
         aft_engine::test_bridge::bash_remote::remote_report(&saved).unwrap().starts_with(report),
         "{saved:?}"
@@ -2907,7 +2910,7 @@ async fn runon_uncounted_expired_replay_reports_expired_after_bounded_recovery()
     assert!(output.contains("output lost"), "{output}");
     assert!(!dir.path().join("dist").exists());
     let attaches = daemon
-        .log
+        .log()
         .lock()
         .unwrap()
         .iter()
@@ -3166,7 +3169,7 @@ async fn runon_return_over_cap_report_names_the_requested_cap() {
         );
         assert!(output.contains(&report), "{output}");
         let task_id = reply.data["task_id"].as_str().unwrap();
-        let saved = read_task(&ctx.bash_background().task(task_id).unwrap().paths.json).unwrap();
+        let saved = read_task(&ctx.bash_background().test_task(task_id).unwrap().paths().json).unwrap();
         assert!(aft_engine::test_bridge::bash_remote::remote_report(&saved).unwrap().contains(&report));
     }
 }
@@ -3205,12 +3208,12 @@ async fn runon_return_v3_uses_advertised_cap_for_new_and_existing_outputs() {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
         let task_id = reply.data["task_id"].as_str().unwrap();
-        let task = ctx.bash_background().task(task_id).unwrap();
-        let saved = read_task(&task.paths.json).unwrap();
+        let task = ctx.bash_background().test_task(task_id).unwrap();
+        let saved = read_task(&task.paths().json).unwrap();
         let remote = saved.remote.unwrap();
         assert_eq!(remote.return_max_bytes, 134_217_728);
         let restored =
-            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest()).unwrap();
         assert_eq!(restored.return_max_bytes, Some(134_217_728));
     }
 }
@@ -3258,14 +3261,14 @@ async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
         assert_eq!(runs.len(), if retry { 2 } else { 1 });
         assert_eq!(runs[0]["return_max_bytes"], 134_217_728);
         let task_id = reply.data["task_id"].as_str().unwrap();
-        let task = ctx.bash_background().task(task_id).unwrap();
-        let saved = read_task(&task.paths.json).unwrap();
+        let task = ctx.bash_background().test_task(task_id).unwrap();
+        let saved = read_task(&task.paths().json).unwrap();
         let remote = saved.remote.unwrap();
         let cap = if retry { 20 * 1024 * 1024 } else { 134_217_728 };
         assert_eq!(remote.return_max_bytes, cap);
         assert_eq!(remote.return_cap_retried, retry);
         let restored =
-            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest()).unwrap();
         assert_eq!(restored.return_max_bytes, Some(cap));
         if retry {
             assert_eq!(runs[1]["return_max_bytes"], cap);
@@ -3354,7 +3357,7 @@ async fn agent_commands_runon_never_declares_a_local_root() {
     let ctx = restarted_context(dir.path());
     let response = handle_with_policy(
         &ctx,
-        Some(launch(daemon.connection.clone())),
+        Some(launch(daemon.connection().clone())),
         serde_json::json!({"command":"uname -a","runon":"linux","compressed":false}),
     );
     assert!(response.success, "{response:?}");

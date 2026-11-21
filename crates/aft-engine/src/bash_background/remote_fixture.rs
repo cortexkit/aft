@@ -29,7 +29,8 @@ impl PausedReattachClock {
         Self { root, clock }
     }
 
-    async fn after_resets(&self, count: u64) {
+    #[cfg(test)]
+    pub(super) async fn after_resets(&self, count: u64) {
         let mut resets = self.clock.resets.subscribe();
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -40,7 +41,8 @@ impl PausedReattachClock {
         .unwrap();
     }
 
-    async fn after_waits(&self, count: u64) {
+    #[cfg(test)]
+    pub(super) async fn after_waits(&self, count: u64) {
         let mut waits = self.clock.waits.subscribe();
         tokio::time::timeout(
             Duration::from_secs(30),
@@ -671,7 +673,8 @@ impl PausedDrainingClock {
         self.clock.ticks.send_modify(|now| *now += ms);
     }
 
-    fn set_retry_jitter_ms(&self, ms: u64) {
+    #[cfg(test)]
+    pub(super) fn set_retry_jitter_ms(&self, ms: u64) {
         self.clock.retry_jitter_ms.store(ms, Ordering::SeqCst);
     }
 
@@ -1120,7 +1123,8 @@ pub fn assert_project_told_of_the_stop_once(project: &BgTaskRegistry, task: &str
     );
 }
 
-fn held<T>(lock: &Mutex<T>) -> bool {
+#[cfg(test)]
+pub(super) fn held<T>(lock: &Mutex<T>) -> bool {
     matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock))
 }
 
@@ -1451,3 +1455,27 @@ pub(super) fn persist_accepted_with_snapshot_scope(
 // Reattachment is recorded in metadata without adding agent-visible wording.
 #[cfg(test)]
 pub(super) const REATTACHED_RESULT_SENTENCE: Option<&str> = None;
+
+impl Drop for UncapturedTerminalBeforeRenderForTest {
+    fn drop(&mut self) {
+        let _ = self.release.send(());
+        if let Some(publisher) = self.publisher.take() {
+            let result = publisher.join();
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
+        }
+    }
+}
+
+impl UncapturedTerminalBeforeRenderForTest {
+    pub fn dir(&self) -> &tempfile::TempDir {
+        &self.dir
+    }
+    pub fn registry(&self) -> &BgTaskRegistry {
+        &self.registry
+    }
+    pub fn task(&self) -> &Arc<BgTask> {
+        &self.task
+    }
+}

@@ -1,4 +1,5 @@
 mod tests {
+    use aft_engine::test_bridge::bash_remote::ReplyBudgetTestExt as _;
     use std::time::{Duration, Instant};
 
     use crate::blocking_wait::{clamp_worker_wait_ms, ReplyBudget};

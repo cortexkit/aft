@@ -671,7 +671,7 @@ impl SpawnPlan {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[cfg(unix)]
     pub(crate) fn launcher_for_test(profile: SandboxProfile, launcher_path: PathBuf) -> Self {
         Self::Launcher {
@@ -681,7 +681,7 @@ impl SpawnPlan {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn refused_for_test(code: &'static str) -> Self {
         Self::Refused {
             code,

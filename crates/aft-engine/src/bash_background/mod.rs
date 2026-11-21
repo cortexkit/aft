@@ -286,7 +286,7 @@ impl SpawnReceipt {
             }
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn new(deadline: std::time::Instant) -> Self {
         Self::new_with_start_time(deadline, std::time::Instant::now())
     }

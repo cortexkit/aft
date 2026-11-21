@@ -97,7 +97,7 @@ mod tests {
         count: usize,
     ) -> (tempfile::TempDir, Vec<std::sync::Arc<AppContext>>) {
         let dir = tempfile::tempdir().unwrap();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let contexts = (0..count)
             .map(|i| {
                 let root = dir.path().join(format!("project-{i}"));
@@ -184,7 +184,7 @@ mod tests {
         let root_id = ProjectRootId::from_path(&root).unwrap();
         assert_ne!(root, root_id.as_path());
 
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let mut config = Config::default();
         config.project_root = Some(root.clone());
         config.storage_dir = Some(dir.path().join("storage"));

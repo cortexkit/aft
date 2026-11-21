@@ -555,6 +555,7 @@ pub(super) fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aft_engine::test_bridge::bash_remote::PersistedTaskTestExt as _;
     use sha2::{Digest, Sha256};
 
     fn selector() -> Selector {
@@ -720,9 +721,9 @@ mod tests {
                             title: "cargo test".into(),
                             command: "cargo test".into(),
                             started_at_ms: 1730000000000,
-                            remote: Some(Remote {
-                                job_id: "00000000-0000-4000-8000-000000000007".into(),
-                            }),
+                            remote: Some(remote_running(
+                                "00000000-0000-4000-8000-000000000007".into(),
+                            )),
                             command_truncated: false,
                         }],
                         complete: true,
@@ -1106,7 +1107,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         crate::db::open(&dir.path().join("aft.db")).unwrap();
         let selected = selector();
-        let ticket = crate::bash_background::store_writes::Ticket::new(dir.path());
+        let ticket = aft_engine::test_bridge::bash_remote::store_write_ticket(dir.path());
         let observe = || {
             answer(
                 json!({"scope": selected}),
@@ -1121,7 +1122,7 @@ mod tests {
         assert_eq!(reply.data["reason"], "store_read_failed");
         ticket.resolved();
         assert_eq!(observe().data["complete"], true);
-        drop(crate::bash_background::store_writes::Ticket::new(
+        drop(aft_engine::test_bridge::bash_remote::store_write_ticket(
             dir.path(),
         ));
         let reply = observe();
@@ -1288,8 +1289,8 @@ mod tests {
         assert!(!lines[0].contains("sleep 30"));
         assert_eq!(metrics.snapshot()["answered"], 1);
         assert_eq!(metrics.snapshot()["with_running"], 1);
-        let task = registry.task_for_test(&id).unwrap();
-        let locked = task.state.lock().unwrap();
+        let task = registry.test_task(&id).unwrap();
+        let locked = task.test_state().lock().unwrap();
         let start = Instant::now();
         let reply = answer(
             json!({"scope":selected}),
@@ -1366,7 +1367,7 @@ mod tests {
         let layout = persistence::resolve_task_layout(&paths.session_dir, &id).unwrap();
         let paths = &layout.paths;
         let mut metadata = persistence::read_task_at(&layout).unwrap();
-        metadata.lifecycle_scope = Some(live);
+        *metadata.lifecycle_scope_mut() = Some(live);
         persistence::write_task_at(&layout, &metadata).unwrap();
         assert_eq!(metadata.scope.as_ref(), Some(&stamp));
         let sessions = [paths.session_dir.clone()];

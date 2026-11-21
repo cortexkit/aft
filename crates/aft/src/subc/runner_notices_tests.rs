@@ -1,4 +1,12 @@
 use super::*;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::ScheduledTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::SchedulerTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::SchedulerTestExt as _;
 
 fn notice_route(session: &str) -> CodeSearchNotice {
     CodeSearchNotice {
@@ -2149,7 +2157,7 @@ fn wait_for_id(scheduler: &Scheduler, id: &str, finished: bool) {
             !left.is_zero(),
             "notice did not reach scheduled state: {id}"
         );
-        entries = scheduler.wake.wait_timeout(entries, left).unwrap().0;
+        entries = scheduler.wake().wait_timeout(entries, left).unwrap().0;
     }
 }
 
@@ -2261,7 +2269,7 @@ fn runner_notices_route_bind_expedites_retry_without_parallel_send() {
     let first = capture.receiver.try_recv().unwrap();
     let id = format!("aft:bash:{}", task.task);
     assert!(
-        scheduler.entries.lock().unwrap()[&id].due
+        scheduler.entries.lock().unwrap()[&id].due()
             > std::time::Instant::now() + Duration::from_secs(50)
     );
     let (entered, release) = capture.block_next();

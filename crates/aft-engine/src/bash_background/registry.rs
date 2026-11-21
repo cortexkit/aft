@@ -1498,7 +1498,7 @@ pub(crate) struct RegistryInner {
     #[cfg(unix)]
     db_schema_hints: AtomicBool,
     background_admission: Mutex<()>,
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     before_bootstrap_release: Mutex<
         Option<(
             std::sync::mpsc::Sender<String>,
@@ -2092,7 +2092,7 @@ impl BgTaskRegistry {
                 #[cfg(unix)]
                 db_schema_hints: AtomicBool::new(true),
                 background_admission: Mutex::new(()),
-                #[cfg(all(test, unix))]
+                #[cfg(all(unix, any(test, feature = "test-support")))]
                 before_bootstrap_release: Mutex::new(None),
                 #[cfg(all(test, unix))]
                 before_watchdog_registration: Mutex::new(None),
@@ -2494,7 +2494,11 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(all(test, debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(
+        any(test, feature = "test-support"),
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    ))]
     pub(crate) fn install_pty_seal_pause_for_test(
         &self,
         arrived: std::sync::mpsc::Sender<String>,
@@ -6271,7 +6275,7 @@ impl BgTaskRegistry {
                     error.to_string(),
                 ));
             }
-            #[cfg(all(test, unix))]
+            #[cfg(all(unix, any(test, feature = "test-support")))]
             self.wait_before_bootstrap_release_for_test(&task_id);
         }
 
@@ -11119,7 +11123,7 @@ impl BgTaskRegistry {
     }
 
     /// The task's current hard-kill limit in milliseconds since it started.
-    #[cfg(all(test, unix))]
+    #[cfg(all(any(test, feature = "test-support"), unix))]
     pub(crate) fn hard_kill_limit_ms_for_test(
         &self,
         task_id: &str,
@@ -11132,7 +11136,7 @@ impl BgTaskRegistry {
 
     /// Replaces the task's hard-kill limit, so a test can bring the kill close
     /// without waiting out the 30-minute default.
-    #[cfg(all(test, unix))]
+    #[cfg(all(any(test, feature = "test-support"), unix))]
     pub(crate) fn set_hard_kill_limit_ms_for_test(
         &self,
         task_id: &str,
@@ -12830,7 +12834,7 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(any(test, feature = "test-support"), unix))]
     pub(crate) fn secret_proxy_address_for_test(
         &self,
         task_id: &str,
@@ -15865,7 +15869,7 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     fn wait_before_bootstrap_release_for_test(&self, task_id: &str) {
         let gate = self.inner.before_bootstrap_release.lock().unwrap().take();
         if let Some((arrived, release)) = gate {
@@ -15891,14 +15895,14 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(test)]
-    pub fn task_json_path(&self, task_id: &str, session_id: &str) -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn task_json_path(&self, task_id: &str, session_id: &str) -> Option<PathBuf> {
         self.task_for_session(task_id, session_id)
             .map(|task| task.paths.json.clone())
     }
 
-    #[cfg(test)]
-    pub fn task_exit_path(&self, task_id: &str, session_id: &str) -> Option<PathBuf> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn task_exit_path(&self, task_id: &str, session_id: &str) -> Option<PathBuf> {
         self.task_for_session(task_id, session_id)
             .map(|task| task.paths.exit.clone())
     }
@@ -19123,7 +19127,8 @@ mod tests {
         assert!(registry.live_scope_stamps().is_empty());
     }
 
-    use super::test_support::{insert_terminal_piped_task, lifecycle_running_fixture};
+    pub(crate) use super::test_support::insert_terminal_piped_task;
+    use super::test_support::lifecycle_running_fixture;
     #[cfg(unix)]
     fn approved_reap_fixture(command: &str) -> (tempfile::TempDir, BgTaskRegistry, Arc<BgTask>) {
         use std::os::unix::process::ExitStatusExt;
@@ -27355,7 +27360,7 @@ mod tests {
         );
     }
 
-    use super::test_support::registry_with_db_and_frames;
+    pub(crate) use super::test_support::registry_with_db_and_frames;
     fn task_caller(
         root: &Path,
         principal: &str,

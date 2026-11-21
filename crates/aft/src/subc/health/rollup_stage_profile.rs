@@ -24,7 +24,7 @@ fn profile_rollup_stages_over_one_hundred_roots() {
         dirs.push(dir);
         assert!(executor.register_actor(root, test_ctx()));
     }
-    let app = crate::context::App::default_shared();
+    let app = crate::test_app();
     let cache = HealthRollupCache::new();
     // Warm once outside the measured window: first-touch work is not steady state.
     cache.clock_ms.store(0, Ordering::Relaxed);

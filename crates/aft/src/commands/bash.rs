@@ -1000,17 +1000,22 @@ where
             error: PipedAttemptError::Spawn(error),
         }) => Err(format!(
             "failed to spawn bash command via {}: {error}",
-            candidates[index].binary()
+            aft_engine::test_bridge::bash_remote::windows_shell_binary(&candidates[index])
         )),
         Err(CandidateFailure::Exhausted { last }) => {
             let last_error = match last {
                 Some((index, PipedAttemptError::Spawn(error))) => {
-                    format!("{}: {error}", candidates[index].binary())
+                    format!(
+                        "{}: {error}",
+                        aft_engine::test_bridge::bash_remote::windows_shell_binary(
+                            &candidates[index]
+                        )
+                    )
                 }
                 _ => "no candidates were attempted".into(),
             };
             Err(format!("failed to spawn bash command: no Windows shell could be spawned. Last error: {last_error}. PATH-probed candidates: {:?}",
-                candidates.iter().map(|shell| shell.binary()).collect::<Vec<_>>()))
+                candidates.iter().map(aft_engine::test_bridge::bash_remote::windows_shell_binary).collect::<Vec<_>>()))
         }
         Err(CandidateFailure::Stopped {
             error: PipedAttemptError::Setup(message),
@@ -1022,8 +1027,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
     #[cfg(windows)]
     use aft_engine::test_bridge::bash_remote::WindowsShell;
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 
     #[test]
     fn standalone_runon_is_refused_by_name_even_with_remote_execution_enabled() {
@@ -3099,7 +3106,8 @@ mod tests {
     #[test]
     fn strict_worker_uncontained_plan_requires_approval() {
         use crate::config::SandboxMode;
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail};
+        use crate::sandbox_spawn::with_worker_jail;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -3130,7 +3138,8 @@ mod tests {
     #[test]
     fn strict_worker_contained_plan_keeps_scanner_report_only() {
         use crate::config::SandboxMode;
-        use crate::sandbox_spawn::{with_spawn_plan_for_test, with_worker_jail};
+        use crate::sandbox_spawn::with_worker_jail;
+        use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
 
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
@@ -3244,6 +3253,7 @@ mod tests {
         });
         assert!(!denied.success);
         assert_eq!(denied.data["code"], "sandbox_escalation_denied");
+        use aft_engine::test_bridge::display_data::AppContextTestExt as _;
         assert_eq!(ctx.escalation_grants().lock().len_for_test(), 2);
         crate::sandbox_spawn::clear_sandbox_spawn_test_seam(project.path());
     }

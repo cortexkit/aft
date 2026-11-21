@@ -4,6 +4,8 @@
 
 #![cfg(unix)]
 
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::SpawnReceiptTestExt as _;
 use std::collections::BTreeMap;
 
 use serde_json::json;

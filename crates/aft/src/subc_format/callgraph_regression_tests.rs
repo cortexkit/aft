@@ -1,5 +1,6 @@
 use crate::callgraph_store::{CallGraphRead, UNRESOLVED_CALL_SITE_COUNT_LIMIT};
 use crate::data_layer::callgraph_store_adapter::*;
+use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
 use std::path::Path;
 
 fn fixture(

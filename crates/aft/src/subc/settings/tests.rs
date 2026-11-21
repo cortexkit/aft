@@ -203,7 +203,7 @@ async fn exercise_bootstrap() {
     let cache_path = std::fs::canonicalize(cache.path()).unwrap();
     let _volume = crate::walk_boundary::simulated_volumes::simulate(&cache_path, u64::MAX - 301);
     let ctx = Arc::new(AppContext::from_app(
-        App::default_shared(),
+        crate::test_app(),
         crate::config::Config {
             storage_dir: Some(temp.path().join("storage")),
             ..Default::default()

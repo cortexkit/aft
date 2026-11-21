@@ -47,9 +47,9 @@ pub struct ReplyBudget {
 struct WaitClock {
     awake: Instant,
     continuous: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     base_now: Option<fn() -> Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     suspend: Option<&'static std::sync::atomic::AtomicU64>,
 }
 
@@ -58,20 +58,20 @@ impl WaitClock {
         Self {
             awake: Instant::now(),
             continuous: continuous_now(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             base_now: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             suspend: None,
         }
     }
 
     fn now(self) -> Instant {
         let elapsed = continuous_now().saturating_sub(self.continuous);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let elapsed = self
             .base_now
             .map_or(elapsed, |now| now().saturating_duration_since(self.awake));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let elapsed = elapsed
             + Duration::from_millis(
                 self.suspend
@@ -200,7 +200,7 @@ impl ReplyBudget {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_suspend_clock(
         mut self,
         clock: &'static std::sync::atomic::AtomicU64,
@@ -212,7 +212,7 @@ impl ReplyBudget {
     /// A test driving Tokio time must use that same clock for expiry, not just
     /// for scheduler wakeups. Opt in per budget so native-clock suspend tests
     /// and other calls keep their independent time sources.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_runtime_clock(mut self) -> Self {
         self.clock.awake = tokio::time::Instant::now().into_std();
         self.clock.base_now = Some(|| tokio::time::Instant::now().into_std());

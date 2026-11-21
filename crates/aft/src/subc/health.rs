@@ -7155,7 +7155,7 @@ mod tests {
     fn health_budget_keeps_findings_evidence_out_of_the_public_reply() {
         let cache = HealthRollupCache::new();
         let executor = Executor::new();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let evidence = json!({
             "build_breaker_error": null, "database_open_failed": false,
             "lsp_start_failures": {("server".repeat(HEALTH_METRICS_BUDGET_BYTES / 6)): 3}
@@ -7821,7 +7821,7 @@ mod tests {
     fn health_reports_live_indexing_and_root_identity_headline() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let foreign_root = tempfile::tempdir().unwrap();
         let _foreign = crate::cold_build_limiter::progress::start(
             foreign_root.path(),
@@ -7905,7 +7905,7 @@ mod tests {
             None,
             crate::cold_build_limiter::progress::StartLog::Quiet,
         );
-        let app = App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
 
         let report = refresh_until_root_count(&cache, &executor, &app, 1);
@@ -8138,7 +8138,7 @@ mod tests {
         use crate::cold_build_limiter::progress::{Omitted, Snapshot};
         let executor = Executor::new();
         let dispatch_metrics = DispatchPathMetrics::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         cache.refresh(&executor, &app);
         let report = build_health_report_with_indexing(
@@ -8200,7 +8200,7 @@ mod tests {
     fn health_reports_slow_bind_acks_in_the_window_and_the_worst_latency() {
         let metrics = DispatchPathMetrics::new();
         let executor = Executor::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let quiet = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         let quiet_acks = &quiet.metrics.as_ref().unwrap()["dispatch_path"]["bind_acks"];
         assert_eq!(quiet_acks["count"], 0);
@@ -8362,7 +8362,7 @@ mod tests {
              (harness, session_id, task_id, project_key, command, cwd, status, started_at, completed_at, completion_delivered)
              VALUES ('opencode', 'session', 'old-task', 'project', 'true', '.', 'completed', 0, 1, 1);"
         ).unwrap();
-        let app = App::default_shared();
+        let app = crate::test_app();
         app.set_db(Arc::clone(&db));
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(0, Ordering::Relaxed);
@@ -8476,7 +8476,7 @@ mod tests {
             )
             .expect("insert eligible bash task");
         }
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         app.set_db(Arc::new(std::sync::Mutex::new(conn)));
 
         let report = test_health_report(
@@ -8524,7 +8524,7 @@ mod tests {
             crate::db::compression_events::RetentionSweepSkipReason::OpeningCountLockBudgetExhausted
         );
 
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         app.set_db(db);
         let report = test_health_report(
             &Executor::new(),
@@ -8571,7 +8571,7 @@ mod tests {
         // A rollup cache that has not been refreshed since the mutation began:
         // what holds a root must not wait for the next background rollup.
         let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let report = build_health_report(
             &cache,
             &executor,
@@ -8604,7 +8604,7 @@ mod tests {
     fn health_worker_publishes_a_fresh_snapshot_without_loop_refresh() {
         let cache = Arc::new(HealthRollupCache::new());
         let executor = Arc::new(Executor::new());
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let worker = HealthRollupWorker::start(Arc::clone(&cache), executor, Arc::clone(&app));
         // Generous under a loaded parallel suite: the property is "publishes
         // without the loop", not how fast a starved thread gets scheduled.
@@ -8641,7 +8641,7 @@ mod tests {
         let worker = HealthRollupWorker::start_with_interval(
             Arc::clone(&cache),
             Arc::new(Executor::new()),
-            crate::context::App::default_shared(),
+            crate::test_app(),
             Duration::from_millis(100),
         );
         let started = Instant::now();
@@ -8680,11 +8680,7 @@ mod tests {
             dirs.push(dir);
         }
         let cache = Arc::new(HealthRollupCache::new());
-        let worker = HealthRollupWorker::start(
-            Arc::clone(&cache),
-            executor,
-            crate::context::App::default_shared(),
-        );
+        let worker = HealthRollupWorker::start(Arc::clone(&cache), executor, crate::test_app());
         let mut clock = 0;
         assert_eq!(
             unsafe {
@@ -8753,7 +8749,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root, Arc::clone(&ctx)));
         let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let report = refresh_until_root_count(&cache, &executor, &app, 1);
         let metrics = report.metrics.unwrap();
         let refusals = metrics["bash_task_refusals"].as_array().unwrap();
@@ -8776,7 +8772,7 @@ mod tests {
     fn health_unavailable_rollup_reports_degraded_status_and_reason() {
         let executor = Executor::new();
         let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
         assert_eq!(report.status, HealthStatus::Degraded);
@@ -8810,7 +8806,7 @@ mod tests {
         assert!(executor.register_actor(root, ctx));
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(1_000, Ordering::Relaxed);
-        let app = App::default_shared();
+        let app = crate::test_app();
         app.lsp_child_registry().track(std::process::id());
         cache.refresh_for_test(&executor, &app);
         assert_eq!(cache.snapshot().0.metrics["actor_count"], 1);
@@ -8870,7 +8866,7 @@ mod tests {
         let executor = Executor::new();
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(250, Ordering::Relaxed);
-        let app = App::default_shared();
+        let app = crate::test_app();
         executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
         let report = build_health_report(
             &cache,
@@ -9002,7 +8998,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root, ctx));
         let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let (locked_tx, locked_rx) = std::sync::mpsc::channel();
         std::thread::scope(|scope| {
             scope.spawn(|| {
@@ -9029,7 +9025,7 @@ mod tests {
         build_health_diagnostic_rollup_from_actors(
             cache,
             &Executor::new(),
-            &crate::context::App::default_shared(),
+            &crate::test_app(),
             Vec::new(),
         )
     }
@@ -9077,7 +9073,7 @@ mod tests {
     fn diagnostics_findings_200_roots_are_independent_of_report_trimming() {
         let cache = HealthRollupCache::new();
         let executor = Executor::new();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let context = test_ctx();
         // Settled roots exercise optional-detail trimming; warming roots must
         // now retain their evidence before the byte budget is applied.
@@ -9269,7 +9265,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root, Arc::clone(&ctx)));
         let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
 
         let before_contended_attempt = crate::context::memory_estimate_walks_for_test();
         executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
@@ -9381,7 +9377,7 @@ mod tests {
         }
         let executor = Executor::new();
         assert!(executor.register_actor(root, ctx));
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         let epoch = Instant::now();
         let refresh_at = |seconds| {
@@ -9420,10 +9416,10 @@ mod tests {
     fn rollup_resolves_shared_storage_paths_once_per_tick() {
         // One shared App, so every context names the same storage root the way
         // the daemon's contexts do; only the project roots differ.
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let executor = Executor::new();
         let cache = HealthRollupCache::new();
-        let shared_app = crate::context::App::default_shared();
+        let shared_app = crate::test_app();
         let mut entries = Vec::new();
         let mut dirs = Vec::new();
         for index in 0..32 {
@@ -9475,7 +9471,7 @@ mod tests {
     #[test]
     fn rollup_110_root_step_counters_keep_current_numbers_and_age() {
         let executor = Executor::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(0, Ordering::Relaxed);
         let mut dirs = Vec::new();
@@ -9598,7 +9594,7 @@ mod tests {
         let executor = Executor::new();
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let cache = HealthRollupCache::new();
-        cache.refresh_for_test(&executor, &crate::context::App::default_shared());
+        cache.refresh_for_test(&executor, &crate::test_app());
         let census = cache.memory_census();
         let label = root.as_path().display().to_string();
         assert!(
@@ -9610,7 +9606,7 @@ mod tests {
     #[test]
     fn quiet_rollup_does_not_rebuild_inspect_memory_payloads() {
         let executor = Executor::new();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         let storage = tempfile::tempdir().unwrap();
         let mut dirs = Vec::new();
@@ -9836,7 +9832,7 @@ mod tests {
         let executor = Arc::new(Executor::new());
         assert!(executor.register_actor(root.clone(), test_ctx()));
         let cache = Arc::new(HealthRollupCache::new());
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         cache.clock_ms.store(0, Ordering::Relaxed);
         // Seed a known publication without relying on a periodic worker's
         // nonblocking scheduler snapshot, which may legitimately skip a tick.
@@ -9884,7 +9880,7 @@ mod tests {
         assert!(executor.register_actor(root, test_ctx()));
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(0, Ordering::Relaxed);
-        cache.refresh_for_test(&executor, &crate::context::App::default_shared());
+        cache.refresh_for_test(&executor, &crate::test_app());
         // A wake channel nobody reads, as a stuck rollup thread leaves it.
         let (wake_tx, _wake_rx) = std::sync::mpsc::sync_channel(1);
         *cache.census_wake.lock().unwrap() = Some(wake_tx);
@@ -9941,7 +9937,7 @@ mod tests {
         crate::build_breaker::BuildDeathBreaker::reset_open_calls_for_test();
 
         let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         cache.refresh(&executor, &app);
         cache.refresh(&executor, &app);
         assert_eq!(
@@ -10059,7 +10055,7 @@ mod tests {
     fn bash_posix_spawn_health_reports_forced_fallback() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         crate::posix_spawn::FORCE_FALLBACK.set(true);
         struct Reset;
@@ -10085,7 +10081,7 @@ mod tests {
     fn bg_runtime_health_fields_are_always_present() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let (_dir, root) = test_root("health-bg-runtime-fields");
         let channel = super::super::route_key(22, 4);
         let cache = HealthRollupCache::new();
@@ -10182,7 +10178,7 @@ mod tests {
                 &executor,
                 &HashMap::new(),
                 &DispatchPathMetrics::new(),
-                &crate::context::App::default_shared(),
+                &crate::test_app(),
             );
             let busy = report
                 .detail
@@ -10244,7 +10240,7 @@ mod tests {
                     &executor,
                     &HashMap::new(),
                     &DispatchPathMetrics::new(),
-                    &crate::context::App::default_shared(),
+                    &crate::test_app(),
                 );
                 if let Some(roots) = report
                     .metrics
@@ -10288,7 +10284,7 @@ mod tests {
         assert!(!checkout.checkout().planes().callgraph);
         assert!(executor.register_actor(root.clone(), ctx));
 
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         cache.refresh_for_test(&executor, &app);
         let metrics = DispatchPathMetrics::new();
@@ -10443,7 +10439,7 @@ mod tests {
     fn health_report_exposes_stall_watchdog_counters() {
         let executor = Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
-        let app = App::default_shared();
+        let app = crate::test_app();
 
         let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
         let stall = &report.metrics.expect("health metrics")["dispatch_path"]["stall_watchdog"];
@@ -10457,7 +10453,7 @@ mod tests {
     fn health_report_exposes_live_durable_log_counters() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let report = build_health_report(
             &HealthRollupCache::new(),
             &executor,
@@ -10487,7 +10483,7 @@ mod tests {
     fn health_report_exposes_unconfigured_binding_refusal_counter() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let report = build_health_report(
             &HealthRollupCache::new(),
             &executor,
@@ -10508,7 +10504,7 @@ mod tests {
             &Executor::new(),
             &HashMap::new(),
             &DispatchPathMetrics::new(),
-            &App::default_shared(),
+            &crate::test_app(),
         );
         let metrics = report.metrics.expect("health metrics");
         let fallbacks = metrics["full_sync_fallbacks"]
@@ -10527,7 +10523,7 @@ mod tests {
             &Executor::new(),
             &HashMap::new(),
             &DispatchPathMetrics::new(),
-            &App::default_shared(),
+            &crate::test_app(),
         );
         let metrics = report.metrics.expect("health metrics");
         let profile = &metrics["memory_profile"];
@@ -10553,7 +10549,7 @@ mod tests {
     fn health_report_lists_stopped_routes() {
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let report = build_health_report(
             &HealthRollupCache::new(),
             &executor,
@@ -10569,7 +10565,7 @@ mod tests {
     fn health_report_exposes_deferred_bash_waits_in_flight() {
         let executor = Executor::new();
         let metrics = Arc::new(DispatchPathMetrics::new());
-        let app = App::default_shared();
+        let app = crate::test_app();
         let guard = DeferredBashWaitGuard::new(&metrics);
 
         let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);
@@ -10647,12 +10643,7 @@ mod tests {
 
         let metrics = DispatchPathMetrics::new();
         let pending_binds = HashMap::new();
-        let report = test_health_report(
-            &executor,
-            &pending_binds,
-            &metrics,
-            &crate::context::App::default_shared(),
-        );
+        let report = test_health_report(&executor, &pending_binds, &metrics, &crate::test_app());
         let dispatch = report
             .metrics
             .as_ref()
@@ -10708,7 +10699,7 @@ mod tests {
             drr_quantum: 1,
         });
         let dispatch_path_metrics = Arc::new(DispatchPathMetrics::new());
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let registry = app.lsp_child_registry();
         registry.track(std::process::id());
         let cache = HealthRollupCache::new();
@@ -10793,7 +10784,7 @@ mod tests {
             heavy_permits: 1,
             drr_quantum: 1,
         });
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let report = test_health_report(
             &executor,
             &HashMap::new(),
@@ -10836,7 +10827,7 @@ mod tests {
             (executor, dirs)
         }
 
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let (five, five_dirs) = fixture(5);
         let five_cache = HealthRollupCache::new();
@@ -10913,7 +10904,7 @@ mod tests {
     #[test]
     fn health_names_roots_whose_index_store_failed_within_the_reply_budgets() {
         use crate::data_layer::surfaces::{reason, DataCheckoutProbe};
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         for root_count in [1usize, 12, 50] {
             let executor = Executor::with_config(crate::executor::ExecutorConfig {
                 pool_size: 1,
@@ -11041,7 +11032,7 @@ mod tests {
         crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 200, true);
         crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 900, false);
         assert!(executor.register_actor(root.clone(), ctx));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
 
@@ -11082,7 +11073,7 @@ mod tests {
             },
         );
         assert!(executor.register_actor(root, ctx));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let cache = HealthRollupCache::new();
         let report = refresh_until_root_count(&cache, &executor, &app, 1)
             .metrics
@@ -11117,7 +11108,7 @@ mod tests {
             };
         ctx.trip_semantic_refresh_circuit(1, "connection refused by embedding backend");
         assert!(executor.register_actor(root.clone(), ctx));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
 
@@ -11158,7 +11149,7 @@ mod tests {
             "connection refused",
         );
         assert!(executor.register_actor(root.clone(), ctx));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
 
@@ -11194,7 +11185,7 @@ mod tests {
                 entries_total: Some(12),
             };
         assert!(executor.register_actor(root.clone(), ctx.clone()));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 1);
@@ -11269,7 +11260,7 @@ mod tests {
         let (_dir, root) = test_root("meaning-fill-health-budget");
         let ctx = test_ctx();
         assert!(executor.register_actor(root.clone(), ctx.clone()));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let dispatch = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 1);
@@ -11486,7 +11477,7 @@ mod tests {
             true,
         );
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let app = App::default_shared();
+        let app = crate::test_app();
         let dispatch = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
 
@@ -11747,7 +11738,7 @@ mod tests {
         watcher.finish_rescan(42, Some(-4096));
         watcher.note_raw_event();
         assert!(executor.register_actor(root.clone(), ctx));
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 1);
@@ -11822,7 +11813,7 @@ mod tests {
             dirs.push(dir);
             assert!(executor.register_actor(root, test_ctx()));
         }
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
         let cache = HealthRollupCache::new();
         refresh_until_root_count(&cache, &executor, &app, 50);
@@ -11920,7 +11911,7 @@ mod tests {
             std::fs::read(&memo).unwrap(),
             std::fs::metadata(&memo).unwrap().modified().unwrap(),
         );
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Executor::new();
         register_standing_health_actor(&executor, &app, &root, standing_config(&root, &storage));
         let metrics = DispatchPathMetrics::new();
@@ -11980,7 +11971,7 @@ mod tests {
             .next()
             .expect("configured standing entry");
 
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Executor::new();
         register_standing_health_actor(&executor, &app, root.path(), config.clone());
         let metrics = DispatchPathMetrics::new();
@@ -12059,7 +12050,7 @@ mod tests {
                 .expect("original record exists")
         };
 
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Executor::new();
         register_standing_health_actor(&executor, &app, original.path(), config.clone());
         std::fs::remove_file(&link).expect("replace standing symlink");
@@ -12161,7 +12152,7 @@ mod tests {
             &Executor::new(),
             &HashMap::new(),
             &DispatchPathMetrics::new(),
-            &App::default_shared(),
+            &crate::test_app(),
         );
         let metrics = report.metrics.expect("health metrics");
         let helpers = &metrics["filesystem_helpers"];
@@ -12199,7 +12190,7 @@ mod tests {
 
     #[test]
     fn health_report_carries_process_io_and_write_ledger_top_writers() {
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Executor::new();
         let metrics = DispatchPathMetrics::new();
         let report = test_health_report(&executor, &HashMap::new(), &metrics, &app);

@@ -70,7 +70,7 @@ fn synthetic_bound_roots() {
     let _env = crate::test_env::without_storage_override();
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path().join("storage");
-    let app = App::default_shared();
+    let app = crate::test_app();
     let root_count: usize = std::env::var("AFT_HEAP_ROOTS")
         .unwrap_or_else(|_| "100".into())
         .parse()
