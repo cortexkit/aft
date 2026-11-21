@@ -12301,7 +12301,7 @@ mod callgraph_store_for_ops_tests {
         if boundary != PendingCaptureBoundary::AfterIntakeProbe {
             assert!(ctx.watcher_drain_has_work(), "the scheduler must not wait");
         }
-        let hook = install_pending_capture_hook_for_test(move |reached| {
+        let hook = pending_capture_fixture::install_pending_capture_hook_for_test(move |reached| {
             if reached == boundary {
                 // Capture has observed contention, not a changed value. Release
                 // only the other reader; the pending metadata stays unchanged.

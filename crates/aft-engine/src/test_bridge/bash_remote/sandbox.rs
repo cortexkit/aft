@@ -91,3 +91,13 @@ pub fn restore_local_launch(
 > {
     sandbox_spawn::restore_local_launch(task, expected)
 }
+#[cfg(target_os = "macos")]
+pub fn probe_command_for_plan(
+    plan: &crate::sandbox_spawn::SpawnPlan,
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    cwd: &std::path::Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<std::process::Command, String> {
+    crate::sandbox_spawn::probe_command_for_plan(plan, program, args, cwd, env)
+}

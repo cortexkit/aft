@@ -162,6 +162,9 @@ pub mod bash_background {
 }
 
 pub mod sandbox_spawn {
+    #[cfg(target_os = "macos")]
+    pub use super::super::sandbox::probe_command_for_plan;
+
     #[cfg(target_os = "linux")]
     pub mod remote {
         use crate::context::AppContext;
