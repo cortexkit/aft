@@ -652,7 +652,7 @@ fn terminate_pty_group(pid: u32) {
 /// Test gates that park a piped-task kill after it has published `Killing`
 /// and released the state lock, before it signals, so a test can act while
 /// the kill is in flight. Keyed by task id so parallel tests do not collide.
-#[cfg(any(test, all(unix, feature = "test-support")))]
+#[cfg(any(test, feature = "test-support"))]
 struct KillSignalGate {
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,

@@ -66,7 +66,6 @@ pub fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, String> {
     sandbox_engine::create_task_temp_dir(task_bundle_dir)
 }
 
-#[cfg(unix)]
 pub fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
     sandbox_engine::cleanup_task_temp_dir(path)
 }

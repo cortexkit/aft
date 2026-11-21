@@ -8,9 +8,9 @@ use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
 use aft_engine::test_bridge::bash_remote::bash_background::secrets::{PROXY_KEYS, REMOVE_KEYS};
 use aft_engine::test_bridge::bash_remote::secrets_support::*;
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
-use aft_engine::test_bridge::bash_remote::PreflightTestExt as _;
-use aft_engine::test_bridge::bash_remote::PreparedTaskTestExt as _;
 use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
+#[cfg(unix)]
+use aft_engine::test_bridge::bash_remote::{PreflightTestExt as _, PreparedTaskTestExt as _};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{

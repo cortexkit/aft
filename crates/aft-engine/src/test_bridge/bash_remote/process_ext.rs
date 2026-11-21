@@ -701,3 +701,13 @@ impl BusyRootTestExt for crate::bash_background::registry::push_projection_fixtu
         &self.ctx
     }
 }
+
+pub trait TaskRuntimeTestExt: Sized {
+    fn empty_pty() -> Self;
+}
+
+impl TaskRuntimeTestExt for super::TaskRuntime {
+    fn empty_pty() -> Self {
+        Self::Pty(None)
+    }
+}

@@ -48,8 +48,10 @@ mod unix;
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub use unix::prepare;
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub(crate) use unix::prepare_with_launcher;
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub(crate) use unix::Start as StartForTest;
 
 #[cfg(all(target_os = "linux", feature = "test-hooks"))]
 pub async fn run_for_test(
