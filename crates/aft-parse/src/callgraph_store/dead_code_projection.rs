@@ -132,6 +132,9 @@ pub fn symbol_kind_from_label(label: &str) -> Option<SymbolKind> {
         "variable" => Some(SymbolKind::Variable),
         "heading" => Some(SymbolKind::Heading),
         "file_summary" => Some(SymbolKind::FileSummary),
+        "module" => Some(SymbolKind::Module),
+        "package" => Some(SymbolKind::Package),
+        "task" => Some(SymbolKind::Task),
         _ => None,
     }
 }

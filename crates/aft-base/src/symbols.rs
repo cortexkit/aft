@@ -19,6 +19,9 @@ pub enum SymbolKind {
     Heading,
     /// Synthetic file-level summary chunk for generic entry-point files.
     FileSummary,
+    Module,
+    Package,
+    Task,
 }
 
 /// Location range within a source file (line/column, 0-indexed internally).

@@ -41,6 +41,7 @@ pub enum LangId {
     ObjC,
     Toml,
     Luau,
+    SystemVerilog,
 }
 
 #[cfg(any(test, feature = "test-support"))]

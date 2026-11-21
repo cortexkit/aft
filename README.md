@@ -170,6 +170,7 @@ _Coming soon._
 | Ruby | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | PHP | ✓ | ✓ | ✓ | ✓ | ✓ | |
 | Lua / Perl | ✓ | ✓ | ✓ | ✓ | ✓ | |
+| SystemVerilog / Verilog | ✓ | | | | | |
 | Zig | ✓ | ✓ | ✓ | ✓ | | |
 | Bash | ✓ | ✓ | | ✓ | | |
 | HTML / Markdown (incl. Quarto / R-Markdown) | ✓ | ✓ | | | | |

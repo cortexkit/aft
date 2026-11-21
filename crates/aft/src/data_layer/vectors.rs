@@ -231,9 +231,9 @@ fn cut_stored(
 /// The code a chunk's kind is stored as.
 fn kind_code(kind: &SymbolKind) -> u8 {
     match kind {
-        SymbolKind::Function => 0,
+        SymbolKind::Function | SymbolKind::Task => 0,
         SymbolKind::Kernel => 1,
-        SymbolKind::Class => 2,
+        SymbolKind::Class | SymbolKind::Module | SymbolKind::Package => 2,
         SymbolKind::Method => 3,
         SymbolKind::Struct => 4,
         SymbolKind::Interface => 5,

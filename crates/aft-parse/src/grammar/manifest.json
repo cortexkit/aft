@@ -11,6 +11,18 @@
       "sha256": "56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039",
       "size": 135204,
       "url": "https://github.com/cortexkit/aft/releases/download/grammars-1/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm"
+    },
+    {
+      "language": "systemverilog",
+      "extensions": ["sv", "svh", "v", "vh"],
+      "grammar_repository": "https://github.com/gmlarumbe/tree-sitter-systemverilog",
+      "grammar_commit": "3390da8c76a976b6f47d19667accc43e81a1483b",
+      "abi": 15,
+      "license": "MIT",
+      "sample": "grammars/corpus/systemverilog.sv",
+      "sha256": "c1fc6f231bcc0513b25e0204b56b067d1d596c86b20a215c7127d4d3d07d486d",
+      "size": 23530921,
+      "url": "https://github.com/cortexkit/aft/releases/download/grammars-1/c1fc6f231bcc0513b25e0204b56b067d1d596c86b20a215c7127d4d3d07d486d.wasm"
     }
   ]
 }

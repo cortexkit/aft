@@ -2092,11 +2092,18 @@ fn resolve_zoom_symbol(
     let (name, anchor_line) = split_zoom_line_anchor(query);
     let matches = if is_heading {
         resolve_heading_symbols(provider, path, name)?
-    } else if crate::data_layer::grammar::downloaded_language(path).is_some() {
+    } else if let Some(language) = crate::data_layer::grammar::downloaded_language(path) {
         crate::parser::list_symbols_shared(provider, path, true)?
             .iter()
             .filter(|symbol| {
                 symbol.name == name
+                    || (language == "systemverilog"
+                        && name.rsplit_once("::").is_some_and(|(scope, leaf)| {
+                            symbol.name == leaf
+                                && scope
+                                    .split("::")
+                                    .eq(symbol.scope_chain.iter().map(String::as_str))
+                        }))
                     || symbol.parent.as_ref().is_some_and(|parent| {
                         format!("{parent}.{}", symbol.name) == name
                             || format!("{parent}:{}", symbol.name) == name

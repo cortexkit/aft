@@ -8943,8 +8943,11 @@ fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStreng
     match strength {
         SemanticKindPriorStrength::NaturalLanguage => match kind {
             SymbolKind::Function
+            | SymbolKind::Task
             | SymbolKind::Kernel
             | SymbolKind::Class
+            | SymbolKind::Module
+            | SymbolKind::Package
             | SymbolKind::Method
             | SymbolKind::Struct
             | SymbolKind::Interface
@@ -8956,8 +8959,11 @@ fn semantic_kind_multiplier(kind: &SymbolKind, strength: SemanticKindPriorStreng
         },
         SemanticKindPriorStrength::Mixed => match kind {
             SymbolKind::Function
+            | SymbolKind::Task
             | SymbolKind::Kernel
             | SymbolKind::Class
+            | SymbolKind::Module
+            | SymbolKind::Package
             | SymbolKind::Method
             | SymbolKind::Struct
             | SymbolKind::Interface
@@ -10722,6 +10728,9 @@ fn symbol_kind_label(kind: &SymbolKind) -> &'static str {
         SymbolKind::Variable => "variable",
         SymbolKind::Heading => "heading",
         SymbolKind::FileSummary => "file-summary",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
     }
 }
 

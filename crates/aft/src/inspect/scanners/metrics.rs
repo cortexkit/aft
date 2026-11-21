@@ -278,6 +278,7 @@ fn language_key(path: &Path) -> &'static str {
         Some(LangId::Php) => "php",
         Some(LangId::Lua) => "lua",
         Some(LangId::Luau) => "luau",
+        Some(LangId::SystemVerilog) => "systemverilog",
         Some(LangId::Perl) => "perl",
         Some(LangId::Pascal) => "pascal",
         Some(LangId::R) => "r",

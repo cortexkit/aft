@@ -943,6 +943,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Php => "php",
         LangId::Lua => "lua",
         LangId::Luau => "luau",
+        LangId::SystemVerilog => "systemverilog",
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
@@ -1146,7 +1147,8 @@ fn formatter_candidates_with_pyproject(
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }
@@ -1225,7 +1227,8 @@ fn checker_candidates(
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html | LangId::Markdown | LangId::Yaml => Vec::new(),
     }
 }

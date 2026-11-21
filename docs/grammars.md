@@ -6,6 +6,14 @@ Most languages AFT understands are compiled into AFT itself. A downloadable gram
 
 Files ending in `.luau` get outlines, symbol navigation (`aft_outline`, `aft_zoom`), call graphs (`aft_callgraph`), search, and TODO inspection. `require` paths resolve through `.luaurc` aliases.
 
+## What SystemVerilog projects get
+
+Files ending in `.sv`, `.svh`, `.v`, or `.vh` get outlines and symbol navigation
+(`aft_outline`, `aft_zoom`). They show written declarations, including modules,
+interfaces, packages, functions, and tasks. They do not preprocess includes or
+macros or elaborate a design. The grammar is downloaded on first use and can
+then be reused offline.
+
 ## How a grammar is fetched and stored
 
 - AFT carries a manifest for each downloadable grammar. It names the upstream grammar repository and commit, the license, the file size and its SHA-256 hash. Luau's grammar comes from [tree-sitter-luau](https://github.com/4teapo/tree-sitter-luau) and is published as an asset of this repository's `grammars-1` release.

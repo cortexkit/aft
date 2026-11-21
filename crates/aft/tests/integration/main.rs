@@ -13,6 +13,8 @@ mod test_helpers;
 #[cfg(all(feature = "test-hooks", feature = "wasm-grammars"))]
 mod grammar_loader_test;
 mod helpers;
+#[cfg(feature = "wasm-grammars")]
+mod systemverilog_outline_test;
 
 mod aft_search_contract_test;
 mod apply_patch_leaf_test;

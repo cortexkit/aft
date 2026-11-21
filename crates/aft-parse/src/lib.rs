@@ -66,3 +66,4 @@ pub mod indent;
 pub mod line_matcher;
 pub mod luau;
 pub mod parser;
+mod systemverilog;

@@ -763,6 +763,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Php => "php",
         LangId::Lua => "lua",
         LangId::Luau => "luau",
+        LangId::SystemVerilog => "systemverilog",
         LangId::Perl => "perl",
         LangId::Html => "html",
         LangId::Markdown => "markdown",
@@ -1011,7 +1012,8 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1135,7 +1137,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::SystemVerilog => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1377,6 +1380,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Php => "aft-tool-detection.php",
         LangId::Lua => "aft-tool-detection.lua",
         LangId::Luau => "aft-tool-detection.luau",
+        LangId::SystemVerilog => "aft-tool-detection.sv",
         LangId::Perl => "aft-tool-detection.pl",
         LangId::Html => "aft-tool-detection.html",
         LangId::Markdown => "aft-tool-detection.md",

@@ -9777,6 +9777,9 @@ fn build_embed_text_with_lines_and_caps(
         SymbolKind::Variable => "variable",
         SymbolKind::Heading => "heading",
         SymbolKind::FileSummary => "file-summary",
+        SymbolKind::Module => "module",
+        SymbolKind::Package => "package",
+        SymbolKind::Task => "task",
     };
 
     // Build: "file:relative/path kind:function name:validateAuth signature:fn validateAuth(token: &str) -> bool"
@@ -10591,8 +10594,9 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 // Serialization helpers
 fn symbol_kind_to_u8(kind: &SymbolKind) -> u8 {
     match kind {
-        SymbolKind::Function => 0,
-        SymbolKind::Class => 1,
+        // Preserve the existing disk format; structural records keep the exact kinds.
+        SymbolKind::Function | SymbolKind::Task => 0,
+        SymbolKind::Class | SymbolKind::Module | SymbolKind::Package => 1,
         SymbolKind::Method => 2,
         SymbolKind::Struct => 3,
         SymbolKind::Interface => 4,
