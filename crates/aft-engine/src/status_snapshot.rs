@@ -60,7 +60,7 @@ impl AppContext {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn try_build_status_snapshot(&self) -> Option<StatusPayload> {
         let counts = self.try_status_bar_count_values()?;
         Some(self.build_status_snapshot_with_counts(
