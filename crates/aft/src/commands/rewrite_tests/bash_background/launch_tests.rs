@@ -1,5 +1,16 @@
-use super::*;
+use crate::bash_background::persistence::session_tasks_dir;
+#[cfg(unix)]
+use crate::bash_background::persistence::{read_task_at, resolve_task_layout};
 use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
+use crate::bash_background::registry::BgTaskRegistry;
+use crate::bash_background::{self, BgTaskStatus};
+use crate::sandbox_spawn::SpawnPlan;
+use std::{collections::HashMap, fs, path::Path};
+#[cfg(unix)]
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[test]
 fn windows_launchers_use_injected_production_retry_policies() {
@@ -32,15 +43,15 @@ fn windows_launchers_use_injected_production_retry_policies() {
         found
     }
     // Win32 launchers cannot execute on Unix. Inspect actual call expressions
-    // in their production bodies; comments and test adapters cannot satisfy this fence.
+    // in their production bodies; comments and test adapters cannot satisfy this check.
     for (source, function, callee) in [
         (
-            include_str!("scope_spawn.rs"),
+            include_str!("../../../bash_background/scope_spawn.rs"),
             "spawn_detached_child",
             "crate::windows_shell::spawn_piped_candidates",
         ),
         (
-            include_str!("pty_process.rs"),
+            include_str!("../../../bash_background/pty_process.rs"),
             "spawn_pty_for_command",
             "crate::windows_shell::spawn_pty_candidates",
         ),
@@ -63,17 +74,17 @@ fn launch(
     pty: bool,
     cwd: &Path,
 ) -> Result<String, String> {
-    let shell = super::super::resolve_shell_path(pty, super::super::BashShell::Bash).unwrap();
+    let shell = bash_background::resolve_shell_path(pty, bash_background::BashShell::Bash).unwrap();
     if pty {
         registry.spawn_pty_with_shell(
             SpawnPlan::Unsandboxed,
             "exit 0",
-            super::super::BashShell::Bash,
+            bash_background::BashShell::Bash,
             shell,
             "launch-test".into(),
             cwd.into(),
             HashMap::new(),
-            super::super::HardKill::Default,
+            bash_background::HardKill::Default,
             None,
             storage.into(),
             4,
@@ -87,15 +98,15 @@ fn launch(
         registry.spawn_with_shell_in_slot(
             SpawnPlan::Unsandboxed,
             "exit 0",
-            super::super::BashShell::Bash,
+            bash_background::BashShell::Bash,
             shell,
             "launch-test".into(),
             cwd.into(),
             HashMap::new(),
-            super::super::HardKill::Default,
+            bash_background::HardKill::Default,
             None,
             storage.into(),
-            super::super::TaskSlot::Foreground,
+            bash_background::TaskSlot::Foreground,
             true,
             false,
             Some(storage.into()),
@@ -166,8 +177,7 @@ fn with_live_task(run: impl FnOnce(&crate::context::AppContext, &str)) {
         ..Default::default()
     };
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
-    let ctx =
-        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let request = serde_json::from_value(serde_json::json!({
         "id": "typed-error-spawn", "command": "bash", "session_id": "typed-error",
         "params": { "command": if cfg!(windows) { "ping -n 31 127.0.0.1" } else { "sleep 30" } }
@@ -251,8 +261,7 @@ fn spawn_storage_error_text_cannot_impersonate_slot_refusal() {
         ..Default::default()
     };
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
-    let ctx =
-        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let req = serde_json::from_value(serde_json::json!({
         "id": "typed-spawn", "command": "bash", "session_id": "typed-error", "params": { "command": "exit 0" }
     })).unwrap();

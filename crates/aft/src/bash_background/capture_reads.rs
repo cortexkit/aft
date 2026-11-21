@@ -373,4 +373,4 @@ pub(crate) fn read_raw_edges(buffer: &BgBuffer, width: usize) -> Option<RawEdges
 
 #[cfg(test)]
 #[path = "capture_reads_tests.rs"]
-mod tests;
+pub(crate) mod tests;

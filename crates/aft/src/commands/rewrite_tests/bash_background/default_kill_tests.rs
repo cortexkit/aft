@@ -5,11 +5,15 @@ pub(crate) fn wait_fixture(
     explicit_timeout: Option<u64>,
 ) -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
     let (dir, ctx, task) = test_support::wait_fixture(explicit_timeout);
+    assert_worker_wait_limit(&ctx);
+    (dir, ctx, task)
+}
+
+pub(super) fn assert_worker_wait_limit(ctx: &crate::context::AppContext) {
     assert_eq!(
-        crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx),
+        crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
         1_800_000
     );
-    (dir, ctx, task)
 }
 
 fn message_detach_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {
