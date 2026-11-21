@@ -125,3 +125,6 @@ async fn consent_head_policy_resolves_with_database_unlocked() {
         "aft.db was locked during resolution: {probes:?}"
     );
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

@@ -184,7 +184,7 @@ impl ConfigLiveState {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn project_fallback_file_for_test(&self) -> Option<PathBuf> {
         self.watches
             .lock()
@@ -193,12 +193,12 @@ impl ConfigLiveState {
             .map(|watch| watch.file().to_path_buf())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn project_watcher_sees_config_for_test(&self) -> bool {
         self.project_watcher_sees_config.load(Ordering::Acquire)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn wait_for_watch_attachment(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         let watches = self.watches.lock();

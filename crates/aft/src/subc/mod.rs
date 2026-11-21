@@ -15105,6 +15105,9 @@ pub(crate) mod test_support {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
 }
 
 #[cfg(test)]
@@ -16938,12 +16941,12 @@ mod tests {
         ctx.set_canonical_cache_root(root.as_path().to_path_buf());
         ctx.mark_subc_bound();
         let mut inputs = slot::BuildInputs::from_config(&Config::default(), true);
-        inputs.search.rerank = Some(crate::config::RerankConfig {
+        inputs.search().rerank = Some(crate::config::RerankConfig {
             backend: Some(crate::config::RerankBackendKind::Synapse),
             ..Default::default()
         });
-        inputs.semantic.subc_connection_file = Some(connection.path().to_path_buf());
-        inputs.semantic.route_project_root = Some(root.as_path().to_path_buf());
+        inputs.semantic().subc_connection_file = Some(connection.path().to_path_buf());
+        inputs.semantic().route_project_root = Some(root.as_path().to_path_buf());
         // An explicit pin needs no discovery server, but constructs the real
         // Synapse transport and its nested Tokio runtime on the build thread.
         ctx.rerank_slot().set_constructor_for_test(
@@ -17648,7 +17651,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while counters
             .snapshot()
-            .exclusion_planning
+            .exclusion_planning()
             .is_none_or(|plan| plan.attempts < 2)
         {
             assert!(
@@ -22259,6 +22262,21 @@ mod tests {
             },
         );
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::RetrySlotTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BackendSlotTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BuildInputsTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::LspClientTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::LspEventWaitTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;
 }
 
 #[cfg(test)]

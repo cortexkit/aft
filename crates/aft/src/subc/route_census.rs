@@ -605,17 +605,17 @@ mod tests {
         let (dir, ctx, task) = wait_fixture(None);
         let root = ProjectRootId::from_path(dir.path()).unwrap();
         let registry = ctx.bash_background();
-        std::fs::write(&task.paths.stdout, "private task output").unwrap();
-        std::fs::write(&task.paths.stderr, "").unwrap();
+        std::fs::write(&task.paths().stdout, "private task output").unwrap();
+        std::fs::write(&task.paths().stderr, "").unwrap();
         let watch = registry
             .register_watch(
-                task.task_id.clone(),
+                task.task_id().clone(),
                 WatchPattern::Substring("secret pattern".into()),
                 false,
             )
             .unwrap();
-        std::fs::remove_file(&task.paths.stdout).unwrap();
-        std::fs::remove_file(&task.paths.stderr).unwrap();
+        std::fs::remove_file(&task.paths().stdout).unwrap();
+        std::fs::remove_file(&task.paths().stderr).unwrap();
         let ctx = Arc::new(ctx);
         let executor = Executor::new();
         executor.register_actor(root.clone(), ctx.clone());
@@ -647,12 +647,12 @@ mod tests {
             assert_eq!(route["pins"]["active_watch"], 1);
             assert_eq!(route["last_background_work_age_ms"], 0);
         }
-        let guard = task.state.lock().unwrap();
+        let guard = task.state().lock().unwrap();
         let busy = fixture.snapshot(&executor, &metrics, now).render(&executor);
         assert!(busy["roots"][0]["routes"][0]["pins"]["running_bash"].is_null());
         drop(guard);
         ctx.bash_background()
-            .unregister_watch(&task.task_id, &watch);
+            .unregister_watch(&task.task_id(), &watch);
     }
 
     #[test]
@@ -802,4 +802,7 @@ mod tests {
         assert_eq!(history.entries.len(), DESCRIPTION_LIMIT);
         assert_eq!(history.evicted, 1);
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;
 }

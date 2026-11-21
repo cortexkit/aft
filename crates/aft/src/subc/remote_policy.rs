@@ -1202,3 +1202,6 @@ mod preset_writer_tests {
         assert!(ctx.db().is_none());
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

@@ -826,4 +826,7 @@ mod tests {
         let _other = yields.register(route, 9);
         assert!(!yields.request(route, 7), "an ended watch is not waiting");
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 }

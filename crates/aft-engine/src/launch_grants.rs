@@ -40,7 +40,7 @@ impl UnrestoredGrant {
 struct State {
     absent: HashMap<PolicyKey, Vec<AccessGrant>>,
     reported: HashMap<PolicyKey, Vec<AccessGrant>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     probes: HashMap<PathBuf, usize>,
 }
 
@@ -127,13 +127,13 @@ impl LaunchGrantState {
             .collect()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn note_probe(&self, path: &Path) {
         *self.0.lock().probes.entry(path.to_path_buf()).or_default() += 1;
     }
 
     // Only the Unix-only restore tests read the count.
-    #[cfg(all(test, unix))]
+    #[cfg(all(any(test, feature = "test-support"), unix))]
     pub(crate) fn probe_count(&self, path: &Path) -> usize {
         self.0.lock().probes.get(path).copied().unwrap_or_default()
     }

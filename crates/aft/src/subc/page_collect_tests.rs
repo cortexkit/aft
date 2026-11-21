@@ -1063,3 +1063,6 @@ fn page_collect_read_and_release_are_keyed_by_session() {
     }
     assert!(matches!(read_as(HARNESS, SESSION), ReadReply::Bytes(_)));
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::SnapshotStoreTestExt as _;

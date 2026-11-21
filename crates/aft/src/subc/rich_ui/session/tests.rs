@@ -1102,3 +1102,6 @@ async fn hello_capabilities_are_required_for_core_head_carrier_status() {
         );
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

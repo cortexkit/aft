@@ -511,4 +511,9 @@ mod tests {
         assert!(values["warnings"].is_null());
         assert_eq!(values["diagnostics"], "no_language_server");
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::ExecutorApp as _;
 }

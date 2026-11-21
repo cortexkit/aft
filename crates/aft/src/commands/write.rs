@@ -510,4 +510,7 @@ mod audit_regressions {
         assert_ne!(response.data["no_op"], true);
         assert!(response.data.get("diff").is_none());
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }

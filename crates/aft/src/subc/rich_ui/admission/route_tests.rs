@@ -527,3 +527,6 @@ async fn operation_ledger_isolates_custodian_sessions_and_replays_exact_body() {
     proxy_task.await.unwrap();
     executor.remove_actor(&root);
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

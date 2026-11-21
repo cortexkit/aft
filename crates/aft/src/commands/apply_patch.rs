@@ -1086,6 +1086,9 @@ mod audit_regressions {
             assert!(!backed.contains(&dest.abs));
         }
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
 }
 
 fn report_key(applied: &AppliedHunkResult) -> String {

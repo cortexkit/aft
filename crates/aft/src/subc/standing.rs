@@ -2045,4 +2045,10 @@ mod tests {
             "a failed data layer build fell back to today's search cache"
         );
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppTestExt as _;

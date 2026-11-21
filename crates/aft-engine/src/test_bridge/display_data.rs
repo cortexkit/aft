@@ -265,6 +265,13 @@ pub mod outline {
             })
         }
 
+        pub fn with_loaded(loaded: u64) -> Self {
+            Self(outline::Prewarm {
+                loaded,
+                ..Default::default()
+            })
+        }
+
         pub fn cached(&self) -> u64 {
             self.0.cached
         }
@@ -355,3 +362,5 @@ pub fn bind_foreground(
 ) -> Result<crate::data_layer::checkout::Checkout, crate::data_layer::checkout::DataError> {
     crate::data_layer::runtime::bind_foreground(root, storage, planes)
 }
+mod access;
+pub use access::*;

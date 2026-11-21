@@ -1778,4 +1778,9 @@ mod tests {
         );
         assert!(waits.pending.is_empty());
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppTestExt as _;
 }
