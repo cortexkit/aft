@@ -13,6 +13,7 @@ use subc_protocol::ErrorBody;
 
 use super::{legacy_file_path_digests, served_tools, CallerRole, CatalogPreset, ServedTool};
 
+// Runners must read versioned schema pins (tp2) before AFT advertises tool versions.
 const PUBLISH_TOOL_VERSIONS: bool = false;
 const INITIAL: ToolVersion = ToolVersion::new(1, 0, 0);
 const VERSIONS: &[(&str, ToolVersion)] = &[
@@ -77,11 +78,33 @@ pub(super) fn prepare_catalog(tools: &mut [CatalogTool]) {
     let publish = VERSION_PROBE.unwrap_or(PUBLISH_TOOL_VERSIONS);
     #[cfg(not(feature = "test-hooks"))]
     let publish = PUBLISH_TOOL_VERSIONS;
+    #[cfg(test)]
+    let publish = CATALOG_PUBLICATION
+        .with(|value| value.get())
+        .unwrap_or(publish);
     if !publish {
         for tool in tools {
             tool.version = None;
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static CATALOG_PUBLICATION: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Render archived catalog fixtures in their original wire format even after
+/// production catalogs start advertising versions.
+#[cfg(test)]
+pub(super) fn legacy_catalog() -> impl Drop {
+    struct Restore(Option<bool>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CATALOG_PUBLICATION.with(|value| value.set(self.0));
+        }
+    }
+    Restore(CATALOG_PUBLICATION.with(|value| value.replace(Some(false))))
 }
 
 pub(super) fn admit_pin(

@@ -5180,6 +5180,7 @@ mod tests {
     fn notice_template_vectors() -> BTreeMap<String, String> {
         use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
+        let _legacy_catalog = versions::legacy_catalog();
         let mut files = BTreeMap::new();
         files.insert(
             "README.md".into(),
@@ -5393,6 +5394,7 @@ mod tests {
 
     #[test]
     fn full_catalog_goldens_and_digest_only_have_exact_identity() {
+        let _legacy_catalog = versions::legacy_catalog();
         let mut presets_seen = BTreeSet::new();
         for (_, raw) in CATALOG_FIXTURES {
             let fixtures: Value = serde_json::from_str(raw).unwrap();
@@ -5417,6 +5419,7 @@ mod tests {
     fn legacy_bash_false_catalog_matches_pre_migration_bytes() {
         use crate::config_resolve::{resolve_config, ConfigTier};
 
+        let _legacy_catalog = versions::legacy_catalog();
         // Captured from the pre-migration resolver and renderer at 4d0a522e.
         // In hashline edit mode the description names shell reads that mint
         // line tags only when Bash rewriting is enabled. Pin that wording and

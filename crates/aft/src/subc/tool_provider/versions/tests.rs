@@ -14,6 +14,27 @@ fn admit(call: &ToolCallRequest) -> Result<CallerRole, ErrorBody> {
 }
 
 #[test]
+fn catalog_publication_switch_controls_the_wire_version_and_digest() {
+    let render = || super::super::catalog(json!({"preset":"reader"}), &[], false).unwrap();
+    let default = render();
+    let _legacy = legacy_catalog();
+    let legacy = render();
+    let published = default["tools"].as_array().unwrap();
+    assert!(!published.is_empty());
+    for tool in published {
+        if PUBLISH_TOOL_VERSIONS {
+            assert_eq!(tool["version"], "1.0.0");
+        } else {
+            assert!(tool.get("version").is_none());
+        }
+    }
+    assert_eq!(
+        default["catalog_digest"] != legacy["catalog_digest"],
+        PUBLISH_TOOL_VERSIONS
+    );
+}
+
+#[test]
 fn tp2_same_major_uses_the_current_schema_and_existing_argument_refusals() {
     let current = read_tool();
     let mut newer = current.input_schema.clone();
