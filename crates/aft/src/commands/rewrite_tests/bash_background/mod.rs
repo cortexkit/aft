@@ -8,6 +8,7 @@ mod launch_tests;
 mod persistence;
 mod pty_completion_tests;
 mod registry;
+mod secrets;
 #[cfg(unix)]
 pub(crate) mod spawn_reply;
 #[cfg(target_os = "linux")]
