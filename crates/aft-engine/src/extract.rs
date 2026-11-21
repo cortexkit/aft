@@ -56,9 +56,7 @@ mod tests {
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(crate::test_support::manifest_dir())
-            .join("tests")
-            .join("fixtures")
-            .join("extract_function")
+            .join("../aft/tests/fixtures/extract_function")
             .join(name)
     }
 

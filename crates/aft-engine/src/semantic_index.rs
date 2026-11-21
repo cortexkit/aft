@@ -10895,7 +10895,7 @@ pub(crate) mod tests {
             .and_then(Path::parent)
             .expect("workspace root");
         let files = [
-            workspace_root.join("crates/aft/src/bash_background/registry.rs"),
+            workspace_root.join("crates/aft-engine/src/bash_background/registry.rs"),
             workspace_root.join("crates/aft-tokenizer/src/claude_data.rs"),
         ];
 
