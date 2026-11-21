@@ -1462,7 +1462,11 @@ fn subc_startup_failure_diagnostics_include_exit_status_and_stderr() {
 }
 
 pub(super) async fn accept_module(listener: &ModuleListener) -> TcpStream {
-    let (mut stream, hello) = tokio::time::timeout(Duration::from_secs(10), async {
+    // A daemon whose startup copies its own debug image into a private pin
+    // can take 10-14 s on a CI runner without fast file cloning, before it
+    // connects. This is a wait for a connection that will arrive, so it gets
+    // the suite's generous positive budget.
+    let (mut stream, hello) = tokio::time::timeout(Duration::from_secs(30), async {
         listener.modules.lock().await.recv().await
     })
     .await
