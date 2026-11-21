@@ -1000,17 +1000,22 @@ where
             error: PipedAttemptError::Spawn(error),
         }) => Err(format!(
             "failed to spawn bash command via {}: {error}",
-            candidates[index].binary()
+            aft_engine::test_bridge::bash_remote::windows_shell_binary(&candidates[index])
         )),
         Err(CandidateFailure::Exhausted { last }) => {
             let last_error = match last {
                 Some((index, PipedAttemptError::Spawn(error))) => {
-                    format!("{}: {error}", candidates[index].binary())
+                    format!(
+                        "{}: {error}",
+                        aft_engine::test_bridge::bash_remote::windows_shell_binary(
+                            &candidates[index]
+                        )
+                    )
                 }
                 _ => "no candidates were attempted".into(),
             };
             Err(format!("failed to spawn bash command: no Windows shell could be spawned. Last error: {last_error}. PATH-probed candidates: {:?}",
-                candidates.iter().map(|shell| shell.binary()).collect::<Vec<_>>()))
+                candidates.iter().map(aft_engine::test_bridge::bash_remote::windows_shell_binary).collect::<Vec<_>>()))
         }
         Err(CandidateFailure::Stopped {
             error: PipedAttemptError::Setup(message),
@@ -3248,6 +3253,7 @@ mod tests {
         });
         assert!(!denied.success);
         assert_eq!(denied.data["code"], "sandbox_escalation_denied");
+        use aft_engine::test_bridge::display_data::AppContextTestExt as _;
         assert_eq!(ctx.escalation_grants().lock().len_for_test(), 2);
         crate::sandbox_spawn::clear_sandbox_spawn_test_seam(project.path());
     }

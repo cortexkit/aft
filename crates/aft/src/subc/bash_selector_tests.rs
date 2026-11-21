@@ -557,7 +557,7 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
     assert_eq!(text.matches(&notice).count(), 1, "{text}");
     assert!(ctx
         .bash_background()
-        .take_cancelled_call_notices(CANCEL_SESSION)
+        .test_take_cancelled_call_notices(CANCEL_SESSION)
         .is_empty());
 }
 
