@@ -26,10 +26,6 @@ use crate::lsp::manager::{
 use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
-#[cfg(test)]
-use aft_engine::test_bridge::search_misc::inspect::{
-    InspectBuilderState, InspectCacheTest, InspectManagerTest,
-};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
@@ -6392,6 +6388,7 @@ mod render_text_tests {
 
 #[cfg(test)]
 mod fresh_payload_tests {
+    use aft_engine::test_bridge::search_misc::inspect::InspectManagerTest as _;
     use std::path::PathBuf;
     use std::sync::{Arc, RwLock};
 
@@ -8006,6 +8003,9 @@ mod inspect_freshness_progress_tests {
 
 #[cfg(test)]
 mod deferred_terminal_tests {
+    use aft_engine::test_bridge::search_misc::inspect::{
+        InspectBuilderState, InspectCacheTest as _, InspectManagerTest as _,
+    };
     mod inspect_request_deadline_tests {
         use super::*;
 
