@@ -4,15 +4,16 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::bash_rewrite::rules::{
-        find_request, grep_basic_regex_has_dialect_conflict, grep_request,
-        should_suppress_grep_footer, HeadRule, TailRule,
-    };
+    use crate::bash_rewrite::rules::{HeadRule, TailRule};
     use crate::bash_rewrite::{RewriteDecision, RewriteRule};
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
     use crate::hashline::integration::RegistrationRequest;
     use crate::protocol::DEFAULT_SESSION_ID;
+    use aft_engine::test_bridge::bash_remote::{
+        find_request, grep_basic_regex_has_dialect_conflict, grep_request,
+        should_suppress_grep_footer,
+    };
 
     #[test]
     fn recursive_ls_declines_single_level_rewrite() {
@@ -25,9 +26,9 @@ mod tests {
             },
         );
         for command in ["ls -R", "ls -AR", "ls -RA ."] {
-            assert!(crate::bash_rewrite::rules::ls_request(command, &ctx).is_none(), "{command}");
+            assert!(aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(command, &ctx).is_none(), "{command}");
         }
-        assert!(crate::bash_rewrite::rules::ls_request("ls -A", &ctx).is_some());
+        assert!(aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -A", &ctx).is_some());
     }
 
     /// A directory read never lists `.` and `..`, which is the `ls -A`
@@ -42,10 +43,10 @@ mod tests {
                 ..Config::default()
             },
         );
-        let request = crate::bash_rewrite::rules::ls_request("ls -A", &ctx).expect("ls -A is rewritten");
+        let request = aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -A", &ctx).expect("ls -A is rewritten");
         assert_eq!(request["include_hidden"], json!(true));
         for command in ["ls -a", "ls -la", "ls -aA", "ls -Aa ."] {
-            assert!(crate::bash_rewrite::rules::ls_request(command, &ctx).is_none(), "{command}");
+            assert!(aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(command, &ctx).is_none(), "{command}");
         }
     }
 
@@ -55,7 +56,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn literal_append_rewrites_match_bash_bytes() {
-        use crate::bash_rewrite::parser::tests::LITERAL_APPEND_CASES;
+        use aft_engine::test_bridge::bash_remote::LITERAL_APPEND_CASES;
         use std::process::Command;
 
         if which::which("bash").is_err() {
@@ -331,65 +332,4 @@ mod tests {
         assert!(content.contains("3:three\n4:four\n"), "{content}");
     }
 
-    /// Deciding a head/tail rewrite must not load a file larger than the
-    /// preflight budget, and a session that cannot rewrite reads nothing.
-    #[test]
-    fn head_tail_decisions_skip_whole_file_reads_they_cannot_use() {
-        let dir = fixture();
-        let root = fs::canonicalize(dir.path()).unwrap();
-        fs::write(root.join("src/app.ts"), "one\ntwo\nthree\nfour\n").unwrap();
-        // A sparse file: large on disk metadata, cheap to create.
-        let big = fs::File::create(root.join("src/big.log")).unwrap();
-        big.set_len(64 * 1024 * 1024).unwrap();
-        drop(big);
-        let ctx = crate::test_context(
-            default_language_provider_factory(),
-            Config {
-                project_root: Some(root.clone()),
-                experimental_bash_rewrite: true,
-                ..Default::default()
-            },
-        );
-
-        // No hashline session: tail -n +N declines before any read.
-        crate::bash_rewrite::rules::reset_head_tail_preflight_reads();
-        assert!(matches!(
-            TailRule.decide("tail -n +2 src/app.ts", "tail-off", None, &ctx),
-            RewriteDecision::Decline(_)
-        ));
-        assert_eq!(crate::bash_rewrite::rules::head_tail_preflight_reads(), 0);
-
-        ctx.hashline_bindings().register(
-            &root,
-            DEFAULT_SESSION_ID.to_string(),
-            RegistrationRequest {
-                configured_enabled: true,
-                edit_slot_survives: true,
-                read_slot_survives: true,
-            },
-        );
-        crate::bash_rewrite::rules::reset_head_tail_preflight_reads();
-        assert!(matches!(
-            HeadRule.decide("head -n 1 src/big.log", "big", None, &ctx),
-            RewriteDecision::Decline(_)
-        ));
-        for command in ["tail -n 1 src/big.log", "tail -n +2 src/big.log"] {
-            assert!(
-                matches!(
-                    TailRule.decide(command, "big", None, &ctx),
-                    RewriteDecision::Decline(_)
-                ),
-                "{command}"
-            );
-        }
-        assert_eq!(crate::bash_rewrite::rules::head_tail_preflight_reads(), 0);
-
-        // A small file is read once to decide, even for tail -n +N.
-        crate::bash_rewrite::rules::reset_head_tail_preflight_reads();
-        assert!(matches!(
-            TailRule.decide("tail -n +2 src/app.ts", "tail-on", None, &ctx),
-            RewriteDecision::Accept(_)
-        ));
-        assert_eq!(crate::bash_rewrite::rules::head_tail_preflight_reads(), 1);
-    }
 }

@@ -982,13 +982,15 @@ fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {
 /// This adapter preserves the existing test diagnostics; it has no retry loop.
 #[cfg(test)]
 fn try_spawn_with_fallback<C, F>(
-    candidates: &[crate::windows_shell::WindowsShell],
+    candidates: &[aft_engine::test_bridge::bash_remote::WindowsShell],
     mut try_one: F,
 ) -> Result<C, String>
 where
-    F: FnMut(&crate::windows_shell::WindowsShell) -> std::io::Result<C>,
+    F: FnMut(&aft_engine::test_bridge::bash_remote::WindowsShell) -> std::io::Result<C>,
 {
-    use crate::windows_shell::{spawn_piped_candidates, CandidateFailure, PipedAttemptError};
+    use aft_engine::test_bridge::bash_remote::{
+        spawn_piped_candidates, CandidateFailure, PipedAttemptError,
+    };
     match spawn_piped_candidates(candidates, |shell, _| {
         try_one(shell).map_err(PipedAttemptError::Spawn)
     }) {
@@ -1021,7 +1023,7 @@ where
 mod tests {
     use super::*;
     #[cfg(windows)]
-    use crate::windows_shell::WindowsShell;
+    use aft_engine::test_bridge::bash_remote::WindowsShell;
 
     #[test]
     fn standalone_runon_is_refused_by_name_even_with_remote_execution_enabled() {
@@ -1923,7 +1925,7 @@ mod tests {
     /// macOS/Linux dev machines without a real Windows spawn.
     #[test]
     fn try_spawn_with_fallback_retries_on_notfound_until_success() {
-        use crate::windows_shell::WindowsShell;
+        use aft_engine::test_bridge::bash_remote::WindowsShell;
         use std::cell::RefCell;
         use std::io::{Error, ErrorKind};
 
@@ -1963,7 +1965,7 @@ mod tests {
     /// spawn shells.
     #[test]
     fn try_spawn_with_fallback_stops_at_first_success() {
-        use crate::windows_shell::WindowsShell;
+        use aft_engine::test_bridge::bash_remote::WindowsShell;
         use std::cell::RefCell;
 
         let candidates = [
@@ -1992,7 +1994,7 @@ mod tests {
     /// early avoids wasted work and surfaces the real error.
     #[test]
     fn try_spawn_with_fallback_returns_immediately_on_non_notfound_error() {
-        use crate::windows_shell::WindowsShell;
+        use aft_engine::test_bridge::bash_remote::WindowsShell;
         use std::cell::RefCell;
         use std::io::{Error, ErrorKind};
 
@@ -2031,7 +2033,7 @@ mod tests {
     /// issue #27-class problems can see what was attempted.
     #[test]
     fn try_spawn_with_fallback_reports_all_candidates_when_none_succeed() {
-        use crate::windows_shell::WindowsShell;
+        use aft_engine::test_bridge::bash_remote::WindowsShell;
         use std::io::{Error, ErrorKind};
 
         let candidates = [WindowsShell::Pwsh, WindowsShell::Cmd];
@@ -2060,7 +2062,7 @@ mod tests {
     /// "no candidates were attempted" rather than panic on empty iteration.
     #[test]
     fn try_spawn_with_fallback_handles_empty_candidates_list() {
-        use crate::windows_shell::WindowsShell;
+        use aft_engine::test_bridge::bash_remote::WindowsShell;
 
         let candidates: [WindowsShell; 0] = [];
         let result: Result<&'static str, String> = try_spawn_with_fallback(&candidates, |_shell| {
@@ -3425,7 +3427,10 @@ exec "$@"
         assert_eq!(lines[1], "--profile-json");
         assert!(serde_json::from_str::<serde_json::Value>(lines[2]).is_ok());
         assert_eq!(lines[3], "--failure-fd");
-        assert_eq!(lines[4], crate::sandbox_spawn::CHILD_FAILURE_FD.to_string());
+        assert_eq!(
+            lines[4],
+            aft_engine::test_bridge::bash_remote::CHILD_FAILURE_FD.to_string()
+        );
         assert_eq!(lines[5], "--");
         assert!(lines.len() >= 8, "wrapped argv missing target: {lines:?}");
 

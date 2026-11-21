@@ -1,6 +1,5 @@
 use super::*;
-use crate::bash_background::registry::runon_capture::set_test_cap;
-use crate::exec_remote::wire_tests::Daemon;
+use aft_engine::test_bridge::bash_remote::{remote_wire::Daemon, set_test_cap};
 
 const COPY_WARNING: &str = "Copied while another command in this checkout was still running; its changes may be missing from the job.";
 const EDIT: &str = "until test -e .release-editor; do sleep 0.02; done; printf 'edited before capture\n' > tracked.txt";

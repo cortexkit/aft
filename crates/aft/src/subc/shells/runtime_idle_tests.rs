@@ -93,7 +93,7 @@ async fn shells_v1_last_watch_stops_collection_and_reopens_with_current_first_fr
     assert_eq!(first["rows"][0]["command"], "printf before");
     let initial_calls = settled_calls(&service).await;
     replace_command(&ctx, &task, "printf while-watched");
-    crate::bash_background::shell_metadata::facts_changed();
+    aft_engine::test_bridge::bash_remote::shell_metadata::facts_changed();
     let changed = receive(&mut output, 1, FrameType::StreamData).await;
     assert_eq!(changed["type"], "upsert");
     assert_eq!(changed["row"]["command"], "printf while-watched");
@@ -115,7 +115,7 @@ async fn shells_v1_last_watch_stops_collection_and_reopens_with_current_first_fr
     assert!(cached_key.is_some());
 
     replace_command(&ctx, &task, "printf while-idle");
-    crate::bash_background::shell_metadata::facts_changed();
+    aft_engine::test_bridge::bash_remote::shell_metadata::facts_changed();
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(
         settled_calls(&service).await,
@@ -132,7 +132,7 @@ async fn shells_v1_last_watch_stops_collection_and_reopens_with_current_first_fr
     assert_eq!(listed["result"]["rows"][0]["command"], "printf while-idle");
     let after_list = settled_calls(&service).await;
     assert_eq!(after_list, before_close + 1);
-    crate::bash_background::shell_metadata::facts_changed();
+    aft_engine::test_bridge::bash_remote::shell_metadata::facts_changed();
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert_eq!(
         settled_calls(&service).await,

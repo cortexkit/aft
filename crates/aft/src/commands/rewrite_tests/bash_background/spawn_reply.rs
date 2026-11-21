@@ -1,6 +1,6 @@
-use crate::bash_background::successful_spawn_response;
 use crate::context::AppContext;
 use crate::protocol::Response;
+use aft_engine::test_bridge::bash_remote::successful_spawn_response;
 use std::time::Duration;
 
 #[cfg(all(test, unix))]
@@ -37,7 +37,7 @@ pub(crate) fn completed_spawn_for_test(
 
 #[cfg(all(test, unix))]
 mod spawn_reply_tests {
-    use crate::bash_background::successful_spawn_response;
+    use aft_engine::test_bridge::bash_remote::successful_spawn_response;
     use serde_json::json;
 
     #[test]

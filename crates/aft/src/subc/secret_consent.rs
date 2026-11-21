@@ -831,7 +831,7 @@ pub(crate) fn use_label_for_fetch(
     if vault.can_release_material() && crate::secret_proxy::protect_secret_process().is_err() {
         return LaunchDecision::Refuse(LabelOutcome::Refuse {
             code: crate::secret::SECRETS_UNAVAILABLE,
-            message: crate::bash_background::secrets::PROXY_UNAVAILABLE.to_owned(),
+            message: aft_engine::test_bridge::bash_remote::PROXY_UNAVAILABLE.to_owned(),
         });
     }
     let answer = vault.use_secret(&scopes.authorization, label, target);

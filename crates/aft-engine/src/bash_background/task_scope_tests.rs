@@ -156,15 +156,7 @@ fn task_scope_placement_refuses_a_live_unplaced_child() {
     );
 }
 
-pub(crate) struct StopOnDrop(pub(crate) String);
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        if let Ok(Some(scope)) = super::super::task_scope::lookup(&self.0) {
-            let _ = scope.stop();
-        }
-    }
-}
-
+use super::test_support::scopes::{require_manager, scope_stopped, until, StopOnDrop};
 struct ModuleScopeGuard {
     unit: String,
     root: std::path::PathBuf,
@@ -392,7 +384,7 @@ fn task_scope_deadline_survives_durable_starting_checkpoint() {
         )
     });
     let id = arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let layout = super::super::persistence::resolve_task(root.path(), "task-scope", &id).unwrap();
     let saved = read_task_at(&layout).unwrap();
     assert_eq!(saved.status, super::super::BgTaskStatus::Starting);
@@ -451,19 +443,6 @@ fn scope_spawn(
     .unwrap()
 }
 
-pub(crate) fn require_manager() {
-    super::super::task_scope::probe_user_manager(Duration::from_secs(1))
-        .expect("requires a systemd user manager");
-}
-
-pub(crate) fn scope_stopped(events: &Path) -> bool {
-    match std::fs::read_to_string(events) {
-        Ok(text) => text.lines().any(|line| line == "populated 0"),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-        Err(error) => panic!("cannot read cgroup.events: {error}"),
-    }
-}
-
 #[test]
 fn task_scope_stopped_requires_empty_or_missing_events() {
     let root = tempfile::tempdir().unwrap();
@@ -474,14 +453,6 @@ fn task_scope_stopped_requires_empty_or_missing_events() {
     std::fs::write(&events, "populated 0\n").unwrap();
     assert!(scope_stopped(&events));
     assert!(std::panic::catch_unwind(|| scope_stopped(root.path())).is_err());
-}
-
-pub(crate) fn until(mut condition: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(15);
-    while !condition() {
-        assert!(Instant::now() < deadline, "task scope condition timed out");
-        std::thread::sleep(Duration::from_millis(20));
-    }
 }
 
 #[test]
@@ -497,7 +468,7 @@ fn task_scope_spawn_has_named_membership() {
         super::super::HardKill::After(Duration::from_secs(90)),
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let task = r.task(&id).unwrap();
     let pid = task.lock_state().unwrap().metadata.child_pid.unwrap();
     let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
@@ -519,7 +490,7 @@ fn task_scope_memory_uses_the_task_scope() {
         super::super::HardKill::Default,
         Some(64),
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let task = r.task(&id).unwrap();
     let policy = task
         .lock_state()
@@ -589,7 +560,7 @@ fn task_scope_kill_reaches_setsid_descendant() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     until(|| root.path().join("escaped").exists());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     r.kill(&id, "task-scope").unwrap();
@@ -764,7 +735,7 @@ fn task_scope_replay_adopts_and_keeps_output() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let paths = first.task(&id).unwrap().paths.clone();
     until(|| {
         std::fs::read_to_string(&paths.stdout)
@@ -822,7 +793,7 @@ fn task_scope_replay_identity_refusal_does_not_block_session() {
         super::super::HardKill::Default,
         None,
     );
-    let _a = StopOnDrop(a.clone());
+    let _a = StopOnDrop::new(a.clone());
     let b = scope_spawn(
         &first,
         root.path(),
@@ -830,7 +801,7 @@ fn task_scope_replay_identity_refusal_does_not_block_session() {
         super::super::HardKill::Default,
         None,
     );
-    let _b = StopOnDrop(b.clone());
+    let _b = StopOnDrop::new(b.clone());
     let (bad, healthy) = if a < b { (&a, &b) } else { (&b, &a) };
     let layout = super::super::persistence::resolve_task(root.path(), "task-scope", bad).unwrap();
     let mut metadata = read_task_at(&layout).unwrap();
@@ -874,7 +845,7 @@ fn task_scope_kill_without_handle_uses_exact_identity() {
     let root = tempfile::tempdir().unwrap();
     let first = BgTaskRegistry::default();
     let id = scope_spawn(&first, root.path(), "setsid /bin/sh -c 'trap \"\" TERM; echo $$ > escaped; while :; do sleep 1; done' & sleep 60", super::super::HardKill::Default, None);
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     until(|| root.path().join("escaped").exists());
     let task = first.task(&id).unwrap();
     let metadata = task.lock_state().unwrap().metadata.clone();
@@ -904,7 +875,7 @@ fn task_scope_kill_without_handle_does_not_need_pid_identity() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let task = first.task(&id).unwrap();
     let mut metadata = task.lock_state().unwrap().metadata.clone();
     metadata.child_start_time_ms = metadata.child_start_time_ms.map(|start| start + 1);
@@ -933,7 +904,7 @@ fn task_scope_kill_distinguishes_absent_present_and_failed() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let other = BgTaskRegistry::default();
     other.kill_task_scope(&id).unwrap();
     let fake = tempfile::tempdir().unwrap();
@@ -972,7 +943,7 @@ fn task_scope_uncached_kill_does_not_need_user_bus() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let scope = super::super::task_scope::lookup(&id).unwrap().unwrap();
     for target in [random_slug(), id] {
         let output = std::process::Command::new(std::env::current_exe().unwrap()).args(["--exact", "bash_background::registry::task_scope_tests::task_scope_uncached_kill_does_not_need_user_bus", "--nocapture", "--include-ignored"]).env(ID, target).env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent/aft-probe-bus").env("XDG_RUNTIME_DIR", "/nonexistent/aft-probe-runtime").output().unwrap();
@@ -1194,7 +1165,7 @@ fn task_scope_replay_keeps_live_identity_without_user_manager() {
             super::super::HardKill::Default,
             cap,
         );
-        let _stop = StopOnDrop(id.clone());
+        let _stop = StopOnDrop::new(id.clone());
         std::fs::write(root.path().join("task-id"), &id).unwrap();
         let pid = registry
             .task(&id)
@@ -1508,7 +1479,7 @@ fn task_scope_scoped_task_without_marker_is_fate_unknown() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let task = first.task(&id).unwrap();
     let paths = task.paths.clone();
     let pid = task.lock_state().unwrap().metadata.child_pid.unwrap();
@@ -1554,7 +1525,7 @@ fn task_scope_cleanup_and_hook_require_readable_owned_records() {
         super::super::HardKill::Default,
         None,
     );
-    let _terminal = StopOnDrop(terminal.clone());
+    let _terminal = StopOnDrop::new(terminal.clone());
     let running = scope_spawn(
         &r,
         root.path(),
@@ -1562,7 +1533,7 @@ fn task_scope_cleanup_and_hook_require_readable_owned_records() {
         super::super::HardKill::Default,
         None,
     );
-    let _running = StopOnDrop(running.clone());
+    let _running = StopOnDrop::new(running.clone());
     let foreign = scope_spawn(
         &r,
         foreign_root.path(),
@@ -1570,7 +1541,7 @@ fn task_scope_cleanup_and_hook_require_readable_owned_records() {
         super::super::HardKill::Default,
         None,
     );
-    let _foreign = StopOnDrop(foreign.clone());
+    let _foreign = StopOnDrop::new(foreign.clone());
     let unreadable = scope_spawn(
         &r,
         root.path(),
@@ -1578,7 +1549,7 @@ fn task_scope_cleanup_and_hook_require_readable_owned_records() {
         super::super::HardKill::Default,
         None,
     );
-    let _unreadable = StopOnDrop(unreadable.clone());
+    let _unreadable = StopOnDrop::new(unreadable.clone());
     let task =
         super::super::persistence::resolve_task(root.path(), "task-scope", &terminal).unwrap();
     let mut metadata = read_task_at(&task).unwrap();
@@ -1617,7 +1588,7 @@ fn task_scope_cleanup_requires_this_storage_description() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let original = super::super::persistence::resolve_task(root.path(), "task-scope", &id).unwrap();
     let mut metadata = read_task_at(&original).unwrap();
     metadata.mark_terminal(super::super::BgTaskStatus::Completed, Some(0), None);
@@ -1652,7 +1623,7 @@ fn task_scope_cleanup_keeps_harness_store_coverage() {
         super::super::HardKill::Default,
         None,
     );
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let task = super::super::persistence::resolve_task(&store, "task-scope", &id).unwrap();
     let mut metadata = read_task_at(&task).unwrap();
     metadata.mark_terminal(super::super::BgTaskStatus::Completed, Some(0), None);
@@ -1954,7 +1925,7 @@ fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
             true,
         )
         .unwrap();
-    let _stop = StopOnDrop(id.clone());
+    let _stop = StopOnDrop::new(id.clone());
     let task = registry.task(&id).unwrap();
     until(|| {
         std::fs::read_to_string(&task.paths.stdout)

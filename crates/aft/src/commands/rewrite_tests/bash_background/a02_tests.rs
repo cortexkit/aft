@@ -1,4 +1,4 @@
-use crate::bash_background::registry::test_support::{
+use aft_engine::test_bridge::bash_remote::registry_support::{
     capture_display_terminal, display_bodies, set_completion_secrets, terminal_fixture,
 };
 

@@ -1,8 +1,8 @@
 use crate::bash_background::persistence::{read_task_at, resolve_task_layout};
-use crate::bash_background::registry::test_support::{
+use crate::harness::Harness;
+use aft_engine::test_bridge::bash_remote::registry_support::{
     cleanup_finished_at, enqueue_counted_completion, watchdog_fixture as fixture,
 };
-use crate::harness::Harness;
 use std::time::{Duration, Instant};
 
 #[test]

@@ -67,15 +67,9 @@ struct Entry {
     worker_read: Option<WorkerReadGrant>,
 }
 
-pub(crate) struct SpeechTicket {
-    pub(crate) prepared: crate::gh_shim_speech::service::PreparedLaunch,
-    pub(crate) incarnation: String,
-    pub(crate) stored: AtomicBool,
-    pub(crate) background: AtomicBool,
-    pub(crate) active: AtomicBool,
-    pub(crate) failure: Mutex<Option<crate::gh_shim_speech::Refusal>>,
-}
-
+#[path = "gh_shim_speech/ticket_type.rs"]
+pub(crate) mod ticket_type;
+pub(crate) use ticket_type::SpeechTicket;
 thread_local! {static SPAWN_TICKET:std::cell::RefCell<Option<[u8;TICKET_BYTES]>>=const{std::cell::RefCell::new(None)};}
 
 pub(crate) struct SpawnTicketGuard(Option<[u8; TICKET_BYTES]>);

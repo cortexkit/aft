@@ -653,7 +653,7 @@ fn terminate_pty_group(pid: u32) {
 /// Test gates that park a piped-task kill after it has published `Killing`
 /// and released the state lock, before it signals, so a test can act while
 /// the kill is in flight. Keyed by task id so parallel tests do not collide.
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 struct KillSignalGate {
     reached: crossbeam_channel::Sender<()>,
     release: crossbeam_channel::Receiver<()>,
@@ -665,7 +665,7 @@ static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGa
 
 // Park a terminal publisher after it releases the state lock but before it
 // queues the completion. The channel pair is the same as the kill-signal gate.
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
 
@@ -1585,12 +1585,12 @@ pub(crate) struct RegistryInner {
     /// tests count what persisted-GC sweeps cost.
     #[cfg(test)]
     gc_db_liveness_queries: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) child_polls: AtomicU64,
     /// Test-only count of task snapshots built (`snapshot_with_terminal_cache`,
     /// which can open task files on disk), by any caller. Tests use it to
     /// check that a held foreground bash call's periodic task checks build none.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) snapshots_built: AtomicU64,
     /// Name of the thread the per-storage-root persisted GC ran on. Lets the
     /// integration suite pin that the GC stays off the configure/replay thread
@@ -1755,102 +1755,9 @@ pub struct RouteCensusTask {
     pub last_work_age_ms: u64,
 }
 
-pub(crate) struct BgTask {
-    start_view: Mutex<Option<crate::gh_shim_speech::start_view::StartView>>,
-    #[cfg(unix)]
-    provider_preflight: Mutex<Option<Arc<crate::shell_env_provider::PreflightLayout>>>,
-    changed_files: Option<Arc<crate::bash_changed_files::Capture>>,
-    /// Absent after replay: secret values must never be persisted or recovered
-    /// from payload files. Completion notices withhold output when this is absent.
-    completion_secrets: Mutex<Option<crate::log_redact::SecretValues>>,
-    pub(crate) task_id: String,
-    pub(crate) session_id: String,
-    launching_identity: Option<super::TaskIdentity>,
-    pub(crate) paths: TaskPaths,
-    artifact_root: PathBuf,
-    /// Canonical root identity captured at registration and retained on deletion.
-    /// Reclaim probes compare it without filesystem calls on the frame loop.
-    project_root: PathBuf,
-    pub(crate) started: Instant,
-    /// Whether this task holds one of the project root's background slots
-    /// (`max_background_bash_tasks`): true for a background or PTY launch and
-    /// for a task reloaded after a restart, false for a foreground command
-    /// while its caller waits on it. Promotion sets it (see
-    /// [`super::TaskSlot::Foreground`]).
-    holds_background_slot: AtomicBool,
-    /// Completion of the PTY reader thread, which owns an output-file handle
-    /// independently of `PtyRuntime` while it drains the pseudoterminal. Piped
-    /// and replayed tasks have no reader and start complete.
-    terminal_reader_done: Arc<AtomicBool>,
-    /// Whether a delegated worker's wait may push this task's hard kill later
-    /// ([`BgTaskRegistry::renew_hard_kill`]): true only for the implicit
-    /// default kill, which the task's record carries (`default_hard_kill`) so
-    /// a task reloaded after a restart stays renewable.
-    hard_kill_renewable: bool,
-    /// The hard-kill limit last written to the task's record, so renewals
-    /// write it at most about once a minute (see [`RENEWAL_PERSIST_STEP_MS`]).
-    persisted_hard_kill_ms: AtomicU64,
-    pub(crate) last_reminder_at: Mutex<Option<Instant>>,
-    pub(crate) terminal_at: Mutex<Option<Instant>>,
-    /// Terminal launcher images cannot be created again. Once removal or an
-    /// absent image is confirmed, later cleanup passes need no task/IO probes.
-    terminal_image_cleaned: AtomicBool,
-    /// Serialize terminal notification routing, including watch safety nets.
-    /// Delivery acknowledgement remains separate so pending results can replay.
-    terminal_notification_routed: Mutex<bool>,
-    /// The project registry whose sessions receive this task's completion
-    /// and cancelled-call notices, when the task is shared between registries
-    /// (see `SavedRemoteTaskClaim`): the first registry that is not a
-    /// `bash.kill_scope` recovery registry to restore or register it. `None`
-    /// for a task only one registry holds; that registry publishes its notices.
-    notice_registry: Mutex<Option<std::sync::Weak<RegistryInner>>>,
-    /// Lets the watchdog's per-tick exit-marker check skip the full marker
-    /// read while the marker is still the empty file it found last time.
-    exit_marker_probe: Mutex<super::persistence::ExitMarkerProbe>,
-    #[cfg(unix)]
-    adopted_exit: Mutex<super::exit_observer::AdoptedExit>,
-    pub(crate) state: Mutex<BgTaskState>,
-    /// The remote worker has observed a stream record or settled a submission
-    /// failure. Kept in memory: launch callers need this only in this process.
-    pub(crate) remote_launch_ready: AtomicBool,
-    /// Launch-only projection, published while state is locked but read without
-    /// that lock. Reply deadlines must not confuse a queued state read with a
-    /// runner that has not accepted the job.
-    runon_launch_state: Mutex<Option<RunonLaunchState>>,
-    /// A remote worker thread is running for this task. At most one may run
-    /// per task: `start_remote_worker` claims this flag before spawning one,
-    /// and the worker clears it as its last step.
-    #[cfg(unix)]
-    pub(crate) remote_worker_running: AtomicBool,
-    drain_reply: BashDrainReplyCache,
-    /// Cache construction is serialized independently of task state: renderers
-    /// can read artifacts and invoke callbacks without holding the state lock.
-    terminal_render: Mutex<()>,
-    /// Notified, with `state` locked, when a kill clears
-    /// `BgTaskState::kill_in_flight`. Readers that must answer with a settled
-    /// status wait on it instead of holding `state` across the kill.
-    terminal_persist_dirty: AtomicBool,
-    pub(crate) timeout_kill_queued: AtomicBool,
-    kill_settled: std::sync::Condvar,
-    /// Notified when the first process-group check saves its result.
-    descendant_sample_saved: std::sync::Condvar,
-    #[cfg(unix)]
-    remote_cancel_notify: tokio::sync::Notify,
-    #[cfg(unix)]
-    local_capture_command: std::sync::OnceLock<runon_capture::LocalCommand>,
-    #[cfg(unix)]
-    runon_copy_warning: AtomicBool,
-    /// Harness namespace the task's aft.db row is keyed under: the harness of
-    /// the route that started it (or of the row it was replayed from). The
-    /// root context is shared by routes from several harnesses, so this can
-    /// differ from the registry's current `db_harness`.
-    db_harness: Option<String>,
-    /// Orders this task's aft.db row writes, which happen after `state` is
-    /// released; see [`DbWriteOrder`]. Shared by every `BgTask` for the same
-    /// session and task id in the process.
-    db_write_order: Arc<DbWriteOrder>,
-}
-
+#[path = "task_types.rs"]
+pub(crate) mod task_types;
+pub(crate) use task_types::{BgTask, BgTaskState, TaskRuntime};
 pub struct ForegroundWaitGuard {
     registry: BgTaskRegistry,
     session_id: String,
@@ -2092,76 +1999,6 @@ impl Drop for DeferredDbWrites<'_> {
     }
 }
 
-pub(crate) enum TaskRuntime {
-    Piped(Option<Child>),
-    Pty(Option<PtyRuntime>),
-}
-
-pub(crate) struct BgTaskState {
-    pub(crate) metadata: PersistedTask,
-    /// Only the latest pre-acceptance line, never written to task metadata.
-    pub(crate) remote_admission_note: Option<String>,
-    /// The path stays in persisted metadata until this worker result succeeds,
-    /// so a crash or a full queue leaves enough information for the stale sweep.
-    temp_cleanup: Option<crossbeam_channel::Receiver<std::io::Result<()>>>,
-    /// Spaces out removal attempts after this task's scratch removal failed.
-    temp_cleanup_retry: super::temp_cleanup::RetryBackoff,
-    /// The scratch directory this task used, kept in memory after cleanup has
-    /// deleted it and cleared `metadata.sandbox_temp_dir`. A later read of a
-    /// path inside it by the same session can then fail as not-found instead
-    /// of asking for permission to read a file that no longer exists.
-    pub(crate) removed_temp_dir: Option<PathBuf>,
-    /// Delete the scratch directory without waiting for its retention time:
-    /// the retention sweep found it due, the session's scope ended, or the
-    /// task record is being pruned. In memory only; a restart re-derives the
-    /// time from the persisted `metadata.sandbox_temp_delete_at`.
-    scratch_released: bool,
-    pub(crate) runtime: TaskRuntime,
-    /// Pinned task-io directory and original O_EXCL output handles retained for
-    /// the process lifetime. Daemon writes never reopen child-writable names.
-    pub(crate) io_handles: Option<TaskIoHandles>,
-    pub(crate) detached: bool,
-    /// True once an owned child handle has observed the direct child's exit
-    /// via `try_wait()` or `wait()`. Used by the two-pass watchdog to skip the racy
-    /// `is_process_alive(child_pid)` probe on the second pass — we already
-    /// have authoritative evidence that the child is dead, no need to
-    /// re-verify via PID liveness which is unreliable on Windows where
-    /// PIDs can be recycled within seconds.
-    ///
-    /// Remains `false` on replay-restored tasks (those have a `child_pid`
-    /// but never observed exit via this process's `try_wait()`), so those
-    /// continue to fall through to the `is_process_alive` probe path.
-    pub(crate) child_exit_observed: bool,
-    /// Prevent duplicate completion delivery while the post-exit process-group
-    /// sample is waiting for its grace period.
-    pub(crate) descendant_sampling_started: bool,
-    /// The first check of the process group has started but its result is
-    /// not saved yet. Set together with `descendant_sampling_started`, so a
-    /// publisher that skips sampling because it has started waits for this to
-    /// clear (see `finish_terminal_transition`) instead of sending a notice
-    /// built before any check.
-    pub(crate) descendant_sample_pending: bool,
-    /// Reclamation found no saved process identity still in the terminal
-    /// task's group. A stale descendant list, or a reused group number, must
-    /// not retain the deleted root. Rechecked after a registry restart.
-    root_reclaim_group_unowned: bool,
-    /// True while a kill has released this lock to signal and reap the
-    /// process group. That kill owns the terminal transition until it clears
-    /// the flag: the watchdog must not declare the task dead without an exit
-    /// marker, and a second kill waits for the first rather than signaling
-    /// again.
-    pub(crate) kill_in_flight: bool,
-    pub(crate) buffer: BgBuffer,
-    terminal_output_cache: Option<TerminalOutputCache>,
-    // The terminal render is immutable until invalidated. Keep its payload
-    // total outside the render so the estimate's existing size formula stays
-    // unchanged and health does not scan retained recovery lines every tick.
-    terminal_output_cache_bytes: u64,
-    /// PTY timeout intent, a known memory stop, or a piped kill's committed
-    /// outcome after observing no natural marker before the signal decision.
-    pub(crate) pending_terminal_override: Option<BgTaskStatus>,
-}
-
 pub const ARTIFACT_PAGE_BYTES: usize = 64 * 1024;
 
 pub struct ArtifactPage {
@@ -2309,9 +2146,9 @@ impl BgTaskRegistry {
                 persisted_gc_runs: AtomicU64::new(0),
                 #[cfg(test)]
                 gc_db_liveness_queries: AtomicU64::new(0),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 child_polls: AtomicU64::new(0),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 snapshots_built: AtomicU64::new(0),
                 persisted_gc_thread: Mutex::new(None),
                 session_recovery: Mutex::new(HashMap::new()),
@@ -2618,7 +2455,7 @@ impl BgTaskRegistry {
             .ok_or_else(|| "task_not_found".to_string())?;
         let mut file = open_task_artifact(&task.paths, artifact)
             .map_err(|error| format!("artifact_refused: {error}"))?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         ARTIFACT_READ_ALL_CALLS.with(|calls| calls.set(calls.get() + 1));
         file.read_all()
             .map_err(|error| format!("artifact_refused: {error}"))
@@ -3243,7 +3080,7 @@ impl BgTaskRegistry {
         task: &Arc<BgTask>,
         preview_bytes: usize,
     ) -> BgTaskSnapshot {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner.snapshots_built.fetch_add(1, Ordering::Relaxed);
         let mut snapshot = task.snapshot(preview_bytes);
         self.maybe_compress_snapshot(task, &mut snapshot);
@@ -3436,7 +3273,7 @@ impl BgTaskRegistry {
             }
         }
         self.settle_memory_accounting(task)?;
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "test-support")))]
         {
             let gate = TERMINAL_PUBLICATION_GATES
                 .get()
@@ -12310,7 +12147,7 @@ impl BgTaskRegistry {
             match &mut state.runtime {
                 TaskRuntime::Piped(child_slot) => {
                     if let Some(child) = child_slot.as_mut() {
-                        #[cfg(test)]
+                        #[cfg(any(test, feature = "test-support"))]
                         self.inner.child_polls.fetch_add(1, Ordering::Relaxed);
                         if let Ok(Some(status)) = child.try_wait() {
                             *child_slot = None;
@@ -17070,8 +16907,9 @@ fn canonicalized_path(path: &Path) -> PathBuf {
     fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
+    #[cfg(test)]
     static ARTIFACT_RANGE_AFTER_STAT: std::cell::RefCell<Option<Box<dyn FnOnce(&TaskPaths)>>> = const { std::cell::RefCell::new(None) };
     static ARTIFACT_READ_ALL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -18270,10 +18108,9 @@ mod task_scope_tests;
 #[cfg(all(test, unix))]
 #[path = "completion_replay_ordering_tests.rs"]
 mod completion_replay_ordering_tests;
-#[cfg(test)]
-pub(crate) mod test_support {
-    include!("registry_test_support.rs");
-}
+#[cfg(any(test, feature = "test-support"))]
+#[path = "registry_test_support.rs"]
+pub(crate) mod test_support;
 
 #[cfg(all(test, unix))]
 #[path = "kill_survivor_tests.rs"]
@@ -19008,55 +18845,7 @@ mod tests {
         }
     }
 
-    pub(crate) fn insert_terminal_piped_task(
-        registry: &BgTaskRegistry,
-        dir: &tempfile::TempDir,
-        command: &str,
-        stdout: &str,
-        stderr: &str,
-        compressed: bool,
-    ) -> (String, Arc<BgTask>) {
-        let task_id = random_slug();
-        let paths = task_paths(dir.path(), "session", &task_id).unwrap();
-        fs::create_dir_all(&paths.dir).unwrap();
-        fs::write(&paths.stdout, stdout).unwrap();
-        fs::write(&paths.stderr, stderr).unwrap();
-        let mut metadata = PersistedTask::starting(
-            task_id.clone(),
-            "session".to_string(),
-            command.to_string(),
-            dir.path().to_path_buf(),
-            Some(dir.path().to_path_buf()),
-            Some(30_000),
-            true,
-            compressed,
-        );
-        metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
-        write_task(&paths.json, &metadata).unwrap();
-        registry
-            .insert_rehydrated_task(metadata, paths, true)
-            .expect("insert terminal task");
-        let task = registry.task_for_session(&task_id, "session").unwrap();
-        // This fixture models a live command; replay behavior has separate tests.
-        *task.completion_secrets.lock().unwrap() = Some(Default::default());
-        (task_id, task)
-    }
-
-    pub(crate) fn lifecycle_running_fixture(
-        registry: &BgTaskRegistry,
-        dir: &tempfile::TempDir,
-    ) -> Arc<BgTask> {
-        let (_, task) = insert_terminal_piped_task(registry, dir, "true", "", "", false);
-        let mut state = task.lock_state().unwrap();
-        state.metadata.status = BgTaskStatus::Running;
-        state.metadata.notify_on_completion = false;
-        state.metadata.completion_delivered = false;
-        write_task(&task.paths.json, &state.metadata).unwrap();
-        drop(state);
-        task.holds_background_slot.store(false, Ordering::SeqCst);
-        task
-    }
-
+    use super::test_support::{insert_terminal_piped_task, lifecycle_running_fixture};
     #[cfg(unix)]
     fn approved_reap_fixture(command: &str) -> (tempfile::TempDir, BgTaskRegistry, Arc<BgTask>) {
         use std::os::unix::process::ExitStatusExt;
@@ -27390,27 +27179,7 @@ mod tests {
         );
     }
 
-    pub(crate) fn registry_with_db_and_frames(
-        storage: &Path,
-    ) -> (
-        BgTaskRegistry,
-        Arc<Mutex<TrackedConnection>>,
-        Arc<Mutex<Vec<PushFrame>>>,
-    ) {
-        let frames = Arc::new(Mutex::new(Vec::new()));
-        let captured = Arc::clone(&frames);
-        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
-            captured.lock().unwrap().push(frame);
-        })
-            as Box<dyn Fn(PushFrame) + Send + Sync>);
-        let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
-        registry.set_harness(Harness::Opencode);
-        let conn = crate::db::open(&storage.join("aft.db")).expect("open test DB");
-        let shared = Arc::new(Mutex::new(conn));
-        registry.set_db_pool(shared.clone());
-        (registry, shared, frames)
-    }
-
+    use super::test_support::registry_with_db_and_frames;
     fn task_caller(
         root: &Path,
         principal: &str,
@@ -27731,18 +27500,7 @@ mod tests {
         });
     }
 
-    /// Kills every task the registry still holds when the test ends, whether
-    /// it passed or panicked. Background children are detached so they can
-    /// outlive a bridge; one a test leaves running outlives the test process
-    /// too and, on Windows, keeps the test runner's output handles open.
-    pub(crate) struct KillTasksOnDrop(pub(crate) BgTaskRegistry);
-
-    impl Drop for KillTasksOnDrop {
-        fn drop(&mut self) {
-            self.0.shutdown();
-        }
-    }
-
+    use super::test_support::KillTasksOnDrop;
     #[cfg(unix)]
     fn spawn_long_running_task(
         registry: &BgTaskRegistry,
@@ -29686,7 +29444,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let task_id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,
@@ -29724,7 +29482,7 @@ mod tests {
         frames.lock().unwrap().clear();
 
         let (replayed, _db2, replay_frames) = registry_with_db_and_frames(storage);
-        let _reap_replayed = KillTasksOnDrop(replayed.clone());
+        let _reap_replayed = KillTasksOnDrop::new(replayed.clone());
         // Keep the original process's task row out of the way; replay loads from DB/disk.
         registry
             .inner
@@ -29900,7 +29658,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         registry.inner.shutdown.store(true, Ordering::SeqCst);
         let spawn = || {
             registry
@@ -29984,7 +29742,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, _db, frames) = registry_with_db_and_frames(storage);
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         registry.inner.shutdown.store(true, Ordering::SeqCst);
         let id = registry
             .spawn(
@@ -30107,7 +29865,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let storage = dir.path();
         let (registry, db, _) = registry_with_db_and_frames(storage);
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let task_id = registry
             .spawn(
                 SpawnPlan::Unsandboxed,
@@ -30373,68 +30131,9 @@ mod tests {
         assert!(masked.ends_with("page final\n"));
     }
 
-    pub(crate) fn each_line_running_fixture(
-        storage: &Path,
-    ) -> (
-        BgTaskRegistry,
-        Arc<BgTask>,
-        Arc<Mutex<Vec<PushFrame>>>,
-        String,
-    ) {
-        each_line_running_fixture_with_once(storage, false)
-    }
-
-    pub(crate) fn each_line_running_fixture_with_once(
-        storage: &Path,
-        once: bool,
-    ) -> (
-        BgTaskRegistry,
-        Arc<BgTask>,
-        Arc<Mutex<Vec<PushFrame>>>,
-        String,
-    ) {
-        let (registry, _, frames) = registry_with_db_and_frames(storage);
-        let task_id = registry
-            .spawn(
-                SpawnPlan::Unsandboxed,
-                LONG_RUNNING_COMMAND,
-                "session".into(),
-                storage.to_path_buf(),
-                HashMap::new(),
-                crate::bash_background::HardKill::After(Duration::from_secs(30)),
-                None,
-                storage.to_path_buf(),
-                10,
-                true,
-                false,
-                Some(storage.to_path_buf()),
-            )
-            .unwrap();
-        registry
-            .inner
-            .shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        let watch = registry
-            .register_watch_delivery(
-                task_id.clone(),
-                WatchPattern::Substring("READY".into()),
-                once,
-                true,
-            )
-            .unwrap();
-        let task = registry.task_for_session(&task_id, "session").unwrap();
-        (registry, task, frames, watch)
-    }
-
-    pub(crate) fn append_each_line_output(path: &Path, bytes: &[u8]) {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(path)
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-    }
-
+    use super::test_support::{
+        append_each_line_output, each_line_running_fixture, each_line_running_fixture_with_once,
+    };
     /// Scan until a replayed watch delivers its pending match.
     ///
     /// Right after a replay a scan can return without emitting and without
@@ -30478,7 +30177,7 @@ mod tests {
         for secrets in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (registry, task, _, watch) = each_line_running_fixture(dir.path());
-            let _reap = KillTasksOnDrop(registry.clone());
+            let _reap = KillTasksOnDrop::new(registry.clone());
             let metadata = {
                 let mut state = task.lock_state().unwrap();
                 state.metadata.completion_has_env_secrets = Some(secrets);
@@ -30497,7 +30196,7 @@ mod tests {
                 .inner
                 .shutdown
                 .store(true, std::sync::atomic::Ordering::SeqCst);
-            let _reap_replayed = KillTasksOnDrop(replayed.clone());
+            let _reap_replayed = KillTasksOnDrop::new(replayed.clone());
             append_each_line_output(&task.paths.stdout, b"READY 03b92ca085 failed\n");
             let reloaded = replayed.task_for_session(&task.task_id, "session").unwrap();
             let matched = scan_until_new_match(&replayed, &reloaded, &frames);
@@ -30523,7 +30222,7 @@ mod tests {
     fn each_line_rows_never_mask_the_watch_pattern() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, frames, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let token = format!("ghp_{}", "Q".repeat(36));
         let prefix_watch = registry
             .register_watch_delivery(
@@ -30570,7 +30269,7 @@ mod tests {
                 let dir = tempfile::tempdir().unwrap();
                 let (registry, task, frames, watch) =
                     each_line_running_fixture_with_once(dir.path(), true);
-                let _reap = KillTasksOnDrop(registry.clone());
+                let _reap = KillTasksOnDrop::new(registry.clone());
                 let mut noise = vec![b'x'; super::super::watch_lines::MAX_LINE_BYTES + 1];
                 noise.push(b'\n');
                 append_each_line_output(&task.paths.stdout, &noise);
@@ -30629,7 +30328,7 @@ mod tests {
                 } else {
                     (registry.clone(), frames.clone())
                 };
-                let _reap_live = KillTasksOnDrop(live.clone());
+                let _reap_live = KillTasksOnDrop::new(live.clone());
                 append_each_line_output(&task.paths.stdout, b"READY after warning\n");
                 let live_task = live.task_for_session(&task.task_id, "session").unwrap();
                 let matched = scan_until_new_match(&live, &live_task, &live_frames);
@@ -30661,7 +30360,7 @@ mod tests {
     fn each_line_over_mask_limit_is_counted_unavailable_without_false_secret_text() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, frames, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let line = format!(
             "{{\"status\":\"READY\",\"payload\":\"{}\"}}\n",
             "x".repeat(10 * 1024)
@@ -30692,7 +30391,7 @@ mod tests {
     fn masked_status_page_utf8_internal_boundary_renders_character_once() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, _, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let line = format!("{}€{}\n", "x".repeat(4095), "y".repeat(1024));
         append_each_line_output(&task.paths.stdout, line.as_bytes());
         let page =
@@ -30709,7 +30408,7 @@ mod tests {
     fn masked_status_page_unavailable_line_is_counted_once_and_neighbors_survive() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, _, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let input = format!(
             "plain before\n{{\"payload\":\"{}\"}}\nplain after\n",
             "x".repeat(10 * 1024)
@@ -30723,7 +30422,7 @@ mod tests {
     fn masked_status_page_keeps_real_secret_redaction_across_chunk_edges() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, _, _) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         let secret = "actual-secret-crossing-the-internal-boundary";
         let fixed = "{\"padding\":\"\",\"password\":\"".len();
         let input = format!(
@@ -30746,7 +30445,7 @@ mod tests {
     fn each_line_stream_offsets_do_not_collide_as_ack_versions() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         append_each_line_output(&task.paths.stdout, b"READY a\n");
         registry.scan_task_watch_output(&task);
         append_each_line_output(&task.paths.stderr, b"READY b\n");
@@ -30775,7 +30474,7 @@ mod tests {
     fn each_line_final_partial_flush_advances_version_without_cursor_movement() {
         let dir = tempfile::tempdir().unwrap();
         let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
-        let _reap = KillTasksOnDrop(registry.clone());
+        let _reap = KillTasksOnDrop::new(registry.clone());
         append_each_line_output(&task.paths.stdout, b"READY tail");
         append_each_line_output(&task.paths.stderr, b"READY other\n");
         registry.scan_task_watch_output(&task);
@@ -30806,7 +30505,7 @@ mod tests {
         for acknowledge_first in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let (registry, task, frames, watch) = each_line_running_fixture(dir.path());
-            let _reap = KillTasksOnDrop(registry.clone());
+            let _reap = KillTasksOnDrop::new(registry.clone());
             append_each_line_output(&task.paths.stdout, b"READY a\n");
             registry.scan_task_watch_output(&task);
             let first = pattern_match_frames(&frames).pop().unwrap();
@@ -30824,7 +30523,7 @@ mod tests {
             }
             registry.clear_task_watch_state(&task.task_id);
             let (replayed, _, replay_frames) = registry_with_db_and_frames(dir.path());
-            let _reap_replayed = KillTasksOnDrop(replayed.clone());
+            let _reap_replayed = KillTasksOnDrop::new(replayed.clone());
             replayed
                 .replay_session_inner(dir.path(), "session", None)
                 .unwrap();
@@ -31245,24 +30944,7 @@ mod a02_tests {
     use super::*;
     use crate::bash_background::persistence::write_task;
 
-    pub(crate) fn terminal_fixture() -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>)
-    {
-        let (dir, ctx, task) = test_support::wait_fixture(None);
-        assert_eq!(ctx.config().bash.worker_wait_max_ms, 1_800_000);
-        {
-            let mut state = task.state.lock().unwrap();
-            state
-                .metadata
-                .mark_terminal(BgTaskStatus::Completed, Some(0), None);
-            state.metadata.compressed = true;
-            state.terminal_output_cache = None;
-            write_task(&task.paths.json, &state.metadata).unwrap();
-        }
-        std::fs::write(&task.paths.stdout, "identical output\n").unwrap();
-        std::fs::write(&task.paths.stderr, "").unwrap();
-        (dir, ctx, task)
-    }
-
+    use super::test_support::terminal_fixture;
     #[test]
     fn pty_display_counts_one_stream_and_uses_the_pty_detail_field() {
         let (_dir, ctx, task) = terminal_fixture();

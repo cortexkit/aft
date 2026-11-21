@@ -19,6 +19,9 @@ use crate::log_redact::SecretValues;
 /// Bytes read past the display detail's limit to finish the line that crosses it.
 const LINE_FINISH_BYTES: u64 = 1024 * 1024;
 
+#[cfg(any(test, feature = "test-support"))]
+pub const DISPLAY_LINE_FINISH_BYTES: u64 = LINE_FINISH_BYTES;
+
 /// Bytes read per step while scanning a capture for credentials.
 const SCAN_CHUNK_BYTES: u64 = 1024 * 1024;
 

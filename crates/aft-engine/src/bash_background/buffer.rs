@@ -11,7 +11,7 @@ use super::persistence::{
 #[cfg(test)]
 static TAIL_READS: OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> = OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     pub(crate) static ARTIFACT_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
@@ -120,23 +120,16 @@ impl DiskTruncation {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) enum ArtifactSource {
-    Registered {
-        paths: TaskPaths,
-        artifact: TaskArtifact,
-    },
-    #[cfg(test)]
-    Exact(PathBuf),
-}
-
+#[path = "buffer_types.rs"]
+pub(crate) mod buffer_types;
+pub(crate) use buffer_types::{ArtifactSource, BgBuffer};
 impl ArtifactSource {
     fn open(&self) -> io::Result<ValidatedArtifact> {
         retry_artifact_read(|| self.open_once())
     }
 
     fn open_once(&self) -> io::Result<ValidatedArtifact> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         ARTIFACT_OPENS.with(|count| count.set(count.get() + 1));
         #[cfg(feature = "test-timing-hooks")]
         if matches!(
@@ -249,17 +242,6 @@ impl ArtifactSource {
 #[cfg(test)]
 thread_local! {
     static GROW_AFTER_STAT: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
-}
-
-#[derive(Debug, Clone)]
-pub(crate) enum BgBuffer {
-    Pipes {
-        stdout: ArtifactSource,
-        stderr: ArtifactSource,
-    },
-    Pty {
-        combined: ArtifactSource,
-    },
 }
 
 impl BgBuffer {

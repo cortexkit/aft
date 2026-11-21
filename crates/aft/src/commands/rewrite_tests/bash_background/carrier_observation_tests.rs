@@ -1,11 +1,11 @@
 use super::default_kill_tests;
 use crate::bash_background::persistence::create_task_layout;
 use crate::bash_background::persistence::write_task_at;
-use crate::bash_background::registry::test_support::{
-    insert_terminal_piped_task, register_unpersisted_watch,
-};
 use crate::bash_background::watches::WatchPattern;
 use crate::protocol::RawRequest;
+use aft_engine::test_bridge::bash_remote::registry_support::{
+    insert_terminal_piped_task, register_unpersisted_watch,
+};
 use std::{
     fs,
     sync::{Arc, Mutex},

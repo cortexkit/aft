@@ -2,10 +2,11 @@ mod tests {
     use crate::bash_background::persistence::{
         task_paths, write_task, BgMode, ExitMarker, PersistedTask,
     };
-    use crate::bash_background::registry::{test_support::registry_cases::*, TaskRuntime};
     use crate::bash_background::watches::{PatternMatch, WatchPattern};
-    use crate::bash_background::{buffer::BgBuffer, BgTaskStatus};
+    use crate::bash_background::BgTaskStatus;
     use crate::protocol::BashPatternMatchFrame;
+    use aft_engine::test_bridge::bash_remote::BgBuffer;
+    use aft_engine::test_bridge::bash_remote::{registry_support::registry_cases::*, TaskRuntime};
     use std::{fs, path::PathBuf, time::Instant};
 
     #[test]
@@ -187,13 +188,14 @@ mod tests {
                 carrier: "reserved:carrier".into(),
                 call_key: "terminal".into(),
             };
-            let (frame, _, retained_body) = crate::bash_background::frames::recovered_bash_frame(
-                snapshot,
-                &key,
-                dir.path(),
-                None,
-            )
-            .expect("terminal recovered frame");
+            let (frame, _, retained_body) =
+                aft_engine::test_bridge::bash_remote::recovered_bash_frame(
+                    snapshot,
+                    &key,
+                    dir.path(),
+                    None,
+                )
+                .expect("terminal recovered frame");
             let retained = retained_body
                 .as_deref()
                 .expect("recovered native result is retained");

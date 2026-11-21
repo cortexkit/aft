@@ -1,7 +1,13 @@
 use super::*;
 use crate::bash_background::persistence::{task_paths, write_task};
+use std::io::Write;
 
-pub(crate) fn wait_fixture(
+#[cfg(unix)]
+pub(super) const LONG_RUNNING_COMMAND: &str = "sleep 5";
+#[cfg(windows)]
+pub(super) const LONG_RUNNING_COMMAND: &str = "ping -n 6 127.0.0.1";
+
+pub fn wait_fixture(
     explicit_timeout: Option<u64>,
 ) -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
     let dir = tempfile::tempdir().unwrap();
@@ -52,9 +58,7 @@ pub(crate) fn wait_fixture(
     (dir, ctx, task)
 }
 
-pub(crate) use super::tests::insert_terminal_piped_task;
-
-pub(crate) fn register_unpersisted_watch(
+pub fn register_unpersisted_watch(
     registry: &BgTaskRegistry,
     id: String,
     pattern: WatchPattern,
@@ -69,12 +73,9 @@ pub(crate) fn register_unpersisted_watch(
         .unwrap();
 }
 
-pub(crate) use super::completion_preview::capture_reads::tests::DISPLAY_LINE_FINISH_BYTES;
-pub(crate) use super::completion_preview::capture_reads::tests::{
-    filler, terminal_task, with_secret,
-};
+pub use super::completion_preview::capture_reads::DISPLAY_LINE_FINISH_BYTES;
 
-pub(crate) fn display_bodies(
+pub fn display_bodies(
     registry: &BgTaskRegistry,
     task: &Arc<BgTask>,
     metadata: &PersistedTask,
@@ -84,20 +85,14 @@ pub(crate) fn display_bodies(
 }
 
 #[cfg(unix)]
-pub(crate) mod ordering {
-    pub(crate) use super::super::completion_replay_ordering_tests::{
-        capture_live_ordering_frames, completion_frames, live_secret_task,
-        pause_ordering_publication, registry, MASKED, SESSION,
-    };
-}
+#[path = "ordering_fixture.rs"]
+pub mod ordering;
 
-pub(crate) use super::a02_tests::terminal_fixture;
-
-pub(crate) fn set_completion_secrets(task: &BgTask, values: crate::log_redact::SecretValues) {
+pub fn set_completion_secrets(task: &BgTask, values: crate::log_redact::SecretValues) {
     *task.completion_secrets.lock().unwrap() = Some(values);
 }
 
-pub(crate) fn capture_display_terminal(
+pub fn capture_display_terminal(
     registry: &BgTaskRegistry,
     task: &Arc<BgTask>,
     stale: &PersistedTask,
@@ -106,22 +101,23 @@ pub(crate) fn capture_display_terminal(
     registry.capture_display_terminal(task, stale, buffer);
 }
 
-pub(crate) use super::pty_completion_tests::Fixture as ConPtyFixture;
+#[path = "conpty_fixture.rs"]
+pub(crate) mod conpty;
+pub use conpty::Fixture as ConPtyFixture;
 
 #[cfg(target_os = "linux")]
-pub(crate) mod scopes {
-    pub(crate) use super::super::task_scope_tests::{
-        require_manager, scope_stopped, until, StopOnDrop,
-    };
-}
+#[path = "scope_fixture.rs"]
+pub mod scopes;
 
-pub(crate) use super::watchdog_cost_tests::fixture as watchdog_fixture;
+#[path = "watchdog_fixture.rs"]
+mod watchdog;
+pub use watchdog::watchdog_fixture;
 
-pub(crate) fn cleanup_finished_at(registry: &BgTaskRegistry, retention: Duration, now: Instant) {
+pub fn cleanup_finished_at(registry: &BgTaskRegistry, retention: Duration, now: Instant) {
     registry.cleanup_finished_at(retention, now);
 }
 
-pub(crate) fn enqueue_counted_completion(
+pub fn enqueue_counted_completion(
     registry: &BgTaskRegistry,
     metadata: &PersistedTask,
     paths: &TaskPaths,
@@ -136,37 +132,34 @@ pub(crate) fn enqueue_counted_completion(
     );
 }
 
-pub(crate) mod registry_cases {
-    pub(crate) use super::super::tests::{
-        append_each_line_output, each_line_running_fixture, each_line_running_fixture_with_once,
-        lifecycle_running_fixture, registry_with_db_and_frames, KillTasksOnDrop,
-    };
-    pub(crate) use super::insert_terminal_piped_task;
+pub mod registry_cases {
     use super::*;
+    pub use super::{
+        append_each_line_output, each_line_running_fixture, each_line_running_fixture_with_once,
+        insert_terminal_piped_task, lifecycle_running_fixture, registry_with_db_and_frames,
+        KillTasksOnDrop,
+    };
 
-    pub(crate) fn reset_full_artifact_read_calls() {
+    pub fn reset_full_artifact_read_calls() {
         ARTIFACT_READ_ALL_CALLS.with(|calls| calls.set(0));
     }
-    pub(crate) fn full_artifact_read_calls() -> usize {
+    pub fn full_artifact_read_calls() -> usize {
         ARTIFACT_READ_ALL_CALLS.with(std::cell::Cell::get)
     }
-    pub(crate) fn random_slug() -> String {
+    pub fn random_slug() -> String {
         super::super::random_slug()
     }
-    pub(crate) fn terminal_metadata_from_marker(
+    pub fn terminal_metadata_from_marker(
         metadata: PersistedTask,
         marker: ExitMarker,
         reason: Option<String>,
     ) -> PersistedTask {
         super::super::terminal_metadata_from_marker(metadata, marker, reason)
     }
-    pub(crate) fn terminal_db_row_snapshot(
-        row: BashTaskRow,
-        metadata: PersistedTask,
-    ) -> BgTaskSnapshot {
+    pub fn terminal_db_row_snapshot(row: BashTaskRow, metadata: PersistedTask) -> BgTaskSnapshot {
         super::super::terminal_db_row_snapshot(row, metadata)
     }
-    pub(crate) fn persist_watch_match(
+    pub fn persist_watch_match(
         registry: &BgTaskRegistry,
         session: &str,
         task: &str,
@@ -177,7 +170,7 @@ pub(crate) mod registry_cases {
     ) {
         registry.persist_watch_match(session, task, matched, Some((stdout, stderr, pty)));
     }
-    pub(crate) fn ack_persisted_watches_for_task(
+    pub fn ack_persisted_watches_for_task(
         registry: &BgTaskRegistry,
         session: &str,
         task: &str,
@@ -185,4 +178,197 @@ pub(crate) mod registry_cases {
     ) {
         registry.ack_persisted_watches_for_task(session, task, terminal);
     }
+}
+
+pub fn insert_terminal_piped_task(
+    registry: &BgTaskRegistry,
+    dir: &tempfile::TempDir,
+    command: &str,
+    stdout: &str,
+    stderr: &str,
+    compressed: bool,
+) -> (String, Arc<BgTask>) {
+    let task_id = random_slug();
+    let paths = task_paths(dir.path(), "session", &task_id).unwrap();
+    fs::create_dir_all(&paths.dir).unwrap();
+    fs::write(&paths.stdout, stdout).unwrap();
+    fs::write(&paths.stderr, stderr).unwrap();
+    let mut metadata = PersistedTask::starting(
+        task_id.clone(),
+        "session".to_string(),
+        command.to_string(),
+        dir.path().to_path_buf(),
+        Some(dir.path().to_path_buf()),
+        Some(30_000),
+        true,
+        compressed,
+    );
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task(&paths.json, &metadata).unwrap();
+    registry
+        .insert_rehydrated_task(metadata, paths, true)
+        .expect("insert terminal task");
+    let task = registry.task_for_session(&task_id, "session").unwrap();
+    // This fixture models a live command; replay behavior has separate tests.
+    *task.completion_secrets.lock().unwrap() = Some(Default::default());
+    (task_id, task)
+}
+
+pub fn lifecycle_running_fixture(
+    registry: &BgTaskRegistry,
+    dir: &tempfile::TempDir,
+) -> Arc<BgTask> {
+    let (_, task) = insert_terminal_piped_task(registry, dir, "true", "", "", false);
+    let mut state = task.lock_state().unwrap();
+    state.metadata.status = BgTaskStatus::Running;
+    state.metadata.notify_on_completion = false;
+    state.metadata.completion_delivered = false;
+    write_task(&task.paths.json, &state.metadata).unwrap();
+    drop(state);
+    task.holds_background_slot.store(false, Ordering::SeqCst);
+    task
+}
+
+pub fn registry_with_db_and_frames(
+    storage: &Path,
+) -> (
+    BgTaskRegistry,
+    Arc<Mutex<TrackedConnection>>,
+    Arc<Mutex<Vec<PushFrame>>>,
+) {
+    let frames = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&frames);
+    let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+        captured.lock().unwrap().push(frame);
+    })
+        as Box<dyn Fn(PushFrame) + Send + Sync>);
+    let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
+    registry.set_harness(Harness::Opencode);
+    let conn = crate::db::open(&storage.join("aft.db")).expect("open test DB");
+    let shared = Arc::new(Mutex::new(conn));
+    registry.set_db_pool(shared.clone());
+    (registry, shared, frames)
+}
+
+/// Kills every task the registry still holds when the test ends, whether
+/// it passed or panicked. Background children are detached so they can
+/// outlive a bridge; one a test leaves running outlives the test process
+/// too and, on Windows, keeps the test runner's output handles open.
+pub struct KillTasksOnDrop(BgTaskRegistry);
+
+impl KillTasksOnDrop {
+    pub fn new(registry: BgTaskRegistry) -> Self {
+        Self(registry)
+    }
+}
+
+impl Drop for KillTasksOnDrop {
+    fn drop(&mut self) {
+        self.0.shutdown();
+    }
+}
+
+pub fn each_line_running_fixture(
+    storage: &Path,
+) -> (
+    BgTaskRegistry,
+    Arc<BgTask>,
+    Arc<Mutex<Vec<PushFrame>>>,
+    String,
+) {
+    each_line_running_fixture_with_once(storage, false)
+}
+
+pub fn each_line_running_fixture_with_once(
+    storage: &Path,
+    once: bool,
+) -> (
+    BgTaskRegistry,
+    Arc<BgTask>,
+    Arc<Mutex<Vec<PushFrame>>>,
+    String,
+) {
+    let (registry, _, frames) = registry_with_db_and_frames(storage);
+    let task_id = registry
+        .spawn(
+            SpawnPlan::Unsandboxed,
+            LONG_RUNNING_COMMAND,
+            "session".into(),
+            storage.to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            storage.to_path_buf(),
+            10,
+            true,
+            false,
+            Some(storage.to_path_buf()),
+        )
+        .unwrap();
+    registry
+        .inner
+        .shutdown
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let watch = registry
+        .register_watch_delivery(
+            task_id.clone(),
+            WatchPattern::Substring("READY".into()),
+            once,
+            true,
+        )
+        .unwrap();
+    let task = registry.task_for_session(&task_id, "session").unwrap();
+    (registry, task, frames, watch)
+}
+
+pub fn append_each_line_output(path: &Path, bytes: &[u8]) {
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .unwrap()
+        .write_all(bytes)
+        .unwrap();
+}
+
+pub fn terminal_fixture() -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
+    let (dir, ctx, task) = wait_fixture(None);
+    assert_eq!(ctx.config().bash.worker_wait_max_ms, 1_800_000);
+    {
+        let mut state = task.state.lock().unwrap();
+        state
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        state.metadata.compressed = true;
+        state.terminal_output_cache = None;
+        write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+    std::fs::write(&task.paths.stdout, "identical output\n").unwrap();
+    std::fs::write(&task.paths.stderr, "").unwrap();
+    (dir, ctx, task)
+}
+
+pub fn terminal_task(
+    registry: &BgTaskRegistry,
+    fixture: &tempfile::TempDir,
+    stdout: &str,
+    compressed: bool,
+) -> std::sync::Arc<BgTask> {
+    let (_, task) = insert_terminal_piped_task(registry, fixture, "cmd", stdout, "", compressed);
+    task
+}
+
+pub fn with_secret(task: &BgTask, value: &str) {
+    *task.completion_secrets.lock().unwrap() =
+        Some(crate::log_redact::SecretValues::from_environment([(
+            std::ffi::OsStr::new("API_TOKEN"),
+            std::ffi::OsStr::new(value),
+        )]));
+}
+
+/// Lines of `filler` text, `bytes` long in total.
+pub fn filler(bytes: usize) -> String {
+    let line = "compiling crate foo v0.1.0 (/src/foo)\n";
+    let mut text = line.repeat(bytes / line.len());
+    text.push_str(&"x".repeat(bytes - text.len()));
+    text
 }

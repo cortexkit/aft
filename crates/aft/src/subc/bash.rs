@@ -713,7 +713,7 @@ mod default_kill_tests {
             .spawn()
             .unwrap();
         task.state.lock().unwrap().runtime =
-            crate::bash_background::registry::TaskRuntime::Piped(Some(child.into()));
+            aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(child.into()));
         let registry = ctx.bash_background();
         let observation = observe_deferred_bash_wait(
             registry.clone(),
@@ -726,10 +726,10 @@ mod default_kill_tests {
         )
         .await;
         let polls = registry.inner.child_polls.load(Ordering::Relaxed);
-        if let crate::bash_background::registry::TaskRuntime::Piped(Some(mut child)) =
+        if let aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(mut child)) =
             std::mem::replace(
                 &mut task.state.lock().unwrap().runtime,
-                crate::bash_background::registry::TaskRuntime::Piped(None),
+                aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(None),
             )
         {
             child.kill().unwrap();
@@ -755,7 +755,7 @@ mod default_kill_tests {
             .spawn()
             .unwrap();
         task.state.lock().unwrap().runtime =
-            crate::bash_background::registry::TaskRuntime::Piped(Some(child.into()));
+            aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(child.into()));
         let registry = ctx.bash_background();
         let snapshots_before = registry.inner.snapshots_built.load(Ordering::Relaxed);
         let mut finished = 0;
@@ -776,10 +776,10 @@ mod default_kill_tests {
         let snapshots = registry.inner.snapshots_built.load(Ordering::Relaxed) - snapshots_before;
         // End the child while it is still running, then check that a finished
         // task is reported finished without a snapshot either.
-        if let crate::bash_background::registry::TaskRuntime::Piped(Some(mut child)) =
+        if let aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(Some(mut child)) =
             std::mem::replace(
                 &mut task.state.lock().unwrap().runtime,
-                crate::bash_background::registry::TaskRuntime::Piped(None),
+                aft_engine::test_bridge::bash_remote::TaskRuntime::Piped(None),
             )
         {
             child.kill().unwrap();
@@ -6517,7 +6517,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn subc_blocking_runon_queued_past_its_timeout_answers_with_job_and_phase() {
-        use crate::exec_remote::wire_tests::{daemon, id, Script};
+        use aft_engine::test_bridge::bash_remote::remote_wire::{daemon, id, Script};
         // The runner accepts the job at queue position 7 and keeps it queued
         // well past the call's `timeout`. Allow time for input capture on busy
         // test hosts so this fixture tests queued handback, not capture expiry.
@@ -6615,7 +6615,7 @@ mod grant_path_tests {
     mod held_bash_contract {
         use super::*;
         use crate::bash_background::{registry::SCOPE_REVOKED_REASON, BgTaskStatus};
-        use crate::exec_remote::wire_tests::{Daemon, Script};
+        use aft_engine::test_bridge::bash_remote::remote_wire::{Daemon, Script};
 
         #[test]
         fn held_bash_log_names_cancellation_without_promising_background_work() {
@@ -7003,9 +7003,9 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     async fn capture_fixture(
-        script: crate::exec_remote::wire_tests::Script,
+        script: aft_engine::test_bridge::bash_remote::remote_wire::Script,
     ) -> (
-        crate::exec_remote::wire_tests::Daemon,
+        aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
         tempfile::TempDir,
         ProjectRootId,
         Arc<Executor>,
@@ -7017,17 +7017,19 @@ mod grant_path_tests {
     /// [`capture_fixture`] with a runner that advertises `claims`.
     #[cfg(unix)]
     async fn capture_fixture_with_claims(
-        script: crate::exec_remote::wire_tests::Script,
+        script: aft_engine::test_bridge::bash_remote::remote_wire::Script,
         claims: &[&str],
     ) -> (
-        crate::exec_remote::wire_tests::Daemon,
+        aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
         tempfile::TempDir,
         ProjectRootId,
         Arc<Executor>,
         Arc<AppContext>,
     ) {
-        let daemon =
-            crate::exec_remote::wire_tests::daemon_with_capabilities(script, claims, 1).await;
+        let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
+            script, claims, 1,
+        )
+        .await;
         let (dir, root) = super::super::test_support::test_root("runon-capture");
         assert!(std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -7285,7 +7287,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_draining_retry_waits_for_accepted() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::DrainingGatedAcceptance).await;
         let timing = BashTimingForTest::new(Instant::now());
@@ -7331,7 +7333,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_draining_retry_can_be_killed_after_launch_reply() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::Draining {
             refusals: u32::MAX,
             retry_after_ms: Some(10000),
@@ -7420,7 +7422,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_blocking_wait_keeps_its_own_limit() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for mode in ["wait", "block_to_completion"] {
             let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::GatedAcceptance).await;
@@ -7458,7 +7460,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_pre_acceptance_refusal_ends_subc_worker_wait_promptly() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for (reason, detail) in [
             ("runner_full", Some("hosted_host_full")),
             ("network_unsupported", None),
@@ -7523,7 +7525,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_pre_submission_failures_end_subc_worker_wait_promptly() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for unavailable_connection in [false, true] {
             let (daemon, _dir, root, executor, _ctx) =
                 capture_fixture_with_claims(Script::Plain, &["unrelated/v1"]).await;
@@ -7570,7 +7572,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_status_is_starting_until_accepted() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedAcceptance).await;
         let mut rx = capture_call(
             &executor,
@@ -7629,7 +7631,7 @@ mod grant_path_tests {
 
     #[cfg(unix)]
     async fn capture_interrupt_call(drain: bool) {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedAcceptance).await;
         let metrics = Arc::new(DispatchPathMetrics::new());
         let cancel = BashWaitCancel {
@@ -7713,7 +7715,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bash_keepalive_runon_local_capture_wait_observes_quiet_remote_job() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, _ctx) =
             capture_fixture(Script::GatedAcceptanceThenExit).await;
         let clock = Arc::new(AtomicU64::new(0));
@@ -7773,7 +7775,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_restart_module_loop_reports_pending_until_accepted() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for background in [false] {
             let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::GatedAcceptance).await;
@@ -7926,7 +7928,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_module_loop_drain_after_accepted_keeps_running_reply() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedStages { position: 1 }).await;
         // Keep the foreground wait from promoting the call on its own before
@@ -8028,7 +8030,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_cancellation_and_drain_signals_interrupt_wait() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for drain in [false, true] {
             let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::GatedAcceptance).await;
@@ -8115,7 +8117,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_replies_at_registration_before_acceptance() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedAcceptanceThenExit).await;
         let received_at = Instant::now();
@@ -8190,7 +8192,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_with_return_paths_replies_at_once_and_copies_back_at_completion() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, dir, root, executor, ctx) = capture_fixture_with_claims(
             Script::GatedReturnVector("failed-missing"),
             &["exec-remote/v1", "exec-remote-return/v2"],
@@ -8263,7 +8265,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_refusal_after_reply_is_a_task_completion() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedAcceptanceThenRefused).await;
         let mut rx = capture_call(
@@ -8315,7 +8317,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_kill_before_submission_never_dispatches() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedRoute).await;
         let mut replies = capture_call(
             &executor,
@@ -8380,7 +8382,7 @@ mod grant_path_tests {
     /// deadline.
     #[cfg(unix)]
     async fn background_admission_reply(
-        daemon: &crate::exec_remote::wire_tests::Daemon,
+        daemon: &aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
         executor: &Arc<Executor>,
         root: &ProjectRootId,
     ) -> (BashDeferredCompletion, Instant) {
@@ -8436,7 +8438,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn background_runon_remote_cancel_placement_waits_for_id_and_terminal() {
-        use crate::exec_remote::wire_tests::{id, Script};
+        use aft_engine::test_bridge::bash_remote::remote_wire::{id, Script};
         let (daemon, _dir, root, executor, ctx) = capture_fixture_with_claims(
             Script::PlacementWait { job_id: false },
             &[
@@ -8818,7 +8820,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn codemode_background_runon_outlives_its_run_before_and_after_acceptance() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for accepted_first in [false, true] {
             let script = if accepted_first {
                 Script::GatedStages { position: 1 }
@@ -8906,7 +8908,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn foreground_runon_replies_within_its_window_when_admission_is_slow() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) =
             capture_fixture(Script::GatedAcceptanceThenExit).await;
         ctx.update_config(|config| config.foreground_wait_window_ms = 1_000);
@@ -8985,7 +8987,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn fast_foreground_runon_answers_inline_without_promotion() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (_daemon, _dir, root, executor, ctx) = capture_fixture(Script::Plain).await;
         let mut rx = capture_call(
             &executor,
@@ -9016,7 +9018,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_refusal_preserves_existing_error() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (_daemon, _dir, root, executor, ctx) = capture_fixture(Script::KnownRefused).await;
         let timing = BashTimingForTest::new(Instant::now());
         let (mut rx, task_id) = held_capture_call(
@@ -9096,7 +9098,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_connection_drop_before_accepted_reports_outcome_unknown() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for background in [true, false] {
             let (daemon, _dir, root, executor, ctx) =
                 capture_fixture(Script::DropBeforeAccepted).await;
@@ -9197,7 +9199,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_ready_reply_swap_keeps_finalization() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, dir, root, executor, ctx) = capture_fixture(Script::DropBeforeAccepted).await;
         let mut rx = capture_call(
             &executor,
@@ -9328,7 +9330,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_accepted_then_completed_keeps_launch_reply() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let args =
             json!({"command":"uname -s", "runon":"linux", "background":true, "timeout":10000});
 
@@ -9452,7 +9454,7 @@ mod grant_path_tests {
             .build()
             .unwrap()
             .block_on(async {
-                use crate::exec_remote::wire_tests::Script;
+                use aft_engine::test_bridge::bash_remote::remote_wire::Script;
                 for (background, expire_read) in [(true, false), (false, false), (false, true)] {
                     let script = if refused { Script::AcceptedThenRefused } else { Script::Plain };
                     let (_daemon, _dir, root, executor, ctx) = capture_fixture(script).await;
@@ -9527,7 +9529,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_wait_ended_after_accepted_keeps_launch_reply() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for drain_ends_wait in [true, false] {
             for finished in [false, true] {
                 let case = format!(
@@ -9657,7 +9659,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_wait_ended_after_accepted_then_refused_reports_refusal() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         for drain_ends_wait in [true, false] {
             let case = if drain_ends_wait {
                 "module drain after Accepted then refusal"
@@ -9730,7 +9732,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_replies_before_client_deadline() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, _ctx) = capture_fixture(Script::GatedAcceptance).await;
         let started = Instant::now();
         let budget = crate::commands::blocking_wait::ReplyBudget::new(
@@ -9771,7 +9773,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn runon_capture_deadline_shares_timeout_and_warns_with_task_id() {
-        use crate::exec_remote::wire_tests::Script;
+        use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, ctx) = capture_fixture(Script::GatedAcceptance).await;
         let started = Instant::now();
         let mut rx = capture_call(

@@ -16,27 +16,9 @@ use serde::{Deserialize, Serialize};
 /// Most paths one bash call may ask the runner to copy back.
 pub(crate) const MAX_RETURN_PATHS: usize = 64;
 
-/// What happened to one requested path.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ReturnedPath {
-    /// The path as the caller wrote it, relative to the command's workdir.
-    pub path: String,
-    /// The same path relative to the checkout, with `/` separators, as the
-    /// runner names the files it reports as changed. `None` when the workdir
-    /// is not in a checkout.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout_path: Option<String>,
-    pub outcome: ReturnOutcome,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "outcome", rename_all = "snake_case")]
-pub(crate) enum ReturnOutcome {
-    /// The verified file now sits at the requested local path.
-    Returned { bytes: u64 },
-    /// Nothing was written for this path.
-    NotReturned { reason: NotReturned },
-}
+#[path = "return_types.rs"]
+pub(crate) mod return_types;
+pub(crate) use return_types::{ReturnOutcome, ReturnedPath};
 
 /// Why a requested path was not written locally.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

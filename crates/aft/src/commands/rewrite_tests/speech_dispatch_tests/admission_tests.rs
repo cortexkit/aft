@@ -58,7 +58,8 @@ async fn agent_selected_bindings_without_a_row_refuse_with_a_specific_detail() {
     .await;
     fixture.plex.state.lock().unwrap().agent = "agent-not-bound-to-the-head".into();
     let ticket = call_ticket(&fixture).await;
-    let speech = crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap()).unwrap();
+    let speech =
+        aft_engine::test_bridge::bash_remote::speech_for_ticket(ticket.value().unwrap()).unwrap();
     let denial = speech.prepared.denial.as_ref().unwrap();
     assert_eq!(denial.code, Code::AuthorityUnavailable);
     assert_eq!(denial.reason, "binding_unverifiable");
@@ -87,7 +88,8 @@ async fn agent_selected_bindings_reject_even_a_signed_row_for_another_agent() {
     }));
     fixture.partners(|partners| partners.bindings = Arc::new(move |_, _| Ok(reply.clone())));
     let ticket = call_ticket(&fixture).await;
-    let speech = crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap()).unwrap();
+    let speech =
+        aft_engine::test_bridge::bash_remote::speech_for_ticket(ticket.value().unwrap()).unwrap();
     let denial = speech.prepared.denial.as_ref().unwrap();
     assert_eq!(denial.code, Code::IdentityConflict);
     assert_eq!(denial.reason, "binding_changed");
@@ -107,8 +109,10 @@ async fn agent_selected_bindings_reject_even_a_signed_row_for_another_agent() {
 async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let warm = crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
-        .unwrap();
+    let warm = aft_engine::test_bridge::bash_remote::speech_for_ticket(
+        fixture.params["ticket"].as_str().unwrap(),
+    )
+    .unwrap();
     let context = warm.prepared.context.clone();
     assert_eq!(
         context.prepare().denial.unwrap().detail.as_deref(),
@@ -118,7 +122,7 @@ async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
     crate::db::open(&dir.path().join("aft.db")).unwrap();
     let context = crate::gh_shim_speech::service::LaunchContext {
         seed: context.seed,
-        service: crate::gh_shim_speech::service::record_service(dir.path()),
+        service: aft_engine::test_bridge::bash_remote::record_service(dir.path()),
     };
     assert_eq!(
         context.prepare().denial.unwrap().detail.as_deref(),
@@ -127,9 +131,10 @@ async fn preparation_distinguishes_absent_runtime_from_entered_tokio_runtime() {
 }
 
 async fn call_ticket(fixture: &Fixture) -> crate::gh_shim_ticket::ScopedTicket {
-    let speech =
-        crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
-            .unwrap();
+    let speech = aft_engine::test_bridge::bash_remote::speech_for_ticket(
+        fixture.params["ticket"].as_str().unwrap(),
+    )
+    .unwrap();
     let seed = speech.prepared.context.seed.clone();
     let root = fixture.service.store.path().parent().unwrap().to_path_buf();
     let session = fixture.session.clone();
@@ -189,9 +194,10 @@ async fn foreground_calls_and_unpromoted_tasks_use_captured_guards() {
                 reserve(project, session, scope, body)
             });
         });
-        let warm =
-            crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
-                .unwrap();
+        let warm = aft_engine::test_bridge::bash_remote::speech_for_ticket(
+            fixture.params["ticket"].as_str().unwrap(),
+        )
+        .unwrap();
         assert!(!warm.background.load(std::sync::atomic::Ordering::SeqCst));
         assert!(fixture
             .service
@@ -531,9 +537,10 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
     .unwrap();
     assert_ne!(project_alias, canonical_project);
     assert_eq!(fs::canonicalize(&project_alias).unwrap(), canonical_project);
-    let speech =
-        crate::gh_shim_ticket::speech_for_ticket(fixture.params["ticket"].as_str().unwrap())
-            .unwrap();
+    let speech = aft_engine::test_bridge::bash_remote::speech_for_ticket(
+        fixture.params["ticket"].as_str().unwrap(),
+    )
+    .unwrap();
     let template = speech.prepared.context.seed.clone();
     for (seed_project, ticket_project) in [
         (
@@ -572,7 +579,7 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
         .await
         .unwrap();
         for raw in [pending.value().unwrap(), call.value().unwrap()] {
-            let attached = crate::gh_shim_ticket::speech_for_ticket(raw)
+            let attached = aft_engine::test_bridge::bash_remote::speech_for_ticket(raw)
                 .expect("equivalent existing path aliases must retain launch context");
             assert!(attached.failure.lock().unwrap().is_none());
             assert!(attached.prepared.policy.is_some());
@@ -582,7 +589,8 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
                 ticket_project
             );
         }
-        let attached = crate::gh_shim_ticket::speech_for_ticket(call.value().unwrap()).unwrap();
+        let attached =
+            aft_engine::test_bridge::bash_remote::speech_for_ticket(call.value().unwrap()).unwrap();
         assert_eq!(
             fixture
                 .service

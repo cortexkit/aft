@@ -758,7 +758,7 @@ static TEST_LAUNCHERS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::ne
 thread_local! {
     static CURRENT_PRINCIPAL: RefCell<Option<AuthenticatedPrincipal>> = const { RefCell::new(None) };
     static WORKER_JAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     static TEST_PLAN_OVERRIDE: RefCell<Option<SpawnPlan>> = const { RefCell::new(None) };
 }
 
@@ -1528,7 +1528,7 @@ fn resolve_sandbox_spawn_with_mode(
     // This check must remain ahead of every platform and production-policy
     // branch. Windows tests use it to avoid entering process paths that cannot
     // consume native launcher plans.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(plan) = TEST_PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return plan;
     }
@@ -5948,7 +5948,7 @@ pub fn install_sandbox_launcher_for_test(project_root: &Path, launcher_path: Pat
     LauncherScope(root, previous)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() -> R) -> R {
     struct PlanScope(Option<SpawnPlan>);
 

@@ -112,9 +112,9 @@ impl Submission {
     pub(crate) async fn before_send(&self) -> Result<Copy, crate::exec_remote::Error> {
         let started = Instant::now();
         let cap = WAIT_CAP;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let test = TEST_CAPS.lock().unwrap().get(&self.checkout).cloned();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let cap = test.as_ref().map_or(cap, |test| test.cap);
         let deadline = tokio::time::Instant::now() + cap;
         let mut window = CopyWindow {
@@ -157,7 +157,7 @@ impl Submission {
                     break (id, cap_hit);
                 }
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(test) = &test {
                 test.started.notify_one();
             }
@@ -208,40 +208,40 @@ impl Drop for Copy {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone)]
 struct TestWait {
     cap: Duration,
     started: Arc<Notify>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static TEST_CAPS: LazyLock<Mutex<HashMap<PathBuf, TestWait>>> = LazyLock::new(Mutex::default);
 
-#[cfg(test)]
-pub(super) struct TestWaitCap {
+#[cfg(any(test, feature = "test-support"))]
+pub struct TestWaitCap {
     checkout: PathBuf,
     started: Arc<Notify>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl TestWaitCap {
-    pub(super) async fn wait_started(&self) {
+    pub async fn wait_started(&self) {
         tokio::time::timeout(Duration::from_secs(10), self.started.notified())
             .await
             .expect("runon must wait for the foreground editor");
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for TestWaitCap {
     fn drop(&mut self) {
         TEST_CAPS.lock().unwrap().remove(&self.checkout);
     }
 }
 
-#[cfg(test)]
-pub(super) fn set_test_cap(checkout: &Path, cap: Duration) -> TestWaitCap {
+#[cfg(any(test, feature = "test-support"))]
+pub fn set_test_cap(checkout: &Path, cap: Duration) -> TestWaitCap {
     let checkout = super::canonicalized_path(checkout);
     let started = Arc::new(Notify::new());
     TEST_CAPS.lock().unwrap().insert(

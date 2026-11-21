@@ -48,7 +48,7 @@ async fn promotion_between_preflight_and_admission_posts_exactly_once() {
     let task = fixture.task.clone();
     fixture.partners(|partners| {
         partners.before_final_gate = Some(Arc::new(move || {
-            crate::gh_shim_ticket::promote_speech_task(&session, &task);
+            aft_engine::test_bridge::bash_remote::promote_speech_task(&session, &task);
         }))
     });
     let answer = fixture.post(true, "promote-in-flight").await;
@@ -83,8 +83,8 @@ async fn seal_spawn_between_preflight_and_admission_posts_exactly_once() {
     let ticket = fixture.params["ticket"].as_str().unwrap().to_string();
     fixture.partners(|partners| {
         partners.before_final_gate = Some(Arc::new(move || {
-            let _spawn = crate::gh_shim_ticket::spawn_ticket_guard(Some(&ticket));
-            crate::gh_shim_ticket::seal_spawn(&metadata);
+            let _spawn = aft_engine::test_bridge::bash_remote::spawn_ticket_guard(Some(&ticket));
+            aft_engine::test_bridge::bash_remote::seal_spawn(&metadata);
         }))
     });
     let answer = fixture.post(true, "seal-in-flight").await;

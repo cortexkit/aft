@@ -442,25 +442,7 @@ enum Quote {
 pub(super) mod tests {
     use super::parse;
 
-    pub(crate) const LITERAL_APPEND_CASES: &[&str] = &[
-        "echo plain words >> notes.txt",
-        "echo '$? $$ $! $# $* $@ $- $0 $9 $HOME ${HOME} $(date) $((1+2)) `date`' >> notes.txt",
-        "echo '* ? [abc] {a,b} {1..3} ~ ~root' >> notes.txt",
-        "echo \"* ? [abc] {a,b} {1..3} ~ ~root\" >> notes.txt",
-        "echo \\$HOME \\`date\\` \\* \\? \\[abc] \\{a,b\\} \\~root >> notes.txt",
-        "echo \"\\$HOME \\`date\\`\" >> notes.txt",
-        "echo hello! >> notes.txt",
-        "echo hi >> 'notes.txt'",
-        "echo hi >> \"notes.txt\"",
-        "cat >> notes.txt <<EOF\nliteral text\nEOF",
-        "cat >> notes.txt <<EOF\nEOF",
-        "cat >> notes.txt <<'EOF'\n$HOME $(date) `date` \\literal\nEOF",
-        "cat >> notes.txt <<\"EOF\"\n$HOME $(date) `date` \\literal\nEOF",
-        "cat >> notes.txt <<\\EOF\n$HOME $(date) `date` \\literal\nEOF",
-        "cat >> notes.txt <<E'OF'\n$HOME\nEOF",
-        "cat >> notes.txt <<'EOF'\nEOFsuffix\nmore\nEOF",
-    ];
-
+    use super::LITERAL_APPEND_CASES;
     #[test]
     fn append_shell_control_syntax_declines() {
         for command in [
@@ -559,3 +541,23 @@ pub(super) mod tests {
         assert!(accepted.is_empty(), "must decline: {accepted:?}");
     }
 }
+
+#[cfg(any(test, feature = "test-support"))]
+pub const LITERAL_APPEND_CASES: &[&str] = &[
+    "echo plain words >> notes.txt",
+    "echo '$? $$ $! $# $* $@ $- $0 $9 $HOME ${HOME} $(date) $((1+2)) `date`' >> notes.txt",
+    "echo '* ? [abc] {a,b} {1..3} ~ ~root' >> notes.txt",
+    "echo \"* ? [abc] {a,b} {1..3} ~ ~root\" >> notes.txt",
+    "echo \\$HOME \\`date\\` \\* \\? \\[abc] \\{a,b\\} \\~root >> notes.txt",
+    "echo \"\\$HOME \\`date\\`\" >> notes.txt",
+    "echo hello! >> notes.txt",
+    "echo hi >> 'notes.txt'",
+    "echo hi >> \"notes.txt\"",
+    "cat >> notes.txt <<EOF\nliteral text\nEOF",
+    "cat >> notes.txt <<EOF\nEOF",
+    "cat >> notes.txt <<'EOF'\n$HOME $(date) `date` \\literal\nEOF",
+    "cat >> notes.txt <<\"EOF\"\n$HOME $(date) `date` \\literal\nEOF",
+    "cat >> notes.txt <<\\EOF\n$HOME $(date) `date` \\literal\nEOF",
+    "cat >> notes.txt <<E'OF'\n$HOME\nEOF",
+    "cat >> notes.txt <<'EOF'\nEOFsuffix\nmore\nEOF",
+];

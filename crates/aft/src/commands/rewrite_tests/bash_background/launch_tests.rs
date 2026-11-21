@@ -2,11 +2,11 @@ use crate::bash_background;
 use crate::bash_background::persistence::session_tasks_dir;
 #[cfg(unix)]
 use crate::bash_background::persistence::{read_task_at, resolve_task_layout};
-use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
 use crate::bash_background::registry::BgTaskRegistry;
 #[cfg(unix)]
 use crate::bash_background::BgTaskStatus;
 use crate::sandbox_spawn::SpawnPlan;
+use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
 use std::{collections::HashMap, fs, path::Path};
 #[cfg(unix)]
 use std::{

@@ -1,11 +1,12 @@
 mod tests {
-    use crate::bash_background::persistence::work_counts;
-    use crate::bash_background::registry::test_support::{
+    use crate::bash_background::registry::BgTaskRegistry;
+    use crate::log_redact::SECRET_PLACEHOLDER;
+    use aft_engine::test_bridge::bash_remote::registry_support::{
         display_bodies, filler, terminal_task, with_secret,
         DISPLAY_LINE_FINISH_BYTES as LINE_FINISH_BYTES,
     };
-    use crate::bash_background::registry::{BgTask, BgTaskRegistry};
-    use crate::log_redact::SECRET_PLACEHOLDER;
+    use aft_engine::test_bridge::bash_remote::work_counts;
+    use aft_engine::test_bridge::bash_remote::BgTask;
 
     fn display_detail(
         registry: &BgTaskRegistry,

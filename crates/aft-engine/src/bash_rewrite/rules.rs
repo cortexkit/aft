@@ -1452,7 +1452,7 @@ fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> O
     Some(json!({ "file": target, "include_hidden": include_hidden }))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn grep_request(command: &str, binary: &str) -> Option<Value> {
     grep_request_from_parsed(parse(command).as_ref(), binary)
 }
@@ -1469,16 +1469,19 @@ fn record_head_tail_preflight_read() {
 }
 
 #[cfg(test)]
-pub(crate) fn reset_head_tail_preflight_reads() {
+fn reset_head_tail_preflight_reads() {
     HEAD_TAIL_PREFLIGHT_READS.with(|reads| reads.set(0));
 }
 
 #[cfg(test)]
-pub(crate) fn head_tail_preflight_reads() -> usize {
+fn head_tail_preflight_reads() -> usize {
     HEAD_TAIL_PREFLIGHT_READS.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]
+mod preflight_tests;
+
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn find_request(command: &str) -> Option<Value> {
     find_request_from_parsed(parse(command).as_ref())
 }

@@ -375,7 +375,7 @@ impl SpawnReceipt {
             Some(StartupClockForTest::Expired) => self.deadline,
             None => now,
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let now = SPAWN_COMMIT_TIME_FOR_TEST.with(|clock| clock.get().unwrap_or(now));
         if !matches!(*state, SpawnReceiptState::Pending) || now >= self.deadline {
             // A second commit on one receipt is a bug; refusing it keeps an
@@ -422,14 +422,14 @@ thread_local! {
     static CURRENT_SPAWN_RECEIPT: std::cell::RefCell<Option<std::sync::Arc<SpawnReceipt>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static SPAWN_COMMIT_TIME_FOR_TEST: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// Overrides only the receipt's clock on this thread, leaving other startups
 /// and the real process/persistence path untouched.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_spawn_commit_time_for_test<T>(
     now: std::time::Instant,
     run: impl FnOnce() -> T,

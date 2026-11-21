@@ -419,7 +419,7 @@ mod linux {
     }
 
     fn local_cgroup_mount() -> Option<PathBuf> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(mount) = LOCAL_RECOVERY_FIXTURE
             .with(|fixture| fixture.borrow().as_ref().map(|(_, mount)| mount.clone()))
         {
@@ -517,7 +517,7 @@ mod linux {
     }
 
     pub(crate) fn user_manager_command(executable: &Path) -> Command {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         assert!(
             LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.borrow().is_none()),
             "memory recovery attempted a user-manager call"
@@ -919,7 +919,7 @@ mod linux {
     }
 
     pub(crate) fn current_cgroup(pid: u32) -> Option<PathBuf> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some((current, _)) = LOCAL_RECOVERY_FIXTURE.with(|fixture| fixture.borrow().clone())
         {
             return Some(current);
@@ -927,12 +927,12 @@ mod linux {
         unified_cgroup_path(&std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     thread_local! {
         static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// Synthetic ancestry must also supply a mount so recovery never probes
     /// the host's cgroup hierarchy by accident.
     pub(crate) fn with_local_recovery_mount_for_test<T>(

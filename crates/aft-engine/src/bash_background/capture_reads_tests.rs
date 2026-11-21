@@ -1,36 +1,7 @@
-use std::ffi::OsStr;
-
+use super::super::super::test_support::{filler, terminal_task, with_secret};
 use super::*;
 use crate::bash_background::registry::BgTaskRegistry;
 use crate::log_redact::SECRET_PLACEHOLDER;
-
-pub(crate) fn terminal_task(
-    registry: &BgTaskRegistry,
-    fixture: &tempfile::TempDir,
-    stdout: &str,
-    compressed: bool,
-) -> std::sync::Arc<super::super::super::BgTask> {
-    let (_, task) = super::super::super::tests::insert_terminal_piped_task(
-        registry, fixture, "cmd", stdout, "", compressed,
-    );
-    task
-}
-
-pub(crate) fn with_secret(task: &super::super::super::BgTask, value: &str) {
-    *task.completion_secrets.lock().unwrap() = Some(SecretValues::from_environment([(
-        OsStr::new("API_TOKEN"),
-        OsStr::new(value),
-    )]));
-}
-
-/// Lines of `filler` text, `bytes` long in total.
-pub(crate) fn filler(bytes: usize) -> String {
-    let line = "compiling crate foo v0.1.0 (/src/foo)\n";
-    let mut text = line.repeat(bytes / line.len());
-    text.push_str(&"x".repeat(bytes - text.len()));
-    text
-}
-
 fn notice_preview(
     registry: &BgTaskRegistry,
     task: &std::sync::Arc<super::super::super::BgTask>,
@@ -126,7 +97,7 @@ fn raw_edges_match_the_whole_normalized_capture() {
     let registry = BgTaskRegistry::default();
     // Carriage returns exercise normalization; `é` exercises char boundaries.
     let stdout = format!("{}progress 10%\rprogress 99%\né-start\n", filler(9_000));
-    let (_, task) = super::super::super::tests::insert_terminal_piped_task(
+    let (_, task) = super::super::super::test_support::insert_terminal_piped_task(
         &registry,
         &fixture,
         "cmd",
@@ -158,5 +129,3 @@ fn raw_edges_match_the_whole_normalized_capture() {
         }
     }
 }
-
-pub(crate) const DISPLAY_LINE_FINISH_BYTES: u64 = LINE_FINISH_BYTES;
