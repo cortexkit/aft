@@ -24,14 +24,16 @@ use regex::bytes::Regex;
 /// counted in health as large reads.
 pub(crate) use crate::large_read_counts::LARGE_READ_BYTES;
 
-pub(crate) use crate::large_read_counts::{
-    allow_whole, is_ceiling_error, skip, WHOLE_READ_CEILING, WHOLE_READ_SKIP_REASON,
-};
+#[doc(hidden)]
+pub use crate::large_read_counts::{allow_whole, is_ceiling_error, WHOLE_READ_CEILING};
+
+pub(crate) use crate::large_read_counts::{skip, WHOLE_READ_SKIP_REASON};
 
 /// Visit raw lines, including their LF, without retaining earlier lines. The
 /// caller keeps only its selected windows. An oversized line is skipped and
 /// its path is reported as incomplete, just like an oversized whole-file read.
-pub(crate) fn visit_lines(
+#[doc(hidden)]
+pub fn visit_lines(
     path: &std::path::Path,
     site: Site,
     mut visit: impl FnMut(usize, usize, &[u8]),
@@ -201,7 +203,8 @@ pub(crate) fn step_bytes() -> usize {
 }
 
 /// Whether a file of `size` bytes is a large read.
-pub(crate) fn is_large(size: u64) -> bool {
+#[doc(hidden)]
+pub fn is_large(size: u64) -> bool {
     #[cfg(test)]
     if let Some(large) = LARGE_OVERRIDE.with(std::cell::Cell::get) {
         return size > large;
@@ -316,7 +319,8 @@ impl<'a, S: StepSource + ?Sized> Steps<'a, S> {
 /// [`Utf8Check::finish`] does too, as `std::str::from_utf8` over all of them
 /// would decide.
 #[derive(Default)]
-pub(crate) struct Utf8Check {
+#[doc(hidden)]
+pub struct Utf8Check {
     carry: [u8; 4],
     carry_len: usize,
 }
@@ -439,7 +443,8 @@ impl PhraseNormalizer {
 
 /// Why a streamed read stopped before the end of the file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Interrupted {
+#[doc(hidden)]
+pub enum Interrupted {
     /// The phase's time limit passed.
     Deadline,
     /// The request was cancelled.
@@ -448,7 +453,8 @@ pub(crate) enum Interrupted {
 
 /// What a streamed presence check found.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PresenceRead {
+#[doc(hidden)]
+pub enum PresenceRead {
     /// The file is UTF-8 text; whether its normalized text holds the phrase.
     Holds(bool),
     /// The file could not be read, or is binary or not UTF-8.
@@ -462,7 +468,8 @@ pub(crate) enum PresenceRead {
 /// in the first 1,024 and invalid UTF-8 anywhere make the file unreadable,
 /// even after the phrase was found. `checkpoint` runs before every step and
 /// can stop the check. Also returns the bytes read.
-pub(crate) fn stream_presence(
+#[doc(hidden)]
+pub fn stream_presence(
     source: &mut (impl StepSource + ?Sized),
     size_at_open: u64,
     needle: &[u8],
@@ -551,7 +558,8 @@ fn presence_steps<S: StepSource + ?Sized>(
 // Streamed line scans
 
 /// What happened to one match occurrence handed to a scan's per-match logic.
-pub(crate) enum MatchVisit {
+#[doc(hidden)]
+pub enum MatchVisit {
     /// The scan must end: a stop flag, the result cap, cancellation or the
     /// deadline.
     Stop,
@@ -564,7 +572,8 @@ pub(crate) enum MatchVisit {
 
 /// Where a scan's per-match logic gets the line and text of a match, so the
 /// same logic runs over a whole buffer and over a file read in steps.
-pub(crate) trait ScanLines {
+#[doc(hidden)]
+pub trait ScanLines {
     /// Line number, 1-based character column and printable text of the line
     /// holding `offset`, and the offset where the next line starts, as
     /// [`crate::search_index::line_details_bytes_with_cr_policy`] reports
@@ -718,7 +727,8 @@ impl ScanLines for RegionLines<'_> {
 }
 
 /// A pattern a scan may run over a file read in steps.
-pub(crate) enum LineMatcher<'a> {
+#[doc(hidden)]
+pub enum LineMatcher<'a> {
     /// A non-empty needle with no LF, searched in the ASCII-lowercased bytes
     /// when `case_insensitive_ascii`.
     Literal {
@@ -731,7 +741,8 @@ pub(crate) enum LineMatcher<'a> {
 
 /// How a streamed scan ended.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) enum ScanEnd {
+#[doc(hidden)]
+pub enum ScanEnd {
     /// It reached the end of the file (or the size at open).
     Finished,
     /// The per-match logic stopped it, or `step_hook` stopped it the way the
@@ -751,7 +762,8 @@ pub(crate) enum ScanEnd {
 /// the next line's start and is handed over with that line. `step_hook` sees
 /// every byte once, in order, before it is searched, and can end the scan
 /// with [`ScanEnd::Stopped`] or [`ScanEnd::Interrupted`].
-pub(crate) fn scan_lines(
+#[doc(hidden)]
+pub fn scan_lines(
     site: Site,
     path: &std::path::Path,
     source: &mut (impl StepSource + ?Sized),
@@ -903,7 +915,8 @@ fn scan_region(
 
 /// Whether a literal needle may be scanned in steps: it is not empty and
 /// holds no LF, so every occurrence lies inside one line.
-pub(crate) fn literal_is_line_local(needle: &[u8]) -> bool {
+#[doc(hidden)]
+pub fn literal_is_line_local(needle: &[u8]) -> bool {
     !needle.is_empty() && !needle.contains(&b'\n')
 }
 
@@ -918,7 +931,8 @@ pub(crate) fn literal_is_line_local(needle: &[u8]) -> bool {
 /// The regex's own pattern text is parsed again with the byte regex's
 /// settings. The builder's case-insensitivity flag is not recorded on the
 /// compiled regex, so the pattern must pass with it both off and on.
-pub(crate) fn regex_is_line_local(regex: &Regex) -> bool {
+#[doc(hidden)]
+pub fn regex_is_line_local(regex: &Regex) -> bool {
     [false, true].into_iter().all(|case_insensitive| {
         regex_syntax::ParserBuilder::new()
             .utf8(false)
@@ -950,7 +964,10 @@ fn excludes_lf(hir: &regex_syntax::hir::Hir) -> bool {
 // ---------------------------------------------------------------------------
 // Large-read counters for health
 
-pub(crate) use crate::large_read_counts::{record, record_whole, with_counter, Site, SITES};
+#[doc(hidden)]
+pub use crate::large_read_counts::{record, record_whole, Site};
+
+pub(crate) use crate::large_read_counts::{with_counter, SITES};
 #[cfg(test)]
 use crate::large_read_counts::{TEST_COUNTERS, ZERO};
 
@@ -1024,7 +1041,8 @@ fn summarize_health_sites(mut sites: Vec<HealthSite>) -> serde_json::Value {
 /// Large reads since start, with totals over all sites and a bounded preview
 /// of the four sites that read the most bytes, ordered by bytes then name.
 /// Whole-read counters are a subset of the combined count and byte totals.
-pub(crate) fn health() -> serde_json::Value {
+#[doc(hidden)]
+pub fn health() -> serde_json::Value {
     summarize_health_sites(
         SITES
             .into_iter()
@@ -1068,10 +1086,8 @@ pub(crate) fn widest_health_for_test() -> serde_json::Value {
 
 /// Count `read`, a loader's whole read of a file, at `site` when it is a
 /// large read, and hand it back unchanged.
-pub(crate) fn counted<T: AsRef<[u8]>, U>(
-    site: Site,
-    read: io::Result<(T, U)>,
-) -> io::Result<(T, U)> {
+#[doc(hidden)]
+pub fn counted<T: AsRef<[u8]>, U>(site: Site, read: io::Result<(T, U)>) -> io::Result<(T, U)> {
     if let Ok((bytes, _)) = &read {
         record_whole(site, bytes.as_ref().len());
     }

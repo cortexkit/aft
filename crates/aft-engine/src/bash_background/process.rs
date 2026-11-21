@@ -875,7 +875,8 @@ pub(crate) fn oom_priority_marker(scratch: Option<&Path>, io_dir: &Path) -> std:
 static OOM_PRIORITY_FAILURES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[cfg(target_os = "linux")]
-pub(crate) fn oom_priority_failures() -> u64 {
+#[doc(hidden)]
+pub fn oom_priority_failures() -> u64 {
     OOM_PRIORITY_FAILURES.load(std::sync::atomic::Ordering::Relaxed)
 }
 

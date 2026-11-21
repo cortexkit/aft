@@ -921,7 +921,8 @@ pub(crate) fn servers_for_file_with_mode(
 /// configuration lookups of files that share folders, so each folder is
 /// probed once per pass. Start a new memo for each pass: it never notices a
 /// configuration created, moved or deleted after it answered.
-pub(crate) fn servers_for_file_in_pass(
+#[doc(hidden)]
+pub fn servers_for_file_in_pass(
     path: &Path,
     config: &Config,
     memo: &mut BiomeSelectionMemo,
@@ -1201,7 +1202,8 @@ fn biome_selection_for_config(config_path: Option<PathBuf>) -> BiomeFileSelectio
 /// Nothing here notices files changing on disk, so a memo must not outlive
 /// the pass it was created for.
 #[derive(Default)]
-pub(crate) struct BiomeSelectionMemo {
+#[doc(hidden)]
+pub struct BiomeSelectionMemo {
     /// Directory identities and regular filenames observed during this pass.
     directories: HashMap<PathBuf, Option<BiomeDirectory>>,
     /// Workspace root by (root-marker set, resolved starting directory).

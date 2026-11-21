@@ -74,7 +74,8 @@ fn relative_path_text(path: &Path) -> String {
 }
 
 #[derive(Default, Debug)]
-pub(crate) struct Journal {
+#[doc(hidden)]
+pub struct Journal {
     state: Mutex<JournalState>,
 }
 #[derive(Default, Debug)]
@@ -294,7 +295,8 @@ fn git_bytes(directory: &Path, args: &[&str], deadline: Instant, limit: usize) -
 }
 pub(crate) struct Scope(Option<Arc<Capture>>);
 pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
-pub(crate) struct BudgetGuard(SharedCallDeadline);
+#[doc(hidden)]
+pub struct BudgetGuard(SharedCallDeadline);
 impl BudgetGuard {
     pub(crate) fn new(deadline: Instant) -> Self {
         Self(Arc::new(Mutex::new(Some(deadline))))

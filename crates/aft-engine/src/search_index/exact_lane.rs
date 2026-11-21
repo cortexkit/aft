@@ -376,7 +376,8 @@ impl PreparedExactCache {
 /// Reuse only query-independent work, addressed by the bytes just read from
 /// disk. A new content hash cannot reuse old preparation, even before a watcher
 /// notices a write. No candidate selection, evidence, or digest check is cached.
-pub(crate) fn verify_cached_exact_matches_in_text_with_member(
+#[doc(hidden)]
+pub fn verify_cached_exact_matches_in_text_with_member(
     file_path: &Path,
     text: &str,
     digest: blake3::Hash,
@@ -400,7 +401,8 @@ pub(crate) fn verify_cached_exact_matches_in_text_with_member(
 /// bounded preparation, keyed by the bytes' digest, not their phrase, window
 /// or definition match decisions; a later request that reads changed bytes
 /// gets a new digest and prepares them afresh.
-pub(crate) fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
+#[doc(hidden)]
+pub fn prepare_exact_text(text: &str, digest: blake3::Hash) -> Arc<PreparedExactText> {
     static CACHE: OnceLock<PreparedExactCache> = OnceLock::new();
     // The process-wide budget includes text, lazy symbol normalization, and
     // per-entry metadata. Only bytes drive eviction: a count cap discarded

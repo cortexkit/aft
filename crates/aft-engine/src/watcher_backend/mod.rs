@@ -5,7 +5,8 @@ use std::sync::{mpsc, Arc};
 use crate::watcher_filter::SharedGitignore;
 pub(crate) mod cookie;
 pub(crate) mod counters;
-pub(crate) mod flush;
+#[doc(hidden)]
+pub mod flush;
 
 // Directories inotify could not watch when it started. Recursive-handle
 // backends (FSEvents, Windows) watch the whole tree with one handle and have
@@ -167,7 +168,8 @@ impl ProjectWatcher {
     }
 }
 
-pub(crate) fn create_project_watcher(
+#[doc(hidden)]
+pub fn create_project_watcher(
     root: PathBuf,
     extra_watch_paths: Vec<PathBuf>,
     tx: mpsc::Sender<notify::Result<notify::Event>>,

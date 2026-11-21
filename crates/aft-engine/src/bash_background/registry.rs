@@ -81,7 +81,7 @@ mod saved_delivery;
 use saved_delivery::list_delivery_gaps;
 mod live_delivery;
 use live_delivery::LiveDelivery;
-pub(crate) use live_delivery::RouteDeliverySessions;
+pub use live_delivery::RouteDeliverySessions;
 
 #[path = "display_bodies.rs"]
 mod display_bodies;
@@ -159,7 +159,7 @@ impl Drop for UncommittedLayout<'_> {
 /// Default timeout for background bash tasks: 30 minutes.
 /// Agents can override per-call via the `timeout` parameter (in ms); see
 /// [`super::HardKill`].
-pub(crate) const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+pub const DEFAULT_BG_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 thread_local! {
     static LEDGER_SPAWN: std::cell::RefCell<Option<crate::db::call_ledger::Key>> = const { std::cell::RefCell::new(None) };
@@ -168,7 +168,7 @@ thread_local! {
 
 /// Carry the shell task's daemon-authenticated scope identity separately
 /// from tool arguments, so the caller cannot invent or change its owner.
-pub(crate) fn with_scope_spawn<T>(
+pub fn with_scope_spawn<T>(
     scope: Option<subc_protocol::scope::ScopeStamp>,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -182,13 +182,13 @@ pub(crate) fn with_scope_spawn<T>(
     run()
 }
 
-pub(crate) fn scope_for_spawn() -> Option<subc_protocol::scope::ScopeStamp> {
+pub fn scope_for_spawn() -> Option<subc_protocol::scope::ScopeStamp> {
     SCOPE_SPAWN.with(|slot| slot.borrow().clone())
 }
 
 /// The registry's first task write runs synchronously during dispatch. Carry
 /// its durable admission identity without putting host data in tool arguments.
-pub(crate) fn with_ledger_spawn<T>(
+pub fn with_ledger_spawn<T>(
     key: Option<crate::db::call_ledger::Key>,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -229,7 +229,7 @@ pub const RUN_ENDED_REASON: &str = "run_ended";
 /// a cancellation that leaves the scope usable, or the person revoking a
 /// folder the command's sandbox allowed.
 /// `None` for any other status reason.
-pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
+pub fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     match reason {
         Some(SCOPE_REVOKED_REASON | "scope revoked") => Some("scope revoked"),
         Some(RUN_ENDED_REASON) => Some("run ended"),
@@ -241,11 +241,11 @@ pub(crate) fn scope_end_label(reason: Option<&str>) -> Option<&'static str> {
     }
 }
 #[path = "folder_grants.rs"]
-pub(crate) mod folder_grants;
+pub mod folder_grants;
 #[path = "remote.rs"]
-pub(crate) mod remote;
+pub mod remote;
 #[path = "return_files.rs"]
-pub(crate) mod return_files;
+pub mod return_files;
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[cfg(test)]
@@ -417,7 +417,7 @@ pub(super) fn log_bash_kill(task_id: &str, pid: Option<u32>, pgid: Option<i32>, 
 
 /// Stop independent commands concurrently so a batch shares one grace window.
 /// Callers collect targets before entering here, without registry/task locks.
-pub(crate) fn stop_tasks_in_parallel<T: Send, R: Send>(
+pub fn stop_tasks_in_parallel<T: Send, R: Send>(
     tasks: impl IntoIterator<Item = T>,
     stop: impl Fn(T) -> R + Sync,
 ) -> Vec<R> {
@@ -1252,7 +1252,7 @@ pub struct BgTaskRegistry {
 
 /// Reserves one configure replay call, including at most one bounded disk scan.
 /// Claim under lifecycle admission, then consume outside the lifecycle lock.
-pub(crate) struct ProjectReplayBatch<'a> {
+pub struct ProjectReplayBatch<'a> {
     registry: &'a BgTaskRegistry,
 }
 
@@ -1347,15 +1347,13 @@ mod scratch_retention;
 #[path = "shell_registry.rs"]
 mod shell_registry;
 
-pub(crate) use shell_registry::{
-    ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD,
-};
+pub use shell_registry::{ShellReader, ShellSnapshot, ShellSnapshotCache, SHELL_MASK_WITHHELD};
 #[path = "task_image_cleanup.rs"]
 mod task_image_cleanup;
 
 const MAX_DUPLICATE_COMMAND_TASKS_TO_CHECK: usize = 128;
 
-pub(crate) struct DuplicateRunningTask {
+pub struct DuplicateRunningTask {
     pub(crate) task_id: String,
     pub(crate) age: Duration,
     pub(crate) same_session: bool,
@@ -1364,7 +1362,7 @@ pub(crate) struct DuplicateRunningTask {
 #[path = "task_access.rs"]
 mod task_access;
 pub use scratch_retention::{RetainedScratchHealth, SCRATCH_RETENTION};
-pub(crate) use task_access::safe_task_entry;
+pub use task_access::safe_task_entry;
 
 /// What woke the watchdog pass in which a task was observed terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1670,7 +1668,7 @@ const PENDING_WAIT_DETACH_TTL: Duration = Duration::from_secs(120);
 /// A detach target shares this cache with the task's metadata writers. Its
 /// mutex only protects published values: no disk or task-state work runs under it.
 #[derive(Clone, Default)]
-pub(crate) struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
+pub struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
 
 #[derive(Clone, Default)]
 pub(crate) struct BashDrainReplyState {
@@ -2149,9 +2147,9 @@ pub(crate) struct BgTaskState {
     pub(crate) pending_terminal_override: Option<BgTaskStatus>,
 }
 
-pub(crate) const ARTIFACT_PAGE_BYTES: usize = 64 * 1024;
+pub const ARTIFACT_PAGE_BYTES: usize = 64 * 1024;
 
-pub(crate) struct ArtifactPage {
+pub struct ArtifactPage {
     pub bytes: Vec<u8>,
     pub next_offset: u64,
     pub has_more: bool,

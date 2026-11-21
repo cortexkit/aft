@@ -60,9 +60,9 @@ mod build_slots;
 pub mod checkout_controls;
 #[cfg(unix)]
 use checkout_controls::checkout_control_denies;
-pub(crate) use checkout_controls::remote_control_denies;
+pub use checkout_controls::remote_control_denies;
 mod launcher_image;
-pub(crate) mod remote;
+pub mod remote;
 #[doc(hidden)]
 pub mod remote_shell_guard;
 mod requirement;
@@ -75,7 +75,8 @@ pub use remote::run_for_test as run_remote_shell_for_test;
 mod tool_launch_policy;
 #[cfg(unix)]
 mod worker_reads;
-pub(crate) use requirement::{resolve_command_sandbox_spawn, SandboxRequirement};
+pub(crate) use requirement::resolve_command_sandbox_spawn;
+pub use requirement::SandboxRequirement;
 #[cfg(unix)]
 use settings_grants::absolute_env_path;
 #[cfg(target_os = "macos")]
@@ -153,7 +154,7 @@ struct EscalationGrant {
 
 #[cfg(unix)]
 #[derive(Debug, Clone)]
-pub(crate) struct ProviderApprovalSnapshot {
+pub struct ProviderApprovalSnapshot {
     pub(crate) input: HashMap<String, String>,
     pub(crate) environment: ChildEnvironment,
     pub(crate) failure: Option<String>,
@@ -161,11 +162,7 @@ pub(crate) struct ProviderApprovalSnapshot {
 }
 
 #[cfg(unix)]
-pub(crate) fn save_provider_approval(
-    ctx: &AppContext,
-    id: &str,
-    snapshot: ProviderApprovalSnapshot,
-) {
+pub fn save_provider_approval(ctx: &AppContext, id: &str, snapshot: ProviderApprovalSnapshot) {
     let mut store = ctx.escalation_grants().lock();
     if let Some(grant) = store.grants.get_mut(id) {
         grant.provider_snapshot = Some(snapshot);
@@ -210,7 +207,7 @@ fn provider_grant_expiry_timer(owner: std::sync::Weak<parking_lot::Mutex<Escalat
 }
 
 #[cfg(unix)]
-pub(crate) fn frozen_provider_approval(
+pub fn frozen_provider_approval(
     ctx: &AppContext,
     id: &str,
     principal: &AuthenticatedPrincipal,
@@ -776,7 +773,7 @@ impl Drop for PrincipalScope {
 }
 
 /// Run dispatch with server-owned principal data installed for bash resolution.
-pub(crate) fn with_authenticated_principal<R>(
+pub fn with_authenticated_principal<R>(
     principal: AuthenticatedPrincipal,
     run: impl FnOnce() -> R,
 ) -> R {
@@ -795,21 +792,18 @@ impl Drop for WorkerJailScope {
 
 /// Select the worker shell profile after the route's Alfonso worker stamp
 /// has been authenticated; the flag is scoped to this request's dispatch.
-pub(crate) fn with_worker_jail<R>(jailed: bool, run: impl FnOnce() -> R) -> R {
+pub fn with_worker_jail<R>(jailed: bool, run: impl FnOnce() -> R) -> R {
     let previous = WORKER_JAIL.with(|slot| slot.replace(jailed));
     let _scope = WorkerJailScope(previous);
     run()
 }
 
 /// Whether the shell dispatch on this thread belongs to a jailed worker.
-pub(crate) fn worker_jail_active() -> bool {
+pub fn worker_jail_active() -> bool {
     WORKER_JAIL.with(std::cell::Cell::get)
 }
 
-pub(crate) fn effective_sandbox_mode(
-    ctx: &AppContext,
-    principal: &AuthenticatedPrincipal,
-) -> SandboxMode {
+pub fn effective_sandbox_mode(ctx: &AppContext, principal: &AuthenticatedPrincipal) -> SandboxMode {
     if principal_requires_strict(principal) {
         return SandboxMode::Strict;
     }
@@ -821,7 +815,7 @@ pub(crate) fn effective_sandbox_mode(
     }
 }
 
-pub(crate) fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> bool {
+pub fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> bool {
     // An MCP harness claim can only tighten confinement, including if a facade is
     // mistakenly stamped first-party. It never grants trust or relaxes a profile.
     !principal_is_first_party(principal)
@@ -830,7 +824,7 @@ pub(crate) fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> b
 }
 
 /// Resolve the role and authenticated principal before choosing the launcher.
-pub(crate) fn sandbox_required(ctx: &AppContext) -> bool {
+pub fn sandbox_required(ctx: &AppContext) -> bool {
     effective_sandbox_mode(ctx, &current_authenticated_principal()) != SandboxMode::Off
         || (cfg!(unix) && worker_jail_active())
 }
@@ -846,13 +840,13 @@ fn worker_jail_refusal(reason: &str) -> SpawnPlan {
 }
 
 /// Current dispatch principal. Standalone requests are first-party by construction.
-pub(crate) fn current_authenticated_principal() -> AuthenticatedPrincipal {
+pub fn current_authenticated_principal() -> AuthenticatedPrincipal {
     CURRENT_PRINCIPAL
         .with(|slot| slot.borrow().clone())
         .unwrap_or(AuthenticatedPrincipal::FirstParty)
 }
 
-pub(crate) fn principal_is_first_party(principal: &AuthenticatedPrincipal) -> bool {
+pub fn principal_is_first_party(principal: &AuthenticatedPrincipal) -> bool {
     matches!(
         principal,
         AuthenticatedPrincipal::FirstParty
@@ -864,7 +858,7 @@ pub(crate) fn principal_is_first_party(principal: &AuthenticatedPrincipal) -> bo
 }
 
 #[cfg(unix)]
-pub(crate) fn approved_payload_environment(
+pub fn approved_payload_environment(
     overrides: &HashMap<String, String>,
     temp_dir: &Path,
 ) -> ChildEnvironment {
@@ -873,7 +867,7 @@ pub(crate) fn approved_payload_environment(
 
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn mint_host_escalation_grant(
+pub fn mint_host_escalation_grant(
     ctx: &AppContext,
     principal: &AuthenticatedPrincipal,
     command: &[u8],
@@ -1450,15 +1444,12 @@ fn hex_bytes(bytes: &[u8]) -> String {
 ///
 /// Process spawning and in-process bash rewriting share this check so neither
 /// confinement nor the worker environment can be bypassed by a rewrite.
-pub(crate) fn native_sandbox_enforced(
-    ctx: &AppContext,
-    principal: &AuthenticatedPrincipal,
-) -> bool {
+pub fn native_sandbox_enforced(ctx: &AppContext, principal: &AuthenticatedPrincipal) -> bool {
     cfg!(unix)
         && (effective_sandbox_mode(ctx, principal) != SandboxMode::Off || worker_jail_active())
 }
 
-pub(crate) fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<SpawnPlan> {
+pub fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<SpawnPlan> {
     unsupported_profile_sandbox_refusal(effective_sandbox_mode(
         ctx,
         &current_authenticated_principal(),

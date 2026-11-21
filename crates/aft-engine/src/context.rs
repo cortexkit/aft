@@ -1,18 +1,18 @@
-pub(crate) use crate::secret::call_context;
+pub use crate::secret::call_context;
 
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
-pub(crate) use crate::data_layer::status::EmbeddingBackendHealthSnapshot;
+pub use crate::data_layer::status::view_load_error_response;
+pub use crate::data_layer::status::EmbeddingBackendHealthSnapshot;
 pub(crate) use crate::data_layer::status::{
-    view_load_cause, view_load_error_response, VIEW_LOAD_DEGRADED_REASON, VIEW_LOAD_LOG_INTERVAL,
+    view_load_cause, VIEW_LOAD_DEGRADED_REASON, VIEW_LOAD_LOG_INTERVAL,
 };
 pub use crate::data_layer::status::{
     SemanticFillHealth, SemanticHealthComponentSnapshot, SemanticIndexEvent, SemanticIndexStatus,
     SemanticRefreshAccounting, ViewLoadFailure, SEMANTIC_MASS_REFRESH_MIN_FILES,
 };
 pub(crate) use crate::executor::root_lifecycle::SubcLifecycleAdmission;
-pub(crate) use crate::watcher_backend::counters::{
-    watcher_counters_for_root, WatcherCounters, WatcherCountersSnapshot,
-};
+pub(crate) use crate::watcher_backend::counters::WatcherCounters;
+pub use crate::watcher_backend::counters::{watcher_counters_for_root, WatcherCountersSnapshot};
 #[cfg(test)]
 pub(crate) use crate::watcher_backend::counters::{
     WatcherExclusionPlanningSnapshot, WatcherOverflowPrefix,
@@ -251,12 +251,12 @@ pub(crate) use gitignore_state::IgnoreRuleChange;
 
 // The shared ignore-rule definition every project walker applies; see
 // `apply_project_ignore_rules`.
-pub(crate) use gitignore_state::apply_project_ignore_rules;
+pub use gitignore_state::apply_project_ignore_rules;
 
 #[path = "confinement.rs"]
-pub(crate) mod confinement;
+pub mod confinement;
 #[path = "launch_grants.rs"]
-pub(crate) mod launch_grants;
+pub mod launch_grants;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
@@ -277,7 +277,7 @@ impl Drop for ProgressOriginGuard {
 
 /// Scope progress to the exact route generation that admitted a request. Handles
 /// captured inside the scope retain that destination when used on other threads.
-pub(crate) fn progress_origin_guard(
+pub fn progress_origin_guard(
     request_id: &str,
     channel: u16,
     epoch: u32,
@@ -1452,7 +1452,7 @@ pub(crate) mod pending_restore_work {
 /// Why [`AppContext::artifact_eviction_blocker`] refused eviction. The idle
 /// reaper counts retained unbound roots per kind in its health census.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ArtifactEvictionBlocker {
+pub enum ArtifactEvictionBlocker {
     /// A configured standing root keeps its artifacts resident on purpose.
     StandingRoot,
     /// A search, callgraph, or semantic build receiver is still installed.
@@ -1571,7 +1571,7 @@ impl WatcherDrainSliceState {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ConfigureMaintenanceJob {
+pub struct ConfigureMaintenanceJob {
     pub(crate) generation: u64,
     pub(crate) root_path: PathBuf,
     pub(crate) canonical_cache_root: PathBuf,
@@ -2053,7 +2053,7 @@ struct PathRestrictionContext {
 /// Marks explicit roots passed to search tools so their worker-only refusal
 /// for a filesystem-root search can be handled at the shared path gate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum WorkerSearchTool {
+pub enum WorkerSearchTool {
     Glob,
     Grep,
     AftSearch,
@@ -15060,7 +15060,7 @@ mod data_layer_health_tests {
 
 /// Run once from daemon startup, never from a route or a short-lived database
 /// opener. Copy failures must not make the shared persistence store unavailable.
-pub(crate) fn start_runner_harness_copy(
+pub fn start_runner_harness_copy(
     app: std::sync::Arc<crate::context::App>,
     path: std::path::PathBuf,
 ) {

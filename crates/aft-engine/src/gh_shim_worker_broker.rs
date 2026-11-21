@@ -194,7 +194,8 @@ impl Drop for ServiceGuard {
     }
 }
 
-pub(crate) fn install(relay: Arc<GhRelay>) -> (ServiceGuard, mpsc::Receiver<ScopeQuery>) {
+#[doc(hidden)]
+pub fn install(relay: Arc<GhRelay>) -> (ServiceGuard, mpsc::Receiver<ScopeQuery>) {
     let (scopes, rx) = mpsc::channel(32);
     let guard = ServiceGuard {
         #[cfg(unix)]

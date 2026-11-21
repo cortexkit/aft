@@ -47,7 +47,8 @@ pub fn planes(kinds: &[IndexKind]) -> Planes {
 /// published. A standing pass passes one that turns `false` when a session
 /// binds the root or the pass's job is cancelled, so such a pass never
 /// clears the root's strict-verification flag.
-pub(crate) fn verify_current(
+#[doc(hidden)]
+pub fn verify_current(
     root: &Path,
     storage: &Path,
     planes: Planes,

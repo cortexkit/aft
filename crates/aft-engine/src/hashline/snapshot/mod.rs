@@ -1163,7 +1163,8 @@ pub fn capture_taggable_read_with_options(
 
 /// Bytes and permissions observed through the same open file. Metadata is kept
 /// private so callers cannot accidentally pair earlier bytes with a later stat.
-pub(crate) struct ReadSource {
+#[doc(hidden)]
+pub struct ReadSource {
     bytes: Vec<u8>,
     metadata: fs::Metadata,
 }
@@ -1202,7 +1203,8 @@ pub(crate) fn helper_state_scope() -> HelperStateScope {
     )
 }
 
-pub(crate) fn read_source(path: &Path) -> io::Result<ReadSource> {
+#[doc(hidden)]
+pub fn read_source(path: &Path) -> io::Result<ReadSource> {
     #[cfg(test)]
     let hook = SOURCE_AFTER_READ.with(|hook| hook.borrow_mut().take());
     #[cfg(test)]
@@ -1282,7 +1284,8 @@ fn same_read_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 
 /// Apply the disk capture's complete refusal and publication rules to bytes
 /// already obtained with `read_source`, without opening the file again.
-pub(crate) fn capture_taggable_source_with_options(
+#[doc(hidden)]
+pub fn capture_taggable_source_with_options(
     store: &mut SnapshotStore,
     canonical_path: &Path,
     requested_path: impl Into<String>,
@@ -1437,7 +1440,8 @@ pub fn capture_bash_rewrite_read(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn capture_bash_rewrite_read_with_options(
+#[doc(hidden)]
+pub fn capture_bash_rewrite_read_with_options(
     store: &mut SnapshotStore,
     canonical_path: impl AsRef<Path>,
     requested_path: impl Into<String>,

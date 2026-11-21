@@ -1,6 +1,6 @@
 {
   "crates/aft-engine/src/bash_background/registry.rs": {
-    "lines": 18646,
+    "lines": 18644,
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
   "crates/aft-engine/src/bash_background/remote_tests.rs": {
@@ -20,11 +20,11 @@
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/lsp/manager.rs": {
-    "lines": 11109,
+    "lines": 11108,
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
   "crates/aft-engine/src/sandbox_spawn.rs": {
-    "lines": 10385,
+    "lines": 10376,
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft/src/commands/semantic_search/mod.rs": {
@@ -32,7 +32,7 @@
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/semantic_index.rs": {
-    "lines": 10557,
+    "lines": 10555,
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
   "crates/aft-parse/src/parser.rs": {

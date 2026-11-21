@@ -569,19 +569,22 @@ pub struct PersistedTask {
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub(crate) struct RunnerNoticePolicy {
+#[doc(hidden)]
+pub struct RunnerNoticePolicy {
     pub dedupe: bool,
     pub reminder_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RunnerCompletionDelivery {
+#[doc(hidden)]
+pub struct RunnerCompletionDelivery {
     pub generation: u8,
     pub phase: RunnerCompletionPhase,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) enum RunnerCompletionPhase {
+#[doc(hidden)]
+pub enum RunnerCompletionPhase {
     Ready {
         due_ms: u64,
     },
@@ -2850,7 +2853,8 @@ pub(super) fn open_task_artifact_once(
 
 /// Open and sample the same artifact handle, reopening if either validation
 /// races an atomic replacement. Callers calculate offsets only after this step.
-pub(crate) fn sample_task_artifact(
+#[doc(hidden)]
+pub fn sample_task_artifact(
     paths: &TaskPaths,
     artifact: TaskArtifact,
 ) -> io::Result<(ValidatedArtifact, u64)> {

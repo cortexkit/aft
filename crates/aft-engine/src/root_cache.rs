@@ -55,12 +55,15 @@ pub use location::{
     PruneLegacyError, PruneLegacyEvent, PruneLegacyReport, StoragePaths, CACHE_DIR_BUSY,
     CACHE_DIR_BUSY_MESSAGE, CACHE_DIR_UNAVAILABLE,
 };
-pub(crate) use location::{
-    cache_status_code, check_cache_access, ensure_config_storage_lease, identity_storage_root,
-    prepare_process_cache_root, prepare_third_party_cache_dir, unavailable_code,
+#[doc(hidden)]
+pub use location::{
+    cache_status_code, ensure_config_storage_lease, prepare_process_cache_root, unavailable_code,
     unavailable_warning,
 };
 use location::{canonical_process_lease_dir, existing_ancestor};
+pub(crate) use location::{
+    check_cache_access, identity_storage_root, prepare_third_party_cache_dir,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RootCacheDomain {

@@ -14,9 +14,11 @@ pub mod edit_gate;
 pub mod extract_gate;
 pub mod fragment;
 pub(crate) mod gate;
-pub(crate) mod grammar;
+#[doc(hidden)]
+pub mod grammar;
 pub(crate) mod graph_rows;
-pub(crate) mod graph_store;
+#[doc(hidden)]
+pub mod graph_store;
 pub mod host;
 pub(crate) mod ignore_rules;
 pub mod incremental;
@@ -24,14 +26,17 @@ pub mod incremental;
 mod incremental_tests;
 pub(crate) mod meaning;
 pub mod old_index;
-pub(crate) mod outline;
+#[doc(hidden)]
+pub mod outline;
 pub(crate) mod overlay;
-pub(crate) mod parent;
+#[doc(hidden)]
+pub mod parent;
 pub(crate) mod parent_query;
 pub mod parent_session;
 #[cfg(test)]
 mod publication_tests;
-pub(crate) mod query;
+#[doc(hidden)]
+pub mod query;
 #[doc(hidden)]
 pub mod read_fence;
 mod refresh_budget;
@@ -39,7 +44,8 @@ mod refresh_memory;
 #[cfg(feature = "test-hooks")]
 pub mod refresh_probe;
 pub mod reuse;
-pub(crate) mod runtime;
+#[doc(hidden)]
+pub mod runtime;
 #[cfg(test)]
 mod rust_bin_targets_tests;
 #[cfg(feature = "callgraph-shape-census")]
@@ -64,8 +70,10 @@ pub mod trace_measure;
 pub mod vectors;
 
 pub(crate) mod bound_checkouts;
-pub(crate) mod meaning_query;
-pub(crate) mod text_scope;
+#[doc(hidden)]
+pub mod meaning_query;
+#[doc(hidden)]
+pub mod text_scope;
 
 pub(crate) mod dead_code_reads;
 pub mod dead_code_snapshot;

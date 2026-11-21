@@ -43,7 +43,8 @@ pub(crate) const REQUEST_FILES_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 
 /// Size, modification time and file identity of a file when a phase read it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct FileStat {
+#[doc(hidden)]
+pub struct FileStat {
     pub size: u64,
     pub modified: Option<SystemTime>,
     /// The inode on Unix; `None` where the platform has no stable id here.
@@ -65,7 +66,8 @@ impl FileStat {
 
 /// One file's bytes as a phase read them, with what later phases derive
 /// from them computed once.
-pub(crate) struct RequestFile {
+#[doc(hidden)]
+pub struct RequestFile {
     bytes: Vec<u8>,
     stat: Option<FileStat>,
     digest: OnceLock<blake3::Hash>,
@@ -436,7 +438,8 @@ impl Drop for Guard {
 
 /// Start a request's set. A request nested in another (a parent folder's
 /// child search) gets its own set while its guard lives.
-pub(crate) fn install() -> Guard {
+#[doc(hidden)]
+pub fn install() -> Guard {
     let execution = current_execution();
     let files = Arc::new(RequestFiles::default());
     #[cfg(test)]
@@ -476,7 +479,8 @@ pub(crate) fn without_request_files_for_test<R>(run: impl FnOnce() -> R) -> R {
 }
 
 /// The set of the request running on this thread or task, if any.
-pub(crate) fn current() -> Option<Arc<RequestFiles>> {
+#[doc(hidden)]
+pub fn current() -> Option<Arc<RequestFiles>> {
     active()
         .lock()
         .get(&current_execution())
@@ -484,7 +488,8 @@ pub(crate) fn current() -> Option<Arc<RequestFiles>> {
 }
 
 /// `read`, through the current request's set when there is one.
-pub(crate) fn read_through(
+#[doc(hidden)]
+pub fn read_through(
     files: Option<&RequestFiles>,
     path: &Path,
     read: impl FnOnce(&Path) -> io::Result<(Vec<u8>, Option<FileStat>)>,
@@ -505,11 +510,13 @@ pub(crate) fn read_through(
 
 /// Read the whole file the way `std::fs::read` does, with the stat of the
 /// opened file.
-pub(crate) fn read_whole_file(path: &Path) -> io::Result<(Vec<u8>, Option<FileStat>)> {
+#[doc(hidden)]
+pub fn read_whole_file(path: &Path) -> io::Result<(Vec<u8>, Option<FileStat>)> {
     read_whole_file_at(path, crate::large_read::Site::SourceFile)
 }
 
-pub(crate) fn read_whole_file_at(
+#[doc(hidden)]
+pub fn read_whole_file_at(
     path: &Path,
     site: crate::large_read::Site,
 ) -> io::Result<(Vec<u8>, Option<FileStat>)> {

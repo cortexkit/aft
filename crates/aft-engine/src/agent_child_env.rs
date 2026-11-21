@@ -82,10 +82,8 @@ enum WorkerTestThreadBudgetIssue {
 
 /// Supply bounded test-run concurrency to a worker-preset bash child without
 /// replacing a value the caller already chose.
-pub(crate) fn inject_worker_test_threads(
-    project_root: &Path,
-    environment: &mut HashMap<String, String>,
-) {
+#[doc(hidden)]
+pub fn inject_worker_test_threads(project_root: &Path, environment: &mut HashMap<String, String>) {
     inject_worker_test_threads_with(project_root, environment, |name| {
         std::env::var_os(name).is_some()
     });
@@ -118,7 +116,8 @@ fn inject_worker_test_threads_with(
 /// A configured `bash.env` value for either must not reach this budget, and
 /// the config loader refuses both, so a caller that merges configuration into
 /// a launch environment drops them first.
-pub(crate) fn is_worker_test_thread_env_name(name: &str) -> bool {
+#[doc(hidden)]
+pub fn is_worker_test_thread_env_name(name: &str) -> bool {
     let name = name.to_ascii_uppercase();
     name == NEXT_TEST_THREADS_ENV || name == RUST_TEST_THREADS_ENV
 }
@@ -744,7 +743,8 @@ pub(crate) fn is_subc_credential_env_key(key: &str) -> bool {
 
 /// Apply request overrides to a non-PTY child and remove subc credentials from
 /// both the inherited process environment and explicit command overrides.
-pub(crate) fn apply_to_command(command: &mut Command, environment: &HashMap<String, String>) {
+#[doc(hidden)]
+pub fn apply_to_command(command: &mut Command, environment: &HashMap<String, String>) {
     // A ticket in this process's own environment belongs to whatever command
     // started this process, never to the child. The child gets a ticket only
     // when its request environment carries one issued for it.

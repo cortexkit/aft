@@ -240,7 +240,8 @@ pub fn resolve_standing_root(literal_path: &str) -> Result<ResolvedStandingRoot,
 /// Configured standing roots use `persist=true`; read-only health reports use
 /// `false`. Both resolve the identity stored under `storage`. StandingRoots::reconcile
 /// separately checks that the literal path still points at its pinned target.
-pub(crate) fn resolve_standing_root_in_storage(
+#[doc(hidden)]
+pub fn resolve_standing_root_in_storage(
     literal_path: &str,
     storage: &Path,
     persist: bool,

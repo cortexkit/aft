@@ -7,14 +7,16 @@
 
 pub(crate) type FileReporter = fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str);
 static FILE_REPORTER: std::sync::OnceLock<FileReporter> = std::sync::OnceLock::new();
-pub(crate) fn register_file_reporter(reporter: FileReporter) {
+#[doc(hidden)]
+pub fn register_file_reporter(reporter: FileReporter) {
     let _ = FILE_REPORTER.set(reporter);
 }
 #[cfg(test)]
 pub(crate) fn file_reporter_registered() -> bool {
     FILE_REPORTER.get().is_some()
 }
-pub(crate) fn report_file(
+#[doc(hidden)]
+pub fn report_file(
     file: &str,
     old_path: Option<&str>,
     before: Option<&str>,
@@ -30,7 +32,8 @@ use std::path::Path;
 
 #[cfg(windows)]
 pub(crate) mod delete_tree_win;
-pub(crate) mod remote_links;
+#[doc(hidden)]
+pub mod remote_links;
 
 use crate::config::Config;
 use crate::context::AppContext;
@@ -87,10 +90,8 @@ pub(crate) struct SourceWriteOutcome {
 /// crash mid-write leaves that copy behind, and the next write to the file
 /// reports it. Every source write path, including syntax rollback and
 /// hashline transactions, goes through this one decision.
-pub(crate) fn atomic_write_source(
-    path: &Path,
-    bytes: &[u8],
-) -> std::io::Result<SourceWriteOutcome> {
+#[doc(hidden)]
+pub fn atomic_write_source(path: &Path, bytes: &[u8]) -> std::io::Result<SourceWriteOutcome> {
     let started = std::time::Instant::now();
     let result = atomic_write_source_with(path, bytes, |file, bytes| {
         use std::io::Write;
@@ -1070,7 +1071,8 @@ pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
 }
 
 /// Byte starts shared by all line-range edits against one captured source.
-pub(crate) struct LineOffsets {
+#[doc(hidden)]
+pub struct LineOffsets {
     starts: Vec<usize>,
     source_len: usize,
 }
@@ -1101,7 +1103,8 @@ impl LineOffsets {
     }
 }
 
-pub(crate) fn validate_byte_range(source: &str, start: usize, end: usize) -> Result<(), AftError> {
+#[doc(hidden)]
+pub fn validate_byte_range(source: &str, start: usize, end: usize) -> Result<(), AftError> {
     if start > end {
         return Err(AftError::InvalidRequest {
             message: format!(
@@ -1204,7 +1207,8 @@ pub fn validate_syntax_str(content: &str, path: &Path) -> Option<bool> {
 /// (Python block indentation), so an edit is judged the same way whichever
 /// path validates it. Outline keeps using [`validate_syntax`]: it only needs
 /// to know whether tree-sitter could recover the symbols.
-pub(crate) fn validate_edited_file_syntax(path: &Path) -> Result<Option<bool>, AftError> {
+#[doc(hidden)]
+pub fn validate_edited_file_syntax(path: &Path) -> Result<Option<bool>, AftError> {
     if matches!(detect_language(path), None | Some(LangId::Markdown)) {
         return Ok(None);
     }
@@ -1282,7 +1286,8 @@ pub fn wants_preview(params: &serde_json::Value) -> bool {
 
 /// A shared byte-to-line map and borrowed context lines for ambiguity payloads.
 /// Line endings follow `str::lines`, while offsets count every LF byte.
-pub(crate) struct SourceLineIndex<'a> {
+#[doc(hidden)]
+pub struct SourceLineIndex<'a> {
     starts: Vec<usize>,
     lines: Vec<&'a str>,
 }
@@ -1337,13 +1342,15 @@ impl<'a> SourceLineIndex<'a> {
 /// The regular-file capture and identity associated with a handler's source.
 /// Reuse is conditional on live identity; symlinks and platforms without strong
 /// version evidence retain the path-reading pipeline.
-pub(crate) struct EditObservation {
+#[doc(hidden)]
+pub struct EditObservation {
     capture: Option<crate::backup::CapturedRegularFile>,
     version: Option<crate::backup::DiskFileVersion>,
     expected: mutation::Version,
 }
 
-pub(crate) mod mutation;
+#[doc(hidden)]
+pub mod mutation;
 
 impl EditObservation {
     pub(crate) fn check(&self, path: &Path) -> Result<(), AftError> {
@@ -1358,7 +1365,8 @@ impl EditObservation {
     }
 }
 
-pub(crate) fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObservation)> {
+#[doc(hidden)]
+pub fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObservation)> {
     let (bytes, observation) = read_edit_bytes(path)?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| {
@@ -1371,9 +1379,8 @@ pub(crate) fn read_edit_source(path: &Path) -> std::io::Result<(String, EditObse
     Ok((text, observation))
 }
 
-pub(crate) fn read_edit_bytes(
-    path: &Path,
-) -> std::io::Result<(std::sync::Arc<[u8]>, EditObservation)> {
+#[doc(hidden)]
+pub fn read_edit_bytes(path: &Path) -> std::io::Result<(std::sync::Arc<[u8]>, EditObservation)> {
     let mut expected = mutation::Version::existing(path, std::sync::Arc::from([]));
     let before = crate::backup::DiskFileVersion::of_path(path);
     let (bytes, capture) = match crate::backup::CapturedRegularFile::read(path)? {
@@ -1397,7 +1404,8 @@ pub(crate) fn read_edit_bytes(
     ))
 }
 
-pub(crate) fn auto_backup_observed(
+#[doc(hidden)]
+pub fn auto_backup_observed(
     ctx: &AppContext,
     session: &str,
     path: &Path,
@@ -1462,7 +1470,8 @@ pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
 
 /// Render a reference patch for size-limited GitHub comment bodies and tests.
 /// File responses must use [`DiffBudget`] instead of this unbounded renderer.
-pub(crate) fn build_unbounded_unified_diff(file: &str, before: &str, after: &str) -> String {
+#[doc(hidden)]
+pub fn build_unbounded_unified_diff(file: &str, before: &str, after: &str) -> String {
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     if before == after {
         return format!(
@@ -1519,11 +1528,14 @@ pub fn attach_preview_diff(
 
 /// Total rendered diff bytes across all copies in a response. Even sixfold JSON
 /// escaping leaves ample room below the smallest transport's 3 MiB body limit.
-pub(crate) const DIFF_RESPONSE_BUDGET: usize = 128 * 1024;
-pub(crate) const DIFF_OMITTED_NOTICE: &str = "Diff preview omitted: exceeds the response budget.";
+#[doc(hidden)]
+pub const DIFF_RESPONSE_BUDGET: usize = 128 * 1024;
+#[doc(hidden)]
+pub const DIFF_OMITTED_NOTICE: &str = "Diff preview omitted: exceeds the response budget.";
 
 /// One allowance shared by every file in a reply, including duplicate host fields.
-pub(crate) struct DiffBudget {
+#[doc(hidden)]
+pub struct DiffBudget {
     pub(crate) remaining: usize,
     copies: usize,
     pub(crate) omitted: bool,
@@ -1666,10 +1678,8 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-pub(crate) fn construct_diff<'a>(
-    before: &'a str,
-    after: &'a str,
-) -> similar::TextDiff<'a, 'a, 'a, str> {
+#[doc(hidden)]
+pub fn construct_diff<'a>(before: &'a str, after: &'a str) -> similar::TextDiff<'a, 'a, 'a, str> {
     #[cfg(test)]
     if let Some(timeout) = DIFF_TIMEOUT_OVERRIDE.with(std::cell::Cell::get) {
         return construct_diff_with_timeout(before, after, timeout);
@@ -1708,7 +1718,8 @@ fn diff_counts(before: &str, after: &str) -> (usize, usize) {
     counts_from_diff(&construct_diff(before, after))
 }
 
-pub(crate) fn response_diff(
+#[doc(hidden)]
+pub fn response_diff(
     params: &serde_json::Value,
     file: &str,
     before: &str,
@@ -1731,7 +1742,8 @@ pub(crate) fn response_diff(
 
 /// Render the optional counts and the host patch from the same line diff.
 /// Both representations describe one observed before/after pair.
-pub(crate) fn attach_edit_diff(
+#[doc(hidden)]
+pub fn attach_edit_diff(
     result: &mut serde_json::Value,
     params: &serde_json::Value,
     file: &str,
@@ -1871,7 +1883,8 @@ pub fn attach_backup_skipped_reason(
 
 /// Persist a regular-file capture that was already freshness-checked while
 /// creating the operation's rollback checkpoint.
-pub(crate) fn auto_backup_from_capture(
+#[doc(hidden)]
+pub fn auto_backup_from_capture(
     ctx: &AppContext,
     session: &str,
     path: &Path,
@@ -2181,11 +2194,13 @@ impl WriteResult {
     }
 }
 
-pub(crate) fn syntax_unknown_notice(reason: &str) -> String {
+#[doc(hidden)]
+pub fn syntax_unknown_notice(reason: &str) -> String {
     format!("Syntax check: unknown ({reason}); the new file was written, but its syntax could not be confirmed.")
 }
 
-pub(crate) fn append_syntax_skipped_reason(result: &mut serde_json::Value, reason: Option<&str>) {
+#[doc(hidden)]
+pub fn append_syntax_skipped_reason(result: &mut serde_json::Value, reason: Option<&str>) {
     if let Some(reason) = reason {
         result["syntax_skipped_reason"] = serde_json::json!(reason);
         if !result["warnings"].is_array() {
@@ -2200,11 +2215,13 @@ pub(crate) fn append_syntax_skipped_reason(result: &mut serde_json::Value, reaso
 
 /// Response field carrying the 1-based first error line of a created file that
 /// does not parse. Present only for files the call created.
-pub(crate) const CREATED_SYNTAX_ERROR_LINE_FIELD: &str = "syntax_error_line";
+#[doc(hidden)]
+pub const CREATED_SYNTAX_ERROR_LINE_FIELD: &str = "syntax_error_line";
 
 /// The reply line for a file this call created that does not parse. Every
 /// reply path renders it through this function so the wording stays the same.
-pub(crate) fn created_file_syntax_error_notice(first_error_line: u64) -> String {
+#[doc(hidden)]
+pub fn created_file_syntax_error_notice(first_error_line: u64) -> String {
     format!(
         "Syntax check: the new file does not parse (first error near line {first_error_line}); it was written as given."
     )
@@ -2261,7 +2278,8 @@ pub(crate) fn full_validation_requested(config: &Config, params: &serde_json::Va
 
 /// Validate the completed multi-file operation, never its intermediate writes.
 /// Call only after all writes succeeded and rollback is no longer needed.
-pub(crate) fn validate_written_files(
+#[doc(hidden)]
+pub fn validate_written_files(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     paths: &[std::path::PathBuf],
     config: &Config,
@@ -2309,7 +2327,8 @@ pub fn write_format_validate(
 }
 
 /// Reuse the captured original only while its strong file identity still matches.
-pub(crate) fn write_format_validate_observed(
+#[doc(hidden)]
+pub fn write_format_validate_observed(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
@@ -2329,7 +2348,8 @@ pub(crate) fn write_format_validate_observed(
     )
 }
 
-pub(crate) fn write_format_validate_bytes_observed(
+#[doc(hidden)]
+pub fn write_format_validate_bytes_observed(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
@@ -2363,7 +2383,8 @@ pub(crate) fn write_format_validate_bytes_observed(
 
 /// The caller owns admission for all affected files. Release a completed file
 /// immediately after its write, before invoking formatters or language servers.
-pub(crate) fn write_format_validate_admitted(
+#[doc(hidden)]
+pub fn write_format_validate_admitted(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     content: &str,
@@ -2586,7 +2607,8 @@ fn parse_captured_syntax_with_lang(
 /// span. GitHub-flavored Markdown splits cells at these pipes even inside
 /// backticks; ordinary cell delimiters and recoverable Markdown parser errors
 /// are not defects by themselves.
-pub(crate) fn markdown_table_advisory(path: &Path, source: &str) -> Option<String> {
+#[doc(hidden)]
+pub fn markdown_table_advisory(path: &Path, source: &str) -> Option<String> {
     if detect_language(path) != Some(LangId::Markdown) {
         return None;
     }
@@ -2672,7 +2694,8 @@ fn code_span_has_unescaped_pipe(line: &str) -> bool {
 
 /// Syntax verdict for a file the current call created.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CreatedFileSyntax {
+#[doc(hidden)]
+pub struct CreatedFileSyntax {
     /// `None` when the language has no parser or confirmation could not finish.
     pub valid: Option<bool>,
     pub skipped_reason: Option<&'static str>,
@@ -2693,7 +2716,8 @@ pub(crate) struct CreatedFileSyntax {
 /// shell verdict is unknown and carries a reason instead of an error line;
 /// for bash that includes a missing shell, since tree-sitter-bash alone
 /// rejects some valid scripts.
-pub(crate) fn check_created_file_syntax(
+#[doc(hidden)]
+pub fn check_created_file_syntax(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
     source: &str,
@@ -4301,7 +4325,8 @@ mod in_place_write_tests {
     }
 }
 /// Capture the mutation baseline together with the text used to parse imports.
-pub(crate) fn parse_file_imports_observed(
+#[doc(hidden)]
+pub fn parse_file_imports_observed(
     path: &std::path::Path,
     lang: crate::parser::LangId,
 ) -> Result<

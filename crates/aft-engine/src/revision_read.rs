@@ -48,7 +48,8 @@ const MAX_REF_LEN: usize = 256;
 static NEXT_SCRATCH: AtomicU64 = AtomicU64::new(0);
 
 /// The `ref` argument of a request, when it carries a non-blank one.
-pub(crate) fn requested_ref(req: &RawRequest) -> Option<&str> {
+#[doc(hidden)]
+pub fn requested_ref(req: &RawRequest) -> Option<&str> {
     req.params
         .get(REF_PARAM)
         .and_then(Value::as_str)
@@ -56,14 +57,16 @@ pub(crate) fn requested_ref(req: &RawRequest) -> Option<&str> {
 }
 
 /// Refuse the call unless `revision_reads` is on.
-pub(crate) fn check_enabled(req: &RawRequest, ctx: &AppContext) -> Result<(), Response> {
+#[doc(hidden)]
+pub fn check_enabled(req: &RawRequest, ctx: &AppContext) -> Result<(), Response> {
     if ctx.config().revision_reads {
         return Ok(());
     }
     Err(disabled(req))
 }
 
-pub(crate) fn disabled(req: &RawRequest) -> Response {
+#[doc(hidden)]
+pub fn disabled(req: &RawRequest) -> Response {
     Response::error(
         &req.id,
         DISABLED_CODE,
@@ -76,7 +79,8 @@ pub(crate) fn disabled(req: &RawRequest) -> Response {
 
 /// One call's view of a git revision: the revision resolved to a commit once,
 /// and the files of that commit copied out so far.
-pub(crate) struct RevisionSession {
+#[doc(hidden)]
+pub struct RevisionSession {
     reference: String,
     commit: String,
     toplevel: PathBuf,

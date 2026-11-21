@@ -6,7 +6,8 @@ use serde_json::Value;
 
 // Without a client deadline, use the default worker wait plus the reply
 // margin advertised by the tool catalog.
-pub(crate) const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
+#[doc(hidden)]
+pub const WORKER_REPLY_MARGIN_MS: u64 = 240_000;
 const LEGACY_TRANSPORT_MS: u64 =
     crate::config::DEFAULT_BASH_WORKER_WAIT_MAX_MS + WORKER_REPLY_MARGIN_MS;
 pub(crate) const MAX_BLOCKING_WAIT_MS: u64 =
@@ -33,7 +34,8 @@ fn safety_margin(window: Duration) -> Duration {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct ReplyBudget {
+#[doc(hidden)]
+pub struct ReplyBudget {
     pub(crate) received_at: Instant,
     pub(crate) deadline: Instant,
     clock: WaitClock,
@@ -225,7 +227,8 @@ impl From<Instant> for ReplyBudget {
     }
 }
 
-pub(crate) fn clamp_worker_wait_ms(configured: u64) -> u64 {
+#[doc(hidden)]
+pub fn clamp_worker_wait_ms(configured: u64) -> u64 {
     if configured > MAX_BLOCKING_WAIT_MS {
         static WARN: std::sync::Once = std::sync::Once::new();
         WARN.call_once(|| {

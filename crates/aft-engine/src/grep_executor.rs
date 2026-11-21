@@ -12,11 +12,13 @@ pub(crate) const NO_FILES_IN_SCOPE_NOTE: &str =
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 
-pub(crate) mod git_exclude;
+#[doc(hidden)]
+pub mod git_exclude;
 pub mod multi_path;
 mod walk_coverage;
 
-pub(crate) use walk_coverage::{plural, walk_coverage_note};
+#[doc(hidden)]
+pub use walk_coverage::{plural, walk_coverage_note};
 
 use self::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
@@ -106,7 +108,8 @@ pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
     let _restore = Restore(WALK_LIMIT.with(|current| current.replace(limit)));
     run()
 }
-pub(crate) use crate::bounded_io::FALLBACK_WALK_BUDGET;
+#[doc(hidden)]
+pub use crate::bounded_io::FALLBACK_WALK_BUDGET;
 const FALLBACK_WALK_RETURN_MARGIN: Duration = Duration::from_millis(100);
 
 fn fallback_walk_budget() -> Duration {
@@ -306,7 +309,8 @@ fn log_fallback_walk(log: WalkLog) {
 /// Counts are updated before include/exclude filtering. Empty-scope probes count
 /// rejected directories once, without enumerating their contents.
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct ScopeFileCounts {
+#[doc(hidden)]
+pub struct ScopeFileCounts {
     pub examined: usize,
     pub ignored: usize,
     pub filtered: usize,
@@ -318,7 +322,8 @@ pub(crate) const MAX_IGNORE_PROBE_ENTRIES: usize = 4096;
 pub(crate) use crate::list_surfaces::grep::MAX_IGNORED_SCOPE_NAMES;
 
 #[derive(Debug, Default)]
-pub(crate) struct IgnoredScopeEntries {
+#[doc(hidden)]
+pub struct IgnoredScopeEntries {
     pub names: Vec<String>,
     pub total: usize,
     pub truncated: bool,
@@ -327,7 +332,8 @@ pub(crate) struct IgnoredScopeEntries {
 const IGNORE_PROBE_JOIN_BUDGET: Duration = Duration::from_millis(1);
 
 #[derive(Debug)]
-pub(crate) struct IgnoredScopeProbe {
+#[doc(hidden)]
+pub struct IgnoredScopeProbe {
     result: std::sync::mpsc::Receiver<Option<IgnoredScopeEntries>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     deadline: Instant,
@@ -446,7 +452,8 @@ impl IgnoreProbeWorker {
 
 /// Ignore coverage is optional: it never queues behind another probe or uses
 /// search's Rayon workers. A late answer is discarded after a one-ms join.
-pub(crate) fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe> {
+#[doc(hidden)]
+pub fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe> {
     let [root] = scope.roots.as_slice() else {
         return None;
     };
@@ -674,7 +681,8 @@ pub(crate) mod scan_order_for_test {
     }
 }
 
-pub(crate) fn resolve_grep_scope(
+#[doc(hidden)]
+pub fn resolve_grep_scope(
     ctx: &impl IndexHost,
     paths: Option<&serde_json::Value>,
     max_results: usize,
@@ -821,7 +829,8 @@ pub fn compute_filter_root(
     }
 }
 
-pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Option<bool> {
+#[doc(hidden)]
+pub fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Option<bool> {
     let mut unknown = false;
     for root in &scope.roots {
         // A starting path a confined walk may not use has nothing in scope.
@@ -853,10 +862,8 @@ pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Optio
 }
 
 /// Used for an empty indexed answer, whose catalog cannot count ignored files.
-pub(crate) fn scope_file_counts(
-    scope: &GrepScope,
-    filters: &PathFilters,
-) -> Option<ScopeFileCounts> {
+#[doc(hidden)]
+pub fn scope_file_counts(scope: &GrepScope, filters: &PathFilters) -> Option<ScopeFileCounts> {
     let mut counts = ScopeFileCounts::default();
     for root in &scope.roots {
         counts.add(diagnose_scope_counts(
@@ -977,7 +984,8 @@ pub(crate) fn execute_profiled_with_filters(
 /// [`execute_profiled_with_filters`] with a choice of which lines are kept
 /// once the search passes `params.max_results`: the first found, or the
 /// first by path and line.
-pub(crate) fn execute_profiled_with_filters_in_order(
+#[doc(hidden)]
+pub fn execute_profiled_with_filters_in_order(
     ctx: &impl IndexHost,
     pattern: &CompiledPattern,
     scope: &GrepScope,
@@ -1307,7 +1315,8 @@ fn execute_root_from_view(
 
 /// True when both paths name the same directory, comparing the given forms
 /// first and then their canonical forms (symlinks, `\\?\` prefixes).
-pub(crate) fn is_same_directory(left: &Path, right: &Path) -> bool {
+#[doc(hidden)]
+pub fn is_same_directory(left: &Path, right: &Path) -> bool {
     left == right
         || crate::bounded_io::canonicalize(left)
             .ok()
@@ -1519,7 +1528,8 @@ fn merge_grep_results_with_canonicalizer(
 /// run semantic search, so this walk does not check its starting path; grep,
 /// glob and their scope probes use [`fallback_target_walk_builder`], which
 /// does.
-pub(crate) fn fallback_project_walk_builder(
+#[doc(hidden)]
+pub fn fallback_project_walk_builder(
     search_root: &Path,
     skipped_foreign_mounts: Arc<AtomicUsize>,
 ) -> WalkBuilder {
@@ -1682,7 +1692,8 @@ fn target_walk_builder(
     builder
 }
 
-pub(crate) fn is_fallback_skipped_directory_name(name: &str) -> bool {
+#[doc(hidden)]
+pub fn is_fallback_skipped_directory_name(name: &str) -> bool {
     matches!(
         name,
         "node_modules"
@@ -1744,7 +1755,8 @@ impl TargetIgnoreRules {
     }
 }
 
-pub(crate) fn target_is_ignored(path: &Path) -> bool {
+#[doc(hidden)]
+pub fn target_is_ignored(path: &Path) -> bool {
     crate::bounded_io::run(path, None, |path| Ok(target_is_ignored_unbounded(&path)))
         .unwrap_or(false)
 }
@@ -1933,7 +1945,8 @@ fn target_is_ignored_unbounded(path: &Path) -> bool {
 /// walk stops at the caller's deadline (with a margin to return), so an
 /// oversized scope reports unknown instead of keeping a filesystem helper
 /// occupied after the caller has given up.
-pub(crate) fn diagnose_scope_counts(
+#[doc(hidden)]
+pub fn diagnose_scope_counts(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -2076,7 +2089,8 @@ pub(crate) fn bounded_fallback_walk_files(
     )
 }
 
-pub(crate) fn bounded_fallback_walk_files_for_target(
+#[doc(hidden)]
+pub fn bounded_fallback_walk_files_for_target(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -2096,7 +2110,8 @@ pub(crate) fn bounded_fallback_walk_files_for_target(
     )
 }
 
-pub(crate) fn bounded_glob_walk_in_named_ignored_folder(
+#[doc(hidden)]
+pub fn bounded_glob_walk_in_named_ignored_folder(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -2114,10 +2129,8 @@ pub(crate) fn bounded_glob_walk_in_named_ignored_folder(
     )
 }
 
-pub(crate) fn source_first_fallback_walk_files(
-    root: &Path,
-    deadline: Instant,
-) -> FallbackWalkOutcome {
+#[doc(hidden)]
+pub fn source_first_fallback_walk_files(root: &Path, deadline: Instant) -> FallbackWalkOutcome {
     let started = Instant::now();
     let mut files = Vec::new();
     let mut entries_visited = 0;
@@ -2159,7 +2172,8 @@ pub(crate) fn source_first_fallback_walk_files(
     outcome
 }
 
-pub(crate) fn is_fallback_source_path(path: &Path) -> bool {
+#[doc(hidden)]
+pub fn is_fallback_source_path(path: &Path) -> bool {
     use crate::parser::LangId;
     crate::parser::detect_language(path).is_some_and(|language| {
         !matches!(
@@ -2169,7 +2183,8 @@ pub(crate) fn is_fallback_source_path(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn bounded_fallback_walk_files_with_limits(
+#[doc(hidden)]
+pub fn bounded_fallback_walk_files_with_limits(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -3434,7 +3449,8 @@ fn should_stop_fallback_search(
             && total_matches.load(Ordering::Relaxed) >= stop_after)
 }
 
-pub(crate) fn ripgrep_glob(
+#[doc(hidden)]
+pub fn ripgrep_glob(
     search_root: &Path,
     pattern: &str,
     max_results: usize,

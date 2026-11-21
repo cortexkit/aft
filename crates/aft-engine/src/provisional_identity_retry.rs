@@ -218,7 +218,8 @@ impl RetrySlot {
 
 /// Record what a finished configure means for the retry. Called for every
 /// configure, including a replay prepared by [`poll`].
-pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, success: bool) {
+#[doc(hidden)]
+pub fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, success: bool) {
     if !success {
         // A failed configure publishes nothing, so the bind the retry belongs
         // to still stands. If the failed attempt advanced the generation, the
@@ -283,7 +284,8 @@ pub(crate) fn note_configure_outcome(ctx: &AppContext, request: &RawRequest, suc
 
 /// Stop retrying, for a root that unbound or quiesced. Returns whether a
 /// retry was armed.
-pub(crate) fn cancel(ctx: &AppContext) -> bool {
+#[doc(hidden)]
+pub fn cancel(ctx: &AppContext) -> bool {
     ctx.provisional_identity_retry().0.lock().take().is_some()
 }
 
@@ -366,7 +368,8 @@ fn stale_reason(ctx: &AppContext, retry: &PendingRetry) -> Option<&'static str> 
 ///
 /// Called only from configure-tail maintenance, never from an interactive
 /// request.
-pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
+#[doc(hidden)]
+pub fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
     let slot = ctx.provisional_identity_retry();
     if !slot.is_due() {
         return None;
@@ -424,7 +427,8 @@ pub(crate) fn poll(ctx: &AppContext) -> Option<PreparedReplay> {
 /// roots are served only by the attached daemon's subc module, which replays
 /// through [`PreparedReplay::run`] with its standing handoff, so these
 /// callers have no standing entry a settled key could share.
-pub(crate) fn drain_inline(ctx: &AppContext) -> bool {
+#[doc(hidden)]
+pub fn drain_inline(ctx: &AppContext) -> bool {
     match poll(ctx) {
         Some(replay) => {
             replay.run(ctx, |_| {});
@@ -439,7 +443,8 @@ pub(crate) fn drain_inline(ctx: &AppContext) -> bool {
 /// (a shared-hold run that must rerun as an exclusive writer), and only the
 /// run that completes the configure settles the retry.
 #[derive(Clone)]
-pub(crate) struct PreparedReplay {
+#[doc(hidden)]
+pub struct PreparedReplay {
     retry: std::sync::Arc<parking_lot::Mutex<Option<PendingRetry>>>,
     root: std::path::PathBuf,
     _cache_claim: Option<std::sync::Arc<()>>,

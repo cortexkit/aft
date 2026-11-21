@@ -170,7 +170,8 @@ pub(crate) fn artifact_cache_key_read_only(
 /// Wall times overlap: memo_hold includes load, pruning and writes, while
 /// rev_list includes child execution and waiting for the child to exit.
 #[derive(Debug, Default)]
-pub(crate) struct ArtifactCacheKeyTimings {
+#[doc(hidden)]
+pub struct ArtifactCacheKeyTimings {
     pub(crate) git_usable: Duration,
     pub(crate) rev_list: Duration,
     /// Git processes actually started, including unborn-branch verification.
@@ -673,7 +674,8 @@ pub(crate) fn resolve_root_identity_with_recheck(
 /// degraded reason and as the detail of a refused identity lookup. A bound
 /// root retries the identity in the background while this reason stands; see
 /// [`crate::provisional_identity_retry`].
-pub(crate) const PROVISIONAL_IDENTITY_REASON: &str =
+#[doc(hidden)]
+pub const PROVISIONAL_IDENTITY_REASON: &str =
     "identity provisional: aft.db was busy at bind; indexes start once the database is free";
 /// Replaces [`PROVISIONAL_IDENTITY_REASON`] once the background retry gives up.
 pub(crate) const PROVISIONAL_IDENTITY_EXHAUSTED_REASON: &str = "identity provisional: aft.db stayed busy or unreadable for 5 minutes after bind, so this folder has no search, semantic or call-graph index. Close whatever holds aft.db open (usually another AFT process in a long write), then reopen this folder's session to bind it again";

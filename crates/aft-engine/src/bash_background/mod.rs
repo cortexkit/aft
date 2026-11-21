@@ -2,7 +2,8 @@
 //! reaps them, output buffering/compression, and on-disk persistence so tasks
 //! survive a bridge restart.
 
-pub(crate) mod frames;
+#[doc(hidden)]
+pub mod frames;
 
 pub mod buffer;
 mod exit_observer;
@@ -15,18 +16,24 @@ pub mod process;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;
-pub(crate) mod runner_notice_scheduler;
-pub(crate) mod scoped_tasks;
-pub(crate) mod shell_metadata;
-pub(crate) mod store_writes;
+#[doc(hidden)]
+pub mod runner_notice_scheduler;
+#[doc(hidden)]
+pub mod scoped_tasks;
+#[doc(hidden)]
+pub mod shell_metadata;
+#[doc(hidden)]
+pub mod store_writes;
 pub(crate) mod task_scope;
 mod temp_cleanup;
-pub(crate) mod viewed_task;
+#[doc(hidden)]
+pub mod viewed_task;
 pub use crate::task_watch_lines as watch_lines;
 pub mod watchdog;
 pub use crate::task_watches as watches;
 pub(crate) mod windows_waiter;
-pub(crate) mod worker_thread;
+#[doc(hidden)]
+pub mod worker_thread;
 
 use crate::bash_permissions::PermissionAsk;
 use crate::context::AppContext;
@@ -58,7 +65,8 @@ mod slot_limit_tests;
 /// in-process rewrite is about to run) or the reply deadline refuses it. Both
 /// end states are final, so a caller told "refused" can rely on the command
 /// never starting later, and a caller told "committed" gets the task id.
-pub(crate) struct SpawnReceipt {
+#[doc(hidden)]
+pub struct SpawnReceipt {
     changed_files_deadline: std::sync::OnceLock<crate::bash_changed_files::SharedCallDeadline>,
     state: std::sync::Mutex<SpawnReceiptState>,
     deadline: std::time::Instant,
@@ -69,7 +77,8 @@ pub(crate) struct SpawnReceipt {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BashStartupStep {
+#[doc(hidden)]
+pub enum BashStartupStep {
     Admission,
     Setup,
     Environment,
@@ -235,7 +244,8 @@ enum SpawnReceiptState {
 
 /// What the reply deadline found when it settled a startup's receipt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum StartupOutcome {
+#[doc(hidden)]
+pub enum StartupOutcome {
     /// Nothing had committed; the receipt is now refused and the command can
     /// never start under it.
     Refused,
@@ -421,10 +431,8 @@ pub(crate) fn with_spawn_commit_time_for_test<T>(
     run()
 }
 
-pub(crate) fn with_spawn_receipt<T>(
-    receipt: std::sync::Arc<SpawnReceipt>,
-    run: impl FnOnce() -> T,
-) -> T {
+#[doc(hidden)]
+pub fn with_spawn_receipt<T>(receipt: std::sync::Arc<SpawnReceipt>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<std::sync::Arc<SpawnReceipt>>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -605,11 +613,13 @@ impl Drop for TaskIdentityScope {
 
 /// Keep task delivery scoped during ordinary tool calls and their response
 /// finalizers, which do not need to install shell-spawn authority.
-pub(crate) fn task_identity_scope(identity: Option<TaskIdentity>) -> TaskIdentityScope {
+#[doc(hidden)]
+pub fn task_identity_scope(identity: Option<TaskIdentity>) -> TaskIdentityScope {
     TaskIdentityScope(CURRENT_TASK_IDENTITY.with(|slot| slot.replace(identity)))
 }
 
-pub(crate) trait TaskIdentityAuth: Sized {
+#[doc(hidden)]
+pub trait TaskIdentityAuth: Sized {
     fn current() -> Option<Self>;
     fn from_principal(principal: &crate::sandbox_spawn::AuthenticatedPrincipal) -> Option<Self>;
     fn allows_current(owner: Option<&Self>) -> bool;
@@ -674,7 +684,8 @@ thread_local! {
 
 /// Request-side timings stay scoped to this dispatch thread until the remote
 /// worker takes ownership of them. Early refusals discard the unfinished log.
-pub(crate) struct RunonTimingScope(Option<crate::exec_remote::LaunchTimings>);
+#[doc(hidden)]
+pub struct RunonTimingScope(Option<crate::exec_remote::LaunchTimings>);
 
 impl RunonTimingScope {
     pub(crate) fn start(started: std::time::Instant) -> Self {
@@ -695,7 +706,8 @@ impl Drop for RunonTimingScope {
     }
 }
 
-pub(crate) fn enter_runon_phase(phase: &'static str) {
+#[doc(hidden)]
+pub fn enter_runon_phase(phase: &'static str) {
     CURRENT_RUNON_TIMINGS.with(|current| {
         if let Some(timings) = current.borrow_mut().as_mut() {
             timings.enter(phase);
@@ -713,7 +725,8 @@ fn take_runon_timings() -> crate::exec_remote::LaunchTimings {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct RemoteLaunch {
+#[doc(hidden)]
+pub struct RemoteLaunch {
     pub requested_platform: Option<crate::exec_remote::types::Platform>,
     pub params: crate::exec_remote::FrozenParams,
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -746,7 +759,8 @@ pub(crate) struct RemoteLaunch {
 /// reason, never a silent local run. `runon` is the caller's demand, `pty`,
 /// `powershell` and `host_sandbox` describe the rest of the call, and the
 /// session's remote policy is the one installed by [`with_remote_policy`].
-pub(crate) fn remote_for_runon(
+#[doc(hidden)]
+pub fn remote_for_runon(
     config: &crate::config::Config,
     runon: &str,
     pty: bool,
@@ -807,7 +821,8 @@ pub(crate) fn remote_for_runon(
 }
 
 /// Preserve automatic routing only for deployed plans carrying a prefix list.
-pub(crate) fn remote_for_legacy_command(
+#[doc(hidden)]
+pub fn remote_for_legacy_command(
     config: &crate::config::Config,
     command: &str,
     pty: bool,
@@ -829,7 +844,8 @@ pub(crate) fn remote_for_legacy_command(
         })
 }
 
-pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<RemoteLaunch>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -840,7 +856,8 @@ pub(crate) fn with_remote_policy<T>(policy: Option<RemoteLaunch>, run: impl FnOn
     run()
 }
 
-pub(crate) fn with_worker_preset<T>(worker_preset: bool, run: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_worker_preset<T>(worker_preset: bool, run: impl FnOnce() -> T) -> T {
     struct Restore(bool);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -851,13 +868,15 @@ pub(crate) fn with_worker_preset<T>(worker_preset: bool, run: impl FnOnce() -> T
     run()
 }
 
-pub(crate) fn worker_preset_active() -> bool {
+#[doc(hidden)]
+pub fn worker_preset_active() -> bool {
     CURRENT_WORKER_PRESET.with(std::cell::Cell::get)
 }
 
 /// Run `run` with `call_key` as the current call's key, restoring the
 /// previous one afterwards, even if `run` panics.
-pub(crate) fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<Option<String>>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -877,7 +896,8 @@ pub(crate) fn with_call_key<T>(call_key: Option<String>, run: impl FnOnce() -> T
 /// call-ledger row belongs to the run route that sent it; the task must name
 /// that same requester so the ledger can find it. `None` keeps the
 /// principal's id.
-pub(crate) fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_call_requester<T>(requester: Option<String>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<Option<String>>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -903,7 +923,8 @@ thread_local! {
 
 /// Run `run` with `schema_pin` recorded as the pin of any task it creates,
 /// restoring the previous one afterwards, even if `run` panics.
-pub(crate) fn with_schema_pin<T>(schema_pin: Option<String>, run: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_schema_pin<T>(schema_pin: Option<String>, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<Option<String>>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -991,7 +1012,8 @@ fn resolve_powershell_path_with(
 /// The refusal for a PowerShell command on a host without `pwsh`. `shell_tool`
 /// is the name the host registered AFT's command tool under, which is what the
 /// agent has to call again (`bash`, or `shell` on OpenCode 2).
-pub(crate) fn powershell_missing_message(shell_tool: &str) -> String {
+#[doc(hidden)]
+pub fn powershell_missing_message(shell_tool: &str) -> String {
     format!(
         "PowerShell (pwsh) is not installed or is not on PATH, so this command was not run. \
          Rewrite it in bash syntax and call the {shell_tool} tool without `shell: \"powershell\"`, \
@@ -1007,7 +1029,8 @@ pub(crate) fn powershell_missing_message(shell_tool: &str) -> String {
 /// lookup stats each `PATH` directory. So the answer is kept for as long as
 /// this process's `PATH` is unchanged; a changed `PATH` (for example after
 /// startup fills it from the login shell) looks again.
-pub(crate) fn powershell_available() -> bool {
+#[doc(hidden)]
+pub fn powershell_available() -> bool {
     static LAST: std::sync::Mutex<Option<(Option<std::ffi::OsString>, bool)>> =
         std::sync::Mutex::new(None);
     let path = std::env::var_os("PATH");
@@ -1024,7 +1047,8 @@ pub(crate) fn powershell_available() -> bool {
     available
 }
 
-pub(crate) fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf, String> {
+#[doc(hidden)]
+pub fn resolve_shell_path(pty: bool, shell: BashShell) -> Result<PathBuf, String> {
     if shell.is_powershell() {
         return resolve_powershell_path_with(|candidate| which::which(candidate).ok());
     }
@@ -1061,7 +1085,8 @@ pub struct BgTaskInfo {
     pub status_reason: Option<String>,
 }
 
-pub(crate) const PTY_EXIT_STATUS_UNKNOWN_REASON: &str = "AFT could not read how it ended";
+#[doc(hidden)]
+pub const PTY_EXIT_STATUS_UNKNOWN_REASON: &str = "AFT could not read how it ended";
 pub use crate::protocol::BgTaskStatus;
 
 /// When a background bash task is killed for running too long (its hard kill).
@@ -1140,7 +1165,8 @@ impl TaskSlot {
 /// background feature and takes a background slot. A foreground command
 /// (`false`, and not a PTY) always starts; see [`TaskSlot::Foreground`].
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn spawn_with_secrets(
+#[doc(hidden)]
+pub fn spawn_with_secrets(
     request_id: &str,
     session_id: &str,
     command: &str,
@@ -1813,11 +1839,13 @@ pub(crate) fn successful_spawn_response(
 
 // A root context is shared by routes from different harnesses. Determine a
 // command's owner from its route binding, not the last harness to configure the root.
-pub(crate) fn route_harness() -> Option<crate::harness::Harness> {
+#[doc(hidden)]
+pub fn route_harness() -> Option<crate::harness::Harness> {
     TaskIdentity::current()?.harness.parse().ok()
 }
 
-pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
+#[doc(hidden)]
+pub fn task_storage_dir(ctx: &AppContext) -> PathBuf {
     let config = ctx.config();
     let root = storage_dir(config.storage_dir.as_deref());
     route_harness()
@@ -1842,7 +1870,8 @@ pub(crate) fn task_storage_dir(ctx: &AppContext) -> PathBuf {
 /// (before any project binds) and by `configure` (the first configure of a
 /// standalone process; later and SubC configures find the pass started).
 /// Repeated calls for the same root do nothing.
-pub(crate) fn note_storage_root(storage_root: &std::path::Path) {
+#[doc(hidden)]
+pub fn note_storage_root(storage_root: &std::path::Path) {
     // A test process must never send cancels for a developer's real store:
     // test builds start the pass only for temporary storage roots.
     #[cfg(test)]
@@ -2344,5 +2373,7 @@ mod legacy_root_task_repair_tests {
 
 #[cfg(all(test, unix))]
 pub(crate) use registry::push_projection_fixture;
-pub(crate) mod progress;
-pub(crate) mod secrets;
+#[doc(hidden)]
+pub mod progress;
+#[doc(hidden)]
+pub mod secrets;

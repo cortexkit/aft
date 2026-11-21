@@ -9613,10 +9613,7 @@ where
 
 /// Join existing startups for a workspace diagnostics request without
 /// starting servers for files the request has not opened.
-pub(crate) fn wait_for_pending_startups_unlocked<G>(
-    lock: impl Fn() -> G,
-    scope: Option<&Path>,
-) -> bool
+pub fn wait_for_pending_startups_unlocked<G>(lock: impl Fn() -> G, scope: Option<&Path>) -> bool
 where
     G: std::ops::DerefMut<Target = LspManager>,
 {
@@ -10325,7 +10322,9 @@ pub fn walk_applicable_area(
     }
 }
 
-pub(crate) use super::applicability_cache::{ApplicabilityMetrics, InvalidationCause};
+pub use super::applicability_cache::ApplicabilityMetrics;
+
+pub(crate) use super::applicability_cache::InvalidationCause;
 
 pub(crate) fn applicability_metrics(root: &Path) -> ApplicabilityMetrics {
     super::applicability_cache::shared()

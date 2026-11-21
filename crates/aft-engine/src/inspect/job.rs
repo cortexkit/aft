@@ -238,10 +238,8 @@ pub(crate) fn dead_code_skipped_language(file: &Path) -> Option<&'static str> {
 
 /// A skipped programming language is a coverage gap, not evidence of zero
 /// findings. Data and documentation files do not imply dead-code support.
-pub(crate) fn attach_dead_code_language_coverage(
-    payload: &mut serde_json::Value,
-    files: &[PathBuf],
-) {
+#[doc(hidden)]
+pub fn attach_dead_code_language_coverage(payload: &mut serde_json::Value, files: &[PathBuf]) {
     let mut supported = 0usize;
     let mut unsupported = std::collections::BTreeMap::new();
     for file in files {
@@ -617,7 +615,8 @@ impl JobOutcome {
     }
 }
 
-pub(crate) use crate::file_kind::is_test_support_file;
+#[doc(hidden)]
+pub use crate::file_kind::is_test_support_file;
 
 /// Whether a project-relative path belongs to a test tree: an automated-test
 /// file or a test-support file (fixture, corpus, mock, snapshot). This is the
@@ -669,6 +668,7 @@ impl ExcludedTestTally {
     }
 }
 
-pub(crate) use crate::file_kind::is_test_file;
+#[doc(hidden)]
+pub use crate::file_kind::is_test_file;
 
 pub(crate) use crate::path_identity::{canonicalize_normalized, normalize_path};

@@ -52,7 +52,7 @@ mod fold;
 mod memory_profile;
 mod recording;
 mod refresh;
-pub(crate) use refresh::RefreshCounts;
+pub use refresh::RefreshCounts;
 pub(crate) mod resume;
 pub(crate) mod staged_records;
 mod text_build;

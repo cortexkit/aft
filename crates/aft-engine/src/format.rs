@@ -612,7 +612,8 @@ fn is_executable(_metadata: &std::fs::Metadata) -> bool {
 /// controlled code, so configure and warm paths must never execute it—even for
 /// a seemingly harmless `--version` probe. Version checks belong in the actual
 /// format operation below, after the user or agent has initiated formatting.
-pub(crate) fn tool_available_for_missing_warning(tool: &str, project_root: Option<&Path>) -> bool {
+#[doc(hidden)]
+pub fn tool_available_for_missing_warning(tool: &str, project_root: Option<&Path>) -> bool {
     resolve_tool_uncached(tool, project_root).is_some()
 }
 
@@ -1390,7 +1391,8 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
     project_root.join(filename)
 }
 
-pub(crate) fn install_hint(tool: &str) -> String {
+#[doc(hidden)]
+pub fn install_hint(tool: &str) -> String {
     match tool {
         "biome" => {
             "Run `bun add -d --workspace-root @biomejs/biome` or install globally.".to_string()

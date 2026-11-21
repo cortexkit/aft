@@ -15,7 +15,8 @@
 //! and the snapshot store.
 
 pub(crate) mod scan;
-pub(crate) mod snapshot;
+#[doc(hidden)]
+pub mod snapshot;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
@@ -26,11 +27,15 @@ use serde_json::{json, Value};
 
 use scan::{RefKind, Reference};
 
-pub(crate) const COLLECT_OPERATION: &str = "page.collect";
-pub(crate) const READ_OPERATION: &str = "page.read";
-pub(crate) const RELEASE_OPERATION: &str = "page.release";
+#[doc(hidden)]
+pub const COLLECT_OPERATION: &str = "page.collect";
+#[doc(hidden)]
+pub const READ_OPERATION: &str = "page.read";
+#[doc(hidden)]
+pub const RELEASE_OPERATION: &str = "page.release";
 /// HELLO capability: this module serves the page-bundle operations.
-pub(crate) const CAPABILITY: &str = "page-collect/v1";
+#[doc(hidden)]
+pub const CAPABILITY: &str = "page-collect/v1";
 
 /// The least time the page itself gets to be read, whatever the deadline.
 const ENTRY_READ_MIN: std::time::Duration = std::time::Duration::from_secs(1);
@@ -46,14 +51,16 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_ENCODED_PATH_BYTES: usize = 3 * MAX_PATH_BYTES;
 
 /// Largest `page.read` length.
-pub(crate) const MAX_READ_LENGTH: u64 = 1024 * 1024;
+#[doc(hidden)]
+pub const MAX_READ_LENGTH: u64 = 1024 * 1024;
 
 /// Most `omitted` entries one reply lists; the rest are only counted.
 pub(crate) const MAX_OMITTED: usize = 1024;
 
 /// The bounds one `page.collect` runs under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Limits {
+#[doc(hidden)]
+pub struct Limits {
     pub entry_max_bytes: u64,
     pub max_files: u64,
     pub max_file_bytes: u64,
@@ -389,7 +396,8 @@ pub(crate) fn sniff_html(bytes: &[u8]) -> bool {
 
 /// Why a [`PageSource`] did not return a file's bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReadFailure {
+#[doc(hidden)]
+pub enum ReadFailure {
     Denied,
     Missing,
     /// Larger than the limit the read was given; `size` is at least the
@@ -402,7 +410,8 @@ pub(crate) enum ReadFailure {
 
 /// Reads files for a collection. The session-policy implementation checks
 /// every path under the agent session's read rules before opening it.
-pub(crate) trait PageSource {
+#[doc(hidden)]
+pub trait PageSource {
     /// Read the whole file at `path` (absolute, lexically normalized), or
     /// fail with [`ReadFailure::TooLarge`] when it holds more than `limit`
     /// bytes, or with [`ReadFailure::Deadline`] when its I/O has not
@@ -412,7 +421,8 @@ pub(crate) trait PageSource {
 
 /// Why `page.collect` refused. Each maps to one refusal code.
 #[derive(Debug)]
-pub(crate) enum CollectRefusal {
+#[doc(hidden)]
+pub enum CollectRefusal {
     /// The page is missing or the policy denies it. `reason` is `missing`
     /// or `denied`; nothing about a denied file's contents is reported.
     EntryUnreadable {
@@ -639,7 +649,8 @@ struct Pending {
 /// files it references, reading through `source` and storing through
 /// `sink`. A referenced file that cannot be included is listed in
 /// `omitted`; only a problem with the page itself refuses.
-pub(crate) fn collect(
+#[doc(hidden)]
+pub fn collect(
     entry: &Path,
     limits: &Limits,
     started: Instant,

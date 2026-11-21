@@ -6,7 +6,8 @@
 
 pub mod arity;
 pub mod scan;
-pub(crate) mod synthetic_load;
+#[doc(hidden)]
+pub mod synthetic_load;
 #[cfg(unix)]
 pub(crate) mod writes;
 

@@ -59,7 +59,8 @@ static METRICS: Metrics = Metrics {
     skipped_unsupported_target: AtomicU64::new(0),
 };
 
-pub(crate) fn metrics() -> serde_json::Value {
+#[doc(hidden)]
+pub fn metrics() -> serde_json::Value {
     serde_json::json!({
         "hinted": METRICS.hinted.load(Ordering::Relaxed),
         "no_candidate_table": METRICS.no_candidate_table.load(Ordering::Relaxed),

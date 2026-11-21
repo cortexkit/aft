@@ -19,16 +19,21 @@
 //! that rebinds to another root, is dropped, or whose routes have all been
 //! closed past the unbind grace period no longer counts.
 
-pub(crate) mod engine;
-pub(crate) mod external;
-pub(crate) use crate::data_layer::parent_query as query;
-pub(crate) use crate::data_layer::parent_session::{display_relative, Plane};
+#[doc(hidden)]
+pub mod engine;
+#[doc(hidden)]
+pub mod external;
+#[doc(hidden)]
+pub use crate::data_layer::parent_query as query;
+#[doc(hidden)]
+pub use crate::data_layer::parent_session::{display_relative, Plane};
 pub use crate::data_layer::parent_session::{Discovery, RequestedPlanes};
 #[cfg(test)]
 mod tests;
 mod worker;
 
-pub(crate) use query::attach_search_gaps;
+#[doc(hidden)]
+pub use query::attach_search_gaps;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,13 +77,15 @@ const SKIPPED_DIRECTORY_NAMES: &[&str] = &[
 /// through watcher events instead.
 const DEFAULT_POINTER_INTERVAL: Duration = Duration::from_secs(10);
 
-pub(crate) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+#[doc(hidden)]
+pub fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-pub(crate) fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+#[doc(hidden)]
+pub fn read<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -497,7 +504,8 @@ pub fn release_context_except(ctx: &crate::context::AppContext, root: &Path) {
 /// Release a context as soon as its last route closes. Parent readers have no
 /// local builds to preserve during the project-root abandonment grace period.
 /// Returns whether the context held a parent session.
-pub(crate) fn release_context(ctx: &crate::context::AppContext) -> bool {
+#[doc(hidden)]
+pub fn release_context(ctx: &crate::context::AppContext) -> bool {
     let id = context_id(ctx);
     let mut registry = lock(registry());
     let mut released = false;
@@ -946,7 +954,8 @@ impl crate::data_layer::parent_session::ParentView for ParentSession {
     }
 }
 
-pub(crate) fn grep_fan_out(
+#[doc(hidden)]
+pub fn grep_fan_out(
     ctx: &crate::context::AppContext,
     pattern: &crate::pattern_compile::CompiledPattern,
     scope: &crate::grep_executor::GrepScope,
@@ -970,7 +979,8 @@ pub(crate) fn grep_fan_out(
     )
 }
 
-pub(crate) fn glob_fan_out(
+#[doc(hidden)]
+pub fn glob_fan_out(
     ctx: &crate::context::AppContext,
     search_roots: &[PathBuf],
     pattern: &str,

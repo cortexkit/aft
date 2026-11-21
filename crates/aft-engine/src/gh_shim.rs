@@ -33,7 +33,7 @@ use crate::db::github_read_cache::{invalidate_github_read_cache_resource, Github
 use subc_protocol::{BindIdentity, RouteTarget};
 
 mod manifest_guard;
-pub(crate) mod manifest_sync;
+pub mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
 mod prefrontal_route;

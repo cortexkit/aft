@@ -1,5 +1,6 @@
 use crate as aft;
-pub(crate) mod configure;
+#[doc(hidden)]
+pub mod configure;
 use crate::context::{
     AppContext, SemanticIndexStatus, SemanticRefreshRequest, WatcherDrainApplyPhase,
     WatcherDrainPhase, WatcherDrainSliceState,
@@ -397,7 +398,8 @@ pub fn follow_configure_with_data_layer(ctx: &AppContext) {
 /// Executor-maintenance form of [`drain_deferred_configure_maintenance`]:
 /// returns `true` when the drain stepped aside for a queued interactive
 /// writer on the same root and left the rest parked for a requeued drain.
-pub(crate) fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) -> bool {
+#[doc(hidden)]
+pub fn drain_deferred_configure_maintenance_yielding(ctx: &AppContext) -> bool {
     (configure::hooks().drain_yielding)(ctx)
 }
 
@@ -522,7 +524,8 @@ pub fn drain_inspect_events(ctx: &AppContext) {
     drain_inspect_events_for_generation(ctx, ctx.configure_generation());
 }
 
-pub(crate) fn drain_inspect_events_for_generation(ctx: &AppContext, generation: u64) {
+#[doc(hidden)]
+pub fn drain_inspect_events_for_generation(ctx: &AppContext, generation: u64) {
     let Some(drained) =
         ctx.run_if_subc_bound_generation(generation, || ctx.inspect_manager().drain_completions())
     else {
@@ -1132,7 +1135,8 @@ fn collect_mutation_paths(
     }
 }
 
-pub(crate) fn record_file_mutation<'a, 'p>(
+#[doc(hidden)]
+pub fn record_file_mutation<'a, 'p>(
     ctx: &'a AppContext,
     paths: impl IntoIterator<Item = &'p Path>,
 ) -> FileMutationGuard<'a> {

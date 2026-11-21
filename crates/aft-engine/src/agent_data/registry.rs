@@ -63,7 +63,8 @@ fn no_links(root: &Path, relative: &str) -> Result<PathBuf, PathDrop> {
     Ok(path)
 }
 
-pub(crate) fn usable(record: &RootRecord) -> bool {
+#[doc(hidden)]
+pub fn usable(record: &RootRecord) -> bool {
     record.root_key.is_some()
         && record.root_key_mismatch != Some(true)
         && matches!(
