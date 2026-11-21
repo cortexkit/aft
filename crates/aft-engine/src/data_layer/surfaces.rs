@@ -291,7 +291,7 @@ pub struct DataStoreFailure {
     pub at_ms: u64,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Storage folders handed out by `serve_text_index_for_test`, removed when
     /// the test's thread ends.
@@ -302,7 +302,7 @@ thread_local! {
 /// Binds `ctx`'s index-store checkout over the files already on disk and
 /// waits until its text index serves them. A context with no storage folder
 /// gets a throwaway one, so a test never writes into the real storage.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn serve_text_index_for_test(ctx: &AppContext) {
     serve_text_for_test(ctx, true);
 }
@@ -315,7 +315,7 @@ pub(crate) fn serve_text_only_for_test(ctx: &AppContext) {
     serve_text_for_test(ctx, false);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn serve_text_for_test(ctx: &AppContext, whole_build: bool) {
     bind_for_test(ctx);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
@@ -339,7 +339,7 @@ fn serve_text_for_test(ctx: &AppContext, whole_build: bool) {
 
 /// Binds the index store's checkout of `ctx`'s root, giving the context a
 /// throwaway storage folder when it has none, without waiting for a build.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn bind_for_test(ctx: &AppContext) {
     if ctx.config().storage_dir.is_none() {
         let dir = tempfile::tempdir().expect("test storage folder");
@@ -1954,8 +1954,12 @@ pub fn warm_meaning(ctx: &dyn IndexHost) -> Option<WarmState> {
     })
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod fixtures;
+
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::fixtures::*;
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -1963,13 +1967,6 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::data_layer::checkout::{CheckoutStatus, LiveMemory};
-
-    pub(crate) fn write(root: &Path, path: &str, text: &str) -> PathBuf {
-        let path = root.join(path);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, text).unwrap();
-        path
-    }
 
     /// A configured context over a small Rust crate, with its own storage.
     fn context(root: &Path, storage: &Path) -> AppContext {
@@ -1995,27 +1992,6 @@ pub(crate) mod tests {
         let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
         ctx.set_canonical_cache_root(root.to_path_buf());
         ctx
-    }
-
-    pub(crate) fn root_fixture_config(
-        root: &Path,
-        storage: &Path,
-        edit: impl FnOnce(&mut crate::config::Config),
-    ) -> crate::config::Config {
-        write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
-        write(
-            root,
-            "src/lib.rs",
-            "mod util;\npub fn caller() { util::callee(); }\n",
-        );
-        write(root, "src/util.rs", "pub fn callee() {}\n");
-        let mut config = crate::config::Config {
-            project_root: Some(root.to_path_buf()),
-            storage_dir: Some(storage.to_path_buf()),
-            ..crate::config::Config::default()
-        };
-        edit(&mut config);
-        config
     }
 
     /// Pauses the initial build after publication but before it starts a
@@ -2139,26 +2115,6 @@ pub(crate) mod tests {
             (OFF, READY)
         );
         assert!(graph_only.data_view().is_none());
-    }
-
-    /// Waits up to 60 s for both planes of `ctx`'s bound checkout to be
-    /// ready with no edit pending.
-    pub(crate) fn settled(ctx: &AppContext) -> DataStoreReport {
-        let started = Instant::now();
-        loop {
-            let report = report(ctx).expect("data layer on");
-            if report.text.status == READY
-                && report.callgraph.status == READY
-                && report.pending_edits == 0
-            {
-                return report;
-            }
-            assert!(
-                started.elapsed() < Duration::from_secs(60),
-                "never settled: {report:?}"
-            );
-            std::thread::sleep(Duration::from_millis(50));
-        }
     }
 
     fn failed_with(failure: Option<(&'static str, bool)>) -> Option<DataFailure> {

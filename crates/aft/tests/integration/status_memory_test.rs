@@ -118,3 +118,12 @@ fn status_memory_attributes_every_registered_root_and_exposes_residual() {
         "process-wide SQLite counters replace per-root SQLite gaps"
     );
 }
+#[cfg(feature = "test-hooks")]
+#[test]
+fn test_hooks_keep_the_default_context_storage_configuration() {
+    let ctx = aft::context::AppContext::new(
+        aft::context::default_language_provider_factory(),
+        aft::config::Config::default(),
+    );
+    assert!(ctx.config().storage_dir.is_none());
+}

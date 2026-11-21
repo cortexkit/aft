@@ -1,4 +1,6 @@
-use crate::late_result_bus::views::{declaration, key, Publication, RecordingWriter, Writer};
+use aft_engine::test_bridge::display_data::late_result_bus::views::{
+    declaration, key, Publication, RecordingWriter, Writer,
+};
 use crate::late_result_bus::NoticeViewsReady;
 use std::time::Duration;
 
@@ -33,7 +35,7 @@ async fn notice_records_gate_opens_only_after_every_notice_view_put_is_acknowled
 
     let mut writer = RecordingWriter::default();
     publication.sync_for_test(&mut writer, &notice_views).await.unwrap();
-    assert_eq!(writer.0.len(), 1, "only the unacknowledged view is retried");
+    assert_eq!(writer.writes().len(), 1, "only the unacknowledged view is retried");
     assert!(
         ready.wait(Duration::ZERO).await,
         "acknowledgments reopen admission even after a timed-out send"
@@ -58,7 +60,7 @@ async fn oversized_notice_view_disables_pending_notice_publication() {
         )
         .await
         .unwrap();
-    assert!(writer.0.is_empty());
+    assert!(writer.writes().is_empty());
     assert!(ready
         .next_pending()
         .now_or_never()
@@ -102,7 +104,7 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
         .sync_for_test(&mut writer, snapshot)
         .await
         .unwrap();
-    assert_eq!(writer.0.len(), keys);
+    assert_eq!(writer.writes().len(), keys);
     for (pin, _) in snapshot.iter().filter(|(pin, _)| pin.starts_with("tp")) {
         let request = ViewsRequest::new(vec![pin.clone()]);
         let reply = ViewsReply::new(std::collections::BTreeMap::from([(
@@ -113,7 +115,7 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
         let route_bytes = serde_json::to_vec(&serde_json::to_value(reply).unwrap()).unwrap();
         assert_eq!(
             writer
-                .0
+                .writes()
                 .iter()
                 .find(|(stored, _)| stored == &key(pin))
                 .unwrap()
@@ -128,14 +130,14 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     assert!(tool_views::SHIPPED.contains_key(pin));
     let versioned = pin.replacen("tp1:", "tp2:", 1);
     assert!(writer
-        .0
+        .writes()
         .iter()
         .any(|(stored, _)| stored == &key(&versioned)));
     assert_eq!(key(pin), "7470313a6170706c795f70617463683a666136326339373937653564313434333637313466353633306431353831356432616463313138353032336133646362613366336564323066633966303534383a31");
     assert_ne!(key(pin), key(&pin.replace(":1", ":2")));
-    let writes = writer.0.len();
+    let writes = writer.writes().len();
     publication.sync_for_test(&mut writer, snapshot).await.unwrap();
-    assert_eq!(writer.0.len(), writes);
+    assert_eq!(writer.writes().len(), writes);
 }
 
 #[tokio::test]
@@ -152,7 +154,7 @@ async fn notice_records_bus_views_and_tool_views_decode_as_the_same_one_pin_repl
         let pin = format!("nv1:aft:{name}:1");
         let route = crate::subc::tool_views::answer(json!({"pins":[pin]})).unwrap();
         let bytes = &writer
-            .0
+            .writes()
             .iter()
             .find(|(stored, _)| stored == &key(&pin))
             .unwrap()

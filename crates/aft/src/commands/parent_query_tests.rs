@@ -861,7 +861,7 @@ fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
         assert!(
             skipped.iter().any(
                 |skip| skip["file"] == json!(root.join(name).join("large.rs"))
-                    && skip["reason"] == crate::large_read::WHOLE_READ_SKIP_REASON
+                    && skip["reason"] == crate::large_read_counts::WHOLE_READ_SKIP_REASON
             ),
             "{response:?}"
         );
@@ -985,7 +985,7 @@ fn parent_session_search_accepts_pattern_only_and_split_requests() {
 #[test]
 fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     use crate::config::{SemanticBackend, SemanticBackendConfig};
-    use crate::data_layer::meaning::MeaningState;
+    use aft_engine::test_bridge::display_data::meaning::MeaningState;
     crate::parent_search::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();

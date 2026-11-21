@@ -17623,7 +17623,9 @@ mod tests {
     /// so each probe must take a contended source as pending work instead.
     #[test]
     fn maintenance_probes_count_a_held_source_lock_as_pending_without_waiting() {
-        use crate::context::MaintenanceProbeLock;
+        use aft_engine::test_bridge::display_data::context::{
+            hold_maintenance_probe_lock_for_test, MaintenanceProbeLock,
+        };
 
         fn drain_kind(lock: MaintenanceProbeLock) -> MaintenanceDrainKind {
             match lock {
@@ -17668,7 +17670,7 @@ mod tests {
             let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
             let holder_ctx = Arc::clone(&ctx);
             let holder = std::thread::spawn(move || {
-                holder_ctx.hold_maintenance_probe_lock_for_test(lock, || {
+                hold_maintenance_probe_lock_for_test(&holder_ctx, lock, || {
                     held_tx.send(()).expect("held signal");
                     let _ = release_rx.recv();
                 });

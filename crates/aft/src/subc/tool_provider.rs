@@ -11401,7 +11401,7 @@ mod ledger_terminal_tests {
             "user@{}.service/app.slice/module.service",
             unsafe { libc::geteuid() }
         ));
-        crate::bash_background::task_scope::with_local_recovery_mount_for_test(
+        aft_engine::test_bridge::bash_remote::task_scope::with_local_recovery_mount_for_test(
             current,
             dir.path().to_path_buf(),
             || {

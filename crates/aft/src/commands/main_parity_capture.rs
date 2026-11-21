@@ -5,8 +5,8 @@
 
 use crate::config::{Config, IndexesConfig, SemanticBackend};
 use crate::context::AppContext;
-use crate::data_layer::meaning::use_constant_vectors;
 use crate::protocol::{RawRequest, Response};
+use aft_engine::test_bridge::display_data::meaning::use_constant_vectors;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};

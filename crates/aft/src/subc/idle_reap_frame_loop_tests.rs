@@ -9,6 +9,8 @@
 
 use super::test_support::{test_ctx, test_root};
 use super::*;
+use aft_engine::test_bridge::display_data::context::pending_restore_work;
+use std::collections::BTreeSet;
 
 #[test]
 fn idle_maintenance_never_probes_an_evicted_root() {
@@ -22,8 +24,6 @@ fn idle_maintenance_never_probes_an_evicted_root() {
         "an idle root started a presence thread"
     );
 }
-use crate::context::pending_restore_work;
-use std::collections::BTreeSet;
 
 type PendingSnapshot = (BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool);
 

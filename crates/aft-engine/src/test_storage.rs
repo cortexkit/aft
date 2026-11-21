@@ -1,5 +1,34 @@
 pub use aft_base::test_storage::*;
 
+#[cfg(feature = "test-support")]
+thread_local! {
+    static ISOLATE_CONTEXT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "test-support")]
+pub(crate) fn with_isolated_context<T>(make: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ISOLATE_CONTEXT.with(|scope| scope.set(self.0));
+        }
+    }
+    let _restore = Restore(ISOLATE_CONTEXT.with(|scope| scope.replace(true)));
+    make()
+}
+
+pub(crate) fn storage_for_context() -> Option<tempfile::TempDir> {
+    let isolate = cfg!(test);
+    #[cfg(feature = "test-support")]
+    let isolate = isolate || ISOLATE_CONTEXT.with(std::cell::Cell::get);
+    isolate.then(|| {
+        tempfile::Builder::new()
+            .prefix("aft-test-context-")
+            .tempdir()
+            .expect("private test storage")
+    })
+}
+
 #[cfg(test)]
 #[allow(unused_imports)]
 use crate::config::Config;

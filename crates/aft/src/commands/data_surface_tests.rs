@@ -1,14 +1,17 @@
 mod tests {
     use crate::context::AppContext;
     use crate::data_layer::checkout::DataError;
-    use crate::data_layer::surfaces::tests::{root_fixture_config, settled, write};
     #[cfg(target_os = "linux")]
-    use crate::data_layer::surfaces::{disclose_index_gaps, serve_text_index_for_test};
-    use crate::data_layer::surfaces::{
-        bind_for_test, reason, report, zoom_callgraph_field, DataCheckoutProbe, READY,
-    };
+    use crate::data_layer::surfaces::disclose_index_gaps;
+    use crate::data_layer::surfaces::{reason, report, zoom_callgraph_field, DataCheckoutProbe};
     use crate::memory::MemoryEstimate;
     use crate::protocol::RawRequest;
+    #[cfg(target_os = "linux")]
+    use aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test;
+    use aft_engine::test_bridge::display_data::surfaces::{
+        bind_for_test, configure_meaning_without_fill, reserve_build, root_fixture_config,
+        settled, status_push, write, READY,
+    };
     use serde_json::{json, Value};
     use std::path::Path;
     #[cfg(target_os = "linux")]
@@ -43,7 +46,7 @@ mod tests {
         let low = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
         bind_for_test(&ctx);
         let data = ctx.data_checkout().unwrap();
-        data.configure_meaning_without_fill_for_test(Some(&ctx.config().semantic));
+        configure_meaning_without_fill(&data, &ctx.config().semantic);
         let checkout = data.checkout();
         let deadline = Instant::now() + Duration::from_secs(10);
         while checkout.last_failure().is_none() {
@@ -69,9 +72,9 @@ mod tests {
         };
         assert_paused(status());
 
-        let retry = checkout.reserve_build().expect("reserve a retry");
+        let retry = reserve_build(checkout).expect("reserve a retry");
         assert_paused(status());
-        assert_paused(ctx.try_build_status_push_snapshot().unwrap());
+        assert_paused(status_push(&ctx).unwrap());
 
         let req = serde_json::from_value(
             json!({"id":"search", "command":"semantic_search", "query":"callee"}),
@@ -93,7 +96,7 @@ mod tests {
 
         drop(low);
         let space = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 39, 1 << 40);
-        checkout.build_reserved(false, retry).unwrap();
+        retry().unwrap();
         let assert_serving = |snapshot: Value| {
             for plane in ["search_index", "callgraph_store"] {
                 assert_eq!(snapshot[plane]["status"], "ready", "{plane}");

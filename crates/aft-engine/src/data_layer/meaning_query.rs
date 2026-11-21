@@ -279,5 +279,68 @@ fn files_accounted(coverage: &Coverage) -> usize {
     coverage.files_embedded + coverage.files_too_large + coverage.files_failed.len()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[path = "meaning_query_test_support.rs"]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{SemanticBackend, SemanticBackendConfig};
+    use crate::context::AppContext;
+
+    #[test]
+    fn polling_a_running_fill_does_not_reload_the_model_when_the_followup_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/lib.rs"), "pub fn widget_count() -> u32 { 7 }\n").unwrap();
+        let (base_url, gate) = test_support::serve("never-held");
+        gate.open();
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            indexes: crate::config::IndexesConfig {
+                trigram: true,
+                semantic: true,
+                callgraph: false,
+            },
+            semantic: SemanticBackendConfig {
+                backend: SemanticBackend::OpenAiCompatible,
+                model: "test-hashed".to_string(),
+                base_url: Some(base_url),
+                ..SemanticBackendConfig::default()
+            },
+            ..crate::config::Config::default()
+        };
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.clone());
+        crate::semantic_admission::note_opened("data-layer-meaning-empty-followup", &root);
+        let held_build = crate::data_layer::runtime::hold_builds_for_test(&root);
+        let held_load = meaning::hold_model_loads_for_test(&root);
+
+        // Configure meaning before the text build publishes and starts the first fill.
+        assert!(matches!(
+            DataSemantic::current(&ctx).unwrap().status(),
+            SemanticIndexStatus::Building { stage, .. } if stage == DATA_LAYER_BUILD_STAGE
+        ));
+        drop(held_build);
+        held_load.wait_for_load();
+
+        // Polling during the held round requests a follow-up, even though the
+        // only file will already be embedded when that round starts.
+        assert!(matches!(
+            DataSemantic::current(&ctx).unwrap().status(),
+            SemanticIndexStatus::Building { stage, .. } if stage == meaning::STARTING_STAGE
+        ));
+        held_load.release();
+        let loads = held_load.loads_after_done_rounds(2);
+        let data = DataSemantic::probe(&ctx).unwrap();
+        let plane = data.serving().unwrap();
+        assert!(plane.complete());
+        assert_eq!(plane.coverage().files_embedded, 1);
+        assert_eq!(loads, 1, "the empty follow-up must not load the model");
+        eprintln!("model loads after two completed rounds: {loads}");
+    }
+}

@@ -91,7 +91,7 @@ pub(crate) fn database_runtime() -> Option<DatabaseRuntime> {
     hooks.map(|hooks| hooks.database_runtime)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn registered() -> bool {
     HOOKS.get().is_some()
 }

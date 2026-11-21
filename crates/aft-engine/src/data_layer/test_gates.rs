@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(crate) enum Point {
+pub enum Point {
     BuildPublication,
     DeltaPublication,
     FillSurvey,
@@ -21,7 +21,7 @@ static RETRY_FAILURES: LazyLock<Mutex<HashMap<PathBuf, Arc<std::sync::atomic::At
     LazyLock::new(Mutex::default);
 
 #[cfg(feature = "wasm-grammars")]
-pub(crate) fn fail_next_grammar_retry(root: &Path) -> Arc<std::sync::atomic::AtomicBool> {
+pub fn fail_next_grammar_retry(root: &Path) -> Arc<std::sync::atomic::AtomicBool> {
     let failed = Arc::new(std::sync::atomic::AtomicBool::new(false));
     RETRY_FAILURES
         .lock()
@@ -49,13 +49,13 @@ struct Gate {
 }
 static GATES: LazyLock<Mutex<HashMap<(PathBuf, Point), Arc<Gate>>>> = LazyLock::new(Mutex::default);
 
-pub(crate) struct Hold {
+pub struct Hold {
     root: PathBuf,
     point: Point,
     gate: Arc<Gate>,
 }
 
-pub(crate) fn hold(root: &Path, point: Point) -> Hold {
+pub fn hold(root: &Path, point: Point) -> Hold {
     let root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let gate = Arc::new(Gate::default());
     assert!(GATES
@@ -67,7 +67,7 @@ pub(crate) fn hold(root: &Path, point: Point) -> Hold {
 }
 
 impl Hold {
-    pub(crate) fn wait_entered(&self) {
+    pub fn wait_entered(&self) {
         let until = Instant::now() + Duration::from_secs(30);
         let mut state = self.gate.state.lock().unwrap();
         while !state.0 {

@@ -1,17 +1,14 @@
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use serde_json::{json, Value};
 
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
-    use crate::data_layer::meaning_query::test_support::serve;
-    use crate::data_layer::meaning;
-    use crate::data_layer::meaning_query::{DataSemantic, DATA_LAYER_BUILD_STAGE};
-    use crate::data_layer::status::SemanticIndexStatus;
+    use crate::data_layer::meaning_query::DataSemantic;
     use crate::protocol::RawRequest;
+    use aft_engine::test_bridge::display_data::meaning_query::serve;
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join(path);
@@ -42,60 +39,6 @@ mod tests {
             &request, ctx,
         ))
         .unwrap()
-    }
-
-    #[test]
-    fn polling_a_running_fill_does_not_reload_the_model_when_the_followup_is_empty() {
-        let dir = tempfile::tempdir().unwrap();
-        let storage = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(dir.path()).unwrap();
-        write(&root, "src/lib.rs", "pub fn widget_count() -> u32 { 7 }\n");
-        let (base_url, gate) = serve("never-held");
-        gate.open();
-        let config = crate::config::Config {
-            project_root: Some(root.clone()),
-            storage_dir: Some(storage.path().to_path_buf()),
-            indexes: crate::config::IndexesConfig {
-                trigram: true,
-                semantic: true,
-                callgraph: false,
-            },
-            semantic: SemanticBackendConfig {
-                backend: SemanticBackend::OpenAiCompatible,
-                model: "test-hashed".to_string(),
-                base_url: Some(base_url),
-                ..SemanticBackendConfig::default()
-            },
-            ..crate::config::Config::default()
-        };
-        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
-        ctx.set_canonical_cache_root(root.clone());
-        crate::semantic_admission::note_opened("data-layer-meaning-empty-followup", &root);
-        let held_build = crate::data_layer::runtime::hold_builds_for_test(&root);
-        let held_load = meaning::hold_model_loads_for_test(&root);
-
-        // Configure meaning before the text build publishes and starts the first fill.
-        assert!(matches!(
-            DataSemantic::current(&ctx).unwrap().status(),
-            SemanticIndexStatus::Building { stage, .. } if stage == DATA_LAYER_BUILD_STAGE
-        ));
-        drop(held_build);
-        held_load.wait_for_load();
-
-        // Polling during the held round requests a follow-up, even though the
-        // only file will already be embedded when that round starts.
-        assert!(matches!(
-            DataSemantic::current(&ctx).unwrap().status(),
-            SemanticIndexStatus::Building { stage, .. } if stage == meaning::STARTING_STAGE
-        ));
-        held_load.release();
-        let loads = held_load.loads_after_done_rounds(2);
-        let data = DataSemantic::probe(&ctx).unwrap();
-        let plane = data.serving().unwrap();
-        assert!(plane.complete());
-        assert_eq!(plane.coverage().files_embedded, 1);
-        assert_eq!(loads, 1, "the empty follow-up must not load the model");
-        eprintln!("model loads after two completed rounds: {loads}");
     }
 
     /// While a fill is under way the plane serves what is filled and every
@@ -269,7 +212,7 @@ mod tests {
                 .and_then(|data| data.serving().cloned())
                 .filter(|meaning| meaning.complete())
         });
-        let embedded = gate.texts.load(Ordering::SeqCst);
+        let embedded = gate.texts_embedded();
         assert!(embedded > 0);
 
         let held = crate::data_layer::meaning::hold_model_loads_for_test(&root);
@@ -304,7 +247,7 @@ mod tests {
                 .filter(|meaning| meaning.complete())
         });
         assert_eq!(
-            gate.texts.load(Ordering::SeqCst),
+            gate.texts_embedded(),
             embedded,
             "reading the plane back embedded files again"
         );
@@ -353,14 +296,14 @@ mod tests {
             "{filled:?}"
         );
         assert!(filled.chunks >= 300, "{filled:?}");
-        let embedded = gate.texts.load(Ordering::SeqCst);
+        let embedded = gate.texts_embedded();
         assert!(embedded >= 300, "{embedded} texts embedded");
 
         let again = crate::data_layer::surfaces::fill_root(&root, storage.path(), &config)
             .expect("the second fill");
         assert_eq!(again, filled);
         assert_eq!(
-            gate.texts.load(Ordering::SeqCst),
+            gate.texts_embedded(),
             embedded,
             "the second fill embedded files again"
         );

@@ -3,10 +3,7 @@
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
-// Preserve the command module's paths for the types and tests moved to status_snapshot.
-#[cfg(test)]
-#[allow(unused_imports)]
-use crate::status_snapshot::cost_tests;
+// Preserve the command module's paths for the types moved to status_snapshot.
 #[allow(unused_imports)]
 use crate::status_snapshot::StatusSnapshotKind;
 pub use crate::status_snapshot::{CompressionAggregateSerde, CompressionStats};
@@ -161,7 +158,7 @@ mod tests {
         );
         assert_eq!(
             ctx.try_build_status_push_snapshot().unwrap(),
-            crate::status_push::project(ctx, explicit)
+            aft_engine::test_bridge::display_data::project_status(ctx, explicit)
         );
         assert_eq!(census_builds.load(Ordering::Relaxed), 1);
     }

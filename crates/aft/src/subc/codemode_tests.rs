@@ -1672,13 +1672,13 @@ fn worker_runs_shell_has_no_bot_identity_to_speak_as() {
     // worker's stamp, which names no agent to act as. Neither stamp grants
     // the Head authority required for bot writes.
     let storage = tempfile::tempdir().unwrap();
-    let speech = crate::gh_shim_speech::service::record_service(storage.path());
+    let speech = aft_engine::test_bridge::bash_remote::record_service(storage.path());
     let scopes = gh_relay_route_scopes(&f.routes, &speech);
     let stamp = scopes
         .for_session(&effective.session)
         .expect("the worker session has one stamp");
     assert_eq!(stamp, f.routes[&channel(4)].scope.as_ref().unwrap());
-    assert!(crate::gh_shim_relay::worker_scope(stamp));
+    assert!(aft_engine::test_bridge::bash_remote::worker_scope(stamp));
     assert_eq!(crate::gh_shim_relay::delegating_agent(stamp), None);
     // The run's own stamp names no agent either.
     let run_stamp = effective.scope.as_ref().unwrap();

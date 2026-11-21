@@ -13,4 +13,9 @@ pub mod test_env {
 
 pub mod test_storage {
     pub use crate::test_storage::*;
+
+    /// Opt into the unit-test storage default for the App built by `make`.
+    pub fn with_isolated_context<T>(make: impl FnOnce() -> T) -> T {
+        crate::test_storage::with_isolated_context(make)
+    }
 }

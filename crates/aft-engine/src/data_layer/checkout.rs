@@ -1544,7 +1544,7 @@ impl Checkout {
             .finish()
             .map_err(|error| graph_spill_error(error, &paused))?;
         #[cfg(all(
-            test,
+            any(test, feature = "test-support"),
             feature = "wasm-grammars",
             feature = "test-hooks",
             not(all(target_os = "windows", target_arch = "aarch64"))

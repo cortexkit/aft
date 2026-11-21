@@ -191,7 +191,7 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
 /// with neither.
 #[must_use]
 pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if super::grammar::extraction_for_test(source)
         == Some(super::grammar::TestExtraction::MarkersOnly)
     {

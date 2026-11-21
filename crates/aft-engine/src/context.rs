@@ -1057,11 +1057,14 @@ thread_local! {
     /// Walks of each resident index on this thread: semantic, trigram and
     /// symbol cache, in that order.
     static MEMORY_INDEX_WALKS: std::cell::RefCell<[usize; 3]> = const { std::cell::RefCell::new([0; 3]) };
+}
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
     static MEMORY_WALK_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
 /// Override only this thread's memory-walk clock for a synchronous test refresh.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_memory_walk_clock_for_test<T>(now: Instant, refresh: impl FnOnce() -> T) -> T {
     struct Reset(Option<Instant>);
     impl Drop for Reset {
@@ -1073,7 +1076,7 @@ pub(crate) fn with_memory_walk_clock_for_test<T>(now: Instant, refresh: impl FnO
     refresh()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn memory_walk_now_for_test() -> Instant {
     MEMORY_WALK_CLOCK.with(|clock| clock.get().unwrap_or_else(Instant::now))
 }
@@ -1281,65 +1284,14 @@ pub struct QueryPendingChanges {
     pub callgraph: CallgraphUnappliedChanges,
 }
 
-/// Points in pending-change capture where a test can move work downstream or
-/// release a concurrent metadata reader before the capture continues.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum PendingCaptureBoundary {
-    /// After the flush-window set, before the dispatch channel and drain.
-    AfterFlushWindow,
-    /// After a contended intake-counter probe, before reading the snapshot.
-    AfterIntakeProbe,
-    /// After a contended cleanup-state probe, before reading the snapshot.
-    AfterCleanupProbe,
-    /// After a contended receiver-slot probe, before reading the snapshot.
-    AfterReceiverProbe,
-    /// After probing the continuation mutex, before waiting for its metadata.
-    AfterContinuationProbe,
-}
-
-#[cfg(test)]
-type PendingCaptureHook = Box<dyn FnMut(PendingCaptureBoundary)>;
-
-#[cfg(test)]
-thread_local! {
-    static PENDING_CAPTURE_HOOK: std::cell::RefCell<Option<PendingCaptureHook>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Run `hook` at each capture boundary reached on this thread until the
-/// returned guard is dropped.
-#[cfg(test)]
-pub(crate) fn install_pending_capture_hook_for_test(
-    hook: impl FnMut(PendingCaptureBoundary) + 'static,
-) -> PendingCaptureHookGuard {
-    PENDING_CAPTURE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
-    PendingCaptureHookGuard
-}
-
-#[cfg(test)]
-pub(crate) struct PendingCaptureHookGuard;
-
-#[cfg(test)]
-impl Drop for PendingCaptureHookGuard {
-    fn drop(&mut self) {
-        PENDING_CAPTURE_HOOK.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-#[cfg(test)]
-fn pending_capture_boundary_for_test(boundary: PendingCaptureBoundary) {
-    let hook = PENDING_CAPTURE_HOOK.with(|slot| slot.borrow_mut().take());
-    if let Some(mut hook) = hook {
-        hook(boundary);
-        PENDING_CAPTURE_HOOK.with(|slot| {
-            let mut slot = slot.borrow_mut();
-            if slot.is_none() {
-                *slot = Some(hook);
-            }
-        });
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod pending_capture_fixture;
+#[cfg(any(test, feature = "test-support"))]
+use pending_capture_fixture::pending_capture_boundary_for_test;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use pending_capture_fixture::{
+    install_pending_capture_hook_for_test, PendingCaptureBoundary,
+};
 
 /// Counts a watcher drain while it runs. The second counter advances when a
 /// drain starts and again when it ends, so a pending-changes capture can tell
@@ -1390,7 +1342,7 @@ pub struct PendingReconciliationState {
 /// When the watcher did record paths meanwhile, the two sorted sets are merged
 /// in one linear pass.
 fn restore_pending_paths(pending: &mut BTreeSet<PathBuf>, mut taken: BTreeSet<PathBuf>) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if pending_restore_work::legacy_enabled() {
         // The path-by-path re-insertion this function replaced, kept so tests
         // can compare reap decisions and work against it.
@@ -1405,7 +1357,7 @@ fn restore_pending_paths(pending: &mut BTreeSet<PathBuf>, mut taken: BTreeSet<Pa
         *pending = taken;
         return;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pending_restore_work::note_merged(pending.len() + taken.len());
     pending.append(&mut taken);
 }
@@ -1413,7 +1365,7 @@ fn restore_pending_paths(pending: &mut BTreeSet<PathBuf>, mut taken: BTreeSet<Pa
 /// Counts the pending paths [`restore_pending_paths`] had to merge one by one
 /// on the calling thread, so tests can assert that a reap sweep's restore
 /// work does not grow with the number of roots or pending paths.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod pending_restore_work {
     use std::cell::Cell;
 
@@ -1427,7 +1379,7 @@ pub(crate) mod pending_restore_work {
     }
 
     /// Paths merged one by one on this thread since the last call.
-    pub(crate) fn take_merged() -> usize {
+    pub fn take_merged() -> usize {
         MERGED.with(|merged| merged.replace(0))
     }
 
@@ -1437,7 +1389,7 @@ pub(crate) mod pending_restore_work {
 
     /// Run `f` with restores on this thread re-inserting every taken path
     /// one by one, as they did before restores moved whole sets back.
-    pub(crate) fn with_legacy_restore<R>(f: impl FnOnce() -> R) -> R {
+    pub fn with_legacy_restore<R>(f: impl FnOnce() -> R) -> R {
         struct Reset(bool);
         impl Drop for Reset {
             fn drop(&mut self) {
@@ -2317,7 +2269,7 @@ fn database_connection_busy() -> crate::db::OpenError {
     ))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static DATABASE_SLOT_CONTENDED_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
@@ -2331,7 +2283,7 @@ fn lock_database_slot<T>(
         if let Some(guard) = slot.try_lock() {
             return Ok(guard);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         DATABASE_SLOT_CONTENDED_FOR_TEST.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
                 hook();
@@ -2426,8 +2378,8 @@ pub struct App {
     /// Weak actor references let status attribute process RSS across roots
     /// without making the process-global App own per-root caches.
     memory_contexts: parking_lot::Mutex<BTreeMap<PathBuf, Weak<AppContext>>>,
-    #[cfg(test)]
-    test_storage: tempfile::TempDir,
+    #[cfg(any(test, feature = "test-support"))]
+    test_storage: Option<tempfile::TempDir>,
 }
 
 impl App {
@@ -2445,11 +2397,8 @@ impl App {
             stdout_writer: Arc::new(Mutex::new(BufWriter::new(io::stdout()))),
             provider_factory,
             memory_contexts: parking_lot::Mutex::new(BTreeMap::new()),
-            #[cfg(test)]
-            test_storage: tempfile::Builder::new()
-                .prefix("aft-test-context-")
-                .tempdir()
-                .expect("private test storage"),
+            #[cfg(any(test, feature = "test-support"))]
+            test_storage: crate::test_storage::storage_for_context(),
         }
     }
 
@@ -2468,14 +2417,17 @@ impl App {
 
     /// All context constructors and publications share this default, including
     /// helpers in other modules. The owning App keeps the directory alive.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn isolate_test_config(&self, mut config: Config) -> Config {
+        let Some(storage) = &self.test_storage else {
+            return config;
+        };
         if config
             .storage_dir
             .as_ref()
             .is_none_or(|p| p.as_os_str().is_empty())
         {
-            config.storage_dir = Some(self.test_storage.path().to_path_buf());
+            config.storage_dir = Some(storage.path().to_path_buf());
         }
         crate::test_storage::assert_context(&config);
         config
@@ -3042,7 +2994,7 @@ pub struct AppContext {
     policy_confinement: parking_lot::Mutex<PolicyConfinementMemo>,
     standalone_approval_route: Arc<()>,
     standalone_plugin_host: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     database_open_attempts: AtomicU64,
     /// The pending aft.db open request, the configure epoch it belongs to, and
     /// whether an open is running. See `crate::database_open`.
@@ -3241,37 +3193,10 @@ fn try_write_unpoisoned<T>(lock: &RwLock<T>) -> Option<std::sync::RwLockWriteGua
     }
 }
 
-/// The locks behind the subc maintenance probes (see
-/// [`AppContext::watcher_drain_has_work`] and its siblings), one per field a
-/// probe reads. Tests hold each in turn to prove no probe waits for it.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum MaintenanceProbeLock {
-    WatcherReceiver,
-    WatcherDrainSlice,
-    Tier2RefreshScheduler,
-    LspManager,
-    ConfigureMaintenanceJobs,
-    ParkedConfigureTail,
-    SemanticIndexReceiver,
-    SemanticRefreshEvents,
-    SemanticRefreshWorker,
-}
-
-#[cfg(test)]
-impl MaintenanceProbeLock {
-    pub(crate) const ALL: [Self; 9] = [
-        Self::WatcherReceiver,
-        Self::WatcherDrainSlice,
-        Self::Tier2RefreshScheduler,
-        Self::LspManager,
-        Self::ConfigureMaintenanceJobs,
-        Self::ParkedConfigureTail,
-        Self::SemanticIndexReceiver,
-        Self::SemanticRefreshEvents,
-        Self::SemanticRefreshWorker,
-    ];
-}
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod maintenance_probe_fixture;
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use maintenance_probe_fixture::MaintenanceProbeLock;
 
 #[cfg(test)]
 fn wait_on_callgraph_build_start_gate(root: &Path) {
@@ -3383,7 +3308,7 @@ impl AppContext {
         #[cfg(unix)]
         crate::shell_env_provider::sweep_preflight_layouts_on_startup();
         crate::reader_floor::register_cache_hooks();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let config = app.isolate_test_config(config);
         let mut config = config;
         if (config.cache_dir.is_some()
@@ -3546,7 +3471,7 @@ impl AppContext {
             policy_confinement: parking_lot::Mutex::new(PolicyConfinementMemo::default()),
             standalone_approval_route: Arc::new(()),
             standalone_plugin_host: AtomicBool::new(false),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             database_open_attempts: AtomicU64::new(0),
             database_open: parking_lot::Mutex::new(Default::default()),
             database_open_idle: parking_lot::Condvar::new(),
@@ -4752,7 +4677,7 @@ impl AppContext {
 
     fn watcher_drain_has_work_inner(&self, wait_for_metadata: bool) -> bool {
         let cleanup_pending = watcher_metadata_probe(&self.deleted_root_cleanup, wait_for_metadata, || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending_capture_boundary_for_test(PendingCaptureBoundary::AfterCleanupProbe);
         }).is_none_or(|cleanup| {
             matches!(
@@ -4762,13 +4687,13 @@ impl AppContext {
             )
         });
         let receiver_pending = watcher_metadata_probe(&self.watcher_rx, wait_for_metadata, || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             pending_capture_boundary_for_test(PendingCaptureBoundary::AfterReceiverProbe);
         })
         .is_none_or(|slot| slot.as_ref().is_some_and(|rx| !rx.is_empty()));
         cleanup_pending || receiver_pending || {
             let slot = watcher_metadata_probe(&self.watcher_drain_slice, wait_for_metadata, || {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 pending_capture_boundary_for_test(PendingCaptureBoundary::AfterContinuationProbe);
             });
             slot.is_none_or(|slot| {
@@ -4806,7 +4731,7 @@ impl AppContext {
         // ending its pending guard; dispatch publishes before clearing that
         // window or its backlog. Read these stages before the channel below.
         let counters = self.watcher_counters.try_read();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if matches!(&counters, Err(std::sync::TryLockError::WouldBlock)) {
             pending_capture_boundary_for_test(PendingCaptureBoundary::AfterIntakeProbe);
         }
@@ -4837,7 +4762,7 @@ impl AppContext {
         } else {
             BTreeSet::new()
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         pending_capture_boundary_for_test(PendingCaptureBoundary::AfterFlushWindow);
         let watcher = self.watcher_query_has_pending_changes();
         let mut changes = CallgraphUnappliedChanges::default();
@@ -4937,7 +4862,7 @@ impl AppContext {
 
     /// Hold the lock behind one maintenance probe for the duration of
     /// `while_held`, so a test can prove the probe does not wait for it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hold_maintenance_probe_lock_for_test(
         &self,
         lock: MaintenanceProbeLock,
@@ -5627,7 +5552,7 @@ impl AppContext {
         self.database_open.lock().epoch
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn note_database_open_attempt_for_test(&self) {
         self.database_open_attempts.fetch_add(1, Ordering::AcqRel);
     }
@@ -6353,7 +6278,7 @@ impl AppContext {
             };
             let mut next = next;
             next.aft_search_registered = next.tool_registered("aft_search");
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let next = self.app.isolate_test_config(next);
             if let Some(lease) = next.cache_lease.as_ref() {
                 let mut leases = self.cache_leases.lock();
@@ -14072,39 +13997,37 @@ mod harness_path_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod database_test_support {
     use super::*;
 
-    pub(crate) fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
+    pub fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
         ctx.database_runtime_refusal("retry", "db_set_host_state")
     }
 
-    pub(crate) fn make_database_retry_due(ctx: &AppContext) {
+    pub fn make_database_retry_due(ctx: &AppContext) {
         ctx.database_runtime_failure.lock().retry_at =
             Some(Instant::now() - Duration::from_secs(1));
     }
 
-    pub(crate) fn database_state(ctx: &AppContext) -> u8 {
+    pub fn database_state(ctx: &AppContext) -> u8 {
         ctx.database_runtime_state.load(Ordering::Acquire)
     }
 
-    pub(crate) fn database_open_attempts(ctx: &AppContext) -> u64 {
+    pub fn database_open_attempts(ctx: &AppContext) -> u64 {
         ctx.database_open_attempts.load(Ordering::Acquire)
     }
 
-    pub(crate) fn database_failure(
-        ctx: &AppContext,
-    ) -> (Option<String>, Option<Instant>, Duration) {
+    pub fn database_failure(ctx: &AppContext) -> (Option<String>, Option<Instant>, Duration) {
         let failure = ctx.database_runtime_failure.lock();
         (failure.error.clone(), failure.retry_at, failure.backoff)
     }
 
-    pub(crate) fn hold_database_slot(app: &App) -> impl Drop + '_ {
+    pub fn hold_database_slot(app: &App) -> impl Drop + '_ {
         app.db.lock()
     }
 
-    pub(crate) fn on_database_slot_contention(callback: impl FnOnce() + 'static) {
+    pub fn on_database_slot_contention(callback: impl FnOnce() + 'static) {
         DATABASE_SLOT_CONTENDED_FOR_TEST.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(callback));
         });
@@ -14962,14 +14885,14 @@ pub fn start_runner_harness_copy(
         log::warn!("canonical runner harness key copy could not start: {error}");
     }
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod callgraph_test_support {
     use crate::config::Config;
     use tempfile::TempDir;
 
     /// Returns the project and storage directories with their config. Bind the
     /// directories before constructing the context so they outlive it.
-    pub(crate) fn cold_build_fixture() -> ([TempDir; 2], Config) {
+    pub fn cold_build_fixture() -> ([TempDir; 2], Config) {
         let project = TempDir::new().expect("project tempdir");
         let storage = TempDir::new().expect("storage tempdir");
         let source_dir = project.path().join("src");

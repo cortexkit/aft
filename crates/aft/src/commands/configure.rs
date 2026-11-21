@@ -54,8 +54,8 @@ mod runtime_hook_tests {
     fn configure_registers_its_runtime_hooks() {
         super::register_runtime_hooks();
         assert!(crate::runtime_drain::configure::registered());
-        assert!(crate::runtime_drain::configure::database_runtime().is_some());
-        assert!(crate::runtime_drain::configure::command_hooks().is_some());
+        assert!(aft_engine::test_bridge::display_data::configure::database_runtime().is_some());
+        assert!(aft_engine::test_bridge::display_data::configure::command_hooks().is_some());
         assert!(crate::cache_location::reader_floor_hooks_registered());
     }
 }
@@ -1665,7 +1665,7 @@ fn lsp_warnings_probe_each_biome_folder_once_per_pass() {
 #[test]
 fn configure_warnings_canonicalize_biome_directories_not_each_file() {
     let temp = tempfile::tempdir().unwrap();
-    let root = crate::inspect::job::canonicalize_normalized(temp.path());
+    let root = crate::path_identity::canonicalize_normalized(temp.path());
     std::fs::create_dir(root.join(".git")).unwrap();
     std::fs::write(
         root.join("biome.json"),
@@ -1733,7 +1733,7 @@ fn configure_warnings_cpu_measurement() {
         let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1_000_000.0;
         seconds(usage.ru_utime) + seconds(usage.ru_stime)
     }
-    let root = crate::inspect::job::canonicalize_normalized(Path::new(
+    let root = crate::path_identity::canonicalize_normalized(Path::new(
         &std::env::var_os("AFT_CONFIGURE_WARNING_MEASURE_ROOT").expect("measurement checkout"),
     ));
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -5102,7 +5102,7 @@ mod tests {
         // The queue holds a bounded number of notices per session and refills
         // as they are acknowledged, so every recovered task's notice arrives
         // over successive drains rather than in one.
-        let cap = crate::bash_background::registry::completion_queue::MAX_QUEUED_PER_SESSION;
+        let cap = aft_engine::test_bridge::bash_remote::completion_queue::MAX_QUEUED_PER_SESSION;
         let mut delivered = std::collections::HashSet::new();
         loop {
             let completions = registry.drain_completions();
@@ -6069,7 +6069,8 @@ mod tests {
             Some(build_key.clone())
         );
         assert_eq!(
-            crate::root_identity::read(&root, storage.path()).unwrap(),
+            aft_engine::test_bridge::search_misc::read_root_identity(&root, storage.path())
+                .unwrap(),
             None
         );
 
@@ -6081,8 +6082,9 @@ mod tests {
         assert_ne!(bound_key, build_key);
         assert_eq!(ctx.cached_artifact_cache_key(&root), Some(bound_key));
         assert!(matches!(
-            crate::root_identity::read(&root, storage.path()).unwrap(),
-            Some(crate::root_identity::Identity::Git { .. })
+            aft_engine::test_bridge::search_misc::read_root_identity(&root, storage.path())
+                .unwrap(),
+            Some(aft_engine::test_bridge::search_misc::RootIdentity::Git { .. })
         ));
     }
 
@@ -6360,8 +6362,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configure_cache_coordination_busy_twice_then_free_retries_three_attempts() {
-        use crate::provisional_identity_retry::{
-            advance_clock_for_test, drain_inline, with_clock_for_test,
+        use crate::provisional_identity_retry::drain_inline;
+        use aft_engine::test_bridge::display_data::identity_clock::{
+            advance_clock_for_test, with_clock_for_test,
         };
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -6370,7 +6373,7 @@ mod tests {
             let (_temp, project, ctx, request) = cache_retry_fixture();
             let calls = Arc::new(AtomicUsize::new(0));
             let observed = Arc::clone(&calls);
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(move |_, name, _| {
                     if name != std::ffi::OsStr::new(".aft-in-use.lock") {
                         return None;
@@ -6439,14 +6442,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configure_cache_coordination_unbind_mid_backoff_cancels_retry() {
-        use crate::provisional_identity_retry::{
-            advance_clock_for_test, drain_inline, with_clock_for_test,
+        use crate::provisional_identity_retry::drain_inline;
+        use aft_engine::test_bridge::display_data::identity_clock::{
+            advance_clock_for_test, with_clock_for_test,
         };
 
         let _storage_override = crate::test_env::without_storage_override();
         with_clock_for_test(|| {
             let (_temp, project, ctx, request) = cache_retry_fixture();
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(force_cache_coordination_busy),
                 || {
                     assert!(handle_configure_for_test(&request, &ctx).success);
@@ -6479,15 +6483,16 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configure_cache_coordination_two_busy_roots_retry_independently() {
-        use crate::provisional_identity_retry::{
-            advance_clock_for_test, drain_inline, with_clock_for_test,
+        use crate::provisional_identity_retry::drain_inline;
+        use aft_engine::test_bridge::display_data::identity_clock::{
+            advance_clock_for_test, with_clock_for_test,
         };
 
         let _storage_override = crate::test_env::without_storage_override();
         with_clock_for_test(|| {
             let (_first_temp, _, first, first_request) = cache_retry_fixture();
             let (_second_temp, _, second, second_request) = cache_retry_fixture();
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(force_cache_coordination_busy),
                 || {
                     assert!(handle_configure_for_test(&first_request, &first).success);
@@ -6498,7 +6503,7 @@ mod tests {
             assert!(drain_inline(&first));
             assert!(first.cache_unavailable_reason().is_none());
             assert!(!first.provisional_identity_retry().is_armed());
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(force_cache_coordination_busy),
                 || assert!(drain_inline(&second)),
             );
@@ -6507,7 +6512,7 @@ mod tests {
             assert!(!drain_inline(&first));
             // Cache recovery does not inherit the identity retry's five-minute give-up.
             advance_clock_for_test(Duration::from_secs(600));
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(force_cache_coordination_busy),
                 || assert!(drain_inline(&second)),
             );
@@ -6536,14 +6541,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn configure_cache_coordination_message_requires_pending_or_due_retry() {
-        use crate::provisional_identity_retry::{
-            advance_clock_for_test, drain_inline, poll, with_clock_for_test,
+        use crate::provisional_identity_retry::{drain_inline, poll};
+        use aft_engine::test_bridge::display_data::identity_clock::{
+            advance_clock_for_test, with_clock_for_test,
         };
 
         let _storage_override = crate::test_env::without_storage_override();
         with_clock_for_test(|| {
             let (_temp, _, ctx, request) = cache_retry_fixture();
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(force_cache_coordination_busy),
                 || assert!(handle_configure_for_test(&request, &ctx).success),
             );
@@ -6568,7 +6574,7 @@ mod tests {
             assert!(ctx.cache_unavailable_reason().is_none());
 
             let (_cancel_temp, _, ctx, request) = cache_retry_fixture();
-            crate::bash_background::persistence::with_openat_file_hook(
+            aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                 Box::new(force_cache_coordination_busy),
                 || assert!(handle_configure_for_test(&request, &ctx).success),
             );
@@ -6616,7 +6622,7 @@ mod tests {
                         "project_root": project, "storage_dir": storage, "harness": "opencode",
                         "config": [user_tier(json!({"indexes": {"trigram": true, "semantic": false, "callgraph": false}}))],
                     }));
-                    let response = crate::bash_background::persistence::with_openat_file_hook(
+                    let response = aft_engine::test_bridge::bash_remote::with_openat_file_hook(
                         Box::new(inject_busy),
                         || handle_configure_for_test(&request, &ctx),
                     );
@@ -7535,7 +7541,10 @@ mod tests {
         assert!(reason.contains("git_identity_unavailable"), "{reason}");
         assert!(reason.contains("Too many open files"), "{reason}");
         assert_eq!(ctx.cached_artifact_cache_key(&canonical_root), None);
-        assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::read_root_identity(&root, &storage).unwrap(),
+            None
+        );
         let path_key = crate::root_identity::key::artifact_path_identity_key_for_test(&root);
         assert!(!storage.join("index").join(&path_key).exists());
         assert!(!storage.join("semantic").join(&path_key).exists());
@@ -7609,7 +7618,11 @@ mod tests {
                     Some(1)
                 );
                 assert!(!ctx.config().indexes.trigram);
-                assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+                assert_eq!(
+                    aft_engine::test_bridge::search_misc::read_root_identity(&root, &storage)
+                        .unwrap(),
+                    None
+                );
                 assert_eq!(ctx.cached_artifact_cache_key(&root), None);
 
                 lock.execute_batch("ROLLBACK").unwrap();
@@ -7623,9 +7636,11 @@ mod tests {
                 );
                 assert!(ctx.config().indexes.trigram);
                 assert!(!ctx.provisional_identity_retry().is_armed());
-                assert!(crate::root_identity::read(&root, &storage)
-                    .unwrap()
-                    .is_some());
+                assert!(
+                    aft_engine::test_bridge::search_misc::read_root_identity(&root, &storage)
+                        .unwrap()
+                        .is_some()
+                );
                 assert!(ctx.cached_artifact_cache_key(&root).is_some());
             },
         );
@@ -7836,10 +7851,8 @@ mod tests {
         );
         let reasons = ctx.degraded_reasons();
         assert!(
-            reasons
-                .iter()
-                .any(|reason| reason
-                    == crate::root_identity::key::PROVISIONAL_IDENTITY_EXHAUSTED_REASON),
+            reasons.iter().any(|reason| reason
+                == aft_engine::test_bridge::search_misc::PROVISIONAL_IDENTITY_EXHAUSTED_REASON),
             "{reasons:?}"
         );
         assert!(!has_busy_provisional_reason(&ctx), "{reasons:?}");
@@ -7878,7 +7891,10 @@ mod tests {
             "{:?}",
             ctx.degraded_reasons()
         );
-        assert_eq!(crate::root_identity::read(&root, &storage).unwrap(), None);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::read_root_identity(&root, &storage).unwrap(),
+            None
+        );
         assert_eq!(ctx.cached_artifact_cache_key(&root), None);
     }
 
@@ -9043,26 +9059,33 @@ mod tests {
             install_project_watcher_with(ctx, root, Vec::new(), move |root, _extra, tx| {
                 let retry_matcher = Arc::clone(&matcher);
                 let derive = move |root: &Path| {
-                    crate::watcher_filter::derive_watcher_exclusion_plan(
+                    aft_engine::test_bridge::search_misc::watcher::derive_watcher_exclusion_plan(
                         root,
                         &matcher,
-                        Some(crate::watcher_filter::WATCHER_EXCLUSION_LIMIT),
+                        Some(
+                            aft_engine::test_bridge::search_misc::watcher::WATCHER_EXCLUSION_LIMIT,
+                        ),
                     )
                 };
                 let observed = generation.load(Ordering::Acquire);
                 let counters = crate::context::watcher_counters_for_root(&root);
-                let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
+                let mut planning =
+                    aft_engine::test_bridge::search_misc::watcher::WatcherExclusionRetry::default();
                 let initial = planning
                     .attempt(&root, observed, &counters, || derive(&root))
                     .unwrap()
                     .unwrap_or_default();
                 *plan.lock().unwrap() = (
                     observed,
-                    crate::watcher_filter::watcher_exclusion_paths(&initial.selected),
+                    aft_engine::test_bridge::search_misc::watcher::watcher_exclusion_paths(
+                        &initial,
+                    ),
                 );
                 created_tx.send(observed).unwrap();
                 let mut exclusion_state =
-                    crate::watcher_filter::WatcherExclusionPaths::new(&root, &initial.selected);
+                    aft_engine::test_bridge::search_misc::watcher::WatcherExclusionPaths::new(
+                        &root, &initial,
+                    );
                 let stop = Arc::new(AtomicBool::new(false));
                 let thread_stop = Arc::clone(&stop);
                 let join = std::thread::spawn(move || {
@@ -9716,7 +9739,7 @@ mod tests {
         assert_eq!(walks, 1);
         assert_eq!(
             key,
-            crate::root_identity::key::artifact_key_from_git_identity(&initial)
+            aft_engine::test_bridge::search_misc::artifact_key_from_git_identity(&initial)
         );
         for name in ["first", "second", "third"] {
             let linked = temp.path().join(name);
@@ -9912,7 +9935,8 @@ mod tests {
             "each retry verifies HEAD then falls back to the full probe"
         );
         assert_eq!(
-            crate::root_identity::read(&linked, storage.path()).unwrap(),
+            aft_engine::test_bridge::search_misc::read_root_identity(&linked, storage.path())
+                .unwrap(),
             None
         );
     }
