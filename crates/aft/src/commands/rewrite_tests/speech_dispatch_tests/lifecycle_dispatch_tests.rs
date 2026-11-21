@@ -105,7 +105,7 @@ async fn seal_spawn_between_preflight_and_admission_posts_exactly_once() {
         .get(&fixture.incarnation)
         .unwrap()
         .record()
-        .seal
+        .seal()
         .is_some());
     let state = fixture.plex.state.lock().unwrap();
     assert_eq!(state.sends, 1);

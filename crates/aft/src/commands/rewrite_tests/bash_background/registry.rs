@@ -31,7 +31,7 @@ mod tests {
     fn approved_pty_offset_status_does_not_also_return_entire_raw_log() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = crate::context::AppContext::from_app(
-            crate::context::App::default_shared(),
+            crate::test_app(),
             crate::config::Config {
                 project_root: Some(dir.path().into()),
                 storage_dir: Some(dir.path().into()),
@@ -66,7 +66,7 @@ mod tests {
     fn lifecycle_dropping_deferred_response_releases_wait_registration() {
         let dir = tempfile::tempdir().unwrap();
         let ctx = crate::context::AppContext::from_app(
-            crate::context::App::default_shared(),
+            crate::test_app(),
             crate::config::Config {
                 project_root: Some(dir.path().to_path_buf()),
                 storage_dir: Some(dir.path().to_path_buf()),

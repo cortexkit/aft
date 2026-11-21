@@ -5,6 +5,7 @@ use crate::protocol::Response;
 use crate::sandbox_spawn::SpawnPlan;
 use crate::secret::SecretVault;
 use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
+use aft_engine::test_bridge::bash_remote::bash_background::secrets::{PROXY_KEYS, REMOVE_KEYS};
 use aft_engine::test_bridge::bash_remote::secrets_support::*;
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 use aft_engine::test_bridge::bash_remote::PreflightTestExt as _;
@@ -302,7 +303,10 @@ fn with_isolated_account<R>(expected_reads: usize, run: impl FnOnce() -> R) -> R
 fn with_safe_ptrace<R>(run: impl FnOnce() -> R) -> R {
     #[cfg(target_os = "linux")]
     {
-        crate::sandbox_spawn::with_secret_ptrace_scope_for_test(Some("1"), run)
+        aft_engine::test_bridge::bash_remote::sandbox_spawn::with_secret_ptrace_scope_for_test(
+            Some("1"),
+            run,
+        )
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -381,14 +385,18 @@ fn secret_bash_sandbox_raise_linux_yama_refusals() {
     ctx.update_config(|config| config.sandbox = Default::default());
     let vault = Vault::new(443);
     for value in [Some("0"), None] {
-        let reply = crate::sandbox_spawn::with_secret_ptrace_scope_for_test(value, || {
-            with_vault(vault.clone(), || {
-                crate::commands::bash::handle(
-                    &request("echo '{{ck-secret:test}}' > must-not-run"),
-                    &ctx,
-                )
-            })
-        });
+        let reply =
+            aft_engine::test_bridge::bash_remote::sandbox_spawn::with_secret_ptrace_scope_for_test(
+                value,
+                || {
+                    with_vault(vault.clone(), || {
+                        crate::commands::bash::handle(
+                            &request("echo '{{ck-secret:test}}' > must-not-run"),
+                            &ctx,
+                        )
+                    })
+                },
+            );
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));
         let message = reply.data["message"].as_str().unwrap();
         assert!(message.starts_with("This command needs the strict sandbox because it uses a vault key, but Linux Yama ptrace_scope"), "{reply:?}");

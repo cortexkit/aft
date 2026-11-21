@@ -372,3 +372,29 @@ pub fn filler(bytes: usize) -> String {
     text.push_str(&"x".repeat(bytes - text.len()));
     text
 }
+
+thread_local! {
+    /// Sleep added to every page read on this thread, so a test can make
+    /// draining a captured backlog slower than a caller's reply budget.
+    pub static ARTIFACT_PAGE_DELAY: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Checks frame-loop lock ownership directly, without treating scheduler latency
+/// as evidence of a blocking lock. This guard must stay on its creating thread.
+pub struct TaskStateLockBanForTest {
+    previous: bool,
+    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+pub fn forbid_task_state_locks_for_test() -> TaskStateLockBanForTest {
+    TaskStateLockBanForTest {
+        previous: TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.replace(true)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+impl Drop for TaskStateLockBanForTest {
+    fn drop(&mut self) {
+        TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.set(self.previous));
+    }
+}

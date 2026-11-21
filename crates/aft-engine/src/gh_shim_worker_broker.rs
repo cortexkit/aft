@@ -112,21 +112,21 @@ struct Service {
 #[cfg(unix)]
 static SERVICE: Mutex<Option<Service>> = Mutex::new(None);
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 thread_local! {
     static TEST_SERVICE: std::cell::RefCell<Option<Option<Service>>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(unix)]
 fn command_service() -> Option<Service> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(service) = TEST_SERVICE.with(|slot| slot.borrow().clone()) {
         return service;
     }
     SERVICE.lock().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 fn with_service_for_test<R>(service: Option<Service>, run: impl FnOnce() -> R) -> R {
     struct Restore(Option<Option<Service>>);
     impl Drop for Restore {
@@ -138,12 +138,12 @@ fn with_service_for_test<R>(service: Option<Service>, run: impl FnOnce() -> R) -
     run()
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 pub(crate) fn without_service_for_test<R>(run: impl FnOnce() -> R) -> R {
     with_service_for_test(None, run)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 pub(crate) fn with_available_service_for_test<R>(root: &Path, run: impl FnOnce() -> R) -> R {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();

@@ -175,9 +175,9 @@ fn exercise_profile(
         stop_spawned_test_task(&ctx, &response);
     };
     if service_available {
-        crate::gh_shim_worker_broker::with_available_service_for_test(project.path(), run);
+        aft_engine::test_bridge::bash_remote::gh_shim_worker_broker::with_available_service_for_test(project.path(), run);
     } else {
-        crate::gh_shim_worker_broker::without_service_for_test(run);
+        aft_engine::test_bridge::bash_remote::gh_shim_worker_broker::without_service_for_test(run);
     }
 }
 

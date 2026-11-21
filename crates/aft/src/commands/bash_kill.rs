@@ -215,7 +215,7 @@ mod tests {
         let project_a = tempfile::tempdir().unwrap();
         let project_b = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let ctx_a = actor(&app, project_a.path(), storage.path());
         let ctx_b = actor(&app, project_b.path(), storage.path());
         let session = "shared-session";
@@ -255,7 +255,7 @@ mod tests {
         let _storage_env = crate::test_env::without_storage_override();
         let project = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
-        let ctx = actor(&App::default_shared(), project.path(), storage.path());
+        let ctx = actor(&crate::test_app(), project.path(), storage.path());
 
         let reply = handle(&kill_request("noop", "kill-session"), &ctx);
         assert_eq!(reply.data["code"], "task_not_found", "{:?}", reply.data);

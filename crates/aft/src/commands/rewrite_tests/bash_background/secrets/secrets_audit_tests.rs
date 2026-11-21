@@ -1,6 +1,6 @@
 use super::*;
 use aft_engine::test_bridge::bash_remote::{
-    LaunchTestExt as _, PreflightTestExt as _, RuntimeTestExt as _,
+    LaunchTestExt as _, PreflightTestExt as _, RuntimeTestExt as _, SpawnPlanTestExt as _,
 };
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -442,7 +442,7 @@ fn audit_killing_revokes_before_term_grace() {
             .secret_proxy_address_for_test(&id)
             .unwrap();
         let (reached, release) =
-            crate::bash_background::registry::install_kill_signal_gate_for_test(&id);
+            aft_engine::test_bridge::bash_remote::bash_background::registry::install_kill_signal_gate_for_test(&id);
         let registry = f.ctx.bash_background().clone();
         let before_stop = revision(Source::Shell);
         let killed_id = id.clone();

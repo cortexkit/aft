@@ -709,14 +709,14 @@ fn secret_ptrace_scope_unavailable(value: std::io::Result<String>) -> Option<Str
 
 #[cfg(target_os = "linux")]
 fn secret_ptrace_scope_value() -> std::io::Result<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(value) = TEST_SECRET_PTRACE_SCOPE.with(|slot| slot.borrow().clone()) {
         return value.ok_or_else(|| std::io::ErrorKind::NotFound.into());
     }
     std::fs::read_to_string("/proc/sys/kernel/yama/ptrace_scope")
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 thread_local! {
     // Tests' stand-in for /proc/sys/kernel/yama/ptrace_scope, the Linux setting
     // that stops other processes from reading this one's memory. Unset reads
@@ -724,7 +724,7 @@ thread_local! {
     static TEST_SECRET_PTRACE_SCOPE: std::cell::RefCell<Option<Option<String>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub(crate) fn with_secret_ptrace_scope_for_test<R>(
     value: Option<&str>,
     run: impl FnOnce() -> R,

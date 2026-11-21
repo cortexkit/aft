@@ -487,9 +487,10 @@ async fn production_relay_requires_the_captured_binding_after_policy_mapping() {
         .store
         .get(&fixture.incarnation)
         .unwrap()
-        .record;
+        .record()
+        .clone();
     let repo = fixture.params["request"]["repository"].as_str().unwrap();
-    assert!(record.bindings.remove(repo).is_some());
+    assert!(record.bindings_mut().remove(repo).is_some());
     let encoded = serde_json::to_string(&record).unwrap();
     fixture
         .service
@@ -543,7 +544,8 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
             .get(&fixture.incarnation)
             .unwrap()
             .record()
-            .project_root,
+            .project_root()
+            .as_str(),
         supplied_project.display().to_string()
     );
     let canonical_project = fs::canonicalize(&supplied_project).unwrap();
@@ -621,7 +623,8 @@ async fn existing_storage_and_project_aliases_keep_capture_and_path_spellings() 
                 .get(&attached.incarnation())
                 .unwrap()
                 .record()
-                .project_root,
+                .project_root()
+                .as_str(),
             seed_project
         );
     }
