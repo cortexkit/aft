@@ -236,14 +236,21 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
         .map_err(|error| error.to_string())
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub(crate) enum SectionsError {
-    #[error("{0}")]
     Input(String),
-    #[error(transparent)]
-    Spill(#[from] aft_store::spill::Error),
-    #[error(transparent)]
-    Segment(#[from] aft_store::segment::SegmentError),
+    Spill(aft_store::spill::Error),
+    Segment(aft_store::segment::SegmentError),
+}
+
+impl std::fmt::Display for SectionsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(message) => f.write_str(message),
+            Self::Spill(error) => error.fmt(f),
+            Self::Segment(error) => error.fmt(f),
+        }
+    }
 }
 
 /// One file's fragment, built and not yet added to a [`SectionsWriter`].
@@ -566,7 +573,8 @@ impl<'i> SectionsWriter<'i> {
             spill
                 .lock()
                 .expect("graph spill lock")
-                .add(fragment, packed)?;
+                .add(fragment, packed)
+                .map_err(SectionsError::Spill)?;
         }
         Ok(built)
     }
@@ -657,7 +665,8 @@ impl<'i> SectionsWriter<'i> {
             GraphOutput::Streamed(graph) => {
                 graph.into_inner().expect("graph spill lock").write(writer)
             }
-        }?;
+        }
+        .map_err(SectionsError::Segment)?;
         Ok(self.keys)
     }
 }

@@ -21,13 +21,22 @@ pub(super) struct MemoryLimit {
     pub(super) files: usize,
 }
 
-#[derive(Clone, Copy, Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum RefreshStop {
-    #[error("call-graph memory ceiling exceeded")]
     Memory(MemoryLimit),
-    #[error("cancelled")]
     Cancelled,
 }
+
+impl std::fmt::Display for RefreshStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Memory(_) => "call-graph memory ceiling exceeded",
+            Self::Cancelled => "cancelled",
+        })
+    }
+}
+
+impl std::error::Error for RefreshStop {}
 
 pub(super) struct RefreshMemory {
     start: Option<u64>,
