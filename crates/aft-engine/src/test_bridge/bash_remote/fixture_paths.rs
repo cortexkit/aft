@@ -162,6 +162,24 @@ pub mod bash_background {
 }
 
 pub mod sandbox_spawn {
+    #[cfg(target_os = "linux")]
+    pub mod remote {
+        use crate::context::AppContext;
+        use std::path::{Path, PathBuf};
+
+        pub fn prepare_with_launcher(
+            ctx: &AppContext,
+            folder: &Path,
+            workdir: PathBuf,
+            command: String,
+            launcher: PathBuf,
+        ) -> Result<crate::sandbox_spawn::remote::StartForTest, String> {
+            crate::sandbox_spawn::remote::prepare_with_launcher(
+                ctx, folder, workdir, command, launcher,
+            )
+        }
+    }
+
     pub use super::super::with_spawn_plan_for_test;
     #[cfg(unix)]
     pub use crate::sandbox_spawn::escalation_grant_type::EscalationGrantStore;

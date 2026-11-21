@@ -6,8 +6,10 @@ mod tests {
     use crate::bash_background::BgTaskStatus;
     use crate::protocol::BashPatternMatchFrame;
     use aft_engine::test_bridge::bash_remote::BgBuffer;
-    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
     use aft_engine::test_bridge::bash_remote::{registry_support::registry_cases::*, TaskRuntime};
+    use aft_engine::test_bridge::bash_remote::{
+        BgTaskRegistryTestExt as _, TaskRuntimeTestExt as _,
+    };
     use std::{fs, path::PathBuf, time::Instant};
 
     #[test]
@@ -43,7 +45,7 @@ mod tests {
         {
             let mut state = task.test_lock_state().unwrap();
             state.metadata_mut().mode = BgMode::Pty;
-            *state.runtime_mut() = TaskRuntime::Pty(None);
+            *state.runtime_mut() = TaskRuntime::empty_pty();
             *state.buffer_mut() = BgBuffer::registered(&task.paths(), BgMode::Pty);
             write_task(&task.paths().json, &state.metadata()).unwrap();
         }
