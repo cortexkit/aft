@@ -20,6 +20,13 @@ pub fn thread_census() -> crate::lifecycle_census::ThreadCensus {
     crate::lifecycle_census::thread_census()
 }
 
+#[cfg(windows)]
+pub mod lifecycle_census {
+    pub fn thread_ids_for_test() -> Option<Vec<u64>> {
+        crate::lifecycle_census::thread_ids_for_test()
+    }
+}
+
 pub fn cleanup_expired(
     harness: &Path,
     retention: std::time::Duration,
