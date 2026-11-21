@@ -22,11 +22,21 @@ pub struct ExactRead {
 #[doc(hidden)]
 pub struct ReadHooks {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) mid_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    mid_read: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
     /// Runs after the path and policy checks, before the file is identified
     /// and opened, so tests can swap checkout entries inside that window.
     #[cfg(test)]
     pub after_check: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[cfg(feature = "test-support")]
+impl ReadHooks {
+    pub(crate) fn with_mid_read(mid_read: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self {
+            mid_read: Some(mid_read),
+            ..Self::default()
+        }
+    }
 }
 
 #[doc(hidden)]

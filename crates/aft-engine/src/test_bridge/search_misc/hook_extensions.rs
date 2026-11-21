@@ -174,11 +174,8 @@ pub mod file_read_exact {
     use crate::file_read_exact::ReadHooks;
     use std::sync::Arc;
 
-    pub fn read_hooks_with_mid_read(mid_read: Arc<dyn Fn() + Send + Sync>) -> ReadHooks {
-        ReadHooks {
-            mid_read: Some(mid_read),
-            ..ReadHooks::default()
-        }
+    pub fn with_mid_read(mid_read: Arc<dyn Fn() + Send + Sync>) -> ReadHooks {
+        ReadHooks::with_mid_read(mid_read)
     }
 }
 
