@@ -1,10 +1,18 @@
-use super::*;
+use crate::config::Config;
+use crate::context::AppContext;
 use crate::edit::mutation::set_before_check;
+use crate::executor::test_support::test_executor;
+use crate::executor::Lane;
+use crate::parser::TreeSitterProvider;
+use crate::path_identity::ProjectRootId;
 use crate::protocol::RawRequest;
-#[allow(unused_imports)]
-pub(crate) use aft_base::executor::tests::stale_write::*;
+use crate::protocol::Response;
+use aft_base::executor::tests::stale_write::*;
 use serde_json::json;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 fn run(req: &RawRequest, ctx: &AppContext) -> Response {
     use crate::commands::*;
@@ -21,7 +29,7 @@ fn run(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn context(root: &Path) -> Arc<AppContext> {
-    Arc::new(AppContext::new(
+    Arc::new(crate::test_context(
         Box::new(TreeSitterProvider::new()),
         Config {
             project_root: Some(root.to_path_buf()),

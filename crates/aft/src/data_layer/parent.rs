@@ -356,6 +356,3 @@ impl ChildCheckouts {
         self.bound()
     }
 }
-
-#[cfg(test)]
-mod tests;

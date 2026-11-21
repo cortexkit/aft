@@ -81,7 +81,7 @@ fn request(value: Value) -> RawRequest {
 
 /// A session bound to `root` through configure, with the call graph on or off.
 fn configure(root: &Path, storage: &Path, callgraph: bool) -> Arc<AppContext> {
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             storage_dir: Some(storage.to_path_buf()),
@@ -161,7 +161,7 @@ fn refusing_executor() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let root = std::fs::canonicalize(dir.path()).unwrap();
-    let ctx = Arc::new(AppContext::new(
+    let ctx = Arc::new(crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config::default(),
     ));
@@ -1015,7 +1015,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
 
     let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
-        let ctx = Arc::new(AppContext::new(
+        let ctx = Arc::new(crate::test_context(
             Box::new(crate::parser::TreeSitterProvider::new()),
             crate::config::Config {
                 storage_dir: Some(storage.clone()),

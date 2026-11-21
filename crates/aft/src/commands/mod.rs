@@ -54,6 +54,8 @@ mod edit_boundary_tests;
 pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
+#[cfg(test)]
+mod executor_tests;
 pub mod extract_function;
 #[cfg(test)]
 mod feature_status_tests;
@@ -133,3 +135,8 @@ mod store_diet_tests;
 pub(crate) mod data_callgraph;
 pub(crate) mod data_search;
 pub mod parent_query;
+#[cfg(test)]
+mod parent_query_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod main_parity_capture;

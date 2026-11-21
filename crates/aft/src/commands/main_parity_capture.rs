@@ -3,9 +3,9 @@
 //! Regeneration uses the same test-only constant-vector callback and command
 //! handlers in both checkouts. Production code and serializers are unchanged.
 
-use super::main_parity_vectors::use_constant_vectors;
 use crate::config::{Config, IndexesConfig, SemanticBackend};
 use crate::context::AppContext;
+use crate::data_layer::meaning::use_constant_vectors;
 use crate::protocol::{RawRequest, Response};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -184,7 +184,7 @@ fn capture_case(
         .unwrap()
         .retain(|_, value| !value.is_null());
     let document = json!({"indexes":config.indexes,"semantic":semantic,"inspect":{"categories":{"diagnostics":false}}}).to_string();
-    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     ctx.set_canonical_cache_root(root.clone());
     crate::semantic_admission::note_opened("main-parity", &root);
     let configured = crate::commands::configure::handle_configure(
