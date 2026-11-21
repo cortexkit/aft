@@ -197,6 +197,15 @@ impl RepeatBreaker {
     pub fn clear(&self) {
         self.sessions.lock().clear();
     }
+
+    #[cfg(test)]
+    pub(crate) fn session_call_counts(&self) -> HashMap<String, usize> {
+        self.sessions
+            .lock()
+            .iter()
+            .map(|(session, state)| (session.clone(), state.calls.len()))
+            .collect()
+    }
 }
 
 pub(crate) fn hash_value(value: &impl Hash) -> u64 {
@@ -233,11 +242,10 @@ mod tests {
         }
 
         let current = format!("repeat-growth-{}", 127);
-        let mut sessions = breaker.sessions.lock();
+        let sessions = breaker.session_call_counts();
         assert_eq!(sessions.len(), 1, "expired sessions must not accumulate");
-        let state = sessions.get_mut(&current).expect("current session remains");
-        assert_eq!(state.calls.len(), 1, "current call remains available");
-        drop(sessions);
+        let count = sessions.get(&current).expect("current session remains");
+        assert_eq!(*count, 1, "current call remains available");
 
         breaker.observe_at(
             &current,
@@ -245,6 +253,6 @@ mod tests {
             128,
             start + Duration::from_secs(cadence_secs * 127),
         );
-        assert_eq!(breaker.sessions.lock()[&current].calls.len(), 2);
+        assert_eq!(breaker.session_call_counts()[&current], 2);
     }
 }
