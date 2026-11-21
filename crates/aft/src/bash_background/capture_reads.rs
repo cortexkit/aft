@@ -408,4 +408,4 @@ fn read_normalized_tail(
 
 #[cfg(test)]
 #[path = "capture_reads_tests.rs"]
-mod tests;
+pub(crate) mod tests;

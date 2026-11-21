@@ -57,3 +57,25 @@ pub(crate) use super::tests::insert_terminal_piped_task;
     pub(crate) fn register_unpersisted_watch(registry: &BgTaskRegistry, id: String, pattern: WatchPattern, once: bool) {
         registry.inner.watch_registry.lock().unwrap().register(id, pattern, once).unwrap();
     }
+
+pub(crate) use super::completion_preview::capture_reads::tests::{filler, terminal_task, with_secret};
+    pub(crate) use super::completion_preview::capture_reads::tests::DISPLAY_LINE_FINISH_BYTES;
+
+    pub(crate) fn display_bodies(registry: &BgTaskRegistry, task: &Arc<BgTask>, metadata: &PersistedTask, buffer: &BgBuffer) -> crate::bash_background::frames::BashBodies {
+        registry.display_bodies(task, metadata, buffer)
+    }
+
+#[cfg(unix)]
+    pub(crate) mod ordering {
+        pub(crate) use super::super::completion_replay_ordering_tests::{capture_live_ordering_frames, completion_frames, live_secret_task, pause_ordering_publication, registry, MASKED, SESSION};
+    }
+
+pub(crate) use super::a02_tests::terminal_fixture;
+
+    pub(crate) fn set_completion_secrets(task: &BgTask, values: crate::log_redact::SecretValues) {
+        *task.completion_secrets.lock().unwrap() = Some(values);
+    }
+
+    pub(crate) fn capture_display_terminal(registry: &BgTaskRegistry, task: &Arc<BgTask>, stale: &PersistedTask, buffer: &BgBuffer) {
+        registry.capture_display_terminal(task, stale, buffer);
+    }
