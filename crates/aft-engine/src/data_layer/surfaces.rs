@@ -29,7 +29,7 @@ use super::checkout::{
     PlaneStatus, INDEX_STORE,
 };
 use super::runtime::{DataCheckout, DataFailure};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use crate::context::AppContext;
 use crate::data_layer::host::IndexHost;
 use crate::data_layer::status::{SemanticFillHealth, SemanticHealthComponentSnapshot};
