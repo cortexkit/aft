@@ -325,7 +325,7 @@ fn hinted_retry_after_ms(terminal: &TerminalRecord) -> Option<u64> {
 #[cfg(unix)]
 fn hinted_retry_budget_ms(_root: &Path, request: &RunRequest) -> u64 {
     #[cfg(test)]
-    if let Some(ms) = tests::hinted_retry_budget_ms(_root) {
+    if let Some(ms) = seams::hinted_retry_budget_ms(_root) {
         return ms;
     }
     request.queue_wait_limit_s.map_or_else(
@@ -391,7 +391,7 @@ fn draining_delay_ms(
 #[cfg(unix)]
 fn retry_jitter_for_task(_task: &BgTask) -> impl FnOnce(u64) -> u64 {
     #[cfg(test)]
-    let clock = tests::task_draining_clock(_task);
+    let clock = seams::task_draining_clock(_task);
     move |max| {
         #[cfg(test)]
         if let Some(clock) = clock {
@@ -419,7 +419,7 @@ fn retry_jitter_for_task(_task: &BgTask) -> impl FnOnce(u64) -> u64 {
 #[cfg(unix)]
 fn draining_budget_ms(_root: &Path) -> u64 {
     #[cfg(test)]
-    if let Some(ms) = tests::draining_budget_ms(_root) {
+    if let Some(ms) = seams::draining_budget_ms(_root) {
         return ms;
     }
     DRAINING_RETRY_BUDGET_MS
@@ -428,7 +428,7 @@ fn draining_budget_ms(_root: &Path) -> u64 {
 #[cfg(unix)]
 fn draining_now_ms(_root: &Path) -> u64 {
     #[cfg(test)]
-    if let Some(clock) = tests::draining_clock(_root) {
+    if let Some(clock) = seams::draining_clock(_root) {
         return clock.now();
     }
     unix_millis()
@@ -437,7 +437,7 @@ fn draining_now_ms(_root: &Path) -> u64 {
 #[cfg(unix)]
 async fn draining_retry_sleep(_root: &Path, _now: u64, delay: u64) {
     #[cfg(test)]
-    if let Some(clock) = tests::draining_clock(_root) {
+    if let Some(clock) = seams::draining_clock(_root) {
         clock.sleep_until(_now, _now.saturating_add(delay)).await;
         return;
     }
@@ -577,7 +577,7 @@ struct ReattachBudget {
     #[cfg(test)]
     budget_override: bool,
     #[cfg(test)]
-    clock: Option<Arc<tests::ReattachClock>>,
+    clock: Option<Arc<seams::ReattachClock>>,
     #[cfg(test)]
     clock_job_end: Option<Duration>,
     #[cfg(test)]
@@ -593,7 +593,7 @@ impl ReattachBudget {
         // A shortened test budget stands for the whole allowance: the job's
         // limits are treated as already passed.
         #[cfg(test)]
-        let budget_override = tests::take_reattach_budget(_root);
+        let budget_override = seams::take_reattach_budget(_root);
         #[cfg(test)]
         let (grace, until_job_end) = match budget_override {
             Some(budget) => (budget, Duration::ZERO),
@@ -607,7 +607,7 @@ impl ReattachBudget {
             retry_duration(duration_ms(grace)),
         );
         #[cfg(test)]
-        let clock = tests::reattach_clock(_root);
+        let clock = seams::reattach_clock(_root);
         Self {
             grace,
             job_end: tokio::time::Instant::now() + until_job_end,
@@ -2197,7 +2197,7 @@ impl OutputSink for TaskSink {
     }
     fn terminal(&mut self, record: &TerminalRecord, verdict: &Verdict) -> io::Result<()> {
         #[cfg(test)]
-        let clock = tests::task_draining_clock(&self.task);
+        let clock = seams::task_draining_clock(&self.task);
         let jitter = retry_jitter_for_task(&self.task);
         // A job that ran but sent no manifest returned nothing. A refusal
         // before start may be retried, so it leaves the request open.
@@ -3236,7 +3236,7 @@ impl BgTaskRegistry {
                 }
                 let result = run_diagnosed(client, &sink.task, &request, timings).await;
                 #[cfg(test)]
-                let result = if result.is_ok() && tests::lose_submission_replies(_root) {
+                let result = if result.is_ok() && seams::lose_submission_replies(_root) {
                     // A round trip confirms dispatch reached the fake executor
                     // before losing the caller's dispatch result.
                     let _ = client.status().await;
@@ -3329,7 +3329,7 @@ impl BgTaskRegistry {
                 .or_insert(OwedCancelOwner::Worker);
         }
         #[cfg(test)]
-        tests::note_remote_worker_start(&task);
+        seams::note_remote_worker_start(&task);
         let registry = self.clone();
         let spawned = Arc::clone(&task);
         std::thread::Builder::new()
@@ -3784,7 +3784,7 @@ impl BgTaskRegistry {
                     // Stands in for the daemon stopping before it sent the
                     // cancellation to the runner.
                     #[cfg(test)]
-                    if tests::stop_draining_worker(&root) {
+                    if seams::stop_draining_worker(&root) {
                         return Ok(());
                     }
                     let result = if recovery.cancel_acknowledged == Some(point.job_id) {
@@ -3893,7 +3893,7 @@ impl BgTaskRegistry {
                 })) => {
                     #[cfg(test)]
                     if reason == RefusalReason::SubmissionNeverAccepted
-                        && tests::stop_draining_worker(&root)
+                        && seams::stop_draining_worker(&root)
                     {
                         return Ok(());
                     }
@@ -3963,7 +3963,7 @@ impl BgTaskRegistry {
                         }
                     }
                     #[cfg(test)]
-                    tests::draining_gate(&root, tests::DrainingGate::BeforeRefusalReport).await;
+                    seams::draining_gate(&root, seams::DrainingGate::BeforeRefusalReport).await;
                     let reason = serde_json::to_value(reason)
                         .unwrap()
                         .as_str()
@@ -4005,7 +4005,7 @@ impl BgTaskRegistry {
                 }
                 Ok(StreamProgress::Complete(verdict)) => {
                     #[cfg(test)]
-                    if verdict == Verdict::OutcomeUnknown && tests::stop_draining_worker(&root) {
+                    if verdict == Verdict::OutcomeUnknown && seams::stop_draining_worker(&root) {
                         return Ok(());
                     }
                     if !platform_ok {
@@ -4045,7 +4045,7 @@ impl BgTaskRegistry {
                     if stream
                         .resume_point()
                         .is_some_and(|point| point.gap_recovery.is_some())
-                        && tests::stop_draining_worker(&root)
+                        && seams::stop_draining_worker(&root)
                     {
                         return Ok(());
                     }
@@ -4164,11 +4164,11 @@ impl BgTaskRegistry {
                 return Ok(None);
             }
             #[cfg(test)]
-            if tests::stop_draining_worker(root) {
+            if seams::stop_draining_worker(root) {
                 return Ok(None);
             }
             #[cfg(test)]
-            tests::draining_gate(root, tests::DrainingGate::BeforeBudgetCheck).await;
+            seams::draining_gate(root, seams::DrainingGate::BeforeBudgetCheck).await;
             let retry = remote.retry.as_ref().unwrap();
             let first = retry.first_refusal_at_ms.unwrap();
             let elapsed = now.saturating_sub(first);
@@ -4217,7 +4217,7 @@ impl BgTaskRegistry {
             return Ok(None);
         };
         #[cfg(test)]
-        tests::draining_gate(root, tests::DrainingGate::BeforeResubmit).await;
+        seams::draining_gate(root, seams::DrainingGate::BeforeResubmit).await;
         let keyed_request = self
             .key_fresh_request(client, task, request.clone(), &mut timings)
             .await?;
@@ -4260,7 +4260,7 @@ impl BgTaskRegistry {
             Ok(stream) => Ok(Some((stream, hinted))),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
-                tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
+                seams::draining_gate(root, seams::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
                 // A pause that landed meanwhile already ended the task; the
                 // resubmission never reached the runner, so nothing runs.
@@ -4329,7 +4329,7 @@ impl BgTaskRegistry {
         // Stands in for the daemon stopping while it waits: the worker ends
         // and leaves only the refusal it has already saved.
         #[cfg(test)]
-        if tests::stop_draining_worker(root) {
+        if seams::stop_draining_worker(root) {
             return Ok(HintedRetryStep::Ended);
         }
         loop {
@@ -4360,7 +4360,7 @@ impl BgTaskRegistry {
             }
         }
         #[cfg(test)]
-        tests::draining_gate(root, tests::DrainingGate::BeforeHintedResubmit).await;
+        seams::draining_gate(root, seams::DrainingGate::BeforeHintedResubmit).await;
         let request = self
             .key_fresh_request(client, task, retry.request.clone(), &mut timings)
             .await?;
@@ -4401,7 +4401,7 @@ impl BgTaskRegistry {
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
-                tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
+                seams::draining_gate(root, seams::DrainingGate::BeforeNoStartRefusal).await;
                 self.refuse_remote_before_dispatch(task, &error.to_string())?;
                 // A pause that landed meanwhile already ended the task; the
                 // resubmission never reached the runner, so nothing runs.
@@ -5419,7 +5419,7 @@ async fn send_owed_cancels(storage_root: &Path) -> OwedCancelReport {
             );
         }
         #[cfg(test)]
-        tests::draining_gate(storage_root, tests::DrainingGate::OwedCancelClaimed).await;
+        seams::draining_gate(storage_root, seams::DrainingGate::OwedCancelClaimed).await;
         let sent = send_owed_cancel(&session_dir, &task_id).await;
         // Saved under the claim table's lock: a registry restoring the task
         // meanwhile either adopts the claim (and gets the outcome below) or
@@ -5517,7 +5517,7 @@ fn save_owed_cancel_outcome(
         let mut json_writes = order.lock_json_writes();
         let mut record = read_task_at(&layout)?;
         #[cfg(test)]
-        tests::owed_cancel_save_gate(task_id);
+        seams::owed_cancel_save_gate(task_id);
         if let Some(remote) = record.remote.as_mut() {
             if cleared {
                 remote.cancel_pending = false;
@@ -5632,7 +5632,7 @@ async fn cancel_with_backoff(
                     "owed runner cancel for task {task_id} job {job_id}: attempt {attempt} of {OWED_CANCEL_ATTEMPTS} failed: {last_error}"
                 );
                 #[cfg(test)]
-                tests::note_owed_cancel_attempt_failed(task_id);
+                seams::note_owed_cancel_attempt_failed(task_id);
             }
         }
         if attempt < OWED_CANCEL_ATTEMPTS {
@@ -6095,7 +6095,7 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
 }
 
 /// Send a retry's resubmission. Tests can make it fail as a call that never
-/// reached the runner (see `tests::refuse_resubmission`).
+/// reached the runner (see `seams::refuse_resubmission`).
 #[cfg(unix)]
 async fn resubmit(
     client: &ExecRemoteClient,
@@ -6105,7 +6105,7 @@ async fn resubmit(
     timings: exec::LaunchTimings,
 ) -> Result<exec::RemoteStream, exec::Error> {
     #[cfg(test)]
-    if tests::refuse_resubmission(_root) {
+    if seams::refuse_resubmission(_root) {
         return Err(exec::Error::Protocol(
             "test: resubmission failed before it was sent".into(),
         ));
@@ -6148,14 +6148,14 @@ fn proves_no_start(error: &exec::Error) -> bool {
 }
 
 #[cfg(all(test, unix))]
+#[path = "remote_test_support.rs"]
+mod seams;
+#[cfg(all(test, unix))]
 #[path = "remote_tests.rs"]
 mod tests;
-
-#[cfg(all(test, unix))]
-pub(crate) use tests::{assert_siblings_submit_refused_before_connect, submit_runon_for_test};
-
 #[cfg(all(test, unix))]
 pub(crate) use tests::{
-    captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
+    assert_siblings_submit_refused_before_connect, captured_task_after_losing_replay_for_test,
+    submit_runon_for_test, uncaptured_terminal_before_render_for_test,
     uncaptured_unknown_before_render_for_test,
 };

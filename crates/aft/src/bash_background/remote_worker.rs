@@ -18,7 +18,7 @@ pub(super) fn run(
             .and_then(|rt| rt.block_on(registry.run_remote_task(task.clone(), initial, timings)))
     };
     #[cfg(test)]
-    let result = tests::capture_remote_launch_logs(&task, run);
+    let result = seams::capture_remote_launch_logs(&task, run);
     #[cfg(not(test))]
     let result = run();
     if let Err(mut error) = result {
@@ -36,7 +36,7 @@ pub(super) fn run(
             release_worker_owed_cancel_claim(&task.task_id);
             task.remote_worker_running.store(false, Ordering::Release);
             #[cfg(test)]
-            tests::note_remote_worker_exit(&task.task_id);
+            seams::note_remote_worker_exit(&task.task_id);
             return;
         }
         let point = task
@@ -66,5 +66,5 @@ pub(super) fn run(
     release_worker_owed_cancel_claim(&task.task_id);
     task.remote_worker_running.store(false, Ordering::Release);
     #[cfg(test)]
-    tests::note_remote_worker_exit(&task.task_id);
+    seams::note_remote_worker_exit(&task.task_id);
 }
