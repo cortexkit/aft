@@ -19,6 +19,7 @@ const UPPER: &[&str] = &[
     "search_hot_path_measurements",
     "engine_source_guard_tests",
     "upper_test_context",
+    "test_context",
 ];
 const TRACE_FACADE: &str = "pub use crate::trace_measure_run::run;";
 const REGISTERING_HELPER: &str = "upper_test_context.rs";
