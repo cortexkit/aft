@@ -4,10 +4,38 @@ use quick_xml::{
     events::{BytesStart, Event},
     Reader,
 };
+use std::collections::BTreeSet;
 
 use super::csharp_projects::{AGGREGATOR, COMPILES, UNKNOWN};
 
-pub(super) fn classify(source: &[u8]) -> Option<(u8, std::collections::BTreeSet<String>)> {
+pub(super) struct Facts {
+    pub kind: u8,
+    pub membership_safe: bool,
+    pub references: BTreeSet<String>,
+    pub imports: BTreeSet<String>,
+}
+
+pub(super) fn has_project_root(source: &[u8]) -> bool {
+    let prefix = source
+        .strip_prefix(b"\xef\xbb\xbf")
+        .unwrap_or(source)
+        .trim_ascii_start();
+    if !prefix.starts_with(b"<") || source.len() as u64 > super::CSharpProjects::PROJECT_READ_LIMIT
+    {
+        return false;
+    }
+    let mut xml = Reader::from_reader(prefix);
+    loop {
+        match xml.read_event() {
+            Ok(Event::Start(tag) | Event::Empty(tag)) => return tag.name().as_ref() == b"Project",
+            Ok(Event::Decl(_) | Event::Comment(_) | Event::PI(_)) => {}
+            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => {}
+            _ => return false,
+        }
+    }
+}
+
+pub(super) fn classify(source: &[u8]) -> Option<Facts> {
     // Do not trust a prefix of a project: a later property could disable defaults.
     if source.len() as u64 > super::CSharpProjects::PROJECT_READ_LIMIT {
         return None;
@@ -17,8 +45,8 @@ pub(super) fn classify(source: &[u8]) -> Option<(u8, std::collections::BTreeSet<
     xml.config_mut().check_comments = true;
     let mut seen_root = false;
     let mut stack: Vec<(Vec<u8>, bool)> = Vec::new();
-    let mut references = std::collections::BTreeSet::new();
-    let mut marker = None;
+    let mut references = BTreeSet::new();
+    let mut imports = BTreeSet::new();
     let mut aggregator = false;
     let mut defaults = true;
     loop {
@@ -32,15 +60,10 @@ pub(super) fn classify(source: &[u8]) -> Option<(u8, std::collections::BTreeSet<
                     }
                     seen_root = true;
                 }
-                if marker.is_some() {
-                    return None;
-                }
                 aggregator |= qualifying_sdk(&xml, &tag, depth)?;
                 let (conditional, include) = item(&xml, &tag)?;
                 add_reference(&mut references, &stack, &name, conditional, include);
-                if name == b"EnableDefaultCompileItems" {
-                    marker = Some(String::new());
-                }
+                defaults &= membership_directive(&xml, &tag, &mut imports)?;
                 stack.push((name, conditional));
             }
             Event::Empty(tag) => {
@@ -51,54 +74,88 @@ pub(super) fn classify(source: &[u8]) -> Option<(u8, std::collections::BTreeSet<
                     }
                     seen_root = true;
                 }
-                if marker.is_some() {
-                    return None;
-                }
                 aggregator |= qualifying_sdk(&xml, &tag, stack.len())?;
                 let (conditional, include) = item(&xml, &tag)?;
                 add_reference(&mut references, &stack, name.as_ref(), conditional, include);
-                if name.as_ref() == b"EnableDefaultCompileItems" {
-                    defaults = false;
-                }
+                defaults &= membership_directive(&xml, &tag, &mut imports)?;
             }
             Event::End(_) => {
-                if stack.pop()?.0 == b"EnableDefaultCompileItems" {
-                    defaults &= marker.take()?.trim().eq_ignore_ascii_case("true");
-                }
+                stack.pop()?;
             }
             Event::Text(text) => {
                 let text = text.xml_content().ok()?;
                 if stack.is_empty() && !text.trim().is_empty() {
                     return None;
                 }
-                if let Some(marker) = &mut marker {
-                    marker.push_str(&text);
-                }
             }
-            Event::CData(text) => {
+            Event::CData(_) => {
                 if stack.is_empty() {
                     return None;
                 }
-                if let Some(marker) = &mut marker {
-                    marker.push_str(&text.decode().ok()?);
-                }
             }
             Event::DocType(_) => return None,
-            Event::GeneralRef(_) if marker.is_some() || stack.is_empty() => return None,
+            Event::GeneralRef(_) if stack.is_empty() => return None,
             Event::Eof => break,
             _ => {}
         }
     }
-    (seen_root && stack.is_empty()).then_some((
-        if aggregator {
+    (seen_root && stack.is_empty()).then_some(Facts {
+        kind: if aggregator {
             AGGREGATOR
         } else if defaults {
             COMPILES
         } else {
             UNKNOWN
         },
+        membership_safe: defaults,
         references,
-    ))
+        imports,
+    })
+}
+
+fn membership_directive(
+    xml: &Reader<&[u8]>,
+    tag: &BytesStart<'_>,
+    imports: &mut BTreeSet<String>,
+) -> Option<bool> {
+    let name = tag.local_name();
+    let name = name.as_ref();
+    if [
+        b"Compile".as_slice(),
+        b"EnableDefaultItems",
+        b"EnableDefaultCompileItems",
+        b"DefaultItemExcludes",
+        b"DefaultExcludesInProjectFolder",
+        b"DefaultItemExcludesInProjectFolder",
+    ]
+    .into_iter()
+    .any(|directive| name.eq_ignore_ascii_case(directive))
+    {
+        return Some(false);
+    }
+    if name.eq_ignore_ascii_case(b"Import") {
+        let mut project = None;
+        for attr in tag.attributes() {
+            let attr = attr.ok()?;
+            // An SDK-qualified import is relative to the SDK, not the
+            // checkout folder containing the Import.
+            if attr.key.as_ref().eq_ignore_ascii_case(b"Sdk") {
+                return Some(true);
+            }
+            if attr.key.as_ref().eq_ignore_ascii_case(b"Project") {
+                project = Some(
+                    attr.decode_and_unescape_value(xml.decoder())
+                        .ok()?
+                        .into_owned(),
+                );
+            }
+        }
+        let Some(path) = project.filter(|path| !path.contains(['\r', '\n'])) else {
+            return Some(false);
+        };
+        imports.insert(path);
+    }
+    Some(true)
 }
 
 fn item(xml: &Reader<&[u8]>, tag: &BytesStart<'_>) -> Option<(bool, Option<String>)> {

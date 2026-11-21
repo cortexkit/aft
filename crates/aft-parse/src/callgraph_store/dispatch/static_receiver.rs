@@ -4,6 +4,8 @@
 mod bindings;
 #[path = "static_receiver/codec.rs"]
 mod codec;
+#[path = "static_receiver/csharp_membership.rs"]
+mod csharp_membership;
 #[path = "static_receiver/csharp_projects.rs"]
 mod csharp_projects;
 pub use csharp_projects::CSharpProjects;

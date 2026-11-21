@@ -267,3 +267,131 @@ fn csharp_project_reference_cycle_and_reference_edit_have_cold_parity() {
     assert!(stats.sites_resolved > 0, "{stats:?}");
     check_unknown(&rows[CALLER.0]);
 }
+
+#[test]
+fn csharp_explicit_compile_items_do_not_prove_default_membership() {
+    for doc in [
+        r#"<Project Sdk="Microsoft.NET.Sdk"><ItemGroup><Compile Remove="helpers/Assert.cs" /></ItemGroup></Project>"#,
+        r#"<Project><ItemGroup><Compile Include="some/Test.cs" /></ItemGroup></Project>"#,
+        r#"<Project><ItemGroup><Compile Update="**/*.cs" /></ItemGroup></Project>"#,
+        "<Project><PropertyGroup><EnableDefaultItems>false</EnableDefaultItems></PropertyGroup></Project>",
+        "<Project><PropertyGroup><EnableDefaultItems>true</EnableDefaultItems></PropertyGroup></Project>",
+        "<Project><PropertyGroup><EnableDefaultCompileItems>true</EnableDefaultCompileItems></PropertyGroup></Project>",
+        "<Project><PropertyGroup><EnableDefaultCompileItems>$(Unknown)</EnableDefaultCompileItems></PropertyGroup></Project>",
+        "<Project><PropertyGroup><DefaultItemExcludes>helpers/**</DefaultItemExcludes></PropertyGroup></Project>",
+        "<Project><PropertyGroup><DefaultExcludesInProjectFolder>helpers/**</DefaultExcludesInProjectFolder></PropertyGroup></Project>",
+    ] {
+        let files = [CALLER, (APP.0, doc), TYPE];
+        check_unknown(&records_match_files(&project_checkout(&files,&[]))[CALLER.0]);
+    }
+}
+
+#[test]
+fn csharp_build_props_and_targets_membership_changes_refresh_like_cold() {
+    for name in ["Directory.Build.props", "app/Directory.Build.targets"] {
+        let before = project_checkout(&[CALLER, APP, TYPE], &[]);
+        let after = project_checkout(
+            &[
+                CALLER,
+                APP,
+                TYPE,
+                (
+                    name,
+                    r#"<Project><ItemGroup><Compile Remove="**/Assert.cs" /></ItemGroup></Project>"#,
+                ),
+            ],
+            &[],
+        );
+        let (stats, rows) = update_checked_bytes(before.clone(), after.clone(), &[name]);
+        assert!(stats.sites_resolved > 0, "{name}: {stats:?}");
+        check_unknown(&rows[CALLER.0]);
+        let (stats, rows) = update_checked_bytes(after, before, &[name]);
+        assert!(stats.sites_resolved > 0, "{name}: {stats:?}");
+        check_exact(&rows[CALLER.0]);
+    }
+}
+
+#[test]
+fn csharp_transitive_literal_import_membership_refreshes_by_snapshot_path() {
+    let first = (
+        "app/Directory.Build.props",
+        r#"<Project><Import Project="../build/shared" /></Project>"#,
+    );
+    let second = (
+        "build/shared",
+        r#"<Project><Import Project="membership.rules" /></Project>"#,
+    );
+    let terminal = "build/membership.rules";
+    let before = project_checkout(
+        &[CALLER, APP, TYPE, first, second, (terminal, "<Project />")],
+        &[],
+    );
+    check_exact(&records_match_files(&before)[CALLER.0]);
+    let removed = project_checkout(&[CALLER, APP, TYPE, first, second], &[]);
+    let excluded = project_checkout(
+        &[
+            CALLER,
+            APP,
+            TYPE,
+            first,
+            second,
+            (
+                terminal,
+                r#"<Project><ItemGroup><Compile Remove="**/Assert.cs" /></ItemGroup></Project>"#,
+            ),
+        ],
+        &[],
+    );
+    let (stats, rows) = update_checked_bytes(before.clone(), excluded, &[terminal]);
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    check_unknown(&rows[CALLER.0]);
+    let (stats, rows) = update_checked_bytes(removed, before, &[terminal]);
+    assert!(stats.sites_resolved > 0, "{stats:?}");
+    check_exact(&rows[CALLER.0]);
+}
+
+#[test]
+fn csharp_unknown_explicit_imports_do_not_prove_membership() {
+    for include in [
+        "../../outside.props",
+        "../build/missing",
+        "../build/malformed",
+        "../build/cycle",
+    ] {
+        let xml = format!(r#"<Project><Import Project="{include}" /></Project>"#);
+        let files = [
+            CALLER,
+            (APP.0, &xml),
+            TYPE,
+            ("build/malformed", "<Project><Unclosed></Project>"),
+            (
+                "build/cycle",
+                r#"<Project><Import Project="../app/App.csproj" /></Project>"#,
+            ),
+        ];
+        check_unknown(&records_match_files(&project_checkout(&files, &[]))[CALLER.0]);
+    }
+}
+
+#[test]
+fn csharp_sdk_and_nonliteral_imports_do_not_bind_checkout_files() {
+    let root = (
+        "Directory.Build.props",
+        r#"<Project><Import Project="Sdk.props" Sdk="External.Build.Sdk" /><Import Project="$(ExternalDirectory)shared.props" /></Project>"#,
+    );
+    let files = [CALLER, TYPE, APP, root];
+    check_exact(&records_match_files(&project_checkout(&files, &[]))[CALLER.0]);
+    let mut with_local = files.to_vec();
+    with_local.push((
+        "Sdk.props",
+        r#"<Project><ItemGroup><Compile Remove="app/helpers/Assert.cs" /></ItemGroup></Project>"#,
+    ));
+    check_exact(&records_match_files(&project_checkout(&with_local, &[]))[CALLER.0]);
+}
+
+#[test]
+fn csharp_ancestor_default_items_definition_blocks_even_when_true() {
+    let props = ("Directory.Build.props", "<Project><PropertyGroup><EnableDefaultItems>true</EnableDefaultItems></PropertyGroup></Project>");
+    let rows = records_match_files(&project_checkout(&[CALLER, TYPE, APP, props], &[]));
+    check_unknown(&rows[CALLER.0]);
+}

@@ -3,9 +3,12 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
 
+use super::csharp_membership::{self as membership, Markers, DIRECTORY_INPUTS};
+
 #[derive(Debug, Default)]
 pub struct CSharpProjects {
     declarations: HashMap<String, Folder>,
+    membership_imports: HashMap<String, BTreeSet<String>>,
     projects: Vec<Project>,
     lookups: Mutex<HashMap<String, Arc<Lookup>>>,
 }
@@ -49,24 +52,36 @@ impl CSharpProjects {
     /// project files are reopened during resolution.
     pub fn new<'a>(paths: impl IntoIterator<Item = (&'a [u8], Option<&'a [u8]>)>) -> Self {
         let mut this = Self::default();
-        for (path, config) in paths {
-            let Some(folder) = Self::manifest_folder(path) else {
-                continue;
-            };
-            let (kind, references) = config.map_or((UNKNOWN, &[][..]), |bytes| {
-                bytes
-                    .split_first()
-                    .map_or((UNKNOWN, &[][..]), |(kind, refs)| (*kind, refs))
-            });
-            if kind == AGGREGATOR {
+        let mut files = HashMap::new();
+        let mut project_paths = Vec::new();
+        for (path, bytes) in paths {
+            let markers = Markers::decode(bytes);
+            if let Some(folder) = Self::manifest_folder(path) {
+                project_paths.push((path, folder, markers));
+            }
+            if bytes.is_some() || Self::is_membership_config_path(path) {
+                if let Ok(path) = std::str::from_utf8(path) {
+                    files.insert(path, markers);
+                }
+            }
+        }
+        for (path, folder, markers) in project_paths {
+            if markers.kind == AGGREGATOR {
                 continue;
             }
-            let supported = kind == COMPILES && std::str::from_utf8(path).is_ok();
+            let supported = markers.kind == COMPILES
+                && std::str::from_utf8(path).ok().is_some_and(|path| {
+                    let check = membership::project(path, &files);
+                    this.membership_imports
+                        .entry(folder.clone())
+                        .or_default()
+                        .extend(check.imports);
+                    check.known
+                });
             let entry = if supported {
                 let id = this.projects.len();
-                let references = std::str::from_utf8(references)
-                    .unwrap_or_default()
-                    .lines()
+                let references = markers
+                    .references()
                     .filter_map(|path| reference_path(&folder, path))
                     .collect();
                 this.projects.push(Project {
@@ -89,24 +104,49 @@ impl CSharpProjects {
 
     /// Compact configuration fact from the project's own bounded XML read.
     pub fn project_markers(source: &[u8]) -> Vec<u8> {
-        let Some((kind, refs)) = super::msbuild::classify(source) else {
-            return vec![UNKNOWN];
+        let Some(facts) = super::msbuild::classify(source) else {
+            return vec![UNKNOWN, 0];
         };
-        let mut out = vec![kind];
-        if kind == COMPILES {
-            for (i, path) in refs.into_iter().enumerate() {
-                if i != 0 {
-                    out.push(b'\n');
-                }
+        let mut out = vec![facts.kind, u8::from(facts.membership_safe)];
+        if facts.kind == COMPILES {
+            for path in facts.references {
+                out.extend(b"R\t");
                 out.extend(path.as_bytes());
+                out.push(b'\n');
             }
+        }
+        for path in facts.imports {
+            out.extend(b"I\t");
+            out.extend(path.as_bytes());
+            out.push(b'\n');
         }
         out
     }
 
+    pub fn is_membership_config_path(path: &[u8]) -> bool {
+        path.ends_with(b".csproj")
+            || path
+                .rsplit(|&byte| byte == b'/')
+                .next()
+                .is_some_and(|name| {
+                    DIRECTORY_INPUTS
+                        .iter()
+                        .any(|input| name == input.as_bytes())
+                })
+    }
+
+    pub fn has_project_root(source: &[u8]) -> bool {
+        super::msbuild::has_project_root(source)
+    }
+
     pub fn manifest_folder(path: &[u8]) -> Option<String> {
-        let name = path.rsplit(|&byte| byte == b'/').next()?;
-        if !name.ends_with(b".csproj") {
+        path.ends_with(b".csproj")
+            .then(|| Self::membership_folder(path))
+            .flatten()
+    }
+
+    pub fn membership_folder(path: &[u8]) -> Option<String> {
+        if !Self::is_membership_config_path(path) {
             return None;
         }
         let dir = path
@@ -118,6 +158,22 @@ impl CSharpProjects {
 
     pub fn dependency(folder: &str) -> String {
         format!("csproject:{folder}")
+    }
+
+    pub fn import_dependency(path: &str) -> String {
+        format!("csimport:{path}")
+    }
+
+    fn depend_folder(&self, folder: &str, depends: &mut impl FnMut(String)) {
+        depends(Self::dependency(folder));
+        if let Some(imports) = self.membership_imports.get(folder) {
+            for dir in membership::ancestors(folder).skip(1) {
+                depends(Self::dependency(dir));
+            }
+            for path in imports {
+                depends(Self::import_dependency(path));
+            }
+        }
     }
 
     pub(super) fn owner(&self, file: &str, mut depends: impl FnMut(String)) -> Option<ProjectId> {
@@ -143,7 +199,7 @@ impl CSharpProjects {
             }))
         };
         for folder in &lookup.folders {
-            depends(Self::dependency(folder));
+            self.depend_folder(folder, &mut depends);
         }
         lookup.project
     }
@@ -157,7 +213,7 @@ impl CSharpProjects {
             .closure
             .get_or_init(|| self.walk(project));
         for folder in &closure.folders {
-            depends(Self::dependency(folder));
+            self.depend_folder(folder, &mut depends);
         }
         closure.projects.as_ref()
     }
@@ -194,7 +250,7 @@ impl CSharpProjects {
     }
 }
 
-fn parent(path: &str) -> &str {
+pub(super) fn parent(path: &str) -> &str {
     path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
@@ -208,7 +264,18 @@ fn reference_path(folder: &str, include: &str) -> Option<String> {
             || (!include.starts_with('/')).then_some(include),
             |path| Some(path.trim_start_matches('/')),
         )?;
-    if include.contains(['$', '%', '@', '*', '?', ':', ';']) || !include.ends_with(".csproj") {
+    include
+        .ends_with(".csproj")
+        .then(|| normalize_inside(folder, include))
+        .flatten()
+}
+
+pub(super) fn normalize_inside(folder: &str, include: &str) -> Option<String> {
+    let include = include.trim();
+    if include.is_empty()
+        || include.starts_with('/')
+        || include.contains(['$', '%', '@', '*', '?', ':', ';', '\r', '\n'])
+    {
         return None;
     }
     let mut parts = folder
@@ -224,7 +291,7 @@ fn reference_path(folder: &str, include: &str) -> Option<String> {
             part => parts.push(part),
         }
     }
-    Some(parts.join("/"))
+    (!parts.is_empty()).then(|| parts.join("/"))
 }
 
 #[cfg(test)]

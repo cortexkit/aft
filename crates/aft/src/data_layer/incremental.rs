@@ -874,17 +874,21 @@ impl LiveCheckout {
             .collect::<Vec<_>>();
         let project_keys = changed
             .iter()
-            .filter_map(|path| {
+            .filter(|path| {
                 let path = path.as_bytes();
-                if old.state.get(path).map(|record| record.kind)
-                    == inputs.state.get(path).map(|record| record.kind)
-                    && old.configs.get(path) == inputs.configs.get(path)
-                {
-                    return None;
-                }
+                old.state.get(path).map(|record| record.kind)
+                    != inputs.state.get(path).map(|record| record.kind)
+                    || old.configs.get(path) != inputs.configs.get(path)
+            })
+            .flat_map(|path| {
                 use crate::callgraph_store::join::dispatch::CSharpProjects;
-                CSharpProjects::manifest_folder(path)
-                    .map(|folder| CSharpProjects::dependency(&folder))
+                [
+                    Some(CSharpProjects::import_dependency(path)),
+                    CSharpProjects::membership_folder(path.as_bytes())
+                        .map(|folder| CSharpProjects::dependency(&folder)),
+                ]
+                .into_iter()
+                .flatten()
             })
             .collect::<BTreeSet<_>>();
         if budget.is_some() {

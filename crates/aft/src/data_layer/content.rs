@@ -58,7 +58,7 @@ use crate::parser::LangId;
 /// contained type of proven standard-library smart-pointer fields (for example,
 /// `Runner` in `Arc<Runner>`), so calls can resolve to that type's methods;
 /// 15 stores each distinct method-call answer once per fragment.
-pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-19";
+pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+record-23";
 
 /// The language of a resolver configuration file the call graph reads raw,
 /// or the start of it. A configuration record also holds the TODO markers
@@ -68,7 +68,7 @@ pub const EXTRACTOR_VERSION: &str = "ruled-callgraph-v14-resolver-precision+reco
 /// content, language and extractor version, and two files with the same
 /// bytes whose comments are read in different grammars must not share one.
 pub const CONFIG: &str = "config";
-const CSHARP_PROJECT_CONFIG: &str = "config-csproj";
+pub(super) const CSHARP_PROJECT_CONFIG: &str = "config-csproj";
 
 /// Whether `language` (as [`language_for`] chose it) is a configuration
 /// file's (see [`CONFIG`]).
@@ -157,9 +157,9 @@ pub fn scan_policy() -> aft_store::scan::ScanPolicy {
     aft_store::scan::ScanPolicy {
         read_large: Some(parsed_or_embedded_path),
         read_limit: Some(|path| {
-            path.ends_with(b".csproj").then_some(
-                crate::callgraph_store::join::dispatch::CSharpProjects::PROJECT_READ_LIMIT,
-            )
+            use crate::callgraph_store::join::dispatch::CSharpProjects;
+            CSharpProjects::is_membership_config_path(path)
+                .then_some(CSharpProjects::PROJECT_READ_LIMIT)
         }),
         ..aft_store::scan::ScanPolicy::default()
     }
@@ -195,7 +195,8 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     {
         return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name()));
     }
-    if path.ends_with(".csproj") {
+    use crate::callgraph_store::join::dispatch::CSharpProjects;
+    if CSharpProjects::is_membership_config_path(path.as_bytes()) {
         return Some(CSHARP_PROJECT_CONFIG.to_string());
     }
     if crate::callgraph_extractor::is_resolution_input(path.as_bytes()) {
@@ -218,6 +219,9 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
     } else {
         match source_language(path) {
             Some(language) => language,
+            None if CSharpProjects::has_project_root(source) => {
+                return Some(CSHARP_PROJECT_CONFIG.to_string())
+            }
             None => return markers_language(path),
         }
     };

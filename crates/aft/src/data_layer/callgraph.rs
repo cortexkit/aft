@@ -77,6 +77,7 @@ impl CheckoutInputs {
                     record.path.as_slice(),
                     self.configs
                         .get(&record.path)
+                        .filter(|_| record.language == super::content::CSHARP_PROJECT_CONFIG)
                         .map(|markers| markers.as_ref()),
                 )
             }),
