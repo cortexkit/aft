@@ -342,7 +342,7 @@ pub struct IgnoredScopeProbe {
     result: std::sync::mpsc::Receiver<Option<IgnoredScopeEntries>>,
     cancelled: Arc<std::sync::atomic::AtomicBool>,
     deadline: Instant,
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
     _pending: Option<std::sync::mpsc::SyncSender<Option<IgnoredScopeEntries>>>,
 }
 
@@ -450,7 +450,7 @@ impl IgnoreProbeWorker {
             result,
             cancelled,
             deadline,
-            #[cfg(any(test, feature = "test-hooks"))]
+            #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
             _pending: None,
         })
     }
