@@ -255,7 +255,7 @@ fn embedding_backend_build_health_registry(
 }
 
 pub fn unix_millis_now() -> u64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(now) = LANE_PAUSE_TEST_CLOCK.with(|clock| clock.borrow().clone()) {
         return now.load(std::sync::atomic::Ordering::SeqCst);
     }
@@ -267,7 +267,7 @@ pub fn unix_millis_now() -> u64 {
 }
 
 thread_local! {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     static LANE_PAUSE_TEST_CLOCK: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicU64>>> = const { std::cell::RefCell::new(None) };
     #[cfg(test)]
     static LANE_PAUSE_CHUNK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -498,7 +498,7 @@ fn retain_reuse_files(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_lane_pause_clock<T>(
     start_ms: u64,
     run: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicU64>) -> T,
@@ -738,7 +738,7 @@ fn check_remote_backend_for_root(
 }
 
 /// Start a controlled in-flight probe so command tests need no network route.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn start_remote_backend_probe_for_test(
     root: &Path,
     base_url: &str,
@@ -856,7 +856,7 @@ pub fn embedding_backend_build_health(project_root: &Path) -> Option<EmbeddingBa
     registry.get(project_root).cloned()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Path, reason: &str) {
     record_embedding_backend_build_failure(
         project_root,
@@ -867,7 +867,7 @@ pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Pat
 /// Hold a loopback port without listening so a backend connection fails while
 /// no parallel test can claim the address. Dropping a temporary listener would
 /// release the port before the asynchronous backend probe connects to it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
     let socket = tokio::net::TcpSocket::new_v4().expect("create backend socket");
     socket
@@ -1296,7 +1296,7 @@ thread_local! {
     };
     #[cfg(test)]
     static TEST_SKIPPED_ROW_WARNINGS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     static TEST_QUERY_BUDGET_MS: RefCell<Option<u64>> = const { RefCell::new(None) };
 }
 
@@ -1346,7 +1346,7 @@ pub struct QueryBudget {
 
 impl QueryBudget {
     pub fn from_config(config: &SemanticBackendConfig) -> Self {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(timeout_ms) = TEST_QUERY_BUDGET_MS.with(|slot| *slot.borrow()) {
             return Self { timeout_ms };
         }
@@ -1367,7 +1367,7 @@ impl QueryBudget {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_query_budget_for_test<R>(timeout_ms: u64, action: impl FnOnce() -> R) -> R {
     struct Reset(Option<u64>);
     impl Drop for Reset {
@@ -1515,7 +1515,7 @@ impl SemanticIndexFingerprint {
         serde_json::to_string(self).unwrap_or_else(|_| String::new())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
         Self::from_config(config, dimension)
     }
@@ -1676,9 +1676,8 @@ fn log_fingerprint_mismatch(cached: Option<&SemanticIndexFingerprint>, expected:
     }
 }
 
-pub(crate) trait LocalEmbeddingProvider: Send {
-    fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String>;
-}
+pub(crate) mod local_embedding_provider;
+use local_embedding_provider::LocalEmbeddingProvider;
 
 impl LocalEmbeddingProvider for LocalEmbedder {
     fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
@@ -3156,7 +3155,7 @@ impl SemanticEmbeddingModel {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn from_local_provider_for_test(
         provider: Box<dyn LocalEmbeddingProvider>,
         project_root: PathBuf,

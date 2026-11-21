@@ -371,7 +371,8 @@ fn aft_inspect_dead_code_matches_the_shared_fixtures() {
     for name in SCENARIOS {
         let expected = expected("aft_inspect.dead_code", name);
         let scenario = scenario(name, &[EXAMPLE_FUNCTION]);
-        let payload = crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(1);
+        let payload =
+            aft_engine::test_bridge::search_misc::inspect::callgraph_unavailable_aggregate(1);
         let mut summary = crate::commands::inspect::summary_for_test(
             crate::inspect_category::InspectCategory::DeadCode,
             &payload,

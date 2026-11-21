@@ -4,10 +4,13 @@ mod tests {
     use std::sync::Arc;
 
     use crate::config::Config;
-    use crate::inspect::scanners::todos::{
-        markers_lexical, outcomes_for_test, run_todos_scan, todos_job, uncached_aggregate_for_test,
-    };
+    use crate::inspect::scanners::todos::run_todos_scan;
     use crate::inspect::InspectJob;
+    use crate::parser::todo_markers::markers_lexical;
+    use aft_engine::test_bridge::search_misc::inspect::{
+        note_withheld_root, outcomes_for_test, todos_job, uncached_aggregate_for_test,
+        TODOS_NO_INDEX_STORE,
+    };
     use aft_store::content::TodoMarkers;
     use std::path::Path;
     use std::time::Instant;
@@ -84,7 +87,7 @@ mod tests {
         assert_eq!(cargo.language, "toml");
         assert_eq!(lines(&cargo), vec![(2, "TODO".into(), "publish".into())]);
 
-        let not_text = crate::inspect::scanners::todos::markers_lexical(b"// TODO: a\0b\n");
+        let not_text = crate::parser::todo_markers::markers_lexical(b"// TODO: a\0b\n");
         assert_eq!(not_text.items, None);
         let lexical = markers_lexical(b"x = \"// TODO: quoted\"\n# XXX: real\n");
         assert_eq!(lexical.language, "lexical");
@@ -241,10 +244,7 @@ mod tests {
         );
         assert!(aggregate.get("count").is_none(), "{aggregate:#}");
 
-        crate::inspect::data_sources::note_root(
-            &root,
-            crate::inspect::data_sources::RootKind::Withheld,
-        );
+        note_withheld_root(&root);
         let result = run_todos_scan(&todos_job(&root, vec![root.join("src/lib.rs")]));
         let aggregate = result.outcome.unwrap().aggregate;
         assert_eq!(aggregate["unavailable"], true, "{aggregate:#}");
@@ -252,10 +252,7 @@ mod tests {
             aggregate,
             uncached_aggregate_for_test(&todos_job(&root, vec![root.join("src/lib.rs")]))
         );
-        assert_eq!(
-            aggregate["gaps"][0]["reason"],
-            crate::inspect::data_sources::TODOS_NO_INDEX_STORE
-        );
+        assert_eq!(aggregate["gaps"][0]["reason"], TODOS_NO_INDEX_STORE);
     }
 
     /// Counting the TODOs of a bound, published checkout reads them from the

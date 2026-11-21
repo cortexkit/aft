@@ -1408,7 +1408,7 @@ fn scratch_read_allocator_path_uses_the_task_record() {
     struct Cleanup(PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
-            let _ = crate::sandbox_spawn::cleanup_task_temp_dir(&self.0);
+            let _ = aft_engine::test_bridge::bash_remote::cleanup_task_temp_dir(&self.0);
         }
     }
     let (_directory, ctx, _scratch, _scope) = scratch_read_context();
@@ -1416,8 +1416,9 @@ fn scratch_read_allocator_path_uses_the_task_record() {
         .bash_background()
         .task_for_test("bash-0123456789abcdef")
         .unwrap();
-    let allocated =
-        Cleanup(crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap());
+    let allocated = Cleanup(
+        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap(),
+    );
     let file = allocated.0.join("worker.diff");
     std::fs::write(&file, "own scratch diff\n").unwrap();
     task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(allocated.0.clone());
@@ -1445,7 +1446,8 @@ fn scratch_read_right_after_command_exit_reads_kept_scratch_without_ask() {
         .bash_background()
         .task_for_test("bash-0123456789abcdef")
         .unwrap();
-    let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+    let scratch =
+        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap();
     task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
     let written = std::process::Command::new("/bin/sh")
         .arg("-c")
@@ -1508,7 +1510,7 @@ fn scratch_read_right_after_command_exit_reads_kept_scratch_without_ask() {
         std::fs::read_to_string(&file).unwrap(),
         "fn kept_scratch() {}\n"
     );
-    let _ = crate::sandbox_spawn::cleanup_task_temp_dir(&scratch);
+    let _ = aft_engine::test_bridge::bash_remote::cleanup_task_temp_dir(&scratch);
 }
 
 /// The worker flow seen in production: one shell call writes into its own
@@ -1525,7 +1527,8 @@ fn scratch_read_after_command_exit_is_not_found_without_ask() {
         .bash_background()
         .task_for_test("bash-0123456789abcdef")
         .unwrap();
-    let scratch = crate::sandbox_spawn::create_task_temp_dir(&task.paths.io_dir).unwrap();
+    let scratch =
+        aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap();
     task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
     let written = std::process::Command::new("/bin/sh")
         .arg("-c")

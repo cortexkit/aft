@@ -132,7 +132,7 @@ pub fn run_todos_scan(job: &InspectJob) -> InspectResult {
         Ok(stored) => stored,
         Err(error) => return InspectResult::failed(job, error, started.elapsed()),
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_outcome_for_test(&job.project_root, &stored);
     if cancelled() {
         return InspectResult::failed(
@@ -290,8 +290,8 @@ fn display_file_path(project_root: &Path, path: &Path) -> String {
 
 /// The pre-memo aggregation path, kept independent of `TodoCounts` so parity
 /// checks cover both summary construction and reuse across checkout changes.
-#[cfg(test)]
-pub(crate) fn uncached_aggregate_for_test(job: &InspectJob) -> serde_json::Value {
+#[cfg(any(test, feature = "test-support"))]
+pub fn uncached_aggregate_for_test(job: &InspectJob) -> serde_json::Value {
     let stored = crate::inspect::data_sources::stored_todos_uncached_for_test(
         &job.project_root,
         &job.config,
@@ -317,7 +317,7 @@ pub(crate) fn uncached_aggregate_for_test(job: &InspectJob) -> serde_json::Value
 
 /// This test-only copy retains the full-record aggregation's scanned-files
 /// collection and single-pass kind tally for baseline timing comparisons.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn aggregate_uncached_for_test(job: &InspectJob, files: Vec<FileTodos>) -> InspectScanSuccess {
     let mut scanned_files = Vec::new();
     let mut skipped_files = Vec::new();
@@ -392,11 +392,11 @@ fn aggregate_uncached_for_test(job: &InspectJob, files: Vec<FileTodos>) -> Inspe
 
 /// What each count of a root found, in order, for tests that follow the
 /// counts a background refresh takes.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static OUTCOMES_FOR_TEST: std::sync::Mutex<Vec<(std::path::PathBuf, &'static str)>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_outcome_for_test(root: &Path, stored: &StoredTodos) {
     let outcome = match stored {
         StoredTodos::Files { .. } => "counted",
@@ -411,8 +411,8 @@ fn note_outcome_for_test(root: &Path, stored: &StoredTodos) {
 
 /// The outcomes of the counts of `root` so far: `counted`, `pending` or
 /// `unavailable`.
-#[cfg(test)]
-pub(crate) fn outcomes_for_test(root: &Path) -> Vec<&'static str> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn outcomes_for_test(root: &Path) -> Vec<&'static str> {
     OUTCOMES_FOR_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -422,10 +422,10 @@ pub(crate) fn outcomes_for_test(root: &Path) -> Vec<&'static str> {
         .collect()
 }
 
-#[cfg(test)]
-pub(crate) use self::test_support::todos_job;
+#[cfg(any(test, feature = "test-support"))]
+pub use self::test_support::todos_job;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 mod test_support {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, RwLock};
@@ -434,7 +434,7 @@ mod test_support {
     use crate::inspect::{InspectCategory, InspectJob, JobKey, JobScope};
     use crate::parser::SymbolCache;
 
-    pub(crate) fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
+    pub fn todos_job(root: &Path, scope_files: Vec<PathBuf>) -> InspectJob {
         let scope = JobScope::for_project(root.to_path_buf());
         InspectJob {
             job_id: 1,

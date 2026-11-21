@@ -52,12 +52,16 @@ thread_local! {
     /// wall-clock time cannot show on a loaded machine.
     static FALLBACK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static TARGET_WALK_BUILDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
     static IGNORE_PROBE_STATE: std::cell::Cell<Option<IgnoreProbeStateForTest>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy)]
-pub(crate) enum IgnoreProbeStateForTest {
+pub enum IgnoreProbeStateForTest {
     Ready,
     Pending,
     Busy,
@@ -65,8 +69,8 @@ pub(crate) enum IgnoreProbeStateForTest {
 
 /// Pin completion on the calling thread without changing process-wide state
 /// or racing the optional worker. Evidence still comes from the real folder.
-#[cfg(test)]
-pub(crate) fn with_ignore_probe_state_for_test<R>(
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_ignore_probe_state_for_test<R>(
     state: IgnoreProbeStateForTest,
     run: impl FnOnce() -> R,
 ) -> R {
@@ -469,7 +473,7 @@ pub fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe>
     if Instant::now() >= deadline {
         return None;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(state) = IGNORE_PROBE_STATE.with(std::cell::Cell::get) {
         return match state {
             IgnoreProbeStateForTest::Ready => Some(IgnoredScopeProbe::ready(
@@ -2671,8 +2675,8 @@ pub(crate) fn fallback_grep_counted(
 /// [`fallback_grep`] with explicit walk limits: at most `max_files` eligible
 /// files, and `budget` of wall-clock time for walking and searching them.
 #[allow(clippy::too_many_arguments)]
-#[cfg(test)]
-pub(crate) fn fallback_grep_with_limits(
+#[cfg(any(test, feature = "test-support"))]
+pub fn fallback_grep_with_limits(
     project_root: &Path,
     search_root: &Path,
     filter_root: &Path,
@@ -3539,8 +3543,10 @@ fn line_details_with_next(
     (line_index as u32 + 1, column, line_text, next_line_start)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod grep_test_fixture;
 #[cfg(test)]
-pub(crate) use tests::literal;
+use grep_test_fixture::literal;
 
 #[cfg(test)]
 mod tests {
@@ -3898,19 +3904,6 @@ mod tests {
 
     /// 256 files of 100,000 matching lines each: 25.6 million matching lines,
     /// of which the default store cap of 100,100 keeps the first by path.
-    pub(crate) fn literal(pattern: &str) -> CompiledPattern {
-        match crate::pattern_compile::compile(
-            pattern,
-            crate::pattern_compile::CompileOpts {
-                literal: true,
-                ..crate::pattern_compile::CompileOpts::default()
-            },
-        ) {
-            crate::pattern_compile::CompileResult::Ok(pattern) => pattern,
-            other => panic!("compile literal: {other:?}"),
-        }
-    }
-
     fn dense_lines_project() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();

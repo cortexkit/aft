@@ -11,7 +11,7 @@ mod preflight;
 mod schema;
 mod transport;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use transport::build_display_metadata;
 
 pub use binding::{

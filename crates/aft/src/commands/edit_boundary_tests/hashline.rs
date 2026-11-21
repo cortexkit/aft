@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod diff_budget_tests {
-    use crate::hashline::integration::{build_display_metadata, DisplayFileBytes};
+    use crate::hashline::integration::DisplayFileBytes;
+    use aft_engine::test_bridge::search_misc::build_display_metadata;
     use serde_json::json;
 
     #[test]

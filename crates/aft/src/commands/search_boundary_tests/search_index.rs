@@ -1,5 +1,5 @@
 mod tests {
-    use crate::search_index::bounded_grep_line_text_bytes;
+    use aft_engine::test_bridge::search_misc::bounded_grep_line_text_bytes;
 
     #[test]
     fn semantic_namespaces_share_type_identity() {

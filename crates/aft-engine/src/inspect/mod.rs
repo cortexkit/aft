@@ -14,7 +14,7 @@ pub(crate) mod scoped_diagnostics_sweep;
 #[doc(hidden)]
 pub use generated::relative_shape_is_generated;
 pub mod job;
-mod manager;
+pub(crate) mod manager;
 pub mod oxc_engine;
 pub mod phase_log;
 pub mod scanners;

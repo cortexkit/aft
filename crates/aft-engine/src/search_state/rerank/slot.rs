@@ -112,7 +112,7 @@ impl BackendSlot {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_constructor_for_test(&self, constructor: Constructor, backoff: Duration) {
         *lock(&self.constructor) = constructor;
         *lock(&self.backoff) = backoff;

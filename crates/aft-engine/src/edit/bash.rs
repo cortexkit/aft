@@ -13,13 +13,13 @@ use std::time::{Duration, Instant};
 use crate::format::{FormatError, SubprocessOutcome};
 use crate::parser::{detect_language, LangId};
 
-pub(crate) const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+pub const CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `bash -n` exit status for a syntax error.
-pub(crate) const SYNTAX_ERROR_STATUS: i32 = 2;
+pub const SYNTAX_ERROR_STATUS: i32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum CheckOutcome {
+pub enum CheckOutcome {
     Exited { code: Option<i32>, stderr: String },
     Missing,
     TimedOut,
@@ -105,7 +105,7 @@ fn verdict(
 }
 
 /// The first line number in a `bash: line N: ...` message.
-pub(crate) fn reported_line(stderr: &str) -> Option<usize> {
+pub fn reported_line(stderr: &str) -> Option<usize> {
     stderr.match_indices("line ").find_map(|(start, marker)| {
         let rest = &stderr[start + marker.len()..];
         let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
@@ -117,7 +117,7 @@ pub(crate) fn reported_line(stderr: &str) -> Option<usize> {
 }
 
 fn check(tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher, source: &str) -> CheckOutcome {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(outcome) =
         RUNNER.with(|runner| runner.borrow_mut().as_mut().map(|runner| runner(source)))
     {
@@ -133,7 +133,7 @@ fn check(tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher, source: &st
 /// An absolute path to bash on `PATH`. Never on Windows: the `bash.exe` found
 /// there is usually the WSL launcher, which starts a Linux environment
 /// rather than checking anything locally.
-pub(crate) fn find_bash() -> Result<Option<PathBuf>, String> {
+pub fn find_bash() -> Result<Option<PathBuf>, String> {
     if cfg!(windows) {
         return Ok(None);
     }
@@ -148,7 +148,7 @@ pub(crate) fn find_bash() -> Result<Option<PathBuf>, String> {
 /// Run `bash -n` over `source` on stdin. The file path is never passed, and
 /// inherited startup hooks are cleared before the request's policy environment
 /// is installed; `--norc --noprofile` rules out user startup files too.
-pub(crate) fn run_bash(
+pub fn run_bash(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     bash: &Path,
     source: &str,
@@ -187,16 +187,16 @@ fn check_outcome(result: Result<SubprocessOutcome, FormatError>) -> CheckOutcome
     }
 }
 
-#[cfg(test)]
-pub(crate) type Runner = Box<dyn FnMut(&str) -> CheckOutcome>;
+#[cfg(any(test, feature = "test-support"))]
+pub type Runner = Box<dyn FnMut(&str) -> CheckOutcome>;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static RUNNER: std::cell::RefCell<Option<Runner>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
-pub(crate) fn with_runner<T>(runner: Runner, f: impl FnOnce() -> T) -> T {
+#[cfg(any(test, feature = "test-support"))]
+pub fn with_runner<T>(runner: Runner, f: impl FnOnce() -> T) -> T {
     struct Restore(Option<Runner>);
     impl Drop for Restore {
         fn drop(&mut self) {
