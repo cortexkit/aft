@@ -17156,14 +17156,19 @@ mod tests {
 
     #[test]
     fn idle_lsp_sweep_reaps_one_package_while_bound_root_is_busy() {
-        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
-        let root = ProjectRootId::from_path(fixture.config.project_root.as_ref().unwrap()).unwrap();
-        fixture.ctx.mark_subc_bound();
+        use aft_engine::test_bridge::search_misc::{
+            lsp::manager::regression_tests::IdleLspFixture, IdleLspFixtureTestExt as _,
+        };
+        let fixture =
+            IdleLspFixture::with_server_binary(crate::fake_lsp_test_helper::fake_server_binary);
+        let root =
+            ProjectRootId::from_path(fixture.config().project_root.as_ref().unwrap()).unwrap();
+        fixture.ctx().mark_subc_bound();
         let executor = Executor::new();
-        assert!(executor.register_actor(root.clone(), Arc::clone(&fixture.ctx)));
+        assert!(executor.register_actor(root.clone(), Arc::clone(fixture.ctx())));
         let mut roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         for _ in 0..3 {
-            fixture.hover(&fixture.busy);
+            fixture.hover(fixture.busy());
             let now = Instant::now();
             roots.get_mut(&root).unwrap().last_touched = now;
             reap_idle_lsp_servers(now, &roots, &executor);

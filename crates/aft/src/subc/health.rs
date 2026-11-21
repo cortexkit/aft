@@ -4625,14 +4625,12 @@ fn build_health_diagnostic_rollup_from_actors(
     // Shared bases and semantic arenas are measured once for the compact
     // rollup; a rollup that also measures the census reuses that measurement.
     let shared_memory = crate::memory_census::shared_process_memory();
-    let memory = memory_rollup_metrics(Some(
-        aft_engine::test_bridge::search_misc::memory_census::rollup_snapshot_with_shared(
-            "ready",
-            memory_roots,
-            allocator.clone(),
-            &shared_memory,
-        ),
-    ));
+    let memory = memory_rollup_metrics(Some(crate::memory_census::rollup_snapshot_with_shared(
+        "ready",
+        memory_roots,
+        allocator.clone(),
+        &shared_memory,
+    )));
     let census_snapshot = measure_census.then(|| {
         crate::memory_census::snapshot_uncapped_with_shared(
             "ready",
@@ -9772,7 +9770,7 @@ mod tests {
                         (format!("/parity/root-{index:03}"), row)
                     })
                     .collect();
-                aft_engine::test_bridge::search_misc::memory_census::rollup_snapshot_with_shared(
+                crate::memory_census::rollup_snapshot_with_shared(
                     "ready",
                     roots,
                     allocator.clone(),

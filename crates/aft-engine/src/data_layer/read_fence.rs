@@ -20,7 +20,7 @@ thread_local! {
             floor_filter_root: None,
         })
     };
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "test-support")))]
     static ASK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -247,12 +247,12 @@ pub(crate) fn with_gate<R>(gate: ReadGate, run: impl FnOnce() -> R) -> R {
     run()
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 pub(crate) fn note_ask() {
     ASK_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 pub(crate) fn ask_calls() -> usize {
     ASK_CALLS.with(|calls| calls.get())
 }

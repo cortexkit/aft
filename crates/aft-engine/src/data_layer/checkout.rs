@@ -1615,7 +1615,7 @@ impl Checkout {
             }
             report.text_ready_ms = Some(elapsed_ms(build_started));
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         while call_graph_holds_for_test()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6236,7 +6236,7 @@ impl Checkout {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn call_graph_holds_for_test() -> &'static std::sync::Mutex<std::collections::HashSet<PathBuf>> {
     static HOLDS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<PathBuf>>> =
         std::sync::OnceLock::new();
@@ -6247,7 +6247,7 @@ fn call_graph_holds_for_test() -> &'static std::sync::Mutex<std::collections::Ha
 /// publishes and before its call graph is built, until the returned guard
 /// drops, so a test can look at a checkout whose text serves while its call
 /// graph is building.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
     call_graph_holds_for_test()
         .lock()
@@ -6257,7 +6257,7 @@ pub(crate) fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
 }
 
 /// See [`hold_call_graph_for_test`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) struct CallGraphHold(PathBuf);
 
 /// Roots whose builds wait before they publish, each with whether a build

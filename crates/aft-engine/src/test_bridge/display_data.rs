@@ -106,6 +106,22 @@ pub mod late_result_bus {
         crate::late_result_bus::readers::card_wake(body, msg_id).await
     }
 
+    pub mod readers {
+        pub struct TestAttachment(crate::late_result_bus::readers::TestAttachment);
+
+        impl TestAttachment {
+            pub fn new(id: &str, attached: bool) -> Self {
+                Self(crate::late_result_bus::readers::TestAttachment::new(
+                    id, attached,
+                ))
+            }
+
+            pub fn state(&self) -> &tokio::sync::watch::Sender<bool> {
+                &self.0.state
+            }
+        }
+    }
+
     pub mod status {
         pub fn test_value(session: &str) -> Option<serde_json::Value> {
             crate::late_result_bus::status::test_value(session)
@@ -163,6 +179,17 @@ pub mod context {
 
     pub mod callgraph_test_support {
         pub use crate::context::callgraph_test_support::cold_build_fixture;
+    }
+
+    pub mod policy_load_probe {
+        pub use crate::context::policy_load_probe::Probe;
+    }
+
+    #[cfg(unix)]
+    pub mod confinement {
+        pub fn ask_calls() -> usize {
+            crate::data_layer::read_fence::ask_calls()
+        }
     }
 
     pub mod database_test_support {
@@ -403,8 +430,26 @@ pub mod data_layer {
     }
 
     pub mod runtime {
-        pub fn hold_builds_for_test(root: &std::path::Path) -> impl Drop {
-            crate::data_layer::runtime::hold_builds_for_test(root)
+        pub struct BuildHold {
+            _hold: crate::data_layer::runtime::BuildHold,
+        }
+
+        pub fn hold_builds_for_test(root: &std::path::Path) -> BuildHold {
+            BuildHold {
+                _hold: crate::data_layer::runtime::hold_builds_for_test(root),
+            }
+        }
+    }
+
+    pub mod checkout {
+        pub struct CallGraphHold {
+            _hold: crate::data_layer::checkout::CallGraphHold,
+        }
+
+        pub fn hold_call_graph_for_test(root: &std::path::Path) -> CallGraphHold {
+            CallGraphHold {
+                _hold: crate::data_layer::checkout::hold_call_graph_for_test(root),
+            }
         }
     }
 

@@ -9,7 +9,7 @@ impl Drop for BuildReservation {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for CallGraphHold {
     fn drop(&mut self) {
         call_graph_holds_for_test()
