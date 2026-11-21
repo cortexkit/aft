@@ -196,3 +196,15 @@ pub(super) fn unavailable(reason: &'static str) {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct RecordingWriter(pub(crate) Vec<(String, Vec<u8>)>);
+
+#[cfg(test)]
+impl Writer for RecordingWriter {
+    async fn put(&mut self, key: &str, value: Vec<u8>) -> Result<(), &'static str> {
+        self.0.push((key.into(), value));
+        Ok(())
+    }
+}

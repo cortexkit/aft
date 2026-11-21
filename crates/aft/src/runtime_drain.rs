@@ -2235,7 +2235,7 @@ mod request_lsp_contention_tests {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn issue645_rescan_yields_before_followup() {
         let temp = tempfile::tempdir().unwrap();
@@ -2421,7 +2421,14 @@ mod tests {
     fn watcher_context(
         root: &Path,
     ) -> (AppContext, crossbeam_channel::Sender<WatcherDispatchEvent>) {
-        let ctx = AppContext::new(default_language_provider_factory(), Config::default());
+        watcher_context_with(root, AppContext::new)
+    }
+
+    pub(crate) fn watcher_context_with(
+        root: &Path,
+        make_context: impl FnOnce(Box<dyn crate::language::LanguageProvider>, Config) -> AppContext,
+    ) -> (AppContext, crossbeam_channel::Sender<WatcherDispatchEvent>) {
+        let ctx = make_context(default_language_provider_factory(), Config::default());
         ctx.update_config(|config| {
             config.project_root = Some(root.to_path_buf());
         });

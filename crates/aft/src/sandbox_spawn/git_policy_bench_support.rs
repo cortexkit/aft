@@ -45,3 +45,27 @@ pub(super) fn legacy_git_path_values(
         })
         .collect()
 }
+
+pub(crate) fn ignore_cached_answers(ignore: bool) {
+    super::GIT_POLICY_IGNORE_ANSWERS.with(|value| value.set(ignore));
+}
+
+pub(crate) fn use_unbatched(unbatched: bool) {
+    BENCH_UNBATCHED.with(|value| value.set(unbatched));
+}
+
+pub(crate) fn evict(root: &Path) {
+    let key = super::git_policy_cache_key(root, &super::git_policy_environment(root), true).unwrap();
+    super::git_policy_cache().lock().unwrap().remove(&key);
+}
+
+pub(crate) fn counts(root: &Path) -> [usize; 4] {
+    super::with_git_policy_test_state(root, |state| {
+        [state.hits, state.misses, state.uncached, state.calls]
+    })
+    .unwrap()
+}
+
+pub(crate) fn git_output(root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    git_policy_output(root, args)
+}

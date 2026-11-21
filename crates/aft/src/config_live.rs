@@ -181,7 +181,21 @@ impl ConfigLiveState {
     }
 
     #[cfg(test)]
-    fn wait_for_watch_attachment(&self) {
+    pub(crate) fn project_fallback_file_for_test(&self) -> Option<PathBuf> {
+        self.watches
+            .lock()
+            .project_fallback
+            .as_ref()
+            .map(|watch| watch.file().to_path_buf())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn project_watcher_sees_config_for_test(&self) -> bool {
+        self.project_watcher_sees_config.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_for_watch_attachment(&self) {
         let deadline = Instant::now() + Duration::from_secs(10);
         let watches = self.watches.lock();
         for watch in [watches.user.as_ref(), watches.project_fallback.as_ref()]
@@ -1099,7 +1113,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn with_config_watch_attach_gate<T>(
+pub(crate) fn with_config_watch_attach_gate<T>(
     gate: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
     run: impl FnOnce() -> T,
 ) -> T {
@@ -1656,5 +1670,10 @@ pub fn request_reload_for_roots(roots: &[Arc<AppContext>]) {
 }
 
 #[cfg(test)]
+pub(crate) fn staged_sources_empty_for_test() -> bool {
+    STAGED_SOURCES.with(|slot| slot.borrow().is_none())
+}
+
+#[cfg(test)]
 #[path = "config_live_tests.rs"]
-mod tests;
+pub(crate) mod tests;

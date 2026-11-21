@@ -9600,7 +9600,7 @@ pub(crate) mod regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]
-mod startup_regression_tests;
+pub(crate) mod startup_regression_tests;
 
 #[cfg(all(test, unix))]
 #[path = "instance_regression_tests.rs"]

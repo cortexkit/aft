@@ -1,15 +1,19 @@
 use super::*;
 use crate::config::UserServerDef;
+
+pub(crate) fn attempt_reason_for_test(result: &ServerAttemptResult) -> String {
+    server_attempt_result_reason(result)
+}
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-const WAIT: Duration = Duration::from_secs(30);
+pub(crate) const WAIT: Duration = Duration::from_secs(30);
 
 thread_local! {
     static MANAGER_LOCK_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn locked<R>(f: &Fixture, operation: impl FnOnce(&mut LspManager) -> R) -> R {
+pub(crate) fn locked<R>(f: &Fixture, operation: impl FnOnce(&mut LspManager) -> R) -> R {
     let mut manager = f.manager.lock();
     MANAGER_LOCK_HELD.set(true);
     let result = operation(&mut manager);
@@ -17,16 +21,23 @@ fn locked<R>(f: &Fixture, operation: impl FnOnce(&mut LspManager) -> R) -> R {
     result
 }
 
-struct Fixture {
+pub(crate) struct Fixture {
     _root: tempfile::TempDir,
-    config: Config,
-    file: PathBuf,
-    manager: Arc<parking_lot::Mutex<LspManager>>,
-    snapshot: ApplicableServerSnapshot,
-    key: ServerKey,
+    pub(crate) config: Config,
+    pub(crate) file: PathBuf,
+    pub(crate) manager: Arc<parking_lot::Mutex<LspManager>>,
+    pub(crate) snapshot: ApplicableServerSnapshot,
+    pub(crate) key: ServerKey,
 }
 
-fn fixture() -> Fixture {
+impl Fixture {
+    pub(crate) fn assert_no_cached_failure(&self) {
+        assert!(!self.manager.lock().failed_spawns.contains_key(&self.key));
+        assert!(!self.manager.lock().transient_backoff.contains_key(&self.key));
+    }
+}
+
+pub(crate) fn fixture() -> Fixture {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("marker"), "marker").unwrap();
     let file = root.path().join("source.reserved");
@@ -86,14 +97,14 @@ fn fixture() -> Fixture {
     }
 }
 
-struct Pause {
-    entered: Receiver<()>,
-    resume: Sender<()>,
-    spawns: Arc<AtomicUsize>,
+pub(crate) struct Pause {
+    pub(crate) entered: Receiver<()>,
+    pub(crate) resume: Sender<()>,
+    pub(crate) spawns: Arc<AtomicUsize>,
     under_lock: Arc<AtomicBool>,
 }
 
-fn pause_first_spawn(f: &Fixture) -> Pause {
+pub(crate) fn pause_first_spawn(f: &Fixture) -> Pause {
     let (entered_tx, entered) = unbounded();
     let (resume, resume_rx) = unbounded();
     let spawns = Arc::new(AtomicUsize::new(0));
@@ -218,13 +229,12 @@ fn waiter_sees_pending_then_the_real_result() {
     });
     assert_eq!(area.in_progress, vec![f.key.clone()]);
     assert!(area.successful.is_empty());
-    assert!(!f.manager.lock().failed_spawns.contains_key(&f.key));
-    assert!(!f.manager.lock().transient_backoff.contains_key(&f.key));
+    f.assert_no_cached_failure();
     pause.resume.send(()).unwrap();
     let ready = ensure_server_for_file_detailed_unlocked(|| f.manager.lock(), &f.file, &f.config);
     assert_eq!(ready.successful, vec![f.key.clone()]);
     assert_eq!(
-        server_attempt_result_reason(&ready.attempts[0].result),
+        attempt_reason_for_test(&ready.attempts[0].result),
         "ok"
     );
     assert_eq!(

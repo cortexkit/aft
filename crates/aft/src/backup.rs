@@ -7117,6 +7117,19 @@ fn backup_sequence(backup_id: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    impl BackupStore {
+        pub(crate) fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf> {
+            Some(
+                self.session_dir(session)?
+                    .join(Self::path_hash(&canonicalize_key(path)))
+                    .join("meta.json"),
+            )
+        }
+
+        pub(crate) fn history_content_reads_for_test(&self) -> u64 {
+            self.history_content_reads.load(Ordering::Relaxed)
+        }
+    }
 
     #[cfg(windows)]
     #[test]
@@ -9429,10 +9442,8 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let meta_path = store
-                .session_dir(DEFAULT_SESSION_ID)
-                .unwrap()
-                .join(BackupStore::path_hash(&canonicalize_key(&path)))
-                .join("meta.json");
+                .history_meta_path_for_test(DEFAULT_SESSION_ID, &path)
+                .unwrap();
             let mut meta: serde_json::Value =
                 serde_json::from_slice(&fs::read(&meta_path).unwrap()).unwrap();
             for entry in meta["entries"].as_array_mut().unwrap() {
@@ -9458,8 +9469,7 @@ mod tests {
             restarted
                 .backup()
                 .lock()
-                .history_content_reads
-                .load(Ordering::Relaxed),
+                .history_content_reads_for_test(),
             0
         );
     }

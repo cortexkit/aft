@@ -8263,20 +8263,20 @@ mod tests {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod git_policy_bench_support;
+pub(crate) mod git_policy_bench_support;
 
 #[cfg(all(test, unix))]
-mod git_policy_cache_tests {
+pub(crate) mod git_policy_cache_tests {
     use super::*;
 
-    struct Fixture {
+    pub(crate) struct Fixture {
         _dir: tempfile::TempDir,
-        root: PathBuf,
+        pub(crate) root: PathBuf,
         roots: Mutex<HashSet<PathBuf>>,
     }
 
     impl Fixture {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
             let environment = vec![
@@ -8320,7 +8320,7 @@ mod git_policy_cache_tests {
             fixture
         }
 
-        fn hooks(&self, path: &str) {
+        pub(crate) fn hooks(&self, path: &str) {
             std::fs::create_dir_all(self.root.join(path)).unwrap();
             std::fs::write(
                 self.root.join(".git/config"),
@@ -8349,7 +8349,7 @@ mod git_policy_cache_tests {
             with_git_policy_test_state(&self.root, run).unwrap()
         }
 
-        fn register_root(&self, root: &Path) {
+        pub(crate) fn register_root(&self, root: &Path) {
             let root = root.canonicalize().unwrap();
             let environment = self.state(|state| state.environment.clone());
             git_policy_test_states()
@@ -8495,7 +8495,7 @@ mod git_policy_cache_tests {
         }
     }
 
-    fn commit(root: &Path) {
+    pub(crate) fn commit(root: &Path) {
         let commit = git_policy_output(
             root,
             &[
@@ -8514,7 +8514,7 @@ mod git_policy_cache_tests {
         assert!(commit.status.success(), "{commit:?}");
     }
 
-    fn git_ok(root: &Path, args: &[&str]) {
+    pub(crate) fn git_ok(root: &Path, args: &[&str]) {
         let output = git_policy_output(root, args).unwrap();
         assert!(output.status.success(), "git {args:?}: {output:?}");
     }
@@ -9016,8 +9016,8 @@ mod git_policy_cache_tests {
         // Two warm-up spawns fill the cache in both modes before sampling.
         for index in 0..spawns * 2 + 2 {
             let ignore_answers = index % 2 == 0;
-            GIT_POLICY_IGNORE_ANSWERS.with(|value| value.set(ignore_answers));
-            let before = with_git_policy_test_state(&root, |state| state.calls).unwrap();
+            git_policy_bench_support::ignore_cached_answers(ignore_answers);
+            let before = git_policy_bench_support::counts(&root)[3];
             let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
                 "id": "spawn-latency", "command": "bash", "session_id": "spawn-latency",
                 "params": {"command": "true", "compressed": false}
@@ -9029,7 +9029,7 @@ mod git_policy_cache_tests {
             // is needed.
             let response = with_worker_jail(true, || crate::commands::bash::handle(&request, &ctx));
             let elapsed = began.elapsed().as_secs_f64() * 1000.0;
-            let calls = with_git_policy_test_state(&root, |state| state.calls).unwrap() - before;
+            let calls = git_policy_bench_support::counts(&root)[3] - before;
             assert!(response.success, "{response:?}");
             let id = response.data["task_id"].as_str().unwrap().to_string();
             while !ctx.bash_background().is_task_terminal(&id) {
@@ -9043,7 +9043,7 @@ mod git_policy_cache_tests {
                 samples[usize::from(!ignore_answers)].push((elapsed, calls));
             }
         }
-        GIT_POLICY_IGNORE_ANSWERS.with(|value| value.set(false));
+        git_policy_bench_support::ignore_cached_answers(false);
         for (label, samples) in [("base", &samples[0]), ("answers", &samples[1])] {
             let mut times = samples.iter().map(|(ms, _)| *ms).collect::<Vec<_>>();
             times.sort_by(f64::total_cmp);
@@ -9079,7 +9079,7 @@ mod git_policy_cache_tests {
         // Landlock rules only add access, so a hooks folder inside a worktree
         // the command may write cannot be made read-only. Keep hooks outside.
         fixture.hooks(hooks.path().to_str().unwrap());
-        let commit = git_policy_output(
+        let commit = git_policy_bench_support::git_output(
             &fixture.root,
             &[
                 "-c",
@@ -9099,7 +9099,7 @@ mod git_policy_cache_tests {
         let mut roots = vec![(fixture.root.clone(), 10)];
         for index in 0..4 {
             let root = linked.path().join(format!("worker-{index}"));
-            let output = git_policy_output(
+            let output = git_policy_bench_support::git_output(
                 &fixture.root,
                 &[
                     "worktree",
@@ -9115,11 +9115,10 @@ mod git_policy_cache_tests {
             roots.push((root, 2));
         }
         for (label, unbatched) in [("before", true), ("after", false)] {
-            git_policy_bench_support::BENCH_UNBATCHED.with(|value| value.set(unbatched));
+            git_policy_bench_support::use_unbatched(unbatched);
             for (root_index, (root, starts)) in roots.iter().enumerate() {
                 fixture.register_root(root);
-                let key = git_policy_cache_key(root, &git_policy_environment(root), true).unwrap();
-                git_policy_cache().lock().unwrap().remove(&key);
+                git_policy_bench_support::evict(root);
                 let mut config = crate::config::Config::default();
                 config.project_root = Some(root.clone());
                 config.storage_dir =
@@ -9133,10 +9132,7 @@ mod git_policy_cache_tests {
                     AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
                 let _launcher = install_sandbox_launcher_for_test(root, launcher.clone());
                 for start in 0..*starts {
-                    let before = with_git_policy_test_state(root, |state| {
-                        [state.hits, state.misses, state.uncached, state.calls]
-                    })
-                    .unwrap();
+                    let before = git_policy_bench_support::counts(root);
                     let request: crate::protocol::RawRequest =
                         serde_json::from_value(serde_json::json!({
                             "id": "policy-cost", "command": "bash", "session_id": "policy-cost",
@@ -9166,10 +9162,7 @@ mod git_policy_cache_tests {
                             .exit_code,
                         Some(0)
                     );
-                    let after = with_git_policy_test_state(root, |state| {
-                        [state.hits, state.misses, state.uncached, state.calls]
-                    })
-                    .unwrap();
+                    let after = git_policy_bench_support::counts(root);
                     let delta =
                         std::array::from_fn::<_, 4, _>(|index| after[index] - before[index]);
                     assert_eq!(delta[1], usize::from(start == 0));
@@ -9178,7 +9171,7 @@ mod git_policy_cache_tests {
                 }
             }
         }
-        git_policy_bench_support::BENCH_UNBATCHED.with(|value| value.set(false));
+        git_policy_bench_support::use_unbatched(false);
     }
 
     #[test]
