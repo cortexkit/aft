@@ -83,7 +83,7 @@ pub fn prepare(_: &AppContext, _: &Path, _: PathBuf, _: String) -> Result<Start,
 pub struct Start;
 #[cfg(not(target_os = "linux"))]
 impl Start {
-    pub(crate) fn start(self, _: Duration) -> Result<Running, String> {
+    pub fn start(self, _: Duration) -> Result<Running, String> {
         Err("no remote shell sandbox backend".into())
     }
 }
@@ -92,7 +92,7 @@ impl Start {
 pub struct Running;
 #[cfg(not(target_os = "linux"))]
 impl Running {
-    pub(crate) async fn wait(self, _: CancellationToken) -> Result<Output, String> {
+    pub async fn wait(self, _: CancellationToken) -> Result<Output, String> {
         Err("no remote shell sandbox backend".into())
     }
 }
