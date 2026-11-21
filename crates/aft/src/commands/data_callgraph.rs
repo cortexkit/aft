@@ -277,4 +277,7 @@ mod tests {
         let refused = callers(&ctx, &readme, "callee");
         assert_eq!(refused.data["code"], "not_indexed", "{:?}", refused.data);
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 }

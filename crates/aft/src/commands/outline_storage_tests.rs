@@ -723,4 +723,9 @@ pub fn separator() -> char {
             assert_eq!(after, before);
         }
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::CheckoutViewTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
 }

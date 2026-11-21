@@ -1333,3 +1333,8 @@ pub(super) fn catalog(
 #[cfg(test)]
 #[path = "access_grants_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::LaunchGrantStateTestExt as _;

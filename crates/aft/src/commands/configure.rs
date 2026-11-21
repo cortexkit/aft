@@ -9503,7 +9503,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(timings.git_spawns, 1, "every fresh bind still verifies Git");
-            (key, timings.root_walks)
+            (key, timings.root_walks())
         };
         let (key, walks) = bind(&main);
         assert_eq!(walks, 1);
@@ -9977,8 +9977,28 @@ mod tests {
             median(&mut optimized_warm_post_ack).as_micros(),
         );
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::IndexHost as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::RetrySlotTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::ArtifactCacheKeyTimingsTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
 }
 
 #[cfg(test)]
 #[path = "configure_live_reload_tests.rs"]
 mod live_reload_tests;
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

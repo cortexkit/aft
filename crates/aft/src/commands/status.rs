@@ -134,7 +134,8 @@ mod tests {
                 },
                 ..Default::default()
             });
-        let census_builds = &ctx.status_emitter().memory_census_builds;
+        use aft_engine::test_bridge::display_data::StatusEmitterTestExt as _;
+        let census_builds = ctx.status_emitter().memory_census_builds();
         let push = ctx.try_build_status_push_snapshot().unwrap();
         assert_eq!(
             census_builds.load(Ordering::Relaxed),
@@ -511,4 +512,9 @@ mod tests {
         assert!(values["warnings"].is_null());
         assert_eq!(values["diagnostics"], "no_language_server");
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::ExecutorApp as _;
 }

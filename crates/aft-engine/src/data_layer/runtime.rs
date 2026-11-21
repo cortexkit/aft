@@ -129,10 +129,10 @@ impl Drop for ClearOnDrop {
 
 /// Keeps test waits aware of a build until its follow-up work has been queued,
 /// including the handoff after the production `building` flag is cleared.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct BuildTaskGuard(Arc<std::sync::atomic::AtomicUsize>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl BuildTaskGuard {
     fn new(tasks: &Arc<std::sync::atomic::AtomicUsize>) -> Self {
         tasks.fetch_add(1, Ordering::AcqRel);
@@ -140,7 +140,7 @@ impl BuildTaskGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for BuildTaskGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::Release);
@@ -476,7 +476,7 @@ struct Work {
     building: Arc<AtomicBool>,
     /// Counts build tasks through their final follow-up scheduling, including
     /// tasks that overlap after clearing their `building` flags.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     build_tasks: Arc<std::sync::atomic::AtomicUsize>,
     /// A fold of the checkout's segments is queued or running.
     folding: Arc<AtomicBool>,
@@ -570,7 +570,7 @@ impl Work {
         if self.building.swap(true, Ordering::AcqRel) {
             return false;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let build_task = BuildTaskGuard::new(&self.build_tasks);
         let flag = ClearOnDrop(Arc::clone(&self.building));
         let Some(reservation) = self.checkout.reserve_build() else {
@@ -578,7 +578,7 @@ impl Work {
         };
         let work = Arc::clone(self);
         self.runner.run(BUILD_REQUEST, Pool::Build, move || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let _build_task = build_task;
             if work.stopped.load(Ordering::Acquire) {
                 return;
@@ -1427,7 +1427,7 @@ impl Drop for DataCheckout {
 
 impl DataCheckout {
     /// [`Self::open_planes`] with every plane.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open(
         root: &Path,
         storage: &Path,
@@ -1539,7 +1539,7 @@ impl DataCheckout {
             },
             checkout,
             building: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             build_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
@@ -1646,7 +1646,7 @@ impl DataCheckout {
     /// A checkout reusing another checkout's published call graph can serve a
     /// ready view before its background build ends.
     /// Profiles must wait before applying the edits that populate an engine.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn wait_for_memory_profile_idle_for_test(&self) {
         let deadline = Instant::now() + Duration::from_secs(300);
         // Read the task count first: observing its release publishes the flags
@@ -2149,7 +2149,7 @@ impl DataCheckout {
 
     /// Records an outcome as a build or refresh of this checkout would, for
     /// a test of what status reports for it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn note_outcome_for_test<T>(
         &self,
         stage: &'static str,

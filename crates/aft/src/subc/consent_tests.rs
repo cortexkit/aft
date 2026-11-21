@@ -8495,3 +8495,8 @@ fn standalone_approval_deadline_leaves_the_rerun_margin() {
 #[cfg(unix)]
 #[path = "secret_fetch_cancellation_tests.rs"]
 mod secret_fetch_cancellation;
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;

@@ -69,8 +69,8 @@ fn wait_for_data_layer_settled(ctx: &AppContext) {
     loop {
         let report = report(ctx).expect("the data layer is on");
         if report.text.status == READY
-            && report.callgraph.status == READY
-            && report.pending_edits == 0
+            && report.callgraph().status == READY
+            && report.pending_edits() == 0
         {
             return;
         }
@@ -189,7 +189,7 @@ fn a_watcher_rescan_reaches_the_data_layer() {
         }
     }
     assert_eq!(
-        ctx.watcher_counters().snapshot().rescans_unknown_total,
+        ctx.watcher_counters().snapshot().rescans_unknown_total(),
         1,
         "the rescan ran"
     );
@@ -208,3 +208,14 @@ fn a_watcher_rescan_reaches_the_data_layer() {
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::DataStoreReportTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc::InspectManagerTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
+
+use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;

@@ -1737,6 +1737,9 @@ mod tests {
 
         assert!(result.unwrap_err().contains("file not found"));
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
 }
 
 fn delete_glob_checkpoint(ctx: &AppContext, session: &str, name: &str) {

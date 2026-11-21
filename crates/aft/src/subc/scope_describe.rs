@@ -1615,3 +1615,6 @@ async fn kill_only(executor: Arc<Executor>, stamp: &ScopeStamp) {
         let _ = await_executor_response(job, "speech-end-safety-kill".into()).await;
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

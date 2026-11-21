@@ -342,6 +342,9 @@ mod audit_regressions {
             assert_eq!(store.history(session, &path).len(), 1);
         }
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }
 
 fn build_batch_output(
@@ -969,7 +972,8 @@ mod a03_tests {
         let mut observed = Vec::new();
         for count in [2, 8, 9, 20_000] {
             let source = format!("{}end", "é TARGET long context\r\n".repeat(count));
-            edit::A03_LINE_INDEX_PASSES.with(|counter| counter.set(0));
+            aft_engine::test_bridge::search_misc::edit::A03_LINE_INDEX_PASSES
+                .with(|counter| counter.set(0));
             let response = resolve_edit(
                 &source,
                 &serde_json::json!({"match": "TARGET", "replacement": "x"}),
@@ -995,7 +999,8 @@ mod a03_tests {
                 "{:?}",
                 response
             );
-            let passes = edit::A03_LINE_INDEX_PASSES.with(|counter| counter.get());
+            let passes = aft_engine::test_bridge::search_misc::edit::A03_LINE_INDEX_PASSES
+                .with(|counter| counter.get());
             eprintln!("A03 ambiguity matches={count}: index passes={passes}");
             observed.push(passes);
         }
@@ -1084,7 +1089,8 @@ mod a03_tests {
         );
         std::fs::write(&path, &source).unwrap();
         let req: RawRequest = serde_json::from_value(serde_json::json!({"id": "ambiguity", "command": "edit_match", "file": path, "match": "TARGET", "replacement": "x"})).unwrap();
-        edit::A03_LINE_INDEX_PASSES.with(|count| count.set(0));
+        aft_engine::test_bridge::search_misc::edit::A03_LINE_INDEX_PASSES
+            .with(|count| count.set(0));
         let response = crate::commands::edit_match::handle_edit_match(&req, &ctx);
         assert!(!response.success);
         // The 10,006-character line is shortened to its first and last 120
@@ -1097,7 +1103,11 @@ mod a03_tests {
             serde_json::json!({"occurrence": 3, "line": 3, "context": context}),
         ];
         assert_eq!(response.data["occurrences"], serde_json::json!(expected));
-        assert_eq!(edit::A03_LINE_INDEX_PASSES.with(|count| count.get()), 1);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::edit::A03_LINE_INDEX_PASSES
+                .with(|count| count.get()),
+            1
+        );
     }
 
     #[cfg(unix)]
@@ -1326,7 +1336,8 @@ mod audit11_regressions {
     #[test]
     fn batch_reuses_one_line_offset_scan() {
         let source = "\u{feff}first\r\n\u{e9}\r\nthree\rfour\r\ntail";
-        edit::LINE_OFFSET_BYTES_SCANNED.with(|count| count.set(0));
+        aft_engine::test_bridge::search_misc::edit::LINE_OFFSET_BYTES_SCANNED
+            .with(|count| count.set(0));
         let offsets = edit::LineOffsets::new(source);
         let edit = serde_json::json!({"line_start": 2, "line_end": 2, "content": "new"});
         for _ in 0..100 {
@@ -1355,7 +1366,8 @@ mod audit11_regressions {
             );
         }
         assert_eq!(
-            edit::LINE_OFFSET_BYTES_SCANNED.with(|count| count.get()),
+            aft_engine::test_bridge::search_misc::edit::LINE_OFFSET_BYTES_SCANNED
+                .with(|count| count.get()),
             source.len()
         );
     }
@@ -1382,4 +1394,7 @@ mod audit11_regressions {
             .all(|edit| edit.replacement == "v = 'b'\n    w = 'c'"));
         assert_eq!(STRING_LINE_PARSES.with(|count| count.get()), 1);
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
 }

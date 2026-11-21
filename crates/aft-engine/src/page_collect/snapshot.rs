@@ -304,7 +304,7 @@ impl SnapshotStore {
     }
 
     /// Number of snapshots alive or being built.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn live_count(&self) -> usize {
         let state = self.lock();
         state.ready.len() + state.building

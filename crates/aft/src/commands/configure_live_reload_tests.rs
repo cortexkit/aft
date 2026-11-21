@@ -1134,7 +1134,7 @@ fn legacy_project_config_events_trigger_reload_with_an_existing_project_watcher(
             std::thread::sleep(Duration::from_millis(500));
             state
                 .signal()
-                .due_at_ms
+                .due_at_ms()
                 .store(0, std::sync::atomic::Ordering::Release);
             write(&legacy, r#"{"format_on_edit":true}"#);
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -1157,3 +1157,8 @@ fn legacy_project_config_events_trigger_reload_with_an_existing_project_watcher(
         }
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::ConfigLiveStateTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc::ConfigReloadSignalTestExt as _;

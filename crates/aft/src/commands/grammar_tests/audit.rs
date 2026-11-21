@@ -1494,7 +1494,7 @@ isolated!(
             .outline_symbols(b"bad.luau")
             .unwrap()
             .unwrap()
-            .symbols
+            .symbols()
             .is_empty());
         let cache = f.ctx.symbol_cache();
         let generation = cache.write().unwrap().reset();
@@ -1505,7 +1505,7 @@ isolated!(
             &|| false,
         )
         .unwrap();
-        assert_eq!(report.loaded, 2, "{report:?}");
+        assert_eq!(report.loaded(), 2, "{report:?}");
         let parser =
             crate::parser::FileParser::with_symbol_cache(cache).with_dynamic_languages(true);
         assert_eq!(parser.cached_has_error(&bad), None);
@@ -1664,3 +1664,12 @@ isolated!(
         assert_eq!(crate::parser::work_counters::tree_parses() - before, 1);
     }
 );
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::CheckoutTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::CheckoutViewTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::VectorPlaneTestExt as _;

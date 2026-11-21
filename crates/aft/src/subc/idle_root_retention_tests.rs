@@ -32,7 +32,7 @@ fn run_in_child(test_name: &str) {
 /// retention check below pass without measuring, so it fails the test
 /// instead: the measuring thread itself always exists.
 fn thread_total() -> u64 {
-    let total = crate::lifecycle_census::thread_census().total;
+    let total = aft_engine::test_bridge::search_misc::thread_census().total;
     assert!(
         total > 0,
         "the thread census cannot count threads on this platform; the retention checks would be vacuous"
@@ -1468,3 +1468,8 @@ fn deferred_filter_release_runs_after_the_last_task_record_is_gone() {
         "the deferred release must also release the embedding model"
     );
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
