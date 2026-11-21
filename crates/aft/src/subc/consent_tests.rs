@@ -7965,7 +7965,7 @@ async fn scratch_read_worker_route_skips_cingulate_only_for_own_task() {
             .unwrap()
             .lock_state()
             .unwrap()
-            .metadata
+            .metadata_mut()
             .sandbox_temp_dir = Some(scratch.clone());
         roots.push(scratch);
     }
