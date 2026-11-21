@@ -54,7 +54,8 @@ impl Notice {
 /// Reserves the notices for one reply without clearing their durable flags.
 /// A response discarded before delivery releases its reservations when dropped.
 #[derive(Clone, Default)]
-pub(crate) struct CancelledCallReceipt(Option<Arc<Vec<Notice>>>);
+#[doc(hidden)]
+pub struct CancelledCallReceipt(Option<Arc<Vec<Notice>>>);
 
 impl std::fmt::Debug for CancelledCallReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

@@ -1049,7 +1049,8 @@ fn next_watcher_apply_phase(stage: WatcherDrainApplyPhase) -> WatcherDrainApplyP
 /// partial failures and rollback. Keep this guard outside batch validation so
 /// a queued query never depends on delivery of an OS file notification.
 #[must_use]
-pub(crate) struct FileMutationGuard<'a> {
+#[doc(hidden)]
+pub struct FileMutationGuard<'a> {
     ctx: &'a AppContext,
     revisit: Vec<PathBuf>,
     paths: std::collections::BTreeSet<PathBuf>,

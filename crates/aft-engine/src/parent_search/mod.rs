@@ -729,7 +729,8 @@ impl std::ops::Deref for Child {
 }
 
 /// The semantic model this session embeds queries with.
-pub(crate) struct ParentSemantic {
+#[doc(hidden)]
+pub struct ParentSemantic {
     /// The model, lent to each child's search engine for the length of one
     /// query so the query is embedded once and no child starts its own model.
     pub model: Mutex<Option<crate::semantic_index::EmbeddingModel>>,

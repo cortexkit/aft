@@ -928,7 +928,8 @@ fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> Scope
 }
 
 #[derive(Clone)]
-pub(crate) struct ScopedCoverageCandidates {
+#[doc(hidden)]
+pub struct ScopedCoverageCandidates {
     pub files: Vec<PathBuf>,
     pub walk_complete: bool,
 }

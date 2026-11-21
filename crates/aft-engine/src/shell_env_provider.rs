@@ -399,7 +399,8 @@ fn effective_timeout_ms(configured: u64, remaining: Option<std::time::Duration>)
 /// running task. Ownership stays in memory; restart cleanup checks the recorded
 /// daemon pid and OS start time before reclaiming orphaned files.
 #[derive(Debug)]
-pub(crate) struct PreflightLayout(PathBuf);
+#[doc(hidden)]
+pub struct PreflightLayout(PathBuf);
 
 #[cfg(unix)]
 impl PreflightLayout {

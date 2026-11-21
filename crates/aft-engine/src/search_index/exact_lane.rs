@@ -211,7 +211,8 @@ struct PreparedExactSymbol {
     member_declaration: bool,
 }
 
-pub(crate) struct PreparedExactText {
+#[doc(hidden)]
+pub struct PreparedExactText {
     normalized: String,
     symbols: Vec<PreparedExactSymbol>,
 }

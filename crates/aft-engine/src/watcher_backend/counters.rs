@@ -100,7 +100,8 @@ struct WatcherLossRecovery {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct WatcherCounters {
+#[doc(hidden)]
+pub struct WatcherCounters {
     pub bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     matcher_wakes: Mutex<Vec<MatcherWake>>,

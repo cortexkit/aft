@@ -454,7 +454,8 @@ pub(crate) fn grep_fan_out(
 }
 
 /// The parent session's glob answer for `search_roots`.
-pub(crate) struct GlobFanOut {
+#[doc(hidden)]
+pub struct GlobFanOut {
     pub files: Vec<PathBuf>,
     pub indexed_mtimes: HashMap<PathBuf, SystemTime>,
     pub scope_has_files: bool,

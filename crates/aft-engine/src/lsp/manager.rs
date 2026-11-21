@@ -956,7 +956,7 @@ impl PostEditDiagnosticsWait {
 /// the manager lock released (see [`LspManager::subscribe_events`]). It
 /// returns when an event arrives or another drain path handled one, so the
 /// caller re-checks at once instead of sleeping a fixed interval.
-pub(crate) struct LspEventWait {
+pub struct LspEventWait {
     event_rx: EventReceiver,
     ingress_rx: Receiver<()>,
     wake_rx: Receiver<()>,

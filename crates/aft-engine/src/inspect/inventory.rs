@@ -437,7 +437,8 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
-pub(crate) struct InventoryGuard(Option<Arc<InspectInventory>>);
+#[doc(hidden)]
+pub struct InventoryGuard(Option<Arc<InspectInventory>>);
 
 impl Drop for InventoryGuard {
     fn drop(&mut self) {
@@ -659,7 +660,8 @@ impl InspectInventory {
 /// Why the index store's list of a folder's files could not stand in for a
 /// walk of the folder, so the caller walked it instead.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StoreListMiss {
+#[doc(hidden)]
+pub enum StoreListMiss {
     /// No index-store checkout of the folder is bound in this process.
     NotBound,
     /// The folder holds repositories, each with a checkout of its own, and

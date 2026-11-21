@@ -24,9 +24,9 @@ pub struct RepeatIntervention {
 
 #[derive(Debug, Clone)]
 pub struct RepeatObservation {
-    pub(crate) tool: String,
-    pub(crate) semantic_key: String,
-    pub(crate) mutating: bool,
+    pub tool: String,
+    pub semantic_key: String,
+    pub mutating: bool,
 }
 
 impl RepeatObservation {

@@ -94,7 +94,8 @@ struct Envelope {
     operation: Operation,
 }
 
-pub(crate) struct ScopeQuery {
+#[doc(hidden)]
+pub struct ScopeQuery {
     pub session: String,
     pub reply: oneshot::Sender<Option<ScopeStamp>>,
 }
@@ -175,7 +176,8 @@ pub(crate) fn with_available_service_for_test<R>(root: &Path, run: impl FnOnce()
 
 /// Installed for one module connection. Losing that connection invalidates all
 /// brokers that captured its channel, including commands surviving a reconnect.
-pub(crate) struct ServiceGuard {
+#[doc(hidden)]
+pub struct ServiceGuard {
     #[cfg(unix)]
     scopes: mpsc::Sender<ScopeQuery>,
 }

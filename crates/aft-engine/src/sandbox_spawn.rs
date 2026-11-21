@@ -155,10 +155,10 @@ struct EscalationGrant {
 #[cfg(unix)]
 #[derive(Debug, Clone)]
 pub struct ProviderApprovalSnapshot {
-    pub(crate) input: HashMap<String, String>,
+    pub input: HashMap<String, String>,
     pub environment: ChildEnvironment,
     pub failure: Option<String>,
-    pub(crate) preflight_layout: Option<Arc<crate::shell_env_provider::PreflightLayout>>,
+    pub preflight_layout: Option<Arc<crate::shell_env_provider::PreflightLayout>>,
 }
 
 #[cfg(unix)]
@@ -6686,7 +6686,7 @@ pub struct ToolLaunchPolicy<'ctx> {
 
 /// One request's launch policy, shared by every command the request runs so
 /// they launch tools under one policy and one private task directory.
-pub(crate) struct RequestToolLaunch {
+pub struct RequestToolLaunch {
     /// The principal and worker-jail flag to resolve for. `None` when
     /// `resolved` was filled when the policy was made.
     deferred: Option<(AuthenticatedPrincipal, bool)>,

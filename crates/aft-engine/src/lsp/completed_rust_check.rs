@@ -983,7 +983,8 @@ impl Runtime {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(try_from = "DiskCheck", into = "DiskCheck")]
-pub(crate) struct SavedCheck {
+#[doc(hidden)]
+pub struct SavedCheck {
     schema: u32,
     root: PathBuf,
     checkout: PathBuf,

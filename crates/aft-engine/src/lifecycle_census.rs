@@ -19,7 +19,8 @@ use crate::context::{App, AppContext};
 const THREAD_CLASSIFICATION_CAP: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct LspChildRootSnapshot {
+#[doc(hidden)]
+pub struct LspChildRootSnapshot {
     pub root: String,
     pub kind: String,
     pub count: u64,
@@ -44,7 +45,8 @@ pub struct LspCensus {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct ThreadCensus {
+#[doc(hidden)]
+pub struct ThreadCensus {
     pub total: u64,
     pub classified: bool,
     pub by_class: BTreeMap<String, u64>,
@@ -67,12 +69,14 @@ impl Default for ThreadCensus {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct ChildrenCensus {
+#[doc(hidden)]
+pub struct ChildrenCensus {
     pub detached_total: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
-pub(crate) struct FdCensus {
+#[doc(hidden)]
+pub struct FdCensus {
     pub open: u64,
     pub soft_limit: u64,
 }

@@ -80,7 +80,8 @@ pub(crate) enum SourceWriteMode {
 
 /// What [`atomic_write_source`] did, plus warnings the caller must show.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SourceWriteOutcome {
+#[doc(hidden)]
+pub struct SourceWriteOutcome {
     pub(crate) mode: SourceWriteMode,
     /// Each warning starts with a stable code and a colon:
     /// `recovery_copy_found`, `no_recovery_copy`, `mode_not_restored` or
@@ -2190,7 +2191,7 @@ pub struct WriteResult {
     pub lsp_outcome: Option<crate::lsp::manager::PostEditWaitOutcome>,
     /// Post-format excerpt when the formatter reflowed the applied edit.
     pub reformatted_excerpt: Option<ReformattedExcerpt>,
-    pub(crate) final_text: Option<ObservedFinalText>,
+    pub final_text: Option<ObservedFinalText>,
     /// Warnings from writing the file itself (see [`SourceWriteOutcome`]),
     /// added to the reply's `warnings` array.
     pub write_warnings: Vec<String>,

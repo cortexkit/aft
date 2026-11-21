@@ -6,7 +6,8 @@ use std::time::Instant;
 /// Dropping a foreground wait stops its observer, even if the command continues
 /// in the background. The timeout below bounds cancellation, not exit detection:
 /// the kernel wait returns immediately when the process exits.
-pub(crate) struct ForegroundExitObserver(std::sync::Arc<std::sync::atomic::AtomicBool>);
+#[doc(hidden)]
+pub struct ForegroundExitObserver(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
 impl Drop for ForegroundExitObserver {
     fn drop(&mut self) {

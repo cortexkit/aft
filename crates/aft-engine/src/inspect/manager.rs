@@ -149,7 +149,7 @@ struct ProjectionFleet {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DeadCodeSnapshotCensus {
+pub struct DeadCodeSnapshotCensus {
     pub roots: usize,
     pub bytes: u64,
     pub drops: u64,

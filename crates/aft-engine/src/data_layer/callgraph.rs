@@ -59,7 +59,8 @@ use super::refresh_memory::{RefreshChecks, RefreshMemory, RefreshStop};
 
 /// What resolving a checkout reads.
 #[derive(Clone, Debug)]
-pub(crate) struct CheckoutInputs {
+#[doc(hidden)]
+pub struct CheckoutInputs {
     /// The checkout's paths.
     pub(crate) state: CheckoutState,
     /// Every parsed file's record key and parse output, by path.
@@ -990,7 +991,8 @@ pub(crate) struct SiteResolution {
 
 /// One file's resolution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct FileResolution {
+#[doc(hidden)]
+pub struct FileResolution {
     /// One row per reference.
     pub(crate) rows: Vec<DerivedRow>,
     /// What binding and resolution consulted, and the surface queries

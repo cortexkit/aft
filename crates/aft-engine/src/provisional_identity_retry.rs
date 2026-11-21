@@ -189,7 +189,8 @@ struct PendingRetry {
 
 /// Per-root retry state, held by the root's [`AppContext`].
 #[derive(Default)]
-pub(crate) struct RetrySlot(parking_lot::Mutex<Option<PendingRetry>>);
+#[doc(hidden)]
+pub struct RetrySlot(parking_lot::Mutex<Option<PendingRetry>>);
 
 impl RetrySlot {
     /// True when an armed retry's next attempt is due. Never waits: a held

@@ -12,7 +12,8 @@ use std::path::{Path, PathBuf};
 pub const OPERATION: &str = "file.read_exact";
 const MAX_BYTES: u64 = 1024 * 1024;
 
-pub(crate) struct ExactRead {
+#[doc(hidden)]
+pub struct ExactRead {
     pub value: Value,
     pub resolved: PathBuf,
 }

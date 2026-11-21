@@ -27,7 +27,8 @@ const NEW_DIRECTORY_SCAN_BUDGET: Duration = Duration::from_millis(200);
 /// for the same paths before they are reported.
 const NEW_DIRECTORY_REPORT_DELAY: Duration = Duration::from_millis(100);
 
-pub(crate) struct ProjectWatcher {
+#[doc(hidden)]
+pub struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     wake: Arc<mpsc::Sender<Message>>,
     join: Option<JoinHandle<()>>,

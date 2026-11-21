@@ -58,7 +58,8 @@ pub fn stage_configure_sources(sources: ConfigSources) {
     STAGED_SOURCES.with(|staged| *staged.borrow_mut() = Some(sources));
 }
 
-pub(crate) struct ConfigureSourcesScope;
+#[doc(hidden)]
+pub struct ConfigureSourcesScope;
 
 #[doc(hidden)]
 pub fn configure_sources_scope() -> ConfigureSourcesScope {

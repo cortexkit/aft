@@ -37,7 +37,8 @@ impl Drop for Scratch {
     }
 }
 
-pub(crate) struct Start {
+#[doc(hidden)]
+pub struct Start {
     launcher: PathBuf,
     scratch: Scratch,
     workdir: PathBuf,

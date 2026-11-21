@@ -7,7 +7,8 @@ use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
 use crate::db::remote_exec::PolicyKey;
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub(crate) struct UnrestoredGrant {
+#[doc(hidden)]
+pub struct UnrestoredGrant {
     pub(crate) path: PathBuf,
     pub(crate) mode: AccessOperation,
     pub(crate) retryable: bool,
@@ -44,7 +45,8 @@ struct State {
 }
 
 #[derive(Default)]
-pub(crate) struct LaunchGrantState(parking_lot::Mutex<State>);
+#[doc(hidden)]
+pub struct LaunchGrantState(parking_lot::Mutex<State>);
 
 fn session_key(key: &PolicyKey) -> PolicyKey {
     let mut key = key.clone();

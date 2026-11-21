@@ -267,7 +267,7 @@ thread_local! {
     static REQUEST_PROGRESS_ORIGIN: std::cell::RefCell<Option<(String, crate::protocol::ProgressOrigin)>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct ProgressOriginGuard(Option<(String, crate::protocol::ProgressOrigin)>);
+pub struct ProgressOriginGuard(Option<(String, crate::protocol::ProgressOrigin)>);
 
 impl Drop for ProgressOriginGuard {
     fn drop(&mut self) {
@@ -761,7 +761,7 @@ pub struct RootHealthSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RootHealthSummary {
+pub struct RootHealthSummary {
     cache_unavailable: Option<&'static str>,
     state: RootHealthState,
     search_index_status: Option<&'static str>,
@@ -1374,7 +1374,7 @@ impl Drop for WatcherDrainGuard<'_> {
 /// Pending watcher-derived reconciliation state taken out of the context for
 /// a transactional TTL teardown: committed (dropped) once eviction succeeds,
 /// restored when a secondary blocker aborts the eviction.
-pub(crate) struct PendingReconciliationState {
+pub struct PendingReconciliationState {
     tier2: BTreeSet<PathBuf>,
     semantic: BTreeSet<PathBuf>,
     corpus_refresh: bool,

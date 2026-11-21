@@ -140,7 +140,8 @@ impl RequestFile {
 }
 
 /// A file fetched through the set.
-pub(crate) struct Fetched {
+#[doc(hidden)]
+pub struct Fetched {
     pub file: Arc<RequestFile>,
     /// This fetch read the disk: no earlier phase of the request kept the
     /// file. Only such a phase may release it again.
@@ -204,7 +205,8 @@ impl RequestFilesReport {
 }
 
 /// The candidate files of one request. See the module documentation.
-pub(crate) struct RequestFiles {
+#[doc(hidden)]
+pub struct RequestFiles {
     slots: Mutex<HashMap<PathBuf, Arc<Slot>>>,
     matching_lines: Mutex<HashMap<MatchingLineKey, Option<(u32, String)>>>,
     budget: usize,

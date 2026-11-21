@@ -215,7 +215,8 @@ impl Drop for CardWatch {
     }
 }
 
-pub(crate) struct Receipt {
+#[doc(hidden)]
+pub struct Receipt {
     wake: Arc<Wake>,
     pending: HashMap<u64, Vec<oneshot::Sender<()>>>,
 }

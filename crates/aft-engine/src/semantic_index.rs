@@ -235,7 +235,7 @@ fn record_embedding_call(
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct EmbeddingBackendBuildHealth {
+pub struct EmbeddingBackendBuildHealth {
     pub last_error: String,
     pub since_ms: u64,
     pub next_retry_ms: u64,
@@ -1788,7 +1788,7 @@ struct QueryEmbedHealthState {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct QueryEmbedHealthSnapshot {
+pub struct QueryEmbedHealthSnapshot {
     pub query_embed_timeouts: u64,
     pub query_embed_p50_ms: u64,
 }
