@@ -2768,14 +2768,14 @@ pub struct ValidatedArtifact {
 impl ValidatedArtifact {
     fn new(file: File) -> io::Result<Self> {
         validate_regular_handle(&file)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         work_counts::record_artifact_open();
         Ok(Self { file })
     }
 
     pub fn len(&self) -> io::Result<u64> {
         validate_regular_handle(&self.file)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         work_counts::record_stat();
         Ok(self.file.metadata()?.len())
     }
@@ -2793,7 +2793,7 @@ impl ValidatedArtifact {
         Read::by_ref(&mut self.file)
             .take(read_len)
             .read_to_end(&mut bytes)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         work_counts::record_bytes(bytes.len());
         Ok((bytes, len > max_bytes as u64))
     }
@@ -2804,7 +2804,7 @@ impl ValidatedArtifact {
         Read::by_ref(&mut self.file)
             .take(len)
             .read_to_end(&mut bytes)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         work_counts::record_bytes(bytes.len());
         Ok(bytes)
     }
@@ -2813,7 +2813,7 @@ impl ValidatedArtifact {
         self.rewind()?;
         let mut bytes = Vec::new();
         self.file.read_to_end(&mut bytes)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         work_counts::record_bytes(bytes.len());
         Ok(bytes)
     }
