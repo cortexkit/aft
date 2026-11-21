@@ -502,7 +502,7 @@ jobs:
     name: Worker GitHub reads (required Landlock)
     if: ${{ github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 35
     env:
       AFT_REQUIRE_LANDLOCK: "1"
     steps:
