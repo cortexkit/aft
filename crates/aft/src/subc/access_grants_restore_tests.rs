@@ -867,3 +867,8 @@ async fn grants_stalled_restore_retries_after_path_recovers() {
     assert!(text.contains("launch grant"), "{text}");
     assert!(text.contains("retry after the path recovers"), "{text}");
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::LaunchGrantStateTestExt as _;

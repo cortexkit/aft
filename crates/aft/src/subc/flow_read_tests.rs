@@ -1542,3 +1542,6 @@ async fn perf_sweep_long_sample_does_not_block_project_writes() {
     }
     no_second_frame(&mut output).await;
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

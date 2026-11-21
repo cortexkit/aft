@@ -1468,3 +1468,8 @@ fn deferred_filter_release_runs_after_the_last_task_record_is_gone() {
         "the deferred release must also release the embedding model"
     );
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

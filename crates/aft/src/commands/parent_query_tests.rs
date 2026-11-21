@@ -931,3 +931,8 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
         state => panic!("beta's plane is not read: {state:?}"),
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::IndexHost as _;

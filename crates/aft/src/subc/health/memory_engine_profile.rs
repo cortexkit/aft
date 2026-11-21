@@ -222,3 +222,6 @@ fn retained_aft_engines() {
         });
     }
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

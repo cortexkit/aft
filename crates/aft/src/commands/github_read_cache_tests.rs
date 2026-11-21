@@ -751,3 +751,8 @@ fn a_read_still_running_at_the_deadline_without_a_cached_copy_is_pending() {
     );
     release.send(()).unwrap();
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc::GithubReadDeferredTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::search_misc::GithubReadEngineTestExt as _;

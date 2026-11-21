@@ -1077,6 +1077,9 @@ mod audit_regressions {
             Path::new("project/user.service/index.ts")
         ));
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
 }
 
 /// Check if a path string refers to the same file as `target`, accounting for

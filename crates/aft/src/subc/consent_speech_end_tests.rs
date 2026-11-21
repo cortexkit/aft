@@ -469,3 +469,8 @@ async fn audit_started_shell_is_killed_by_scope_cleanup_and_never_not_started() 
         "result"
     );
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::ServiceTestExt as _;

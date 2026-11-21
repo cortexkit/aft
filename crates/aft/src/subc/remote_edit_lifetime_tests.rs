@@ -874,3 +874,6 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
 #[cfg(target_os = "linux")]
 #[path = "remote_shell_wire_tests.rs"]
 mod shell;
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
