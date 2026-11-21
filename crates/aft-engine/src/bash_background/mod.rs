@@ -192,11 +192,13 @@ impl StartupSteps {
 }
 
 impl BashStartupStepSnapshot {
-    pub(crate) fn current(self) -> BashStartupStep {
+    #[doc(hidden)]
+    pub fn current(self) -> BashStartupStep {
         self.current
     }
 
-    pub(crate) fn format_steps(self) -> String {
+    #[doc(hidden)]
+    pub fn format_steps(self) -> String {
         use std::fmt::Write as _;
 
         let mut formatted = String::with_capacity(128);

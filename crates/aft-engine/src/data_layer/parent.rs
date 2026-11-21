@@ -255,9 +255,9 @@ pub(crate) struct ChildSearch {
     /// when it could not be bound, and `text` says why.
     pub checkout: Option<Arc<DataCheckout>>,
     /// Its text plane, as grep reads it.
-    pub(crate) text: Plane<CheckoutView>,
+    pub text: Plane<CheckoutView>,
     /// Why its meaning search has nothing to answer from, when it has not.
-    pub(crate) meaning_gap: Option<String>,
+    pub meaning_gap: Option<String>,
 }
 
 /// The words a parent folder's `aft_search` names a child with, when the

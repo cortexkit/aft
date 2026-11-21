@@ -97,7 +97,8 @@ impl FlushControl {
             .contains_key(&id)
     }
 
-    pub(crate) fn wait(&self, root: &Path, deadline: Instant) -> bool {
+    #[doc(hidden)]
+    pub fn wait(&self, root: &Path, deadline: Instant) -> bool {
         // Do not create a file when the caller has too little time to remove it.
         if deadline.saturating_duration_since(Instant::now()) < MIN_MARKER_BUDGET {
             return false;

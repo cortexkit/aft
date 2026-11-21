@@ -10,11 +10,12 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct Output {
     text: String,
     code: i32,
-    pub(crate) timed_out: bool,
+    pub timed_out: bool,
 }
 
 impl Output {
-    pub(crate) fn result(self, id: &str, line: Option<String>) -> ToolCallResult {
+    #[doc(hidden)]
+    pub fn result(self, id: &str, line: Option<String>) -> ToolCallResult {
         let line = line
             .as_deref()
             .or(self.timed_out.then_some("[command timed out]"));
