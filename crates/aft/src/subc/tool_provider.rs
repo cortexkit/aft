@@ -7273,9 +7273,13 @@ mod tests {
             ),
             (
                 schema.schema_digest.as_str(),
-                2,
+                1,
                 Some("tool_semantics_changed"),
             ),
+            // Version 2 differs from 3 only in the display record the apps draw
+            // (3 adds the `tail` field); the command runs the same, so a version-2
+            // pin is still admitted (see `tool_views::runs_under_newer_semantics`).
+            (schema.schema_digest.as_str(), 2, None),
         ] {
             let mut request = call("bash", json!({"command": "echo"}));
             request.schema_pin = Some(SchemaPin::new("bash", digest, semantics).encode().unwrap());
