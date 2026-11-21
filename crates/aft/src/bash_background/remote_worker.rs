@@ -1,5 +1,68 @@
 use super::*;
 
+/// Send a retry's resubmission. Tests can make it fail as a call that never
+/// reached the runner (see `tests::refuse_resubmission`).
+pub(super) async fn resubmit(
+    client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
+    request: &RunRequest,
+    _root: &Path,
+    timings: exec::LaunchTimings,
+) -> Result<exec::RemoteStream, exec::Error> {
+    #[cfg(test)]
+    if tests::refuse_resubmission(_root) {
+        return Err(exec::Error::Protocol(
+            "test: resubmission failed before it was sent".into(),
+        ));
+    }
+    run_diagnosed(client, task, request, timings).await
+}
+
+pub(super) async fn run_diagnosed(
+    client: &ExecRemoteClient,
+    task: &Arc<BgTask>,
+    request: &RunRequest,
+    timings: exec::LaunchTimings,
+) -> Result<exec::RemoteStream, exec::Error> {
+    let capture = task.state.lock().ok().and_then(|state| {
+        state
+            .metadata
+            .remote
+            .as_ref()
+            .filter(|r| r.explicit_runon)
+            .map(|_| {
+                super::super::runon_capture::Submission::new(
+                    task.clone(),
+                    Path::new(&request.workspace_key),
+                )
+            })
+    });
+    client
+        .run_with_diagnostics(
+            request,
+            Some(exec::RunDiagnostics {
+                capture,
+                task_id: &task.task_id,
+                session: &task.session_id,
+                timings,
+            }),
+        )
+        .await
+}
+
+impl BgTaskRegistry {
+    pub(super) fn cancel_before_dispatch(&self, task: &Arc<BgTask>) {
+        if !self.finish_owner_pause_cancel(task, Ok(())) {
+            self.remote_terminal_with_note(
+                task,
+                Verdict::Cancelled,
+                None,
+                Some("cancelled before remote dispatch to ck-motor; command never started"),
+            );
+        }
+    }
+}
+
 pub(super) fn run(
     registry: BgTaskRegistry,
     task: Arc<BgTask>,

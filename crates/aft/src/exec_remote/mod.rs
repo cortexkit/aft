@@ -57,6 +57,8 @@ impl std::fmt::Display for DirectoryKind {
 #[derive(Debug)]
 pub enum Error {
     Protocol(String),
+    #[cfg(unix)]
+    CancelledBeforeCapture,
     ResolveDirectory {
         kind: DirectoryKind,
         path: std::path::PathBuf,
@@ -84,6 +86,8 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Protocol(message) => write!(f, "remote execution protocol: {message}"),
+            #[cfg(unix)]
+            Self::CancelledBeforeCapture => write!(f, "remote capture cancelled before dispatch"),
             Self::ResolveDirectory { kind, path, source } => {
                 write!(f, "could not resolve {kind} {}: {source}", path.display())
             }

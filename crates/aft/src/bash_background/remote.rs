@@ -20,6 +20,8 @@ use std::ffi::OsStr;
 #[cfg(unix)]
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::PathBuf;
+#[cfg(unix)]
+use worker::{resubmit, run_diagnosed};
 
 pub use crate::protocol::RemoteOomKill;
 
@@ -895,6 +897,8 @@ impl RemotePreStartRefusal {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct RemoteTask {
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub(super) copy_warning: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<KeyedSubmission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2022,6 +2026,7 @@ impl OutputSink for TaskSink {
         r.job_id = Some(accepted.job_id);
         r.queue_position = Some(accepted.queue_position);
         r.accepted = true;
+        r.copy_warning |= self.task.runon_copy_warning.load(Ordering::Acquire);
         r.accepted_platform = accepted.platform.clone();
         r.granted_network = accepted.network == Some(Network::Outbound);
         if accepted.env_not_forwarded.is_some() {
@@ -2208,7 +2213,9 @@ impl OutputSink for TaskSink {
                     .map(|mut returns| returns.without_manifest())
             })
             .flatten();
+        let copy_warning = self.task.runon_copy_warning.load(Ordering::Acquire);
         self.commit(|r| {
+            r.copy_warning |= copy_warning;
             let resubmit_refusal = r.submission.as_ref().is_some_and(|s| s.resuming)
                 && matches!(verdict, Verdict::RunLocally { .. });
             // A keyed refusal belongs to this call, not to the existing job.
@@ -2832,6 +2839,7 @@ impl BgTaskRegistry {
         metadata.status = BgTaskStatus::Running;
         metadata.execution_note = Some(format!("remote execution requested on {RUNNER_ID}"));
         metadata.remote = Some(RemoteTask {
+            copy_warning: false,
             submission: None,
             requested_platform: launch.requested_platform.clone(),
             accepted_platform: None,
@@ -3255,6 +3263,7 @@ impl BgTaskRegistry {
                         .map_err(|e| e.to_string())?;
                     return Ok(Some(stream));
                 }
+                Ok(Err(exec::Error::CancelledBeforeCapture)) => return Ok(None),
                 result => crate::slog_warn!(
                     "runon: keyed recovery failed task_id={} attempt={} reason={}",
                     sink.task.task_id,
@@ -3718,18 +3727,15 @@ impl BgTaskRegistry {
                 .as_ref()
                 .is_some_and(|remote| remote.cancel_requested)
             {
-                if !self.finish_owner_pause_cancel(&task, Ok(())) {
-                    self.remote_terminal_with_note(
-                        &task,
-                        Verdict::Cancelled,
-                        None,
-                        Some("cancelled before remote dispatch to ck-motor; command never started"),
-                    );
-                }
+                self.cancel_before_dispatch(&task);
                 return Ok(());
             }
             match run_diagnosed(&client, &task, &request, timings).await {
                 Ok(stream) => stream,
+                Err(exec::Error::CancelledBeforeCapture) => {
+                    self.cancel_before_dispatch(&task);
+                    return Ok(());
+                }
                 Err(error) if proves_no_start(&error) => {
                     return if remote.explicit_runon {
                         self.refuse_remote_before_dispatch(&task, &error.to_string())
@@ -4040,6 +4046,10 @@ impl BgTaskRegistry {
                     self.remote_terminal(&task, verdict, None);
                     return Ok(());
                 }
+                Err(exec::Error::CancelledBeforeCapture) => {
+                    self.cancel_before_dispatch(&task);
+                    return Ok(());
+                }
                 Err(error) => {
                     #[cfg(test)]
                     if stream
@@ -4258,6 +4268,10 @@ impl BgTaskRegistry {
         let hinted = HintedRetry::start(root, request);
         match resubmit(client, task, &keyed_request, root, timings).await {
             Ok(stream) => Ok(Some((stream, hinted))),
+            Err(exec::Error::CancelledBeforeCapture) => {
+                self.cancel_draining_retry(task);
+                Ok(None)
+            }
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
                 tests::draining_gate(root, tests::DrainingGate::BeforeNoStartRefusal).await;
@@ -4398,6 +4412,10 @@ impl BgTaskRegistry {
         }
         retry.resubmits += 1;
         match resubmit(client, task, &request, root, timings).await {
+            Err(exec::Error::CancelledBeforeCapture) => {
+                self.cancel_draining_retry(task);
+                Ok(HintedRetryStep::Ended)
+            }
             Ok(stream) => Ok(HintedRetryStep::Resubmitted(stream)),
             Err(error) if proves_no_start(&error) => {
                 #[cfg(test)]
@@ -4652,6 +4670,9 @@ impl BgTaskRegistry {
             };
             if state.metadata.is_terminal() {
                 return;
+            }
+            if let Some(remote) = state.metadata.remote.as_mut() {
+                remote.copy_warning |= task.runon_copy_warning.load(Ordering::Acquire);
             }
             reason = remote_oom_kill(&state.metadata)
                 .map(|oom| oom.message())
@@ -6092,44 +6113,6 @@ fn append_executor_environment_disclosure(metadata: &mut PersistedTask) {
     if !note.contains(&disclosure) {
         note.push_str(&format!("\n{disclosure}"));
     }
-}
-
-/// Send a retry's resubmission. Tests can make it fail as a call that never
-/// reached the runner (see `tests::refuse_resubmission`).
-#[cfg(unix)]
-async fn resubmit(
-    client: &ExecRemoteClient,
-    task: &Arc<BgTask>,
-    request: &RunRequest,
-    _root: &Path,
-    timings: exec::LaunchTimings,
-) -> Result<exec::RemoteStream, exec::Error> {
-    #[cfg(test)]
-    if tests::refuse_resubmission(_root) {
-        return Err(exec::Error::Protocol(
-            "test: resubmission failed before it was sent".into(),
-        ));
-    }
-    run_diagnosed(client, task, request, timings).await
-}
-
-#[cfg(unix)]
-async fn run_diagnosed(
-    client: &ExecRemoteClient,
-    task: &Arc<BgTask>,
-    request: &RunRequest,
-    timings: exec::LaunchTimings,
-) -> Result<exec::RemoteStream, exec::Error> {
-    client
-        .run_with_diagnostics(
-            request,
-            Some(exec::RunDiagnostics {
-                task_id: &task.task_id,
-                session: &task.session_id,
-                timings,
-            }),
-        )
-        .await
 }
 
 #[cfg(unix)]

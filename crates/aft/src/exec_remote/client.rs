@@ -65,6 +65,8 @@ impl LaunchTimings {
 }
 
 pub(crate) struct RunDiagnostics<'a> {
+    #[cfg(unix)]
+    pub(crate) capture: Option<crate::bash_background::registry::runon_capture::Submission>,
     pub task_id: &'a str,
     pub session: &'a str,
     pub timings: LaunchTimings,
@@ -300,9 +302,18 @@ impl ExecRemoteClient {
         &self,
         method: &str,
         params: &T,
-        consumer: StreamConsumer,
+        #[allow(unused_mut)] mut consumer: StreamConsumer,
         mut diagnostics: Option<RunDiagnostics<'_>>,
     ) -> Result<RemoteStream, Error> {
+        #[cfg(unix)]
+        let capture = diagnostics.as_ref().and_then(|d| d.capture.clone());
+        #[cfg(unix)]
+        if let Some(capture) = &capture {
+            if let Some(diagnostics) = diagnostics.as_mut() {
+                diagnostics.timings.enter("foreground_capture_wait");
+            }
+            consumer.capture = Some(capture.before_send().await?);
+        }
         if let Some(diagnostics) = diagnostics.as_mut() {
             diagnostics.timings.enter("send");
         }
@@ -330,6 +341,9 @@ impl ExecRemoteClient {
             sent_at: (method == "exec.run").then_some(sent_at),
             return_request: None,
             return_retry: None,
+            pending_return_retry: None,
+            #[cfg(unix)]
+            capture,
         })
     }
 
@@ -404,6 +418,9 @@ pub enum StreamProgress {
     Complete(Verdict),
 }
 
+type PendingReturnRetry =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<RemoteStream, Error>> + Send>>;
+
 /// One held-open run/attach observation. Dropping it sends request-level Cancel
 /// (SDK semantics), which detaches at the executor, unlike `exec.cancel` by job
 /// ID. Persist its resume point before dropping when recovery is needed.
@@ -418,6 +435,9 @@ pub struct RemoteStream {
     sent_at: Option<Instant>,
     return_request: Option<RunRequest>,
     return_retry: Option<(ExecRemoteClient, RunRequest)>,
+    pending_return_retry: Option<PendingReturnRetry>,
+    #[cfg(unix)]
+    capture: Option<crate::bash_background::registry::runon_capture::Submission>,
 }
 
 impl RemoteStream {
@@ -452,6 +472,16 @@ impl RemoteStream {
     /// time only, and the executor owns queue waiting and reconnects to runner.
     pub async fn next<S: OutputSink>(&mut self, sink: &mut S) -> Result<StreamProgress, Error> {
         loop {
+            if let Some(retry) = self.pending_return_retry.as_mut() {
+                // `next` can be dropped while waiting. Keep the one permitted
+                // retry, including its pre-send wait and deadline, in the stream.
+                let result = retry.await;
+                self.pending_return_retry = None;
+                let next = result?;
+                self.subscription = next.subscription;
+                self.consumer = next.consumer;
+                self.sent_at = next.sent_at;
+            }
             if let Some(request) = self.return_request.take() {
                 sink.return_request(&request, false)?;
             }
@@ -477,16 +507,23 @@ impl RemoteStream {
                         if let Some(maximum) = refused_return_cap(&error, &request) {
                             let request = request.with_return_max_bytes(maximum);
                             if sink.return_request(&request, true)? {
-                                self.subscription = client
-                                    .consumer
-                                    .subscribe_route(
-                                        &client.route,
-                                        envelope("exec.run", &request)?,
-                                        SubscribeOptions::default(),
-                                    )
-                                    .await
-                                    .map_err(Error::Transport)?;
-                                self.sent_at = Some(Instant::now());
+                                #[cfg(unix)]
+                                let capture = self.capture.take();
+                                #[cfg(unix)]
+                                // The typed cap refusal proves there was no copy.
+                                if let Some(copy) = self.consumer.capture.take() {
+                                    copy.discard();
+                                }
+                                self.pending_return_retry = Some(Box::pin(async move {
+                                    #[allow(unused_mut)]
+                                    let mut consumer =
+                                        StreamConsumer::keyed_run(request.resume_from_seq());
+                                    #[cfg(unix)]
+                                    if let Some(capture) = capture {
+                                        consumer.capture = Some(capture.before_send().await?);
+                                    }
+                                    client.stream("exec.run", &request, consumer, None).await
+                                }));
                                 continue;
                             }
                         }

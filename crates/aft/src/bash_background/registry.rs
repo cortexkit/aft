@@ -249,6 +249,9 @@ pub(crate) mod folder_grants;
 pub(crate) mod remote;
 #[path = "return_files.rs"]
 pub(crate) mod return_files;
+#[cfg(unix)]
+#[path = "runon_capture.rs"]
+pub(crate) mod runon_capture;
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[cfg(test)]
@@ -1832,6 +1835,10 @@ pub(crate) struct BgTask {
     descendant_sample_saved: std::sync::Condvar,
     #[cfg(unix)]
     remote_cancel_notify: tokio::sync::Notify,
+    #[cfg(unix)]
+    local_capture_command: std::sync::OnceLock<runon_capture::LocalCommand>,
+    #[cfg(unix)]
+    runon_copy_warning: AtomicBool,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
     /// the route that started it (or of the row it was replayed from). The
     /// root context is shared by routes from several harnesses, so this can
@@ -6059,6 +6066,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -6148,6 +6159,10 @@ impl BgTaskRegistry {
                 false
             } else if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
                 if let Some(mut release) = child.stdin.take() {
+                    if !task.holds_background_slot.load(Ordering::Acquire) {
+                        task.local_capture_command
+                            .get_or_init(|| runon_capture::LocalCommand::start(&task, &workdir));
+                    }
                     if let Err(error) = release.write_all(b"run\n") {
                         crate::slog_warn!(
                             "background task {task_id} bootstrap release failed: {error}"
@@ -6518,6 +6533,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -6902,6 +6921,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -11061,6 +11084,8 @@ impl BgTaskRegistry {
                     .map_err(|e| format!("failed to promote background task: {e}"))?;
                 state.metadata = updated;
                 task.holds_background_slot.store(true, Ordering::SeqCst);
+                #[cfg(unix)]
+                task.finish_local_capture_command();
                 Ok::<_, String>(state.metadata.status.is_terminal())
             })?
         };
@@ -13787,6 +13812,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -18072,7 +18101,16 @@ impl BgTask {
         true
     }
 
+    #[cfg(unix)]
+    fn finish_local_capture_command(&self) {
+        if let Some(command) = self.local_capture_command.get() {
+            command.finish();
+        }
+    }
+
     fn mark_terminal_now(&self) {
+        #[cfg(unix)]
+        self.finish_local_capture_command();
         if let Ok(mut terminal_at) = self.terminal_at.lock() {
             if terminal_at.is_none() {
                 *terminal_at = Some(Instant::now());
@@ -18498,57 +18536,7 @@ mod adopted_identity;
 #[path = "completion_queue.rs"]
 pub(crate) mod completion_queue;
 
-fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
-    let warning = metadata
-        .remote
-        .as_ref()
-        .and_then(|remote| remote.output_incomplete.as_ref())
-        .map(remote::RemoteOutputIncomplete::warning_line);
-    let mut note = match (warning, metadata.execution_note.as_deref()) {
-        (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
-        (Some(warning), _) => Some(warning),
-        (None, Some(note)) => Some(note.to_owned()),
-        (None, None) => None,
-    };
-    // Disk recovery can render the task's terminal result before the finalizer has
-    // saved its execution note. Keep the same memory advice on that path.
-    if let Some(oom) = remote::remote_oom_kill(metadata) {
-        let message = oom.message();
-        if !note.as_ref().is_some_and(|note| note.contains(&message)) {
-            note = Some(match note {
-                Some(note) => format!("{note}\n{message}"),
-                None => message,
-            });
-        }
-    }
-    let note = if metadata.status == BgTaskStatus::Killed
-        && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
-    {
-        let cancellation = "[killed (cancelled by owner); expected stop, not a command failure]";
-        Some(match note {
-            Some(note) => format!("{cancellation}\n{note}"),
-            None => cancellation.to_owned(),
-        })
-    } else {
-        note
-    };
-    match (metadata.memory_policy.as_ref(), note) {
-        (Some(policy), Some(note)) => Some(format!("{}\n{note}", policy.note())),
-        (Some(policy), None) => Some(policy.note()),
-        (None, note) => note,
-    }
-}
-
-/// Print what a remote run's report says about the workspace after the
-/// command's output, where a reader looks once the output ends.
-fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
-    if let Some(report) = remote::remote_report(metadata) {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&report);
-    }
-}
+use completion_preview::{append_remote_report, rendered_execution_note};
 
 fn append_source_read_only_note(output: &mut String, metadata: &PersistedTask, buffer: &BgBuffer) {
     use std::io::BufRead;

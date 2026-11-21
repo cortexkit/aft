@@ -62,6 +62,7 @@ pub(super) fn persist_accepted_with_snapshot_scope(
     metadata.status = BgTaskStatus::Running;
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        copy_warning: false,
         submission: None,
         accepted_platform: None,
         explicit_runon: false,
