@@ -1,5 +1,5 @@
 use super::*;
-use crate::late_result_bus::{self, display, views};
+use aft_engine::test_bridge::display_data::late_result_bus::{self, display, views};
 use cortexkit_role_tool_display::DisplayKind;
 use subc_transport::connection_file::{self, ConnectionInfo, Endpoint};
 

@@ -2,8 +2,9 @@ mod tests {
     use std::path::Path;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use crate::bash_rewrite::bash_hints::{
-        code_search_nudge, fresh_at, operands, pipeline_stages, statements, token,
+    use crate::bash_rewrite::bash_hints::code_search_nudge;
+    use aft_engine::test_bridge::bash_remote::bash_hints::{
+        fresh_at, operands, pipeline_stages, statements, token,
     };
 
     const SEARCH_HINT: &str = "DO NOT search code by running grep/rg in bash — it is unindexed, unranked, and serial. Use the `aft_search` tool instead (it auto-routes concepts, identifiers, regex, and literals).";

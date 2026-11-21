@@ -1,6 +1,6 @@
 mod tests {
-    use crate::data_layer::runtime::tests::PublicationFixture;
     use crate::write_intent::{WriteIntent, WritePhase};
+    use aft_engine::test_bridge::display_data::PublicationFixture;
     use std::time::Duration;
 
     #[test]

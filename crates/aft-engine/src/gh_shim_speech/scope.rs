@@ -14,12 +14,9 @@ pub struct ValidatedEnd {
     evidence: Value,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ScopedRpcEndSource {
-    Provider,
-    RouteOpen,
-}
-
+#[path = "scope_end_type.rs"]
+pub(crate) mod scope_end_type;
+pub(crate) use scope_end_type::ScopedRpcEndSource;
 impl ValidatedEnd {
     pub(crate) fn scoped_rpc(
         expected: &ScopeStamp,

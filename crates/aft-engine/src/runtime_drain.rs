@@ -2239,6 +2239,9 @@ mod request_lsp_contention_tests {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod watcher_fixture;
+
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
@@ -2385,21 +2388,7 @@ pub(crate) mod tests {
     fn watcher_context(
         root: &Path,
     ) -> (AppContext, crossbeam_channel::Sender<WatcherDispatchEvent>) {
-        watcher_context_with(root, AppContext::new)
-    }
-
-    pub(crate) fn watcher_context_with(
-        root: &Path,
-        make_context: impl FnOnce(Box<dyn crate::language::LanguageProvider>, Config) -> AppContext,
-    ) -> (AppContext, crossbeam_channel::Sender<WatcherDispatchEvent>) {
-        let ctx = make_context(default_language_provider_factory(), Config::default());
-        ctx.update_config(|config| {
-            config.project_root = Some(root.to_path_buf());
-        });
-        ctx.set_canonical_cache_root(root.to_path_buf());
-        let (tx, rx) = crossbeam_channel::unbounded();
-        *ctx.watcher_rx().lock() = Some(rx);
-        (ctx, tx)
+        super::watcher_fixture::watcher_context_with(root, AppContext::new)
     }
 
     #[test]

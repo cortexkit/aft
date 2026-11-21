@@ -3,7 +3,7 @@
 /// a slow filesystem cannot keep other routes from the database.
 #[tokio::test]
 async fn consent_head_policy_resolves_with_database_unlocked() {
-    use crate::access_policy::path_probe;
+    use crate::policy_path::path_probe;
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let db = f.ctx.db().unwrap();

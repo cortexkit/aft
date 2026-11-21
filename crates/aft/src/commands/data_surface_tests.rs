@@ -1,16 +1,18 @@
 mod tests {
     use crate::context::AppContext;
     use crate::data_layer::checkout::DataError;
-    use crate::data_layer::surfaces::tests::{root_fixture_config, settled, write};
     #[cfg(target_os = "linux")]
-    use crate::data_layer::surfaces::{
-        bind_for_test, disclose_index_gaps, serve_text_index_for_test,
-    };
-    use crate::data_layer::surfaces::{
-        reason, report, zoom_callgraph_field, DataCheckoutProbe, READY,
-    };
+    use crate::data_layer::surfaces::disclose_index_gaps;
+    use crate::data_layer::surfaces::{reason, report, zoom_callgraph_field, DataCheckoutProbe};
     use crate::memory::MemoryEstimate;
     use crate::protocol::RawRequest;
+    #[cfg(target_os = "linux")]
+    use aft_engine::test_bridge::display_data::surfaces::{
+        bind_for_test, serve_text_index_for_test,
+    };
+    use aft_engine::test_bridge::display_data::surfaces::{
+        root_fixture_config, settled, write, READY,
+    };
     use serde_json::{json, Value};
     use std::path::Path;
     #[cfg(target_os = "linux")]
@@ -230,7 +232,10 @@ mod tests {
         let health = ctx.try_health_snapshot(&root);
         assert_eq!(health.search_index.unwrap().status, "off");
         assert_eq!(health.callgraph_store.unwrap().status, "off");
-        assert_eq!(health.data_store.unwrap().reason, Some(reason::NOT_BOUND));
+        assert_eq!(
+            health.data_store.unwrap().reason,
+            Some(aft_engine::test_bridge::display_data::surfaces::NOT_BOUND)
+        );
         assert_eq!(
             zoom(&ctx, &lib)["callgraph"],
             json!({"status": "unavailable", "code": "callgraph_unavailable",

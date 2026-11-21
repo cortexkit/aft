@@ -758,7 +758,7 @@ static TEST_LAUNCHERS: OnceLock<Mutex<HashMap<PathBuf, PathBuf>>> = OnceLock::ne
 thread_local! {
     static CURRENT_PRINCIPAL: RefCell<Option<AuthenticatedPrincipal>> = const { RefCell::new(None) };
     static WORKER_JAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     static TEST_PLAN_OVERRIDE: RefCell<Option<SpawnPlan>> = const { RefCell::new(None) };
 }
 
@@ -1528,7 +1528,7 @@ fn resolve_sandbox_spawn_with_mode(
     // This check must remain ahead of every platform and production-policy
     // branch. Windows tests use it to avoid entering process paths that cannot
     // consume native launcher plans.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(plan) = TEST_PLAN_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return plan;
     }
@@ -3107,7 +3107,7 @@ impl std::fmt::Debug for GitPolicyAnswers {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 thread_local! {
     /// Makes the profile builders ignore stored answers and ask Git, as they
     /// did before answers existed. Only the manual spawn benchmark sets it.
@@ -3117,7 +3117,7 @@ thread_local! {
 #[cfg(unix)]
 impl GitPolicyAnswers {
     fn current(&self, project_root: &Path) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if GIT_POLICY_IGNORE_ANSWERS.with(|value| value.get()) {
             return false;
         }
@@ -3224,7 +3224,7 @@ enum GitPolicyResolution {
 
 #[cfg(unix)]
 fn note_git_policy_resolution(_project_root: &Path, resolution: GitPolicyResolution) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     with_git_policy_test_state(_project_root, |state| match resolution {
         GitPolicyResolution::Hit => state.hits += 1,
         GitPolicyResolution::Miss => state.misses += 1,
@@ -3262,7 +3262,7 @@ impl Drop for GitPolicyFlightGuard {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         cache.in_flight.remove(&self.key);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         with_git_policy_test_state(&self.key.worktree, |state| {
             if state.expire_wait_on_owner_release {
                 state.expire_wait = true;
@@ -3330,18 +3330,18 @@ fn git_policy_cache_changed() -> &'static Condvar {
     CHANGED.get_or_init(Condvar::new)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(all(not(test), unix))]
+#[cfg(all(not(any(test, feature = "test-support")), unix))]
 const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 struct GitPolicyTestUncachedGate {
     entered: std::sync::mpsc::Sender<()>,
     release: std::sync::mpsc::Receiver<bool>,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 #[derive(Default)]
 struct GitPolicyTestState {
     environment: Vec<(OsString, OsString)>,
@@ -3357,13 +3357,13 @@ struct GitPolicyTestState {
     after_config_listing: Option<Box<dyn FnOnce() + Send>>,
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 fn git_policy_test_states() -> &'static Mutex<HashMap<PathBuf, GitPolicyTestState>> {
     static STATES: OnceLock<Mutex<HashMap<PathBuf, GitPolicyTestState>>> = OnceLock::new();
     STATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 fn with_git_policy_test_state<R>(
     project_root: &Path,
     run: impl FnOnce(&mut GitPolicyTestState) -> R,
@@ -3377,7 +3377,7 @@ fn with_git_policy_test_state<R>(
         .map(run)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 fn signal_git_policy_waiter_for_test(project_root: &Path) {
     let signal =
         with_git_policy_test_state(project_root, |state| state.waiter_signal.take()).flatten();
@@ -3388,7 +3388,7 @@ fn signal_git_policy_waiter_for_test(project_root: &Path) {
 
 #[cfg(unix)]
 fn git_policy_wait_remaining(_project_root: &Path, deadline: Instant) -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if with_git_policy_test_state(_project_root, |state| state.expire_wait).unwrap_or(false) {
         return Duration::ZERO;
     }
@@ -3595,7 +3595,7 @@ impl GitPolicyInputs {
 
 #[cfg(unix)]
 fn git_policy_environment(_project_root: &Path) -> Vec<(OsString, OsString)> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(environment) =
         with_git_policy_test_state(_project_root, |state| state.environment.clone())
     {
@@ -3807,7 +3807,7 @@ fn git_policy_config_inputs(
         return None;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(hook) =
         with_git_policy_test_state(project_root, |state| state.after_config_listing.take())
             .flatten()
@@ -3930,12 +3930,12 @@ thread_local! {
 
 /// Every Git subprocess the policy resolver starts, for tests that measure
 /// whether a resolution reused the cache.
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 static GIT_POLICY_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(unix)]
 fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         GIT_POLICY_SPAWNS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let delay = with_git_policy_test_state(project_root, |state| {
@@ -3948,13 +3948,13 @@ fn git_policy_output(project_root: &Path, args: &[&str]) -> std::io::Result<std:
         }
     }
     let command = crate::effective_path::new_command("git");
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let mut command = command;
     #[cfg(test)]
     if GIT_POLICY_BENCH_OLD.with(|value| value.get()) {
         command.env("PATH", crate::effective_path::effective_path());
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         if let Some(environment) =
             with_git_policy_test_state(project_root, |state| state.environment.clone())
@@ -4035,7 +4035,7 @@ fn resolve_git_policy_inner(project_root: &Path) -> Result<GitPolicy, String> {
                     return resolve_git_policy_uncached(project_root, environment, worker)
                         .map(|(policy, _)| policy);
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 signal_git_policy_waiter_for_test(project_root);
                 let (next_cache, _) = git_policy_cache_changed()
                     .wait_timeout(cache, remaining)
@@ -4096,10 +4096,10 @@ fn resolve_git_policy_uncached(
     environment: Vec<(OsString, OsString)>,
     worker: bool,
 ) -> Result<(GitPolicy, Option<GitPolicyInputs>), String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let test_gate =
         with_git_policy_test_state(project_root, |state| state.uncached_gate.take()).flatten();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(gate) = test_gate {
         let _ = gate.entered.send(());
         if gate.release.recv().unwrap() {
@@ -4590,7 +4590,7 @@ fn configured_git_path_values(
     project_root: &Path,
     keys: &[&str],
 ) -> Result<Vec<Option<String>>, String> {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
     if git_policy_bench_support::BENCH_UNBATCHED.with(|value| value.get()) {
         return git_policy_bench_support::legacy_git_path_values(project_root, keys);
     }
@@ -5948,7 +5948,7 @@ pub fn install_sandbox_launcher_for_test(project_root: &Path, launcher_path: Pat
     LauncherScope(root, previous)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_spawn_plan_for_test<R>(plan: SpawnPlan, run: impl FnOnce() -> R) -> R {
     struct PlanScope(Option<SpawnPlan>);
 
@@ -8253,122 +8253,16 @@ mod tests {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub(crate) mod git_policy_bench_support;
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub(crate) mod git_policy_cache_fixture;
 
 #[cfg(all(test, unix))]
 pub(crate) mod git_policy_cache_tests {
     use super::*;
 
-    pub(crate) struct Fixture {
-        _dir: tempfile::TempDir,
-        pub(crate) root: PathBuf,
-        roots: Mutex<HashSet<PathBuf>>,
-    }
-
-    impl Fixture {
-        pub(crate) fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
-            let root = dir.path().canonicalize().unwrap();
-            let environment = vec![
-                (OsString::from("HOME"), root.clone().into_os_string()),
-                (
-                    OsString::from("XDG_CONFIG_HOME"),
-                    root.join("xdg").into_os_string(),
-                ),
-                (
-                    OsString::from("GIT_CONFIG_GLOBAL"),
-                    root.join("global").into_os_string(),
-                ),
-                (
-                    OsString::from("GIT_CONFIG_SYSTEM"),
-                    root.join("system").into_os_string(),
-                ),
-            ];
-            git_policy_test_states()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .insert(
-                    root.clone(),
-                    GitPolicyTestState {
-                        environment,
-                        ..Default::default()
-                    },
-                );
-            let output = git_policy_output(&root, &["init", "--quiet"]).unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let fixture = Self {
-                _dir: dir,
-                roots: Mutex::new(HashSet::from([root.clone()])),
-                root,
-            };
-            fixture.hooks("first-hooks");
-            fixture.state(|state| state.calls = 0);
-            fixture
-        }
-
-        pub(crate) fn hooks(&self, path: &str) {
-            std::fs::create_dir_all(self.root.join(path)).unwrap();
-            std::fs::write(
-                self.root.join(".git/config"),
-                format!(
-                    "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\thooksPath = {path}\n"
-                ),
-            )
-            .unwrap();
-        }
-
-        fn resolve(&self) -> (GitPolicy, usize) {
-            self.resolve_at(&self.root)
-        }
-
-        fn resolve_at(&self, root: &Path) -> (GitPolicy, usize) {
-            self.register_root(root);
-            let before = with_git_policy_test_state(root, |state| state.calls).unwrap();
-            let policy = with_worker_jail(true, || resolve_git_policy(root)).unwrap();
-            (
-                policy,
-                with_git_policy_test_state(root, |state| state.calls).unwrap() - before,
-            )
-        }
-
-        fn state<R>(&self, run: impl FnOnce(&mut GitPolicyTestState) -> R) -> R {
-            with_git_policy_test_state(&self.root, run).unwrap()
-        }
-
-        pub(crate) fn register_root(&self, root: &Path) {
-            let root = root.canonicalize().unwrap();
-            let environment = self.state(|state| state.environment.clone());
-            git_policy_test_states()
-                .lock()
-                .unwrap()
-                .entry(root.clone())
-                .or_insert_with(|| GitPolicyTestState {
-                    environment,
-                    ..Default::default()
-                });
-            self.roots.lock().unwrap().insert(root);
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            for root in self.roots.lock().unwrap().iter() {
-                let environment = git_policy_environment(root);
-                for worker in [false, true] {
-                    if let Some(key) = git_policy_cache_key(root, &environment, worker) {
-                        git_policy_cache().lock().unwrap().remove(&key);
-                    }
-                }
-                git_policy_test_states().lock().unwrap().remove(root);
-            }
-        }
-    }
-
+    use super::git_policy_cache_fixture::*;
     #[test]
     fn git_policy_cache_is_bounded_and_evicts_least_recent_entries() {
         fn key(index: usize) -> GitPolicyCacheKey {
@@ -8484,30 +8378,6 @@ pub(crate) mod git_policy_cache_tests {
                 "head-policy hook settings are answered from the validated resolution"
             );
         }
-    }
-
-    pub(crate) fn commit(root: &Path) {
-        let commit = git_policy_output(
-            root,
-            &[
-                "-c",
-                "user.name=Cache Test",
-                "-c",
-                "user.email=cache@example.invalid",
-                "commit",
-                "--quiet",
-                "--allow-empty",
-                "-m",
-                "cache fixture",
-            ],
-        )
-        .unwrap();
-        assert!(commit.status.success(), "{commit:?}");
-    }
-
-    pub(crate) fn git_ok(root: &Path, args: &[&str]) {
-        let output = git_policy_output(root, args).unwrap();
-        assert!(output.status.success(), "git {args:?}: {output:?}");
     }
 
     /// What `git worktree list` reports right now, read directly from Git.

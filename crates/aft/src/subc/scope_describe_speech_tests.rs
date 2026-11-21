@@ -27,7 +27,7 @@ async fn fenced_end_retries_one_failed_read_and_kills_tasks_with_scope_revoked_r
             crate::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 30",
             BashShell::Bash,
-            crate::bash_background::registry::resolve_posix_shell(),
+            aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
             "fanout-session".into(),
             root.clone(),
             HashMap::new(),

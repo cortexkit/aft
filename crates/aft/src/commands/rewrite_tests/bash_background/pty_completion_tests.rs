@@ -1,4 +1,4 @@
-use crate::bash_background::registry::test_support::ConPtyFixture as Fixture;
+use aft_engine::test_bridge::bash_remote::registry_support::ConPtyFixture as Fixture;
 
 fn assert_status_text(data: serde_json::Value, reason: &str) {
     let text = crate::subc_format::format_response(

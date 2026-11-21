@@ -16,7 +16,7 @@ fn vector_of(text: &str) -> Vec<f32> {
 
 /// Holds every embedding request whose input names `marker` until
 /// [`Gate::open`] is called.
-pub(crate) struct Gate {
+pub struct Gate {
     marker: &'static str,
     open: Mutex<bool>,
     opened: Condvar,
@@ -26,13 +26,18 @@ pub(crate) struct Gate {
 }
 
 impl Gate {
-    pub(crate) fn held(&self) -> usize {
+    pub fn held(&self) -> usize {
         self.held.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn open(&self) {
+    pub fn open(&self) {
         *self.open.lock().unwrap() = true;
         self.opened.notify_all();
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn texts_embedded(&self) -> usize {
+        self.texts.load(Ordering::SeqCst)
     }
 
     fn wait_if_held(&self, texts: &[String]) {
@@ -50,7 +55,7 @@ impl Gate {
 /// A loopback OpenAI-compatible embedding server answering every text
 /// with [`vector_of`], holding requests that name `marker` until the
 /// returned gate opens. Returns its base URL.
-pub(crate) fn serve(marker: &'static str) -> (String, Arc<Gate>) {
+pub fn serve(marker: &'static str) -> (String, Arc<Gate>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let gate = Arc::new(Gate {

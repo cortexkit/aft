@@ -1,11 +1,11 @@
 //! Manual reproduction of health's memory census with retained, edited AFT engines.
 
 use super::*;
-use crate::data_layer::runtime::{
-    memory_figure_walks_for_test, memory_profile_layer_for_test,
-    with_memory_figure_baseline_for_test,
-};
 use crate::test_allocations::profile::{cpu_ns, STEPS};
+use aft_engine::test_bridge::display_data::memory_profile::{
+    memory_figure_walks_for_test, memory_profile_layer_for_test,
+    with_memory_figure_baseline_for_test, with_memory_walk_clock_for_test,
+};
 
 fn copy_sources(source: &Path, root: &Path) {
     let tracked = std::process::Command::new("git")
@@ -146,7 +146,7 @@ fn retained_aft_engines() {
                 let epoch =
                     start + Duration::from_secs((mode_index * 240 + phase_index * 120) as u64);
                 // Warm initial publication and memory figures outside the steady-state window.
-                crate::context::with_memory_walk_clock_for_test(epoch, || {
+                aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(epoch, || {
                     cache.refresh_for_test(&executor, &app);
                 });
                 let mut total_cpu = 0;
@@ -175,7 +175,7 @@ fn retained_aft_engines() {
                         STEPS.with(|held| *held.borrow_mut() = steps);
                     }
                     let now = epoch + Duration::from_secs(tick * 3);
-                    crate::context::with_memory_walk_clock_for_test(now, || {
+                    with_memory_walk_clock_for_test(now, || {
                         // Measure the census separately per root, then the full rollup
                         // on the same thread. The latter reuses those exact figures.
                         let mut root_cpu = 0;
@@ -183,7 +183,7 @@ fn retained_aft_engines() {
                             let before_walks = memory_figure_walks_for_test();
                             let before_cpu = cpu_ns();
                             std::hint::black_box(
-                                crate::data_layer::surfaces::memory_estimate_for_rollup(ctx),
+                                aft_engine::test_bridge::display_data::surfaces::memory_estimate_for_rollup(ctx),
                             );
                             let elapsed = cpu_ns() - before_cpu;
                             root_cpu += elapsed;

@@ -87,7 +87,7 @@ impl aft_store::heap::HeapBytes for FillFailure {
 
 /// How a checkout's meaning search stands.
 #[derive(Debug, Clone)]
-pub(crate) enum MeaningState {
+pub enum MeaningState {
     /// Semantic search is off or not admitted for the root.
     Off,
     /// The checkout has published nothing yet, so there is nothing to fill.
@@ -534,7 +534,7 @@ impl Meaning {
         config: &SemanticBackendConfig,
         model: &mut Option<(SemanticBackendConfig, SemanticEmbeddingModel)>,
     ) -> Round {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
         if main_parity_vectors::uses_constant_vectors(checkout.root()) {
             return self.fill_main_parity_vectors(checkout, config);
         }
@@ -555,11 +555,11 @@ impl Meaning {
             if let Some(dimensions) = model_free_dimensions_for_test(checkout.root()) {
                 return self.fill_without_model_for_test(checkout, config, dimensions);
             }
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let constant_dimensions = lock(constant_vectors_for_test())
                 .get(checkout.root())
                 .copied();
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(dimensions) = constant_dimensions {
                 return self.fill_constant_vectors_for_test(checkout, config, dimensions);
             }
@@ -636,7 +636,7 @@ impl Meaning {
 }
 
 /// Fill implementations that exercise stored coverage without loading a model.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Meaning {
     fn fill_constant_vectors_for_test(
         &self,
@@ -681,6 +681,7 @@ impl Meaning {
 
     /// A fill for a checkout with no files meaning search applies to: the
     /// plane is made for `dimensions` and nothing is embedded.
+    #[cfg(test)]
     fn fill_without_model_for_test(
         &self,
         checkout: &Arc<Checkout>,
@@ -721,7 +722,7 @@ fn model_free_planes_for_test() -> &'static Mutex<std::collections::HashMap<Path
     PLANES.get_or_init(Default::default)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn constant_vectors_for_test() -> &'static Mutex<std::collections::HashMap<PathBuf, usize>> {
     static PLANES: std::sync::OnceLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
         std::sync::OnceLock::new();
@@ -730,7 +731,7 @@ fn constant_vectors_for_test() -> &'static Mutex<std::collections::HashMap<PathB
 
 /// Embed constant, correctly sized rows without model or network work, while
 /// still exercising meaning search's fill, publication and follow-up jobs.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn fill_with_constant_vectors_for_test(root: &Path, dimensions: usize) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
@@ -846,9 +847,9 @@ pub(crate) fn waiting(coverage: &Coverage) -> bool {
     !coverage.pending.is_empty()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub(crate) use main_parity_vectors::use_constant_vectors;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 #[path = "main_parity_vectors.rs"]
 mod main_parity_vectors;

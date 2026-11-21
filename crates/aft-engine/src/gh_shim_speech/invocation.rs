@@ -9,13 +9,9 @@ use super::{Code, Refusal};
 
 const MAX_INPUT_BYTES: usize = 4 * 1024 * 1024;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Invocation {
-    pub(crate) args: Vec<String>,
-    pub(crate) body_inputs: BTreeMap<String, String>,
-}
-
+#[path = "invocation_types.rs"]
+pub(crate) mod invocation_types;
+pub(crate) use invocation_types::Invocation;
 impl Invocation {
     pub(crate) fn validate(&self) -> Result<(), Refusal> {
         let mut bytes = 0usize;

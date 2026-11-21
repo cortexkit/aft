@@ -892,7 +892,7 @@ fn runon_uncaptured_reply_reports_terminal_outcome_not_starting() {
 
 #[tokio::test]
 async fn exec_remote_bash_keyed_disconnect_reattaches_while_job_is_running() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use aft_engine::test_bridge::bash_remote::remote_wire::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Running).await;
     let dir = tempfile::tempdir().unwrap();
     ensure_git_fixture(dir.path());
@@ -966,7 +966,7 @@ async fn runon_restart_first_watch_reattaches(
     auth_refusals: u32,
     lost: bool,
 ) {
-    let daemon = crate::exec_remote::wire_tests::daemon_with_capabilities(
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities(
         Script::RestartRunning {
             auth_refusals,
             lost,
@@ -1376,7 +1376,7 @@ async fn restart_unaccepted_submission(
 
 #[tokio::test]
 async fn remote_restart_unaccepted_running_job_attaches_and_finishes() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use aft_engine::test_bridge::bash_remote::remote_wire::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Running).await;
     let (_dir, ctx, task_id, paths) =
         restart_unaccepted_submission(daemon.connection.clone(), Some(id()), true).await;
@@ -1413,7 +1413,7 @@ async fn remote_restart_unaccepted_running_job_attaches_and_finishes() {
 
 #[tokio::test]
 async fn remote_restart_unaccepted_completed_job_replays_output() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use aft_engine::test_bridge::bash_remote::remote_wire::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Finished).await;
     let (_dir, ctx, task_id, paths) =
         restart_unaccepted_submission(daemon.connection.clone(), Some(id()), false).await;
@@ -1480,7 +1480,7 @@ async fn remote_restart_unaccepted_without_job_id_settles_without_resubmission()
 
 #[tokio::test]
 async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use aft_engine::test_bridge::bash_remote::remote_wire::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Queued).await;
     let (_dir, ctx, task_id, paths) =
         restart_unaccepted_submission(daemon.connection.clone(), Some(id()), true).await;
@@ -1535,7 +1535,7 @@ async fn remote_restart_unaccepted_queued_progress_reaches_bash_status() {
 
 #[tokio::test]
 async fn remote_queue_wait_wire_vectors_reach_bash_status_as_queued_progress() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use aft_engine::test_bridge::bash_remote::remote_wire::{outage_daemon_with_replay, OutageReplay};
     use sha2::{Digest, Sha256};
     // Published 0.2.22 progress vectors, including an unknown waiting reason.
     // Send their bytes unchanged: enum construction can conceal pin changes.
@@ -1591,7 +1591,7 @@ async fn remote_queue_wait_wire_vectors_reach_bash_status_as_queued_progress() {
 
 #[tokio::test]
 async fn remote_restart_unaccepted_quiet_attach_waits_without_claiming_capture() {
-    use crate::exec_remote::wire_tests::{outage_daemon_with_replay, OutageReplay};
+    use aft_engine::test_bridge::bash_remote::remote_wire::{outage_daemon_with_replay, OutageReplay};
     let daemon = outage_daemon_with_replay(OutageReplay::Silent).await;
     let (_dir, ctx, task_id, paths) =
         restart_unaccepted_submission(daemon.connection.clone(), Some(id()), false).await;
@@ -1898,7 +1898,7 @@ fn handle_with_policy(
 pub(crate) fn assert_siblings_submit_refused_before_connect(
     ctx: &crate::context::AppContext,
     launch: crate::bash_background::RemoteLaunch,
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
     message: &str,
 ) {
     let marker = ctx
@@ -1946,7 +1946,7 @@ pub(crate) fn assert_siblings_submit_refused_before_connect(
 pub(crate) async fn submit_runon_for_test(
     ctx: &crate::context::AppContext,
     launch: crate::bash_background::RemoteLaunch,
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
 ) -> serde_json::Value {
     let response = handle_with_policy(
         ctx,
@@ -2631,7 +2631,7 @@ async fn runon_macos_reaches_the_wire_request_as_macos_platform() {
 
 #[tokio::test]
 async fn runon_memory_is_sent_only_when_requested_and_supported() {
-    use crate::exec_remote::wire_tests::daemon_with_capabilities;
+    use aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_capabilities;
     for (runon, supports_memory, expected) in [
         ("linux", false, None),
         ("linux", true, None),
@@ -2797,7 +2797,7 @@ async fn malformed_runon_vcpu_requests_are_refused_before_dispatch() {
 async fn old_shape_prefix_routing_survives_the_runon_kill_switch_and_runon_works_when_enabled() {
     for enabled in [false, true] {
         let daemon =
-            crate::exec_remote::wire_tests::daemon_with_clients(Script::Plain, "exec-remote/v1", 2)
+            aft_engine::test_bridge::bash_remote::remote_wire::daemon_with_clients(Script::Plain, "exec-remote/v1", 2)
                 .await;
         let dir = tempfile::tempdir().unwrap();
         let ctx = remote_test_context_with_runon(dir.path(), enabled);
@@ -2996,7 +2996,7 @@ async fn a_reporting_runner_report_is_printed_after_the_output() {
     );
     assert!(
         rendered.ends_with(
-            &render_terminal_report(&crate::exec_remote::wire_tests::report_vector("all"), &[])
+            &render_terminal_report(&aft_engine::test_bridge::bash_remote::remote_wire::report_vector("all"), &[])
                 .unwrap()
         ),
         "{rendered}"
@@ -3012,7 +3012,7 @@ async fn a_reporting_runner_report_is_printed_after_the_output() {
 /// reply and how long its foreground wait took.
 async fn orchestrated_reply(
     ctx: &crate::context::AppContext,
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
     params: serde_json::Value,
 ) -> (crate::protocol::Response, Duration) {
     // These callers check terminal payloads, not the foreground wait cap.
@@ -3030,7 +3030,7 @@ async fn orchestrated_reply(
 /// of the wait cap in a particular remote phase.
 async fn orchestrated_reply_with_probe(
     ctx: &crate::context::AppContext,
-    daemon: &crate::exec_remote::wire_tests::Daemon,
+    daemon: &aft_engine::test_bridge::bash_remote::remote_wire::Daemon,
     mut params: serde_json::Value,
     ready: impl Fn(&str) -> bool,
 ) -> (crate::protocol::Response, Duration) {

@@ -5,14 +5,15 @@ mod tests {
 
     use crate::context::AppContext;
     use crate::data_layer::content;
-    use crate::data_layer::outline::{
-        already_claimed_for_test, prewarm, root_bound, warm_file, Prewarm,
-    };
-    #[cfg(unix)]
-    use crate::data_layer::outline::{record_reads, tables};
+    use crate::data_layer::outline::{root_bound, warm_file};
     use crate::parser::work_counters;
     use crate::parser::{SharedSymbolCache, SymbolCache};
     use crate::protocol::{RawRequest, Response};
+    use aft_engine::test_bridge::display_data::outline::{
+        already_claimed_for_test, complete_rust_outline, prewarm, Prewarm,
+    };
+    #[cfg(unix)]
+    use aft_engine::test_bridge::display_data::outline::{record_reads, tables};
 
     fn write(root: &Path, path: &str, text: &str) -> PathBuf {
         let path = root.join(path);
@@ -116,7 +117,7 @@ pub fn separator() -> char {
         }
         for (from, to) in [
             ("../aft-store/src/stat.rs", "src/stat.rs"),
-            ("src/data_layer/runtime.rs", "src/runtime.rs"),
+            ("../aft-engine/src/data_layer/runtime.rs", "src/runtime.rs"),
             ("tests/fixtures/sample.go", "pkg/sample.go"),
         ] {
             copy(root, &crate_dir.join(from), to);
@@ -195,14 +196,14 @@ pub fn separator() -> char {
             .symbols
             .iter()
             .any(|symbol| symbol.scoped_name == "Host::held_calls"));
-        let completed = content::complete_rust_outline(raw.clone(), surface);
+        let completed = complete_rust_outline(raw.clone(), surface);
         assert_eq!(
             record.encode(),
             encoded,
             "navigation must not rewrite the record"
         );
         assert_eq!(
-            content::complete_rust_outline(completed.clone(), surface),
+            complete_rust_outline(completed.clone(), surface),
             completed,
             "members must not be duplicated when already present"
         );
@@ -214,7 +215,7 @@ pub fn separator() -> char {
         assert_eq!(
             prewarm(&view, &cache, generation, &|| false)
                 .unwrap()
-                .loaded,
+                .loaded(),
             1
         );
         let before = work_counters::tree_parses();
@@ -386,8 +387,8 @@ pub fn separator() -> char {
 
         // A second prewarm finds every file in the cache already.
         let again = prewarm(&view, &cache, generation, &|| false).unwrap();
-        assert_eq!(again.cached, sources.len() as u64);
-        assert_eq!(again.loaded, 0);
+        assert_eq!(again.cached(), sources.len() as u64);
+        assert_eq!(again.loaded(), 0);
     }
 
     /// A file that moved on from its published content, on disk only or
@@ -407,8 +408,8 @@ pub fn separator() -> char {
         assert!(view.outline_symbols(b"src/store.rs").unwrap().is_some());
         let cache = fresh_cache();
         let report = prewarm(&view, &cache, 0, &|| false).unwrap();
-        assert_eq!(report.left, 1);
-        assert_eq!(report.loaded, sources.len() as u64 - 1);
+        assert_eq!(report.left(), 1);
+        assert_eq!(report.loaded(), sources.len() as u64 - 1);
         assert!(!cache.read().unwrap().contains_key(&store));
         assert!(!warm_file(&view, &cache, &store));
 
@@ -423,7 +424,7 @@ pub fn separator() -> char {
         // A reset cache is not filled for the generation it left.
         let stale = cache.write().unwrap().reset() - 1;
         let report = prewarm(&view, &cache, stale, &|| false).unwrap();
-        assert!(report.stopped);
+        assert!(report.stopped());
         assert_eq!(cache.read().unwrap().len(), 0);
     }
 
@@ -640,7 +641,7 @@ pub fn separator() -> char {
         let decoded = tables::without_sharing(|| {
             prewarm(&worktree_view, &cache, generation, &|| false).unwrap()
         });
-        assert_eq!(decoded.loaded, files);
+        assert_eq!(decoded.loaded(), files);
         assert_eq!(record_reads() - reads, files);
         let decoded_bytes = cache.read().unwrap().estimated_memory().estimated_bytes;
         // Up to four top-level symbols of each file to zoom on and search.
@@ -689,14 +690,14 @@ pub fn separator() -> char {
         let main_cache = main_ctx.symbol_cache();
         let main_generation = main_cache.read().unwrap().generation();
         let main_report = prewarm(&main_view, &main_cache, main_generation, &|| false).unwrap();
-        assert_eq!(main_report.loaded, files);
+        assert_eq!(main_report.loaded(), files);
 
         // The worktree bound again takes them: no record and no file read.
         let generation = cache.write().unwrap().reset();
         let reads = record_reads();
         let source_reads = work_counters::SOURCE_READS.with(std::cell::Cell::get);
         let shared = prewarm(&worktree_view, &cache, generation, &|| false).unwrap();
-        assert_eq!(shared.loaded, files);
+        assert_eq!(shared.loaded(), files);
         assert_eq!(record_reads() - reads, 0, "records read");
         assert_eq!(
             work_counters::SOURCE_READS.with(std::cell::Cell::get) - source_reads,
@@ -709,12 +710,12 @@ pub fn separator() -> char {
         assert_eq!(shared_bytes.map(|bytes| bytes + table_bytes), decoded_bytes);
         let listed = loop {
             // Another test's prewarm may hold the tables for a moment.
-            if let Some(stats) = tables::shared().stats() {
+            if let Some(stats) = tables::shared_bytes() {
                 break stats;
             }
             std::thread::yield_now();
         };
-        assert!(listed.bytes >= table_bytes);
+        assert!(listed >= table_bytes);
 
         let after = answers(&worktree_ctx, &worktree, &sources, &symbols);
         assert_eq!(after.len(), before.len());

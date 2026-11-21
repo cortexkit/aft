@@ -1331,7 +1331,7 @@ impl Checkout {
             return Ok(false);
         }
         #[cfg(all(
-            test,
+            any(test, feature = "test-support"),
             feature = "wasm-grammars",
             feature = "test-hooks",
             not(all(target_os = "windows", target_arch = "aarch64"))
@@ -1719,7 +1719,7 @@ impl Checkout {
             .finish()
             .map_err(|error| graph_spill_error(error, &paused))?;
         #[cfg(all(
-            test,
+            any(test, feature = "test-support"),
             feature = "wasm-grammars",
             feature = "test-hooks",
             not(all(target_os = "windows", target_arch = "aarch64"))
@@ -5934,7 +5934,7 @@ impl CheckoutView {
             let Some(ordinal) = content.find(key).map_err(DataError::store)? else {
                 continue;
             };
-            #[cfg(test)]
+            #[cfg(any(test, all(unix, feature = "test-support")))]
             super::outline::note_record_read();
             let record = content.record(ordinal).map_err(DataError::store)?;
             let RecordBody::Parsed { surface, body } = record.data else {

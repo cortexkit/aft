@@ -793,7 +793,7 @@ fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
         assert!(
             skipped.iter().any(
                 |skip| skip["file"] == json!(root.join(name).join("large.rs"))
-                    && skip["reason"] == crate::large_read::WHOLE_READ_SKIP_REASON
+                    && skip["reason"] == crate::large_read_counts::WHOLE_READ_SKIP_REASON
             ),
             "{response:?}"
         );
@@ -811,7 +811,7 @@ fn audit1432_parent_search_collects_ceiling_skips_from_both_children() {
 #[test]
 fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     use crate::config::{SemanticBackend, SemanticBackendConfig};
-    use crate::data_layer::meaning::MeaningState;
+    use aft_engine::test_bridge::display_data::meaning::MeaningState;
     crate::parent_search::set_default_refresh_interval(Duration::from_millis(100));
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
@@ -821,7 +821,8 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     for name in ["alpha", "beta"] {
         init_repo(&root.join(name), name);
     }
-    let (base_url, gate) = crate::data_layer::meaning_query::test_support::serve("never-held");
+    let (base_url, gate) =
+        aft_engine::test_bridge::display_data::meaning_query::serve("never-held");
     gate.open();
     let semantic = SemanticBackendConfig {
         backend: SemanticBackend::OpenAiCompatible,
@@ -884,7 +885,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     }));
     let beta_gap = child_gap(
         "beta",
-        Some(crate::data_layer::parent::NO_VECTORS.to_string()),
+        Some(aft_engine::test_bridge::display_data::NO_VECTORS.to_string()),
     );
     // Each child builds its checkout on first use; once both have
     // published, only beta is named, for its missing vectors.

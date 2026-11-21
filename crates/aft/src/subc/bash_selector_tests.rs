@@ -390,7 +390,7 @@ async fn cancelled_call_notice_read_case(intervening: NoticeInterveningCall, sta
             crate::sandbox_spawn::SpawnPlan::Unsandboxed,
             "sleep 60",
             crate::bash_background::BashShell::Bash,
-            crate::bash_background::registry::resolve_posix_shell(),
+            aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
             CANCEL_SESSION.into(),
             root.as_path().into(),
             HashMap::new(),

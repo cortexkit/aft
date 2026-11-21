@@ -482,7 +482,7 @@ struct Work {
     folding: Arc<AtomicBool>,
     /// A call-graph refresh is queued or running.
     refreshing: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     refreshes_started: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     refresh_hold: Arc<AtomicBool>,
@@ -732,12 +732,11 @@ impl Work {
             }
             let mut flag = Some(flag);
             let mut requested = false;
+            #[cfg(any(test, feature = "test-support"))]
+            work.refreshes_started.fetch_add(1, Ordering::SeqCst);
             #[cfg(test)]
-            {
-                work.refreshes_started.fetch_add(1, Ordering::SeqCst);
-                while work.refresh_hold.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(5));
-                }
+            while work.refresh_hold.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(5));
             }
             loop {
                 requested |= work.refresh_requested.swap(false, Ordering::AcqRel);
@@ -853,7 +852,7 @@ impl Work {
             std::thread::sleep(delay);
         }
         #[cfg(all(
-            test,
+            any(test, feature = "test-support"),
             feature = "wasm-grammars",
             feature = "test-hooks",
             not(all(target_os = "windows", target_arch = "aarch64"))
@@ -1082,7 +1081,7 @@ impl Work {
                     let _flag = flag;
                     let registry = crate::grammar::registry();
                     #[cfg(all(
-                        test,
+                        any(test, feature = "test-support"),
                         feature = "wasm-grammars",
                         feature = "test-hooks",
                         not(all(target_os = "windows", target_arch = "aarch64"))
@@ -1544,7 +1543,7 @@ impl DataCheckout {
             build_tasks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             folding: Arc::new(AtomicBool::new(false)),
             refreshing: Arc::new(AtomicBool::new(false)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             refreshes_started: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             refresh_hold: Arc::new(AtomicBool::new(false)),
@@ -2353,7 +2352,7 @@ impl DataCheckout {
                 || (reuse_dirty
                     && now.saturating_duration_since(previous.attempted_at)
                         < MEMORY_FIGURE_MAX_AGE);
-            #[cfg(all(test, target_os = "linux"))]
+            #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
             let reuse = if reuse_dirty && MEMORY_FIGURE_BASELINE.with(std::cell::Cell::get) {
                 previous.version == epoch && age < MEMORY_FIGURE_MAX_AGE
             } else {
@@ -2366,7 +2365,7 @@ impl DataCheckout {
                 );
             }
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         MEMORY_FIGURE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let figure = walk();
         if figure.shared.status == "busy" || !figure.shared.not_estimated.is_empty() {
@@ -2402,7 +2401,7 @@ impl DataCheckout {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static MEMORY_FIGURE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     #[cfg(target_os = "linux")]
@@ -2410,7 +2409,7 @@ thread_local! {
 }
 
 /// Compare the former epoch-or-age refresh policy on the same retained engines.
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub(crate) fn with_memory_figure_baseline_for_test<T>(
     baseline: bool,
     measure: impl FnOnce() -> T,
@@ -2425,18 +2424,22 @@ pub(crate) fn with_memory_figure_baseline_for_test<T>(
     measure()
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 pub(crate) fn memory_profile_layer_for_test() -> Arc<DataLayer> {
     layer()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn memory_figure_walks_for_test() -> usize {
     MEMORY_FIGURE_WALKS.with(std::cell::Cell::get)
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod publication_fixture;
+
 #[cfg(test)]
 pub(crate) mod tests {
+    use super::publication_fixture::{wait_until, PublicationFixture};
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -2630,127 +2633,6 @@ pub(crate) mod tests {
                 deadline.at = at;
                 self.manual_clock.lock().as_mut().unwrap().pending = Some(deadline);
             }
-        }
-    }
-
-    pub(crate) struct PublicationFixture {
-        handle: Arc<DataCheckout>,
-        _root: tempfile::TempDir,
-        _storage: tempfile::TempDir,
-    }
-
-    impl PublicationFixture {
-        pub(crate) fn new(settle: Duration, quiet: Duration) -> Self {
-            let root = tempfile::tempdir().unwrap();
-            let storage = tempfile::tempdir().unwrap();
-            let path = std::fs::canonicalize(root.path()).unwrap();
-            std::fs::create_dir_all(path.join("src")).unwrap();
-            std::fs::write(path.join("Cargo.toml"), "[package]\nname = \"demo\"\n").unwrap();
-            std::fs::write(path.join("src/lib.rs"), "pub fn original() {}\n").unwrap();
-            let handle = DataCheckout::open_with_periods(
-                &path,
-                storage.path(),
-                None,
-                Planes::ALL,
-                quiet,
-                settle,
-            )
-            .unwrap();
-            assert!(matches!(
-                handle.fresh_view(Duration::from_secs(60)),
-                Fresh::Ready(_)
-            ));
-            wait_until(|| !handle.work.running());
-            Self {
-                handle,
-                _root: root,
-                _storage: storage,
-            }
-        }
-
-        fn add(&self, stem: &str, count: usize) {
-            let paths = (0..count)
-                .map(|i| {
-                    let path = self.handle.root().join(format!("src/{stem}{i}.rs"));
-                    std::fs::write(&path, format!("pub fn {stem}{i}() {{}}\n")).unwrap();
-                    path
-                })
-                .collect::<Vec<_>>();
-            self.handle.note_paths(&paths);
-        }
-
-        fn refresh(&self) {
-            assert!(matches!(
-                self.handle.fresh_view(Duration::from_secs(60)),
-                Fresh::Ready(_)
-            ));
-            wait_until(|| !self.handle.work.refreshing.load(Ordering::Acquire));
-        }
-
-        fn publications(&self) -> usize {
-            self.handle.work.publications_started.load(Ordering::SeqCst)
-        }
-
-        fn context(&self) -> crate::context::AppContext {
-            self.context_with(crate::context::AppContext::new)
-        }
-
-        pub(crate) fn context_with(
-            &self,
-            make_context: impl FnOnce(
-                Box<dyn crate::language::LanguageProvider>,
-                crate::config::Config,
-            ) -> crate::context::AppContext,
-        ) -> crate::context::AppContext {
-            let ctx = make_context(
-                Box::new(crate::parser::TreeSitterProvider::new()),
-                crate::config::Config {
-                    project_root: Some(self.handle.root().to_path_buf()),
-                    storage_dir: Some(self._storage.path().to_path_buf()),
-                    harness: Some(crate::harness::Harness::Opencode),
-                    ..crate::config::Config::default()
-                },
-            );
-            ctx.set_canonical_cache_root(self.handle.root().to_path_buf());
-            ctx.set_harness(crate::harness::Harness::Opencode);
-            ctx.pin_data_checkout(Arc::clone(&self.handle));
-            ctx
-        }
-
-        pub(crate) fn root(&self) -> &Path {
-            self.handle.root()
-        }
-
-        pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
-            self.handle.note_paths(paths);
-        }
-
-        pub(crate) fn record_change(&self, intent: &WriteIntent, phase: WritePhase) {
-            self.handle._listener.record_change(intent, phase);
-        }
-
-        pub(crate) fn pending(&self) -> bool {
-            pending(self.handle.checkout())
-        }
-
-        pub(crate) fn quiet_armed(&self) -> bool {
-            self.handle.quiet.armed.load(Ordering::Acquire)
-        }
-
-        pub(crate) fn wait_for_work(&self) {
-            wait_until(|| !self.handle.work.running());
-        }
-
-        pub(crate) fn refreshes(&self) -> usize {
-            self.handle.work.refreshes_started.load(Ordering::SeqCst)
-        }
-    }
-
-    fn wait_until(ready: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !ready() {
-            assert!(Instant::now() < deadline, "background work did not finish");
-            std::thread::sleep(Duration::from_millis(5));
         }
     }
 

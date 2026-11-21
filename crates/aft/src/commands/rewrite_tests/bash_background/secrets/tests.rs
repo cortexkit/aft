@@ -1,4 +1,3 @@
-use crate::bash_background::secrets::test_support::*;
 use crate::bash_background::secrets::*;
 use crate::context::AppContext;
 use crate::protocol::RawRequest;
@@ -6,6 +5,7 @@ use crate::protocol::Response;
 use crate::sandbox_spawn::SpawnPlan;
 use crate::secret::SecretVault;
 use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
+use aft_engine::test_bridge::bash_remote::secrets_support::*;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
@@ -214,11 +214,11 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
         "scope-watch-unit",
     )
     .unwrap();
-    let environment = crate::sandbox_spawn::ChildEnvironment::from([(
+    let environment = aft_engine::test_bridge::bash_remote::ChildEnvironment::from([(
         OsString::from("SAFE"),
         OsString::from("yes"),
     )]);
-    let prepared = crate::sandbox_spawn::prepare_task_payload(
+    let prepared = aft_engine::test_bridge::bash_remote::prepare_task_payload(
         &layout,
         b"true",
         root.path(),
@@ -347,7 +347,7 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
         "ordinary",
     )
     .unwrap();
-    let ordinary = crate::sandbox_spawn::resolve_command_sandbox_spawn(
+    let ordinary = aft_engine::test_bridge::bash_remote::resolve_command_sandbox_spawn(
         &ctx,
         &AuthenticatedPrincipal::FirstParty,
         RequestedSandboxTier::Native,
@@ -415,7 +415,7 @@ fn secret_bash_sandbox_raise_setup_refusals_name_the_cause() {
         mismatch_class: None,
     };
     let reply = with_vault(vault.clone(), || {
-        crate::sandbox_spawn::with_spawn_plan_for_test(unavailable, || {
+        aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(unavailable, || {
             crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
         })
     });
@@ -461,7 +461,7 @@ fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
             let task = preflight.task.as_ref().unwrap();
             let principal = AuthenticatedPrincipal::FirstParty;
             let shell = Path::new("/bin/sh");
-            let prepared = crate::sandbox_spawn::prepare_task_payload(
+            let prepared = aft_engine::test_bridge::bash_remote::prepare_task_payload(
                 task,
                 b"printf probe",
                 root.path(),
@@ -472,7 +472,7 @@ fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
             )
             .unwrap();
             let plan = preflight.plan.clone().with_prepared_task(prepared);
-            let digest = crate::sandbox_spawn::save_local_launch(
+            let digest = aft_engine::test_bridge::bash_remote::save_local_launch(
                 &plan,
                 root.path(),
                 root.path(),
@@ -483,7 +483,8 @@ fn secret_bash_sandbox_raise_saved_plan_keeps_strict_profile() {
                 crate::config::DEFAULT_LINUX_SCOPE_MAX_RUNTIME_SECS,
             )
             .unwrap();
-            let (restored, ..) = crate::sandbox_spawn::restore_local_launch(task, &digest).unwrap();
+            let (restored, ..) =
+                aft_engine::test_bridge::bash_remote::restore_local_launch(task, &digest).unwrap();
             assert!(restored.protects_secret_memory(), "{restored:?}");
             assert_eq!(
                 crate::sandbox_spawn::effective_sandbox_mode(&ctx, &principal),
@@ -666,7 +667,7 @@ fn secret_bash_nonqualifying_plans_precede_scope_and_rewrite() {
     ];
     for plan in plans {
         let reply = with_vault(vault.clone(), || {
-            crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+            aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(plan, || {
                 crate::commands::bash::handle(
                     &request("echo '{{ck-secret:test}}' >> must-not-be-rewritten"),
                     &ctx,

@@ -1,4 +1,4 @@
-use crate::bash_background::registry::{test_support, BgTask};
+use aft_engine::test_bridge::bash_remote::{registry_support as test_support, BgTask};
 use std::sync::Arc;
 
 pub(crate) fn wait_fixture(
@@ -19,8 +19,8 @@ pub(super) fn assert_worker_wait_limit(ctx: &crate::context::AppContext) {
 fn message_detach_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {
     let (_dir, ctx, task) = wait_fixture(explicit_timeout);
     let registry = ctx.bash_background();
-    let task_id = &task.task_id;
-    let session_id = &task.session_id;
+    let task_id = task.task_id();
+    let session_id = task.session_id();
     let request = serde_json::from_value(serde_json::json!({
         "id": "message-detach", "command": "bash", "session_id": session_id,
         "worker_session": worker_session,
@@ -71,12 +71,12 @@ fn pending_message_detach_preserves_wait_mode_eligibility() {
             serde_json::json!({})
         };
         let request = serde_json::from_value(serde_json::json!({
-            "id": "pending-message", "command": "bash", "session_id": task.session_id,
+            "id": "pending-message", "command": "bash", "session_id": task.session_id(),
             "params": params
         }))
         .unwrap();
         let admission = serde_json::from_value(serde_json::json!({
-            "id": "admission", "command": "bash_wait_detach", "session_id": task.session_id,
+            "id": "admission", "command": "bash_wait_detach", "session_id": task.session_id(),
             "pending": true
         }))
         .unwrap();
@@ -86,7 +86,7 @@ fn pending_message_detach_preserves_wait_mode_eligibility() {
             &ctx,
             crate::protocol::Response::success(
                 "pending-message",
-                serde_json::json!({"task_id": task.task_id, "status": "running"}),
+                serde_json::json!({"task_id": task.task_id(), "status": "running"}),
             ),
         );
         if !wait {
@@ -95,7 +95,7 @@ fn pending_message_detach_preserves_wait_mode_eligibility() {
             };
             assert!(!ctx
                 .bash_background()
-                .request_wait_mode_detach(&task.session_id));
+                .request_wait_mode_detach(task.session_id()));
             assert!(
                 (pending.poll)(&ctx).is_none(),
                 "a message during a plain foreground wait must not detach it"
@@ -114,7 +114,7 @@ fn pending_message_detach_preserves_wait_mode_eligibility() {
             .data
             .to_string()
             .contains("Detached because a user message arrived"));
-        assert_eq!(response.data["task_id"], task.task_id);
+        assert_eq!(response.data["task_id"], task.task_id());
         assert_eq!(ctx.bash_background().active_wait_session_count(), 0);
     }
 }
@@ -123,9 +123,9 @@ fn pending_message_detach_preserves_wait_mode_eligibility() {
 fn pending_message_does_not_change_background_launch() {
     let (_dir, ctx, task) = wait_fixture(None);
     ctx.bash_background()
-        .request_wait_mode_detach(&task.session_id);
+        .request_wait_mode_detach(task.session_id());
     let request = serde_json::from_value(serde_json::json!({
-        "id": "background", "command": "bash", "session_id": task.session_id,
+        "id": "background", "command": "bash", "session_id": task.session_id(),
         "params": { "background": true }
     }))
     .unwrap();
@@ -134,7 +134,7 @@ fn pending_message_does_not_change_background_launch() {
         &ctx,
         crate::protocol::Response::success(
             "background",
-            serde_json::json!({"task_id": task.task_id, "status": "running"}),
+            serde_json::json!({"task_id": task.task_id(), "status": "running"}),
         ),
     );
     let crate::response_finalize::DispatchOutcome::Immediate(response) = outcome else {
@@ -146,10 +146,10 @@ fn pending_message_does_not_change_background_launch() {
         .contains("Detached because a user message arrived"));
     assert_eq!(ctx.bash_background().active_wait_session_count(), 0);
     ctx.bash_background()
-        .begin_wait_mode_session(&task.session_id, "later-foreground");
+        .begin_wait_mode_session(task.session_id(), "later-foreground");
     assert!(ctx
         .bash_background()
-        .take_task_wait_mode_detach(&task.session_id, "later-foreground"));
+        .take_task_wait_mode_detach(task.session_id(), "later-foreground"));
 }
 
 #[test]
@@ -167,8 +167,8 @@ fn head_capped_wait_promotion_preserves_default_hard_kill() {
     let (_dir, ctx, task) = wait_fixture(None);
     let response = crate::commands::bash_orchestrate::promote_bash(
         &ctx,
-        &task.task_id,
-        &task.session_id,
+        task.task_id(),
+        task.session_id(),
         None,
         1_800_000,
         "cap-handoff",
@@ -179,7 +179,7 @@ fn head_capped_wait_promotion_preserves_default_hard_kill() {
     assert!(response.success, "promotion failed: {:?}", response.data);
     assert_eq!(
         ctx.bash_background()
-            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .hard_kill_deadline(task.task_id(), task.session_id())
             .map(|deadline| deadline.limit_ms),
         Some(1_800_000)
     );
@@ -190,8 +190,8 @@ fn worker_capped_wait_promotion_renews_default_hard_kill() {
     let (_dir, ctx, task) = wait_fixture(None);
     let response = crate::commands::bash_orchestrate::promote_bash(
         &ctx,
-        &task.task_id,
-        &task.session_id,
+        task.task_id(),
+        task.session_id(),
         None,
         1_800_000,
         "cap-handoff",
@@ -202,7 +202,7 @@ fn worker_capped_wait_promotion_renews_default_hard_kill() {
     assert!(response.success, "promotion failed: {:?}", response.data);
     assert!(
         ctx.bash_background()
-            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .hard_kill_deadline(task.task_id(), task.session_id())
             .unwrap()
             .limit_ms
             >= 1_801_900

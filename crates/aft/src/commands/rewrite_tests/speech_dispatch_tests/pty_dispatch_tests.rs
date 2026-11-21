@@ -4,13 +4,19 @@ use crate::protocol::BgTaskStatus;
 fn checkpoint(
     task: &str,
 ) -> (
-    Arc<crate::gh_shim_ticket::SpeechTicket>,
+    Arc<aft_engine::test_bridge::bash_remote::SpeechTicket>,
     crate::bash_background::persistence::PersistedTask,
 ) {
-    let speech = crate::gh_shim_ticket::speech_for_task("dispatch-session", task)
+    let speech = aft_engine::test_bridge::bash_remote::speech_for_task("dispatch-session", task)
         .pop()
         .expect("eligible task ticket");
-    let conn = speech.prepared.context.service.store.connect().unwrap();
+    let conn = speech
+        .prepared()
+        .context()
+        .service()
+        .store
+        .test_connect()
+        .unwrap();
     let row = crate::db::bash_tasks::get_bash_task(&conn, "opencode", "dispatch-session", task)
         .unwrap()
         .unwrap();
@@ -80,7 +86,7 @@ async fn eligible_pty_cannot_execute_user_code_before_the_durable_seal() {
         .context
         .service
         .store
-        .get(&speech.incarnation)
+        .get(&speech.incarnation())
         .unwrap()
         .record
         .seal
@@ -161,11 +167,11 @@ async fn pty_seal_failure_revokes_speech_durably_but_runs_the_command_normally()
         .write_pty(&fixture.task, &fixture.session, b"finish\n")
         .unwrap();
     completed(&fixture).await;
-    let restarted = crate::gh_shim_speech::store::Store::new(fixture.service.store.path());
+    let restarted = crate::gh_shim_speech::store::Store::new(fixture.service.store.test_path());
     let error = restarted
         .seal(
             &fixture.incarnation,
-            &crate::gh_shim_speech::model::ExecutionSeal {
+            &aft_engine::test_bridge::bash_remote::ExecutionSeal {
                 child_pid: 123,
                 child_start_time_ms: 456,
                 birth_identity: "birth".into(),
@@ -248,7 +254,7 @@ fn revoked_probe_child() {
         store
             .seal(
                 &incarnation,
-                &crate::gh_shim_speech::model::ExecutionSeal {
+                &aft_engine::test_bridge::bash_remote::ExecutionSeal {
                     child_pid: 123,
                     child_start_time_ms: 456,
                     birth_identity: "new-process".into()
@@ -258,8 +264,9 @@ fn revoked_probe_child() {
             .reason,
         "revoked"
     );
-    let service = crate::gh_shim_speech::service::record_service(Path::new(&root));
-    let cold = crate::gh_shim_ticket::redeem_speech_cold(&ticket, &service).unwrap_err();
+    let service = aft_engine::test_bridge::bash_remote::record_service(Path::new(&root));
+    let cold =
+        aft_engine::test_bridge::bash_remote::redeem_speech_cold(&ticket, &service).unwrap_err();
     assert_eq!(
         cold.reason, "snapshot_invalid",
         "a revoked unsealed candidate has no redemption digest"
@@ -277,7 +284,7 @@ fn probe_revoked_in_a_new_process(fixture: &Fixture) {
         ])
         .env(
             "AFT_TEST_REVOKED_PTY_ROOT",
-            fixture.service.store.path().parent().unwrap(),
+            fixture.service.store.test_path().parent().unwrap(),
         )
         .env("AFT_TEST_REVOKED_PTY_INCARNATION", &fixture.incarnation)
         .env("AFT_TEST_REVOKED_PTY_TICKET", ticket)

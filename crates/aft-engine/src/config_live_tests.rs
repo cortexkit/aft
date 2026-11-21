@@ -49,10 +49,7 @@ fn shell_env_provider_changes_apply_to_the_next_call() {
     assert!(disabled.applied.contains(&"shell.env_provider"));
 }
 
-pub(crate) fn write(path: &Path, text: &str) {
-    std::fs::create_dir_all(path.parent().expect("parent")).expect("config dir");
-    std::fs::write(path, text).expect("write config");
-}
+use super::test_config_file::write;
 
 #[test]
 fn bash_env_updates_live_while_cache_dir_waits_for_reconfigure() {

@@ -37,11 +37,9 @@ pub struct Running {
     pub command_truncated: bool,
 }
 
-#[derive(Debug, Serialize)]
-pub(crate) struct Remote {
-    pub job_id: String,
-}
-
+#[path = "scoped_tasks_types.rs"]
+pub(crate) mod scoped_tasks_types;
+pub(crate) use scoped_tasks_types::Remote;
 pub(crate) fn running(metadata: &crate::bash_background::persistence::PersistedTask) -> Running {
     let mut command = crate::log_redact::redact_command(&metadata.command).into_owned();
     let command_truncated = command.len() > COMMAND_BYTES;

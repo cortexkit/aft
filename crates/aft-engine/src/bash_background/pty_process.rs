@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-#[cfg(any(windows, test))]
+#[cfg(any(windows, test, feature = "test-support"))]
 #[cfg(all(test, unix))]
 use std::fs;
 use std::fs::File;
@@ -602,7 +602,7 @@ fn try_spawn_pty(
         exit_observed,
         was_killed,
         coordinator,
-        #[cfg(any(windows, test))]
+        #[cfg(any(windows, test, feature = "test-support"))]
         output_drain: cfg!(windows).then(super::pty_runtime::PtyOutputDrain::default),
     })
 }

@@ -266,6 +266,6 @@ fn files_accounted(coverage: &Coverage) -> usize {
     coverage.files_embedded + coverage.files_too_large + coverage.files_failed.len()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[path = "meaning_query_test_support.rs"]
 pub(crate) mod test_support;
