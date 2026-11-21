@@ -739,7 +739,7 @@ fn grep_project_root(ctx: &AppContext) -> std::path::PathBuf {
     std::fs::canonicalize(&configured).unwrap_or(configured)
 }
 
-fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool {
+pub(crate) fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool {
     let Some(path) = path else {
         return false;
     };
@@ -990,7 +990,7 @@ fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
     }
 }
 
-fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
+pub(crate) fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
     // Basic grep treats these characters as literals unless escaped, while the
     // AFT regex engine gives them extended-regex meanings. BRE also treats `^`
     // and `$` as anchors only at the beginning and end of the whole pattern.
@@ -1415,17 +1415,17 @@ fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> O
 }
 
 #[cfg(test)]
-fn grep_request(command: &str, binary: &str) -> Option<Value> {
+pub(crate) fn grep_request(command: &str, binary: &str) -> Option<Value> {
     grep_request_from_parsed(parse(command).as_ref(), binary)
 }
 
 #[cfg(test)]
-fn find_request(command: &str) -> Option<Value> {
+pub(crate) fn find_request(command: &str) -> Option<Value> {
     find_request_from_parsed(parse(command).as_ref())
 }
 
 #[cfg(test)]
-fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
+pub(crate) fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
     ls_request_from_parsed(parse(command).as_ref(), ctx)
 }
 

@@ -90,6 +90,17 @@ fn route_records() -> &'static Mutex<RouteRecordStore> {
     ROUTE_RECORDS.get_or_init(|| Mutex::new(RouteRecordStore::default()))
 }
 
+#[cfg(test)]
+pub(crate) fn count_route_records_for_prefix(prefix: &str) -> usize {
+    route_records()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .records
+        .keys()
+        .filter(|request_id| request_id.starts_with(prefix))
+        .count()
+}
+
 fn store_record(record: DispatchRecord) {
     if let Ok(mut records) = route_records().lock() {
         if records.records.contains_key(&record.request_id) {
@@ -172,7 +183,7 @@ pub fn dispatch_for_request(
     )
 }
 
-fn dispatch_for_request_with_handlers(
+pub(crate) fn dispatch_for_request_with_handlers(
     command: &str,
     request_id: &str,
     session_id: Option<&str>,
@@ -376,13 +387,7 @@ mod tests {
             );
         }
 
-        let retained = route_records()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .records
-            .keys()
-            .filter(|request_id| request_id.starts_with(&prefix))
-            .count();
+        let retained = count_route_records_for_prefix(&prefix);
         assert!(retained <= MAX_RECORDS, "retained {retained} route records");
         let latest = format!("{prefix}{}", MAX_RECORDS + 127);
         assert!(
