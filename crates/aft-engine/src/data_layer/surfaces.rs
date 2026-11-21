@@ -104,7 +104,8 @@ pub enum Withheld {
 
 /// One plane as status, health and zoom report it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct PlaneReport {
+#[doc(hidden)]
+pub struct PlaneReport {
     /// [`OFF`], [`BUILDING`], [`READY`] or [`UNAVAILABLE`].
     pub status: &'static str,
     /// Why the plane is off or unavailable; see [`reason`].

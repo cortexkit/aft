@@ -4,9 +4,12 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub(crate) const DELETE: u32 = 0x0001_0000;
-pub(crate) const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
-pub(crate) const FILE_SHARE_ALL: u32 = 0x0000_0007;
+#[doc(hidden)]
+pub const DELETE: u32 = 0x0001_0000;
+#[doc(hidden)]
+pub const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+#[doc(hidden)]
+pub const FILE_SHARE_ALL: u32 = 0x0000_0007;
 const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_DISPOSITION_INFO: i32 = 4;
@@ -26,7 +29,8 @@ extern "system" {
 
 /// Open the entry at `path` itself, never a link's target, with the
 /// access a delete needs. Directories open too (`BACKUP_SEMANTICS`).
-pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
+#[doc(hidden)]
+pub fn open_entry(path: &Path) -> io::Result<File> {
     use std::os::windows::fs::OpenOptionsExt;
     std::fs::OpenOptions::new()
         .access_mode(DELETE | FILE_READ_ATTRIBUTES)
@@ -38,7 +42,8 @@ pub(crate) fn open_entry(path: &Path) -> io::Result<File> {
 /// Where the open entry is now, in the form the access policy uses for
 /// its identities (no `\\?\` prefix). With the link itself opened, this
 /// names the link entry, not what it points at.
-pub(crate) fn location(entry: &File) -> io::Result<PathBuf> {
+#[doc(hidden)]
+pub fn location(entry: &File) -> io::Result<PathBuf> {
     crate::file_read_exact::opened_location(entry)
         .map(|path| crate::path_identity::normalize_path(&path))
 }
@@ -51,7 +56,8 @@ pub(crate) fn location(entry: &File) -> io::Result<PathBuf> {
 /// now. That object was the one authorized; if it was renamed since the
 /// last check, deleting it is still within the delete contract (objects
 /// are authorized, not pathnames at the instant of unlink).
-pub(crate) fn dispose(entry: &File) -> io::Result<()> {
+#[doc(hidden)]
+pub fn dispose(entry: &File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     let handle = entry.as_raw_handle();
     let mut flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;

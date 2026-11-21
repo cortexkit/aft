@@ -31,7 +31,8 @@ pub fn report_file(
 use std::path::Path;
 
 #[cfg(windows)]
-pub(crate) mod delete_tree_win;
+#[doc(hidden)]
+pub mod delete_tree_win;
 #[doc(hidden)]
 pub mod remote_links;
 
