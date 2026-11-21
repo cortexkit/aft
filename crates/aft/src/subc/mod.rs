@@ -22275,7 +22275,7 @@ mod tests {
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::LspClientTestExt as _;
     #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::LspEventWaitTestExt as _;
+    use aft_engine::test_bridge::search_misc::LspManagerTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;
 
