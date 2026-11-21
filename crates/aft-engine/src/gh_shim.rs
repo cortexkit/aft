@@ -8508,7 +8508,7 @@ pub(crate) mod tests {
     use ring::signature::{Ed25519KeyPair, KeyPair};
     use sha2::{Digest, Sha256};
 
-    use super::speech_dispatch_support::{
+    pub(super) use super::speech_dispatch_support::{
         fixture_manifest, signed, signed_with, write_signed_manifest, TEST_SEED,
     };
     /// Seed for the standby-slot fixture key. Test-only material: the compiled

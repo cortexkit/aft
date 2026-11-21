@@ -3107,7 +3107,7 @@ impl std::fmt::Debug for GitPolicyAnswers {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 thread_local! {
     /// Makes the profile builders ignore stored answers and ask Git, as they
     /// did before answers existed. Only the manual spawn benchmark sets it.
@@ -3117,7 +3117,7 @@ thread_local! {
 #[cfg(unix)]
 impl GitPolicyAnswers {
     fn current(&self, project_root: &Path) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if GIT_POLICY_IGNORE_ANSWERS.with(|value| value.get()) {
             return false;
         }
@@ -3330,7 +3330,7 @@ fn git_policy_cache_changed() -> &'static Condvar {
     CHANGED.get_or_init(Condvar::new)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(all(not(any(test, feature = "test-support")), unix))]
 const GIT_POLICY_FLIGHT_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3930,7 +3930,7 @@ thread_local! {
 
 /// Every Git subprocess the policy resolver starts, for tests that measure
 /// whether a resolution reused the cache.
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 static GIT_POLICY_SPAWNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 #[cfg(unix)]

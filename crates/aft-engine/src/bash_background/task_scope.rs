@@ -735,7 +735,7 @@ mod linux {
             .flatten()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn probe_user_manager(limit: Duration) -> Result<(), String> {
         let launcher = systemd_run_path_with(Path::is_file).ok_or("systemd-run is unavailable")?;
         successful(run(
@@ -1050,7 +1050,7 @@ mod linux {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn lookup(task_id: &str) -> Result<Option<ScopeHandle>, String> {
         lookup_with(Path::new("systemctl"), task_id)
     }

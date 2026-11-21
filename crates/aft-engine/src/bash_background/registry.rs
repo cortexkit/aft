@@ -665,7 +665,7 @@ static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGa
 static TERMINAL_PUBLICATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 static REHYDRATED_REGISTRATION_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
 
@@ -710,7 +710,7 @@ fn wait_on_group_sample_gate_for_test(task_id: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
     let gate = REHYDRATED_REGISTRATION_GATES
         .get()
@@ -13587,7 +13587,7 @@ impl BgTaskRegistry {
         let recovered_terminal = metadata.status.is_terminal().then(|| metadata.clone());
         let terminal_already_delivered =
             metadata.status.is_terminal() && metadata.completion_delivered;
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "test-support")))]
         wait_on_rehydrated_registration_gate_for_test(&task_id);
         let mut task = BgTask {
             start_view: Mutex::new(None),
