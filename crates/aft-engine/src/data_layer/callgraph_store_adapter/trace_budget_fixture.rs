@@ -72,6 +72,7 @@ impl CountingStore {
             });
     }
 
+    #[cfg(test)]
     pub(super) fn add_outgoing(&mut self, caller: &StoreNode, target: &StoreNode) {
         self.outgoing
             .entry((caller.file.clone(), caller.symbol.clone()))
@@ -91,38 +92,47 @@ impl CountingStore {
             });
     }
 
+    #[cfg(test)]
     pub(super) fn total_forward_queries(&self) -> usize {
         *self.forward_query_count.borrow()
     }
 
+    #[cfg(test)]
     pub(super) fn reset_forward_queries(&self) {
         *self.forward_query_count.borrow_mut() = 0;
     }
 
+    #[cfg(test)]
     pub(super) fn total_frontier_queries(&self) -> usize {
         *self.frontier_query_count.borrow()
     }
 
+    #[cfg(test)]
     pub(super) fn total_caller_queries(&self) -> usize {
         self.caller_queries.borrow().values().sum()
     }
 
+    #[cfg(test)]
     pub(super) fn total_caller_frontier_queries(&self) -> usize {
         *self.caller_frontier_query_count.borrow()
     }
 
+    #[cfg(test)]
     pub(super) fn caller_frontier_target_count(&self) -> usize {
         *self.caller_frontier_target_count.borrow()
     }
 
+    #[cfg(test)]
     pub(super) fn total_caller_count_queries(&self) -> usize {
         *self.caller_count_queries.borrow()
     }
 
+    #[cfg(test)]
     pub(super) fn caller_count_target_count(&self) -> usize {
         *self.caller_count_targets.borrow()
     }
 
+    #[cfg(test)]
     pub(super) fn reset_query_counts(&self) {
         self.caller_queries.borrow_mut().clear();
         *self.caller_frontier_query_count.borrow_mut() = 0;

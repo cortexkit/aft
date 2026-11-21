@@ -318,7 +318,7 @@ pub(crate) use aft_base::test_allocations;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "base_tests/test_env.rs"]
 pub(crate) mod test_env;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::test_gate;
 #[cfg(all(test, windows))]
 pub(crate) use aft_base::test_read_denial;

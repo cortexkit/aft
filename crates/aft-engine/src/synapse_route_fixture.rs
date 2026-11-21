@@ -27,7 +27,7 @@ pub struct Daemon {
     server: std::thread::JoinHandle<()>,
     pub(super) release: tokio::sync::watch::Sender<bool>,
     release_open: tokio::sync::watch::Sender<bool>,
-    disconnect: tokio::sync::watch::Sender<bool>,
+    _disconnect: tokio::sync::watch::Sender<bool>,
 }
 
 impl Daemon {
@@ -244,7 +244,7 @@ impl Daemon {
             server,
             release,
             release_open,
-            disconnect,
+            _disconnect: disconnect,
         }
     }
 
@@ -256,10 +256,12 @@ impl Daemon {
         self.release.send(true).unwrap();
     }
 
+    #[cfg(test)]
     pub(super) fn disconnect_first_connection(&self) {
-        self.disconnect.send(true).unwrap();
+        self._disconnect.send(true).unwrap();
     }
 
+    #[cfg(test)]
     pub(super) fn config(&self, root: usize) -> SemanticBackendConfig {
         SemanticBackendConfig {
             backend: crate::config::SemanticBackend::Synapse,
@@ -286,6 +288,7 @@ impl Daemon {
     }
 
     /// Wait until the fake holds exactly `live` open connections.
+    #[cfg(test)]
     pub(super) fn wait_live(&self, live: usize) {
         let (count, _) = self
             .counts
@@ -299,10 +302,12 @@ impl Daemon {
         assert_eq!(count.live, live, "unexpected open daemon connections");
     }
 
+    #[cfg(test)]
     pub(super) fn wait_queries(&self, queries: usize) {
         self.wait_queries_with_timeout(queries, Duration::from_secs(2));
     }
 
+    #[cfg(test)]
     pub(super) fn wait_queries_with_timeout(&self, queries: usize, timeout: Duration) {
         let (counts, _) = self
             .counts

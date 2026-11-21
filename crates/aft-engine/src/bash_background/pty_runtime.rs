@@ -3,7 +3,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[allow(dead_code)]
-pub(crate) struct PtyRuntime {
+#[doc(hidden)]
+pub struct PtyRuntime {
     pub(crate) bootstrap_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
     pub(crate) master: Option<Box<dyn portable_pty::MasterPty + Send>>,
     pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,

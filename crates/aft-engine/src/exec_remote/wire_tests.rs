@@ -1,5 +1,7 @@
 use super::{tests::MemorySink, types::*, wire_fixture::*, *};
-use serde_json::{json, Value};
+use serde_json::json;
+#[cfg(unix)]
+use serde_json::Value;
 use std::time::Duration;
 use subc_protocol::{BindIdentity, FrameType};
 async fn client(daemon: &Daemon) -> ExecRemoteClient {

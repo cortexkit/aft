@@ -63,6 +63,7 @@ impl Fixture {
     pub(in crate::bash_background) fn task(&self) -> &Arc<BgTask> {
         &self.task
     }
+    #[cfg(test)]
     pub(in crate::bash_background) fn new(fail_reader: bool) -> Self {
         Self::with_exit_code(fail_reader, 0)
     }
@@ -164,6 +165,7 @@ impl Fixture {
             .expect("reader reached EOF or error");
     }
 
+    #[cfg(test)]
     pub(in crate::bash_background) fn assert_pending(&self) {
         assert_eq!(self.task.snapshot(0).info.status, BgTaskStatus::Running);
         assert_eq!(
