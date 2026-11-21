@@ -1,1 +1,0 @@
-- AFT now wakes runners over the CortexKit bus when late results are ready, while keeping the existing late-results feed as the source of truth and fallback.
