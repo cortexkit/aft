@@ -1,13 +1,18 @@
-// The explicit crate-private imports preserve the old visibility of engine
-// implementation modules, overriding the facade's public glob.
-#![allow(hidden_glob_reexports)]
-
-pub use aft_engine::data_layer::*;
+// Only the modules the upper crate previously exposed are public here.
+#[doc(hidden)]
+pub use aft_engine::data_layer::read_fence;
+#[cfg(feature = "test-hooks")]
+pub use aft_engine::data_layer::refresh_probe;
+pub use aft_engine::data_layer::{
+    callgraph, callgraph_roots, callgraph_store_adapter, checkout, checkout_gate, content,
+    dead_code_graph, dead_code_snapshot, edit_gate, extract_gate, fragment, host, incremental,
+    old_index, parent_session, reuse, standing, status, surfaces, symbol_prewarm_measure, vectors,
+};
 pub(crate) use aft_engine::data_layer::{
     grammar, graph_store, meaning_query, outline, parent, query, runtime, text_scope,
 };
 
 pub mod trace_measure {
     pub use crate::trace_measure_run::run;
-    pub use aft_engine::data_layer::trace_measure::*;
+    pub(crate) use aft_engine::data_layer::trace_measure::{build, Built};
 }

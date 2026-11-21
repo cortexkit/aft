@@ -330,8 +330,8 @@ mod audit_regressions {
         assert_eq!(std::fs::read_to_string(path).unwrap(), original);
         let store = ctx.backup().lock();
         assert_eq!(
-            store.discard_paths_for_tests,
-            vec![path.canonicalize().unwrap()],
+            store.discard_paths_for_tests(),
+            &vec![path.canonicalize().unwrap()],
             "rollback must not visit the session's other checkouts"
         );
         assert!(
