@@ -74,10 +74,17 @@ pub fn discard_older(conn: &Connection, scope: &ScopeKey) -> rusqlite::Result<()
 }
 
 pub(super) fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<()> {
-    conn.execute(
-        "DELETE FROM codemode_owners WHERE used_ms <= ?1",
-        [now.saturating_sub(IDLE_MS)],
+    let cutoff = now.saturating_sub(IDLE_MS);
+    // Read first: a DELETE takes the write lock even when nothing matches, and
+    // this runs on every maintenance pass while most passes have nothing to do.
+    let expired: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM codemode_owners WHERE used_ms <= ?1)",
+        [cutoff],
+        |row| row.get(0),
     )?;
+    if expired {
+        conn.execute("DELETE FROM codemode_owners WHERE used_ms <= ?1", [cutoff])?;
+    }
     Ok(())
 }
 
