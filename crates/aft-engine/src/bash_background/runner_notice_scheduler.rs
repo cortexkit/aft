@@ -17,7 +17,8 @@ pub enum Next {
     Retry(Duration),
 }
 
-pub(crate) struct Scheduled {
+#[doc(hidden)]
+pub struct Scheduled {
     // Taking work leaves its send_id reserved until the attempt returns, so a
     // reconnect cannot start a second send for the same completion.
     pub work: Option<Work>,

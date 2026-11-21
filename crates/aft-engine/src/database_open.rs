@@ -111,7 +111,8 @@ pub(crate) struct DatabaseOpenRequest {
 
 /// Per-root open state, guarded by one mutex on the root's context.
 #[derive(Debug)]
-pub(crate) struct DatabaseOpenSlot {
+#[doc(hidden)]
+pub struct DatabaseOpenSlot {
     /// Bumped by every configure commit. Publication compares against it
     /// under this mutex, so an older open can never mark a newer configure's
     /// database ready.
@@ -175,13 +176,13 @@ pub enum DatabaseOpenOutcome {
 #[doc(hidden)]
 pub struct DatabaseOpenReport {
     /// Reader-floor check plus the read-only schema peek.
-    pub(crate) floor_check: Duration,
+    pub floor_check: Duration,
     /// Taking the process-shared database slot and opening SQLite (PRAGMAs,
     /// lock-contention retries and migrations included).
-    pub(crate) open: Duration,
+    pub open: Duration,
     /// The process already held a handle for this database file.
-    pub(crate) reused_handle: bool,
-    pub(crate) outcome: DatabaseOpenOutcome,
+    pub reused_handle: bool,
+    pub outcome: DatabaseOpenOutcome,
 }
 
 /// Hand the root's staged open to the dedicated thread. Called once the bind

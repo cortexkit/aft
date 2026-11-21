@@ -93,7 +93,8 @@ pub fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Respon
 }
 
 #[cfg(unix)]
-pub(crate) struct Preflight {
+#[doc(hidden)]
+pub struct Preflight {
     pub(crate) plan: SpawnPlan,
     pub(crate) task: Option<super::persistence::ResolvedTask>,
     requirement: SandboxRequirement,
@@ -212,7 +213,8 @@ impl Drop for Runtime {
 }
 
 #[cfg(unix)]
-pub(crate) struct Launch {
+#[doc(hidden)]
+pub struct Launch {
     pub(crate) preflight: Preflight,
     pub(crate) runtime: SharedRuntime,
     adopted: bool,

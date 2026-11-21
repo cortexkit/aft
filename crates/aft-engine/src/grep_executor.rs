@@ -587,7 +587,8 @@ pub struct GrepParams {
 }
 
 #[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct GrepExecutionPhaseTimings {
+#[doc(hidden)]
+pub struct GrepExecutionPhaseTimings {
     pub snapshot_acquire: Duration,
     /// Regex decomposition is paid once per grep request, not once per root.
     pub query_decomposition: Duration,

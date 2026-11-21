@@ -647,7 +647,8 @@ impl ScanLines for WholeLines<'_> {
 /// [`ScanLines`] over a run of whole lines of a file read in steps: the run
 /// starts at a line start, and every line in it but the file's last ends
 /// with its LF.
-pub(crate) struct RegionLines<'a> {
+#[doc(hidden)]
+pub struct RegionLines<'a> {
     bytes: &'a [u8],
     /// File offset of `bytes[0]`.
     base: usize,

@@ -497,7 +497,8 @@ pub(crate) struct Omitted {
 
 /// What a collection found.
 #[derive(Debug, Default)]
-pub(crate) struct Collected {
+#[doc(hidden)]
+pub struct Collected {
     /// The page's name, as listed in `files`.
     pub entry: String,
     pub files: Vec<FileRecord>,

@@ -475,7 +475,8 @@ impl ServerInstanceId {
 /// synthetic test events may omit the instance; public standalone events keep
 /// their payload shape and never enter the manager's channel directly.
 #[derive(Debug, Clone)]
-pub(crate) struct ReceivedLspEvent {
+#[doc(hidden)]
+pub struct ReceivedLspEvent {
     pub(crate) event: LspEvent,
     pub(crate) instance: Option<ServerInstanceId>,
     /// Stamped by the reader before enqueueing or startup deferral, on the

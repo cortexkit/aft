@@ -891,7 +891,7 @@ impl RemotePreStartRefusal {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub(crate) struct RemoteTask {
+pub struct RemoteTask {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<KeyedSubmission>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -86,7 +86,8 @@ struct SlotState {
 
 /// A context's reranker backend, rebuilt in the background when its inputs
 /// change.
-pub(crate) struct BackendSlot {
+#[doc(hidden)]
+pub struct BackendSlot {
     state: Arc<Mutex<SlotState>>,
     constructor: Mutex<Constructor>,
     backoff: Mutex<Duration>,

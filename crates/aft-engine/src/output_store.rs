@@ -31,7 +31,8 @@ pub(crate) struct Artifact {
 }
 
 #[derive(Default)]
-pub(crate) struct OutputFiles {
+#[doc(hidden)]
+pub struct OutputFiles {
     pub(crate) files: Mutex<HashMap<PathBuf, Artifact>>,
     roots: Mutex<HashMap<PathBuf, PathBuf>>,
     #[cfg(test)]

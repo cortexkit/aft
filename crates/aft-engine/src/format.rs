@@ -1820,7 +1820,8 @@ pub(crate) struct FileValidation {
     skipped_reason: Option<String>,
 }
 
-pub(crate) struct BatchValidation {
+#[doc(hidden)]
+pub struct BatchValidation {
     files: Vec<FileValidation>,
     checkers: Vec<String>,
 }

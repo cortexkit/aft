@@ -41,10 +41,10 @@ pub(crate) type DisplayPublish<'a> =
 
 #[doc(hidden)]
 pub struct Hooks {
-    pub(crate) take_due_read: fn() -> Option<(String, Vec<u8>)>,
-    pub(crate) mark_read_published: fn(&str, bool),
-    pub(crate) announce: for<'a> fn(String, Vec<u8>, DisplayPublish<'a>) -> DisplayPublish<'a>,
-    pub(crate) bus_snapshot: fn() -> Vec<(String, Vec<u8>)>,
+    pub take_due_read: fn() -> Option<(String, Vec<u8>)>,
+    pub mark_read_published: fn(&str, bool),
+    pub announce: for<'a> fn(String, Vec<u8>, DisplayPublish<'a>) -> DisplayPublish<'a>,
+    pub bus_snapshot: fn() -> Vec<(String, Vec<u8>)>,
 }
 
 static HOOKS: OnceLock<Hooks> = OnceLock::new();

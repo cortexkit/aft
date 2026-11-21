@@ -201,7 +201,8 @@ pub fn check_requested_paths(paths: &[String]) -> Result<(), String> {
 
 /// Where a returned path's file goes, as resolved before any of it is written.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Destination {
+#[doc(hidden)]
+pub struct Destination {
     /// The resolved file to replace or create.
     pub target: std::path::PathBuf,
     /// Parent directories that do not exist yet, shallowest first. Each lies

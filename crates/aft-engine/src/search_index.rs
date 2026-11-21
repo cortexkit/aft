@@ -943,7 +943,8 @@ struct PreparedIndexedFile {
     trigram_map: BTreeMap<u32, PostingFilter>,
 }
 
-pub(crate) struct SearchCorpusFile {
+#[doc(hidden)]
+pub struct SearchCorpusFile {
     metadata: SearchFileMetadata,
     pub bytes: Vec<u8>,
     pub generated: bool,
@@ -1127,7 +1128,8 @@ pub struct PathFilters {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct SearchScope {
+#[doc(hidden)]
+pub struct SearchScope {
     pub root: PathBuf,
     pub use_index: bool,
 }
@@ -3984,7 +3986,8 @@ pub(crate) const MISSING_ON_DISK_REFILL_BUDGET: usize = 256;
 /// Result of checking a ranked list against the disk, see
 /// [`take_present_on_disk`].
 #[derive(Debug)]
-pub(crate) struct PresentOnDisk<T> {
+#[doc(hidden)]
+pub struct PresentOnDisk<T> {
     /// Up to `limit` items whose path exists, in their original order.
     pub present: Vec<T>,
     /// Items dropped because their path is not on disk.

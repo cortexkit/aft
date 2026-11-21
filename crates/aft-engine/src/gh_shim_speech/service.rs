@@ -123,11 +123,11 @@ pub fn run_nonce() -> Option<&'static str> {
 #[derive(Clone, Debug)]
 #[doc(hidden)]
 pub struct LaunchSeed {
-    pub(crate) launch: Result<LaunchAuthority, Refusal>,
-    pub(crate) lifecycle: Option<ScopeStamp>,
-    pub(crate) session: String,
-    pub(crate) harness: String,
-    pub(crate) project_root: String,
+    pub launch: Result<LaunchAuthority, Refusal>,
+    pub lifecycle: Option<ScopeStamp>,
+    pub session: String,
+    pub harness: String,
+    pub project_root: String,
 }
 
 #[derive(Clone)]

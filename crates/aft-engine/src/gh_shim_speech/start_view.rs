@@ -21,7 +21,8 @@ struct View {
 /// Owns one launch's view, including a shared OS lock that keeps crash cleanup
 /// from removing it while a long-running command can still read it.
 #[derive(Debug)]
-pub(crate) struct StartView {
+#[doc(hidden)]
+pub struct StartView {
     path: PathBuf,
     file: Option<File>,
 }

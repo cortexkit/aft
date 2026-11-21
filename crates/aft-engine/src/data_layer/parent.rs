@@ -250,7 +250,8 @@ pub fn callgraph_plane(ctx: &impl IndexHost, parent: &Path, child: &Path) -> Pla
 }
 
 /// One child repository as a parent folder's `aft_search` reads it.
-pub(crate) struct ChildSearch {
+#[doc(hidden)]
+pub struct ChildSearch {
     /// Its checkout, which the child's search engine answers from; `None`
     /// when it could not be bound, and `text` says why.
     pub checkout: Option<Arc<DataCheckout>>,

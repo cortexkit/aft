@@ -7,10 +7,10 @@ use super::{Code, Refusal, ScopeRole};
 #[serde(deny_unknown_fields)]
 #[doc(hidden)]
 pub struct RouteOrigin {
-    pub(crate) run_nonce: String,
-    pub(crate) connection_generation: String,
-    pub(crate) channel: u32,
-    pub(crate) epoch: u64,
+    pub run_nonce: String,
+    pub connection_generation: String,
+    pub channel: u32,
+    pub epoch: u64,
 }
 
 /// This value comes from the authenticated dispatch context, never tool arguments.

@@ -467,7 +467,8 @@ where
 }
 
 /// Keeps delivery alive for exactly one attached module session.
-pub(crate) struct Worker {
+#[doc(hidden)]
+pub struct Worker {
     _stop: tokio::sync::oneshot::Sender<()>,
 }
 

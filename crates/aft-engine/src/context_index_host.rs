@@ -98,7 +98,8 @@ impl ReadPolicy for AppContext {
     }
 }
 
-pub(crate) struct SearchReadPolicy<'a> {
+#[doc(hidden)]
+pub struct SearchReadPolicy<'a> {
     context: &'a AppContext,
     tool: WorkerSearchTool,
 }

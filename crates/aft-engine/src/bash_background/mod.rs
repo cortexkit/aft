@@ -153,7 +153,8 @@ struct StartupSteps {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct BashStartupStepSnapshot {
+#[doc(hidden)]
+pub struct BashStartupStepSnapshot {
     completed: [std::time::Duration; STARTUP_STEP_COUNT],
     seen: u16,
     current: BashStartupStep,
@@ -614,7 +615,8 @@ thread_local! {
     static CURRENT_TASK_IDENTITY: std::cell::RefCell<Option<TaskIdentity>> = const { std::cell::RefCell::new(None) };
 }
 
-pub(crate) struct TaskIdentityScope(Option<TaskIdentity>);
+#[doc(hidden)]
+pub struct TaskIdentityScope(Option<TaskIdentity>);
 
 impl Drop for TaskIdentityScope {
     fn drop(&mut self) {

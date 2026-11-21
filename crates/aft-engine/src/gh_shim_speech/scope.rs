@@ -8,7 +8,8 @@ use super::{Code, Refusal, ScopeRole};
 
 /// Only authenticated, selector-bound scope evidence can create a permanent end record.
 #[derive(Clone, Debug)]
-pub(crate) struct ValidatedEnd {
+#[doc(hidden)]
+pub struct ValidatedEnd {
     key: ScopeKey,
     evidence: Value,
 }

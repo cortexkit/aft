@@ -101,7 +101,7 @@ struct UncommittedLayout<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) enum RegistryError {
+pub enum RegistryError {
     TaskNotFound(String),
     TaskLimit(String),
     StartupDeadline(String),
@@ -978,7 +978,7 @@ pub struct RemoteRefusal {
 }
 
 #[derive(Clone)]
-pub(crate) struct RunonLaunchState {
+pub struct RunonLaunchState {
     pub accepted: bool,
     pub progress: remote::RemoteProgress,
     pub admission_note: Option<String>,
@@ -1329,13 +1329,13 @@ pub(crate) struct ScopeKilledTask {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct ScopeRemoteCancel {
+pub struct ScopeRemoteCancel {
     pub job_id: Option<String>,
     pub cancel: String,
 }
 
 #[derive(Default)]
-pub(crate) struct ScopeKillReport {
+pub struct ScopeKillReport {
     pub killed: Vec<ScopeKilledTask>,
     pub already_finished: usize,
 }
@@ -1671,7 +1671,7 @@ const PENDING_WAIT_DETACH_TTL: Duration = Duration::from_secs(120);
 pub struct BashDrainReplyCache(Arc<Mutex<BashDrainReplyState>>);
 
 #[derive(Clone, Default)]
-pub(crate) struct BashDrainReplyState {
+pub struct BashDrainReplyState {
     pub(crate) completion_finished_at: Option<u64>,
     pub completion_delivered: bool,
     pub(crate) runner_completion_offers: usize,
@@ -1735,7 +1735,7 @@ impl BashDrainReplyCache {
     }
 }
 
-pub(crate) struct RouteCensusTask {
+pub struct RouteCensusTask {
     pub harness: Option<String>,
     pub session_id: String,
     pub scope: Option<subc_protocol::scope::ScopeStamp>,
@@ -1836,7 +1836,7 @@ pub(crate) struct BgTask {
     db_write_order: Arc<DbWriteOrder>,
 }
 
-pub(crate) struct ForegroundWaitGuard {
+pub struct ForegroundWaitGuard {
     registry: BgTaskRegistry,
     session_id: String,
     task_id: String,

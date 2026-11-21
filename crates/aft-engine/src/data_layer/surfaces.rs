@@ -161,7 +161,8 @@ impl PlaneReport {
 /// How a root's checkout stands in the data layer, for every status
 /// surface.
 #[derive(Clone, Debug)]
-pub(crate) struct DataStoreReport {
+#[doc(hidden)]
+pub struct DataStoreReport {
     pub(crate) skipped_folders: usize,
     pub(crate) skipped_folder_note: Option<String>,
     pub text: PlaneReport,

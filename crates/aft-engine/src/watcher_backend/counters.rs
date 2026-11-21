@@ -100,7 +100,8 @@ struct WatcherLossRecovery {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct WatcherCounters {
+#[doc(hidden)]
+pub struct WatcherCounters {
     pub bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
     pub bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,

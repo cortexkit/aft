@@ -45,7 +45,7 @@ pub(crate) const RECORD_PACK_ENV: &str = "AFT_RERANK_RECORD_PACK";
 /// One candidate document handed to a backend: the bounded candidate text.
 #[doc(hidden)]
 pub struct RerankDoc<'a> {
-    pub(crate) text: &'a str,
+    pub text: &'a str,
 }
 
 /// Names the exact scoring function a backend applies. Two backends with equal

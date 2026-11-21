@@ -13,7 +13,8 @@ pub(super) struct State {
     unproven: bool,
 }
 
-pub(crate) struct WorkGuard(Arc<Service>);
+#[doc(hidden)]
+pub struct WorkGuard(Arc<Service>);
 impl Drop for WorkGuard {
     fn drop(&mut self) {
         {
@@ -32,7 +33,8 @@ impl Drop for WorkGuard {
     }
 }
 
-pub(crate) struct RuntimeGuard(Arc<Service>);
+#[doc(hidden)]
+pub struct RuntimeGuard(Arc<Service>);
 impl RuntimeGuard {
     #[doc(hidden)]
     pub fn retain_until_process_exit(&self) {

@@ -349,7 +349,8 @@ impl Drop for Reservation {
 
 /// A snapshot being written. Dropped without [`Builder::commit`], it deletes
 /// its folder and frees its place.
-pub(crate) struct Builder {
+#[doc(hidden)]
+pub struct Builder {
     reservation: Option<Reservation>,
     id: String,
     owner: SnapshotOwner,
