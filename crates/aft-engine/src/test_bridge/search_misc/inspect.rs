@@ -47,6 +47,7 @@ pub fn note_withheld_root(root: &Path) {
 }
 
 pub trait InspectManagerTest {
+    fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState;
     fn dead_code_build_is_pending(&self) -> bool;
     fn set_cold_build_limiter(
         &self,
@@ -59,6 +60,9 @@ pub trait InspectManagerTest {
 }
 
 impl InspectManagerTest for InspectManager {
+    fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
+        self.tier2_builder_state(category)
+    }
     fn dead_code_build_is_pending(&self) -> bool {
         self.dead_code_build_is_pending()
     }

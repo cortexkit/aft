@@ -1079,7 +1079,7 @@ pub struct BackupStore {
     discovery_entry_limit: usize,
     #[cfg(test)]
     discovery_entries_examined: Arc<AtomicU64>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     discovery_deadline_override: Option<Instant>,
     /// Parsed `meta.json` fields kept between status pushes; see
     /// `status_inventory`.
@@ -1181,7 +1181,7 @@ impl BackupStore {
             discovery_entry_limit: MAX_SESSION_DISCOVERY_ENTRIES,
             #[cfg(test)]
             discovery_entries_examined: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             discovery_deadline_override: None,
             status_meta_caches: Arc::default(),
             #[cfg(test)]
@@ -1273,7 +1273,7 @@ impl BackupStore {
         self.discovery_entry_limit = limit;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn expire_discovery_for_tests(&mut self) {
         self.discovery_deadline_override = Some(Instant::now());
     }
@@ -4878,7 +4878,7 @@ impl BackupStore {
     }
 
     fn discovery_limits(&self, budget: BackupIoBudget) -> status_inventory::DiscoveryLimits {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let budget = BackupIoBudget {
             deadline: self
                 .discovery_deadline_override
