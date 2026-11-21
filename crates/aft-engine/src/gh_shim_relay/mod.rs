@@ -2024,7 +2024,14 @@ impl SubcRelayTransport {
 
     /// A transport already holding `consumer`, for tests that serve it from a
     /// fake daemon without a module identity.
-    #[cfg(test)]
+    #[cfg(any(
+        test,
+        all(
+            feature = "test-support",
+            debug_assertions,
+            any(target_os = "linux", target_os = "macos")
+        )
+    ))]
     fn with_consumer(
         consumer: subc_client_rs::SubcConsumer,
         route_open_deadline: Option<Duration>,
