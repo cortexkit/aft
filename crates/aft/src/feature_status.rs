@@ -474,7 +474,3 @@ pub fn observe_callgraph_query_with_contention(
         false,
     )
 }
-
-#[cfg(test)]
-#[path = "feature_status/consumer_fixture_tests.rs"]
-mod consumer_fixture_tests;

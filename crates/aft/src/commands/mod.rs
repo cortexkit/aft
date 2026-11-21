@@ -51,6 +51,8 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
+#[cfg(test)]
+mod feature_status_tests;
 #[cfg(all(test, unix))]
 mod fifo_mutation_tests;
 pub mod policy_environment;
@@ -79,6 +81,8 @@ pub mod move_file;
 pub mod move_symbol;
 pub use crate::grep_executor::multi_path;
 pub mod organize_imports;
+#[cfg(test)]
+mod os_metadata_tests;
 pub mod outline;
 pub mod read;
 pub(crate) mod read_manifest;

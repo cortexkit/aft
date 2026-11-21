@@ -10,7 +10,7 @@ use crate::search_index::SearchIndex;
 pub(crate) use aft_base::os_metadata::tests::*;
 
 fn context(root: &Path, trigram: bool) -> AppContext {
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.to_path_buf()),
