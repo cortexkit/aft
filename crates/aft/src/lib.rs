@@ -307,7 +307,7 @@ pub(crate) use aft_engine::test_bridge::test_env;
 #[cfg(test)]
 mod upper_test_context;
 #[cfg(test)]
-pub(crate) use upper_test_context::test_context;
+pub(crate) use upper_test_context::{test_app, test_context};
 // The fake LSP builder also compiles in integration tests under this helper name.
 #[cfg(test)]
 use test_support as test_helpers;

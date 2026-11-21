@@ -604,7 +604,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
     std::fs::write(&original, "original\n").unwrap();
     let outside = storage.path().join("out.txt");
     std::fs::write(&outside, "outside\n").unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let db = app.open_db(&storage.path().join("aft.db")).unwrap();
     let key = |pairing: &str| grants::Key {
         pairing_id: pairing.into(),

@@ -1178,7 +1178,7 @@ mod tests {
                     read,
                     write,
                     &path.join("absent-connection.json"),
-                    crate::context::App::default_shared(),
+                    crate::test_app(),
                     module_executor,
                     |request, _| Response::success(request.id, json!({})),
                     Some(path.join("absent-user-config.json")),

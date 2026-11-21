@@ -13311,7 +13311,7 @@ pub(crate) mod test_support {
             storage_dir: Some(dir.path().to_path_buf()),
             ..Config::default()
         };
-        let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+        let ctx = Arc::new(AppContext::from_app(crate::test_app(), config));
         let storage = crate::bash_background::task_storage_dir(&ctx);
         let task = create_task_layout(&storage, session, task_id).expect("task layout");
         let mut metadata = PersistedTask::starting(
@@ -13400,7 +13400,7 @@ pub(crate) mod test_support {
         std::fs::write(&task.paths.stderr, "").unwrap();
         std::fs::write(&task.paths.exit, "1\n").unwrap();
         let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.as_path().into()),
                 storage_dir: Some(storage),
@@ -13595,7 +13595,7 @@ pub(crate) mod test_support {
         let executor = Executor::new();
         let (dir, root) = test_root("watch-drain-wording");
         let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.as_path().into()),
                 storage_dir: Some(dir.path().join("storage")),
@@ -13648,10 +13648,7 @@ pub(crate) mod test_support {
     async fn deferred_registry_idle_turns_do_not_repoll_and_completion_wakes() {
         let executor = Executor::new();
         let (dir, root) = test_root("deferred-wake-counter");
-        let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
-            Config::default(),
-        ));
+        let ctx = Arc::new(AppContext::from_app(crate::test_app(), Config::default()));
         executor.register_actor(root.clone(), ctx);
         let wake = crate::response_finalize::DeferredResponseWake::default();
         let (tx, rx) = {
@@ -13736,7 +13733,7 @@ pub(crate) mod test_support {
         } else {
             30_000
         };
-        let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+        let ctx = Arc::new(AppContext::from_app(crate::test_app(), config));
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         struct ShutdownOnDrop(crate::bash_background::BgTaskRegistry);
         impl Drop for ShutdownOnDrop {
@@ -14897,7 +14894,7 @@ mod tests {
         let storage = temp.path().join("storage");
         crate::private_storage::create_dir_all(&storage).unwrap();
         let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 storage_dir: Some(storage.clone()),
                 ..Default::default()
@@ -14965,7 +14962,7 @@ mod tests {
         let healthy_path = dir.path().join("healthy-root");
         std::fs::create_dir_all(&healthy_path).unwrap();
         let healthy_root = ProjectRootId::from_path(&healthy_path).unwrap();
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Arc::new(Executor::new());
         let index = crate::config::IndexConfig {
             roots: vec![
@@ -15147,7 +15144,7 @@ mod tests {
     #[tokio::test]
     async fn standing_actor_lock_contention_does_not_block_route_binds_or_health() {
         let (dir, root) = test_root("standing-frame-isolation");
-        let app = App::default_shared();
+        let app = crate::test_app();
         let executor = Arc::new(Executor::new());
         let ctx = Arc::new(AppContext::from_app(
             Arc::clone(&app),
@@ -15575,7 +15572,7 @@ mod tests {
         executor.register_actor(root, ctx);
 
         let guard = db.lock().expect("hold bash-background DB mutex");
-        let app = App::default_shared();
+        let app = crate::test_app();
         let metrics = Arc::new(DispatchPathMetrics::new());
         let health_rollup_cache = Arc::new(HealthRollupCache::new());
         let frame = Frame::build_with_version(
@@ -16577,7 +16574,7 @@ mod tests {
     #[test]
     fn deleted_idle_root_is_fully_forgotten_and_status_counts_drop() {
         let (root_dir, root) = test_root("deleted-root-reap");
-        let app = App::default_shared();
+        let app = crate::test_app();
         let ctx = Arc::new(AppContext::from_app(
             Arc::clone(&app),
             Config {
@@ -16621,7 +16618,7 @@ mod tests {
 
         let (root_dir, root) = test_root("deleted-root-synapse-runtime");
         let connection = tempfile::NamedTempFile::new().expect("connection file");
-        let app = App::default_shared();
+        let app = crate::test_app();
         let ctx = Arc::new(AppContext::from_app(
             Arc::clone(&app),
             Config {
@@ -16738,7 +16735,7 @@ mod tests {
         );
         assert_eq!(outcome.evicted, 0);
 
-        let app = crate::context::App::default_shared();
+        let app = crate::test_app();
         let health_rollup_cache = HealthRollupCache::new();
         health_rollup_cache.refresh(&executor, &app);
         let report = build_health_report(
@@ -22888,7 +22885,7 @@ mod pong_priority_tests {
                     gate: module_gate,
                 },
                 &storage_path.join("connection.json"),
-                App::default_shared(),
+                crate::test_app(),
                 module_executor,
                 |request, ctx| {
                     if request.command == "configure" {

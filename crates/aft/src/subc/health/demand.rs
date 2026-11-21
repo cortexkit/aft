@@ -115,7 +115,7 @@ mod tests {
         let worker = HealthRollupWorker::start(
             Arc::clone(&cache),
             Arc::new(Executor::new()),
-            App::default_shared(),
+            crate::test_app(),
         );
         wait_for_refresh(&cache, 1);
         std::thread::sleep(HEALTH_ROLLUP_TTL + Duration::from_millis(100));

@@ -817,7 +817,7 @@ fn blocked_display_and_full_wake_queue_never_delay_a_reply() {
         outbox: Mutex::new(Outbox::new()),
         wake,
         limits: Mutex::new(outbox::ceilings()),
-        store: store::Store::new(crate::context::App::default_shared(), PathBuf::new()),
+        store: store::Store::new(crate::test_app(), PathBuf::new()),
     };
     let identity = Identity {
         runner: Principal::Reserved {
@@ -1389,7 +1389,7 @@ pub(super) fn test_writer(database: PathBuf) -> Writer {
         outbox: Mutex::new(Outbox::new()),
         wake,
         limits: Mutex::new(outbox::ceilings()),
-        store: store::Store::new(crate::context::App::default_shared(), database),
+        store: store::Store::new(crate::test_app(), database),
     }
 }
 

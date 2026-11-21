@@ -1097,7 +1097,7 @@ fn evicted_idle_roots_release_their_per_context_threads() {
         return;
     }
 
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let storage = tempfile::tempdir().unwrap();
     // Warm process-wide state (pools, registries) with one root that is

@@ -6,7 +6,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
     let original =
         "{\n  // my settings\n  \"search_index\": false,\n  \"hoist_builtin_tools\": false\n}\n";
     std::fs::write(&user, original).unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let metrics = Arc::new(DispatchPathMetrics::new());
     let (writer, mut frames) = mpsc::channel(8);

@@ -29,7 +29,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let app = App::default_shared();
+            let app = crate::test_app();
             let executor = Arc::new(Executor::new());
             let (writer, mut replies) = mpsc::channel(8);
             let (completion, mut completed) = mpsc::channel(8);

@@ -75,7 +75,7 @@ mod tests {
         let before = crate::memory::allocator_snapshot_calls_for_test();
         for now in [0, 3_000, 30_000, 300_001, 3_600_000] {
             cache.clock_ms.store(now, Ordering::Relaxed);
-            cache.refresh_for_test(&Executor::new(), &App::default_shared());
+            cache.refresh_for_test(&Executor::new(), &crate::test_app());
         }
         assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
     }
@@ -107,7 +107,7 @@ mod tests {
         let worker = HealthRollupWorker::start(
             Arc::clone(&cache),
             Arc::new(Executor::new()),
-            App::default_shared(),
+            crate::test_app(),
         );
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()

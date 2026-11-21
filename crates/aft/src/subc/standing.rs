@@ -1095,7 +1095,7 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -1232,7 +1232,7 @@ mod tests {
                 config.cache_config_unknown = Some("unreadable user document".into());
             }
             root_cache::prepare_cache_root_for_test(&mut config);
-            let ctx = Arc::new(AppContext::from_app(App::default_shared(), config));
+            let ctx = Arc::new(AppContext::from_app(crate::test_app(), config));
             let root = ProjectRootId::from_path(&project).unwrap();
             executor.register_actor(root.clone(), Arc::clone(&ctx));
             contexts.push((root, ctx));
@@ -1271,10 +1271,7 @@ mod tests {
         let storage = temp.path().join("storage");
         let cache = temp.path().join("offline-volume");
         std::fs::create_dir(&project).unwrap();
-        let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
-            Config::default(),
-        ));
+        let ctx = Arc::new(AppContext::from_app(crate::test_app(), Config::default()));
         let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
             "id":"initial-cache-bind", "command":"configure", "harness":"opencode", "project_root":project, "storage_dir":storage,
             "config":[{"tier":"user", "source":"test user", "doc":serde_json::json!({"storage":{"cache_dir":cache}, "indexes":{"trigram":false,"semantic":false,"callgraph":false}}).to_string()}]
@@ -1364,10 +1361,7 @@ mod tests {
             let volume = crate::walk_boundary::simulated_volumes::simulate(&cache, u64::MAX - 17);
             let user_file = user_dir.join("aft.jsonc");
             Self::write_user_config(&user_file, &cache);
-            let ctx = Arc::new(AppContext::from_app(
-                App::default_shared(),
-                Config::default(),
-            ));
+            let ctx = Arc::new(AppContext::from_app(crate::test_app(), Config::default()));
             let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
                 "id": "connect", "command": "configure", "harness": "opencode",
                 "project_root": project, "storage_dir": storage,
@@ -1725,7 +1719,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let literal = root.path().to_string_lossy().into_owned();
         let ctx = AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(root.path().to_path_buf()),
                 storage_dir: Some(storage.path().to_path_buf()),
@@ -1768,7 +1762,7 @@ mod tests {
         let canonical = std::fs::canonicalize(root.path()).unwrap();
         let literal = canonical.to_string_lossy().into_owned();
         let ctx = Arc::new(AppContext::from_app(
-            App::default_shared(),
+            crate::test_app(),
             Config {
                 project_root: Some(canonical.clone()),
                 storage_dir: Some(storage.path().to_path_buf()),

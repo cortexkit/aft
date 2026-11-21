@@ -161,7 +161,7 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
     }
     let outside = storage.path().join("outside.txt");
     std::fs::write(&outside, "must not leave B's selected root").unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let db = app.open_db(&storage.path().join("aft.db")).unwrap();
     for pairing in &SCOPES[..2] {
         grants::save(
