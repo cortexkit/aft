@@ -51,3 +51,9 @@ pub(crate) fn wait_fixture(
     }
     (dir, ctx, task)
 }
+
+pub(crate) use super::tests::insert_terminal_piped_task;
+
+    pub(crate) fn register_unpersisted_watch(registry: &BgTaskRegistry, id: String, pattern: WatchPattern, once: bool) {
+        registry.inner.watch_registry.lock().unwrap().register(id, pattern, once).unwrap();
+    }

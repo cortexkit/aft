@@ -325,7 +325,9 @@ async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
     let _manifest =
         super::super::super::authorization::set_test_manifest_for_test(Some(MANIFEST.to_vec()));
     let (dir, ctx, task) =
-        crate::bash_background::registry::default_kill_tests::wait_fixture(Some(1950));
+        crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(Some(
+            1950,
+        ));
     let root = dir.path().canonicalize().unwrap();
     ctx.set_db(Arc::new(std::sync::Mutex::new(
         crate::db::open(&root.join("aft.db")).unwrap(),

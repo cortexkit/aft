@@ -1,4 +1,6 @@
-use super::*;
+use crate::bash_background::registry::{test_support, BgTask};
+use std::sync::Arc;
+
 pub(crate) fn wait_fixture(
     explicit_timeout: Option<u64>,
 ) -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
