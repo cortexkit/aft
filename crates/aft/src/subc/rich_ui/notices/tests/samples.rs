@@ -11,17 +11,11 @@ fn read(bytes: &[u8], sha256: &str) -> Value {
 #[test]
 fn notice_records_match_occipital_phone_reader_sample_contract() {
     let sample = read(
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/notice-records/02-wake-records-with-notices.json"
-        )),
+        include_bytes!("../../../../../tests/fixtures/notice-records/02-wake-records-with-notices.json"),
         "f6a3c1c6df70a10a79b1abdbc2c4f59e17b8e6fc6edb3cf1c86719b7b233c0ae",
     );
     let sample_views = read(
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/notice-records/05-notice-views.json"
-        )),
+        include_bytes!("../../../../../tests/fixtures/notice-records/05-notice-views.json"),
         "fc698d032e5b7f8e3ba8d2abf10c62335c5861b5f77b15fcdc3fcc50fb330ee6",
     );
     // Occipital's sample views own their names and data schemas. Compare the
