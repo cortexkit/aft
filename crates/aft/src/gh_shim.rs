@@ -8364,7 +8364,12 @@ mod bypass_bot_credentials_tests;
 // that verify under it are `cfg(debug_assertions)` and the helpers only they
 // use read as dead there; the module compiles in both profiles.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
-mod tests {
+pub(crate) mod tests {
+    #[cfg(all(debug_assertions, any(target_os = "linux", target_os = "macos")))]
+    pub(crate) mod speech_dispatch_support {
+        include!("gh_shim_speech/dispatch_test_support.rs");
+    }
+
     /// Deadline for tests that expect rung discovery to finish. The product
     /// budget is 2 s; a loaded Windows runner has exceeded it, which turns the
     /// answer into R1 (budget exhausted) and fails tests that are not about the

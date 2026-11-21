@@ -80,8 +80,8 @@ async fn agent_selected_bindings_reject_even_a_signed_row_for_another_agent() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new_with_options(false, subconscious_options(false)).await;
     let mut reply = fixture.plex.bindings();
-    let manifest = super::super::tests::fixture_manifest();
-    let (other_repo, other_agent) = manifest.bindings.iter().next().unwrap();
+    let manifest = SpeechManifest::new();
+    let (other_repo, other_agent) = manifest.bindings().iter().next().unwrap();
     reply["bindings"].as_array_mut().unwrap().push(json!({
         "repository":other_repo, "agent_id":other_agent, "app_handle_id":"another-handle"
     }));
@@ -351,15 +351,10 @@ async fn foreground_call_rejects_each_rebound_launch_identity_field() {
 async fn current_policy_withdrawal_is_enforced_by_the_production_relay() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
-    let mut current = super::super::tests::fixture_manifest();
-    current.manifest_version += 1;
-    for rows in current.tiers.values_mut() {
-        rows.retain(|row| row.tuple() != "issue comment");
-    }
-    current.canonicalization.remove("issue comment");
-    let paths = StatePaths::from_root(fixture._dir.path().join("shim"));
-    super::super::tests::write_signed_manifest(&paths, current, unix_seconds());
-    load_manifest(&paths, unix_seconds()).unwrap();
+    let mut current = SpeechManifest::new();
+    current.bump_version();
+    current.remove_issue_comment();
+    current.sign_and_load(fixture._dir.path().join("shim"));
     for bound in [false, true] {
         let answer = fixture.post(bound, "current-withdrawn").await;
         assert_eq!(
@@ -424,13 +419,11 @@ async fn foreground_call_cannot_acquire_a_current_only_repository() {
     let _lock = crate::test_env::process_env_lock();
     let fixture = Fixture::new(false).await;
     let ticket = call_ticket(&fixture).await;
-    let mut current = super::super::tests::fixture_manifest();
-    let agent = current.bindings.values().next().unwrap().clone();
-    current.bindings.insert("new-owner/new-repo".into(), agent);
-    current.manifest_version += 1;
-    let paths = StatePaths::from_root(fixture._dir.path().join("shim"));
-    super::super::tests::write_signed_manifest(&paths, current, unix_seconds());
-    load_manifest(&paths, unix_seconds()).unwrap();
+    let mut current = SpeechManifest::new();
+    let agent = current.bindings().values().next().unwrap().clone();
+    current.insert_binding("new-owner/new-repo".into(), agent);
+    current.bump_version();
+    current.sign_and_load(fixture._dir.path().join("shim"));
     let mut params = fixture.params.clone();
     params["ticket"] = json!(ticket.value().unwrap());
     params["request"]["repository"] = json!("new-owner/new-repo");
