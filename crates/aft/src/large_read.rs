@@ -1405,7 +1405,7 @@ mod tests {
 
     #[test]
     fn phrase_normalizer_matches_normalize_exact_phrase_at_every_split() {
-        use crate::commands::semantic_search::exact_lane::normalize_exact_phrase;
+        use crate::search_index::exact_lane::normalize_exact_phrase;
         let mut rng = Rng(0xD1B5_4A32_D192_ED03);
         let mut texts: Vec<String> = vec![
             String::new(),
@@ -1437,7 +1437,7 @@ mod tests {
 
     /// Today's whole-read presence answer for `bytes`.
     fn whole_presence(bytes: &[u8], needle: &str) -> PresenceRead {
-        use crate::commands::semantic_search::exact_lane::normalize_exact_phrase;
+        use crate::search_index::exact_lane::normalize_exact_phrase;
         if crate::search_index::is_binary_bytes(bytes) {
             return PresenceRead::Unreadable;
         }
@@ -1448,7 +1448,7 @@ mod tests {
     }
 
     fn assert_presence_matches(bytes: &[u8], phrase: &str) {
-        use crate::commands::semantic_search::exact_lane::normalize_exact_phrase;
+        use crate::search_index::exact_lane::normalize_exact_phrase;
         let needle = normalize_exact_phrase(phrase);
         let expected = whole_presence(bytes, &needle);
         let mut steps: Vec<usize> = STEPS.to_vec();
