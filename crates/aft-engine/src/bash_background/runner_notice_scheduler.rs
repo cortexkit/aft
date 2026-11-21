@@ -20,10 +20,10 @@ pub enum Next {
 pub(crate) struct Scheduled {
     // Taking work leaves its send_id reserved until the attempt returns, so a
     // reconnect cannot start a second send for the same completion.
-    pub(crate) work: Option<Work>,
+    pub work: Option<Work>,
     pub(crate) due: std::time::Instant,
-    pub(crate) completion: bool,
-    pub(crate) retrying: bool,
+    pub completion: bool,
+    pub retrying: bool,
     expedite: bool,
     follow: Arc<Follow>,
 }

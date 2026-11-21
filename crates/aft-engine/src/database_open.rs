@@ -123,7 +123,7 @@ pub(crate) struct DatabaseOpenSlot {
     pub(crate) running: bool,
     /// Root and storage directory of the last open that published ready.
     /// A rebind with the same pair keeps the root ready.
-    pub(crate) ready_for: Option<(PathBuf, PathBuf)>,
+    pub ready_for: Option<(PathBuf, PathBuf)>,
 }
 
 impl Default for DatabaseOpenSlot {

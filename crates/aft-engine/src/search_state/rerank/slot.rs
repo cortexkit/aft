@@ -159,7 +159,8 @@ impl BackendSlot {
     /// The installed backend for `inputs`, without I/O and without waiting.
     /// If the slot has not built or started building for these inputs, this
     /// starts a build and returns `NotReady` until it finishes.
-    pub(crate) fn read(&self, inputs: BuildInputs) -> Installed {
+    #[doc(hidden)]
+    pub fn read(&self, inputs: BuildInputs) -> Installed {
         {
             let state = lock(&self.state);
             if state.inputs.as_ref() == Some(&inputs) {

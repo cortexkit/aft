@@ -221,7 +221,8 @@ impl Running {
         unsafe { libc::kill(-self.group, libc::SIGKILL) };
     }
 
-    pub(crate) async fn wait(mut self, cancel: CancellationToken) -> Result<Output, String> {
+    #[doc(hidden)]
+    pub async fn wait(mut self, cancel: CancellationToken) -> Result<Output, String> {
         let stdout = self.child.stdout.take().expect("piped stdout");
         let stderr = self.child.stderr.take().expect("piped stderr");
         let mut out = Captured::default();

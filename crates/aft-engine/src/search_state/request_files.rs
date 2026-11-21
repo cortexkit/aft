@@ -100,7 +100,8 @@ impl RequestFile {
 
     /// The stat the reading phase took before it read the bytes, so a file
     /// changed after it can only look newer than these bytes, never older.
-    pub(crate) fn stat(&self) -> Option<FileStat> {
+    #[doc(hidden)]
+    pub fn stat(&self) -> Option<FileStat> {
         self.stat
     }
 

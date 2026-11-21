@@ -395,7 +395,8 @@ impl SnapshotSink for Builder {
 impl Builder {
     /// Publish the snapshot. Returns its id and when it expires, in
     /// milliseconds since the Unix epoch.
-    pub(crate) fn commit(mut self) -> (String, u64) {
+    #[doc(hidden)]
+    pub fn commit(mut self) -> (String, u64) {
         let store = self
             .reservation
             .as_mut()

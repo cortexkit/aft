@@ -539,7 +539,7 @@ impl StatusBarCountValues {
         }
         self
     }
-    pub(crate) fn legacy_projection(&self) -> Option<StatusBarCounts> {
+    pub fn legacy_projection(&self) -> Option<StatusBarCounts> {
         let [Some(errors), Some(warnings), Some(todos)] = [self.errors, self.warnings, self.todos]
         else {
             return None;
@@ -794,11 +794,11 @@ impl RootHealthSummary {
         }
     }
 
-    pub(crate) fn is_busy(&self) -> bool {
+    pub fn is_busy(&self) -> bool {
         matches!(self.state, RootHealthState::Busy)
     }
 
-    pub(crate) fn is_fully_ready(&self) -> bool {
+    pub fn is_fully_ready(&self) -> bool {
         // `off` is the data layer's plane on a root nothing has queried yet:
         // nothing is built and nothing is pending.
         let component_is_satisfied = |status: &str| matches!(status, "ready" | "disabled" | "off");
@@ -815,7 +815,7 @@ impl RootHealthSummary {
             && self.tier2_status.is_some_and(component_is_satisfied)
     }
 
-    pub(crate) fn into_snapshot(self, project_root: &Path) -> RootHealthSnapshot {
+    pub fn into_snapshot(self, project_root: &Path) -> RootHealthSnapshot {
         if self.is_busy() {
             return RootHealthSnapshot::busy(project_root);
         }
@@ -1579,22 +1579,22 @@ pub struct ConfigureMaintenanceJob {
     pub storage_root: PathBuf,
     pub harness_dir: PathBuf,
     pub session_id: String,
-    pub(crate) root_too_broad: bool,
-    pub(crate) format_tool_cache_clear_needed: bool,
+    pub root_too_broad: bool,
+    pub format_tool_cache_clear_needed: bool,
     pub run_bash_replay: bool,
-    pub(crate) configure_database_runtime: bool,
-    pub(crate) refresh_project_runtime: bool,
-    pub(crate) sync_bash_compress_flag: bool,
-    pub(crate) reset_filter_registry: bool,
-    pub(crate) clear_failed_spawns: bool,
+    pub configure_database_runtime: bool,
+    pub refresh_project_runtime: bool,
+    pub sync_bash_compress_flag: bool,
+    pub reset_filter_registry: bool,
+    pub clear_failed_spawns: bool,
     /// Advance search disk-publication epochs only after the configure
     /// acknowledgement is sent. Updating an epoch may wait for a writer already
     /// committing, so the initial route bind must not perform this work.
-    pub(crate) supersede_search_artifact_persistence: bool,
+    pub supersede_search_artifact_persistence: bool,
     /// Keep the adopted semantic worker's artifact-publication epoch valid so it
     /// can still publish its result while unrelated configure work replaces the
     /// other artifact lanes.
-    pub(crate) supersede_semantic_artifact_persistence: bool,
+    pub supersede_semantic_artifact_persistence: bool,
 }
 
 impl StatusEmitter {

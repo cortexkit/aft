@@ -4,7 +4,7 @@ use crate::context::AppContext;
 /// One child's search engine context and what is installed in it.
 #[doc(hidden)]
 pub struct ChildEngine {
-    pub(crate) ctx: AppContext,
+    pub ctx: AppContext,
 }
 
 impl ChildEngine {

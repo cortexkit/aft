@@ -425,7 +425,8 @@ impl Parses {
         self.map.contains_key(path)
     }
 
-    pub(crate) fn len(&self) -> usize {
+    #[doc(hidden)]
+    pub fn len(&self) -> usize {
         self.map.len()
     }
 
@@ -442,7 +443,8 @@ impl Parses {
     }
 
     /// Every entry, reading each parse.
-    pub(crate) fn iter(&self) -> ParsesIter<'_> {
+    #[doc(hidden)]
+    pub fn iter(&self) -> ParsesIter<'_> {
         ParsesIter {
             parses: self,
             keys: self.map.keys(),

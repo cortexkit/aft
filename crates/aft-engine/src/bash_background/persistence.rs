@@ -546,22 +546,22 @@ pub struct PersistedTask {
     /// Runner completion send attempts, including the first offer. Persisted
     /// so retry backoff survives daemon restarts; it is not a delivery limit.
     #[serde(default, skip_serializing_if = "is_zero")]
-    pub(crate) runner_completion_offers: usize,
+    pub runner_completion_offers: usize,
     /// The first notice fixes optional wire members and reminder timing for
     /// this task. Discovery or config changes must not change a send's identity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runner_notice_policy: Option<RunnerNoticePolicy>,
+    pub runner_notice_policy: Option<RunnerNoticePolicy>,
     /// Scheduled elapsed time of the latest reminder, also embedded in its
     /// send_id. Replay must reuse it rather than measure elapsed time again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runner_reminder_elapsed_ms: Option<u64>,
+    pub runner_reminder_elapsed_ms: Option<u64>,
     /// Freeze the exact runner send before its first attempt. A restart must
     /// reuse the same text and delivery list even if task observations change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runner_completion_notice: Option<cortexkit_role_llm_runner::send::SendRequest>,
+    pub runner_completion_notice: Option<cortexkit_role_llm_runner::send::SendRequest>,
     /// Delivery generations and pending checks advance atomically with the frozen send.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) runner_completion_delivery: Option<RunnerCompletionDelivery>,
+    pub runner_completion_delivery: Option<RunnerCompletionDelivery>,
     /// The saved folder grants this command's sandbox allowed, so revoking
     /// one can stop it. Persisted so a restarted AFT still knows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
