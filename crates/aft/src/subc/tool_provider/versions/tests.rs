@@ -65,7 +65,7 @@ fn an_aliased_major_refusal_names_the_wire_tool_and_pins() {
     call.schema_pin = Some(sent.clone());
     let original = super::super::route_head_call_name(&mut call, false);
     assert_eq!(original.as_deref(), Some(sent.as_str()));
-    let error = wire_refusal(admit(&call).unwrap_err(), original.as_deref());
+    let error = routed::wire_refusal(admit(&call).unwrap_err(), original.as_deref());
     let expected_current = ToolMajorPin::new("aft_outline", &tool.schema_digest, 1)
         .encode()
         .unwrap();
@@ -95,8 +95,8 @@ fn unmapped_tp1_preserves_both_legacy_refusal_bodies() {
     assert_ne!(&tool.schema_digest, remote);
     let unknown_digest = "0".repeat(64);
     for (digest, expected) in [
-        (&tool.schema_digest, r#"{"code":"tool_semantics_changed","detail":{"current":3,"expected":99,"tool":"bash"},"message":"semantics pin is stale"}"#.to_owned()),
-        (&unknown_digest, format!(r#"{{"code":"tool_schema_changed","detail":{{"current":"{remote}","expected":"{unknown_digest}","tool":"bash"}},"message":"schema pin is stale"}}"#)),
+        (&tool.schema_digest, r#"{"code":"tool_semantics_changed","message":"semantics pin is stale","detail":{"tool":"bash","expected":99,"current":3}}"#.to_owned()),
+        (&unknown_digest, format!(r#"{{"code":"tool_schema_changed","message":"schema pin is stale","detail":{{"tool":"bash","expected":"{unknown_digest}","current":"{remote}"}}}}"#)),
     ] {
         let mut call = ToolCallRequest::new("bash", json!({"command":"echo"}));
         call.schema_pin = Some(SchemaPin::new("bash", digest, 99).encode().unwrap());
