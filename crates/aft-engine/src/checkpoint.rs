@@ -457,7 +457,7 @@ impl CheckpointStore {
         store
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn lock_path_for_test(&self) -> &Path {
         &self.lock_path
     }
@@ -465,7 +465,7 @@ impl CheckpointStore {
     /// Point this store's mutation lock at a private path. Tests use this for
     /// isolation instead of mutating the process-global `AFT_CACHE_DIR` env
     /// var, which races parallel lib tests that resolve storage paths.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_lock_path_for_test(&mut self, lock_path: PathBuf) {
         self.storage_dir = lock_path.parent().map(Path::to_path_buf);
         self.storage_harness = Some("test".to_string());

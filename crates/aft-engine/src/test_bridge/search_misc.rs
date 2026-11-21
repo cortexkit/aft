@@ -284,6 +284,12 @@ pub trait BackupStoreTest {
     fn expire_discovery_for_tests(&mut self);
     fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf>;
     fn history_content_reads_for_test(&self) -> u64;
+    fn release_after_next_snapshot_for_tests(&mut self);
+    fn fail_next_disk_write_for_tests(&mut self);
+    fn set_discovery_entry_limit_for_tests(&mut self, limit: usize);
+    fn discard_paths_for_tests(&self) -> &Vec<PathBuf>;
+    fn disk_io_count_for_tests(&self) -> u64;
+    fn resident_entry_count(&self) -> usize;
     fn uses_db_pool(
         &self,
         conn: &std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>,
@@ -309,6 +315,30 @@ impl BackupStoreTest for crate::backup::BackupStore {
 
     fn history_content_reads_for_test(&self) -> u64 {
         self.history_content_reads_for_test()
+    }
+
+    fn release_after_next_snapshot_for_tests(&mut self) {
+        self.release_after_next_snapshot_for_tests();
+    }
+
+    fn fail_next_disk_write_for_tests(&mut self) {
+        self.fail_next_disk_write_for_tests();
+    }
+
+    fn set_discovery_entry_limit_for_tests(&mut self, limit: usize) {
+        self.set_discovery_entry_limit_for_tests(limit);
+    }
+
+    fn discard_paths_for_tests(&self) -> &Vec<PathBuf> {
+        &self.discard_paths_for_tests
+    }
+
+    fn disk_io_count_for_tests(&self) -> u64 {
+        self.disk_io_count_for_tests()
+    }
+
+    fn resident_entry_count(&self) -> usize {
+        self.resident_entry_count()
     }
 
     fn uses_db_pool(
@@ -340,11 +370,21 @@ pub mod watcher_backend {
 
 pub trait CheckpointStoreTestExt {
     fn unbound_in_for_test(storage_dir: &Path) -> Self;
+    fn lock_path_for_test(&self) -> &Path;
+    fn set_lock_path_for_test(&mut self, lock_path: PathBuf);
 }
 
 impl CheckpointStoreTestExt for crate::checkpoint::CheckpointStore {
     fn unbound_in_for_test(storage_dir: &Path) -> Self {
         Self::unbound_in_for_test(storage_dir)
+    }
+
+    fn lock_path_for_test(&self) -> &Path {
+        self.lock_path_for_test()
+    }
+
+    fn set_lock_path_for_test(&mut self, lock_path: PathBuf) {
+        self.set_lock_path_for_test(lock_path);
     }
 }
 
