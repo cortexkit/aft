@@ -995,7 +995,7 @@ fn a_parent_folders_search_reads_its_childrens_stored_vectors_and_fills_none() {
     for name in ["alpha", "beta"] {
         init_repo(&root.join(name), name);
     }
-    let (base_url, gate) = crate::data_layer::meaning_query::tests::serve("never-held");
+    let (base_url, gate) = crate::data_layer::meaning_query::test_support::serve("never-held");
     gate.open();
     let semantic = SemanticBackendConfig {
         backend: SemanticBackend::OpenAiCompatible,

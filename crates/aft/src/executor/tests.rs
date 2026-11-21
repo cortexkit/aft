@@ -5,6 +5,7 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use super::test_support::test_executor;
 use super::*;
 use crate::context::AppContext;
 
@@ -90,21 +91,6 @@ fn test_ctx() -> Arc<AppContext> {
         Box::new(TreeSitterProvider::new()),
         Config::default(),
     ))
-}
-
-fn test_executor(
-    pool_size: usize,
-    read_cap: usize,
-    actor_cap: usize,
-    heavy_permits: usize,
-) -> Executor {
-    Executor::with_config(ExecutorConfig {
-        pool_size,
-        read_cap,
-        actor_cap,
-        heavy_permits,
-        drr_quantum: 1,
-    })
 }
 
 #[test]
