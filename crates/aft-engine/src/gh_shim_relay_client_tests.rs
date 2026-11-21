@@ -687,7 +687,7 @@ fn every_vendored_plexus_refusal_code_has_an_explanation() {
         }
     }
     let dir = std::path::Path::new(crate::test_support::manifest_dir())
-        .join("tests/fixtures/gh_shim/plexus-contract/replies-contract");
+        .join("../aft/tests/fixtures/gh_shim/plexus-contract/replies-contract");
     let mut found = std::collections::BTreeSet::new();
     let mut files = 0;
     for entry in std::fs::read_dir(&dir).unwrap() {

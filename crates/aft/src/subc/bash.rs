@@ -355,7 +355,7 @@ mod frame_loop_lock_tests {
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let state = task.test_state().lock().unwrap();
         assert!(state.metadata().remote.as_ref().unwrap().accepted);
-        let no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        let no_task_locks = aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
         let reply = answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true);
         tokio::pin!(reply);
         let answered = std::future::poll_fn(|cx| {
@@ -450,7 +450,7 @@ mod frame_loop_lock_tests {
             let state = task.test_state().lock().unwrap();
             assert!(state.metadata().status.is_terminal());
             let no_task_locks =
-                crate::bash_background::registry::forbid_task_state_locks_for_test();
+                aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
             let reply =
                 answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true);
             tokio::pin!(reply);
@@ -513,7 +513,7 @@ mod frame_loop_lock_tests {
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (completion_tx, mut completion_rx) = mpsc::channel(4);
         let (poll_touch_tx, _poll_touch_rx) = mpsc::channel(4);
-        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        let _no_task_locks = aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
         // A local task still has to be classified when the remote hand-back
         // deadline is due. That classification must stay on a worker thread.
         tokio::time::timeout(
@@ -652,7 +652,7 @@ mod frame_loop_lock_tests {
             )
         );
         let _state = task.test_state().lock().unwrap();
-        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        let _no_task_locks = aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
         // The frame loop awaits this function directly. It must be ready even
         // while task state is unavailable, not merely offload a blocking read
         // and leave the module loop waiting for that worker.
@@ -5760,7 +5760,7 @@ mod grant_path_tests {
             .get("command")
             .and_then(Value::as_str)
             .unwrap_or("sleep 1");
-        crate::bash_background::spawn(
+        aft_engine::test_bridge::bash_remote::bash_background::spawn(
             &req.id,
             req.session(),
             command,
@@ -5825,7 +5825,7 @@ mod grant_path_tests {
             "test dispatch observes the ledger identity a task would record",
             json!({
                 "task_requester": aft_engine::test_bridge::bash_remote::call_key_for_new_task("task").requester,
-                "ledger_carrier": crate::bash_background::registry::ledger_spawn_for_test()
+                "ledger_carrier": aft_engine::test_bridge::bash_remote::bash_background::registry::ledger_spawn_for_test()
                     .map(|key| key.carrier),
             }),
         )
@@ -7870,7 +7870,7 @@ mod grant_path_tests {
             let task = ctx.bash_background().test_task(&task_id).unwrap();
             let state = task.test_state().lock().unwrap();
             let no_task_locks =
-                crate::bash_background::registry::forbid_task_state_locks_for_test();
+                aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
             assert_eq!(
                 answer_held_bash_calls_from_module_loop(&writer_tx, &routes, &metrics, true)
                     .await
@@ -9097,7 +9097,7 @@ mod grant_path_tests {
         {
             let _state = task.test_state().lock().unwrap();
             let _no_task_locks =
-                crate::bash_background::registry::forbid_task_state_locks_for_test();
+                aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
             let cached = ctx
                 .bash_background()
                 .drain_reply_cache(&task_id, "deadline-session")
@@ -9205,7 +9205,7 @@ mod grant_path_tests {
         // The worker is held after metadata publication but before the canonical
         // output cache is built; no task or artifact reads may rescue this reply.
         let _state = fixture.task().test_state().lock().unwrap();
-        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        let _no_task_locks = aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
         for background in [false, true] {
             let reply = cached_runon_launch_reply(
                 &fixture.registry(),
@@ -11142,7 +11142,7 @@ mod grant_path_tests {
         #[cfg(not(windows))]
         let response = running_bash_stub(req, ctx);
         #[cfg(windows)]
-        let response = crate::bash_background::spawn(
+        let response = aft_engine::test_bridge::bash_remote::bash_background::spawn(
             &req.id,
             req.session(),
             "ping -n 60 127.0.0.1",
@@ -11726,7 +11726,7 @@ mod grant_path_tests {
         let (_dir, root) = super::super::test_support::test_root("bash-wait-lock");
         executor.register_actor(root.clone(), super::super::test_support::test_ctx());
         let hang_timeout = Duration::from_secs(120);
-        let _no_task_locks = crate::bash_background::registry::forbid_task_state_locks_for_test();
+        let _no_task_locks = aft_engine::test_bridge::bash_remote::bash_background::registry::forbid_task_state_locks_for_test();
 
         submit_deferred_bash(
             false,

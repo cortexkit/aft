@@ -1,6 +1,9 @@
 mod tests {
     use crate::bash_rewrite::catalog::ControlRole;
     use crate::bash_rewrite::dispatch::*;
+    use aft_engine::test_bridge::bash_remote::bash_rewrite::dispatch::{
+        count_route_records_for_prefix, dispatch_for_request_with_handlers,
+    };
 
     #[test]
     fn unregistered_rewrite_refuses_without_native_execution_or_mutation() {
@@ -47,7 +50,7 @@ mod tests {
             },
         );
         for command in ["printf hi", "printf $(date)"] {
-            crate::bash_rewrite::parser::take_parse_calls();
+            aft_engine::test_bridge::bash_remote::bash_parse::take_parse_calls();
             assert!(dispatch_for_request(
                 command,
                 "parse-once",
@@ -57,7 +60,7 @@ mod tests {
             )
             .is_none());
             assert_eq!(
-                crate::bash_rewrite::parser::take_parse_calls(),
+                aft_engine::test_bridge::bash_remote::bash_parse::take_parse_calls(),
                 1,
                 "{command}"
             );

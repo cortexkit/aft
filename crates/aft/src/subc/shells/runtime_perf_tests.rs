@@ -18,7 +18,7 @@ fn cpu_ns() -> u64 {
 
 fn fixture() -> (tempfile::TempDir, Arc<Executor>, Arc<App>, Vec<TaskPaths>) {
     let dir = tempfile::tempdir().unwrap();
-    let app = App::default_shared();
+    let app = crate::test_app();
     let executor = Arc::new(Executor::new());
     let db = Arc::new(std::sync::Mutex::new(
         crate::db::open(&dir.path().join("aft.db")).unwrap(),

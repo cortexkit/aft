@@ -27,11 +27,17 @@ mod tests {
         );
         for command in ["ls -R", "ls -aR", "ls -Ra ."] {
             assert!(
-                crate::bash_rewrite::rules::ls_request(command, &ctx).is_none(),
+                aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request(
+                    command, &ctx
+                )
+                .is_none(),
                 "{command}"
             );
         }
-        assert!(crate::bash_rewrite::rules::ls_request("ls -a", &ctx).is_some());
+        assert!(
+            aft_engine::test_bridge::bash_remote::bash_rewrite::rules::ls_request("ls -a", &ctx)
+                .is_some()
+        );
     }
 
     // The oracle needs a real POSIX bash. On Windows `bash` on PATH is often the

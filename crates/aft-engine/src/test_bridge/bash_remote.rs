@@ -1,7 +1,7 @@
 //! Fixtures for daemon tests that exercise shell execution and remote jobs.
 
 use crate::bash_background::{self as background, frames, persistence, registry};
-use crate::sandbox_spawn;
+use crate::sandbox_spawn as sandbox_engine;
 use std::path::{Path, PathBuf};
 
 pub mod completion_queue {
@@ -63,12 +63,12 @@ pub fn worker_scope(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
 
 #[cfg(unix)]
 pub fn create_task_temp_dir(task_bundle_dir: &Path) -> Result<PathBuf, String> {
-    sandbox_spawn::create_task_temp_dir(task_bundle_dir)
+    sandbox_engine::create_task_temp_dir(task_bundle_dir)
 }
 
 #[cfg(unix)]
 pub fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
-    sandbox_spawn::cleanup_task_temp_dir(path)
+    sandbox_engine::cleanup_task_temp_dir(path)
 }
 
 pub mod shell_metadata {
@@ -119,7 +119,7 @@ pub const COMMAND_BYTES: usize = background::scoped_tasks::COMMAND_BYTES;
 pub const OWNER_PAUSED_REASON: &str = registry::OWNER_PAUSED_REASON;
 
 #[cfg(unix)]
-pub const CHILD_FAILURE_FD: std::os::fd::RawFd = sandbox_spawn::CHILD_FAILURE_FD;
+pub const CHILD_FAILURE_FD: std::os::fd::RawFd = sandbox_engine::CHILD_FAILURE_FD;
 
 #[cfg(unix)]
 pub fn remote_report(metadata: &persistence::PersistedTask) -> Option<String> {
@@ -148,8 +148,8 @@ pub fn with_spawn_commit_time_for_test<T>(now: std::time::Instant, run: impl FnO
     background::with_spawn_commit_time_for_test(now, run)
 }
 
-pub fn with_spawn_plan_for_test<T>(plan: sandbox_spawn::SpawnPlan, run: impl FnOnce() -> T) -> T {
-    sandbox_spawn::with_spawn_plan_for_test(plan, run)
+pub fn with_spawn_plan_for_test<T>(plan: sandbox_engine::SpawnPlan, run: impl FnOnce() -> T) -> T {
+    sandbox_engine::with_spawn_plan_for_test(plan, run)
 }
 
 mod sandbox;
@@ -339,11 +339,5 @@ pub use scheduler_ext::*;
 
 pub use registry::remote::remote_types::{DrainingRetryTestExt, KeyedSubmissionTestExt};
 
-pub mod bash_background {
-    pub mod registry {
-        #[cfg(unix)]
-        pub mod root_reclaim_tests {
-            pub use crate::bash_background::registry::root_reclaim_fixture::*;
-        }
-    }
-}
+mod fixture_paths;
+pub use fixture_paths::*;

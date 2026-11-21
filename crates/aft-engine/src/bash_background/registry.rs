@@ -206,7 +206,7 @@ pub fn with_ledger_spawn<T>(
 }
 
 /// The call-ledger key a task created on this thread now would be linked to.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn ledger_spawn_for_test() -> Option<crate::db::call_ledger::Key> {
     LEDGER_SPAWN.with(|slot| slot.borrow().clone())
 }
@@ -658,7 +658,7 @@ struct KillSignalGate {
     release: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static KILL_SIGNAL_GATES: std::sync::OnceLock<Mutex<HashMap<String, KillSignalGate>>> =
     std::sync::OnceLock::new();
 
@@ -724,7 +724,7 @@ fn wait_on_rehydrated_registration_gate_for_test(task_id: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn install_kill_signal_gate_for_test(
     task_id: &str,
@@ -748,7 +748,7 @@ pub(crate) fn install_kill_signal_gate_for_test(
     (reached_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_kill_signal_gate_for_test(task_id: &str) {
     let gate = KILL_SIGNAL_GATES
         .get()
@@ -2382,15 +2382,15 @@ impl BgTaskRegistry {
         let registry = self.clone();
         let task_id = task_id.to_owned();
         let session_id = session_id.to_owned();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let delay = ARTIFACT_PAGE_DELAY.with(std::cell::Cell::get);
         crate::bounded_io::run(&task.paths.dir, Some(deadline), move |_| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             let previous = ARTIFACT_PAGE_DELAY.with(|value| value.replace(delay));
             let result = registry
                 .read_artifact_page(&task_id, &session_id, artifact, offset)
                 .map_err(std::io::Error::other);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             ARTIFACT_PAGE_DELAY.with(|value| value.set(previous));
             result
         })
@@ -2415,7 +2415,7 @@ impl BgTaskRegistry {
                 run(&task.paths);
             }
         });
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(delay) = ARTIFACT_PAGE_DELAY.with(std::cell::Cell::get) {
             std::thread::sleep(delay);
         }
@@ -14275,7 +14275,7 @@ impl BgTaskRegistry {
                 child_pid,
                 mut child,
             } => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 wait_on_kill_signal_gate_for_test(&task.task_id);
                 // A command may have finished after Killing was published but
                 // before any signal was delivered. Its own marker wins even
@@ -14299,7 +14299,7 @@ impl BgTaskRegistry {
                     }
                     marker
                 };
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 wait_on_kill_signal_gate_for_test(&format!("{}:committed", task.task_id));
                 #[cfg(feature = "test-timing-hooks")]
                 if scope_diagnostic {
@@ -14436,7 +14436,7 @@ impl BgTaskRegistry {
             self.kill_task_scope_with_reason(&task.task_id, kill_reason)?;
         }
         if terminalized {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             wait_on_kill_signal_gate_for_test(&format!("{task_id}:terminal-published"));
             self.post_terminal_transition_with_token_policy(
                 &task,
@@ -17205,12 +17205,8 @@ thread_local! {
     static ARTIFACT_READ_ALL_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Sleep added to every page read on this thread, so a test can make
-    /// draining a captured backlog slower than a caller's reply budget.
-    pub(crate) static ARTIFACT_PAGE_DELAY: std::cell::Cell<Option<std::time::Duration>> = const { std::cell::Cell::new(None) };
-}
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_support::ARTIFACT_PAGE_DELAY;
 
 #[cfg(test)]
 thread_local! { static ROOT_LOCK_PROBE: std::cell::RefCell<Option<Box<dyn Fn()>>> = const { std::cell::RefCell::new(None) }; }
@@ -17635,33 +17631,13 @@ fn remote_job_id(metadata: &PersistedTask) -> Option<String> {
         .map(|job_id| job_id.to_string())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TASK_STATE_LOCKS_FORBIDDEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Checks frame-loop lock ownership directly, without treating scheduler latency
-/// as evidence of a blocking lock. This guard must stay on its creating thread.
 #[cfg(test)]
-pub(crate) struct TaskStateLockBanForTest {
-    previous: bool,
-    _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
-}
-
-#[cfg(test)]
-pub(crate) fn forbid_task_state_locks_for_test() -> TaskStateLockBanForTest {
-    TaskStateLockBanForTest {
-        previous: TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.replace(true)),
-        _not_send: std::marker::PhantomData,
-    }
-}
-
-#[cfg(test)]
-impl Drop for TaskStateLockBanForTest {
-    fn drop(&mut self) {
-        TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.set(self.previous));
-    }
-}
+pub(crate) use test_support::forbid_task_state_locks_for_test;
 
 impl BgTask {
     /// Unwinding does not make a process terminal. Recover the same state used
@@ -17669,7 +17645,7 @@ impl BgTask {
     pub(crate) fn lock_state(
         &self,
     ) -> std::sync::LockResult<std::sync::MutexGuard<'_, BgTaskState>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         TASK_STATE_LOCKS_FORBIDDEN.with(|flag| {
             assert!(
                 !flag.get(),

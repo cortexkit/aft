@@ -448,6 +448,7 @@ pub trait SpawnPlanTestExt: Sized {
     fn protects_secret_memory(&self) -> bool;
     #[cfg(unix)]
     fn prepared_task(&self) -> Option<&PreparedTask>;
+    fn temp_dir(&self) -> Option<&Path>;
 }
 
 impl SpawnPlanTestExt for SpawnPlan {
@@ -472,6 +473,9 @@ impl SpawnPlanTestExt for SpawnPlan {
     #[cfg(unix)]
     fn prepared_task(&self) -> Option<&PreparedTask> {
         SpawnPlan::prepared_task(self)
+    }
+    fn temp_dir(&self) -> Option<&Path> {
+        SpawnPlan::temp_dir(self)
     }
 }
 
@@ -622,6 +626,7 @@ pub trait BgTaskTestExt {
     fn session_id(&self) -> &String;
     fn state(&self) -> &std::sync::Mutex<super::BgTaskState>;
     fn paths(&self) -> &TaskPaths;
+    fn last_reminder_at(&self) -> &std::sync::Mutex<Option<Instant>>;
 }
 
 impl BgTaskTestExt for BgTask {
@@ -636,5 +641,20 @@ impl BgTaskTestExt for BgTask {
     }
     fn paths(&self) -> &TaskPaths {
         &self.paths
+    }
+    fn last_reminder_at(&self) -> &std::sync::Mutex<Option<Instant>> {
+        &self.last_reminder_at
+    }
+}
+
+#[cfg(unix)]
+pub trait TaskSinkTestExt: Sized {
+    fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> std::io::Result<Self>;
+}
+
+#[cfg(unix)]
+impl TaskSinkTestExt for crate::bash_background::registry::remote::TaskSink {
+    fn new(registry: &BgTaskRegistry, task: Arc<BgTask>) -> std::io::Result<Self> {
+        Self::new(registry, task)
     }
 }

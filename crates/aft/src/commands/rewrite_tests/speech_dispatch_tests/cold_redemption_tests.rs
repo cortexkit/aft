@@ -1,6 +1,9 @@
 use super::*;
 use aft_engine::test_bridge::bash_remote::RedeemedTestExt as _;
 use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
+use aft_engine::test_bridge::bash_remote::{
+    AuthorityRecordTestExt as _, ExecutionSealTestExt as _,
+};
 
 #[test]
 fn cold_redemption_probe_child() {
@@ -21,52 +24,52 @@ fn cold_redemption_probe_child() {
     let conn = store.connect().unwrap();
     let row = crate::db::bash_tasks::get_bash_task(
         &conn,
-        &record.harness,
-        &record.session_id,
-        &record.task_id,
+        &record.harness(),
+        &record.session_id(),
+        &record.task_id(),
     )
     .unwrap()
     .unwrap();
     let rowid: i64 = conn
         .query_row(
             "SELECT rowid FROM bash_tasks WHERE harness=?1 AND session_id=?2 AND task_id=?3",
-            rusqlite::params![record.harness, record.session_id, record.task_id],
+            rusqlite::params![record.harness(), record.session_id(), record.task_id()],
             |row| row.get(0),
         )
         .unwrap();
     let mut metadata: Value = serde_json::from_str(&row.metadata).unwrap();
     let original_record = serde_json::to_string(&record).unwrap();
     let mut changed_record = record.clone();
-    let seal = changed_record.seal.as_mut().unwrap();
+    let seal = changed_record.seal_mut().as_mut().unwrap();
     match case.as_str() {
         "positive" => {}
         "sealed-pid" => {
-            seal.child_pid = u32::MAX;
-            metadata["child_pid"] = json!(seal.child_pid);
+            *seal.child_pid_mut() = u32::MAX;
+            metadata["child_pid"] = json!(seal.child_pid());
             conn.execute(
                 "UPDATE bash_tasks SET pid=?1 WHERE rowid=?2",
-                rusqlite::params![seal.child_pid, rowid],
+                rusqlite::params![seal.child_pid(), rowid],
             )
             .unwrap();
         }
         "sealed-birth" => {
             // Keep the mirror consistent so only the live OS birth-time
             // comparison can reject this altered execution seal.
-            seal.child_start_time_ms += 1;
-            metadata["child_start_time_ms"] = json!(seal.child_start_time_ms);
+            *seal.child_start_time_ms_mut() += 1;
+            metadata["child_start_time_ms"] = json!(seal.child_start_time_ms());
         }
         "sealed-birth-identity" => seal.birth_identity.push_str("-different-boot"),
         "outer-pid-null-with-pgid" => {
             conn.execute(
                 "UPDATE bash_tasks SET pid=NULL,pgid=?1 WHERE rowid=?2",
-                rusqlite::params![seal.child_pid, rowid],
+                rusqlite::params![seal.child_pid(), rowid],
             )
             .unwrap();
         }
         "outer-pid-with-pgid" => {
             conn.execute(
                 "UPDATE bash_tasks SET pid=1,pgid=?1 WHERE rowid=?2",
-                rusqlite::params![seal.child_pid, rowid],
+                rusqlite::params![seal.child_pid(), rowid],
             )
             .unwrap();
         }
@@ -144,7 +147,7 @@ fn cold_redemption_probe_child() {
         rusqlite::params![
             changed,
             blake3::hash(changed.as_bytes()).as_bytes(),
-            record.incarnation
+            record.incarnation()
         ],
     )
     .unwrap();
@@ -156,15 +159,15 @@ fn cold_redemption_probe_child() {
         rusqlite::params![
             original_record,
             blake3::hash(original_record.as_bytes()).as_bytes(),
-            record.incarnation
+            record.incarnation()
         ],
     )
     .unwrap();
     if case == "positive" {
         let redeemed = result.unwrap();
-        assert_eq!(redeemed.launch().as_ref(), Some(&record.launch));
-        assert_eq!(redeemed.session_id, record.session_id);
-        assert_eq!(redeemed.task_id, record.task_id);
+        assert_eq!(redeemed.launch().as_ref(), Some(record.launch()));
+        assert_eq!(redeemed.session_id, record.session_id().as_str());
+        assert_eq!(redeemed.task_id, record.task_id().as_str());
     } else {
         let refusal = result.unwrap_err();
         assert_eq!(refusal.code, Code::AuthorityUnavailable, "{case}");

@@ -499,7 +499,7 @@ pub enum ContractExpect {
 /// file: in both cases the manifest directory is `crates/aft`.
 pub fn load_vectors() -> Vec<ContractVector> {
     let directory = Path::new(crate::test_support::manifest_dir())
-        .join("tests/fixtures/gh_shim/plexus-contract/requests-contract");
+        .join("../aft/tests/fixtures/gh_shim/plexus-contract/requests-contract");
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
         .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
         .map(|entry| entry.expect("contract vector entry").path())
@@ -579,7 +579,7 @@ pub fn load_vectors() -> Vec<ContractVector> {
 /// GitHub pre-reads belong to Plexus, not to the shim's request-shape judge.
 pub fn load_reply_vectors() -> Vec<Value> {
     let directory = Path::new(crate::test_support::manifest_dir())
-        .join("tests/fixtures/gh_shim/plexus-contract/replies-contract");
+        .join("../aft/tests/fixtures/gh_shim/plexus-contract/replies-contract");
     let mut paths: Vec<_> = std::fs::read_dir(&directory)
         .expect("reply contract directory")
         .map(|entry| entry.expect("reply contract entry").path())
