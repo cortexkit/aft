@@ -73,6 +73,51 @@ async fn notice_records_no_write_or_announcement_queued_before_views_publish() {
 }
 
 #[tokio::test]
+async fn notice_record_is_announced_when_contended_outbox_unlocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.db");
+    let writer = test_writer(path.clone());
+    let conn = crate::db::open(&path).unwrap();
+    let record = pull(
+        "broca",
+        "session",
+        "aft:bash:bash-contended",
+        NoticeBody::new("bash_finished:1", None, Default::default()),
+    )
+    .unwrap();
+    let id = record.id.clone();
+    let expected = record.bytes.clone();
+    let mut held = writer.outbox.lock().unwrap();
+    stage_with_contention(&writer, record, Duration::from_secs(5), || {
+        assert!(held.reads.due(Instant::now()).is_none());
+        assert_eq!(
+            crate::db::display_records::read(&conn, &id, crate::db::display_records::now_ms())
+                .unwrap(),
+            Some(expected.clone()),
+            "the write finished while the outbox was locked",
+        );
+        drop(held);
+    })
+    .await;
+
+    let (due, bytes) = {
+        let now = Instant::now();
+        let mut outbox = writer.outbox.lock().unwrap();
+        let due = outbox.reads.due(now).expect("notice wake must be queued");
+        let bytes = outbox.reads.read(&due, now).unwrap();
+        (due, bytes)
+    };
+    assert_eq!(due, id);
+    assert_eq!(bytes, expected);
+    announce_retained(&writer, due, bytes, async { Ok(()) })
+        .await
+        .unwrap();
+    let mut outbox = writer.outbox.lock().unwrap();
+    outbox.reads.published(&id, true, Instant::now());
+    assert!(outbox.reads.due(Instant::now()).is_none());
+}
+
+#[tokio::test]
 async fn notice_records_persist_before_wake_and_display_read_survives_restart() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("aft.db");
