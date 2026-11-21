@@ -272,6 +272,7 @@ pub use aft_base::task_watches;
 #[cfg(test)]
 pub(crate) mod test_storage;
 pub use aft_base::tool_gate;
+pub(crate) mod tool_call_result;
 pub(crate) mod tool_output;
 pub use aft_base::tool_path;
 pub(crate) use aft_base::tool_progress;

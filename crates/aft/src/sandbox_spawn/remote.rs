@@ -1,6 +1,6 @@
 //! Remote shells inherit neither the normal shell profile nor its environment.
 
-use crate::{context::AppContext, run_tool_call::ToolCallResult};
+use crate::{context::AppContext, tool_call_result::ToolCallResult};
 use std::{
     path::{Path, PathBuf},
     time::Duration,

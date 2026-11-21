@@ -247,7 +247,7 @@ impl SearchIndexSnapshot {
             } else {
                 unindexed.insert(id);
             }
-            crate::run_tool_call::progress::report();
+            crate::tool_progress::report();
         }
         Self {
             delta: Arc::new(delta),
@@ -2261,7 +2261,7 @@ impl SearchIndexSnapshot {
         let mut entries = self
             .files
             .iter()
-            .inspect(|_| crate::run_tool_call::progress::report())
+            .inspect(|_| crate::tool_progress::report())
             .filter(|file| !file.path.as_os_str().is_empty())
             .filter_map(|file| {
                 let root = containing_root(&file.path)?;
@@ -5127,7 +5127,7 @@ mod tests {
         let sent = Arc::new(AtomicU64::new(0));
         let origin = Instant::now();
         let token = crate::executor::JobCancellation::new();
-        token.set_progress(crate::run_tool_call::progress::Progress::with_clock(
+        token.set_progress(crate::tool_progress::Progress::with_clock(
             {
                 let clock = clock.clone();
                 move || origin + Duration::from_secs(clock.fetch_add(30, Ordering::SeqCst))

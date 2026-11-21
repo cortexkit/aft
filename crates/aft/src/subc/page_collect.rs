@@ -512,12 +512,6 @@ pub(super) fn collect_with_hooks(call: CollectCall, hooks: ReadHooks<'_>) -> Res
     }
 }
 
-impl page::CollectRefusal {
-    fn into_error(self) -> subc_protocol::ErrorBody {
-        subc_protocol::ErrorBody::new(self.code(), self.message()).with_detail(self.detail())
-    }
-}
-
 /// The outcome of `page.read`: raw bytes, sent as a binary frame, or a
 /// JSON refusal.
 pub(super) enum ReadReply {

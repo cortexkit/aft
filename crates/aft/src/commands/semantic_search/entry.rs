@@ -1,6 +1,11 @@
 use super::*;
 
+#[cfg(test)]
+mod external_hook_tests;
+
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
+    // Direct library callers do not have the binary's startup registration.
+    crate::commands::register_external_search();
     crate::bounded_io::with_skip_disclosure(|| handle_semantic_search_with_disclosure(req, ctx))
 }
 

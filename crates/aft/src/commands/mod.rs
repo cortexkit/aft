@@ -15,6 +15,11 @@ pub fn register_shell_handlers() {
         edit_match: edit_match::handle_edit_match,
     });
 }
+
+#[doc(hidden)]
+pub fn register_external_search() {
+    crate::parent_search::external::register(data_search::dispatch_external_search);
+}
 pub mod bash_abort_inflight;
 pub mod bash_artifact_owned;
 pub mod bash_drain_completions;
