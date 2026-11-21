@@ -1,5 +1,6 @@
 use super::*;
 use crate::protocol::BgTaskStatus;
+use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 
 fn checkpoint(
     task: &str,
@@ -82,7 +83,7 @@ async fn eligible_pty_cannot_execute_user_code_before_the_durable_seal() {
     let (speech, metadata) = checkpoint(&task);
     assert_eq!(metadata.status, BgTaskStatus::Starting);
     assert!(speech
-        .prepared
+        .prepared()
         .context
         .service
         .store

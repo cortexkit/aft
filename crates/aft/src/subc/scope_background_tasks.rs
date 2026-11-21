@@ -555,6 +555,7 @@ pub(super) fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aft_engine::test_bridge::bash_remote::PersistedTaskTestExt as _;
     use sha2::{Digest, Sha256};
 
     fn selector() -> Selector {
@@ -1366,7 +1367,7 @@ mod tests {
         let layout = persistence::resolve_task_layout(&paths.session_dir, &id).unwrap();
         let paths = &layout.paths;
         let mut metadata = persistence::read_task_at(&layout).unwrap();
-        metadata.lifecycle_scope = Some(live);
+        *metadata.lifecycle_scope_mut() = Some(live);
         persistence::write_task_at(&layout, &metadata).unwrap();
         assert_eq!(metadata.scope.as_ref(), Some(&stamp));
         let sessions = [paths.session_dir.clone()];

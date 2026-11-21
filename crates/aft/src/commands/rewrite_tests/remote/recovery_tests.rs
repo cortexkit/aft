@@ -1,3 +1,6 @@
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+use aft_engine::test_bridge::bash_remote::DrainingRetryTestExt as _;
+use aft_engine::test_bridge::bash_remote::KeyedSubmissionTestExt as _;
 #[tokio::test]
 async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart() {
     for started in [false, true] {
@@ -870,7 +873,7 @@ async fn runon_missing_workdir_is_refused_by_name_before_dispatch() {
     assert_eq!(done.child_pid, None);
     assert_eq!(done.remote_job_id, None);
     let task = ctx.bash_background().test_task(task_id).unwrap();
-    assert!(!task.test_state().lock().unwrap().metadata.local_fallback_started);
+    assert!(!task.test_state().lock().unwrap().metadata().local_fallback_started);
     assert!(!marker.exists(), "a refused runon must never spawn locally");
     assert!(
         exec_runs(&daemon).is_empty(),
@@ -906,7 +909,7 @@ async fn runon_transport_failure_still_reports_remote_unavailable() {
         "{done:?}"
     );
     let task = ctx.bash_background().test_task(task_id).unwrap();
-    assert!(!task.test_state().lock().unwrap().metadata.local_fallback_started);
+    assert!(!task.test_state().lock().unwrap().metadata().local_fallback_started);
     assert!(!marker.exists(), "a refused runon must never spawn locally");
     assert!(exec_runs(&daemon).is_empty());
 }
@@ -2215,7 +2218,7 @@ async fn bash_kill_scope_never_resubmits_a_saved_signer_refusal() {
     );
     let retry = remote.retry.as_ref().unwrap();
     assert_eq!(
-        (retry.first_refusal_at_ms, retry.next_retry_at_ms),
+        (retry.first_refusal_at_ms(), retry.next_retry_at_ms()),
         (None, None),
         "{saved:?}"
     );
@@ -2478,7 +2481,7 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
         registry
             .test_task(&task)
             .unwrap()
-            .state
+            .test_state()
             .lock()
             .unwrap()
             .metadata
@@ -2522,7 +2525,7 @@ async fn bash_kill_scope_during_reconnect_settles_once_and_stops_the_worker() {
     let recorded = registry
         .test_task(&task)
         .unwrap()
-        .state
+        .test_state()
         .lock()
         .unwrap()
         .metadata
@@ -2557,7 +2560,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
         serde_json::from_value(fixture["unaccepted"]["request"]["params"]["scope"].clone())
             .unwrap();
     let mut tasks = Vec::new();
-    for (index, connection) in [first.connection.clone(), second.connection.clone()]
+    for (index, connection) in [first.connection().clone(), second.connection().clone()]
         .into_iter()
         .enumerate()
     {
@@ -2653,8 +2656,8 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
             BgTaskStatus::Killed
         );
     }
-    first.acceptance_gate.notify_one();
-    second.acceptance_gate.notify_one();
+    first.acceptance_gate().notify_one();
+    second.acceptance_gate().notify_one();
     for (registry, task) in registries.iter().zip(&tasks) {
         wait_for(
             "paused submission must be withdrawn after route setup",
@@ -2662,7 +2665,7 @@ async fn bash_kill_scope_unaccepted_tasks_share_one_deadline_and_local_kills_are
                 registry
                     .test_task(task)
                     .unwrap()
-                    .state
+                    .test_state()
                     .lock()
                     .unwrap()
                     .metadata
@@ -2714,7 +2717,7 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
         registry
             .test_task(&task)
             .unwrap()
-            .state
+            .test_state()
             .lock()
             .unwrap()
             .metadata
@@ -2728,7 +2731,7 @@ async fn bash_kill_scope_cancels_submission_after_pre_acceptance_pause() {
     // Detaching a caller does not cancel the job. Retain the observation until
     // Accepted supplies an id, then send a real exec.cancel for the owner pause.
     assert!(!daemon
-        .log
+        .log()
         .lock()
         .unwrap()
         .iter()
@@ -2907,7 +2910,7 @@ async fn runon_uncounted_expired_replay_reports_expired_after_bounded_recovery()
     assert!(output.contains("output lost"), "{output}");
     assert!(!dir.path().join("dist").exists());
     let attaches = daemon
-        .log
+        .log()
         .lock()
         .unwrap()
         .iter()
@@ -3210,7 +3213,7 @@ async fn runon_return_v3_uses_advertised_cap_for_new_and_existing_outputs() {
         let remote = saved.remote.unwrap();
         assert_eq!(remote.return_max_bytes, 134_217_728);
         let restored =
-            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest()).unwrap();
         assert_eq!(restored.return_max_bytes, Some(134_217_728));
     }
 }
@@ -3265,7 +3268,7 @@ async fn runon_return_v3_selects_large_cap_and_persists_a_single_cap_retry() {
         assert_eq!(remote.return_max_bytes, cap);
         assert_eq!(remote.return_cap_retried, retry);
         let restored =
-            restore_retry_request(&task, &remote.submission.unwrap().request_digest).unwrap();
+            restore_retry_request(&task, &remote.submission.unwrap().request_digest()).unwrap();
         assert_eq!(restored.return_max_bytes, Some(cap));
         if retry {
             assert_eq!(runs[1]["return_max_bytes"], cap);

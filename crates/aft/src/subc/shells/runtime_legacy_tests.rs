@@ -1,6 +1,10 @@
 // Frozen collection path from before task sampling and store-generation caching.
 // Keep this independent of the cached observation path for wire-equivalence tests.
 use super::*;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::ShellReaderTestExt as _;
 
 pub(super) fn collect_legacy(
     executor: &Executor,

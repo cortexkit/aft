@@ -6,6 +6,7 @@ mod tests {
     use crate::bash_background::BgTaskStatus;
     use crate::protocol::BashPatternMatchFrame;
     use aft_engine::test_bridge::bash_remote::BgBuffer;
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
     use aft_engine::test_bridge::bash_remote::{registry_support::registry_cases::*, TaskRuntime};
     use std::{fs, path::PathBuf, time::Instant};
 

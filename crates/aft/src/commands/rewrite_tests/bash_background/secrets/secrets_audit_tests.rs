@@ -1,4 +1,5 @@
 use super::*;
+use aft_engine::test_bridge::bash_remote::LaunchTestExt as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::AtomicBool;
@@ -360,9 +361,9 @@ fn audit_task_limit_cleans_unarmed_proxy_and_scratch() {
         let f = Fixture::new();
         f.ctx.update_config(|c| c.max_background_bash_tasks = 0);
         let launch = authorized(&f);
-        let retained = launch.runtime.clone();
+        let retained = launch.runtime().clone();
         let address = retained.lock().unwrap().address();
-        let scratch = launch.preflight.plan.temp_dir().unwrap().to_owned();
+        let scratch = launch.preflight().plan.temp_dir().unwrap().to_owned();
         let reply = crate::bash_background::spawn_with_secrets(
             "audit",
             "secret-bash",
@@ -398,10 +399,10 @@ fn audit_arm_failure_cleans_transferred_scratch() {
     isolated("audit_arm_failure_cleans_transferred_scratch", || {
         let f = Fixture::new();
         let mut launch = authorized(&f);
-        let retained = launch.runtime.clone();
+        let retained = launch.runtime().clone();
         let address = retained.lock().unwrap().address();
-        let scratch = launch.preflight.plan.temp_dir().unwrap().to_owned();
-        let task = launch.preflight.task.take().unwrap();
+        let scratch = launch.preflight().plan.temp_dir().unwrap().to_owned();
+        let task = launch.preflight().task.take().unwrap();
         assert_ne!(unsafe { libc::getsid(0) }, std::process::id() as i32);
         assert!(retained.lock().unwrap().arm(std::process::id()).is_err());
         let _ = crate::bash_background::persistence::delete_resolved_task(&task);

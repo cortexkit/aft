@@ -45,7 +45,7 @@ impl Store {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn final_legacy_gate<T>(
         &self,
         incarnation: &str,

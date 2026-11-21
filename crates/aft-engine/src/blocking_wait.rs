@@ -200,7 +200,7 @@ impl ReplyBudget {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_suspend_clock(
         mut self,
         clock: &'static std::sync::atomic::AtomicU64,
@@ -212,7 +212,7 @@ impl ReplyBudget {
     /// A test driving Tokio time must use that same clock for expiry, not just
     /// for scheduler wakeups. Opt in per budget so native-clock suspend tests
     /// and other calls keep their independent time sources.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_runtime_clock(mut self) -> Self {
         self.clock.awake = tokio::time::Instant::now().into_std();
         self.clock.base_now = Some(|| tokio::time::Instant::now().into_std());

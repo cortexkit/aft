@@ -154,7 +154,7 @@ impl ShellReader {
         self.live.is_none()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn persisted(row: BashTaskRow) -> Option<(ShellSnapshot, Self)> {
         Self::persisted_observed(row).map(|(snapshot, reader, _)| (snapshot, reader))
     }
@@ -438,7 +438,7 @@ impl ShellReader {
 }
 
 impl BgTaskRegistry {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn insert_shell_fixture(
         &self,
         metadata: PersistedTask,
@@ -447,7 +447,7 @@ impl BgTaskRegistry {
         self.insert_rehydrated_task(metadata, paths, false)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn update_shell_fixture(
         &self,
         task_id: &str,
@@ -477,7 +477,7 @@ impl BgTaskRegistry {
             persisted_terminal: false,
         })
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn shell_snapshots(&self) -> Vec<ShellSnapshot> {
         let tasks: Vec<_> = self
             .inner

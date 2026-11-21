@@ -1,5 +1,9 @@
 use super::*;
 use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 use sha2::{Digest, Sha256};
 
 #[cfg(unix)]
@@ -2611,7 +2615,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
             }
         );
         let sent = daemon
-            .log
+            .log()
             .lock()
             .unwrap()
             .iter()

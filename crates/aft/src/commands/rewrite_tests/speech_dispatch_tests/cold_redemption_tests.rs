@@ -1,4 +1,6 @@
 use super::*;
+use aft_engine::test_bridge::bash_remote::RedeemedTestExt as _;
+use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 
 #[test]
 fn cold_redemption_probe_child() {
@@ -160,7 +162,7 @@ fn cold_redemption_probe_child() {
     .unwrap();
     if case == "positive" {
         let redeemed = result.unwrap();
-        assert_eq!(redeemed.launch.as_ref(), Some(&record.launch));
+        assert_eq!(redeemed.launch().as_ref(), Some(&record.launch));
         assert_eq!(redeemed.session_id, record.session_id);
         assert_eq!(redeemed.task_id, record.task_id);
     } else {

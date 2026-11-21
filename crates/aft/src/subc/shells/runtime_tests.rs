@@ -1,5 +1,9 @@
 use super::*;
 use crate::bash_background::persistence::TaskArtifact;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::ShellReaderTestExt as _;
 
 fn output_log(frame: &Frame) -> OperationLog {
     OperationLog {

@@ -87,7 +87,7 @@ fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
     assert!(
         task.test_lock_state()
             .unwrap()
-            .metadata
+            .metadata()
             .display
             .as_ref()
             .unwrap()
@@ -99,7 +99,7 @@ fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
     assert!(
         task.test_lock_state()
             .unwrap()
-            .metadata
+            .metadata()
             .display
             .as_ref()
             .unwrap()
