@@ -583,6 +583,10 @@ fn retire_terminal_task(
     if registry.retry_terminal_persist(task).is_err() {
         return;
     }
+    #[cfg(target_os = "linux")]
+    if !registry.release_memory_holder(task) {
+        return;
+    }
     if !registry.cleanup_terminal_task_temp(task).unwrap_or(false) {
         return;
     }

@@ -1173,3 +1173,177 @@ fn memory_limit_terminal_accounting_failure_still_samples_and_notifies() {
     assert_eq!(persisted.status, BgTaskStatus::Failed);
     assert_eq!(persisted.status_reason, Some(policy.exceeded_reason()));
 }
+
+#[cfg(target_os = "linux")]
+fn systemd_memory_policy(cgroup: PathBuf) -> super::super::memory_limit::MemoryPolicy {
+    super::super::memory_limit::MemoryPolicy {
+        mib: 64,
+        kind: "Linux cgroup v2 memory.max".into(),
+        cgroup: Some(cgroup),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_limit_systemd_records_payload_oom_before_stopping_holder() {
+    use super::super::memory_limit::{setup_systemd_payload, Monitor};
+    use std::process::{Command, Stdio};
+
+    let temp = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let (id, task) = tests::insert_terminal_piped_task(&registry, &temp, "allocate", "", "", false);
+    let observed = temp.path().join("metadata-when-holder-stopped.json");
+    let helper = Command::new("/bin/sh")
+        .args(["-c", "read -r ready; exec /bin/cp \"$1\" \"$2\"", "holder"])
+        .arg(&task.paths.json)
+        .arg(&observed)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let helper_pid = helper.id();
+    let scope = temp.path().join("run-holder.scope");
+    let holder = scope.join("holder");
+    fs::create_dir(&scope).unwrap();
+    fs::write(scope.join("memory.events"), "oom_kill 0\n").unwrap();
+    let payload = setup_systemd_payload(
+        &scope,
+        helper_pid,
+        64,
+        |path| {
+            fs::create_dir(path)?;
+            fs::write(path.join("cgroup.procs"), "")?;
+            fs::write(path.join("cgroup.kill"), "0")
+        },
+        |path, value| {
+            if path == scope.join("cgroup.subtree_control") {
+                assert_eq!(
+                    fs::read_to_string(holder.join("cgroup.procs")).unwrap(),
+                    helper_pid.to_string()
+                );
+                assert_eq!(value, "+memory");
+                assert!(!scope.join("payload").exists());
+            }
+            fs::write(path, value)
+        },
+    )
+    .unwrap();
+    assert_eq!(payload, scope.join("payload"));
+    assert_eq!(
+        fs::read_to_string(scope.join("cgroup.subtree_control")).unwrap(),
+        "+memory"
+    );
+    assert_eq!(
+        fs::read_to_string(payload.join("memory.max")).unwrap(),
+        "67108864"
+    );
+    assert_eq!(
+        fs::read_to_string(payload.join("memory.oom.group")).unwrap(),
+        "1"
+    );
+    assert_eq!(
+        fs::read_to_string(payload.join("memory.swap.max")).unwrap(),
+        "0"
+    );
+    assert!(!scope.join("memory.max").exists());
+    assert!(!holder.join("memory.max").exists());
+
+    let policy = systemd_memory_policy(payload.clone());
+    let metadata = {
+        let mut state = task.lock_state().unwrap();
+        state
+            .metadata
+            .mark_terminal(BgTaskStatus::Failed, Some(137), None);
+        state.metadata.memory_policy = Some(policy.clone());
+        state.metadata.clone()
+    };
+    registry.persist_task(&task.paths, &metadata).unwrap();
+    let mut monitor = Monitor::recover(policy.clone(), &id).unwrap().unwrap();
+    monitor.set_holder_for_test(helper);
+    monitor.attach(12345).unwrap();
+    assert_eq!(
+        fs::read_to_string(payload.join("cgroup.procs")).unwrap(),
+        "12345"
+    );
+    assert!(!observed.exists(), "holder stopped at attach");
+    registry
+        .inner
+        .memory_monitors
+        .lock()
+        .unwrap()
+        .insert(id, monitor);
+
+    fs::write(payload.join("memory.events"), "oom_kill 1\n").unwrap();
+    registry.settle_memory_accounting(&task).unwrap();
+    let recorded = super::super::persistence::read_task(&observed).unwrap();
+    assert_eq!(recorded.status, BgTaskStatus::Failed);
+    assert_eq!(recorded.exit_code, Some(137));
+    assert_eq!(recorded.status_reason, Some(policy.exceeded_reason()));
+    assert_eq!(fs::read_to_string(holder.join("cgroup.kill")).unwrap(), "0");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn memory_limit_systemd_replay_reads_payload_or_warns_on_missing_accounting() {
+    for (scope_exists, has_exit_marker) in [(true, true), (true, false), (false, true)] {
+        let temp = tempfile::tempdir().unwrap();
+        let paths =
+            super::super::persistence::task_paths(temp.path(), "session", &random_slug()).unwrap();
+        fs::create_dir_all(&paths.io_dir).unwrap();
+        let payload = temp.path().join("run-replay.scope/payload");
+        if scope_exists {
+            fs::create_dir_all(&payload).unwrap();
+            fs::write(payload.join("memory.events"), "oom_kill 1\n").unwrap();
+        }
+        let policy = systemd_memory_policy(payload.clone());
+        let mut metadata = PersistedTask::starting(
+            paths.task_id.clone(),
+            "session".into(),
+            "allocate".into(),
+            temp.path().into(),
+            None,
+            None,
+            true,
+            false,
+        );
+        metadata.mark_running(u32::MAX, i32::MAX);
+        metadata.memory_policy = Some(policy.clone());
+        super::super::persistence::write_task(&paths.json, &metadata).unwrap();
+        if has_exit_marker {
+            fs::write(&paths.exit, "137").unwrap();
+        }
+
+        let restarted = BgTaskRegistry::default();
+        let (replayed, logs) = crate::logging::capture_log_lines(|| {
+            restarted.rehydrate_resolved_task_with_process_probe(
+                metadata,
+                paths.clone(),
+                "session",
+                |_| false,
+            )
+        });
+        replayed.unwrap();
+        let recorded = super::super::persistence::read_task(&paths.json).unwrap();
+        assert_eq!(recorded.status, BgTaskStatus::Failed);
+        assert_eq!(recorded.exit_code, Some(137));
+        assert_eq!(
+            recorded.status_reason,
+            scope_exists.then(|| policy.exceeded_reason())
+        );
+        assert_eq!(
+            read_exit_marker(&paths).unwrap(),
+            Some(ExitMarker::Code(137))
+        );
+        let warnings: Vec<_> = logs
+            .iter()
+            .filter(|line| line.contains("could not read memory-cap accounting"))
+            .collect();
+        assert_eq!(warnings.len(), usize::from(!scope_exists), "{logs:?}");
+        if let Some(line) = warnings.first() {
+            assert!(line.contains(&paths.task_id), "{line}");
+            assert!(
+                line.contains(payload.join("memory.events").to_str().unwrap()),
+                "{line}"
+            );
+        }
+    }
+}

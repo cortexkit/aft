@@ -8272,62 +8272,19 @@ impl BgTaskRegistry {
             .folder_grants
             .is_some()
             .then(|| (metadata.task_id.clone(), metadata.session_id.clone()));
-        let (marker, process_alive) = if matches!(
-            metadata.status,
-            BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
-        ) {
-            let mut marker = read_exit_marker(&paths).ok().flatten();
-            let process_alive = if marker.is_none() {
-                let alive = process_is_alive(&metadata);
-                #[cfg(target_os = "linux")]
-                let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
-                {
-                    let recovered = (|| -> Result<(), String> {
-                        if let Some(super::task_scope::ScopeLookup::Present(scope)) =
-                            self.recover_persisted_task_scope(&metadata)?
-                        {
-                            if let Some(policy) = metadata.memory_policy.as_mut() {
-                                let monitor = super::memory_limit::Monitor::recover_task_scope(
-                                    policy.mib, &scope,
-                                );
-                                *policy = monitor.policy.clone();
-                                self.inner
-                                    .memory_monitors
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .insert(metadata.task_id.clone(), monitor);
-                            }
-                        }
-                        Ok(())
-                    })();
-                    if recovered.is_err() {
-                        super::task_scope::log_unconfirmed_scope();
-                        false
-                    } else {
-                        alive
-                    }
-                } else {
-                    alive
-                };
-                if !alive {
-                    // The wrapper writes its exit marker before exiting. It may
-                    // have done both since our first read, so observe the marker
-                    // again after detecting death before declaring the outcome lost.
-                    marker = read_exit_marker(&paths).ok().flatten();
-                }
-                alive
-            } else {
-                false
-            };
-            (marker, process_alive)
-        } else {
-            (None, false)
-        };
+        let (marker, process_alive, memory_reason) =
+            self.replay_exit_observation(&mut metadata, &paths, process_is_alive);
         match metadata.status {
             BgTaskStatus::Starting => {
                 let completion_was_delivered = metadata.completion_delivered;
                 if let Some(marker) = marker {
-                    metadata = terminal_metadata_from_marker(metadata, marker, None);
+                    metadata = scope_runtime::replay_terminal_metadata(
+                        metadata,
+                        &paths,
+                        marker,
+                        None,
+                        memory_reason,
+                    );
                 } else if process_alive {
                     crate::slog_info!("background task {} replay Starting -> Running: durable child identity child_pid={:?} pgid={:?}", metadata.task_id, metadata.child_pid, metadata.pgid);
                     metadata.status = BgTaskStatus::Running;
@@ -8351,7 +8308,13 @@ impl BgTaskRegistry {
                 if metadata.mode == BgMode::Pty {
                     if let Some(marker) = marker {
                         let completion_was_delivered = metadata.completion_delivered;
-                        metadata = terminal_metadata_from_marker(metadata, marker, None);
+                        metadata = scope_runtime::replay_terminal_metadata(
+                            metadata,
+                            &paths,
+                            marker,
+                            None,
+                            memory_reason,
+                        );
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -8382,7 +8345,13 @@ impl BgTaskRegistry {
                             metadata.task_id);
                     }
                     let completion_was_delivered = metadata.completion_delivered;
-                    metadata = terminal_metadata_from_marker(metadata, marker, reason);
+                    metadata = scope_runtime::replay_terminal_metadata(
+                        metadata,
+                        &paths,
+                        marker,
+                        reason,
+                        memory_reason,
+                    );
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;

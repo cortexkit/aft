@@ -1,5 +1,22 @@
 use super::*;
 
+pub(super) fn replay_terminal_metadata(
+    metadata: PersistedTask,
+    paths: &TaskPaths,
+    marker: ExitMarker,
+    reason: Option<String>,
+    memory_reason: Option<String>,
+) -> PersistedTask {
+    if let Some(reason) = memory_reason {
+        let mut metadata =
+            terminal_metadata_from_marker(metadata, ExitMarker::Code(137), Some(reason));
+        super::super::persistence::persist_terminal_exit(paths, &mut metadata);
+        metadata
+    } else {
+        terminal_metadata_from_marker(metadata, marker, reason)
+    }
+}
+
 impl BgTaskRegistry {
     pub(crate) fn configure_task_scope_runtime(&self, daemon_mode: bool, max_runtime: Duration) {
         self.inner
@@ -372,6 +389,82 @@ impl BgTaskRegistry {
         }
     }
 
+    pub(super) fn replay_exit_observation(
+        &self,
+        metadata: &mut PersistedTask,
+        paths: &TaskPaths,
+        process_is_alive: impl FnOnce(&PersistedTask) -> bool,
+    ) -> (Option<ExitMarker>, bool, Option<String>) {
+        if !matches!(
+            metadata.status,
+            BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
+        ) {
+            return (None, false, None);
+        }
+        let mut marker = read_exit_marker(paths).ok().flatten();
+        let process_alive = if marker.is_none() {
+            let alive = process_is_alive(metadata);
+            #[cfg(target_os = "linux")]
+            let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none() {
+                let recovered = (|| -> Result<(), String> {
+                    if let Some(super::super::task_scope::ScopeLookup::Present(scope)) =
+                        self.recover_persisted_task_scope(metadata)?
+                    {
+                        if let Some(policy) = metadata.memory_policy.as_mut() {
+                            let monitor = super::super::memory_limit::Monitor::recover_task_scope(
+                                policy.mib, &scope,
+                            );
+                            *policy = monitor.policy.clone();
+                            self.inner
+                                .memory_monitors
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .insert(metadata.task_id.clone(), monitor);
+                        }
+                    }
+                    Ok(())
+                })();
+                if recovered.is_err() {
+                    super::super::task_scope::log_unconfirmed_scope();
+                    false
+                } else {
+                    alive
+                }
+            } else {
+                alive
+            };
+            if !alive {
+                // The wrapper writes its exit marker before exiting. Check it
+                // again after detecting death before declaring the outcome lost.
+                marker = read_exit_marker(paths).ok().flatten();
+            }
+            alive
+        } else {
+            false
+        };
+        #[cfg(target_os = "linux")]
+        let memory_reason = (|| {
+            if process_alive {
+                return None;
+            }
+            let policy = metadata.memory_policy.as_ref()?;
+            policy.systemd_cgroup()?;
+            let mut monitor =
+                super::super::memory_limit::Monitor::recover(policy.clone(), &metadata.task_id)
+                    .ok()??;
+            monitor
+                .exceeded_at_exit(0, &metadata.task_id, marker == Some(ExitMarker::Code(137)))
+                .then(|| monitor.reason())
+        })();
+        #[cfg(not(target_os = "linux"))]
+        let memory_reason: Option<String> = None;
+        if memory_reason.is_some() {
+            // A group OOM can kill the wrapper before it writes its exit marker.
+            marker = Some(ExitMarker::Code(137));
+        }
+        (marker, process_alive, memory_reason)
+    }
+
     pub(crate) fn memory_limit_exceeded(&self, task: &Arc<BgTask>) -> Option<String> {
         let mut state = task.lock_state().ok()?;
         if (state.metadata.remote.is_some() && !state.metadata.local_fallback_started)
@@ -467,7 +560,9 @@ impl BgTaskRegistry {
             .unwrap_or(0);
         let mut updated = false;
         let mut kill_scope = false;
-        if monitor.exceeded(pgid) {
+        let sigkill =
+            state.metadata.status == BgTaskStatus::Failed && state.metadata.exit_code == Some(137);
+        if monitor.exceeded_at_exit(pgid, &task.task_id, sigkill) {
             if monitor.is_task_scope() {
                 kill_scope = true;
             } else {
@@ -508,11 +603,45 @@ impl BgTaskRegistry {
                 task.terminal_persist_dirty.store(false, Ordering::SeqCst);
             }
         }
+        #[cfg(target_os = "linux")]
+        let holder = if task.terminal_persist_dirty.load(Ordering::SeqCst) {
+            None
+        } else {
+            monitor.take_holder()
+        };
         drop(monitors);
         drop(state);
+        #[cfg(target_os = "linux")]
+        {
+            // Keep the scope until both the task file and its database mirror
+            // have been written, and reap without holding the registry locks.
+            drop(db);
+            drop(holder);
+        }
         if kill_scope {
             self.kill_task_scope_with_reason(&task.task_id, "terminal_memory_limit")?;
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn release_memory_holder(&self, task: &BgTask) -> bool {
+        let holder = {
+            let mut monitors = self
+                .inner
+                .memory_monitors
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let Some(monitor) = monitors.get_mut(&task.task_id) else {
+                return true;
+            };
+            let persisted = !task.terminal_persist_dirty.load(Ordering::SeqCst);
+            if monitor.holder_release_pending(persisted) {
+                return false;
+            }
+            monitor.take_holder()
+        };
+        drop(holder);
+        true
     }
 }
