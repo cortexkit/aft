@@ -225,7 +225,7 @@ fn fresh(modified: SystemTime) -> bool {
     fresh_at(modified, SystemTime::now())
 }
 
-fn fresh_at(modified: SystemTime, now: SystemTime) -> bool {
+pub(crate) fn fresh_at(modified: SystemTime, now: SystemTime) -> bool {
     // Match Date.now()'s millisecond precision, including sub-ms mtime slack.
     let now_ms = now
         .duration_since(UNIX_EPOCH)
@@ -318,7 +318,7 @@ fn dynamic(path: &str) -> bool {
     path.starts_with('~') || path.contains('$') || path.contains('`')
 }
 
-fn operands(stage: &str, mut at: usize, windows: bool) -> Vec<String> {
+pub(crate) fn operands(stage: &str, mut at: usize, windows: bool) -> Vec<String> {
     let mut paths = Vec::new();
     let mut pattern = false;
     let mut options_ended = false;
@@ -412,7 +412,7 @@ fn escapes(next: Option<char>, quote: Quote, windows: bool) -> bool {
     }
 }
 
-fn statements(command: &str, windows: bool) -> Option<Vec<&str>> {
+pub(crate) fn statements(command: &str, windows: bool) -> Option<Vec<&str>> {
     let chars: Vec<_> = command.char_indices().collect();
     let mut out = Vec::new();
     let (mut start, mut i, mut depth) = (0, 0, 0usize);
@@ -492,7 +492,7 @@ fn statements(command: &str, windows: bool) -> Option<Vec<&str>> {
     Some(out)
 }
 
-fn pipeline_stages(command: &str, windows: bool) -> Option<Vec<&str>> {
+pub(crate) fn pipeline_stages(command: &str, windows: bool) -> Option<Vec<&str>> {
     let mut chars = command.char_indices().peekable();
     let mut quote = Quote::None;
     let mut stages = Vec::new();
@@ -537,7 +537,7 @@ fn pipeline_stages(command: &str, windows: bool) -> Option<Vec<&str>> {
     Some(stages)
 }
 
-fn token(command: &str, start: usize, windows: bool) -> Option<(String, usize)> {
+pub(crate) fn token(command: &str, start: usize, windows: bool) -> Option<(String, usize)> {
     let mut chars = command[start..].char_indices().peekable();
     while chars.peek().is_some_and(|(_, c)| c.is_whitespace()) {
         chars.next();
