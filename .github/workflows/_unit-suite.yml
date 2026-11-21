@@ -737,6 +737,7 @@ jobs:
   # slowest one takes about as long as its single longest test (about 4 minutes).
   # Watcher tests stay serial; conformance and Bun tests use their own lane.
   # Each job timeout includes 50 minutes for MOTOR to drain the fleet VMs.
+  # The mini's shared Cargo target uses a smaller cap to leave room for indexes.
   # ---------------------------------------------------------------------------
   unit-macos-nextest-archive:
     name: Cargo test archive (macOS)
@@ -761,6 +762,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -875,6 +878,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -999,6 +1004,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1102,6 +1109,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1234,6 +1243,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1281,6 +1292,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1328,6 +1341,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1385,6 +1400,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1506,6 +1523,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1620,6 +1639,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -1711,10 +1732,30 @@ jobs:
       - name: Install GitHub CLI for pinned helper downloads
         shell: bash
         run: |
-          if ! command -v gh >/dev/null 2>&1; then
-            brew install gh
+          set -euo pipefail
+          gh_version=2.105.0
+          gh_sha256=2a5d03103ae444927383b93d9ffd65579a26e2eb900ce1cf11f55258d5319ded
+          if command -v gh >/dev/null 2>&1 && installed=$(gh --version); then
+            case "${installed%%$'\n'*}" in
+              "gh version $gh_version"|"gh version $gh_version "*)
+                printf '%s\n' "$installed"
+                exit 0
+                ;;
+            esac
           fi
-          gh --version
+
+          dist="gh_${gh_version}_macOS_arm64"
+          install_dir="$(mktemp -d "$AFT_CI_JOB_DIR/gh.XXXXXX")"
+          archive="$install_dir/$dist.zip"
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            --proto '=https' --proto-redir '=https' --output "$archive" \
+            "https://github.com/cli/cli/releases/download/v${gh_version}/${dist}.zip"
+          printf '%s  %s\n' "$gh_sha256" "$archive" | shasum -a 256 --check
+          unzip -q "$archive" -d "$install_dir"
+          rm "$archive"
+          bin="$install_dir/$dist/bin"
+          "$bin/gh" --version
+          printf '%s\n' "$bin" >> "$GITHUB_PATH"
 
       - name: Fetch pinned subc-core
         id: subc_core

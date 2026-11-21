@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -10,12 +11,14 @@ from pathlib import Path
 import re
 import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
 import unittest.mock
+import zipfile
 
 
 MODULE_PATH = Path(__file__).with_name("workflow-gates.py")
@@ -265,7 +268,10 @@ class LightPREventGateTests(unittest.TestCase):
                     start, end = (2, -1) if platform == "macos" else (1, len(steps))
                     work = steps[start:end]
                     self.assertEqual(work[0]["uses"], "actions/setup-python@v6")
-                    self.assertEqual(work[1], {"uses": "./.github/actions/native-ci-state"})
+                    setup: dict[str, object] = {"uses": "./.github/actions/native-ci-state"}
+                    if platform == "macos":
+                        setup["with"] = {"target-max-gib": "30"}
+                    self.assertEqual(work[1], setup)
                     self.assertEqual(work[2]["uses"], "oven-sh/setup-bun@v2")
                     self.assertEqual(work[3]["uses"], "actions/setup-node@v5")
                     self.assertEqual(work[4], step)
@@ -1402,7 +1408,10 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 steps = job["steps"][start:end]
                 self.assertEqual(steps[0], {"uses": "actions/setup-python@v6", "if": "runner.environment == 'github-hosted'",
                                              "with": {"python-version": "3.14"}})
-                self.assertEqual(steps[1], {"uses": "./.github/actions/native-ci-state"})
+                setup: dict[str, object] = {"uses": "./.github/actions/native-ci-state"}
+                if mac:
+                    setup["with"] = {"target-max-gib": "30"}
+                self.assertEqual(steps[1], setup)
                 cleanup = steps[-1]
                 self.assertEqual(cleanup["uses"], "./.github/actions/native-ci-state")
                 self.assertEqual(cleanup["if"], "always() && steps.macos-hold.outcome == 'success'" if mac else "always()")
@@ -1462,8 +1471,76 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         conformance = self.suites[0]["jobs"]["unit-macos-conformance"]["steps"]
         gh = next(step for step in conformance if step.get("name") == "Install GitHub CLI for pinned helper downloads")
         fetch = next(step for step in conformance if step.get("name") == "Fetch pinned subc-core")
-        self.assertIn("brew install gh", gh["run"])
+        self.assertNotIn("brew", gh["run"])
         self.assertLess(conformance.index(gh), conformance.index(fetch))
+
+    def test_macos_gh_install_checks_the_version_and_zip_digest_before_use(self) -> None:
+        conformance = self.suites[0]["jobs"]["unit-macos-conformance"]["steps"]
+        step = next(step for step in conformance if step.get("name") == "Install GitHub CLI for pinned helper downloads")
+        script = step["run"]
+        version = re.search(r"(?m)^gh_version=([\d.]+)$", script)
+        pin = re.search(r"(?m)^gh_sha256=([0-9a-f]{64})$", script)
+        assert version is not None and pin is not None, "expected a pinned GitHub CLI release and checksum"
+        version = version[1]
+        dist = f"gh_{version}_macOS_arm64"
+        url = f"https://github.com/cli/cli/releases/download/v{version}/{dist}.zip"
+        test_binary = f"#!/bin/sh\necho 'gh version {version} (fixture)'\n"
+        cases = ((version, False, True), (None, True, True), (version + "0", True, True), (None, False, False))
+        for installed, matching_hash, success in cases:
+            with self.subTest(installed=installed, matching_hash=matching_hash), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                job = root / "job folder"
+                job.mkdir()
+                tools = root / "tools"
+                tools.mkdir()
+                for command in ("mktemp", "shasum", "unzip", "rm"):
+                    path = shutil.which(command)
+                    assert path is not None, f"{command} is required for the offline installer contract test"
+                    (tools / command).symlink_to(path)
+                curl = tools / "curl"
+                curl.write_text('''#!/bin/bash
+set -euo pipefail
+printf '%s\\n' "${!#}" > "$DOWNLOAD_LOG"
+while [[ "$1" != --output ]]; do shift; done
+/bin/cp "$ZIP_FIXTURE" "$2"
+''')
+                curl.chmod(0o755)
+                if installed is not None:
+                    gh = tools / "gh"
+                    gh.write_text(f"#!/bin/sh\necho 'gh version {installed} (existing)'\n")
+                    gh.chmod(0o755)
+                fixture = root / "offline.zip"
+                with zipfile.ZipFile(fixture, "w") as archive:
+                    entry = zipfile.ZipInfo(f"{dist}/bin/gh")
+                    entry.create_system = 3  # Preserve the Unix executable bit when unzipping.
+                    entry.external_attr = 0o100755 << 16
+                    archive.writestr(entry, test_binary)
+                fixture_hash = hashlib.sha256(fixture.read_bytes()).hexdigest()
+                path_file = root / "github-path"
+                path_file.touch()
+                log = root / "download-url"
+                result = subprocess.run(
+                    ["/bin/bash", "-c", script.replace(pin[1], fixture_hash) if matching_hash else script],
+                    env={**os.environ, "PATH": str(tools), "AFT_CI_JOB_DIR": str(job), "GITHUB_PATH": str(path_file),
+                         "ZIP_FIXTURE": str(fixture), "DOWNLOAD_LOG": str(log)},
+                    capture_output=True, text=True,
+                )
+                self.assertEqual(result.returncode == 0, success, result.stdout + result.stderr)
+                if installed == version:
+                    self.assertFalse(log.exists(), "already pinned; no download should occur")
+                    self.assertEqual(path_file.read_text(), "")
+                else:
+                    self.assertEqual(log.read_text().strip(), url)
+                    if success:
+                        installed_bin = Path(path_file.read_text().strip())
+                        self.assertTrue(installed_bin.is_relative_to(job))
+                        self.assertEqual((installed_bin / "gh").read_text(), test_binary)
+                        self.assertIn(f"gh version {version} (fixture)", result.stdout)
+                        self.assertFalse(list(job.glob("*/*.zip")), "remove the downloaded zip after installation")
+                    else:
+                        self.assertIn("checksum did NOT match", result.stderr)
+                        self.assertEqual(path_file.read_text(), "")
+                        self.assertFalse(list(job.glob("*/*/bin/gh")), "do not unpack an unverified zip")
 
     def test_local_archive_consumers_keep_run_scoped_paths(self) -> None:
         for name, job in self.native_jobs():
@@ -1565,10 +1642,12 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.state.run_directory(root, "../target", "1")
 
-    def test_shared_target_is_cleaned_whole_only_above_fifty_gib_on_self_hosted(self) -> None:
-        for environment, size, expected in (("github-hosted", 78, False), ("self-hosted", 50, False),
-                                             ("self-hosted", 78, True)):
-            with self.subTest(environment=environment, size=size), \
+    def test_shared_target_is_cleaned_whole_only_above_the_runner_cap_on_self_hosted(self) -> None:
+        for environment, cap, size, expected in (("github-hosted", 30, 78, False),
+                                                  ("self-hosted", 30, 30, False), ("self-hosted", 30, 31, True),
+                                                  ("self-hosted", 50, 31, False), ("self-hosted", 50, 50, False),
+                                                  ("self-hosted", 50, 51, True)):
+            with self.subTest(environment=environment, cap=cap, size=size), \
                  tempfile.TemporaryDirectory() as tmp, \
                  unittest.mock.patch.dict(os.environ, {"RUNNER_ENVIRONMENT": environment}), \
                  unittest.mock.patch.object(self.state, "target_bytes", return_value=size * 1024**3) as measure, \
@@ -1580,30 +1659,48 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
                 fingerprint.write_bytes(b"fingerprint")
                 # A read-only file, as cargo and git leave on Windows, must not stop the clean.
                 fingerprint.chmod(0o400)
-                self.state.clean_oversized_target(target)
+                self.state.clean_oversized_target(target, cap)
                 self.assertEqual(measure.call_count, int(environment == "self-hosted"))
                 # The clean runs before the toolchain is on PATH, so it never runs cargo.
                 run.assert_not_called()
                 self.assertEqual(target.exists(), not expected)
                 if expected:
-                    self.assertIn("78.0 GiB", output.call_args.args[0])
+                    self.assertIn(f"{size}.0 GiB", output.call_args.args[0])
 
     def test_setup_checks_shared_target_before_publishing_build_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "aft-ci"
             env_file = Path(tmp) / "env"
-            def clean(target):
+            def clean(target, target_max_gib):
                 self.assertEqual(target, root / "target")
+                self.assertEqual(target_max_gib, 30)
                 self.assertFalse(env_file.exists())
                 target.rmdir()
             with unittest.mock.patch.dict(os.environ, {"GITHUB_ENV": str(env_file)}), \
                  unittest.mock.patch.object(self.state, "setup_windows_tool_paths", return_value={}), \
                  unittest.mock.patch.object(self.state, "prune_run_archives"), \
                  unittest.mock.patch.object(self.state, "clean_oversized_target", side_effect=clean) as cleanup:
-                self.state.setup(root, self.state.run_directory(root, "100", "1"))
+                self.state.setup(root, self.state.run_directory(root, "100", "1"), 30)
             cleanup.assert_called_once()
             self.assertTrue((root / "target").is_dir())
             self.assertTrue(env_file.exists())
+
+    def test_native_state_action_passes_the_target_cap_to_setup(self) -> None:
+        action = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/actions/native-ci-state/action.yml"))
+        self.assertEqual(action["inputs"]["target-max-gib"]["default"], "50")
+        step = next(step for step in action["runs"]["steps"] if "scripts/ci-native-state.py" in step.get("run", ""))
+        self.assertEqual(step["env"]["AFT_CI_TARGET_MAX_GIB"], "${{ inputs.target-max-gib }}")
+        self.assertIn('scripts/ci-native-state.py "$AFT_CI_PHASE" "$AFT_CI_TARGET_MAX_GIB"', step["run"])
+        for args, cap in (([], 50), (["30"], 30), (["50"], 50)):
+            with self.subTest(args=args), tempfile.TemporaryDirectory() as tmp, \
+                 unittest.mock.patch.object(self.state.Path, "home", return_value=Path(tmp)), \
+                 unittest.mock.patch.object(self.state, "cleanup_processes"), \
+                 unittest.mock.patch.object(self.state, "setup") as setup, \
+                 unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "setup", *args]), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "self-hosted", "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1"}):
+                self.state.main()
+                root = Path(tmp) / "aft-ci"
+                setup.assert_called_once_with(root, root / "runs" / "100", cap)
 
     def test_target_size_deduplicates_hardlinks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

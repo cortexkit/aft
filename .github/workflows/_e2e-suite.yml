@@ -615,6 +615,8 @@ jobs:
         with:
           python-version: "3.14"
       - uses: ./.github/actions/native-ci-state
+        with:
+          target-max-gib: "30"
 
       - uses: oven-sh/setup-bun@v2
         with:
