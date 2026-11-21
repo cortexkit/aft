@@ -264,7 +264,8 @@ mod tests {
             }
             let page = view.template["page"]["source"].as_str().unwrap();
             assert!(page.contains(match entry.tool.name.as_str() {
-                "edit" | "write" => "view.detail.hunks",
+                "edit" => "view.detail.hunks",
+                "write" => "codeString={input.content}",
                 "apply_patch" => "view.detail.files",
                 _ => "view.output ??",
             }));
@@ -273,12 +274,16 @@ mod tests {
             // and desktop widths.
             let digests = match entry.tool.name.as_str() {
                 "apply_patch" => [
-                    "e13744cb5e3fe03a188391d6245127f58d0b1b69884e5793656ac2186f64f0c6",
-                    "2acf86a6d82f3e8992005d8ab24840ea0fbdd41260a4bb643177640210854e9d",
+                    "a15a500f28427f4fe7459a861ef7af668fc5897d08b9422496f032f62f9bbc3e",
+                    "58f52d34e95b95f474281175d3790627a4f9263e87a078b8b1fefef80116688b",
                 ],
-                "edit" | "write" => [
+                "edit" => [
                     "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
                     "3a457fd30d60ca7acc5bab258da9786bc309a44190d5454795f2b80a870332d7",
+                ],
+                "write" => [
+                    "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
+                    "3422ad764d8aea87c95e6f6b38e21bf10096d27ef72bedb07a9f4276b8fa23fd",
                 ],
                 "bash" => continue, // Covered by the tail-pin compatibility test.
                 name => panic!("missing template digests for {name}"),

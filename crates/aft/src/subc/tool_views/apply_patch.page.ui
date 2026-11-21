@@ -1,4 +1,7 @@
-{(view.completion.outcome ?? view.record.outcome) == "error" && (view.completion.fileCount ?? view.record.fileCount ?? 0) == 0
+export const outcome = view.completion.outcome ?? view.record.outcome
+
+{outcome == "partial" ? <ToolText text="Partly applied" tone="warning" />
+ : outcome == "error" && (view.completion.fileCount ?? view.record.fileCount ?? 0) == 0
  ? <ToolText text="Not applied" tone="danger" /> : null}
 
 {Each(view.detail.files ?? [], "file", [

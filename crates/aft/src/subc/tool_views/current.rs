@@ -7,16 +7,21 @@ pub(in crate::subc) const CATALOG_DIGEST: &str =
 
 pub(super) fn append(entry: &mut Shipped) {
     let mut manifest = entry.history.last().expect("shipped view").clone();
-    let edit = [include_str!("edit.row.ui"), include_str!("edit.page.ui")];
     // Revision 3 already used this catalog. Only the replaced placeholders
     // need revision 4 for apps to accept their new sources.
     let (revision_delta, sources) = match entry.tool.name.as_str() {
-        "edit" => (2, Some(edit)),
+        "edit" => (
+            2,
+            Some([include_str!("edit.row.ui"), include_str!("edit.page.ui")]),
+        ),
         "bash" => (
             2,
             Some([include_str!("bash.row.ui"), include_str!("bash.page.ui")]),
         ),
-        "write" => (3, Some(edit)),
+        "write" => (
+            3,
+            Some([include_str!("edit.row.ui"), include_str!("write.page.ui")]),
+        ),
         "apply_patch" => (
             3,
             Some([
