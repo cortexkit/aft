@@ -3,7 +3,8 @@
 use super::*;
 
 impl PersistedTask {
-    pub(crate) fn lifecycle_scope(&self) -> Option<&subc_protocol::scope::ScopeStamp> {
+    #[doc(hidden)]
+    pub fn lifecycle_scope(&self) -> Option<&subc_protocol::scope::ScopeStamp> {
         self.lifecycle_scope.as_ref().or(self.scope.as_ref())
     }
 }

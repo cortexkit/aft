@@ -1618,12 +1618,14 @@ impl DataCheckout {
     }
 
     #[must_use]
-    pub(crate) fn view(&self) -> Option<CheckoutView> {
+    #[doc(hidden)]
+    pub fn view(&self) -> Option<CheckoutView> {
         self.work.checkout.view()
     }
 
     #[must_use]
-    pub(crate) fn checkout(&self) -> &Checkout {
+    #[doc(hidden)]
+    pub fn checkout(&self) -> &Checkout {
         &self.work.checkout
     }
 

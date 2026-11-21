@@ -73,7 +73,8 @@ pub struct ShellSnapshotCache {
 }
 
 impl ShellSnapshotCache {
-    pub(crate) fn retain(&mut self, ids: &HashMap<String, ShellReader>) {
+    #[doc(hidden)]
+    pub fn retain(&mut self, ids: &HashMap<String, ShellReader>) {
         self.live
             .retain(|id, _| ids.get(id).is_some_and(|reader| !reader.is_persisted()));
         self.saved
@@ -113,7 +114,8 @@ pub struct ShellReader {
 }
 
 impl ShellReader {
-    pub(crate) fn persisted_cached(
+    #[doc(hidden)]
+    pub fn persisted_cached(
         row: BashTaskRow,
         cache: &mut ShellSnapshotCache,
     ) -> Option<(ShellSnapshot, Self)> {
@@ -137,15 +139,18 @@ impl ShellReader {
         }
         Some((snapshot, reader))
     }
-    pub(crate) fn with_stop(mut self, stop: tokio_util::sync::CancellationToken) -> Self {
+    #[doc(hidden)]
+    pub fn with_stop(mut self, stop: tokio_util::sync::CancellationToken) -> Self {
         self.stop = Some(stop);
         self
     }
 
-    pub(crate) fn stopped(&self) -> bool {
+    #[doc(hidden)]
+    pub fn stopped(&self) -> bool {
         self.stop.as_ref().is_some_and(|stop| stop.is_cancelled())
     }
-    pub(crate) fn is_persisted(&self) -> bool {
+    #[doc(hidden)]
+    pub fn is_persisted(&self) -> bool {
         self.live.is_none()
     }
 
@@ -270,7 +275,8 @@ impl ShellReader {
         Ok(updated.shell_revision)
     }
 
-    pub(crate) fn shell_revision_if_changed(
+    #[doc(hidden)]
+    pub fn shell_revision_if_changed(
         &self,
         task_id: &str,
         fingerprint: &str,
@@ -283,7 +289,8 @@ impl ShellReader {
         self.shell_revision(task_id, fingerprint)
     }
 
-    pub(crate) fn shell_read(
+    #[doc(hidden)]
+    pub fn shell_read(
         &self,
         _task_id: &str,
         artifact: TaskArtifact,
@@ -299,7 +306,8 @@ impl ShellReader {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn shell_longest_secret(&self, task_id: &str) -> usize {
+    #[doc(hidden)]
+    pub fn shell_longest_secret(&self, task_id: &str) -> usize {
         self.live
             .as_ref()
             .map_or(crate::log_redact::TICKET_HALO_BYTES + 1, |live| {
@@ -307,11 +315,13 @@ impl ShellReader {
             })
     }
 
-    pub(crate) fn shell_dimensions(&self, _task_id: &str) -> Option<(u16, u16)> {
+    #[doc(hidden)]
+    pub fn shell_dimensions(&self, _task_id: &str) -> Option<(u16, u16)> {
         Some((self.metadata.pty_rows?, self.metadata.pty_cols?))
     }
 
-    pub(crate) fn shell_masked_range(
+    #[doc(hidden)]
+    pub fn shell_masked_range(
         &self,
         task_id: &str,
         artifact: TaskArtifact,
@@ -453,7 +463,8 @@ impl BgTaskRegistry {
             .map_err(|error| error.to_string())
     }
 
-    pub(crate) fn shell_reader(&self, task_id: &str) -> Option<ShellReader> {
+    #[doc(hidden)]
+    pub fn shell_reader(&self, task_id: &str) -> Option<ShellReader> {
         let task = self.task(task_id)?;
         let state = task.lock_state().ok()?;
         Some(ShellReader {
@@ -532,10 +543,8 @@ impl BgTaskRegistry {
             .collect()
     }
 
-    pub(crate) fn shell_snapshots_cached(
-        &self,
-        cache: &mut ShellSnapshotCache,
-    ) -> Vec<ShellSnapshot> {
+    #[doc(hidden)]
+    pub fn shell_snapshots_cached(&self, cache: &mut ShellSnapshotCache) -> Vec<ShellSnapshot> {
         let tasks: Vec<_> = self
             .inner
             .tasks

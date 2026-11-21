@@ -359,7 +359,8 @@ impl Coverage {
             && self.luau_outline_failures().next().is_none()
     }
 
-    pub(crate) fn luau_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
+    #[doc(hidden)]
+    pub fn luau_outline_failures(&self) -> impl Iterator<Item = &(PathBuf, String)> {
         self.files_failed
             .iter()
             .filter(|(_, reason)| cfg!(feature = "wasm-grammars") && reason == LUAU_OUTLINE_FAILED)

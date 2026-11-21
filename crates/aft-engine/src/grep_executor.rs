@@ -342,7 +342,8 @@ pub struct IgnoredScopeProbe {
 }
 
 impl IgnoredScopeProbe {
-    pub(crate) fn finish(self) -> Option<IgnoredScopeEntries> {
+    #[doc(hidden)]
+    pub fn finish(self) -> Option<IgnoredScopeEntries> {
         let wait =
             IGNORE_PROBE_JOIN_BUDGET.min(self.deadline.saturating_duration_since(Instant::now()));
         self.result.recv_timeout(wait).ok().flatten()
@@ -515,7 +516,8 @@ pub fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe>
 }
 
 impl ScopeFileCounts {
-    pub(crate) fn add(&mut self, other: Self) {
+    #[doc(hidden)]
+    pub fn add(&mut self, other: Self) {
         self.examined += other.examined;
         self.ignored += other.ignored;
         self.filtered += other.filtered;
@@ -523,11 +525,13 @@ impl ScopeFileCounts {
         self.entries_visited += other.entries_visited;
     }
 
-    pub(crate) fn empty_note(&self, include_only: bool) -> String {
+    #[doc(hidden)]
+    pub fn empty_note(&self, include_only: bool) -> String {
         self.empty_note_with_hint(include_only, "pass the file path directly to search them")
     }
 
-    pub(crate) fn empty_glob_note(&self) -> String {
+    #[doc(hidden)]
+    pub fn empty_glob_note(&self) -> String {
         self.empty_note_with_hint(true, "name the ignored folder in the pattern to search it")
     }
 

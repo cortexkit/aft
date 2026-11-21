@@ -195,7 +195,8 @@ fn check_scopes(conn: &rusqlite::Connection, launch: &LaunchAuthority) -> Result
 }
 
 impl Store {
-    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+    #[doc(hidden)]
+    pub fn new(path: impl Into<PathBuf>) -> Self {
         Self {
             path: path.into(),
             anchor: Arc::default(),

@@ -238,11 +238,12 @@ pub struct RouteScopes {
         crate::gh_shim_speech::model::RouteOrigin,
         Option<ScopeStamp>,
     )>,
-    pub(crate) speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
+    pub speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
 }
 
 impl RouteScopes {
-    pub(crate) fn push_origin(
+    #[doc(hidden)]
+    pub fn push_origin(
         &mut self,
         origin: crate::gh_shim_speech::model::RouteOrigin,
         stamp: Option<ScopeStamp>,

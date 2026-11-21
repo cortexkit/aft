@@ -53,7 +53,8 @@ impl Drop for RuntimeGuard {
 }
 
 impl Service {
-    pub(crate) fn runtime_guard(self: &Arc<Self>) -> RuntimeGuard {
+    #[doc(hidden)]
+    pub fn runtime_guard(self: &Arc<Self>) -> RuntimeGuard {
         RuntimeGuard(self.clone())
     }
 

@@ -1170,10 +1170,12 @@ pub struct ReadSource {
 }
 
 impl ReadSource {
-    pub(crate) fn bytes(&self) -> &[u8] {
+    #[doc(hidden)]
+    pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
-    pub(crate) fn has_complete_bytes(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_complete_bytes(&self) -> bool {
         self.metadata.is_file()
             && self.metadata.len() <= MAX_FILE_READ_BYTES
             && self.bytes.len() as u64 == self.metadata.len()

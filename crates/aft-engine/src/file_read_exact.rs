@@ -278,7 +278,8 @@ impl ReadExactRefusal {
         }
     }
 
-    pub(crate) fn error(self) -> subc_protocol::ErrorBody {
+    #[doc(hidden)]
+    pub fn error(self) -> subc_protocol::ErrorBody {
         subc_protocol::ErrorBody::new(self.code(), self.message())
     }
 

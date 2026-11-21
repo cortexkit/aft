@@ -156,8 +156,8 @@ struct EscalationGrant {
 #[derive(Debug, Clone)]
 pub struct ProviderApprovalSnapshot {
     pub(crate) input: HashMap<String, String>,
-    pub(crate) environment: ChildEnvironment,
-    pub(crate) failure: Option<String>,
+    pub environment: ChildEnvironment,
+    pub failure: Option<String>,
     pub(crate) preflight_layout: Option<Arc<crate::shell_env_provider::PreflightLayout>>,
 }
 
@@ -521,14 +521,14 @@ impl SpawnPlan {
         }
     }
 
-    pub(crate) fn refusal_code(&self) -> Option<&'static str> {
+    pub fn refusal_code(&self) -> Option<&'static str> {
         match self.policy() {
             Self::Refused { code, .. } => Some(code),
             _ => None,
         }
     }
 
-    pub(crate) fn refusal_message(&self) -> Option<&str> {
+    pub fn refusal_message(&self) -> Option<&str> {
         match self.policy() {
             Self::Refused { message, .. } => Some(message),
             _ => None,
@@ -6774,7 +6774,7 @@ mod edit_tool_launcher;
 
 impl<'ctx> ToolLaunchPolicy<'ctx> {
     /// The inherited external-tool policy, or one resolved for this request.
-    pub(crate) fn for_request(ctx: &'ctx AppContext) -> Self {
+    pub fn for_request(ctx: &'ctx AppContext) -> Self {
         match CURRENT_TOOL_POLICY.with(|slot| slot.borrow().clone()) {
             _ if crate::context::confinement::remote_mutation() => Self::remote_edit_refusal(),
             Some(request) => Self {
@@ -6789,7 +6789,7 @@ impl<'ctx> ToolLaunchPolicy<'ctx> {
     /// call's tools is launched. Resolution then runs with `principal` and
     /// the worker-jail flag installed, exactly as if it had run here, and
     /// with nothing else changed: dispatch itself keeps its own scopes.
-    pub(crate) fn for_session(
+    pub fn for_session(
         principal: AuthenticatedPrincipal,
         worker: bool,
     ) -> std::rc::Rc<RequestToolLaunch> {

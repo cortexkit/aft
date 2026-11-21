@@ -303,7 +303,8 @@ pub struct SliceReader<S> {
 }
 
 impl<S: SliceSource> SliceReader<S> {
-    pub(crate) fn new(source: S, project_root: PathBuf, project_key: String) -> Self {
+    #[doc(hidden)]
+    pub fn new(source: S, project_root: PathBuf, project_key: String) -> Self {
         Self {
             source,
             project_root,

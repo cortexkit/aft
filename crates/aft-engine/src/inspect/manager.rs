@@ -1186,7 +1186,7 @@ impl InspectManager {
         }
     }
 
-    pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
+    pub fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
     }
 
@@ -1210,7 +1210,7 @@ impl InspectManager {
     /// reason inspect reports: `callgraph_building` while it waits for its
     /// call graph, `dead_code_building` while it works out dead code itself
     /// (or waits for a build slot to). `None` when no pass is building.
-    pub(crate) fn dead_code_pending_reason(&self) -> Option<&'static str> {
+    pub fn dead_code_pending_reason(&self) -> Option<&'static str> {
         if !self.dead_code_build_is_pending() {
             return None;
         }
@@ -1243,7 +1243,7 @@ impl InspectManager {
         }
     }
 
-    pub(crate) fn work_progress(&self, category: InspectCategory) -> Option<(String, u64)> {
+    pub fn work_progress(&self, category: InspectCategory) -> Option<(String, u64)> {
         self.builder_states
             .try_lock()
             .ok()?
@@ -1260,7 +1260,7 @@ impl InspectManager {
 
     /// Keep unfinished analysis separate from current findings. Cached rows are
     /// shown only inside a labelled stale result, never as a verified count.
-    pub(crate) fn tier2_incomplete_payload(
+    pub fn tier2_incomplete_payload(
         &self,
         snapshot: &InspectSnapshot,
         category: InspectCategory,
@@ -1379,7 +1379,7 @@ impl InspectManager {
     /// Whether the root has a published call graph a dead_code snapshot can be
     /// built from. Edits pending on a published graph don't count against
     /// it: the snapshot brings them in.
-    pub(crate) fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
+    pub fn callgraph_ready_for_snapshot(&self, snapshot: &InspectSnapshot) -> bool {
         snapshot.config.indexes.callgraph
             && !self
                 .data_layer_dead_code
@@ -1680,7 +1680,7 @@ impl InspectManager {
             .gap("oxc_fact_bytes")
     }
 
-    pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
+    pub fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {
         dead_code_snapshot_census()
     }
 
@@ -1766,7 +1766,7 @@ impl InspectManager {
     /// Lets dead code at `project_root` read its call graph from the data
     /// layer's `checkout` whenever that graph is ready, in place of today's
     /// database (see `inspect::data_sources`).
-    pub(crate) fn read_dead_code_from_data_layer(
+    pub fn read_dead_code_from_data_layer(
         &self,
         project_root: &Path,
         checkout: &Arc<crate::data_layer::runtime::DataCheckout>,
@@ -1777,7 +1777,7 @@ impl InspectManager {
     /// Note that an `aft_inspect` which read the dead-code graph finished at
     /// `now`, and schedule release of the graph once it has gone
     /// [`DEAD_CODE_GRAPH_IDLE_RELEASE`] without another such request.
-    pub(crate) fn note_dead_code_request(self: &Arc<Self>, now: Instant) {
+    pub fn note_dead_code_request(self: &Arc<Self>, now: Instant) {
         if self.dead_code_release_stopped.load(Ordering::SeqCst) {
             return;
         }

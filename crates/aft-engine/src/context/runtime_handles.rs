@@ -1,11 +1,13 @@
 use super::*;
 
 impl App {
-    pub(crate) fn set_subc_connection_file(&self, path: PathBuf) {
+    #[doc(hidden)]
+    pub fn set_subc_connection_file(&self, path: PathBuf) {
         *self.subc_connection_file.write() = Some(path);
     }
 
-    pub(crate) fn subc_connection_file(&self) -> Option<PathBuf> {
+    #[doc(hidden)]
+    pub fn subc_connection_file(&self) -> Option<PathBuf> {
         self.subc_connection_file.read().clone()
     }
 }

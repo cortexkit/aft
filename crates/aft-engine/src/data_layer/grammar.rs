@@ -86,7 +86,8 @@ pub struct GapReply {
 }
 
 impl GapReply {
-    pub(crate) fn capture() -> Self {
+    #[doc(hidden)]
+    pub fn capture() -> Self {
         #[cfg(feature = "wasm-grammars")]
         let unavailable = crate::grammar::registry().status_snapshot();
         #[cfg(not(feature = "wasm-grammars"))]
@@ -94,7 +95,8 @@ impl GapReply {
         Self { unavailable }
     }
 
-    pub(crate) fn value(&self, stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
+    #[doc(hidden)]
+    pub fn value(&self, stored: &str, path: &std::path::Path) -> Option<serde_json::Value> {
         let saved: serde_json::Value = serde_json::from_str(stored).ok()?;
         let mut value = match saved["code"].as_str()? {
             "grammar_parse_timeout" => AftError::GrammarParseTimeout {

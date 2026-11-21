@@ -54,9 +54,9 @@ pub struct RerankDoc<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[doc(hidden)]
 pub struct RerankFingerprint {
-    pub(crate) backend: &'static str,
-    pub(crate) model: String,
-    pub(crate) revision: String,
+    pub backend: &'static str,
+    pub model: String,
+    pub revision: String,
 }
 
 /// Why a backend returned no scores. None of these is a search error: the
@@ -76,7 +76,8 @@ pub enum RerankError {
 }
 
 impl RerankError {
-    pub(crate) fn skip_reason(&self) -> String {
+    #[doc(hidden)]
+    pub fn skip_reason(&self) -> String {
         let reason = match self {
             Self::Unavailable(reason) => reason.clone(),
             Self::Timeout => "timeout".to_string(),
@@ -143,12 +144,13 @@ impl RerankBackend for NoopRerankBackend {
 pub struct RerankSettings {
     pub(crate) backend: RerankBackendKind,
     pub(crate) model: Option<String>,
-    pub(crate) top_n: usize,
-    pub(crate) timeout: Duration,
+    pub top_n: usize,
+    pub timeout: Duration,
 }
 
 impl RerankSettings {
-    pub(crate) fn resolve(search: &SearchConfig) -> Self {
+    #[doc(hidden)]
+    pub fn resolve(search: &SearchConfig) -> Self {
         let rerank = search.rerank.clone().unwrap_or_default();
         let top_n = rerank
             .top_n
@@ -177,8 +179,8 @@ impl RerankSettings {
 #[derive(Clone)]
 #[doc(hidden)]
 pub struct SelectedBackend {
-    pub(crate) backend: Arc<dyn RerankBackend>,
-    pub(crate) fail_closed: bool,
+    pub backend: Arc<dyn RerankBackend>,
+    pub fail_closed: bool,
 }
 
 #[doc(hidden)]

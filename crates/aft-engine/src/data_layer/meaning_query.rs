@@ -33,7 +33,7 @@ pub(crate) const DATA_LAYER_BUILD_STAGE: &str = "data_layer_build";
 #[derive(Debug)]
 #[doc(hidden)]
 pub struct DataMeaning {
-    pub(crate) snapshot: MeaningSnapshot,
+    pub snapshot: MeaningSnapshot,
     /// The last fill's failure, kept until a fill succeeds.
     failure: Option<FillFailure>,
 }
@@ -43,7 +43,8 @@ impl DataMeaning {
     /// and the generation of the vectors. A recorded change and a fill that
     /// lands each change it, so a list cached under it is never served over
     /// other vectors.
-    pub(crate) fn generation(&self) -> String {
+    #[doc(hidden)]
+    pub fn generation(&self) -> String {
         format!(
             "{}:vectors:{}",
             self.snapshot.view_generation(),
@@ -54,7 +55,8 @@ impl DataMeaning {
     /// Logs, at debug level, that a ranking read this plane. The data-layer
     /// parity harness (`benchmarks/aft-search/compare_data_layer.py`) counts
     /// these lines to show which source answered each request.
-    pub(crate) fn note_read(&self, request_id: &str) {
+    #[doc(hidden)]
+    pub fn note_read(&self, request_id: &str) {
         crate::slog_debug!(
             "aft_search {request_id} read the data layer meaning plane at {}",
             self.generation()
@@ -63,7 +65,8 @@ impl DataMeaning {
 
     /// Whether every file meaning search applies to within
     /// `semantic.max_files` is accounted for, apart from Luau outline failures.
-    pub(crate) fn complete(&self) -> bool {
+    #[doc(hidden)]
+    pub fn complete(&self) -> bool {
         !meaning::waiting(self.snapshot.coverage())
             && self
                 .snapshot
@@ -73,18 +76,21 @@ impl DataMeaning {
                 .is_none()
     }
 
-    pub(crate) fn coverage(&self) -> &Coverage {
+    #[doc(hidden)]
+    pub fn coverage(&self) -> &Coverage {
         self.snapshot.coverage()
     }
 
     /// Why the last fill stopped, while files still wait for vectors.
-    pub(crate) fn failure(&self) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn failure(&self) -> Option<&str> {
         self.failure.as_ref().map(FillFailure::message)
     }
 
     /// The vector length a query needs, once the plane holds any vector;
     /// `None` before, as today's index gives none while it is empty.
-    pub(crate) fn dimension(&self) -> Option<usize> {
+    #[doc(hidden)]
+    pub fn dimension(&self) -> Option<usize> {
         (self.snapshot.chunks() > 0).then(|| self.snapshot.dimensions())
     }
 
@@ -149,9 +155,8 @@ impl DataSemantic {
     /// nothing has, and starts a fill when files wait for vectors. `None`
     /// otherwise (the root has no checkout in the data layer, or semantic
     /// search is off), and the caller keeps reading today's index.
-    pub(crate) fn current(
-        ctx: &(impl crate::data_layer::host::IndexHost + ?Sized),
-    ) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn current(ctx: &(impl crate::data_layer::host::IndexHost + ?Sized)) -> Option<Self> {
         if !ctx.config().indexes.semantic {
             return None;
         }
@@ -165,7 +170,8 @@ impl DataSemantic {
 
     /// As [`Self::current`] for status reads: never binds a checkout and
     /// never starts a fill.
-    pub(crate) fn probe(ctx: &(impl IndexHost + ?Sized)) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn probe(ctx: &(impl IndexHost + ?Sized)) -> Option<Self> {
         use crate::data_layer::surfaces::DataCheckoutProbe;
         if !ctx.config().indexes.semantic {
             return None;
@@ -209,14 +215,16 @@ impl DataSemantic {
 
     /// The status aft_search reports for the lane: ready whenever the plane
     /// serves (a partial answer says so itself), otherwise why it does not.
-    pub(crate) fn status(&self) -> SemanticIndexStatus {
+    #[doc(hidden)]
+    pub fn status(&self) -> SemanticIndexStatus {
         match self {
             Self::Serving(_) => SemanticIndexStatus::ready(),
             Self::NotServing(status) => status.clone(),
         }
     }
 
-    pub(crate) fn serving(&self) -> Option<&Arc<DataMeaning>> {
+    #[doc(hidden)]
+    pub fn serving(&self) -> Option<&Arc<DataMeaning>> {
         match self {
             Self::Serving(meaning) => Some(meaning),
             Self::NotServing(_) => None,

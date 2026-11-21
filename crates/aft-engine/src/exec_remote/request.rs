@@ -65,7 +65,8 @@ impl FrozenParams {
     /// The read check runs first, so the `.git` marker is never looked up in a
     /// folder the session may not read. Such a folder is refused as unreadable
     /// whether or not it is a checkout root.
-    pub(crate) fn validate_siblings(
+    #[doc(hidden)]
+    pub fn validate_siblings(
         &mut self,
         ctx: &crate::context::AppContext,
         request_id: &str,

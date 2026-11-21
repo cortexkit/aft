@@ -8,7 +8,8 @@ pub struct ChildEngine {
 }
 
 impl ChildEngine {
-    pub(crate) fn new(session: &ParentSession, child: &Child) -> Self {
+    #[doc(hidden)]
+    pub fn new(session: &ParentSession, child: &Child) -> Self {
         let mut config = crate::config::Config::default();
         config.project_root = Some(child.root.clone());
         // The engine reads the indexes installed below, never a view of its own.

@@ -406,9 +406,9 @@ pub struct EmbeddingBackendHealthSnapshot {
     pub(crate) last_error: Option<String>,
     pub(crate) since_ms: Option<u64>,
     pub(crate) next_retry_ms: Option<u64>,
-    pub(crate) paused_until_ms: Option<u64>,
+    pub paused_until_ms: Option<u64>,
     /// Why the backend refused requests for now, when `paused_until_ms` is set.
-    pub(crate) pause_cause: Option<crate::synapse_embed::PauseCause>,
+    pub pause_cause: Option<crate::synapse_embed::PauseCause>,
 }
 
 pub enum SemanticIndexEvent {

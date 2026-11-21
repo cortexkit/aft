@@ -62,7 +62,7 @@ pub(crate) struct SourceWriteOutcome {
     /// Each warning starts with a stable code and a colon:
     /// `recovery_copy_found`, `no_recovery_copy`, `mode_not_restored` or
     /// `non_atomic_windows_write`.
-    pub(crate) warnings: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 /// Write a source file so that a failed write leaves the original bytes
@@ -1078,7 +1078,8 @@ pub struct LineOffsets {
 }
 
 impl LineOffsets {
-    pub(crate) fn new(source: &str) -> Self {
+    #[doc(hidden)]
+    pub fn new(source: &str) -> Self {
         let mut start = 0;
         let starts = source
             .split_inclusive('\n')
@@ -1095,10 +1096,12 @@ impl LineOffsets {
             source_len: source.len(),
         }
     }
-    pub(crate) fn line_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn line_count(&self) -> usize {
         self.starts.len()
     }
-    pub(crate) fn offset(&self, line: usize) -> usize {
+    #[doc(hidden)]
+    pub fn offset(&self, line: usize) -> usize {
         self.starts.get(line).copied().unwrap_or(self.source_len)
     }
 }
@@ -1293,7 +1296,8 @@ pub struct SourceLineIndex<'a> {
 }
 
 impl<'a> SourceLineIndex<'a> {
-    pub(crate) fn new(source: &'a str) -> Self {
+    #[doc(hidden)]
+    pub fn new(source: &'a str) -> Self {
         #[cfg(test)]
         A03_LINE_INDEX_PASSES.with(|count| count.set(count.get() + 1));
         let mut starts = vec![0];
@@ -1314,7 +1318,8 @@ impl<'a> SourceLineIndex<'a> {
         Self { starts, lines }
     }
 
-    pub(crate) fn line_at(&self, byte: usize) -> usize {
+    #[doc(hidden)]
+    pub fn line_at(&self, byte: usize) -> usize {
         self.starts
             .partition_point(|start| *start <= byte)
             .saturating_sub(1)
@@ -1325,7 +1330,8 @@ impl<'a> SourceLineIndex<'a> {
     /// [`crate::fuzzy_match::NEAREST_MISS_LINE_CHARS`] characters is shortened
     /// around a middle `…`, so one context row stays small even on a long
     /// generated or minified line that many matches share.
-    pub(crate) fn context(&self, line: usize, margin: usize) -> String {
+    #[doc(hidden)]
+    pub fn context(&self, line: usize, margin: usize) -> String {
         let start = line.saturating_sub(margin).min(self.lines.len());
         let end = line
             .saturating_add(margin)
@@ -1353,10 +1359,12 @@ pub struct EditObservation {
 pub mod mutation;
 
 impl EditObservation {
-    pub(crate) fn check(&self, path: &Path) -> Result<(), AftError> {
+    #[doc(hidden)]
+    pub fn check(&self, path: &Path) -> Result<(), AftError> {
         self.expected.check(path)
     }
-    pub(crate) fn missing(path: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn missing(path: &Path) -> Self {
         Self {
             capture: None,
             version: None,
@@ -1542,7 +1550,8 @@ pub struct DiffBudget {
 }
 
 impl DiffBudget {
-    pub(crate) fn new(copies: usize) -> Self {
+    #[doc(hidden)]
+    pub fn new(copies: usize) -> Self {
         assert!(copies > 0);
         Self {
             remaining: DIFF_RESPONSE_BUDGET,
@@ -1551,7 +1560,8 @@ impl DiffBudget {
         }
     }
 
-    pub(crate) fn render(&mut self, file: &str, before: &str, after: &str) -> Option<String> {
+    #[doc(hidden)]
+    pub fn render(&mut self, file: &str, before: &str, after: &str) -> Option<String> {
         if self.omitted {
             return None;
         }
@@ -1594,7 +1604,8 @@ impl DiffBudget {
     }
 
     /// Charge aggregate separators as well as the individual rendered patches.
-    pub(crate) fn separator(&mut self, text: &mut String, separator: &str) {
+    #[doc(hidden)]
+    pub fn separator(&mut self, text: &mut String, separator: &str) {
         let bytes = separator.len().saturating_mul(self.copies);
         if self.omitted || bytes > self.remaining {
             self.omitted = true;
@@ -1606,7 +1617,8 @@ impl DiffBudget {
 
     /// A partial preview could hide the destructive file. Omit all diff text
     /// together, retaining every outcome and count and one explicit notice.
-    pub(crate) fn finish(&self, result: &mut serde_json::Value) {
+    #[doc(hidden)]
+    pub fn finish(&self, result: &mut serde_json::Value) {
         if !self.omitted {
             return;
         }
@@ -2073,7 +2085,8 @@ impl WriteResult {
     /// Return the validated final text only while the live path still has the
     /// same identity. LSP notifications may wait, so response rendering checks
     /// again rather than assuming the file stayed unchanged during that wait.
-    pub(crate) fn final_content(&mut self, path: &Path) -> Option<&str> {
+    #[doc(hidden)]
+    pub fn final_content(&mut self, path: &Path) -> Option<&str> {
         let current = crate::backup::DiskFileVersion::of_path(path);
         if !self
             .final_text

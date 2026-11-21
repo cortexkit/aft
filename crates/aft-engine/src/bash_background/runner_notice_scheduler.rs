@@ -31,16 +31,17 @@ pub(crate) struct Scheduled {
 #[derive(Default)]
 #[doc(hidden)]
 pub struct Follow {
-    pub(crate) send_id: std::sync::Mutex<Option<String>>,
-    pub(crate) force: AtomicBool,
-    pub(crate) attached: AtomicBool,
-    pub(crate) receipts: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
+    pub send_id: std::sync::Mutex<Option<String>>,
+    pub force: AtomicBool,
+    pub attached: AtomicBool,
+    pub receipts: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
 }
 
 #[doc(hidden)]
 pub struct FollowReceipt(pub Vec<tokio::sync::oneshot::Sender<()>>);
 impl FollowReceipt {
-    pub(crate) fn applied(self) {
+    #[doc(hidden)]
+    pub fn applied(self) {
         for done in self.0 {
             let _ = done.send(());
         }
@@ -52,16 +53,18 @@ impl FollowReceipt {
 pub struct Scheduler {
     // Delayed and in-flight notices count toward the same queue capacity limit.
     // Idle workers wait on the earliest deadline, not on one notice's backoff.
-    pub(crate) entries: std::sync::Mutex<HashMap<String, Scheduled>>,
+    pub entries: std::sync::Mutex<HashMap<String, Scheduled>>,
     pub(crate) wake: std::sync::Condvar,
 }
 
 impl Scheduler {
-    pub(crate) fn offer(&self, id: String, completion: bool, work: Work, expedite: bool) -> bool {
+    #[doc(hidden)]
+    pub fn offer(&self, id: String, completion: bool, work: Work, expedite: bool) -> bool {
         self.offer_follow(id, completion, work, expedite, Arc::new(Follow::default()))
     }
 
-    pub(crate) fn offer_follow(
+    #[doc(hidden)]
+    pub fn offer_follow(
         &self,
         id: String,
         completion: bool,

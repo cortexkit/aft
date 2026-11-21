@@ -570,7 +570,7 @@ pub struct CapturedRegularFile {
 }
 
 impl CapturedRegularFile {
-    pub(crate) fn read(path: &Path) -> std::io::Result<Option<Self>> {
+    pub fn read(path: &Path) -> std::io::Result<Option<Self>> {
         let before = std::fs::symlink_metadata(path)?;
         if !before.is_file() {
             return Ok(None);
@@ -589,7 +589,7 @@ impl CapturedRegularFile {
         Ok(Some(Self { metadata, bytes }))
     }
 
-    pub(crate) fn read_text(path: &Path) -> std::io::Result<Option<(Self, String)>> {
+    pub fn read_text(path: &Path) -> std::io::Result<Option<(Self, String)>> {
         let Some(capture) = Self::read(path)? else {
             return Ok(None);
         };
@@ -615,7 +615,7 @@ impl CapturedRegularFile {
         Ok(true)
     }
 
-    pub(crate) fn bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
@@ -1631,7 +1631,7 @@ impl BackupStore {
 
     /// Store an already captured regular file without reading its contents again.
     /// The caller must refresh the capture immediately before invoking this method.
-    pub(crate) fn snapshot_with_op_from_capture(
+    pub fn snapshot_with_op_from_capture(
         &mut self,
         session: &str,
         path: &Path,
@@ -1696,7 +1696,7 @@ impl BackupStore {
 
     /// Record a directory so undoing `op_id` recreates it, empty or not, with
     /// its current mode. The directory's contents are recorded separately.
-    pub(crate) fn snapshot_directory_with_op(
+    pub fn snapshot_directory_with_op(
         &mut self,
         session: &str,
         path: &Path,
@@ -1722,7 +1722,7 @@ impl BackupStore {
 
     /// Record `path` as a hard link to `link_to`, a path whose content is
     /// backed up in the same operation. Undo relinks instead of copying.
-    pub(crate) fn snapshot_hard_link_with_op(
+    pub fn snapshot_hard_link_with_op(
         &mut self,
         session: &str,
         path: &Path,
@@ -1742,7 +1742,7 @@ impl BackupStore {
     /// Back up a hard-linked file whose other links are (partly) outside the
     /// deleted tree. Its content is captured as usual; the entry is marked so
     /// undo can warn that the file comes back as an independent copy.
-    pub(crate) fn snapshot_detached_hard_link_with_op(
+    pub fn snapshot_detached_hard_link_with_op(
         &mut self,
         session: &str,
         path: &Path,
@@ -3591,7 +3591,7 @@ impl BackupStore {
         }
     }
 
-    pub(crate) fn discard_latest_operation_entry_for_path(
+    pub fn discard_latest_operation_entry_for_path(
         &mut self,
         session: &str,
         op_id: &str,
@@ -3608,7 +3608,7 @@ impl BackupStore {
     /// Discard one known rollback snapshot without discovering the session's
     /// other stacks. Callers that report rollback success must also check
     /// whether removal from undo history succeeded.
-    pub(crate) fn try_discard_latest_operation_entry_for_path(
+    pub fn try_discard_latest_operation_entry_for_path(
         &mut self,
         session: &str,
         op_id: &str,
@@ -4444,7 +4444,7 @@ impl BackupStore {
     /// directory (every entry of a tree walked without following links is
     /// physically under its root, so it is under the same temp root).
     /// `None` means entries under `root` are backed up normally.
-    pub(crate) fn whole_tree_skip_reason(&self, root: &Path) -> Option<BackupSkippedReason> {
+    pub fn whole_tree_skip_reason(&self, root: &Path) -> Option<BackupSkippedReason> {
         if !self.policy.enabled || self.policy.max_file_size == Some(0) {
             return Some(BackupSkippedReason::Disabled);
         }
@@ -4457,7 +4457,7 @@ impl BackupStore {
     /// Record that a mutation of `path` in `op_id` has no undo snapshot, for a
     /// caller that decided up front not to snapshot (a whole tree whose backups
     /// are skipped) instead of asking once per entry.
-    pub(crate) fn record_skipped_without_snapshot(
+    pub fn record_skipped_without_snapshot(
         &mut self,
         session: &str,
         path: &Path,

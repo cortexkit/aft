@@ -147,7 +147,8 @@ pub struct Worker {
 }
 
 impl Worker {
-    pub(crate) fn shutdown(mut self) {
+    #[doc(hidden)]
+    pub fn shutdown(mut self) {
         self.stop.take();
         // Only module teardown joins the isolated bus runtime, never a reply.
         if let Some(thread) = self.thread.take() {

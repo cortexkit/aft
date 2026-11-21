@@ -96,7 +96,8 @@ impl Limits {
     /// A missing field takes [`Limits::DEFAULT`]; a field that is not a
     /// non-negative integer, or `max_files` of zero (no room for the page
     /// itself), is an error.
-    pub(crate) fn from_request(value: Option<&Value>) -> Result<Limits, String> {
+    #[doc(hidden)]
+    pub fn from_request(value: Option<&Value>) -> Result<Limits, String> {
         let object = match value {
             None | Some(Value::Null) => return Ok(Self::DEFAULT),
             Some(Value::Object(object)) => object,
@@ -440,7 +441,8 @@ pub enum CollectRefusal {
 }
 
 impl CollectRefusal {
-    pub(crate) fn into_error(self) -> subc_protocol::ErrorBody {
+    #[doc(hidden)]
+    pub fn into_error(self) -> subc_protocol::ErrorBody {
         subc_protocol::ErrorBody::new(self.code(), self.message()).with_detail(self.detail())
     }
 
@@ -867,7 +869,8 @@ fn absolute(dir: &Path, segments: &[String]) -> PathBuf {
 
 impl Collected {
     /// The `page.collect` reply body.
-    pub(crate) fn reply(&self, snapshot: &str, expires_at_ms: u64) -> Value {
+    #[doc(hidden)]
+    pub fn reply(&self, snapshot: &str, expires_at_ms: u64) -> Value {
         let mut body = json!({
             "snapshot": snapshot,
             "expires_at_ms": expires_at_ms,

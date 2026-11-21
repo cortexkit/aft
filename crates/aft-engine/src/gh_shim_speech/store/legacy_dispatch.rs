@@ -125,7 +125,8 @@ impl Store {
 }
 
 impl Store {
-    pub(crate) fn pending_legacy_for_scope(
+    #[doc(hidden)]
+    pub fn pending_legacy_for_scope(
         &self,
         scope: &subc_protocol::scope::ScopeStamp,
     ) -> Result<u64, Refusal> {

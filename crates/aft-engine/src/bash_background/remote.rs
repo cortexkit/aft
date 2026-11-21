@@ -1099,7 +1099,7 @@ impl RemotePhase {
     ///
     /// New runners explicitly report `Started`; output remains evidence of
     /// execution for older runners that do not send that record.
-    pub(crate) fn of(remote: &RemoteTask) -> Self {
+    pub fn of(remote: &RemoteTask) -> Self {
         if !remote.accepted && remote.terminal.is_some() {
             Self::Submitting
         } else if remote.started.is_some() || remote.output_received {
@@ -1116,7 +1116,7 @@ impl RemotePhase {
     }
 
     /// A stable machine-readable name for replies.
-    pub(crate) fn tag(self) -> &'static str {
+    pub fn tag(self) -> &'static str {
         match self {
             Self::Submitting => "submitting",
             Self::WaitingOnRunner => "waiting_on_runner",
@@ -1126,7 +1126,7 @@ impl RemotePhase {
     }
 
     /// The phase in words, naming the runner.
-    pub(crate) fn describe(self) -> String {
+    pub fn describe(self) -> String {
         match self {
             Self::Submitting => "submitting to ck-motor (capturing inputs; not accepted yet)".to_string(),
             Self::WaitingOnRunner => {

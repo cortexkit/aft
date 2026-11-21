@@ -4465,7 +4465,7 @@ impl CheckoutView {
     /// [`changed_paths`](Self::changed_paths) answers as it was last
     /// resolved until it is resolved again; the status says so.
     #[must_use]
-    pub(crate) fn callgraph(&self) -> SliceReader<Arc<dyn SliceSource + Send + Sync>> {
+    pub fn callgraph(&self) -> SliceReader<Arc<dyn SliceSource + Send + Sync>> {
         SliceReader::new(
             Arc::clone(&self.graph),
             self.published.root.clone(),

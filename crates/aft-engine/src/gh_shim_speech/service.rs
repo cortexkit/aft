@@ -181,7 +181,7 @@ struct Cached {
 
 #[doc(hidden)]
 pub struct Service {
-    pub(crate) store: Store,
+    pub store: Store,
     root: PathBuf,
     runtime: Mutex<Option<Runtime>>,
     lease: Mutex<Option<Arc<crate::cache_location::SpeechServingLease>>>,
@@ -335,7 +335,8 @@ impl Service {
         held.is_some()
     }
 
-    pub(crate) fn set_end_notice(&self, notice: EndNotice) {
+    #[doc(hidden)]
+    pub fn set_end_notice(&self, notice: EndNotice) {
         *self
             .on_end
             .lock()
@@ -348,7 +349,8 @@ impl Service {
             .unwrap_or_else(|error| error.into_inner())
             .clear();
     }
-    pub(crate) fn generation(&self) -> String {
+    #[doc(hidden)]
+    pub fn generation(&self) -> String {
         self.runtime
             .lock()
             .unwrap_or_else(|error| error.into_inner())
@@ -433,7 +435,8 @@ impl Service {
         result
     }
 
-    pub(crate) fn record_end(
+    #[doc(hidden)]
+    pub fn record_end(
         self: &Arc<Self>,
         scope: &ScopeStamp,
         proof: ValidatedEnd,
@@ -1082,7 +1085,8 @@ pub fn revocation_pending(session: &str, task: &str) -> bool {
 }
 
 impl Service {
-    pub(crate) fn remember_probe(
+    #[doc(hidden)]
+    pub fn remember_probe(
         &self,
         scope: &ScopeStamp,
         generation: &str,

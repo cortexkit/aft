@@ -104,7 +104,8 @@ pub(crate) struct SearchReadPolicy<'a> {
 }
 
 impl AppContext {
-    pub(crate) fn search_read_policy(&self, tool: WorkerSearchTool) -> SearchReadPolicy<'_> {
+    #[doc(hidden)]
+    pub fn search_read_policy(&self, tool: WorkerSearchTool) -> SearchReadPolicy<'_> {
         SearchReadPolicy {
             context: self,
             tool,

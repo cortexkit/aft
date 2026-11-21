@@ -3,7 +3,8 @@ use super::*;
 pub(super) type Listener = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl BgTaskRegistry {
-    pub(crate) fn set_completion_delivery_listener(&self, listener: Listener) {
+    #[doc(hidden)]
+    pub fn set_completion_delivery_listener(&self, listener: Listener) {
         *self.inner.completion_delivery_listener.lock().unwrap() = Some(listener);
     }
 
@@ -33,7 +34,8 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
-    pub(crate) fn pending_completion_ids(&self) -> HashMap<String, HashSet<String>> {
+    #[doc(hidden)]
+    pub fn pending_completion_ids(&self) -> HashMap<String, HashSet<String>> {
         let mut ids: HashMap<String, HashSet<String>> = HashMap::new();
         if let Ok(completions) = self.inner.completions.lock() {
             for completion in completions.iter() {

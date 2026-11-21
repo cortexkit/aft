@@ -1790,7 +1790,7 @@ impl LspManager {
     /// cached not-applicable outcome is not a start failure. Missing TypeScript
     /// SDKs, rustup toolchain components, and mise startup errors are likewise
     /// environment gaps rather than AFT failures.
-    pub(crate) fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
+    pub fn cached_start_failure_counts(&self) -> std::collections::BTreeMap<String, u64> {
         let now = self.retry_clock.now();
         let mut counts = std::collections::BTreeMap::new();
         for (key, failure) in &self.failed_spawns {
@@ -1918,7 +1918,7 @@ impl LspManager {
         }
     }
 
-    pub(crate) fn store_project_applicability(&mut self, snapshot: ApplicableServerSnapshot) {
+    pub fn store_project_applicability(&mut self, snapshot: ApplicableServerSnapshot) {
         self.project_applicability = Some(snapshot);
     }
 
@@ -2488,7 +2488,7 @@ impl LspManager {
         }
     }
 
-    pub(crate) fn pending_startup_files(&self) -> Vec<(ServerKey, PathBuf)> {
+    pub fn pending_startup_files(&self) -> Vec<(ServerKey, PathBuf)> {
         let mut pending: Vec<_> = self
             .starting
             .iter()
@@ -3996,7 +3996,7 @@ impl LspManager {
     /// [`Self::close_inspect_documents`]. A document AFT edits stays open:
     /// an edit opens it through `didOpen`/`didChange`, not through a pull.
     /// A document reopened or edited since the pull is left open.
-    pub(crate) fn close_documents_opened_for_pulls(
+    pub fn close_documents_opened_for_pulls(
         &mut self,
         file_path: &Path,
         results: &[PullFileResult],
@@ -4167,14 +4167,14 @@ impl LspManager {
     }
 
     /// Whether this server has a running client, including pending startup replay.
-    pub(crate) fn has_client(&self, server_key: &ServerKey) -> bool {
+    pub fn has_client(&self, server_key: &ServerKey) -> bool {
         self.clients.contains_key(server_key)
     }
 
     /// Whether this rust-analyzer's published diagnostics carry the
     /// compiler's results for the files as they are now. See
     /// [`LspClient::rust_check_state`].
-    pub(crate) fn rust_check_state(&self, server_key: &ServerKey) -> RustCheckState {
+    pub fn rust_check_state(&self, server_key: &ServerKey) -> RustCheckState {
         self.clients
             .get(server_key)
             .map_or(RustCheckState::Current, |client| {
@@ -4191,7 +4191,7 @@ impl LspManager {
         })
     }
 
-    pub(crate) fn saved_rust_checks(
+    pub fn saved_rust_checks(
         &self,
         deadline: Instant,
     ) -> HashMap<ServerKey, super::completed_rust_check::SavedCheck> {
@@ -4259,7 +4259,7 @@ impl LspManager {
             .collect()
     }
 
-    pub(crate) fn rust_check_running_reason(&self, key: &ServerKey) -> String {
+    pub fn rust_check_running_reason(&self, key: &ServerKey) -> String {
         if self.rust_automatic_checks_disabled(key) {
             return "cargo check required for aft_inspect; retry aft_inspect".into();
         }
@@ -4287,7 +4287,7 @@ impl LspManager {
     /// start waiting, so each new request waits for the check with a fresh
     /// deadline instead of answering "unknown" at once because an earlier
     /// request's check never began.
-    pub(crate) fn rearm_unreported_rust_check(&mut self, server_key: &ServerKey) {
+    pub fn rearm_unreported_rust_check(&mut self, server_key: &ServerKey) {
         let Some(client) = self.clients.get_mut(server_key) else {
             return;
         };
@@ -5056,7 +5056,7 @@ impl LspManager {
     /// Register a waiter that blocks on language-server events without the
     /// manager lock (see [`LspEventWait`]). Call [`Self::unsubscribe_events`]
     /// when done.
-    pub(crate) fn subscribe_events(&mut self) -> LspEventWait {
+    pub fn subscribe_events(&mut self) -> LspEventWait {
         let waiter_id = self.next_post_edit_waiter_id;
         self.next_post_edit_waiter_id = self.next_post_edit_waiter_id.wrapping_add(1);
         let (wake_tx, wake_rx) = bounded(1);
@@ -5070,14 +5070,14 @@ impl LspManager {
 
     /// Handle an event an [`LspEventWait`] took off the channel, then drain
     /// whatever else is queued.
-    pub(crate) fn handle_waited_event(&mut self, event: Option<ReceivedLspEvent>) {
+    pub fn handle_waited_event(&mut self, event: Option<ReceivedLspEvent>) {
         if let Some(event) = event {
             let _ = self.handle_event(&event);
         }
         self.drain_events();
     }
 
-    pub(crate) fn unsubscribe_events(&mut self, wait: LspEventWait) {
+    pub fn unsubscribe_events(&mut self, wait: LspEventWait) {
         self.post_edit_waiters.remove(&wait.waiter_id);
     }
 
@@ -5085,7 +5085,7 @@ impl LspManager {
     /// can change without the server sending anything: a deferred save
     /// falling due, a check start grace ending, or the publish settle window
     /// closing. A waiter sleeps until the earlier of this and its next event.
-    pub(crate) fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
+    pub fn rust_check_next_timed_change(&self, server_key: &ServerKey) -> Option<Instant> {
         self.clients.get(server_key).and_then(|client| {
             client.rust_check_next_timed_change(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
         })
@@ -6161,7 +6161,7 @@ impl LspManager {
         }
     }
 
-    pub(crate) fn quiesce(&mut self) -> Vec<(ServerKey, LspClient)> {
+    pub fn quiesce(&mut self) -> Vec<(ServerKey, LspClient)> {
         self.quiesced
             .store(true, std::sync::atomic::Ordering::Release);
         self.take_all_clients()
@@ -6173,7 +6173,7 @@ impl LspManager {
     /// them down together under one shared budget. Detaching them here would
     /// hand each root's servers to its own background reap thread, which can
     /// stop them before the exit phase sees them.
-    pub(crate) fn close_start_admission(&self) {
+    pub fn close_start_admission(&self) {
         self.quiesced
             .store(true, std::sync::atomic::Ordering::Release);
         self.cancel_startups();
@@ -6213,7 +6213,7 @@ impl LspManager {
 
     /// Process exit must also reap clients already detached by route quiescence.
     /// Their shutdown threads cannot be relied on after the daemon exits.
-    pub(crate) fn shutdown_at_process_exit(
+    pub fn shutdown_at_process_exit(
         clients: Vec<(ServerKey, LspClient)>,
         registry: LspChildRegistry,
     ) -> LspShutdownAllOutcome {
@@ -6380,7 +6380,7 @@ impl LspManager {
     /// Shut down taken clients on a detached thread named `aft-lsp-idle-reap`.
     /// Idle reapers use this so a hung Shutdown handshake cannot stall the
     /// daemon loop or hold the manager mutex.
-    pub(crate) fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
+    pub fn spawn_idle_lsp_reap(clients: Vec<(ServerKey, LspClient)>) {
         if clients.is_empty() {
             return;
         }
@@ -6423,7 +6423,7 @@ impl LspManager {
     }
 
     /// Read lifecycle facts without resolving files or starting a server.
-    pub(crate) fn operator_server_states(&self) -> Vec<(String, String, Option<String>)> {
+    pub fn operator_server_states(&self) -> Vec<(String, String, Option<String>)> {
         let mut states = std::collections::BTreeMap::<String, (String, Option<String>)>::new();
         let rank = |state: &str| match state {
             "degraded" => 2,

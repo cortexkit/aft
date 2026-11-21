@@ -648,7 +648,8 @@ impl CheckpointStore {
         self.create_impl(session, name, files, None, None)
     }
 
-    pub(crate) fn create_from_captures(
+    #[doc(hidden)]
+    pub fn create_from_captures(
         &mut self,
         session: &str,
         name: &str,

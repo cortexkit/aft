@@ -40,7 +40,8 @@ pub struct BuildInputs {
 }
 
 impl BuildInputs {
-    pub(crate) fn from_config(config: &Config, under_subc: bool) -> Self {
+    #[doc(hidden)]
+    pub fn from_config(config: &Config, under_subc: bool) -> Self {
         Self {
             search: config.search.clone(),
             semantic: config.semantic.clone(),

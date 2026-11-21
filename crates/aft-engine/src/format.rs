@@ -1826,7 +1826,8 @@ pub(crate) struct BatchValidation {
 }
 
 impl BatchValidation {
-    pub(crate) fn append_to(&self, path: &Path, entry: &mut serde_json::Value) {
+    #[doc(hidden)]
+    pub fn append_to(&self, path: &Path, entry: &mut serde_json::Value) {
         if let Some(file) = self.files.iter().find(|file| file.path == path) {
             entry["validation_errors"] = serde_json::json!(file.errors);
             if let Some(reason) = &file.skipped_reason {
@@ -1835,7 +1836,8 @@ impl BatchValidation {
         }
     }
 
-    pub(crate) fn summary(&self) -> String {
+    #[doc(hidden)]
+    pub fn summary(&self) -> String {
         let error_count = |file: &FileValidation| {
             file.errors
                 .iter()

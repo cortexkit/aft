@@ -143,11 +143,13 @@ pub fn watch_card(id: &str) -> CardWatch {
 }
 
 impl CardWatch {
-    pub(crate) fn attached(&self) -> bool {
+    #[doc(hidden)]
+    pub fn attached(&self) -> bool {
         *self.attachment.borrow()
     }
     /// Detach interrupts even an attached wait, restoring the long-poll path.
-    pub(crate) async fn wait(&self) {
+    #[doc(hidden)]
+    pub async fn wait(&self) {
         let mut changes = self.attachment.clone();
         if !*changes.borrow_and_update() {
             return;
@@ -159,7 +161,8 @@ impl CardWatch {
         }
     }
 
-    pub(crate) fn receipt(&self) -> Receipt {
+    #[doc(hidden)]
+    pub fn receipt(&self) -> Receipt {
         Receipt {
             wake: self.wake.clone(),
             pending: std::mem::take(&mut *self.wake.pending.lock()),

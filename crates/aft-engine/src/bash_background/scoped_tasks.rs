@@ -16,7 +16,8 @@ pub struct Selector {
 }
 
 impl Selector {
-    pub(crate) fn matches(&self, stamp: &subc_protocol::scope::ScopeStamp) -> bool {
+    #[doc(hidden)]
+    pub fn matches(&self, stamp: &subc_protocol::scope::ScopeStamp) -> bool {
         self.owner == stamp.owner
             && self.scope_ref == stamp.scope_ref
             && self.epoch == stamp.scope_epoch

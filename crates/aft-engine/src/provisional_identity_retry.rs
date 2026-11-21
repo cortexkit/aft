@@ -462,12 +462,14 @@ impl std::fmt::Debug for PreparedReplay {
 impl PreparedReplay {
     /// Executor request id. The `subc-bind-` prefix is what makes the
     /// executor admit the job as a route bind.
-    pub(crate) fn request_id(&self) -> String {
+    #[doc(hidden)]
+    pub fn request_id(&self) -> String {
         format!("subc-bind-identity-retry-{}", self.root.display())
     }
 
     /// The session whose bind is replayed.
-    pub(crate) fn session(&self) -> String {
+    #[doc(hidden)]
+    pub fn session(&self) -> String {
         self.retry
             .lock()
             .as_ref()
@@ -489,7 +491,8 @@ impl PreparedReplay {
     /// into the family the session is about to build. The session's index
     /// loads start only from its configure tail, which runs after this bind
     /// returns, so the handoff always precedes the session's first build.
-    pub(crate) fn run(
+    #[doc(hidden)]
+    pub fn run(
         &self,
         ctx: &AppContext,
         bind_handoff: impl FnOnce(&AppContext),

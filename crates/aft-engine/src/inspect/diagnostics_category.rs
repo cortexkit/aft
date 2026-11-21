@@ -945,7 +945,8 @@ pub struct ScopeWalkBudget {
 }
 
 impl ScopeWalkBudget {
-    pub(crate) fn new(deadline: Option<Instant>) -> Self {
+    #[doc(hidden)]
+    pub fn new(deadline: Option<Instant>) -> Self {
         Self::with_entry_limit(deadline, 200_000)
     }
 
@@ -958,7 +959,8 @@ impl ScopeWalkBudget {
         }
     }
 
-    pub(crate) fn keep_walking(&self) -> bool {
+    #[doc(hidden)]
+    pub fn keep_walking(&self) -> bool {
         let allowed = Instant::now() < self.deadline
             && self.visited.fetch_add(1, Ordering::Relaxed) < self.entry_limit;
         if !allowed {
@@ -967,7 +969,8 @@ impl ScopeWalkBudget {
         allowed
     }
 
-    pub(crate) fn complete(&self) -> bool {
+    #[doc(hidden)]
+    pub fn complete(&self) -> bool {
         !self.truncated.load(Ordering::Relaxed)
     }
 }

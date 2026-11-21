@@ -1476,7 +1476,7 @@ impl ArtifactEvictionBlocker {
     /// dropping inspect completions that nothing drains while the root is
     /// unbound. The other blockers are either intentional (standing roots,
     /// running bash tasks) or clear on their own.
-    pub(crate) fn clearable_by_unbound_teardown(self) -> bool {
+    pub fn clearable_by_unbound_teardown(self) -> bool {
         matches!(self, Self::InspectTier2)
     }
 }
@@ -1572,16 +1572,16 @@ impl WatcherDrainSliceState {
 
 #[derive(Clone, Debug)]
 pub struct ConfigureMaintenanceJob {
-    pub(crate) generation: u64,
-    pub(crate) root_path: PathBuf,
-    pub(crate) canonical_cache_root: PathBuf,
-    pub(crate) harness: Harness,
-    pub(crate) storage_root: PathBuf,
-    pub(crate) harness_dir: PathBuf,
-    pub(crate) session_id: String,
+    pub generation: u64,
+    pub root_path: PathBuf,
+    pub canonical_cache_root: PathBuf,
+    pub harness: Harness,
+    pub storage_root: PathBuf,
+    pub harness_dir: PathBuf,
+    pub session_id: String,
     pub(crate) root_too_broad: bool,
     pub(crate) format_tool_cache_clear_needed: bool,
-    pub(crate) run_bash_replay: bool,
+    pub run_bash_replay: bool,
     pub(crate) configure_database_runtime: bool,
     pub(crate) refresh_project_runtime: bool,
     pub(crate) sync_bash_compress_flag: bool,
@@ -2414,8 +2414,7 @@ pub struct App {
     /// The authenticated module connection's endpoint, independent of model
     /// backend configuration. Consumer routes must use this same daemon.
     subc_connection_file: parking_lot::RwLock<Option<PathBuf>>,
-    pub(crate) route_delivery_sessions:
-        Arc<crate::bash_background::registry::RouteDeliverySessions>,
+    pub route_delivery_sessions: Arc<crate::bash_background::registry::RouteDeliverySessions>,
     lifecycle_census: crate::lifecycle_census::LifecycleCensusCache,
     active_watchers: AtomicUsize,
     active_actor_roots: AtomicUsize,
@@ -2486,7 +2485,7 @@ impl App {
         self.lsp_child_registry.clone()
     }
 
-    pub(crate) fn publish_lifecycle_census(
+    pub fn publish_lifecycle_census(
         &self,
         snapshot: crate::lifecycle_census::LifecycleCensusSnapshot,
     ) {
@@ -2501,9 +2500,7 @@ impl App {
         self.publish_lifecycle_census(crate::lifecycle_census::collect(self, contexts));
     }
 
-    pub(crate) fn lifecycle_census_snapshot(
-        &self,
-    ) -> crate::lifecycle_census::LifecycleCensusSnapshot {
+    pub fn lifecycle_census_snapshot(&self) -> crate::lifecycle_census::LifecycleCensusSnapshot {
         self.lifecycle_census.snapshot()
     }
 
@@ -2537,7 +2534,7 @@ impl App {
 
     /// Snapshot process roots without waiting behind actor registration. A busy
     /// registry is surfaced as a named status gap by the memory snapshot.
-    pub(crate) fn try_memory_contexts(&self) -> Option<Vec<(PathBuf, Arc<AppContext>)>> {
+    pub fn try_memory_contexts(&self) -> Option<Vec<(PathBuf, Arc<AppContext>)>> {
         let contexts = self.memory_contexts.try_lock()?;
         Some(
             contexts
@@ -2560,7 +2557,7 @@ impl App {
         self.open_db_with_mode(path, crate::db::OpenMode::Deferred)
     }
 
-    pub(crate) fn open_db_with_mode(
+    pub fn open_db_with_mode(
         &self,
         path: &Path,
         mode: crate::db::OpenMode,
@@ -2595,7 +2592,7 @@ impl App {
     /// Opening and closing another descriptor can release SQLite's process-wide
     /// locks. Hold the App slot through the peek so another root cannot open
     /// the file between checking for a handle and opening a read-only one.
-    pub(crate) fn database_schema_version(
+    pub fn database_schema_version(
         &self,
         path: &Path,
         mode: crate::db::OpenMode,
@@ -2713,7 +2710,7 @@ impl App {
         self.active_actor_roots.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn set_open_route_count(&self, count: usize) {
+    pub fn set_open_route_count(&self, count: usize) {
         self.open_routes.store(count, Ordering::SeqCst);
     }
 
@@ -3612,7 +3609,7 @@ impl AppContext {
 
     /// A busy manager is not a missing diagnostic producer. Publishers must
     /// leave their previous bar untouched and retry on a later signal.
-    pub(crate) fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
+    pub fn try_status_bar_count_values(&self) -> Option<StatusBarCountValues> {
         self.status_bar_count_values_inner(false)
     }
 
@@ -3752,10 +3749,7 @@ impl AppContext {
     /// The health rollup resolves each distinct root once per tick and passes
     /// it here so a many-context tick does not re-resolve the same root once
     /// per context. `None` resolves as usual for callers without a tick memo.
-    pub(crate) fn try_health_summary_for_root(
-        &self,
-        cache_dir: Option<&Path>,
-    ) -> RootHealthSummary {
+    pub fn try_health_summary_for_root(&self, cache_dir: Option<&Path>) -> RootHealthSummary {
         // Read lifecycle state before taking artifact locks. Worker admission takes
         // the lifecycle lock first and then installs artifact receivers, so the
         // reverse order here would deadlock a health poll against worker startup.
@@ -4103,7 +4097,7 @@ impl AppContext {
     /// bumps the generation, so generation zero means the ignore rules were
     /// never loaded. A `None` matcher at generation zero is "not known yet",
     /// not "this project ignores nothing".
-    pub(crate) fn gitignore_published(&self) -> bool {
+    pub fn gitignore_published(&self) -> bool {
         self.gitignore_generation.load(Ordering::SeqCst) > 0
     }
 
@@ -4472,7 +4466,7 @@ impl AppContext {
         &self.status_emitter
     }
 
-    pub(crate) fn install_fleet_status_client(
+    pub fn install_fleet_status_client(
         &self,
         client: Option<crate::fleet_status::FleetStatusClient>,
     ) {
@@ -4482,7 +4476,7 @@ impl AppContext {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = client;
     }
 
-    pub(crate) fn fleet_status_client(&self) -> Option<crate::fleet_status::FleetStatusClient> {
+    pub fn fleet_status_client(&self) -> Option<crate::fleet_status::FleetStatusClient> {
         self.fleet_status_client
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4520,7 +4514,7 @@ impl AppContext {
         generation
     }
 
-    pub(crate) fn mark_subc_bound(&self) {
+    pub fn mark_subc_bound(&self) {
         self.lsp().resume();
         self.subc_lifecycle.mark_bound();
         // Idle release holds the lifecycle gate while clearing the pools. Once
@@ -4530,7 +4524,7 @@ impl AppContext {
         self.inspect_manager.resume_root_work();
     }
 
-    pub(crate) fn mark_subc_unbound(&self) {
+    pub fn mark_subc_unbound(&self) {
         self.subc_lifecycle
             .mark_unbound(self.configure_generation.as_ref());
         crate::provisional_identity_retry::cancel(self);
@@ -4542,7 +4536,7 @@ impl AppContext {
         self.subc_lifecycle.is_unbound()
     }
 
-    pub(crate) fn try_subc_unbound_quiesced(&self) -> Option<bool> {
+    pub fn try_subc_unbound_quiesced(&self) -> Option<bool> {
         self.subc_lifecycle.try_is_bound().map(|bound| !bound)
     }
 
@@ -4551,11 +4545,11 @@ impl AppContext {
         self.subc_lifecycle.set_abandon_grace_for_test(grace);
     }
 
-    pub(crate) fn subc_lifecycle_admission(&self) -> SubcLifecycleAdmission {
+    pub fn subc_lifecycle_admission(&self) -> SubcLifecycleAdmission {
         self.subc_lifecycle.clone()
     }
 
-    pub(crate) fn run_if_subc_bound_generation<R>(
+    pub fn run_if_subc_bound_generation<R>(
         &self,
         expected_generation: u64,
         action: impl FnOnce() -> R,
@@ -4708,7 +4702,7 @@ impl AppContext {
         (generation, equivalent)
     }
 
-    pub(crate) fn configure_warm_key_matches(&self, key: &str) -> bool {
+    pub fn configure_warm_key_matches(&self, key: &str) -> bool {
         self.configure_warm_state
             .lock()
             .key
@@ -4716,7 +4710,7 @@ impl AppContext {
             .is_some_and(|current| current == key)
     }
 
-    pub(crate) fn invalidate_configure_warm_state(&self) {
+    pub fn invalidate_configure_warm_state(&self) {
         self.configure_warm_state.lock().key = None;
     }
 
@@ -4728,7 +4722,7 @@ impl AppContext {
             .insert((root, session_id))
     }
 
-    pub(crate) fn has_configure_session_binding(&self, root: &Path, session_id: &str) -> bool {
+    pub fn has_configure_session_binding(&self, root: &Path, session_id: &str) -> bool {
         self.configured_session_roots
             .lock()
             .contains(&(root.to_path_buf(), session_id.to_string()))
@@ -4943,7 +4937,7 @@ impl AppContext {
 
     /// No configure-tail work is queued or parked. The background identity
     /// retry replays a bind only then, so it never interleaves with a tail.
-    pub(crate) fn configure_tail_idle(&self) -> bool {
+    pub fn configure_tail_idle(&self) -> bool {
         self.configure_maintenance_jobs.lock().is_empty()
             && self
                 .parked_configure_tail
@@ -4952,9 +4946,7 @@ impl AppContext {
                 .is_none_or(|tail| tail.jobs_is_empty())
     }
 
-    pub(crate) fn provisional_identity_retry(
-        &self,
-    ) -> &crate::provisional_identity_retry::RetrySlot {
+    pub fn provisional_identity_retry(&self) -> &crate::provisional_identity_retry::RetrySlot {
         &self.provisional_identity_retry
     }
 
@@ -5006,7 +4998,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn park_configure_tail(
+    pub fn park_configure_tail(
         &self,
         state: crate::runtime_drain::configure::ConfigureMaintenanceState,
     ) {
@@ -5017,17 +5009,17 @@ impl AppContext {
         );
     }
 
-    pub(crate) fn take_parked_configure_tail(
+    pub fn take_parked_configure_tail(
         &self,
     ) -> Option<crate::runtime_drain::configure::ConfigureMaintenanceState> {
         self.parked_configure_tail.lock().take()
     }
 
-    pub(crate) fn configure_maintenance_has_capacity(&self) -> bool {
+    pub fn configure_maintenance_has_capacity(&self) -> bool {
         self.configure_maintenance_jobs.lock().len() < crate::executor::MAINTENANCE_QUEUE_CAP
     }
 
-    pub(crate) fn enqueue_configure_maintenance(
+    pub fn enqueue_configure_maintenance(
         &self,
         job: ConfigureMaintenanceJob,
     ) -> Result<(), ConfigureMaintenanceJob> {
@@ -5045,7 +5037,7 @@ impl AppContext {
         Ok(())
     }
 
-    pub(crate) fn drain_configure_maintenance(&self) -> Vec<ConfigureMaintenanceJob> {
+    pub fn drain_configure_maintenance(&self) -> Vec<ConfigureMaintenanceJob> {
         self.configure_maintenance_jobs.lock().drain(..).collect()
     }
 
@@ -5057,10 +5049,7 @@ impl AppContext {
 
     /// Return a worktree probe result only while the root's `.git` marker still
     /// matches the marker present when the successful probe was cached.
-    pub(crate) fn cached_worktree_bridge(
-        &self,
-        canonical_root: &Path,
-    ) -> Option<(bool, Option<PathBuf>)> {
+    pub fn cached_worktree_bridge(&self, canonical_root: &Path) -> Option<(bool, Option<PathBuf>)> {
         #[cfg(test)]
         if self.force_worktree_bridge_reprobe.load(Ordering::SeqCst) {
             return None;
@@ -5076,7 +5065,7 @@ impl AppContext {
 
     /// Cache only successful git worktree probes. Failed probes remain retryable
     /// because a transient process or filesystem error must not become sticky.
-    pub(crate) fn cache_worktree_bridge(
+    pub fn cache_worktree_bridge(
         &self,
         canonical_root: &Path,
         is_worktree_bridge: bool,
@@ -5110,7 +5099,7 @@ impl AppContext {
     }
 
     /// Consume a newly-ready index plane on the query path (`first_query` or a Building wait).
-    pub(crate) fn note_index_query(
+    pub fn note_index_query(
         &self,
         plane: crate::logging::IndexPlane,
         tool: &str,
@@ -5163,7 +5152,7 @@ impl AppContext {
     /// such as standing-root maintenance, use this instead of
     /// [`Self::memoized_artifact_cache_key`] and handle the provisional root
     /// without a key.
-    pub(crate) fn settled_artifact_cache_key(&self, canonical_root: &Path) -> Option<String> {
+    pub fn settled_artifact_cache_key(&self, canonical_root: &Path) -> Option<String> {
         if self.bound_identity_unsettled(canonical_root) {
             return None;
         }
@@ -5184,17 +5173,13 @@ impl AppContext {
     /// provisional. A key derived while the configure was still publishing
     /// (before its degraded reasons said provisional) may have been cached by
     /// a reader on another thread, such as standing-root maintenance.
-    pub(crate) fn forget_unsettled_artifact_cache_key(
-        &self,
-        canonical_root: &Path,
-        raw_root: &Path,
-    ) {
+    pub fn forget_unsettled_artifact_cache_key(&self, canonical_root: &Path, raw_root: &Path) {
         let mut keys = self.artifact_cache_keys.lock();
         keys.remove(canonical_root);
         keys.remove(raw_root);
     }
 
-    pub(crate) fn memoized_readonly_artifact_cache_key(
+    pub fn memoized_readonly_artifact_cache_key(
         &self,
         canonical_root: &Path,
         storage: &Path,
@@ -5265,7 +5250,7 @@ impl AppContext {
         )
     }
 
-    pub(crate) fn memoized_artifact_cache_key_for_configure_profiled(
+    pub fn memoized_artifact_cache_key_for_configure_profiled(
         &self,
         raw_root: &Path,
         canonical_root: &Path,
@@ -5343,7 +5328,7 @@ impl AppContext {
         self.configure_content_generation.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn begin_configure_ack_phase(&self, phase: &'static str) {
+    pub fn begin_configure_ack_phase(&self, phase: &'static str) {
         let now = Instant::now();
         let mut timing = self.configure_phase_timing.lock();
         timing.finish_step(now);
@@ -5362,14 +5347,14 @@ impl AppContext {
     /// Starts a named step inside the current configure phase, ending the
     /// previous step. The phase's entry in the timing line then lists its
     /// steps, so a slow phase names the step that took the time.
-    pub(crate) fn begin_configure_ack_step(&self, step: &'static str) {
+    pub fn begin_configure_ack_step(&self, step: &'static str) {
         let now = Instant::now();
         let mut timing = self.configure_phase_timing.lock();
         timing.finish_step(now);
         timing.step = Some((step, now));
     }
 
-    pub(crate) fn configure_ack_phase_snapshot(&self) -> String {
+    pub fn configure_ack_phase_snapshot(&self) -> String {
         let timing = self.configure_phase_timing.lock();
         let mut parts = timing
             .completed
@@ -5393,7 +5378,7 @@ impl AppContext {
 
     /// Record the configure-tail stage that starts now, or `None` once the
     /// unit has finished.
-    pub(crate) fn note_configure_tail_stage(&self, stage: Option<&'static str>) {
+    pub fn note_configure_tail_stage(&self, stage: Option<&'static str>) {
         *self.configure_tail_stage.lock() = stage.map(|stage| (stage, Instant::now()));
     }
 
@@ -5478,7 +5463,7 @@ impl AppContext {
     }
 
     /// Route teardown must not wait for a request holding the backup mutex.
-    pub(crate) fn release_backup_session_in_background(
+    pub fn release_backup_session_in_background(
         self: &Arc<Self>,
         session: String,
     ) -> std::thread::JoinHandle<()> {
@@ -5548,14 +5533,11 @@ impl AppContext {
         self.app.db()
     }
 
-    pub(crate) fn launch_grants_materialized(
-        &self,
-        scope: &crate::db::access_grants::ScopeKey,
-    ) -> bool {
+    pub fn launch_grants_materialized(&self, scope: &crate::db::access_grants::ScopeKey) -> bool {
         self.launch_grants_materialized.lock().contains(scope)
     }
 
-    pub(crate) fn memoize_launch_grants(&self, scope: crate::db::access_grants::ScopeKey) {
+    pub fn memoize_launch_grants(&self, scope: crate::db::access_grants::ScopeKey) {
         self.launch_grants_materialized.lock().insert(scope);
     }
 
@@ -5580,7 +5562,7 @@ impl AppContext {
     /// root-local pools without marking persistence as initializing, which
     /// would refuse bash and edits until another open ran. A failed or busy
     /// database is always retried.
-    pub(crate) fn begin_database_runtime(
+    pub fn begin_database_runtime(
         &self,
         canonical_cache_root: PathBuf,
         storage_root: PathBuf,
@@ -5656,7 +5638,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn database_open_epoch(&self) -> u64 {
+    pub fn database_open_epoch(&self) -> u64 {
         self.database_open.lock().epoch
     }
 
@@ -5680,7 +5662,7 @@ impl AppContext {
     /// this an open for an older configure could finish after a newer
     /// configure marked persistence as initializing and report its database
     /// as ready. Returns whether `publish` ran.
-    pub(crate) fn publish_database_open(
+    pub fn publish_database_open(
         &self,
         epoch: u64,
         publish: impl FnOnce(&mut crate::database_open::DatabaseOpenSlot),
@@ -5707,7 +5689,7 @@ impl AppContext {
         true
     }
 
-    pub(crate) fn finish_database_runtime(&self, result: Result<(), String>) {
+    pub fn finish_database_runtime(&self, result: Result<(), String>) {
         match result {
             Ok(()) => {
                 *self.database_runtime_failure.lock() = DatabaseRuntimeFailure::default();
@@ -5718,7 +5700,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn finish_database_runtime_error(&self, error: String, busy: bool) {
+    pub fn finish_database_runtime_error(&self, error: String, busy: bool) {
         let mut failure = self.database_runtime_failure.lock();
         failure.record(error, busy);
         self.database_runtime_state
@@ -5774,7 +5756,7 @@ impl AppContext {
         database_runtime(self, &root, &storage, crate::db::OpenMode::SingleAttempt);
     }
 
-    pub(crate) fn database_runtime_pending(&self, command: &str) -> bool {
+    pub fn database_runtime_pending(&self, command: &str) -> bool {
         // Status can read finished task bundles if the store fails, but must
         // wait for an opening store to recover running tasks after a restart.
         (crate::persistence_gate::requires_database(command)
@@ -5784,7 +5766,7 @@ impl AppContext {
 
     /// Wait outside executor admission. Register before checking state so an
     /// open completing between the check and await cannot lose its notification.
-    pub(crate) async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {
+    pub async fn wait_for_database_runtime(&self, command: &str, deadline: Instant) {
         self.wait_for_database_while(deadline, || self.database_runtime_pending(command))
             .await;
     }
@@ -5793,7 +5775,7 @@ impl AppContext {
     /// Unlike `wait_for_database_runtime`, this does not depend on whether a
     /// particular command needs the database. Afterwards persistence may be
     /// open, failed, unconfigured, or (on timeout) still initializing.
-    pub(crate) async fn wait_for_database_settled(&self, deadline: Instant) {
+    pub async fn wait_for_database_settled(&self, deadline: Instant) {
         self.wait_for_database_while(deadline, || {
             self.database_runtime_state.load(Ordering::Acquire) == 1
         })
@@ -5819,18 +5801,18 @@ impl AppContext {
 
     /// True until this context's first configure stages a database open. Such
     /// a context (a library or test context) has never had aft.db open.
-    pub(crate) fn database_runtime_unconfigured(&self) -> bool {
+    pub fn database_runtime_unconfigured(&self) -> bool {
         self.database_runtime_state.load(Ordering::Acquire) == 0
     }
 
     /// True while a committed configure's database open has not finished.
-    pub(crate) fn database_runtime_initializing(&self) -> bool {
+    pub fn database_runtime_initializing(&self) -> bool {
         self.database_runtime_state.load(Ordering::Acquire) == 1
     }
 
     /// Wait outside executor admission until the database open in progress
     /// finishes or `deadline` passes, whatever command is waiting.
-    pub(crate) async fn wait_for_database_open(&self, deadline: Instant) {
+    pub async fn wait_for_database_open(&self, deadline: Instant) {
         loop {
             let changed = self.database_runtime_changed.notified();
             tokio::pin!(changed);
@@ -5850,10 +5832,7 @@ impl AppContext {
     /// The remembered confinement of `key`: `Some(true)` once known confined
     /// (which always wins), `Some(false)` once read as unconfined and not
     /// confined since, `None` when only aft.db can answer.
-    pub(crate) fn policy_key_confinement(
-        &self,
-        key: &crate::db::remote_exec::PolicyKey,
-    ) -> Option<bool> {
+    pub fn policy_key_confinement(&self, key: &crate::db::remote_exec::PolicyKey) -> Option<bool> {
         // Never waits for the database handle slot, which an open holds while
         // SQLite opens: the subc frame loop asks this. A busy slot only means
         // a remembered unconfined answer cannot be checked against it now.
@@ -5875,7 +5854,7 @@ impl AppContext {
     /// is dropped too, not only this key's: a key with no row for its own
     /// epoch reads an older epoch's row (see `db::remote_exec::confined`), so
     /// fencing one epoch can confine another key of the same worker.
-    pub(crate) fn remember_confined_policy_key(&self, key: crate::db::remote_exec::PolicyKey) {
+    pub fn remember_confined_policy_key(&self, key: crate::db::remote_exec::PolicyKey) {
         let mut memo = self.policy_confinement.lock();
         memo.confined.insert(key);
         memo.unconfined.clear();
@@ -5884,7 +5863,7 @@ impl AppContext {
 
     /// The generation to pass to [`Self::remember_unconfined_policy_key`]:
     /// take it before reading a key's policy from aft.db.
-    pub(crate) fn policy_confinement_generation(&self) -> u64 {
+    pub fn policy_confinement_generation(&self) -> u64 {
         self.policy_confinement.lock().generation
     }
 
@@ -5893,7 +5872,7 @@ impl AppContext {
     /// so a save invalidates their older answers. The caller holds aft.db's lock
     /// until the save finishes, so readers cannot observe a pre-save row under
     /// the new generation.
-    pub(crate) fn invalidate_saved_policy_reads(&self) {
+    pub fn invalidate_saved_policy_reads(&self) {
         let mut memo = self.policy_confinement.lock();
         memo.unconfined.clear();
         memo.generation = memo.generation.wrapping_add(1);
@@ -5902,7 +5881,7 @@ impl AppContext {
     /// Remember that the aft.db handle `db` said `key` is unconfined, unless a
     /// key was marked confined since `generation` was taken: that read may
     /// predate the fence, so it is not kept and the next call reads again.
-    pub(crate) fn remember_unconfined_policy_key(
+    pub fn remember_unconfined_policy_key(
         &self,
         key: crate::db::remote_exec::PolicyKey,
         generation: u64,
@@ -5925,7 +5904,7 @@ impl AppContext {
     }
 
     /// Count one read of a policy key's confinement from aft.db.
-    pub(crate) fn note_policy_confinement_read(&self) {
+    pub fn note_policy_confinement_read(&self) {
         #[cfg(test)]
         {
             self.policy_confinement.lock().store_reads += 1;
@@ -5976,14 +5955,14 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn database_runtime_failed(&self) -> bool {
+    pub fn database_runtime_failed(&self) -> bool {
         matches!(
             self.database_runtime_state.load(Ordering::Acquire),
             3 | 4 | 5
         )
     }
 
-    pub(crate) fn database_runtime_unavailable_reason(&self) -> Option<String> {
+    pub fn database_runtime_unavailable_reason(&self) -> Option<String> {
         match self.database_runtime_state.load(Ordering::Acquire) {
             1 => Some("project persistence is still initializing".into()),
             3 | 4 | 5 => Some(
@@ -6070,7 +6049,7 @@ impl AppContext {
 
     /// A non-waiting snapshot for the frame-loop reaper. If the request
     /// timestamp or configuration lock is contended, defer release.
-    pub(crate) fn try_views_idle_request(&self) -> Option<(Instant, u32)> {
+    pub fn try_views_idle_request(&self) -> Option<(Instant, u32)> {
         let config = try_read_unpoisoned(&self.config)?;
         self.last_request_at
             .try_lock()
@@ -6295,7 +6274,7 @@ impl AppContext {
 
     /// Whether the applicability walk started by the latest configuration
     /// publication is still running.
-    pub(crate) fn project_applicability_walk_running(&self) -> bool {
+    pub fn project_applicability_walk_running(&self) -> bool {
         let latest = self.project_applicability_epoch.load(Ordering::SeqCst);
         self.project_applicability_progress
             .settled
@@ -6539,7 +6518,7 @@ impl AppContext {
 
     /// The outside-roots rule this request is judged under: the configured
     /// rule, or deny when the request forces it.
-    pub(crate) fn request_outside_roots(&self, req_id: &str) -> crate::access_policy::OutsideRoots {
+    pub fn request_outside_roots(&self, req_id: &str) -> crate::access_policy::OutsideRoots {
         crate::access_policy::OutsideRoots::for_request(
             &self.config(),
             self.request_force_restrict(req_id),
@@ -6580,7 +6559,7 @@ impl AppContext {
         crate::storage_path::storage_dir(self.config().storage_dir.as_deref())
     }
 
-    pub(crate) fn output_files(&self) -> &crate::output_store::OutputFiles {
+    pub fn output_files(&self) -> &crate::output_store::OutputFiles {
         &self.output_files
     }
 
@@ -6603,7 +6582,7 @@ impl AppContext {
     /// root. The health rollup resolves each distinct root once per tick and
     /// reuses it here so a many-context tick does not re-resolve the same
     /// root once per context.
-    pub(crate) fn cache_unavailable_reason_for_root(&self, cache_dir: &Path) -> Option<String> {
+    pub fn cache_unavailable_reason_for_root(&self, cache_dir: &Path) -> Option<String> {
         let reason = crate::root_cache::cache_unavailable_for_root(&self.config(), cache_dir)?;
         if reason.starts_with(crate::root_cache::CACHE_DIR_BUSY)
             && !crate::provisional_identity_retry::cache_retry_pending(self)
@@ -6617,7 +6596,7 @@ impl AppContext {
 
     /// A connect is starting: any deferred cache recovery queued for an
     /// earlier connect is now stale.
-    pub(crate) fn note_connect_started(&self) {
+    pub fn note_connect_started(&self) {
         self.connect_generation.fetch_add(1, Ordering::SeqCst);
     }
 
@@ -6626,18 +6605,18 @@ impl AppContext {
     /// connect generation, so later cache recoveries re-run it again. Work
     /// queued before the refused connect keeps the older generation and is
     /// still dropped.
-    pub(crate) fn restamp_cache_recovery_request(&self) {
+    pub fn restamp_cache_recovery_request(&self) {
         let generation = self.connect_generation();
         if let Some((_, _, stamped)) = self.cache_recovery.lock().as_mut() {
             *stamped = generation;
         }
     }
 
-    pub(crate) fn connect_generation(&self) -> u64 {
+    pub fn connect_generation(&self) -> u64 {
         self.connect_generation.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn retain_cache_recovery_request(&self, request: &crate::protocol::RawRequest) {
+    pub fn retain_cache_recovery_request(&self, request: &crate::protocol::RawRequest) {
         let generation = self.connect_generation();
         *self.cache_recovery.lock() = self
             .config()
@@ -6648,7 +6627,7 @@ impl AppContext {
 
     /// The retained connect request, with the connect generation it belongs
     /// to, at most once per minute.
-    pub(crate) fn cache_recovery_request_if_due(
+    pub fn cache_recovery_request_if_due(
         &self,
         now: Instant,
     ) -> Option<(crate::protocol::RawRequest, u64)> {
@@ -6739,7 +6718,7 @@ impl AppContext {
     /// This root's checkout in the data layer, bound on first use; `None`
     /// when no root is configured, the root is a parent folder of repositories,
     /// or its store cannot be opened.
-    pub(crate) fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
+    pub fn data_checkout(&self) -> Option<Arc<crate::data_layer::runtime::DataCheckout>> {
         if self.data_checkout_pinned.load(Ordering::Acquire) {
             return self.data_checkout.lock().clone();
         }
@@ -6850,9 +6829,7 @@ impl AppContext {
     /// memory census see it: never binds one (binding starts a build) and
     /// never waits for a bind in progress. `None` when the data layer is
     /// off.
-    pub(crate) fn probe_data_checkout(
-        &self,
-    ) -> Option<crate::data_layer::surfaces::DataCheckoutProbe> {
+    pub fn probe_data_checkout(&self) -> Option<crate::data_layer::surfaces::DataCheckoutProbe> {
         use crate::data_layer::surfaces::DataCheckoutProbe;
         if self.data_checkout_pinned.load(Ordering::Acquire) {
             if let Some(checkout) = self.data_checkout.try_lock().and_then(|slot| slot.clone()) {
@@ -6978,7 +6955,7 @@ impl AppContext {
     /// Tells the data layer the watcher lost events: each bound checkout,
     /// this root's and its child repositories', compares its files with its
     /// state again.
-    pub(crate) fn data_rescan(&self) {
+    pub fn data_rescan(&self) {
         let checkout = self.data_checkout.lock().clone();
         if let Some(checkout) = checkout {
             checkout.rescan();
@@ -7045,7 +7022,7 @@ impl AppContext {
     }
 
     /// The search reranker's backend slot.
-    pub(crate) fn rerank_slot(&self) -> &crate::search_state::rerank::slot::BackendSlot {
+    pub fn rerank_slot(&self) -> &crate::search_state::rerank::slot::BackendSlot {
         &self.rerank_slot
     }
 
@@ -7059,7 +7036,7 @@ impl AppContext {
             ));
     }
 
-    pub(crate) fn daemonless_query_mode(&self) -> bool {
+    pub fn daemonless_query_mode(&self) -> bool {
         self.daemonless_query_mode.load(Ordering::SeqCst)
     }
 
@@ -7245,11 +7222,11 @@ impl AppContext {
     /// A busy aft.db is retried in the background
     /// ([`crate::provisional_identity_retry`]); an unreadable Git identity
     /// waits for the next bind.
-    pub(crate) fn artifact_identity_provisional(&self) -> bool {
+    pub fn artifact_identity_provisional(&self) -> bool {
         self.artifact_identity_provisional_reason().is_some()
     }
 
-    pub(crate) fn artifact_identity_provisional_reason(&self) -> Option<String> {
+    pub fn artifact_identity_provisional_reason(&self) -> Option<String> {
         self.degraded_reasons
             .lock()
             .iter()
@@ -7322,7 +7299,7 @@ impl AppContext {
     /// Gate every watcher-maintained artifact after the last route detaches. Files
     /// may change before the watcher is restored, so a later bind must reconcile
     /// from disk instead of serving retained snapshots that missed those edits.
-    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
+    pub fn invalidate_artifacts_after_watcher_gap(&self) {
         self.next_semantic_persist_epoch();
 
         self.semantic_index
@@ -7357,7 +7334,7 @@ impl AppContext {
 
     /// The Git checkout holding `requested_path`, resolved from the session's
     /// project root. A plain root the policy protects is refused.
-    pub(crate) fn resolve_external_git_root(
+    pub fn resolve_external_git_root(
         &self,
         project_root: &Path,
         requested_path: &str,
@@ -7370,7 +7347,7 @@ impl AppContext {
         )
     }
 
-    pub(crate) fn search_exact_memo(&self) -> Arc<crate::search_state::memo::ExactMemoStore> {
+    pub fn search_exact_memo(&self) -> Arc<crate::search_state::memo::ExactMemoStore> {
         Arc::clone(&self.search_exact_memo)
     }
 
@@ -7448,7 +7425,7 @@ impl AppContext {
     /// pending state belongs to non-equivalent configure and TTL eviction
     /// (transactional take in the TTL reaper), whose strict invalidation
     /// subsumes their purpose.
-    pub(crate) fn cancel_unbound_artifact_work(&self) {
+    pub fn cancel_unbound_artifact_work(&self) {
         if let Some(root) = self.canonical_cache_root_opt() {
             crate::cold_build_limiter::progress::cancel_root(&root);
         }
@@ -7496,13 +7473,13 @@ impl AppContext {
 
     /// Standing ownership exempts a root from idle artifact eviction only. It
     /// does not bypass strict verification, budgets, breaker checks, or leases.
-    pub(crate) fn set_standing_artifact_exempt(&self, exempt: bool) {
+    pub fn set_standing_artifact_exempt(&self, exempt: bool) {
         self.standing_artifact_exempt
             .store(exempt, Ordering::Release);
         self.sync_background_callgraph_refresh();
     }
 
-    pub(crate) fn set_worker_only_routes(&self, worker_only: bool) {
+    pub fn set_worker_only_routes(&self, worker_only: bool) {
         self.worker_only_routes
             .store(worker_only, Ordering::Release);
         self.sync_background_callgraph_refresh();
@@ -7519,7 +7496,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn cold_build_limiter(&self) -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
+    pub fn cold_build_limiter(&self) -> Arc<crate::cold_build_limiter::ColdBuildLimiter> {
         Arc::clone(
             &self
                 .cold_build_limiter
@@ -7802,7 +7779,7 @@ impl AppContext {
 
     /// Drop the semantic-index receiver. A finished load still waiting in it
     /// is freed with it and logged with `reason`.
-    pub(crate) fn retire_semantic_index_rx(&self, reason: &str) {
+    pub fn retire_semantic_index_rx(&self, reason: &str) {
         let mut receiver = self.semantic_index_rx.lock();
         let discarded = take_undelivered_install(
             &self.semantic_pending_install,
@@ -7823,7 +7800,7 @@ impl AppContext {
     /// Rebind a live semantic build to a newer configure generation when the
     /// semantic corpus inputs are unchanged. Its receiver keeps the completed
     /// result while the worker's dedicated build epoch remains valid.
-    pub(crate) fn adopt_semantic_index_rx_generation(&self, generation: u64) -> bool {
+    pub fn adopt_semantic_index_rx_generation(&self, generation: u64) -> bool {
         let receiver = self.semantic_index_rx.lock();
         if receiver.is_none() {
             return false;
@@ -7837,7 +7814,7 @@ impl AppContext {
             .store(generation, Ordering::SeqCst);
     }
 
-    pub(crate) fn semantic_index_rx_generation(&self) -> u64 {
+    pub fn semantic_index_rx_generation(&self) -> u64 {
         self.semantic_index_rx_generation.load(Ordering::SeqCst)
     }
 
@@ -7851,7 +7828,7 @@ impl AppContext {
         self.semantic_index_rx_epoch.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn next_semantic_persist_epoch(&self) -> u64 {
+    pub fn next_semantic_persist_epoch(&self) -> u64 {
         self.semantic_persist_epoch.next()
     }
 
@@ -7859,7 +7836,7 @@ impl AppContext {
         self.semantic_index_status.as_ref()
     }
 
-    pub(crate) fn set_semantic_build_progress(&self, progress: Option<SemanticBuildProgress>) {
+    pub fn set_semantic_build_progress(&self, progress: Option<SemanticBuildProgress>) {
         *self
             .semantic_build_progress
             .write()
@@ -8077,7 +8054,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn semantic_backend_health_snapshot(&self) -> EmbeddingBackendHealthSnapshot {
+    pub fn semantic_backend_health_snapshot(&self) -> EmbeddingBackendHealthSnapshot {
         let outage = self
             .semantic_refresh_circuit
             .backend_outage
@@ -8285,7 +8262,7 @@ impl AppContext {
         &self.watcher
     }
 
-    pub(crate) fn watcher_counters(&self) -> Arc<WatcherCounters> {
+    pub fn watcher_counters(&self) -> Arc<WatcherCounters> {
         Arc::clone(
             &self
                 .watcher_counters
@@ -8357,7 +8334,7 @@ impl AppContext {
         self.install_watcher_runtime_inner(rx, runtime, None);
     }
 
-    pub(crate) fn install_watcher_runtime_with_thread_id(
+    pub fn install_watcher_runtime_with_thread_id(
         &self,
         rx: crossbeam_channel::Receiver<WatcherDispatchEvent>,
         runtime: WatcherThreadHandle,
@@ -8395,7 +8372,7 @@ impl AppContext {
         });
     }
 
-    pub(crate) fn watcher_runtime_matches(&self, root: &Path, gitignore_generation: u64) -> bool {
+    pub fn watcher_runtime_matches(&self, root: &Path, gitignore_generation: u64) -> bool {
         let _runtime_guard = self.watcher_runtime_lock.lock();
         let thread_live = self
             .watcher_thread
@@ -8529,7 +8506,7 @@ impl AppContext {
     /// failure while the root was unbound and drains were suppressed).
     /// Returns true when a finished corpse was actually removed so the caller
     /// can apply watcher-gap invalidation exactly once.
-    pub(crate) fn take_finished_watcher_runtime(&self) -> bool {
+    pub fn take_finished_watcher_runtime(&self) -> bool {
         let runtime = {
             let _runtime_guard = self.watcher_runtime_lock.lock();
             let finished = self
@@ -8564,7 +8541,7 @@ impl AppContext {
         self.app.watcher_count()
     }
 
-    pub(crate) fn watcher_runtime_active(&self) -> bool {
+    pub fn watcher_runtime_active(&self) -> bool {
         let _runtime_guard = self.watcher_runtime_lock.lock();
         // A finished thread is a dead runtime even while its handle is still
         // installed (the backend can fail while drains are suppressed for an
@@ -8632,7 +8609,7 @@ impl AppContext {
     /// that point, and configure persists the delta itself. A rebind that lands
     /// after the check below only lets an ordinary delta write finish, which is
     /// harmless for a bound root. Returns whether a delta was written.
-    pub(crate) fn persist_unbound_artifacts_for_teardown(&self) -> bool {
+    pub fn persist_unbound_artifacts_for_teardown(&self) -> bool {
         if !self.subc_unbound_quiesced() {
             return false;
         }
@@ -8673,14 +8650,14 @@ impl AppContext {
     /// [`ArtifactEvictionBlocker::LockContended`] instead of waiting. The idle
     /// reaper takes the pending reconciliation sets before it asks, so it
     /// passes `include_pending = false` for that check.
-    pub(crate) fn try_artifact_eviction_blocker(
+    pub fn try_artifact_eviction_blocker(
         &self,
         include_pending: bool,
     ) -> Option<ArtifactEvictionBlocker> {
         self.try_artifact_eviction_blocker_for_root(include_pending, None, false)
     }
 
-    pub(crate) fn try_artifact_eviction_blocker_for_deleted_root(
+    pub fn try_artifact_eviction_blocker_for_deleted_root(
         &self,
         include_pending: bool,
         root: &crate::path_identity::ProjectRootId,
@@ -8759,9 +8736,7 @@ impl AppContext {
     /// eviction is blocked by a secondary blocker (running bash, in-flight
     /// builds): the paths are the only repair record for consumed watcher
     /// events, and the root may rebind before the next reap attempt.
-    pub(crate) fn try_take_pending_reconciliation_state(
-        &self,
-    ) -> Option<PendingReconciliationState> {
+    pub fn try_take_pending_reconciliation_state(&self) -> Option<PendingReconciliationState> {
         let mut tier2 = self.pending_tier2_paths.try_lock()?;
         let mut semantic = self.pending_semantic_index_paths.try_lock()?;
         let mut corpus_refresh = self.pending_semantic_corpus_refresh.try_lock()?;
@@ -8776,7 +8751,7 @@ impl AppContext {
     /// The sets are the only record of watcher events already consumed, so
     /// they are never dropped: when a set is locked, a short-lived thread
     /// restores them instead.
-    pub(crate) fn restore_pending_reconciliation_state_without_waiting(
+    pub fn restore_pending_reconciliation_state_without_waiting(
         self: &Arc<Self>,
         state: PendingReconciliationState,
     ) {
@@ -8807,20 +8782,20 @@ impl AppContext {
     /// nothing is evicted unless every one of them was free. Returns false
     /// when eviction is unsafe or a lock was contended; the reaper retries on
     /// its next sweep.
-    pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
+    pub fn try_evict_idle_artifacts(&self) -> bool {
         self.try_evict_idle_artifacts_for_root(None, false)
     }
 
     /// A standing checkout's views can age out too. The caller must exclude
     /// in-flight actor work before releasing its resident registrations.
-    pub(crate) fn try_release_idle_checkout_views(&self) -> bool {
+    pub fn try_release_idle_checkout_views(&self) -> bool {
         self.try_evict_idle_artifacts_for_root(None, true)
     }
 
     /// Deleted-root reclamation uses the same root-scoped task gate both before
     /// and during eviction. Artifact handles belong to this root, so only its
     /// tasks block reclamation of those handles.
-    pub(crate) fn try_evict_idle_artifacts_for_deleted_root(
+    pub fn try_evict_idle_artifacts_for_deleted_root(
         &self,
         root: &crate::path_identity::ProjectRootId,
     ) -> bool {
@@ -8919,7 +8894,7 @@ impl AppContext {
     /// Release resources that can be recreated by an equivalent later bind.
     /// LSP shutdown can wait on child processes, so all work stays off the
     /// executor and subc frame loops.
-    pub(crate) fn release_idle_reopenable_resources_in_background(
+    pub fn release_idle_reopenable_resources_in_background(
         self: &Arc<Self>,
     ) -> std::thread::JoinHandle<()> {
         let ctx = Arc::clone(self);
@@ -8974,7 +8949,7 @@ impl AppContext {
     /// unbound roots: an evicted root is not reaped again, so nothing else
     /// would retry. Returns whether a release was started. Waits on nothing;
     /// a locked task map means "not yet".
-    pub(crate) fn retry_deferred_idle_release(self: &Arc<Self>) -> bool {
+    pub fn retry_deferred_idle_release(self: &Arc<Self>) -> bool {
         if !self.filter_release_deferred.load(Ordering::Acquire)
             || self.bash_background.try_has_task_records() != Some(false)
         {
@@ -9263,7 +9238,7 @@ impl AppContext {
     /// helper uses, so changes reach the servers in the order they were
     /// queued. The slot itself stays in place: the helper still owns it,
     /// finds it empty, and clears it.
-    pub(crate) fn lsp_forward_queued_watcher_changes(&self) {
+    pub fn lsp_forward_queued_watcher_changes(&self) {
         let reloads = {
             let mut lsp = self.lsp_manager.lock();
             let Some(backlog) = self
@@ -9959,7 +9934,7 @@ impl AppContext {
     /// the access policy judged: the canonical parent plus the final
     /// component as spelled. A caller that holds the parent directory open
     /// can check that the directory it holds is the one that was judged.
-    pub(crate) fn authorize_write_location(
+    pub fn authorize_write_location(
         &self,
         req_id: &str,
         path: &Path,
@@ -10071,7 +10046,7 @@ impl AppContext {
         }
     }
 
-    pub(crate) fn validate_search_path(
+    pub fn validate_search_path(
         &self,
         req_id: &str,
         session_id: &str,
@@ -10231,7 +10206,7 @@ impl AppContext {
 
     /// Read saved launch inputs without filesystem probes and combine them with
     /// confirmed-absence records. Neither source can authorize path access.
-    pub(crate) fn unrestored_launch_grants(
+    pub fn unrestored_launch_grants(
         &self,
         req_id: &str,
     ) -> Result<Vec<launch_grants::UnrestoredGrant>, crate::protocol::Response> {
@@ -10354,7 +10329,7 @@ impl AppContext {
 
     /// Keep authority stable within one read-list request, never across calls,
     /// context changes, scope epochs or approval-route changes.
-    pub(crate) fn with_read_policy_snapshot<R>(&self, req_id: &str, run: impl FnOnce() -> R) -> R {
+    pub fn with_read_policy_snapshot<R>(&self, req_id: &str, run: impl FnOnce() -> R) -> R {
         read_policy_cache::with(self as *const Self as usize, req_id, run)
     }
 
@@ -10623,7 +10598,7 @@ impl AppContext {
         Ok(())
     }
 
-    pub(crate) fn mark_standalone_plugin_host(&self) {
+    pub fn mark_standalone_plugin_host(&self) {
         self.standalone_plugin_host.store(true, Ordering::Release);
     }
 
@@ -11318,7 +11293,7 @@ impl AppContext {
     /// are always taken fresh. The rollup's `measured_age_ms` is the age of
     /// the oldest walk in use. A missing index has nothing to walk, so it is
     /// never reused and never makes the figures look older.
-    pub(crate) fn memory_root_snapshot_and_rollup(
+    pub fn memory_root_snapshot_and_rollup(
         &self,
     ) -> (
         crate::memory::RootMemorySnapshot,

@@ -217,7 +217,8 @@ pub(crate) struct PreparedExactText {
 }
 
 impl PreparedExactText {
-    pub(crate) fn normalized(&self) -> &str {
+    #[doc(hidden)]
+    pub fn normalized(&self) -> &str {
         &self.normalized
     }
 

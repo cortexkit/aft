@@ -127,7 +127,8 @@ impl BashStartupStep {
         }
     }
 
-    pub(crate) const fn description(self) -> &'static str {
+    #[doc(hidden)]
+    pub const fn description(self) -> &'static str {
         match self {
             Self::Admission => "executor admission",
             Self::Setup => "request setup",
@@ -256,7 +257,8 @@ pub enum StartupOutcome {
 }
 
 impl SpawnReceipt {
-    pub(crate) fn with_reply_clock(mut self, clock: crate::blocking_wait::ReplyBudget) -> Self {
+    #[doc(hidden)]
+    pub fn with_reply_clock(mut self, clock: crate::blocking_wait::ReplyBudget) -> Self {
         self.reply_clock = clock;
         self
     }
@@ -284,7 +286,8 @@ impl SpawnReceipt {
         Self::new_with_start_time(deadline, std::time::Instant::now())
     }
 
-    pub(crate) fn new_with_start_time(
+    #[doc(hidden)]
+    pub fn new_with_start_time(
         deadline: std::time::Instant,
         startup_started_at: std::time::Instant,
     ) -> Self {
@@ -688,7 +691,8 @@ thread_local! {
 pub struct RunonTimingScope(Option<crate::exec_remote::LaunchTimings>);
 
 impl RunonTimingScope {
-    pub(crate) fn start(started: std::time::Instant) -> Self {
+    #[doc(hidden)]
+    pub fn start(started: std::time::Instant) -> Self {
         Self(CURRENT_RUNON_TIMINGS.with(|current| {
             current.replace(Some(crate::exec_remote::LaunchTimings::new(
                 started,
@@ -977,11 +981,13 @@ pub enum BashShell {
 }
 
 impl BashShell {
-    pub(crate) fn is_powershell(self) -> bool {
+    #[doc(hidden)]
+    pub fn is_powershell(self) -> bool {
         matches!(self, Self::Powershell)
     }
 
-    pub(crate) fn command_text(self, command: &str) -> String {
+    #[doc(hidden)]
+    pub fn command_text(self, command: &str) -> String {
         if self.is_powershell() {
             // Match Pi's optional tool: both .NET and PowerShell's pipeline use
             // UTF-8 before user code runs, so redirected native output remains

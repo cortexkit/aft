@@ -36,8 +36,8 @@ fn safety_margin(window: Duration) -> Duration {
 #[derive(Clone, Copy, Debug)]
 #[doc(hidden)]
 pub struct ReplyBudget {
-    pub(crate) received_at: Instant,
-    pub(crate) deadline: Instant,
+    pub received_at: Instant,
+    pub deadline: Instant,
     clock: WaitClock,
 }
 
@@ -106,7 +106,8 @@ fn continuous_now() -> Duration {
 }
 
 impl ReplyBudget {
-    pub(crate) fn from_envelope(received_at: Instant, body: &Value) -> Self {
+    #[doc(hidden)]
+    pub fn from_envelope(received_at: Instant, body: &Value) -> Self {
         let now = Instant::now();
         let wall_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -136,14 +137,16 @@ impl ReplyBudget {
         Self::new(received_at, deadline)
     }
 
-    pub(crate) fn new(received_at: Instant, client_deadline: Option<Instant>) -> Self {
+    #[doc(hidden)]
+    pub fn new(received_at: Instant, client_deadline: Option<Instant>) -> Self {
         let end = client_deadline
             .unwrap_or_else(|| received_at + Duration::from_millis(LEGACY_TRANSPORT_MS));
         let window = end.saturating_duration_since(received_at);
         Self::with_deadline(received_at, end - safety_margin(window))
     }
 
-    pub(crate) fn with_deadline(received_at: Instant, deadline: Instant) -> Self {
+    #[doc(hidden)]
+    pub fn with_deadline(received_at: Instant, deadline: Instant) -> Self {
         Self {
             received_at,
             deadline,
@@ -151,25 +154,30 @@ impl ReplyBudget {
         }
     }
 
-    pub(crate) fn cap(&self, deadline: Instant) -> Instant {
+    #[doc(hidden)]
+    pub fn cap(&self, deadline: Instant) -> Instant {
         deadline.min(self.deadline)
     }
 
-    pub(crate) fn now(&self) -> Instant {
+    #[doc(hidden)]
+    pub fn now(&self) -> Instant {
         self.clock.now()
     }
 
-    pub(crate) fn elapsed(&self) -> Duration {
+    #[doc(hidden)]
+    pub fn elapsed(&self) -> Duration {
         self.now().saturating_duration_since(self.received_at)
     }
 
-    pub(crate) fn io_deadline(&self, deadline: Instant) -> Instant {
+    #[doc(hidden)]
+    pub fn io_deadline(&self, deadline: Instant) -> Instant {
         Instant::now() + deadline.saturating_duration_since(self.now())
     }
 
     /// Short scheduler sleeps ensure an awake-only runtime timer cannot retain
     /// a long pre-suspend remainder. Only the continuous clock decides expiry.
-    pub(crate) async fn sleep_until(&self, deadline: Instant) {
+    #[doc(hidden)]
+    pub async fn sleep_until(&self, deadline: Instant) {
         loop {
             let remaining = deadline.saturating_duration_since(self.now());
             if remaining.is_zero() {
@@ -179,7 +187,8 @@ impl ReplyBudget {
         }
     }
 
-    pub(crate) async fn timeout_at<F: std::future::Future>(
+    #[doc(hidden)]
+    pub async fn timeout_at<F: std::future::Future>(
         &self,
         deadline: Instant,
         future: F,
@@ -212,7 +221,8 @@ impl ReplyBudget {
 
     /// Exclude restoration from elapsed startup time without changing the
     /// caller's absolute reply deadline or its delivery margin.
-    pub(crate) fn after_launch_restore(self, elapsed: Duration) -> Self {
+    #[doc(hidden)]
+    pub fn after_launch_restore(self, elapsed: Duration) -> Self {
         Self {
             received_at: self.received_at + elapsed,
             deadline: self.deadline,

@@ -15,7 +15,8 @@ pub struct SandboxRequirement {
 }
 
 impl SandboxRequirement {
-    pub(crate) fn for_command(command: &str) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn for_command(command: &str) -> Option<Self> {
         (!secret_rules::placeholder::scan(command).is_empty()).then_some(Self {
             mode: SandboxMode::Strict,
             reason: SandboxRequirementReason::SecretPlaceholder,
@@ -30,7 +31,8 @@ impl SandboxRequirement {
         }
     }
 
-    pub(crate) fn refusal_code(self) -> &'static str {
+    #[doc(hidden)]
+    pub fn refusal_code(self) -> &'static str {
         match self.reason {
             SandboxRequirementReason::SecretPlaceholder => "secrets_sandbox_required",
         }
@@ -44,7 +46,8 @@ impl SandboxRequirement {
         }
     }
 
-    pub(crate) fn check_request(
+    #[doc(hidden)]
+    pub fn check_request(
         self,
         tier: RequestedSandboxTier,
         supported_platform: bool,

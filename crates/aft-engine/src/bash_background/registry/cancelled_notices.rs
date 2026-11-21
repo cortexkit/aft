@@ -115,7 +115,8 @@ impl aft_base::pending_notices::NoticeAcknowledgment for CancelledCallReceipt {
 }
 
 impl BgTaskRegistry {
-    pub(crate) fn reserve_cancelled_call_notices(&self, session_id: &str) -> CancelledCallReceipt {
+    #[doc(hidden)]
+    pub fn reserve_cancelled_call_notices(&self, session_id: &str) -> CancelledCallReceipt {
         let Some(task_ids) = self
             .inner
             .cancelled_call_tasks

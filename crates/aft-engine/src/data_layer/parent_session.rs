@@ -54,7 +54,8 @@ impl<T> Plane<T> {
         }
     }
 
-    pub(crate) fn gap_reason(&self, plane: &str) -> Option<String> {
+    #[doc(hidden)]
+    pub fn gap_reason(&self, plane: &str) -> Option<String> {
         match self {
             Self::Loading => Some(format!("{plane} index of this repository is still loading")),
             Self::Ready(_) => None,
@@ -77,7 +78,7 @@ pub trait InspectCacheView: Send + Sync {
 pub struct Child {
     pub root: PathBuf,
     pub relative: PathBuf,
-    pub(crate) inspect: RwLock<Option<Arc<dyn InspectCacheView>>>,
+    pub inspect: RwLock<Option<Arc<dyn InspectCacheView>>>,
 }
 
 impl Child {

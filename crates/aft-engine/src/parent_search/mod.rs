@@ -741,13 +741,13 @@ pub(crate) struct ParentSemantic {
 /// A parent folder's session state, shared by every context bound to it.
 pub struct ParentSession {
     root: PathBuf,
-    pub(crate) planes: RequestedPlanes,
+    pub planes: RequestedPlanes,
     storage: PathBuf,
-    pub(crate) semantic_config: crate::config::SemanticBackendConfig,
+    pub semantic_config: crate::config::SemanticBackendConfig,
     /// `None` until the worker's first full discovery walk finishes.
     discovery: RwLock<Option<Arc<Discovery>>>,
     children: RwLock<Vec<Arc<Child>>>,
-    pub(crate) semantic: RwLock<Plane<ParentSemantic>>,
+    pub semantic: RwLock<Plane<ParentSemantic>>,
     holders: Mutex<Vec<Holder>>,
     stop: AtomicBool,
     /// While set, the worker skips its rounds, so a test can hold the

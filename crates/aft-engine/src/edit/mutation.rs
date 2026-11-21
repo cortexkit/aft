@@ -112,7 +112,8 @@ pub struct Version {
 }
 
 impl Version {
-    pub(crate) fn read(path: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn read(path: &Path) -> Self {
         let mut version = Self::existing(path, std::sync::Arc::from([]));
         match std::fs::read(path) {
             Ok(bytes) => {
@@ -129,11 +130,13 @@ impl Version {
         }
     }
 
-    pub(crate) fn set_bytes(&mut self, bytes: std::sync::Arc<[u8]>) {
+    #[doc(hidden)]
+    pub fn set_bytes(&mut self, bytes: std::sync::Arc<[u8]>) {
         self.bytes = Some(bytes);
     }
 
-    pub(crate) fn existing(path: &Path, bytes: std::sync::Arc<[u8]>) -> Self {
+    #[doc(hidden)]
+    pub fn existing(path: &Path, bytes: std::sync::Arc<[u8]>) -> Self {
         let metadata = crate::file_identity::metadata(path).ok();
         Self {
             exists: true,
@@ -145,7 +148,8 @@ impl Version {
         }
     }
 
-    pub(crate) fn missing(path: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn missing(path: &Path) -> Self {
         Self {
             exists: false,
             resolved: resolved(path),
@@ -156,7 +160,8 @@ impl Version {
         }
     }
 
-    pub(crate) fn check(&self, path: &Path) -> Result<(), AftError> {
+    #[doc(hidden)]
+    pub fn check(&self, path: &Path) -> Result<(), AftError> {
         let same = if self.exists {
             let metadata = crate::file_identity::metadata(path).ok();
             self.resolved == resolved(path)

@@ -39,7 +39,8 @@ impl<'ctx> ToolLaunchPolicy<'ctx> {
     /// Direct tools carry only their formatter-and-checker launch policy across
     /// dispatch. General sandbox scopes must not cover dispatch: it can start
     /// shared LSP servers.
-    pub(crate) fn with_current<R>(
+    #[doc(hidden)]
+    pub fn with_current<R>(
         policy: Option<std::rc::Rc<RequestToolLaunch>>,
         run: impl FnOnce() -> R,
     ) -> R {
