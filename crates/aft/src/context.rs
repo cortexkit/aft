@@ -12510,29 +12510,10 @@ mod callgraph_store_for_ops_tests {
     use std::path::Path;
     use tempfile::TempDir;
 
-    /// Returns the project and storage directories with the context that uses
-    /// them. Callers bind the directories for the whole test, first, so they
-    /// are removed when it ends and only after the context is dropped.
     fn cold_build_context() -> ([TempDir; 2], Arc<AppContext>) {
-        let project = TempDir::new().expect("project tempdir");
-        let storage = TempDir::new().expect("storage tempdir");
-        let source_dir = project.path().join("src");
-        std::fs::create_dir_all(&source_dir).expect("source dir");
-        std::fs::write(
-            source_dir.join("lib.rs"),
-            "pub fn caller() { callee(); }\npub fn callee() {}\n",
-        )
-        .expect("source file");
-
-        let ctx = Arc::new(AppContext::new(
-            Box::new(TreeSitterProvider::new()),
-            Config {
-                project_root: Some(project.path().to_path_buf()),
-                storage_dir: Some(storage.path().to_path_buf()),
-                ..Config::default()
-            },
-        ));
-        ([project, storage], ctx)
+        let (dirs, config) = super::callgraph_test_support::cold_build_fixture();
+        let ctx = Arc::new(AppContext::new(Box::new(TreeSitterProvider::new()), config));
+        (dirs, ctx)
     }
 
     /// Build a successful call-graph answer and attach its pending-changes
@@ -16267,5 +16248,31 @@ pub(crate) fn start_runner_harness_copy(
         })
     {
         log::warn!("canonical runner harness key copy could not start: {error}");
+    }
+}
+#[cfg(test)]
+pub(crate) mod callgraph_test_support {
+    use crate::config::Config;
+    use tempfile::TempDir;
+
+    /// Returns the project and storage directories with their config. Bind the
+    /// directories before constructing the context so they outlive it.
+    pub(crate) fn cold_build_fixture() -> ([TempDir; 2], Config) {
+        let project = TempDir::new().expect("project tempdir");
+        let storage = TempDir::new().expect("storage tempdir");
+        let source_dir = project.path().join("src");
+        std::fs::create_dir_all(&source_dir).expect("source dir");
+        std::fs::write(
+            source_dir.join("lib.rs"),
+            "pub fn caller() { callee(); }\npub fn callee() {}\n",
+        )
+        .expect("source file");
+
+        let config = Config {
+            project_root: Some(project.path().to_path_buf()),
+            storage_dir: Some(storage.path().to_path_buf()),
+            ..Config::default()
+        };
+        ([project, storage], config)
     }
 }

@@ -77,5 +77,8 @@ use std::time::Instant;
 use tokio::sync::oneshot;
 
 #[cfg(test)]
+pub(crate) mod test_support;
+
+#[cfg(test)]
 #[allow(hidden_glob_reexports)]
 mod tests;

@@ -80,7 +80,7 @@
     "reason": "Split inspect command assembly by area pending; AFT crate split lane."
   },
   "crates/aft/src/executor/tests.rs": {
-    "lines": 5028,
+    "lines": 5014,
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
