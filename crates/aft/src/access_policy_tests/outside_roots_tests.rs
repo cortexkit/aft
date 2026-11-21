@@ -31,7 +31,8 @@ const EXISTING_CONFIGS: [(&str, &str); 3] = [
     ("true", r#"{ "restrict_to_project_root": true }"#),
 ];
 
-const LEGACY_OUTCOMES: &str = include_str!("../fixtures/outside_roots_legacy_outcomes.txt");
+const LEGACY_OUTCOMES: &str =
+    include_str!("../../../aft-engine/src/fixtures/outside_roots_legacy_outcomes.txt");
 
 struct Fixture {
     dir: tempfile::TempDir,

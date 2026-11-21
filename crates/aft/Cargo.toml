@@ -113,22 +113,23 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 
 [features]
 # Source builds need CMake 3.18+ only when downloaded grammars are enabled.
-wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl", "aft-parse/wasm-grammars"]
+wasm-grammars = ["aft-engine/wasm-grammars"]
 # Offline call-graph measurements only; never enabled by production builds.
-callgraph-shape-census = ["aft-base/callgraph-shape-census", "aft-parse/callgraph-shape-census"]
+callgraph-shape-census = ["aft-engine/callgraph-shape-census", "aft-base/callgraph-shape-census", "aft-parse/callgraph-shape-census"]
 test-scope-owner = []
 # Explicit opt-in for cross-process timing controls used by integration tests.
-test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-parse/test-timing-hooks"]
+test-timing-hooks = ["aft-engine/test-timing-hooks", "aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-parse/test-timing-hooks"]
 # Opt-in integration hooks for native re-exec and deterministic conformance inputs;
 # never enable these hooks in production builds.
-test-hooks = ["aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-parse/test-hooks", "aft-parse/test-support"]
+test-hooks = ["aft-engine/test-hooks", "aft-engine/test-support", "aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-parse/test-hooks", "aft-parse/test-support"]
 # Compiles the test-only secret vault (V5). Nothing in the product reads it:
 # a release profile must never enable it, and
 # `scripts/check-secret-test-fake.sh` fails CI when one does.
-secret-test-fake = ["aft-base/secret-test-fake"]
-semantic-chunk-census = []
+secret-test-fake = ["aft-engine/secret-test-fake", "aft-base/secret-test-fake"]
+semantic-chunk-census = ["aft-engine/semantic-chunk-census"]
 
 [dependencies]
+aft-engine = { path = "../aft-engine", version = "=0.66.0" }
 aft-base = { path = "../aft-base", version = "0.66.0" }
 aft-db = { path = "../aft-db", version = "0.66.0" }
 aft-parse = { path = "../aft-parse", version = "0.66.0" }
@@ -145,8 +146,6 @@ portable-pty = "0.9"
 libc = "0.2"
 getrandom = "0.3"
 tree-sitter = "=0.26.7"
-wasmtime = { version = "=36.0.20", optional = true, default-features = false, features = ["pulley", "parallel-compilation"] }
-wasmtime-c-api-impl = { version = "=36.0.20", optional = true, default-features = false }
 tree-sitter-typescript = "0.23.2"
 tree-sitter-javascript = "0.25"
 tree-sitter-python = "0.25"
@@ -329,6 +328,7 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
+aft-engine = { path = "../aft-engine", version = "=0.66.0", features = ["test-support"] }
 aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
 aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
 aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }

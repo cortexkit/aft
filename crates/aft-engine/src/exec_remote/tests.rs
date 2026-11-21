@@ -1,0 +1,1663 @@
+use super::*;
+use cortexkit_exec_remote_types::*;
+
+fn job_id() -> Uuid {
+    "0192a64a-1234-7000-8000-000000000001".parse().unwrap()
+}
+
+#[test]
+fn accepted_021_vector_and_single_locked_contract_are_pinned() {
+    use sha2::{Digest, Sha256};
+    let canonical = include_bytes!("fixtures/frames/accepted.jcs");
+    assert_eq!(
+        format!("{:x}", Sha256::digest(canonical)),
+        include_str!("fixtures/frames/accepted.sha256")
+    );
+    let mut value: serde_json::Value =
+        serde_json::from_slice(include_bytes!("fixtures/frames/accepted.json")).unwrap();
+    // This vector contains only ASCII strings and small integers. Sorting its
+    // object keys is the independent JCS step, regardless of serde map order.
+    value.as_object_mut().unwrap().sort_keys();
+    assert_eq!(serde_json::to_vec(&value).unwrap(), canonical);
+    let record: StreamRecord = serde_json::from_value(value).unwrap();
+    let StreamRecord::Accepted(accepted) = record else {
+        panic!("accepted vector must decode as acceptance")
+    };
+    assert_eq!(accepted.env_not_forwarded, Some(Vec::new()));
+    let lock = std::path::Path::new(crate::test_support::manifest_dir()).join("../../Cargo.lock");
+    let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
+    let packages: Vec<_> = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
+        .collect();
+    assert_eq!(packages.len(), 1);
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.22"));
+}
+
+fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
+    use sha2::{Digest, Sha256};
+    // Retain the published 0.2.0 grading corpus and its original digests;
+    // the additive 0.2.1 accepted-frame contract is pinned separately above,
+    // and the additive 0.2.2 run-report vectors are rendered by the remote
+    // bash tests (see `fixtures/SOURCE.md`).
+    // Runtime cargo metadata resolves unrelated target dependencies even in
+    // offline mode, so unit tests embed the corpus rather than requiring those
+    // packages in the caller's Cargo cache. Keep the singleton version fence
+    // explicit when updating the dependency.
+    let lock: toml::Value = toml::from_str(include_str!("../../../../Cargo.lock")).unwrap();
+    let versions = lock["package"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
+        .map(|package| package["version"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(versions, ["0.2.22"], "exactly one caller contract version");
+    let vectors: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../aft/tests/fixtures/exec-remote/published-v0.2.0.json"
+    ))
+    .unwrap();
+    let mut cases = Vec::new();
+    for (name, vector) in vectors[directory].as_object().unwrap() {
+        let bytes = vector["jcs"].as_str().unwrap().as_bytes();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(bytes)),
+            vector["sha256"].as_str().unwrap(),
+            "{directory}/{name}"
+        );
+        cases.push((name.clone(), serde_json::from_slice(bytes).unwrap()));
+    }
+    cases.sort_by(|a, b| a.0.cmp(&b.0));
+    cases
+}
+
+#[test]
+fn cancel_before_start_has_a_confirmed_verdict() {
+    let mut terminal = TerminalRecord::new(job_id(), Outcome::Cancelled, 1, 0, 0);
+    terminal.ran = Some(Ran::None);
+    assert_eq!(grade(&terminal), Verdict::Cancelled);
+}
+
+#[test]
+fn cancelled_running_exit_has_a_confirmed_verdict() {
+    for code in [143, 137] {
+        let mut terminal = TerminalRecord::new(job_id(), Outcome::Exit { code }, 1, 0, 0)
+            .with_killed(Killed::Cancel);
+        terminal.ran = Some(Ran::Remote);
+        assert_eq!(grade(&terminal), Verdict::CancelKilled, "exit {code}");
+    }
+}
+
+#[test]
+fn cancelled_running_signal_has_a_confirmed_verdict() {
+    for signal in [15, 9] {
+        let mut terminal = TerminalRecord::new(job_id(), Outcome::Signal { signal }, 1, 0, 0)
+            .with_killed(Killed::Cancel);
+        terminal.ran = Some(Ran::Remote);
+        assert_eq!(grade(&terminal), Verdict::CancelKilled, "signal {signal}");
+    }
+}
+
+#[test]
+fn cancel_with_unknown_exit_and_no_liveness_proof_stays_unknown() {
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn cancel_with_typed_execution_ended_proof_is_killed() {
+    let terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    assert!(terminal.execution_ended());
+    assert_eq!(grade(&terminal), Verdict::CancelKilled);
+}
+
+#[test]
+fn cancel_with_execution_ended_false_or_absent_stays_unknown() {
+    for proof in [None, Some(false)] {
+        let mut value =
+            serde_json::to_value(wire_tests::cancel_exit_status_unknown_terminal()).unwrap();
+        if let Some(proof) = proof {
+            value["execution_ended"] = proof.into();
+        } else {
+            value.as_object_mut().unwrap().remove("execution_ended");
+        }
+        let terminal: TerminalRecord = serde_json::from_value(value).unwrap();
+        assert!(!terminal.execution_ended());
+        assert_eq!(grade(&terminal), Verdict::OutcomeUnknown, "proof {proof:?}");
+    }
+}
+
+#[test]
+fn execution_ended_proof_does_not_supply_an_exit_status_or_unknown_kind() {
+    for killed in [
+        None,
+        Some(Killed::Deadline),
+        Some(Killed::Unknown("future_kill".into())),
+    ] {
+        let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+        terminal.killed = killed;
+        assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+    }
+    let mut terminal = wire_tests::cancel_exit_status_unknown_terminal().with_execution_ended();
+    terminal.outcome = Outcome::Unknown {
+        kind: "future_outcome".into(),
+    };
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+    terminal.outcome = Outcome::OutcomeUnknown;
+    terminal.ran = Some(Ran::Unknown("future_ran".into()));
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn published_outcomes_have_explicit_grades() {
+    let cases = vector_cases("outcomes");
+    assert_eq!(cases.len(), 26);
+    for (name, value) in cases {
+        let _: RunRequest = serde_json::from_value(value["request"].clone()).unwrap();
+        let records: Vec<StreamRecord> = serde_json::from_value(value["stream"].clone()).unwrap();
+        let StreamRecord::Terminal(terminal) = records.last().unwrap() else {
+            panic!("{name}")
+        };
+        let expected = match name.as_str() {
+            "exit" => Verdict::Exited { code: 0 },
+            "pipestatus" => Verdict::Exited { code: 1 },
+            "exit-nonzero" => Verdict::Exited { code: 100 },
+            "signal" => Verdict::Signalled { signal: 15 },
+            "cancelled" => Verdict::Cancelled,
+            "killed-deadline" => Verdict::DeadlineKilled,
+            "killed-cancel" => Verdict::CancelKilled,
+            "outcome_unknown" | "outcome_unknown-queued" | "crate-local-unknown-outcome" => {
+                Verdict::OutcomeUnknown
+            }
+            "crate-local-unknown-ran" | "crate-local-unknown-killed" => Verdict::OutcomeUnknown,
+            "crate-local-unknown-stream-record" | "crate-local-unknown-output-stream" => {
+                Verdict::Exited { code: 0 }
+            }
+            "history_expired" => Verdict::HistoryExpired,
+            "bundle_rejected" => Verdict::RunLocally {
+                reason: RefusalReason::BundleRejected,
+                refusal_detail: None,
+            },
+            "queue_wait_exceeded" => Verdict::RunLocally {
+                reason: RefusalReason::QueueWaitExceeded,
+                refusal_detail: None,
+            },
+            "runner_full" => Verdict::RunLocally {
+                reason: RefusalReason::RunnerFull,
+                refusal_detail: None,
+            },
+            "runner_version_mismatch" => Verdict::RunLocally {
+                reason: RefusalReason::RunnerVersionMismatch,
+                refusal_detail: None,
+            },
+            "snapshot_failed" => Verdict::RunLocally {
+                reason: RefusalReason::SnapshotFailed,
+                refusal_detail: None,
+            },
+            "transfer_interrupted" => Verdict::RunLocally {
+                reason: RefusalReason::TransferInterrupted,
+                refusal_detail: None,
+            },
+            "tree_hash_mismatch" => Verdict::RunLocally {
+                reason: RefusalReason::TreeHashMismatch,
+                refusal_detail: None,
+            },
+            "unreachable" => Verdict::RunLocally {
+                reason: RefusalReason::Unreachable,
+                refusal_detail: None,
+            },
+            "workspace_key_rejected" => Verdict::RunLocally {
+                reason: RefusalReason::WorkspaceKeyRejected,
+                refusal_detail: None,
+            },
+            "workspace_setup_failed" => Verdict::RunLocally {
+                reason: RefusalReason::WorkspaceSetupFailed,
+                refusal_detail: None,
+            },
+            "crate-local-unknown-refusal" => Verdict::RunLocally {
+                reason: RefusalReason::Unknown("future_refusal".into()),
+                refusal_detail: None,
+            },
+            _ => panic!("ungraded published case: {name}"),
+        };
+        assert_eq!(grade(terminal), expected, "{name}");
+        let encoded_terminal = serde_json::to_value(terminal).unwrap();
+        let mut original_terminal = value["stream"].as_array().unwrap().last().unwrap().clone();
+        original_terminal.as_object_mut().unwrap().remove("type");
+        assert_eq!(
+            encoded_terminal, original_terminal,
+            "published vector {name} changed when round-tripped"
+        );
+        // The two output/record future-tag goldens are attach excerpts: seq 7
+        // without an accepted record. Resume from the prior retained cursor.
+        let mut consumer = if matches!(
+            name.as_str(),
+            "crate-local-unknown-stream-record" | "crate-local-unknown-output-stream"
+        ) {
+            StreamConsumer::resume(ResumePoint {
+                job_id: terminal.job_id,
+                last_seq: Some(6),
+                gap_recovery: None,
+                last_output_seq: None,
+            })
+        } else {
+            StreamConsumer::new()
+        };
+        let mut sink = MemorySink::default();
+        for record in records {
+            consumer.consume(record, &mut sink).unwrap();
+        }
+        assert_eq!(consumer.finish().unwrap(), expected, "stream grade: {name}");
+        assert_eq!(sink.terminals, [expected]);
+        if name == "crate-local-unknown-stream-record" {
+            assert_eq!(
+                consumer
+                    .resume_point()
+                    .unwrap()
+                    .attach_request()
+                    .unwrap()
+                    .from_seq,
+                8
+            );
+            assert_eq!(sink.unknown, [(7, vec![])]);
+        }
+        if name == "crate-local-unknown-output-stream" {
+            assert_eq!(
+                consumer
+                    .resume_point()
+                    .unwrap()
+                    .attach_request()
+                    .unwrap()
+                    .from_seq,
+                8
+            );
+            assert_eq!(sink.unknown, [(7, vec![0xe2])]);
+        }
+    }
+}
+
+#[test]
+fn refusal_detail_is_preserved_when_grading_a_terminal() {
+    let mut value = serde_json::to_value(TerminalRecord::new(
+        job_id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::RunnerDraining,
+        },
+        1,
+        0,
+        0,
+    ))
+    .unwrap();
+    value["refusal_detail"] = serde_json::json!("runner maintenance window");
+    let terminal: TerminalRecord = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        grade(&terminal),
+        Verdict::RunLocally {
+            reason: RefusalReason::RunnerDraining,
+            refusal_detail: Some("runner maintenance window".into()),
+        }
+    );
+}
+
+#[test]
+fn new_runner_refusal_reasons_still_prove_never_started() {
+    for reason in [
+        RefusalReason::RunnerDraining,
+        RefusalReason::RunnerDiskFull,
+        RefusalReason::NetworkUnsupported,
+    ] {
+        let terminal = TerminalRecord::new(
+            job_id(),
+            Outcome::RefusedBeforeStart {
+                reason: reason.clone(),
+            },
+            1,
+            0,
+            0,
+        );
+        assert_eq!(
+            grade(&terminal),
+            Verdict::RunLocally {
+                reason,
+                refusal_detail: None,
+            }
+        );
+    }
+}
+
+#[test]
+fn control_known_outcome_unknown_never_reruns() {
+    assert_eq!(
+        grade(&TerminalRecord::new(
+            job_id(),
+            Outcome::OutcomeUnknown,
+            0,
+            0,
+            0
+        )),
+        Verdict::OutcomeUnknown
+    );
+}
+
+#[test]
+fn control_known_history_expired_never_reruns() {
+    assert_eq!(
+        grade(&TerminalRecord::new(
+            job_id(),
+            Outcome::HistoryExpired,
+            0,
+            0,
+            0
+        )),
+        Verdict::HistoryExpired
+    );
+}
+
+#[derive(Default)]
+pub(super) struct MemorySink {
+    pub(super) stdout: Vec<u8>,
+    pub(super) stderr: Vec<u8>,
+    pub(super) seqs: Vec<u64>,
+    pub(super) terminals: Vec<Verdict>,
+    pub(super) truncations: Vec<u64>,
+    return_gaps: Vec<(u64, u64)>,
+    unknown: Vec<(u64, Vec<u8>)>,
+    started: Vec<Started>,
+}
+
+#[test]
+fn remote_cancel_progress_job_id_is_not_acceptance_or_an_output_cursor() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    let job_id = Uuid::from_bytes([1; 16]);
+    consumer
+        .consume(
+            StreamRecord::Progress(
+                Progress::new(ProgressPhase::Upload, 0, None)
+                    .unwrap()
+                    .with_job_id(job_id),
+            ),
+            &mut sink,
+        )
+        .unwrap();
+    assert!(consumer.resume_point().is_none());
+    assert_eq!(consumer.known_job_id(), Some(job_id));
+    assert!(sink.seqs.is_empty());
+    assert!(consumer
+        .consume(
+            StreamRecord::Accepted(Accepted::new(Uuid::from_bytes([2; 16]), 1)),
+            &mut sink
+        )
+        .is_err());
+    consumer
+        .consume(StreamRecord::Accepted(Accepted::new(job_id, 1)), &mut sink)
+        .unwrap();
+    let point = consumer.resume_point().unwrap();
+    assert_eq!(point.job_id, job_id);
+    assert_eq!(point.last_seq, None);
+}
+
+impl OutputSink for MemorySink {
+    fn started(&mut self, started: &Started) -> std::io::Result<()> {
+        self.seqs.push(started.seq);
+        self.started.push(started.clone());
+        Ok(())
+    }
+    fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> std::io::Result<()> {
+        self.seqs.push(seq);
+        self.unknown.push((seq, bytes.to_vec()));
+        Ok(())
+    }
+    fn accepted(&mut self, _accepted: &Accepted) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn output(&mut self, seq: u64, stream: OutputStream, bytes: &[u8]) -> std::io::Result<()> {
+        self.seqs.push(seq);
+        match stream {
+            OutputStream::Stdout => self.stdout.extend_from_slice(bytes),
+            OutputStream::Stderr => self.stderr.extend_from_slice(bytes),
+            _ => panic!("unexpected stream in known-output test"),
+        }
+        Ok(())
+    }
+    fn truncated(&mut self, seq: u64) -> std::io::Result<()> {
+        self.truncations.push(seq);
+        Ok(())
+    }
+    fn return_gap(&mut self, from_seq: u64, before_seq: u64) -> std::io::Result<()> {
+        self.return_gaps.push((from_seq, before_seq));
+        Ok(())
+    }
+    fn terminal(&mut self, _record: &TerminalRecord, verdict: &Verdict) -> std::io::Result<()> {
+        self.terminals.push(verdict.clone());
+        Ok(())
+    }
+}
+
+fn accepted() -> StreamRecord {
+    StreamRecord::Accepted(Accepted::new(job_id(), 1))
+}
+
+#[test]
+fn started_records_are_sequenced_deduplicated_and_replayed_without_unknown_output() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"after-start"), &mut sink)
+        .unwrap();
+    let record = StreamRecord::Started(Started::new(0, 123, 1));
+    let bytes = serde_json::to_vec(&record).unwrap();
+    consumer.consume_bytes(&bytes, &mut sink).unwrap();
+    consumer.consume(record.clone(), &mut sink).unwrap();
+    assert_eq!(sink.seqs, [0, 1]);
+    assert_eq!(sink.started, [Started::new(0, 123, 1)]);
+    assert_eq!(sink.stdout, b"after-start");
+    assert!(sink.unknown.is_empty());
+    let point = consumer.resume_point().unwrap();
+    assert_eq!(point.last_seq, Some(1));
+    let mut replay = StreamConsumer::resume(point);
+    replay.consume(record, &mut sink).unwrap();
+    assert_eq!(sink.started.len(), 1);
+}
+fn output(seq: u64, stream: OutputStream, bytes: &[u8]) -> StreamRecord {
+    StreamRecord::Output(Output::new(seq, stream, BytePayload(bytes.to_vec())))
+}
+fn terminal(outcome: Outcome) -> StreamRecord {
+    StreamRecord::Terminal(TerminalRecord::new(job_id(), outcome, 1, 0, 0))
+}
+
+#[test]
+fn control_known_split_utf8_is_reassembled_as_exact_bytes() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    // Three-byte Euro symbol split across non-adjacent stdout/stderr chunks.
+    for record in [
+        output(0, OutputStream::Stdout, b"A\xe2"),
+        output(1, OutputStream::Stderr, b"\xfferr"),
+        output(2, OutputStream::Stdout, b"\x82"),
+        output(3, OutputStream::Stdout, b"\xacZ"),
+    ] {
+        consumer.consume(record, &mut sink).unwrap();
+    }
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(sink.stdout, "A€Z".as_bytes());
+    assert_eq!(sink.stderr, b"\xfferr");
+}
+
+#[test]
+fn control_known_seq_dedupe_keeps_first_record_in_sorted_order() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    for record in [
+        output(1, OutputStream::Stdout, b"B"),
+        output(1, OutputStream::Stderr, b"wrong pending duplicate"),
+        output(0, OutputStream::Stdout, b"A"),
+        output(0, OutputStream::Stdout, b"wrong delivered duplicate"),
+        output(2, OutputStream::Stderr, b"C"),
+    ] {
+        consumer.consume(record, &mut sink).unwrap();
+    }
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(sink.stdout, b"AB");
+    assert_eq!(sink.stderr, b"C");
+    assert_eq!(sink.seqs, [0, 1, 2]);
+}
+
+#[test]
+fn restart_attach_after_n_chunks_has_no_duplicate_or_gap() {
+    for n in 0..=6 {
+        let mut consumer = StreamConsumer::new();
+        let mut sink = MemorySink::default();
+        consumer.consume(accepted(), &mut sink).unwrap();
+        for seq in 0..n {
+            consumer
+                .consume(output(seq, OutputStream::Stdout, &[seq as u8]), &mut sink)
+                .unwrap();
+        }
+        let resume = consumer.resume_point().unwrap();
+        assert_eq!(resume.attach_request().unwrap().from_seq, n);
+        let mut restored = StreamConsumer::resume(resume);
+        // Replay an old chunk too, exercising dedupe across the durable cursor.
+        for seq in n.saturating_sub(1)..6 {
+            restored
+                .consume(output(seq, OutputStream::Stdout, &[seq as u8]), &mut sink)
+                .unwrap();
+        }
+        restored
+            .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+            .unwrap();
+        assert_eq!(sink.stdout, [0, 1, 2, 3, 4, 5], "after {n} chunks");
+    }
+}
+
+#[test]
+fn published_unary_replies_have_explicit_grades() {
+    let cases = vector_cases("replies");
+    assert_eq!(cases.len(), 16);
+    for (name, value) in cases {
+        let (operation, expected) = match name.as_str() {
+            "cancel" => ("exec.cancel", ReplyVerdict::CancelAcknowledged),
+            "drop-existing" => ("workspace.drop", ReplyVerdict::Dropped { existed: true }),
+            "drop-missing" => ("workspace.drop", ReplyVerdict::Dropped { existed: false }),
+            "prepare-prepared" => ("workspace.prepare", ReplyVerdict::Prepared),
+            "crate-local-unknown-prepare-outcome" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared { reason: None },
+            ),
+            "crate-local-unknown-rebuild-result" => (
+                "exec.status",
+                ReplyVerdict::Status {
+                    reachable: true,
+                    has_unknown_rebuild: true,
+                },
+            ),
+            "prepare-bundle_rejected" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::BundleRejected),
+                },
+            ),
+            "prepare-runner_version_mismatch" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::RunnerVersionMismatch),
+                },
+            ),
+            "prepare-snapshot_failed" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::SnapshotFailed),
+                },
+            ),
+            "prepare-transfer_interrupted" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::TransferInterrupted),
+                },
+            ),
+            "prepare-unreachable" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::Unreachable),
+                },
+            ),
+            "prepare-workspace_key_rejected" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::WorkspaceKeyRejected),
+                },
+            ),
+            "prepare-workspace_setup_failed" => (
+                "workspace.prepare",
+                ReplyVerdict::WorkspaceUnprepared {
+                    reason: Some(RefusalReason::WorkspaceSetupFailed),
+                },
+            ),
+            "status" | "status-cold" => (
+                "exec.status",
+                ReplyVerdict::Status {
+                    reachable: true,
+                    has_unknown_rebuild: false,
+                },
+            ),
+            "status-unreachable" => (
+                "exec.status",
+                ReplyVerdict::Status {
+                    reachable: false,
+                    has_unknown_rebuild: false,
+                },
+            ),
+            _ => panic!("ungraded published reply: {name}"),
+        };
+        let reply = decode_reply(operation, &serde_json::to_vec(&value).unwrap()).unwrap();
+        assert_eq!(grade_reply(&reply), expected, "{name}");
+    }
+}
+
+#[test]
+fn request_copies_shell_inputs_without_executor_metadata() {
+    let root = tempfile::tempdir().unwrap();
+    let worktree = root.path().canonicalize().unwrap();
+    let cwd = worktree.join("subdir");
+    std::fs::create_dir(&cwd).unwrap();
+    let env = std::collections::BTreeMap::from([
+        ("RUSTFLAGS".into(), "-Dwarnings".into()),
+        ("SHELL_SECRET".into(), "must stay on caller".into()),
+    ]);
+    let preset = PresetParams {
+        platform: None,
+        siblings: vec![worktree.to_str().unwrap().into()],
+        weight_hint: Some(16),
+        memory_mib: None,
+        queue_wait_limit_s: Some(0),
+        network: None,
+        return_paths: Vec::new(),
+    };
+    let request = build_request(
+        &worktree,
+        &worktree,
+        &cwd,
+        "cargo test",
+        env.clone(),
+        Some(23),
+        &preset,
+    )
+    .unwrap();
+    assert_eq!(
+        request.env,
+        std::collections::BTreeMap::from([("RUSTFLAGS".into(), "-Dwarnings".into())])
+    );
+    assert_eq!(request.workspace_key, worktree.to_str().unwrap());
+    assert_eq!(request.cwd, cwd.to_str().unwrap());
+    assert_eq!(request.timeout, Some(23));
+    assert_eq!(request.queue_wait_limit_s, Some(0));
+    assert_eq!(request.weight_hint, Some(16));
+    assert_eq!(request.siblings, preset.siblings);
+    let wire = serde_json::to_value(&request).unwrap();
+    assert_eq!(wire.as_object().unwrap().len(), 9);
+    for key in [
+        "job_id",
+        "bundles",
+        "snapshot",
+        "tree_hash",
+        "integration_tip",
+    ] {
+        assert!(wire.get(key).is_none());
+    }
+    assert!(build_request(
+        &worktree,
+        &worktree,
+        worktree.parent().unwrap(),
+        "cargo test",
+        env,
+        None,
+        &preset
+    )
+    .is_err());
+    assert!(build_request(
+        std::path::Path::new("relative"),
+        &worktree,
+        &cwd,
+        "cargo test",
+        Default::default(),
+        None,
+        &preset
+    )
+    .is_err());
+}
+
+#[test]
+fn runon_memory_request_builder_omits_unrequested_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    for memory_mib in [None, Some(16_384)] {
+        let request = build_request(
+            &root,
+            &root,
+            &root,
+            "cargo test",
+            Default::default(),
+            Some(23),
+            &PresetParams {
+                memory_mib,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(request.memory_mib, memory_mib);
+        if memory_mib.is_some() {
+            assert_eq!(wire["memory_mib"], 16_384);
+        } else {
+            assert!(wire.get("memory_mib").is_none());
+        }
+        assert_eq!(serde_json::from_value::<RunRequest>(wire).unwrap(), request);
+    }
+}
+
+#[test]
+fn linux_request_retains_the_pre_platform_wire_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    for (demand, options) in [
+        ("linux", ""),
+        ("linux,4c", ",\"weight_hint\":4"),
+        ("linux,net", ""),
+        ("linux,4c,net", ",\"weight_hint\":4"),
+    ] {
+        let resolved = policy::parse_demand(demand).unwrap();
+        let request = build_request(
+            &root,
+            &root,
+            &root,
+            "cargo test",
+            Default::default(),
+            Some(23),
+            &PresetParams {
+                platform: resolved.platform,
+                weight_hint: resolved.weight_hint,
+                network: resolved.network.then_some(Network::Outbound),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let encoded_root = serde_json::to_string(root.to_str().unwrap()).unwrap();
+        let wire = serde_json::to_string(&request)
+            .unwrap()
+            .replace(&encoded_root, r#""/Users/u/repo""#);
+        let network = if resolved.network {
+            ",\"network\":\"outbound\""
+        } else {
+            ""
+        };
+        let expected = format!(
+            r#"{{"workspace_key":"/Users/u/repo","repository_root":"/Users/u/repo","cwd":"/Users/u/repo","command":"cargo test","env":{{}}{options},"timeout":23,"siblings":[]{network}}}"#
+        );
+        assert_eq!(wire.as_bytes(), expected.as_bytes(), "{demand}");
+    }
+}
+
+#[test]
+fn windows_exit_outcomes_preserve_all_32_bits() {
+    for code in [256, 0xC000_0005, u32::MAX] {
+        let wire = format!(r#"{{"type":"windows_exit","code":{code}}}"#);
+        let outcome: Outcome = serde_json::from_str(&wire).unwrap();
+        assert_eq!(serde_json::to_string(&outcome).unwrap(), wire);
+        let record = TerminalRecord::new(job_id(), outcome, 1, 0, 0);
+        assert_eq!(
+            grade(&record),
+            Verdict::Exited {
+                code: i64::from(code)
+            }
+        );
+    }
+}
+
+#[test]
+fn request_strips_secret_shaped_and_control_environment_names() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path().canonicalize().unwrap();
+    let denied = [
+        "MY_TOKEN",
+        "SHELL_SECRET",
+        "PASSWORD",
+        "DB_PASSWD",
+        "PRIVATE_KEY_FILE",
+        "SERVICE_API_KEY",
+        "USER_CREDENTIAL",
+        "AWS_REGION",
+        "AWS_ACCESS_KEY_ID",
+        "GH_REPO",
+        "GITHUB_TOKEN",
+        "NPM_TOKEN",
+        "CARGO_REGISTRY_TOKEN",
+        "SSH_AUTH_SOCK",
+        "NEXTEST_TEST_THREADS",
+        "RUST_TEST_THREADS",
+        "AFT_STORAGE_DIR",
+        "AFT_TEST_CONTROL",
+        "CORTEXKIT_CONTROL_SOCKET",
+        "CK_CONTROL_PATH",
+        "SUBC_MODULE_ID",
+        "SUBC_LAUNCH_NONCE",
+    ];
+    for name in denied {
+        for spelling in [name.to_owned(), name.to_ascii_lowercase()] {
+            let env = std::collections::BTreeMap::from([
+                (spelling.clone(), "sensitive-fixture-value".into()),
+                ("FOO".into(), "ordinary".into()),
+                ("RUSTFLAGS".into(), "-Dwarnings".into()),
+            ]);
+            let request = build_request(
+                &root,
+                &root,
+                &root,
+                "cargo test",
+                env,
+                None,
+                &PresetParams::default(),
+            )
+            .unwrap();
+            assert!(
+                !request.env.contains_key(&spelling),
+                "{spelling} left the caller"
+            );
+            assert_eq!(request.env["FOO"], "ordinary");
+            assert_eq!(request.env["RUSTFLAGS"], "-Dwarnings");
+            assert!(!serde_json::to_string(&request)
+                .unwrap()
+                .contains("sensitive-fixture-value"));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cwd_symlink_escape_is_rejected() {
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let worktree = root.path().canonicalize().unwrap();
+    let link = worktree.join("escape");
+    std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+    assert!(build_request(
+        &worktree,
+        &worktree,
+        &link,
+        "cargo test",
+        Default::default(),
+        None,
+        &PresetParams::default()
+    )
+    .is_err());
+}
+
+#[test]
+fn siblings_read_gate_requires_checkout_marker_and_canonicalizes_gitfile_root() {
+    let root = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    let child = root.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().into()),
+            storage_dir: Some(storage.path().into()),
+            ..Default::default()
+        },
+    );
+    let given = child.join("..");
+    let mut params = FrozenParams {
+        siblings: vec![given.to_str().unwrap().into()],
+        ..Default::default()
+    };
+    assert_eq!(
+        params
+            .validate_siblings(&ctx, "siblings", "session", &[])
+            .map_err(refused_sibling_message),
+        Err(not_checkout_root(&given))
+    );
+    std::fs::write(root.path().join(".git"), "gitdir: /checkout/metadata\n").unwrap();
+    params
+        .validate_siblings(&ctx, "siblings", "session", &[])
+        .unwrap();
+    assert_eq!(
+        params.siblings,
+        [root.path().canonicalize().unwrap().to_str().unwrap()]
+    );
+}
+
+/// The exact agent-visible refusal for a sibling that is not absolute, does not resolve,
+/// or has no `.git` at its top, naming the path as the plan gave it. Spelled out
+/// here so a wording change cannot pass unnoticed.
+fn not_checkout_root(given: &std::path::Path) -> String {
+    format!(
+        "sibling {} is not the root of a git checkout; the command was not run",
+        given.display()
+    )
+}
+
+/// The exact agent-visible refusal for a checkout root the session may not read, naming
+/// the resolved path.
+fn not_readable(resolved: &std::path::Path) -> String {
+    format!(
+        "this session's file tools may not read sibling {}; grant read access to it in allow_paths; the command was not run",
+        resolved.display()
+    )
+}
+
+fn refused_sibling_message(error: SiblingValidationError) -> String {
+    match error {
+        SiblingValidationError::Refused(message) => message,
+        SiblingValidationError::Unavailable(response) => {
+            panic!("unexpected unavailable policy: {response:?}")
+        }
+    }
+}
+
+#[test]
+fn siblings_busy_grant_store_preserves_read_error_instead_of_missing_grant_refusal() {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    let root = tempfile::tempdir().unwrap();
+    let sibling = tempfile::tempdir().unwrap();
+    let storage = tempfile::tempdir().unwrap();
+    std::fs::create_dir(sibling.path().join(".git")).unwrap();
+    let sibling = sibling.path().canonicalize().unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.path().into()),
+            storage_dir: Some(storage.path().into()),
+            ..Default::default()
+        },
+    );
+    let db = Arc::new(Mutex::new(
+        crate::db::open(&storage.path().join("aft.db")).unwrap(),
+    ));
+    ctx.set_db(db.clone());
+    let scope = crate::db::access_grants::ScopeKey {
+        owner: "worker-owner".into(),
+        scope_ref: "worker-scope".into(),
+        epoch: 1,
+    };
+    let grant = AccessGrant {
+        path: crate::policy_path::policy_path(&sibling),
+        kind: GrantKind::Subtree,
+        operation: AccessOperation::Read,
+    };
+    crate::db::access_grants::register_scope(&db.lock().unwrap(), &scope, None, &ctx.config())
+        .unwrap();
+    crate::db::access_grants::insert(&db.lock().unwrap(), &scope, &grant).unwrap();
+    let _scope = crate::access_policy::scope_guard(Some(scope));
+    let _ask =
+        crate::access_policy::ask_route_guard(Some(crate::access_policy::AskRoute::Unavailable));
+    ctx.validate_read_path_without_approval("read", "worker", &sibling)
+        .unwrap();
+
+    let mut params = FrozenParams {
+        siblings: vec![sibling.to_str().unwrap().into()],
+        ..Default::default()
+    };
+    params
+        .validate_siblings(&ctx, "runon", "worker", &[])
+        .unwrap();
+    for preflight in [vec![], vec![grant]] {
+        let budget = crate::bounded_io::Budget::after(Duration::from_secs(1));
+        let release_at = budget.deadline + Duration::from_millis(20);
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let held_db = db.clone();
+        let holder = std::thread::spawn(move || {
+            let _held = held_db.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(release_at.saturating_duration_since(Instant::now()));
+        });
+        locked_rx.recv().unwrap();
+        let result = {
+            let _budget = crate::bounded_io::enter(Some(budget));
+            params.validate_siblings(&ctx, "runon", "worker", &preflight)
+        };
+        holder.join().unwrap();
+        let Err(SiblingValidationError::Unavailable(response)) = result else {
+            panic!("busy grant store was reported as a missing grant or bypassed: {result:?}");
+        };
+        assert_eq!(
+            response.data["code"], "read_deadline_exceeded",
+            "{response:?}"
+        );
+        assert!(!response.data["message"]
+            .as_str()
+            .unwrap()
+            .contains("allow_paths"));
+    }
+    params
+        .validate_siblings(&ctx, "runon", "worker", &[])
+        .unwrap();
+    db.lock()
+        .unwrap()
+        .execute_batch("DROP TABLE access_grants")
+        .unwrap();
+    let read_error = ctx
+        .validate_read_path_without_approval("runon", "worker", &sibling)
+        .unwrap_err();
+    assert_eq!(read_error.data["code"], "grants_unavailable");
+    for preflight in [
+        vec![],
+        vec![AccessGrant {
+            path: crate::policy_path::policy_path(&sibling),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        }],
+    ] {
+        let error = params
+            .validate_siblings(&ctx, "runon", "worker", &preflight)
+            .unwrap_err();
+        let SiblingValidationError::Unavailable(response) = error else {
+            panic!(
+                "unavailable grant store was bypassed or reported as a missing grant: {error:?}"
+            );
+        };
+        assert_eq!(
+            serde_json::to_value(response).unwrap(),
+            serde_json::to_value(&read_error).unwrap()
+        );
+    }
+}
+
+/// A plan preflight may count grants its own allow_paths validated but did not
+/// save. They admit a sibling only when one of them covers the resolved
+/// checkout root, and the sibling must still be a checkout root.
+#[test]
+fn siblings_read_gate_counts_preflight_grants_only_where_they_cover_a_checkout_root() {
+    use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+    use crate::policy_path::policy_path;
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    let granted = dir.path().join("granted");
+    let commons = granted.join("commons");
+    let plain = granted.join("plain");
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::create_dir_all(commons.join(".git")).unwrap();
+    std::fs::create_dir_all(other.join(".git")).unwrap();
+    let ctx = crate::context::AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(project.clone()),
+            storage_dir: Some(dir.path().join("store")),
+            ..Default::default()
+        },
+    );
+    let grant = |path: &std::path::Path, operation| AccessGrant {
+        path: policy_path(path),
+        kind: GrantKind::Subtree,
+        operation,
+    };
+    let check = |sibling: &std::path::Path, grants: &[AccessGrant]| {
+        let mut params = FrozenParams {
+            siblings: vec![sibling.to_str().unwrap().into()],
+            ..Default::default()
+        };
+        params
+            .validate_siblings(&ctx, "siblings", "session", grants)
+            .map_err(refused_sibling_message)
+            .map(|()| params.siblings)
+    };
+    let folder_grant = [grant(&granted, AccessOperation::Read)];
+    // The session's own file tools may not read outside its project.
+    assert_eq!(
+        check(&commons, &[]),
+        Err(not_readable(&policy_path(&commons)))
+    );
+    let canonical = commons.canonicalize().unwrap().to_str().unwrap().to_owned();
+    assert_eq!(
+        check(&commons, &[grant(&commons, AccessOperation::Read)]).unwrap(),
+        [canonical.clone()]
+    );
+    // A write grant on a folder containing the checkout covers reading it.
+    assert_eq!(
+        check(&commons, &[grant(&granted, AccessOperation::Write)]).unwrap(),
+        [canonical]
+    );
+    // A grant that does not cover the checkout admits nothing.
+    assert_eq!(
+        check(&commons, &[grant(&other, AccessOperation::Read)]),
+        Err(not_readable(&policy_path(&commons)))
+    );
+    // A covered folder that is not a checkout root is still refused, as are
+    // a missing path and a relative one.
+    assert_eq!(check(&plain, &folder_grant), Err(not_checkout_root(&plain)));
+    let missing = granted.join("missing");
+    assert_eq!(
+        check(&missing, &folder_grant),
+        Err(not_checkout_root(&missing))
+    );
+    let relative = std::path::Path::new("granted/commons");
+    assert_eq!(
+        check(relative, &folder_grant),
+        Err(not_checkout_root(relative))
+    );
+    // A link inside the granted folder resolves to a checkout outside it,
+    // which is named as resolved.
+    #[cfg(unix)]
+    {
+        let link = granted.join("link");
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(
+            check(&link, &folder_grant),
+            Err(not_readable(&policy_path(&other)))
+        );
+    }
+}
+
+#[test]
+fn absent_metadata_stays_absent_and_remote_changes_stay_listed() {
+    let before = TerminalRecord::new(
+        job_id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::SnapshotFailed,
+        },
+        0,
+        0,
+        0,
+    );
+    let mut consumer = StreamConsumer::new();
+    let mut sink = RecordSink::default();
+    consumer
+        .consume(StreamRecord::Terminal(before.clone()), &mut sink)
+        .unwrap();
+    assert_eq!(sink.record, Some(before));
+    let after = TerminalRecord::new(job_id(), Outcome::Exit { code: 0 }, 1, 2, 3)
+        .with_ran(Ran::Remote)
+        .with_tree_hash("hash")
+        .with_workspace_changes(vec!["result.txt".into()]);
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(StreamRecord::Terminal(after.clone()), &mut sink)
+        .unwrap();
+    assert_eq!(sink.record, Some(after));
+}
+
+#[derive(Default)]
+struct RecordSink {
+    record: Option<TerminalRecord>,
+}
+impl OutputSink for RecordSink {
+    fn accepted(&mut self, _: &Accepted) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn output(&mut self, _: u64, _: OutputStream, _: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn truncated(&mut self, _: u64) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn unknown_output(&mut self, _: u64, _: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+    fn terminal(&mut self, record: &TerminalRecord, _: &Verdict) -> std::io::Result<()> {
+        self.record = Some(record.clone());
+        Ok(())
+    }
+}
+
+#[test]
+fn gaps_and_missing_terminal_require_attach_not_a_local_run() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.resume_point().unwrap().last_seq, None);
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 0 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(matches!(
+        consumer.finish(),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    let point = consumer.resume_point().unwrap();
+    let mut replay = StreamConsumer::resume(point);
+    replay
+        .consume(output(0, OutputStream::Stdout, b"A"), &mut sink)
+        .unwrap();
+    replay
+        .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+        .unwrap();
+    replay
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(sink.stdout, b"AB");
+    assert_eq!(replay.finish().unwrap(), Verdict::Exited { code: 0 });
+}
+
+#[test]
+fn retained_history_truncation_is_explicit_and_replay_continues() {
+    let mut consumer = StreamConsumer::resume(ResumePoint {
+        job_id: job_id(),
+        last_seq: Some(0),
+        gap_recovery: None,
+        last_output_seq: None,
+    });
+    let mut sink = MemorySink::default();
+    consumer
+        .consume(
+            StreamRecord::Output(
+                Output::new(5, OutputStream::Stdout, BytePayload(b"F".to_vec()))
+                    .with_truncated_before_seq(5),
+            ),
+            &mut sink,
+        )
+        .unwrap();
+    consumer
+        .consume(output(6, OutputStream::Stdout, b"G"), &mut sink)
+        .unwrap();
+    assert_eq!(sink.truncations, [5]);
+    assert_eq!(sink.stdout, b"FG");
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        7
+    );
+}
+
+#[test]
+fn multiple_terminals_and_cross_job_records_are_rejected() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    let wrong = TerminalRecord::new(Uuid::nil(), Outcome::Exit { code: 0 }, 1, 0, 0);
+    assert!(consumer
+        .consume(StreamRecord::Terminal(wrong), &mut sink)
+        .is_err());
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert!(consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .is_err());
+    assert_eq!(sink.terminals.len(), 1);
+}
+
+#[test]
+fn control_unknown_ran_never_proves_no_start() {
+    let mut wire = serde_json::to_value(TerminalRecord::new(
+        job_id(),
+        Outcome::RefusedBeforeStart {
+            reason: RefusalReason::Unreachable,
+        },
+        0,
+        0,
+        0,
+    ))
+    .unwrap();
+    wire["ran"] = serde_json::json!("future_location");
+    let terminal: TerminalRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn control_unknown_record_seq_advances_resume() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume_bytes(
+            br#"{"type":"future_record","seq":0,"future":true}"#,
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        1
+    );
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+        .unwrap();
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 0 });
+    assert_eq!(sink.stdout, b"B");
+    assert_eq!(sink.unknown, [(0, vec![])]);
+}
+
+#[test]
+fn unknown_killed_is_not_an_ordinary_signal_or_cancel() {
+    let mut wire = serde_json::to_value(TerminalRecord::new(
+        job_id(),
+        Outcome::Signal { signal: 15 },
+        1,
+        0,
+        0,
+    ))
+    .unwrap();
+    wire["killed"] = serde_json::json!("future_kill");
+    let terminal: TerminalRecord = serde_json::from_value(wire).unwrap();
+    assert_eq!(grade(&terminal), Verdict::OutcomeUnknown);
+}
+
+#[test]
+fn unknown_output_stream_preserves_bytes_and_sequence_without_misattribution() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume_bytes(
+            br#"{"type":"output","seq":0,"stream":"future_fd","bytes":"/w=="}"#,
+            &mut sink,
+        )
+        .unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stderr, b"error"), &mut sink)
+        .unwrap();
+    assert_eq!(sink.unknown, [(0, vec![255])]);
+    assert!(sink.stdout.is_empty());
+    assert_eq!(sink.stderr, b"error");
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        2
+    );
+}
+
+#[test]
+fn unknown_prepare_outcome_does_not_establish_a_workspace() {
+    let bytes = serde_json::to_vec(
+        &serde_json::json!({"transfer_id":job_id(), "outcome":{"type":"future_prepare"}}),
+    )
+    .unwrap();
+    let reply = decode_reply("workspace.prepare", &bytes).unwrap();
+    assert_eq!(
+        grade_reply(&reply),
+        ReplyVerdict::WorkspaceUnprepared { reason: None }
+    );
+}
+
+#[test]
+fn unknown_rebuild_result_is_not_a_successful_warm_generation() {
+    let bytes = serde_json::to_vec(&serde_json::json!({"queue_depth":0,"running_jobs":[],"server_reachable":true,"rustc_version":"rustc test",
+        "repositories":[{"repository_root":"/src/repo", "warm_target_age_s":null,"published_commit":null,"last_rebuild_result":"future_rebuild"}]})).unwrap();
+    let reply = decode_reply("exec.status", &bytes).unwrap();
+    assert_eq!(
+        grade_reply(&reply),
+        ReplyVerdict::Status {
+            reachable: true,
+            has_unknown_rebuild: true
+        }
+    );
+}
+
+#[test]
+fn unknown_records_without_a_terminal_require_recovery() {
+    let mut consumer = StreamConsumer::resume(ResumePoint {
+        job_id: job_id(),
+        last_seq: None,
+        gap_recovery: None,
+        last_output_seq: None,
+    });
+    let mut sink = MemorySink::default();
+    consumer
+        .consume_bytes(br#"{"type":"future_terminal","seq":0}"#, &mut sink)
+        .unwrap();
+    assert!(matches!(
+        consumer.finish(),
+        Err(Error::RecoveryRequired {
+            resume: Some(ResumePoint {
+                last_seq: Some(0),
+                ..
+            }),
+            ..
+        })
+    ));
+}
+
+#[test]
+fn terminal_gap_progress_resets_the_bound_for_a_new_cursor() {
+    let mut sink = MemorySink::default();
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    for attempt in 0..3 {
+        consumer
+            .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+            .unwrap();
+        assert!(matches!(
+            consumer.consume(terminal(Outcome::Exit { code: 7 }), &mut sink),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let point = consumer.resume_point().unwrap();
+        assert_eq!(point.gap_recovery.as_ref().unwrap().reattaches, attempt);
+        consumer = StreamConsumer::resume(point);
+    }
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"A"), &mut sink)
+        .unwrap();
+    consumer
+        .consume(output(3, OutputStream::Stdout, b"D"), &mut sink)
+        .unwrap();
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::OutcomeUnknown), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    let point = consumer.resume_point().unwrap();
+    let gap = point.gap_recovery.as_ref().unwrap();
+    assert_eq!(gap.from_seq, 2);
+    assert_eq!(gap.reattaches, 0);
+    assert_eq!(sink.stdout, b"AB");
+    assert!(sink.truncations.is_empty());
+    consumer = StreamConsumer::resume(point);
+    consumer
+        .consume(output(2, OutputStream::Stdout, b"C"), &mut sink)
+        .unwrap();
+    assert_eq!(
+        consumer.finish_recovery(&mut sink).unwrap(),
+        Verdict::Exited { code: 7 }
+    );
+    assert_eq!(sink.stdout, b"ABCD");
+    assert!(sink.truncations.is_empty());
+}
+
+#[test]
+fn output_gaps_without_terminal_proof_remain_recoverable() {
+    let mut sink = MemorySink::default();
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    for _ in 0..6 {
+        consumer
+            .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+            .unwrap();
+        assert!(matches!(
+            consumer.finish_recovery(&mut sink),
+            Err(Error::RecoveryRequired { .. })
+        ));
+        let point = consumer.resume_point().unwrap();
+        assert!(point.gap_recovery.is_none());
+        assert_eq!(point.last_seq, None);
+        consumer = StreamConsumer::resume(point);
+    }
+    assert!(sink.stdout.is_empty());
+    assert!(sink.truncations.is_empty());
+    assert!(sink.terminals.is_empty());
+}
+
+#[test]
+fn terminal_gap_loses_each_missing_range_but_drains_later_records_in_order() {
+    let mut sink = MemorySink::default();
+    let mut consumer = StreamConsumer::new();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(4, OutputStream::Stdout, b"E"), &mut sink)
+        .unwrap();
+    consumer
+        .consume(output(1, OutputStream::Stdout, b"B"), &mut sink)
+        .unwrap();
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 7 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    for attempt in 1..=3 {
+        consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+        let result = consumer.finish_recovery(&mut sink);
+        if attempt < 3 {
+            assert!(matches!(result, Err(Error::RecoveryRequired { .. })));
+        } else {
+            assert_eq!(result.unwrap(), Verdict::Exited { code: 7 });
+        }
+    }
+    assert_eq!(sink.stdout, b"BE");
+    assert_eq!(sink.seqs, [1, 4]);
+    assert_eq!(sink.truncations, [1, 4]);
+}
+
+#[test]
+fn pending_return_chunks_evict_payloads_but_replay_recovers_them() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    let chunk = |seq| {
+        StreamRecord::ReturnChunk(ReturnChunk::new(
+            job_id(),
+            seq,
+            0,
+            0,
+            BytePayload(vec![42; RETURN_CHUNK_MAX_BYTES]),
+        ))
+    };
+    for seq in 1..=32 {
+        consumer.consume(chunk(seq), &mut sink).unwrap();
+        consumer.consume(chunk(seq), &mut sink).unwrap();
+    }
+    assert_eq!(consumer.resume_point().unwrap().last_seq, None);
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"first"), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(0));
+    consumer
+        .consume(
+            StreamRecord::ReturnChunk(ReturnChunk::new(
+                job_id(),
+                1,
+                0,
+                0,
+                BytePayload(vec![43; RETURN_CHUNK_MAX_BYTES]),
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(consumer.resume_point().unwrap().last_seq, Some(0));
+    consumer
+        .consume(
+            output(1, OutputStream::Stdout, b"conflicting duplicate"),
+            &mut sink,
+        )
+        .unwrap();
+    assert_eq!(sink.stdout, b"first");
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 0 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert!(
+        serde_json::to_vec(&consumer.resume_point().unwrap().gap_recovery)
+            .unwrap()
+            .len()
+            < 12 * 1024 * 1024
+    );
+    consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+    for seq in 1..=32 {
+        consumer.consume(chunk(seq), &mut sink).unwrap();
+        assert!(consumer.resume_point().unwrap().last_seq >= Some(seq));
+    }
+    assert_eq!(
+        consumer
+            .resume_point()
+            .unwrap()
+            .attach_request()
+            .unwrap()
+            .from_seq,
+        33
+    );
+    assert_eq!(sink.seqs, (0..=32).collect::<Vec<_>>());
+    consumer
+        .consume(terminal(Outcome::Exit { code: 0 }), &mut sink)
+        .unwrap();
+    assert_eq!(consumer.finish().unwrap(), Verdict::Exited { code: 0 });
+    assert!(sink.truncations.is_empty());
+    assert!(sink.return_gaps.is_empty());
+}
+
+#[test]
+fn an_output_hole_before_a_large_counted_return_still_reports_output_lost() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    consumer
+        .consume(output(0, OutputStream::Stdout, b"kept"), &mut sink)
+        .unwrap();
+    for seq in 2..=34 {
+        consumer
+            .consume(
+                StreamRecord::ReturnChunk(ReturnChunk::new(
+                    job_id(),
+                    seq,
+                    0,
+                    (seq - 2) * RETURN_CHUNK_MAX_BYTES as u64,
+                    BytePayload(vec![42; RETURN_CHUNK_MAX_BYTES]),
+                )),
+                &mut sink,
+            )
+            .unwrap();
+    }
+    let mut entry = ReturnManifestEntry::returned(
+        "app.bin",
+        33 * RETURN_CHUNK_MAX_BYTES as u64,
+        "0".repeat(64),
+    );
+    entry.chunks = Some(33);
+    consumer
+        .consume(
+            StreamRecord::ReturnManifest(ReturnManifest::new(
+                job_id(),
+                35,
+                vec![entry],
+                33 * RETURN_CHUNK_MAX_BYTES as u64,
+                RETURN_LARGE_MAX_BYTES_CAP,
+            )),
+            &mut sink,
+        )
+        .unwrap();
+    assert!(matches!(
+        consumer.consume(terminal(Outcome::Exit { code: 1 }), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    for attempt in 1..=3 {
+        consumer = StreamConsumer::resume(consumer.resume_point().unwrap());
+        let result = consumer.finish_recovery(&mut sink);
+        if attempt < 3 {
+            assert!(matches!(result, Err(Error::RecoveryRequired { .. })));
+        } else {
+            assert_eq!(result.unwrap(), Verdict::Exited { code: 1 });
+        }
+    }
+    assert_eq!(sink.stdout, b"kept");
+    assert_eq!(
+        sink.truncations,
+        [2],
+        "seq 1 was output, not a returned-file record"
+    );
+    assert!(!sink.return_gaps.is_empty());
+}
+
+#[test]
+fn pending_output_and_manifest_metadata_share_the_byte_budget() {
+    let mut consumer = StreamConsumer::new();
+    let mut sink = MemorySink::default();
+    consumer.consume(accepted(), &mut sink).unwrap();
+    let bytes = vec![42; super::stream::MAX_PENDING_BYTES];
+    assert!(matches!(
+        consumer.consume(output(1, OutputStream::Stdout, &bytes), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    let manifest = ReturnManifest::new(
+        job_id(),
+        1,
+        vec![ReturnManifestEntry::failed(
+            "x".repeat(super::stream::MAX_PENDING_BYTES / 8),
+            ReturnPathsFailureCause::Expired,
+        )],
+        0,
+        RETURN_LARGE_MAX_BYTES_CAP,
+    );
+    assert!(matches!(
+        consumer.consume(StreamRecord::ReturnManifest(manifest), &mut sink),
+        Err(Error::RecoveryRequired { .. })
+    ));
+    assert_eq!(consumer.resume_point().unwrap().last_seq, None);
+    assert!(sink.stdout.is_empty());
+}

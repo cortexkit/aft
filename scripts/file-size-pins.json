@@ -1,9 +1,9 @@
 {
-  "crates/aft/src/bash_background/registry.rs": {
+  "crates/aft-engine/src/bash_background/registry.rs": {
     "lines": 18646,
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
-  "crates/aft/src/bash_background/remote_tests.rs": {
+  "crates/aft-engine/src/bash_background/remote_tests.rs": {
     "lines": 10717,
     "reason": "Split remote execution tests by scenario pending; AFT crate split lane."
   },
@@ -15,15 +15,15 @@
     "lines": 12986,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
-  "crates/aft/src/context.rs": {
+  "crates/aft-engine/src/context.rs": {
     "lines": 11417,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
-  "crates/aft/src/lsp/manager.rs": {
+  "crates/aft-engine/src/lsp/manager.rs": {
     "lines": 11109,
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
-  "crates/aft/src/sandbox_spawn.rs": {
+  "crates/aft-engine/src/sandbox_spawn.rs": {
     "lines": 10385,
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
@@ -31,7 +31,7 @@
     "lines": 10766,
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
-  "crates/aft/src/semantic_index.rs": {
+  "crates/aft-engine/src/semantic_index.rs": {
     "lines": 10557,
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
@@ -39,7 +39,7 @@
     "lines": 9943,
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
-  "crates/aft/src/gh_shim.rs": {
+  "crates/aft-engine/src/gh_shim.rs": {
     "lines": 8523,
     "reason": "Split GitHub shim policy and commands pending; AFT crate split lane."
   },
@@ -51,23 +51,23 @@
     "lines": 7977,
     "reason": "Split inspect integration tests by diagnostic area pending; AFT crate split lane."
   },
-  "crates/aft/src/inspect/scanners/dead_code.rs": {
+  "crates/aft-engine/src/inspect/scanners/dead_code.rs": {
     "lines": 5057,
     "reason": "Split dead-code analysis by language pending; AFT crate split lane."
   },
-  "crates/aft/src/backup.rs": {
+  "crates/aft-engine/src/backup.rs": {
     "lines": 7143,
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
-  "crates/aft/src/data_layer/checkout.rs": {
+  "crates/aft-engine/src/data_layer/checkout.rs": {
     "lines": 6401,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
-  "crates/aft/src/bash_background/remote.rs": {
+  "crates/aft-engine/src/bash_background/remote.rs": {
     "lines": 6160,
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
-  "crates/aft/src/inspect/manager.rs": {
+  "crates/aft-engine/src/inspect/manager.rs": {
     "lines": 6051,
     "reason": "Split inspection scheduling and coordination pending; AFT crate split lane."
   },
