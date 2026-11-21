@@ -1,6 +1,6 @@
 //! Fixtures for daemon tests that exercise shell execution and remote jobs.
 
-use crate::bash_background::{self, frames, persistence, registry};
+use crate::bash_background::{self as background, frames, persistence, registry};
 use crate::sandbox_spawn;
 use std::path::{Path, PathBuf};
 
@@ -33,7 +33,7 @@ pub fn successful_spawn_response(
     pty: bool,
     ctx: &crate::context::AppContext,
 ) -> crate::protocol::Response {
-    bash_background::successful_spawn_response(request_id, session_id, task_id, pty, ctx)
+    background::successful_spawn_response(request_id, session_id, task_id, pty, ctx)
 }
 
 pub fn bash_bodies(
@@ -111,11 +111,11 @@ pub mod bash_hints {
     }
 }
 
-pub const QUEUE_CAPACITY: usize = bash_background::runner_notice_scheduler::QUEUE_CAPACITY;
+pub const QUEUE_CAPACITY: usize = background::runner_notice_scheduler::QUEUE_CAPACITY;
 pub const PREFER_TOOL: &str = crate::bash_rewrite::notices::PREFER_TOOL;
 #[cfg(unix)]
-pub const PROXY_UNAVAILABLE: &str = bash_background::secrets::PROXY_UNAVAILABLE;
-pub const COMMAND_BYTES: usize = bash_background::scoped_tasks::COMMAND_BYTES;
+pub const PROXY_UNAVAILABLE: &str = background::secrets::PROXY_UNAVAILABLE;
+pub const COMMAND_BYTES: usize = background::scoped_tasks::COMMAND_BYTES;
 pub const OWNER_PAUSED_REASON: &str = registry::OWNER_PAUSED_REASON;
 
 #[cfg(unix)]
@@ -129,23 +129,23 @@ pub fn remote_report(metadata: &persistence::PersistedTask) -> Option<String> {
 pub type SharedCallDeadline = crate::bash_changed_files::SharedCallDeadline;
 
 pub fn changed_files_deadline_for_spawn() -> Option<SharedCallDeadline> {
-    bash_background::changed_files_deadline_for_spawn()
+    background::changed_files_deadline_for_spawn()
 }
 
-pub fn call_key_for_new_task(task_id: &str) -> bash_background::TaskCallKey {
-    bash_background::call_key_for_new_task(task_id)
+pub fn call_key_for_new_task(task_id: &str) -> background::TaskCallKey {
+    background::call_key_for_new_task(task_id)
 }
 
-pub fn enter_bash_startup_step(step: bash_background::BashStartupStep) {
-    bash_background::enter_bash_startup_step(step);
+pub fn enter_bash_startup_step(step: background::BashStartupStep) {
+    background::enter_bash_startup_step(step);
 }
 
 pub fn commit_spawn_receipt_inline() -> Result<(), String> {
-    bash_background::commit_spawn_receipt_inline()
+    background::commit_spawn_receipt_inline()
 }
 
 pub fn with_spawn_commit_time_for_test<T>(now: std::time::Instant, run: impl FnOnce() -> T) -> T {
-    bash_background::with_spawn_commit_time_for_test(now, run)
+    background::with_spawn_commit_time_for_test(now, run)
 }
 
 pub fn with_spawn_plan_for_test<T>(plan: sandbox_spawn::SpawnPlan, run: impl FnOnce() -> T) -> T {
@@ -184,8 +184,8 @@ pub fn windows_shell_binary(shell: &WindowsShell) -> std::borrow::Cow<'_, str> {
     shell.binary()
 }
 
-pub fn running(metadata: &persistence::PersistedTask) -> bash_background::scoped_tasks::Running {
-    bash_background::scoped_tasks::running(metadata)
+pub fn running(metadata: &persistence::PersistedTask) -> background::scoped_tasks::Running {
+    background::scoped_tasks::running(metadata)
 }
 
 pub fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool {
@@ -205,7 +205,7 @@ pub fn grep_request(command: &str, binary: &str) -> Option<serde_json::Value> {
 }
 
 pub fn with_artifact_opens<T>(run: impl FnOnce(&std::cell::Cell<u64>) -> T) -> T {
-    bash_background::buffer::ARTIFACT_OPENS.with(run)
+    background::buffer::ARTIFACT_OPENS.with(run)
 }
 
 impl BgTask {
@@ -298,14 +298,14 @@ pub mod secrets_support {
 mod speech;
 pub use speech::*;
 
-pub fn remote_running(job_id: String) -> bash_background::scoped_tasks::scoped_tasks_types::Remote {
-    bash_background::scoped_tasks::remote_running(job_id)
+pub fn remote_running(job_id: String) -> background::scoped_tasks::scoped_tasks_types::Remote {
+    background::scoped_tasks::remote_running(job_id)
 }
 
-pub struct StoreWriteTicket(bash_background::store_writes::Ticket);
+pub struct StoreWriteTicket(background::store_writes::Ticket);
 
 pub fn store_write_ticket(storage: &Path) -> StoreWriteTicket {
-    StoreWriteTicket(bash_background::store_writes::Ticket::new(storage))
+    StoreWriteTicket(background::store_writes::Ticket::new(storage))
 }
 
 impl StoreWriteTicket {
@@ -341,3 +341,12 @@ mod scheduler_ext;
 pub use scheduler_ext::*;
 
 pub use registry::remote::remote_types::{DrainingRetryTestExt, KeyedSubmissionTestExt};
+
+pub mod bash_background {
+    pub mod registry {
+        #[cfg(unix)]
+        pub mod root_reclaim_tests {
+            pub use crate::bash_background::registry::root_reclaim_fixture::*;
+        }
+    }
+}

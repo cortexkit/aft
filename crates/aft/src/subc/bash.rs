@@ -6796,7 +6796,7 @@ mod grant_path_tests {
                     .test_state()
                     .lock()
                     .unwrap()
-                    .metadata
+                    .metadata()
                     .remote
                     .as_ref()
                     .unwrap()
@@ -6945,7 +6945,7 @@ mod grant_path_tests {
                     .test_state()
                     .lock()
                     .unwrap()
-                    .metadata
+                    .metadata()
                     .remote
                     .as_ref()
                     .unwrap()
@@ -6984,7 +6984,7 @@ mod grant_path_tests {
                     .test_state()
                     .lock()
                     .unwrap()
-                    .metadata
+                    .metadata()
                     .remote
                     .as_ref()
                     .unwrap()
@@ -7380,7 +7380,7 @@ mod grant_path_tests {
                     .test_state()
                     .lock()
                     .unwrap()
-                    .metadata
+                    .metadata()
                     .remote
                     .as_ref()
                     .unwrap()
@@ -8368,7 +8368,7 @@ mod grant_path_tests {
                 .test_state()
                 .lock()
                 .unwrap()
-                .metadata
+                .metadata()
                 .remote
                 .as_ref()
                 .unwrap()
@@ -8877,7 +8877,7 @@ mod grant_path_tests {
                 .test_state()
                 .lock()
                 .unwrap()
-                .metadata
+                .metadata()
                 .remote
                 .clone()
                 .unwrap();

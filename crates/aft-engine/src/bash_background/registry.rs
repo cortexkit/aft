@@ -22,6 +22,9 @@ use std::sync::OnceLock;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(all(unix, any(test, feature = "test-support")))]
+#[path = "root_reclaim_fixture.rs"]
+pub(crate) mod root_reclaim_fixture;
 #[cfg(all(test, unix))]
 #[path = "root_reclaim_tests.rs"]
 pub(crate) mod root_reclaim_tests;
@@ -1516,7 +1519,7 @@ pub(crate) struct RegistryInner {
             std::sync::mpsc::Receiver<()>,
         )>,
     >,
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     before_watchdog_registration: Mutex<
         Option<(
             tokio::sync::oneshot::Sender<String>,
@@ -1535,7 +1538,7 @@ pub(crate) struct RegistryInner {
     persisted_artifact_owners:
         Mutex<HashMap<PathBuf, (String, super::persistence::DirectorySnapshot)>>,
     task_read_records: Mutex<VecDeque<(PathBuf, Arc<task_access::TaskReadRecord>)>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     task_access_work: task_access::WorkCounters,
     /// Failed finished-task bundle deletions and their bounded retry count.
     finished_delete_attempts: Mutex<HashMap<String, usize>>,
@@ -1544,13 +1547,13 @@ pub(crate) struct RegistryInner {
     retired_undelivered_completions: AtomicU64,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
     pub(crate) watchdog_tasks: CountedMutex<HashMap<String, Arc<BgTask>>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     reclaim_kill_attempts: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     process_group_sample_count: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     completion_processing_attempts: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     reclaim_kill_noop: AtomicBool,
     /// Finished tasks whose scratch directory is kept on disk until its
     /// delete time, keyed by task id. See `scratch_retention`.
@@ -1605,7 +1608,7 @@ pub(crate) struct RegistryInner {
     /// rather than restarting at the first session after every bind.
     project_replay_scan: Mutex<Option<ProjectReplayScanCursor>>,
     project_replay_batch_claimed: AtomicBool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     project_replay_scan_budget_for_test: Mutex<Option<(usize, Duration)>>,
     /// Output compression callback. Set by `AppContext` after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
@@ -2105,7 +2108,7 @@ impl BgTaskRegistry {
                 background_admission: Mutex::new(()),
                 #[cfg(all(unix, any(test, feature = "test-support")))]
                 before_bootstrap_release: Mutex::new(None),
-                #[cfg(all(test, unix))]
+                #[cfg(all(unix, any(test, feature = "test-support")))]
                 before_watchdog_registration: Mutex::new(None),
                 #[cfg(test)]
                 before_promotion_commit: Mutex::new(None),
@@ -2113,20 +2116,20 @@ impl BgTaskRegistry {
                 drain_reply_slots: Mutex::new(HashMap::new()),
                 persisted_artifact_owners: Mutex::new(HashMap::new()),
                 task_read_records: Mutex::new(VecDeque::new()),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 task_access_work: task_access::WorkCounters::default(),
                 finished_delete_attempts: Mutex::new(HashMap::new()),
                 cleanup_queue: Mutex::new(VecDeque::new()),
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
                 retired_undelivered_completions: AtomicU64::new(0),
                 watchdog_tasks: CountedMutex::new(HashMap::new()),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 reclaim_kill_attempts: AtomicUsize::new(0),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 process_group_sample_count: AtomicUsize::new(0),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 completion_processing_attempts: AtomicUsize::new(0),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 reclaim_kill_noop: AtomicBool::new(false),
                 retained_scratch: Mutex::new(HashMap::new()),
                 revoked_scopes: Mutex::new(HashSet::new()),
@@ -2154,7 +2157,7 @@ impl BgTaskRegistry {
                 session_recovery: Mutex::new(HashMap::new()),
                 project_replay_scan: Mutex::new(None),
                 project_replay_batch_claimed: AtomicBool::new(false),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 project_replay_scan_budget_for_test: Mutex::new(None),
                 compressor: Mutex::new(None),
                 db_pool: RwLock::new(None),
@@ -2471,7 +2474,7 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_project_replay_scan_budget_for_test(
         &self,
         entries: usize,
@@ -2484,7 +2487,7 @@ impl BgTaskRegistry {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((entries, duration));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn project_replay_scan_total_examined_for_test(&self) -> Option<usize> {
         self.inner
             .project_replay_scan
@@ -2496,7 +2499,7 @@ impl BgTaskRegistry {
 
     // Only the Unix unreadable-session replay test uses this; Windows cannot
     // make a session directory unreadable the same way.
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     pub(crate) fn expire_project_replay_backoff_for_test(&self) {
         if let Some(cursor) = self.inner.project_replay_scan.lock().unwrap().as_mut() {
             for failure in cursor.failures.values_mut() {
@@ -5896,7 +5899,7 @@ impl BgTaskRegistry {
             .map_err(|_| "background task registry lock poisoned".to_string())?
             .insert(task_id.clone(), Arc::clone(&task));
         aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Shell);
-        #[cfg(all(test, unix))]
+        #[cfg(all(unix, any(test, feature = "test-support")))]
         self.wait_before_watchdog_registration_for_test(&task_id);
         self.inner
             .cleanup_queue
@@ -6937,7 +6940,7 @@ impl BgTaskRegistry {
         Some(ProjectReplayBatch { registry: self })
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     pub(crate) fn task_registration_identity_for_test(&self, task_id: &str) -> Option<usize> {
         self.task(task_id).map(|task| Arc::as_ptr(&task) as usize)
     }
@@ -8379,7 +8382,7 @@ impl BgTaskRegistry {
         // from several projects. DB rows identify project sessions before the
         // walk; the current route session is included for disk-only task rows.
         let (entry_budget, time_budget) = {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             if let Some(limits) = *self
                 .inner
                 .project_replay_scan_budget_for_test
@@ -10664,7 +10667,7 @@ impl BgTaskRegistry {
     /// registry identity, so killing those tasks is accepted; operational
     /// guidance is to rename a project only after its live tasks have ended.
     pub fn kill_running_tasks_for_root(&self, project_root: &Path) -> usize {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.inner
                 .reclaim_kill_attempts
@@ -12574,7 +12577,7 @@ impl BgTaskRegistry {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn scope_fence_unlocked_for_test(&self) -> bool {
         self.inner.revoked_scopes.try_lock().is_ok()
     }
@@ -13369,7 +13372,7 @@ impl BgTaskRegistry {
 
     /// Drop a task's in-memory record, as the delivered-task cleanup does
     /// once the task's retention ends.
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     pub(crate) fn forget_task_record_for_test(&self, task_id: &str) {
         if let Ok(mut tasks) = self.inner.tasks.lock() {
             tasks.remove(task_id);
@@ -14785,7 +14788,7 @@ impl BgTaskRegistry {
             }
             **routed = true;
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.inner
             .completion_processing_attempts
             .fetch_add(1, Ordering::SeqCst);
@@ -15654,7 +15657,7 @@ impl BgTaskRegistry {
             .unwrap_or_default()
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     pub(crate) fn pause_watchdog_registration_for_test(
         &self,
     ) -> (tokio::sync::oneshot::Receiver<String>, impl Drop) {
@@ -15679,7 +15682,7 @@ impl BgTaskRegistry {
         (arrival, Release(release))
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(unix, any(test, feature = "test-support")))]
     fn wait_before_watchdog_registration_for_test(&self, task_id: &str) {
         let gate = self
             .inner

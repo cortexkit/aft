@@ -1081,6 +1081,9 @@ mod keepalive_tests;
 
 #[cfg(test)]
 mod tests {
+    use aft_engine::test_bridge::bash_remote::{
+        BgTaskRegistryTestExt as _, ReplyBudgetTestExt as _,
+    };
     #[test]
     fn remote_progress_sentences_keep_the_approved_final_period() {
         assert_eq!(

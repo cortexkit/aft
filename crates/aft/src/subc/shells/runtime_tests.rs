@@ -1,9 +1,9 @@
 use super::*;
 use crate::bash_background::persistence::TaskArtifact;
 #[cfg(test)]
-use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
-#[cfg(test)]
 use aft_engine::test_bridge::bash_remote::ShellReaderTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, PersistedTaskTestExt as _};
 
 fn output_log(frame: &Frame) -> OperationLog {
     OperationLog {
@@ -263,7 +263,7 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
                 last_output_at_ms: None,
             };
             let row = project_row(&snapshot, Some(&conn));
-            metadata.shell_fingerprint = Some(
+            *metadata.shell_fingerprint_mut() = Some(
                 blake3::hash(&serde_json::to_vec(&row).unwrap())
                     .to_hex()
                     .to_string(),

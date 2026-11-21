@@ -6917,7 +6917,7 @@ impl<'ctx> ToolLaunchPolicy<'ctx> {
         Ok(command)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn unconfined_for_test() -> ToolLaunchPolicy<'static> {
         ToolLaunchPolicy {
             ctx: None,
