@@ -36,9 +36,9 @@ pub use job::{
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
 pub(crate) use manager::scope_files as tier2_scope_files;
-pub use manager::InspectManager;
 #[cfg(test)]
-pub(crate) use manager::{filter_payload_for_scope_for_test, InspectBuilderState};
+pub(crate) use manager::InspectBuilderState;
+pub use manager::InspectManager;
 pub use phase_log::{
     format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectPhaseLogSnapshot,

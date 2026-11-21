@@ -93,6 +93,9 @@ impl WatcherExclusionRetry {
                 matcher,
                 || derive().map(|plan| plan.0).map_err(|err| err.0),
             )
-            .map(|_| ())
+            .map(|update| match update {
+                watcher_filter::WatcherExclusionUpdate::Planned(plan) => drop(plan),
+                watcher_filter::WatcherExclusionUpdate::Reduced => (),
+            })
     }
 }

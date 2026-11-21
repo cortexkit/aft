@@ -466,6 +466,7 @@ pub(crate) mod pause_test_support {
         include_str!("synapse_embed/fixtures/error-shape-compiling-transient.json");
 
     /// Synapse's error object while a model lane is still loading.
+    #[cfg(test)]
     pub(crate) const MODEL_LOADING_ERROR: &str =
         include_str!("synapse_embed/fixtures/error-model-loading-transient.json");
 

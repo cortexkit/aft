@@ -1,3 +1,4 @@
+#[cfg(unix)]
 use crate::bash_background::persistence::ResolvedTask;
 use crate::context::AppContext;
 use crate::sandbox_spawn::{

@@ -1,11 +1,16 @@
 use super::BgTask;
 use crate::bash_background::persistence::{PersistedTask, TaskPaths};
 use crate::bash_background::registry::{
-    BgCompletion, BgTaskRegistry, BgTaskSnapshot, RegistryError, ShellReader, ShellSnapshot,
+    BgCompletion, BgTaskRegistry, BgTaskSnapshot, ShellReader, ShellSnapshot,
 };
-use crate::bash_background::{BashShell, HardKill, RemoteLaunch, SpawnReceipt, TaskSlot};
+use crate::bash_background::SpawnReceipt;
+#[cfg(unix)]
+use crate::bash_background::{
+    registry::RegistryError, BashShell, HardKill, RemoteLaunch, TaskSlot,
+};
 use crate::blocking_wait::ReplyBudget;
 use crate::db::bash_tasks::BashTaskRow;
+#[cfg(unix)]
 use crate::exec_remote::Verdict;
 #[cfg(unix)]
 use crate::sandbox_profile::SandboxProfile;
@@ -13,8 +18,9 @@ use crate::sandbox_profile::SandboxProfile;
 use crate::sandbox_spawn::PreparedTask;
 use crate::sandbox_spawn::SpawnPlan;
 use serde_json::Value;
+#[cfg(unix)]
+use std::collections::HashMap;
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},

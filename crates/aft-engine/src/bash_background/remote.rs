@@ -929,7 +929,7 @@ pub struct RemoteTask {
     pub owner_pause_cancel: Option<String>,
     pub terminal: Option<TerminalRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub pre_start_refusal: Option<RemotePreStartRefusal>,
+    pub(crate) pre_start_refusal: Option<RemotePreStartRefusal>,
     #[serde(default)]
     pub fallback_digest: Option<String>,
     #[serde(default)]
@@ -948,11 +948,11 @@ pub struct RemoteTask {
     #[serde(default)]
     pub output_received: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_incomplete: Option<RemoteOutputIncomplete>,
+    pub(crate) output_incomplete: Option<RemoteOutputIncomplete>,
     /// Set when the runner refused this job with `queue_wait_exceeded` while it
     /// waited behind an earlier job of this same session in the same workspace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_holder: Option<WorkspaceHolder>,
+    pub(crate) workspace_holder: Option<WorkspaceHolder>,
     /// Files the caller asked the runner to copy back, relative to the
     /// task's workdir (`return_paths`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -977,7 +977,7 @@ pub struct RemoteTask {
         default,
         skip_serializing_if = "super::return_files::StagingRecord::is_empty"
     )]
-    pub return_staging: super::return_files::StagingRecord,
+    pub(crate) return_staging: super::return_files::StagingRecord,
     /// Seq ranges missing before an expired replay's manifest that carried
     /// no chunk counts, where the derived count did not match and recovery
     /// could not fill them: lost output or differently sized chunks.

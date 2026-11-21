@@ -624,12 +624,7 @@ impl WatcherExclusionSource {
         }
     }
 
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "linux",
-        test,
-        feature = "test-support"
-    ))]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::External => "external",
@@ -659,6 +654,7 @@ pub(crate) struct WatcherExclusion {
     feature = "test-support"
 ))]
 impl WatcherExclusion {
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -694,6 +690,7 @@ pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<Pa
 pub(crate) struct WatcherExclusionPaths {
     lasting: Vec<WatcherExclusion>,
     external: BTreeSet<PathBuf>,
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     boundary: Option<WatcherWalkBoundary>,
 }
 
@@ -705,10 +702,13 @@ pub(crate) struct WatcherExclusionPaths {
 ))]
 impl WatcherExclusionPaths {
     pub(crate) fn new(root: &Path, exclusions: &[WatcherExclusion]) -> Self {
+        #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
+        let _ = root;
         let mut state = Self {
             lasting: Vec::new(),
             external: BTreeSet::new(),
             // Matcher publications do not change the bound root or its device.
+            #[cfg(any(target_os = "macos", target_os = "linux", test))]
             boundary: WatcherWalkBoundary::for_root(root),
         };
         state.replace(exclusions);
@@ -772,6 +772,7 @@ impl WatcherExclusionPaths {
         self.refresh_events(std::iter::once(event))
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn refresh_events<'a>(
         &mut self,
         events: impl IntoIterator<Item = &'a notify::Event>,
@@ -812,6 +813,7 @@ impl WatcherExclusionPaths {
     /// Use lexical event paths, before downstream canonicalization. Checking
     /// ancestors also handles a renamed parent of an excluded path, without
     /// probing descendants through a link or a different-device directory.
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     pub(crate) fn refresh_touched(&mut self, paths: &[PathBuf]) -> bool {
         let Some(boundary) = self.boundary.as_ref() else {
             return false;
@@ -1101,6 +1103,7 @@ impl WatcherWalkBoundary {
         test,
         feature = "test-support"
     ))]
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn classify_cached(
         &self,
         path: &Path,

@@ -1,4 +1,4 @@
-use super::super::persistence::{allocate_task_layout, work_counts, write_task_at};
+use super::super::persistence::{work_counts, write_task_at};
 use super::*;
 
 use super::test_support::watchdog_fixture as fixture;

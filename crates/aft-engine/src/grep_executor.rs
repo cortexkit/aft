@@ -1856,7 +1856,7 @@ fn is_disclosable_ignore_boundary(
 
 /// Evidence is limited to the named folder's children, never ignored subtrees.
 /// An incomplete accepted-name set cannot prove that a missing name was ignored.
-#[cfg(any(test, feature = "test-hooks"))]
+#[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
 pub(crate) fn scope_ignored_entries(scope: &GrepScope) -> Option<IgnoredScopeEntries> {
     scope_ignored_entries_cancellable(scope, Arc::new(std::sync::atomic::AtomicBool::new(false)))
 }

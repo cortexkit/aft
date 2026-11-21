@@ -13,10 +13,6 @@ pub use crate::data_layer::status::{
 pub(crate) use crate::executor::root_lifecycle::SubcLifecycleAdmission;
 pub(crate) use crate::watcher_backend::counters::WatcherCounters;
 pub use crate::watcher_backend::counters::{watcher_counters_for_root, WatcherCountersSnapshot};
-#[cfg(test)]
-pub(crate) use crate::watcher_backend::counters::{
-    WatcherExclusionPlanningSnapshot, WatcherOverflowPrefix,
-};
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, BufWriter};

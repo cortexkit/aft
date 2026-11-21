@@ -30926,6 +30926,7 @@ mod watchdog_cost_tests;
 #[cfg(test)]
 mod a02_tests {
     use super::*;
+    #[cfg(unix)]
     use crate::bash_background::persistence::write_task;
 
     use super::test_support::terminal_fixture;
