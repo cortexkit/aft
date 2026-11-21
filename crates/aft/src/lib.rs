@@ -181,7 +181,7 @@ mod nested_worktree_tests;
 pub use aft_base::ort_lifecycle;
 pub use aft_base::pattern_compile;
 pub use aft_base::pending_response;
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 pub(crate) use aft_base::pinned_dir;
 pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
