@@ -69,7 +69,7 @@ pub use aft_base::runner_status_state::{route_bound, route_unbound};
 
 pub(crate) use aft_base::runner_status_state::initialize;
 use aft_base::runner_status_state::{notifier, snapshot_segments, Snapshot};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use aft_base::runner_status_state::{segment_for_test, Sessions};
 
 trait Writer {
@@ -242,7 +242,7 @@ pub(super) fn unavailable(reason: &'static str) {
     failure(reason);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn test_value(session: &str) -> Option<serde_json::Value> {
     segment_for_test(session)
         .map(|segment| serde_json::from_slice(&encode(&segment.text, segment.generation)).unwrap())

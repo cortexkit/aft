@@ -107,7 +107,9 @@ fn meaning_query(ctx: &AppContext) -> Response {
 
 fn enable_meaning(ctx: &AppContext, root: &Path) -> impl Drop {
     ctx.update_config(|config| config.indexes.semantic = true);
-    let fill = crate::data_layer::meaning::fill_with_constant_vectors_for_test(root, 2);
+    let fill = aft_engine::test_bridge::display_data::meaning::fill_with_constant_vectors_for_test(
+        root, 2,
+    );
     crate::semantic_admission::note_opened("luau-s4", root);
     fill
 }
@@ -602,9 +604,15 @@ fn scenario(phase: &str) {
             "old grammar graph cannot serve under a new identity"
         );
         checkout.build().unwrap();
-        assert!(crate::data_layer::content::parses_of_for_test(b.as_bytes()) > 0);
+        assert!(
+            aft_engine::test_bridge::display_data::data_layer::content::parses_of_for_test(
+                b.as_bytes()
+            ) > 0
+        );
         assert_eq!(
-            crate::data_layer::content::parses_of_for_test(ts.as_bytes()),
+            aft_engine::test_bridge::display_data::data_layer::content::parses_of_for_test(
+                ts.as_bytes()
+            ),
             0,
             "built-in records stay reusable"
         );
@@ -662,7 +670,9 @@ fn scenario(phase: &str) {
     );
     assert_eq!(old.data, new.data, "built-in answers cannot gain Luau gaps");
     assert_eq!(
-        crate::data_layer::content::parses_of_for_test(b.as_bytes()),
+        aft_engine::test_bridge::display_data::data_layer::content::parses_of_for_test(
+            b.as_bytes()
+        ),
         0
     );
     assert_eq!(registry.request_count(), 1);
@@ -896,7 +906,9 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
         );
     }
     let plane = vector_plane(&checkout);
-    let parsed = crate::data_layer::content::parses_of_for_test(module.as_bytes());
+    let parsed = aft_engine::test_bridge::display_data::data_layer::content::parses_of_for_test(
+        module.as_bytes(),
+    );
     let report = plane
         .fill(
             &mut |texts| Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect()),
@@ -906,7 +918,9 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
         .unwrap();
     assert!(report.files_queued > 0);
     assert_eq!(
-        crate::data_layer::content::parses_of_for_test(module.as_bytes()),
+        aft_engine::test_bridge::display_data::data_layer::content::parses_of_for_test(
+            module.as_bytes()
+        ),
         parsed,
         "Luau semantic chunks must use stored records"
     );

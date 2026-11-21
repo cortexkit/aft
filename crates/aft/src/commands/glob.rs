@@ -1090,7 +1090,10 @@ mod tests {
             "id": "glob-named-ignored-bounds", "command": "glob", "pattern": "ignored/*.md"
         }))
         .unwrap();
-        let capped = crate::grep_executor::with_walk_limit(1, || handle_glob(&request, &ctx));
+        let capped =
+            aft_engine::test_bridge::search_misc::grep_executor::with_walk_limit(1, || {
+                handle_glob(&request, &ctx)
+            });
         let body = serde_json::to_value(&capped).unwrap();
         assert_eq!(body["success"], true, "{body}");
         assert_eq!(body["total"], 1, "{body}");
@@ -1098,15 +1101,16 @@ mod tests {
         assert_eq!(body["complete"], false, "{body}");
         assert_eq!(body["walk_entries_examined"], 3, "{body}");
 
-        let timed = crate::grep_executor::with_fallback_walk_budget_for_test(
-            Duration::from_millis(100),
-            || {
-                crate::grep_executor::with_fallback_walk_entry_delay_for_test(
+        let timed =
+            aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_budget_for_test(
+                Duration::from_millis(100),
+                || {
+                    aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_entry_delay_for_test(
                     Duration::from_millis(250),
                     || handle_glob(&request, &ctx),
                 )
-            },
-        );
+                },
+            );
         let body = serde_json::to_value(&timed).unwrap();
         assert_eq!(body["success"], true, "{body}");
         assert_eq!(body["total"], 1, "{body}");
@@ -1138,15 +1142,16 @@ mod tests {
         }))
         .unwrap();
 
-        let response = crate::grep_executor::with_fallback_walk_budget_for_test(
-            Duration::from_millis(100),
-            || {
-                crate::grep_executor::with_fallback_walk_entry_delay_for_test(
+        let response =
+            aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_budget_for_test(
+                Duration::from_millis(100),
+                || {
+                    aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_entry_delay_for_test(
                     Duration::from_millis(250),
                     || handle_glob(&request, &ctx),
                 )
-            },
-        );
+                },
+            );
         let body = serde_json::to_value(&response).unwrap();
         assert_eq!(body["success"], true, "{body}");
         assert_eq!(body["complete"], false, "{body}");
@@ -1299,15 +1304,16 @@ mod tests {
         }))
         .unwrap();
 
-        let response = crate::grep_executor::with_fallback_walk_budget_for_test(
-            Duration::from_millis(100),
-            || {
-                crate::grep_executor::with_fallback_walk_entry_delay_for_test(
+        let response =
+            aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_budget_for_test(
+                Duration::from_millis(100),
+                || {
+                    aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_entry_delay_for_test(
                     Duration::from_millis(250),
                     || handle_glob(&request, &ctx),
                 )
-            },
-        );
+                },
+            );
         let body = serde_json::to_value(&response).unwrap();
         assert_eq!(body["success"], true, "{body}");
         assert_eq!(body["complete"], false, "{body}");
@@ -1341,20 +1347,21 @@ mod tests {
         }))
         .unwrap();
 
-        let response = crate::grep_executor::with_fallback_walk_budget_for_test(
-            Duration::from_millis(50),
-            || {
-                crate::grep_executor::with_fallback_walk_entry_delay_for_test(
+        let response =
+            aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_budget_for_test(
+                Duration::from_millis(50),
+                || {
+                    aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_entry_delay_for_test(
                     Duration::from_millis(80),
                     || {
-                        crate::grep_executor::with_fallback_walk_sort_metadata_delay_for_test(
+                        aft_engine::test_bridge::search_misc::grep_executor::with_fallback_walk_sort_metadata_delay_for_test(
                             Duration::from_secs(6),
                             || handle_glob(&request, &ctx),
                         )
                     },
                 )
-            },
-        );
+                },
+            );
         let body = serde_json::to_value(&response).unwrap();
         assert_eq!(body["success"], true, "{body}");
         assert_eq!(body["complete"], false, "{body}");

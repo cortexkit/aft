@@ -1638,8 +1638,8 @@ mod tests {
         let second = temp.path().join("second.txt");
         fs::write(&first, "first TARGET\n").unwrap();
         fs::write(&second, "second TARGET\n").unwrap();
-        crate::backup::reset_capture_read_count(&first);
-        crate::backup::reset_capture_read_count(&second);
+        aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&first);
+        aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&second);
 
         let ctx = crate::test_context(Box::new(StubProvider), Config::default());
         ctx.checkpoint()
@@ -1657,8 +1657,14 @@ mod tests {
 
         let response = handle_edit_match(&request, &ctx);
         assert!(response.success, "glob edit failed: {:?}", response.data);
-        assert_eq!(crate::backup::capture_read_count(&first), 1);
-        assert_eq!(crate::backup::capture_read_count(&second), 1);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::backup::capture_read_count(&first),
+            1
+        );
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::backup::capture_read_count(&second),
+            1
+        );
 
         let backup = ctx.backup().lock();
         assert_eq!(

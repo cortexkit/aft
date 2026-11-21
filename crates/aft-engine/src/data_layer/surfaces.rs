@@ -310,7 +310,7 @@ pub(crate) fn serve_text_index_for_test(ctx: &AppContext) {
 /// Binds the index store's checkout of `ctx`'s root and waits until its text
 /// index serves, without waiting for the call graph: for a test that holds
 /// the call graph's build to look at a checkout whose text alone is ready.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn serve_text_only_for_test(ctx: &AppContext) {
     serve_text_for_test(ctx, false);
 }

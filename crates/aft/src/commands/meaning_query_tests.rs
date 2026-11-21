@@ -215,7 +215,10 @@ mod tests {
         let embedded = gate.texts_embedded();
         assert!(embedded > 0);
 
-        let held = crate::data_layer::meaning::hold_model_loads_for_test(&root);
+        let held =
+            aft_engine::test_bridge::display_data::data_layer::meaning::hold_model_loads_for_test(
+                &root,
+            );
         assert!(
             ctx.try_release_idle_checkout_views(),
             "the root must be idle"

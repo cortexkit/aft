@@ -460,7 +460,7 @@ fn parent_loading_child_failed_walk_is_a_gap_before_zero_matches() {
 #[test]
 fn parent_loading_child_bounded_walk_keeps_matches_and_reports_a_gap() {
     with_loading_child(|parent, _, _| {
-        crate::grep_executor::with_walk_limit(0, || {
+        aft_engine::test_bridge::search_misc::grep_executor::with_walk_limit(0, || {
             let reply = grep(parent, COMMON);
             assert_gap_leads(&reply, "beta");
             assert_eq!(matched_files(&reply).len(), 2, "{reply:#}");

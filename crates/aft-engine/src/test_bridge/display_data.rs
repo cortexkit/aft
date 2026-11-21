@@ -106,6 +106,12 @@ pub mod late_result_bus {
         crate::late_result_bus::readers::card_wake(body, msg_id).await
     }
 
+    pub mod status {
+        pub fn test_value(session: &str) -> Option<serde_json::Value> {
+            crate::late_result_bus::status::test_value(session)
+        }
+    }
+
     pub mod display {
         pub use crate::late_result_bus::display::ready::ReadyPublisher;
         use crate::late_result_bus::{self, DisplayPublish, Hooks};
@@ -146,6 +152,18 @@ pub mod context {
 
     pub use context::maintenance_probe_fixture::MaintenanceProbeLock;
     pub use context::pending_capture_fixture::PendingCaptureBoundary;
+    pub use context::status_count_fixture::STATUS_COUNT_PROBES;
+
+    pub fn memory_estimate_walks_for_test() -> usize {
+        context::memory_estimate_walks_for_test()
+    }
+
+    pub fn configure_bind_effects_for_test(
+        root: &std::path::Path,
+        session_id: &str,
+    ) -> (usize, usize) {
+        context::configure_bind_effects_for_test(root, session_id)
+    }
 
     pub mod callgraph_test_support {
         pub use crate::context::callgraph_test_support::cold_build_fixture;
@@ -386,3 +404,115 @@ pub fn bind_foreground(
 }
 mod access;
 pub use access::*;
+
+pub mod data_layer {
+    pub mod meaning {
+        use std::path::Path;
+
+        pub use super::super::meaning::fill_with_constant_vectors_for_test;
+
+        pub fn hold_model_loads_for_test(root: &Path) -> impl Drop {
+            crate::data_layer::meaning::hold_model_loads_for_test(root)
+        }
+
+        pub fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
+            crate::data_layer::meaning::fail_model_loads_for_test(root, error)
+        }
+
+        pub fn fill_without_model_for_test(root: &Path, dimensions: usize) -> impl Drop {
+            crate::data_layer::meaning::fill_without_model_for_test(root, dimensions)
+        }
+    }
+
+    pub mod runtime {
+        pub fn hold_builds_for_test(root: &std::path::Path) -> impl Drop {
+            crate::data_layer::runtime::hold_builds_for_test(root)
+        }
+    }
+
+    pub mod surfaces {
+        pub fn serve_text_only_for_test(ctx: &crate::context::AppContext) {
+            crate::data_layer::surfaces::serve_text_only_for_test(ctx);
+        }
+    }
+
+    pub mod text_scope {
+        pub mod test_hooks {
+            pub fn today_only() -> bool {
+                crate::data_layer::text_scope::test_hooks::today_only()
+            }
+        }
+    }
+
+    pub mod content {
+        pub fn parses_of_for_test(source: &[u8]) -> usize {
+            crate::data_layer::content::parses_of_for_test(source)
+        }
+    }
+
+    pub mod callgraph_store_adapter {
+        use crate::callgraph_store::{CallGraphRead, StoreNode};
+        use crate::data_layer::callgraph_store_adapter::{
+            self, StoreAdapterResult, StoreIncompleteNote,
+        };
+
+        pub fn empty_receiver_note(
+            store: &impl CallGraphRead,
+            target: &StoreNode,
+            count: usize,
+            include_tests: bool,
+        ) -> StoreAdapterResult<Option<StoreIncompleteNote>> {
+            callgraph_store_adapter::empty_receiver_note(store, target, count, include_tests)
+        }
+
+        pub fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
+            callgraph_store_adapter::test_filter_note_for_count(count, include_tests)
+        }
+    }
+}
+
+pub mod config_live {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    pub fn staged_sources_empty_for_test() -> bool {
+        crate::config_live::staged_sources_empty_for_test()
+    }
+
+    pub fn enable_config_watches_for_test() {
+        crate::config_live::enable_config_watches_for_test();
+    }
+
+    pub fn with_config_watch_attach_gate<T>(
+        gate: Arc<(Mutex<bool>, Condvar)>,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        crate::config_live::with_config_watch_attach_gate(gate, run)
+    }
+}
+
+pub mod provisional_identity_retry {
+    use std::time::Duration;
+
+    pub fn with_timing_for_test<T>(
+        first_delay: Duration,
+        give_up_after: Duration,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        crate::provisional_identity_retry::with_timing_for_test(first_delay, give_up_after, run)
+    }
+}
+
+pub mod runtime_drain {
+    pub fn install_watcher_phase_commit_gate_for_test(
+        target: std::path::PathBuf,
+    ) -> (
+        crossbeam_channel::Receiver<()>,
+        crossbeam_channel::Sender<()>,
+    ) {
+        crate::runtime_drain::install_watcher_phase_commit_gate(target)
+    }
+}
+
+pub mod database_open {
+    pub use crate::database_open::recorded_open::{recorded_opens_for_test, RecordedOpen};
+}

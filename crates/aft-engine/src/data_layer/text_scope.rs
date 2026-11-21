@@ -39,7 +39,7 @@ pub fn ready_view(ctx: &(impl IndexHost + ?Sized)) -> Option<CheckoutView> {
 }
 
 pub(crate) fn text_view(ctx: &(impl IndexHost + ?Sized)) -> TextView {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::today_only() {
         return TextView::Unavailable;
     }
@@ -99,7 +99,7 @@ impl ViewScope {
                 (path, now)
             })
             .collect();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         test_hooks::note_answer();
         Some(Self {
             view,
@@ -323,7 +323,7 @@ fn modified_at(mtime_ns: i64) -> SystemTime {
 
 /// What tests use to run grep and glob the way they ran before the data
 /// layer, in a process that runs it, and to see whether a call read it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_hooks {
     use std::cell::Cell;
 

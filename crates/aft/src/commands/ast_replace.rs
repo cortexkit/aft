@@ -647,8 +647,10 @@ mod lsp_tests {
             manager.set_extra_env("AFT_FAKE_LSP_DISABLE_PUSH", "1");
             manager.set_extra_env("AFT_FAKE_LSP_ECHO_CHANGES", "1");
             assert_eq!(
-                crate::lsp::manager::settled_lsp(&mut manager, |startup_manager| startup_manager
-                    .ensure_file_open(&file, &ctx.config()))
+                aft_engine::test_bridge::search_misc::lsp::manager::settled_lsp(
+                    &mut manager,
+                    |startup_manager| startup_manager.ensure_file_open(&file, &ctx.config())
+                )
                 .unwrap()
                 .server_keys
                 .len(),

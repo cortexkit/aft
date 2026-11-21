@@ -551,7 +551,7 @@ mod audit_regressions {
                 ..Default::default()
             },
         );
-        crate::backup::reset_capture_read_count(&path);
+        aft_engine::test_bridge::search_misc::backup::reset_capture_read_count(&path);
         let request: RawRequest = serde_json::from_value(serde_json::json!({"id": "binary-undo", "command": "write", "file": path, "content": "after"})).unwrap();
         let response = handle_write(&request, &ctx);
         assert!(response.success, "{response:?}");
@@ -560,7 +560,10 @@ mod audit_regressions {
         // Before reuse, the version check proves the file is unchanged: by stat
         // identity on Unix, and on Windows, where that token is unavailable, by
         // comparing the file's full bytes, which is not a capture read.
-        assert_eq!(crate::backup::capture_read_count(&path), 1);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::backup::capture_read_count(&path),
+            1
+        );
         let mut store = ctx.backup().lock();
         let history = store.history(request.session(), &path);
         assert_eq!(history.len(), 1);

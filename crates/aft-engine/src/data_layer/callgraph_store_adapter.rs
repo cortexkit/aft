@@ -137,7 +137,7 @@ pub struct StoreIncompleteNote {
     pub incomplete_reason: String,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn empty_receiver_note(
     store: &impl CallGraphRead,
     target: &StoreNode,

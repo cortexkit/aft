@@ -4520,12 +4520,14 @@ fn build_health_diagnostic_rollup_from_actors(
     // Shared bases and semantic arenas are measured once for the compact
     // rollup; a rollup that also measures the census reuses that measurement.
     let shared_memory = crate::memory_census::shared_process_memory();
-    let memory = memory_rollup_metrics(Some(crate::memory_census::rollup_snapshot_with_shared(
-        "ready",
-        memory_roots,
-        allocator.clone(),
-        &shared_memory,
-    )));
+    let memory = memory_rollup_metrics(Some(
+        aft_engine::test_bridge::search_misc::memory_census::rollup_snapshot_with_shared(
+            "ready",
+            memory_roots,
+            allocator.clone(),
+            &shared_memory,
+        ),
+    ));
     let census_snapshot = measure_census.then(|| {
         crate::memory_census::snapshot_uncapped_with_shared(
             "ready",
@@ -9082,12 +9084,14 @@ mod tests {
         let cache = HealthRollupCache::new();
         let app = crate::test_app();
 
-        let before_contended_attempt = crate::context::memory_estimate_walks_for_test();
+        let before_contended_attempt =
+            aft_engine::test_bridge::display_data::context::memory_estimate_walks_for_test();
         executor.hold_state_lock_for_test(|| {
             cache.refresh(&executor, &app);
         });
         assert_eq!(
-            crate::context::memory_estimate_walks_for_test() - before_contended_attempt,
+            aft_engine::test_bridge::display_data::context::memory_estimate_walks_for_test()
+                - before_contended_attempt,
             0,
             "a contended refresh walked the root's indexes"
         );
@@ -9095,7 +9099,8 @@ mod tests {
         let epoch = Instant::now();
         let refresh_at = |now_ms| {
             cache.clock_ms.store(now_ms, Ordering::Relaxed);
-            let walks_before = crate::context::memory_estimate_walks_for_test();
+            let walks_before =
+                aft_engine::test_bridge::display_data::context::memory_estimate_walks_for_test();
             let census_before = cache.census_builds_for_test();
             aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
                 epoch + Duration::from_millis(now_ms),
@@ -9106,7 +9111,8 @@ mod tests {
             // root_count does not say whether this refresh walked any indexes.
             assert_eq!(rollup.metrics["root_count"], 1);
             (
-                crate::context::memory_estimate_walks_for_test() - walks_before,
+                aft_engine::test_bridge::display_data::context::memory_estimate_walks_for_test()
+                    - walks_before,
                 cache.census_builds_for_test() - census_before,
                 rollup.memory_census_at_ms,
             )
@@ -9359,7 +9365,7 @@ mod tests {
     #[test]
     fn rollup_reuses_an_unchanged_roots_memory_walk_and_reports_its_age() {
         let ctx = test_ctx();
-        let walks = crate::context::memory_estimate_walks_for_test;
+        let walks = aft_engine::test_bridge::display_data::context::memory_estimate_walks_for_test;
         let measure = || {
             let before = walks();
             let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
@@ -9392,11 +9398,13 @@ mod tests {
             "a new walk must reset the age: {changed_age} >= {reused_age}"
         );
         let (_, rollup) = ctx.memory_root_snapshot_and_rollup();
-        let rendered = memory_rollup_metrics(Some(crate::memory_census::rollup_snapshot(
-            "ready",
-            std::collections::BTreeMap::from([("/rollup-shape".to_string(), rollup)]),
-            crate::memory::AllocatorObservation::measure(),
-        )));
+        let rendered = memory_rollup_metrics(Some(
+            aft_engine::test_bridge::search_misc::memory_census::rollup_snapshot(
+                "ready",
+                std::collections::BTreeMap::from([("/rollup-shape".to_string(), rollup)]),
+                crate::memory::AllocatorObservation::measure(),
+            ),
+        ));
         assert!(
             rendered["roots"]["/rollup-shape"]["memory_measured_age_ms"].is_u64(),
             "the per-root memory row must carry its age: {rendered}"
@@ -9463,7 +9471,8 @@ mod tests {
                 cache.refresh_for_test(&executor, &app);
             },
         );
-        let before = crate::inspect::cache::aggregate_memory_walks_for_test();
+        let before =
+            aft_engine::test_bridge::search_misc::inspect::cache::aggregate_memory_walks_for_test();
         cache.clock_ms.store(3_000, Ordering::Relaxed);
         aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
             now + Duration::from_secs(3),
@@ -9472,7 +9481,8 @@ mod tests {
             },
         );
         assert_eq!(
-            crate::inspect::cache::aggregate_memory_walks_for_test() - before,
+            aft_engine::test_bridge::search_misc::inspect::cache::aggregate_memory_walks_for_test()
+                - before,
             0,
             "a quiet 200-root tick rebuilt retained inspect payload estimates",
         );
@@ -9492,7 +9502,8 @@ mod tests {
                 json!({"items": [{"message": "a changed diagnostic with a longer message"}]}),
             )
             .unwrap();
-        let before = crate::inspect::cache::aggregate_memory_walks_for_test();
+        let before =
+            aft_engine::test_bridge::search_misc::inspect::cache::aggregate_memory_walks_for_test();
         cache.clock_ms.store(6_000, Ordering::Relaxed);
         aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
             now + Duration::from_secs(6),
@@ -9501,7 +9512,8 @@ mod tests {
             },
         );
         assert_eq!(
-            crate::inspect::cache::aggregate_memory_walks_for_test() - before,
+            aft_engine::test_bridge::search_misc::inspect::cache::aggregate_memory_walks_for_test()
+                - before,
             1,
             "only the changed root may rebuild its inspect estimate"
         );
@@ -9577,7 +9589,7 @@ mod tests {
                         (format!("/parity/root-{index:03}"), row)
                     })
                     .collect();
-                crate::memory_census::rollup_snapshot_with_shared(
+                aft_engine::test_bridge::search_misc::memory_census::rollup_snapshot_with_shared(
                     "ready",
                     roots,
                     allocator.clone(),
@@ -10834,9 +10846,9 @@ mod tests {
         let executor = Executor::new();
         let (_dir, root) = test_root("semantic-query-embed-health");
         let ctx = test_ctx();
-        crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 120, false);
-        crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 200, true);
-        crate::semantic_index::record_query_embed_observation_for_test(root.as_path(), 900, false);
+        aft_engine::test_bridge::search_misc::semantic_index::record_query_embed_observation_for_test(root.as_path(), 120, false);
+        aft_engine::test_bridge::search_misc::semantic_index::record_query_embed_observation_for_test(root.as_path(), 200, true);
+        aft_engine::test_bridge::search_misc::semantic_index::record_query_embed_observation_for_test(root.as_path(), 900, false);
         assert!(executor.register_actor(root.clone(), ctx));
         let app = crate::test_app();
         let metrics = DispatchPathMetrics::new();
@@ -11413,7 +11425,7 @@ mod tests {
             "roots": roots,
             // Every large-read site at its widest, so the entry's worst
             // size is part of the budget this test checks.
-            "large_reads": crate::large_read::widest_health_for_test(),
+            "large_reads": aft_engine::test_bridge::search_misc::large_read::widest_health_for_test(),
         })
         .as_object()
         .expect("metrics object")
@@ -11456,7 +11468,7 @@ mod tests {
         // yield before it, even with every site at its widest.
         assert_eq!(
             metrics["large_reads"],
-            crate::large_read::widest_health_for_test()
+            aft_engine::test_bridge::search_misc::large_read::widest_health_for_test()
         );
         assert_eq!(metrics["root_count"], 71);
         assert!(metrics["embedding_backend"].is_object());

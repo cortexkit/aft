@@ -958,7 +958,9 @@ mod startup_storage_tests {
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         let mut startup = true;
         let worker = StandingWorker::start(move || {
-            let before = crate::standing_roots::reconciliation_work_for_test();
+            let before =
+                aft_engine::test_bridge::search_misc::standing_roots::reconciliation_work_for_test(
+                );
             let git_before = git_commands();
             if startup {
                 actor.reconcile_at_startup();
@@ -966,7 +968,9 @@ mod startup_storage_tests {
             } else {
                 actor.tick();
             }
-            let after = crate::standing_roots::reconciliation_work_for_test();
+            let after =
+                aft_engine::test_bridge::search_misc::standing_roots::reconciliation_work_for_test(
+                );
             ack_tx
                 .send(std::array::from_fn::<_, 7, _>(|i| {
                     if i == 6 {
@@ -1059,7 +1063,10 @@ mod tests {
         }];
         drop(config);
         crate::developer_tools::with_git_usable_for_test(false, || {
-            let resolutions = || crate::standing_roots::reconciliation_work_for_test()[4];
+            let resolutions = || {
+                aft_engine::test_bridge::search_misc::standing_roots::reconciliation_work_for_test()
+                    [4]
+            };
             let before = resolutions();
             let now = std::time::Instant::now();
             for tick in 0..240 {

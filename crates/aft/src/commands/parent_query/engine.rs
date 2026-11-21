@@ -63,7 +63,7 @@ fn fan_out_children<T: Sync, U: Sync, R: Send>(
 /// layer: always, unless a test hook disables that path for this thread.
 fn data_layer_answers() -> bool {
     #[cfg(test)]
-    if crate::data_layer::text_scope::test_hooks::today_only() {
+    if aft_engine::test_bridge::display_data::data_layer::text_scope::test_hooks::today_only() {
         return false;
     }
     true
