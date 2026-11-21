@@ -212,7 +212,9 @@ impl Fixture {
     }
 }
 
-#[tokio::test(start_paused = true)]
+// This test exercises real inventory reads and process cleanup as well as retry
+// timers. Keep the frame and cleanup deadlines on the same wall clock.
+#[tokio::test]
 async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
     let old = named("prefrontal");
     let mut f = Fixture::new(&old).await;
@@ -306,9 +308,6 @@ async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
         described(ScopeStatus::Ended, true, true),
     )
     .await;
-    // Let the cleanup deadline use real time: database cleanup and process
-    // termination run on worker threads outside the paused Tokio runtime.
-    tokio::time::resume();
     f.killed().await;
     assert_eq!(f.task_status(&second), BgTaskStatus::Killed);
     assert_eq!(f.ctx.bash_background().with_live_scope(&old, || ()), None);
