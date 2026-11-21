@@ -366,6 +366,7 @@ pub struct RelayCall<'a> {
     pub route_scopes: &'a RouteScopes,
 }
 
+mod read_path_template;
 mod reservation;
 
 /// How a call reached plexus, for the relay log line: under the session's
@@ -776,6 +777,18 @@ pub(crate) async fn read_validated_request<T: RelayTransport>(
     // AFT neither reads nor reconstructs the bot identity in that stamp.
     let selector = scope_selector(stamp);
     let body = read_call(parsed, false);
+    if let crate::gh_shim::read_contract::Request::Get { repository, args } = parsed {
+        // This records admitted forwarding attempts, so a retried read can
+        // appear more than once.
+        let separator = if args.path.is_empty() { "" } else { "/" };
+        crate::slog_info!(
+            "gh relay read: GET {}",
+            read_path_template::read_path_template(&format!(
+                "/repos/{repository}{separator}{}",
+                args.path
+            ))
+        );
+    }
     let reply = match transport
         .plexus(
             &redeemed.project_root,
