@@ -1396,7 +1396,7 @@ pub fn read_edit_bytes(path: &Path) -> std::io::Result<(std::sync::Arc<[u8]>, Ed
     let (bytes, capture) = match crate::backup::CapturedRegularFile::read(path)? {
         Some(capture) => (capture.shared_bytes(), Some(capture)),
         None => {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
             (std::fs::read(path)?.into(), None)
         }
@@ -1474,7 +1474,7 @@ impl ObservedFinalText {
 }
 
 pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
     std::fs::read_to_string(path)
 }
@@ -2611,7 +2611,7 @@ fn parse_captured_syntax_with_lang(
     if lang == LangId::Markdown {
         return None;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     A03_SYNTAX_PARSES.with(|count| count.set(count.get() + 1));
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Syntax);
     crate::parser::parse_source_with_cached_parser(path, source, lang)
@@ -2811,7 +2811,7 @@ pub(crate) fn first_syntax_error_line(mut node: tree_sitter::Node<'_>) -> Option
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     pub(crate) static LINE_OFFSET_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EXCERPT_COPIED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2822,8 +2822,8 @@ thread_local! {
     pub(crate) static FORCE_MODE_RESTORE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     pub(crate) static A03_DIFF_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static A03_LINE_INDEX_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static A03_HANDLER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static A03_SYNTAX_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static A03_HANDLER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static A03_SYNTAX_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]

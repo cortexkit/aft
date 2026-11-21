@@ -7030,7 +7030,10 @@ mod tests {
     fn failed_index_store_roots_are_named_in_path_order_with_reasons_up_to_five() {
         use crate::data_layer::surfaces::reason;
         let healthy = data_store_health(None, None);
-        let not_bound = data_store_health(Some(reason::NOT_BOUND), None);
+        let not_bound = data_store_health(
+            Some(aft_engine::test_bridge::display_data::surfaces::NOT_BOUND),
+            None,
+        );
         let bind = data_store_health(Some(reason::BIND_FAILED), None);
         let newer = data_store_health(Some(reason::REQUIRES_NEWER_READER), None);
         let build = data_store_health(Some(reason::BUILD_FAILED), Some(("build", false)));
@@ -9281,7 +9284,7 @@ mod tests {
             cache.clock_ms.store(now_ms, Ordering::Relaxed);
             let walks_before = crate::context::memory_estimate_walks_for_test();
             let census_before = cache.census_builds_for_test();
-            crate::context::with_memory_walk_clock_for_test(
+            aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
                 epoch + Duration::from_millis(now_ms),
                 || cache.refresh_for_test(&executor, &app),
             );
@@ -9358,19 +9361,21 @@ mod tests {
         // must not turn the baseline into an incomplete census scheduled for retry.
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            let memory = crate::data_layer::surfaces::memory_estimate(&ctx).unwrap();
+            let memory =
+                aft_engine::test_bridge::display_data::surfaces::shared_memory_estimate(&ctx)
+                    .unwrap();
             assert_ne!(
-                memory.shared.counts.get("callgraph_engine_started"),
+                memory.counts.get("callgraph_engine_started"),
                 Some(&0),
                 "the retained engine disappeared before the baseline census"
             );
-            if memory.shared.bytes_status == "estimated" {
+            if memory.bytes_status == "estimated" {
                 break;
             }
             assert!(
                 Instant::now() < deadline,
                 "baseline census stayed incomplete: {:?}",
-                memory.shared
+                memory
             );
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -9381,14 +9386,15 @@ mod tests {
         let epoch = Instant::now();
         let refresh_at = |seconds| {
             cache.clock_ms.store(seconds * 1000, Ordering::Relaxed);
-            crate::context::with_memory_walk_clock_for_test(
+            aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
                 epoch + Duration::from_secs(seconds),
                 || cache.refresh_for_test(&executor, &app),
             );
         };
         refresh_at(0);
         let memory_epoch = checkout.checkout().memory_epoch();
-        let walks = crate::data_layer::runtime::memory_figure_walks_for_test();
+        let walks =
+            aft_engine::test_bridge::display_data::memory_profile::memory_figure_walks_for_test();
         for tick in 1..=40 {
             refresh_at(tick * 3);
         }
@@ -9398,7 +9404,7 @@ mod tests {
             "the fixture changed memory after its baseline walk"
         );
         assert_eq!(
-            crate::data_layer::runtime::memory_figure_walks_for_test(),
+            aft_engine::test_bridge::display_data::memory_profile::memory_figure_walks_for_test(),
             walks,
             "health walked the unchanged engine maps again"
         );
@@ -9638,14 +9644,20 @@ mod tests {
         }
         let now = Instant::now();
         cache.clock_ms.store(0, Ordering::Relaxed);
-        crate::context::with_memory_walk_clock_for_test(now, || {
-            cache.refresh_for_test(&executor, &app);
-        });
+        aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
+            now,
+            || {
+                cache.refresh_for_test(&executor, &app);
+            },
+        );
         let before = crate::inspect::cache::aggregate_memory_walks_for_test();
         cache.clock_ms.store(3_000, Ordering::Relaxed);
-        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(3), || {
-            cache.refresh_for_test(&executor, &app);
-        });
+        aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
+            now + Duration::from_secs(3),
+            || {
+                cache.refresh_for_test(&executor, &app);
+            },
+        );
         assert_eq!(
             crate::inspect::cache::aggregate_memory_walks_for_test() - before,
             0,
@@ -9669,9 +9681,12 @@ mod tests {
             .unwrap();
         let before = crate::inspect::cache::aggregate_memory_walks_for_test();
         cache.clock_ms.store(6_000, Ordering::Relaxed);
-        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(6), || {
-            cache.refresh_for_test(&executor, &app);
-        });
+        aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
+            now + Duration::from_secs(6),
+            || {
+                cache.refresh_for_test(&executor, &app);
+            },
+        );
         assert_eq!(
             crate::inspect::cache::aggregate_memory_walks_for_test() - before,
             1,
@@ -11053,7 +11068,7 @@ mod tests {
         ));
         ctx.set_canonical_cache_root(root.as_path().to_path_buf());
         let until = crate::semantic_index::unix_millis_now() + 1_399_000;
-        crate::synapse_embed::share_lane_pause(
+        aft_engine::test_bridge::search_misc::share_lane_pause(
             root.as_path(),
             &crate::synapse_embed::LanePause {
                 lane_id: "health-planned-lane".into(),
@@ -11138,7 +11153,7 @@ mod tests {
                 entries_done: None,
                 entries_total: None,
             };
-        crate::semantic_index::record_embedding_backend_build_failure_for_test(
+        aft_engine::test_bridge::search_misc::semantic::record_embedding_backend_build_failure_for_test(
             root.as_path(),
             "connection refused",
         );
@@ -11250,7 +11265,6 @@ mod tests {
         large_reads: Value,
         fixed_roots: bool,
     ) -> (u64, serde_json::Map<String, Value>) {
-        use crate::data_layer::surfaces::{MeaningCoverage, MeaningPlane, MeaningReport};
         let executor = Executor::new();
         let (_dir, root) = test_root("meaning-fill-health-budget");
         let ctx = test_ctx();
@@ -11311,33 +11325,7 @@ mod tests {
         retain_fixture_process_rows(metrics, &roots);
         metrics.insert("large_reads".into(), large_reads);
         let baseline = refresh_metrics_bytes(metrics) as u64;
-        let fill = MeaningReport {
-            plane: MeaningPlane::Serving {
-                complete: false,
-                refreshing: false,
-                coverage: MeaningCoverage {
-                    files: 123_456,
-                    files_skipped: 0,
-                    files_embedded: 100_000,
-                    files_too_large: 1_234,
-                    files_failed: 1_234,
-                    files_luau_outline_failed: 0,
-                    files_pending: 20_988,
-                    files_past_cap: 99_999,
-                    chunks: 9_999_999,
-                    chunks_embedded: 8_888_888,
-                    chunks_failed: 12_345,
-                },
-                error: Some("embedding backend: the request timed out after 30 s".into()),
-            },
-            filling: true,
-            waiting: true,
-            times: crate::data_layer::meaning::FillTimes {
-                started_at_ms: Some(1_790_000_000_000),
-                stored_at_ms: Some(1_790_000_600_000),
-            },
-        };
-        let fill = serde_json::to_value(fill.health()).unwrap();
+        let fill = aft_engine::test_bridge::display_data::surfaces::largest_meaning_fill_health();
         let semantic = report["roots"][0]["semantic_index"]
             .as_object_mut()
             .expect("the root's semantic_index");

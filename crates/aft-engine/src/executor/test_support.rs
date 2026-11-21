@@ -1,6 +1,6 @@
 use super::{Executor, ExecutorConfig};
 
-pub(crate) fn test_executor(
+pub fn test_executor(
     pool_size: usize,
     read_cap: usize,
     actor_cap: usize,

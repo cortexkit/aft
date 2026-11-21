@@ -1043,7 +1043,7 @@ type ShutdownResult = (Option<ServerKey>, u32, Result<(), LspError>);
 pub struct LspManager {
     capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
     capacity_slots: HashMap<ServerKey, Arc<()>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     spawned_hook: Option<Arc<dyn Fn(u32) + Send + Sync>>,
@@ -1394,7 +1394,7 @@ impl LspManager {
         Self {
             capacity: Arc::default(),
             capacity_slots: HashMap::new(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             spawn_hook: None,
             #[cfg(test)]
             spawned_hook: None,
@@ -4723,25 +4723,6 @@ impl LspManager {
             .expect("LSP event receiver should remain connected");
     }
 
-    // Used only by the Unix-gated child-spawning test modules.
-    #[cfg(all(test, unix))]
-    pub(crate) fn event_sender_for_test(&self) -> LspEventSender {
-        LspEventSender::Managed {
-            sender: self.event_tx.clone(),
-            instance: ServerInstanceId::next(),
-        }
-    }
-
-    // Used only by the Unix-gated child-spawning test modules.
-    #[cfg(all(test, unix))]
-    pub(crate) fn insert_client_for_test(&mut self, client: LspClient) {
-        let key = ServerKey {
-            kind: client.kind(),
-            root: client.root().to_path_buf(),
-        };
-        self.clients.insert(key, client);
-    }
-
     #[doc(hidden)]
     pub fn pending_event_count_for_test(&self) -> usize {
         self.event_rx.len() + self.ready_startup_events.len()
@@ -8009,7 +7990,7 @@ impl LspManager {
 
         Ok(PreparedSpawn {
             start_signal: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             spawn_hook: self.spawn_hook.clone(),
             #[cfg(test)]
             spawned_hook: self.spawned_hook.clone(),
@@ -8942,7 +8923,7 @@ fn diagnostic_path_candidates(file: &Path) -> Vec<PathBuf> {
 /// from `LspManager` state so the slow part can run without the manager lock.
 struct PreparedSpawn {
     start_signal: Option<Arc<StartSignal>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     spawn_hook: Option<Arc<dyn Fn() + Send + Sync>>,
     #[cfg(test)]
     spawned_hook: Option<Arc<dyn Fn(u32) + Send + Sync>>,
@@ -9061,7 +9042,7 @@ impl PreparedSpawn {
     /// Start the process and run the `initialize` handshake. Touches no
     /// manager state, so it runs without the manager lock.
     fn run(mut self, initialize_timeout: Option<Duration>) -> Result<LspClient, SpawnFailure> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(hook) = &self.spawn_hook {
             hook();
         }
@@ -10678,6 +10659,10 @@ fn env_binary_override_from(
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]
 pub(crate) mod regression_tests;
+
+#[cfg(all(unix, any(test, feature = "test-support")))]
+#[path = "startup_fixture.rs"]
+pub(crate) mod startup_fixture;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]

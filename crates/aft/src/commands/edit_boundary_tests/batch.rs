@@ -2,8 +2,9 @@ mod tests {
     use crate::config::Config;
     use crate::edit::{
         attach_edit_diff, build_unbounded_unified_diff, read_edit_source,
-        write_format_validate_observed, A03_HANDLER_READS, A03_SYNTAX_PARSES,
+        write_format_validate_observed,
     };
+    use aft_engine::test_bridge::search_misc::{A03_HANDLER_READS, A03_SYNTAX_PARSES};
 
     #[cfg(unix)]
     #[test]

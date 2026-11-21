@@ -147,7 +147,7 @@ impl Tables {
     /// The table of the record under `key`, when some checkout of the
     /// process took it from that record and it is still held.
     pub(super) fn get(&self, key: RecordKey) -> Option<Table> {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "test-support")))]
         if sharing_off() {
             return None;
         }
@@ -181,7 +181,7 @@ impl Tables {
         symbols: Vec<Symbol>,
         content_hash: blake3::Hash,
     ) -> (Arc<Vec<Symbol>>, bool) {
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "test-support")))]
         if sharing_off() {
             return (Arc::new(symbols), false);
         }
@@ -238,20 +238,20 @@ impl Tables {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 thread_local! {
     /// Set by [`without_sharing`] on this thread.
     static SHARING_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 fn sharing_off() -> bool {
     SHARING_OFF.with(std::cell::Cell::get)
 }
 
 /// Runs `work` on this thread as if no table were shared: nothing is
 /// found here and nothing is listed, as before tables were shared.
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 pub(crate) fn without_sharing<T>(work: impl FnOnce() -> T) -> T {
     SHARING_OFF.with(|off| off.set(true));
     let result = work();

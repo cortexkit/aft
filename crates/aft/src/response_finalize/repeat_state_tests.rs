@@ -1,8 +1,9 @@
 mod tests {
     use std::time::{Duration, Instant};
 
-    use crate::repeat_state::{RepeatBreaker, KEY_IDLE_EXPIRY};
+    use crate::repeat_state::RepeatBreaker;
     use crate::response_finalize::repeat_breaker::RepeatCall;
+    use aft_engine::test_bridge::search_misc::KEY_IDLE_EXPIRY;
 
     #[test]
     fn audit_growth_idle_sessions_are_pruned_without_dropping_the_current_session() {

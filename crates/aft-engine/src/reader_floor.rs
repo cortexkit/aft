@@ -1373,7 +1373,7 @@ pub(crate) mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn prepare_cache_root_for_test(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
@@ -1387,7 +1387,7 @@ pub(crate) fn prepare_cache_root_for_test(
 }
 
 /// Register storage-format reader-version checks before testing obsolete-cache deletion.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn clean_old_for_test(
     tiers: &[crate::config_resolve::ConfigTier],
     storage: &std::path::Path,

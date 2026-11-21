@@ -30,7 +30,7 @@ fn context(root: &Path, trigram: bool) -> AppContext {
 fn glob_all(root: &Path, use_index: bool) -> Vec<String> {
     let ctx = context(root, use_index);
     if use_index {
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
     }
     let response =
         crate::commands::glob::handle_glob(&request("glob", json!({ "pattern": "**/*" })), &ctx);

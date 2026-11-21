@@ -149,13 +149,16 @@ pub(crate) async fn announce(
     (hooks.announce)(id, pull_bytes, publish).await
 }
 
-pub(crate) trait ReadyPublisher {
-    fn ready(
-        &self,
-        id: &str,
-        bytes: Vec<u8>,
-    ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
+pub(crate) mod ready {
+    pub trait ReadyPublisher {
+        fn ready(
+            &self,
+            id: &str,
+            bytes: Vec<u8>,
+        ) -> impl std::future::Future<Output = Result<(), &'static str>> + Send;
+    }
 }
+use ready::ReadyPublisher;
 
 impl ReadyPublisher for BusClient {
     async fn ready(&self, id: &str, bytes: Vec<u8>) -> Result<(), &'static str> {

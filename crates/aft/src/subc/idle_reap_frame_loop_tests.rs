@@ -9,7 +9,7 @@
 
 use super::test_support::{test_ctx, test_root};
 use super::*;
-use crate::context::pending_restore_work;
+use aft_engine::test_bridge::display_data::context::pending_restore_work;
 use std::collections::BTreeSet;
 
 type PendingSnapshot = (BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool);

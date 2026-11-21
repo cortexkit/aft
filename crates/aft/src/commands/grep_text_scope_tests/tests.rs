@@ -11,9 +11,11 @@ use crate::data_layer::checkout::{Checkout, CheckoutView, DataLayer};
 use crate::data_layer::text_scope::ViewScope;
 use crate::pattern_compile::{compile, CompileOpts, CompileResult, CompiledPattern};
 use crate::search_index::{
-    decompose_grep_pattern, sort_paths_by_cached_mtime_desc, GrepResult, GrepScanOrder,
-    PathFilters, SearchIndex, SearchIndexSnapshot,
+    sort_paths_by_cached_mtime_desc, GrepResult, GrepScanOrder, PathFilters, SearchIndex,
+    SearchIndexSnapshot,
 };
+
+use aft_engine::test_bridge::search_misc::decompose_grep_pattern;
 
 /// A checkout under construction: its root, its store, and the next
 /// modification time to give a file, so files order by when they were

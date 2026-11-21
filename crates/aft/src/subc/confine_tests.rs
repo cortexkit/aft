@@ -903,7 +903,10 @@ fn confined_walks_refuse_a_starting_path_outside_the_fence() {
         }
         // No walk listed anything under a refused start: a walk that did
         // would have met entries the read policy denies and counted them.
-        assert_eq!(confinement::denied_count(), 0);
+        assert_eq!(
+            aft_engine::test_bridge::display_data::read_fence::denied_count(),
+            0
+        );
         // The pinned root itself still starts every walk.
         assert!(confinement::check_walk_root("confine-walk-start", &f.pin).is_ok());
         assert!(!glob(&f.pin).0.is_empty());
@@ -1043,7 +1046,7 @@ fn read_on_filesystem_helper(f: &Fixture, input: &str) -> Response {
             crate::bounded_io::run(&f.pin, None, move |_| {
                 assert_ne!(std::thread::current().id(), caller_thread);
                 assert!(
-                    confinement::for_request(&request.id),
+                    aft_engine::test_bridge::display_data::read_fence::for_request(&request.id),
                     "filesystem helper lost the confinement fence"
                 );
                 assert!(helper_ctx.request_force_restrict(&request.id));

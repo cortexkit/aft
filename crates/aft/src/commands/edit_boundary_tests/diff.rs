@@ -1,18 +1,18 @@
 #[cfg(test)]
 mod diff_budget_tests {
     use crate::edit::{
-        attach_edit_diff, attach_mutation_diff, attach_preview_diff, BoundedDiffText, DiffBudget,
+        attach_edit_diff, attach_mutation_diff, attach_preview_diff, DiffBudget,
         DIFF_OMITTED_NOTICE, DIFF_RESPONSE_BUDGET,
+    };
+    use aft_engine::test_bridge::search_misc::{
+        diff_budget_omitted, diff_budget_remaining, set_diff_budget_remaining, BoundedDiffText,
     };
     use serde_json::json;
     use std::fmt::Write;
 
     #[test]
     fn diff_budget_writer_stops_the_stream_before_allocating_large_chunks() {
-        let mut sink = BoundedDiffText {
-            text: String::new(),
-            limit: 16,
-        };
+        let mut sink = BoundedDiffText::new(16);
         let mut visited = 0;
         let rendered = (0..1_000_000).try_for_each(|_| {
             visited += 1;
@@ -20,10 +20,10 @@ mod diff_budget_tests {
         });
         assert!(rendered.is_err());
         assert_eq!(visited, 3);
-        assert_eq!(sink.text, "1234567812345678");
-        let capacity = sink.text.capacity();
+        assert_eq!(sink.text(), "1234567812345678");
+        let capacity = sink.text().capacity();
         assert!(sink.write_str(&"x".repeat(1_000_000)).is_err());
-        assert_eq!(sink.text.capacity(), capacity);
+        assert_eq!(sink.text().capacity(), capacity);
     }
 
     #[test]
@@ -90,10 +90,10 @@ mod diff_budget_tests {
         let patch = budget.render("small.txt", "old\r\n", "é\n").unwrap();
         assert_eq!(patch, "Index: small.txt\n===================================================================\n--- small.txt\n+++ small.txt\n@@ -1 +1 @@\n-old\r\n+é\n");
         let mut budget = DiffBudget::new(2);
-        budget.remaining = patch.len() * 2;
+        set_diff_budget_remaining(&mut budget, patch.len() * 2);
         assert_eq!(budget.render("small.txt", "old\r\n", "é\n").unwrap(), patch);
-        assert_eq!(budget.remaining, 0);
+        assert_eq!(diff_budget_remaining(&budget), 0);
         budget.separator(&mut String::new(), "\n");
-        assert!(budget.omitted);
+        assert!(diff_budget_omitted(&budget));
     }
 }

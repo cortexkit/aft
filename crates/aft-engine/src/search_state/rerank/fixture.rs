@@ -38,7 +38,7 @@ impl From<&RerankFingerprint> for PackFingerprint {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct PackScore {
+pub struct PackScore {
     pub(crate) query: String,
     pub(crate) text_sha256: String,
     pub(crate) score: f32,
@@ -47,7 +47,7 @@ pub(crate) struct PackScore {
 /// On-disk pack. Scores are kept sorted by (query, text hash) so a re-record
 /// of the same inputs produces the same bytes.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct FixturePack {
+pub struct FixturePack {
     pub(crate) version: u32,
     pub(crate) fingerprint: PackFingerprint,
     pub(crate) text_policy: String,
@@ -55,7 +55,7 @@ pub(crate) struct FixturePack {
 }
 
 impl FixturePack {
-    pub(crate) fn empty(fingerprint: &RerankFingerprint) -> Self {
+    pub fn empty(fingerprint: &RerankFingerprint) -> Self {
         Self {
             version: PACK_VERSION,
             fingerprint: fingerprint.into(),
@@ -64,7 +64,7 @@ impl FixturePack {
         }
     }
 
-    pub(crate) fn load(path: &Path) -> Result<Self, String> {
+    pub fn load(path: &Path) -> Result<Self, String> {
         super::note_io();
         let bytes = std::fs::read(path)
             .map_err(|error| format!("read rerank pack {}: {error}", path.display()))?;
@@ -118,13 +118,13 @@ pub(crate) fn text_sha256(text: &str) -> String {
 }
 
 /// Serves scores from a pack and nothing else.
-pub(crate) struct FixtureBackend {
+pub struct FixtureBackend {
     fingerprint: RerankFingerprint,
     scores: HashMap<(String, String), f32>,
 }
 
 impl FixtureBackend {
-    pub(crate) fn from_pack(pack: &FixturePack) -> Self {
+    pub fn from_pack(pack: &FixturePack) -> Self {
         Self {
             // The recorded backend and model stay visible in the fingerprint,
             // so an order memoized from a pack never collides with a live one.
@@ -200,10 +200,7 @@ pub(crate) struct RecordingBackend {
     write_lock: Mutex<()>,
 }
 
-pub(crate) fn recording(
-    inner: Arc<dyn RerankBackend>,
-    pack_path: PathBuf,
-) -> Arc<dyn RerankBackend> {
+pub fn recording(inner: Arc<dyn RerankBackend>, pack_path: PathBuf) -> Arc<dyn RerankBackend> {
     static RECORDERS: OnceLock<
         Mutex<HashMap<(PathBuf, RerankFingerprint), Arc<RecordingBackend>>>,
     > = OnceLock::new();

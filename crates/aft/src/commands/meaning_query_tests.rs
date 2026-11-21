@@ -1,15 +1,14 @@
 mod tests {
     use std::path::Path;
-    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     use serde_json::{json, Value};
 
     use crate::config::{SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
-    use crate::data_layer::meaning_query::test_support::serve;
     use crate::data_layer::meaning_query::DataSemantic;
     use crate::protocol::RawRequest;
+    use aft_engine::test_bridge::display_data::meaning_query::serve;
 
     fn write(root: &Path, path: &str, text: &str) {
         let path = root.join(path);
@@ -197,7 +196,7 @@ mod tests {
                 .and_then(|data| data.serving().cloned())
                 .filter(|meaning| meaning.complete())
         });
-        let embedded = gate.texts.load(Ordering::SeqCst);
+        let embedded = gate.texts_embedded();
         assert!(embedded > 0);
 
         let held = crate::data_layer::meaning::hold_model_loads_for_test(&root);
@@ -232,7 +231,7 @@ mod tests {
                 .filter(|meaning| meaning.complete())
         });
         assert_eq!(
-            gate.texts.load(Ordering::SeqCst),
+            gate.texts_embedded(),
             embedded,
             "reading the plane back embedded files again"
         );
@@ -281,14 +280,14 @@ mod tests {
             "{filled:?}"
         );
         assert!(filled.chunks >= 300, "{filled:?}");
-        let embedded = gate.texts.load(Ordering::SeqCst);
+        let embedded = gate.texts_embedded();
         assert!(embedded >= 300, "{embedded} texts embedded");
 
         let again = crate::data_layer::surfaces::fill_root(&root, storage.path(), &config)
             .expect("the second fill");
         assert_eq!(again, filled);
         assert_eq!(
-            gate.texts.load(Ordering::SeqCst),
+            gate.texts_embedded(),
             embedded,
             "the second fill embedded files again"
         );

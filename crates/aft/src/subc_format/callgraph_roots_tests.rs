@@ -1,11 +1,12 @@
 mod tests {
-    use crate::data_layer::callgraph_roots::{
-        normalize, rust_program_roots, summary, tag, RootKind,
-    };
+    use crate::data_layer::callgraph_roots::{summary, tag, RootKind};
     use crate::data_layer::callgraph_store_adapter::{
         impact_result, trace_to_result, StoreTraceToResult,
     };
-    use crate::data_layer::query::{MemorySlices, SliceReader};
+    use crate::data_layer::query::{SliceReader, SliceSource};
+    use aft_engine::test_bridge::display_data::callgraph_roots::{
+        memory_reader, normalize, rust_program_roots,
+    };
     use std::collections::{BTreeMap, BTreeSet};
     use std::path::Path;
 
@@ -16,13 +17,13 @@ mod tests {
     }
 
     /// The data layer's call graph of a checkout holding `files`.
-    fn graph(files: &[(&str, &str)]) -> (tempfile::TempDir, SliceReader<MemorySlices>) {
+    fn graph(files: &[(&str, &str)]) -> (tempfile::TempDir, SliceReader<impl SliceSource>) {
         let dir = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         for (path, text) in files {
             write(&root, path, text);
         }
-        let reader = crate::data_layer::trace_measure::memory_reader(&root);
+        let reader = memory_reader(&root);
         (dir, reader)
     }
 
@@ -52,7 +53,7 @@ mod tests {
     }
 
     fn trace(
-        reader: &SliceReader<MemorySlices>,
+        reader: &SliceReader<impl SliceSource>,
         file: &str,
         symbol: &str,
         include_tests: bool,
@@ -99,7 +100,7 @@ mod tests {
 }
 "#;
 
-    fn rust_crate() -> (tempfile::TempDir, SliceReader<MemorySlices>) {
+    fn rust_crate() -> (tempfile::TempDir, SliceReader<impl SliceSource>) {
         graph(&[
             (
                 "Cargo.toml",
