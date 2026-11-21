@@ -8,6 +8,40 @@ thread_local! {
     static REUSE: Cell<bool> = const { Cell::new(true) };
     static HOLDER_PROBES: Cell<usize> = const { Cell::new(0) };
     static TIMINGS: RefCell<Option<Vec<(&'static str, f64, f64)>>> = const { RefCell::new(None) };
+    static STREAM_DELTA: Cell<bool> = const { Cell::new(true) };
+    static DELTA_SPILL_FAIL: Cell<bool> = const { Cell::new(false) };
+    static DELTA_STAGE: RefCell<Option<Box<dyn FnMut(&str)>>> = const { RefCell::new(None) };
+}
+
+pub(super) fn stream_delta() -> bool {
+    STREAM_DELTA.with(Cell::get)
+}
+
+pub(super) fn at_delta_stage(stage: &str) {
+    DELTA_STAGE.with_borrow_mut(|hook| {
+        if let Some(hook) = hook {
+            hook(stage);
+        }
+    });
+}
+
+pub(super) fn delta_spill_check() -> std::io::Result<()> {
+    if DELTA_SPILL_FAIL.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::other("injected delta spill write error"));
+    }
+    Ok(())
+}
+
+fn with_delta_stage<T>(hook: impl FnMut(&str) + 'static, f: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            DELTA_STAGE.with_borrow_mut(|hook| *hook = None);
+        }
+    }
+    DELTA_STAGE.with_borrow_mut(|slot| *slot = Some(Box::new(hook)));
+    let _reset = Reset;
+    f()
 }
 
 pub(super) fn reuse_lookups() -> bool {
@@ -98,6 +132,359 @@ fn scratch() -> tempfile::TempDir {
     let base = crate::test_support::manifest_dir().join("../../target/scratch/publication");
     std::fs::create_dir_all(&base).unwrap();
     tempfile::tempdir_in(base).unwrap()
+}
+
+fn delta_fixture(dir: &Path) -> Arc<Checkout> {
+    let root = dir.join("root");
+    write(&root, "a.ts", "export function a() { return 1; }");
+    write(&root, "b.ts", "export function b() { return 2; }");
+    write(&root, "notes.txt", &"x".repeat(1 << 20));
+    let checkout = Arc::new(
+        Checkout::bind(
+            Arc::new(DataLayer::new(8 << 20, 2)),
+            &dir.join("store"),
+            family(),
+            &root,
+        )
+        .unwrap(),
+    );
+    checkout.build().unwrap();
+    checkout
+}
+
+fn edit_delta(checkout: &Checkout, path: &str, text: &str) {
+    write(checkout.root(), path, text);
+    checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+}
+
+fn refresh_delta(checkout: &Checkout) {
+    edit_delta(checkout, "a.ts", "export function a() { return 3; }");
+    edit_delta(checkout, "b.ts", "export function b() { return 4; }");
+    assert!(!checkout.refresh_callgraph().unwrap().unwrap().cold_build);
+}
+
+fn latest_segment(checkout: &Checkout) -> Arc<Segment> {
+    let snapshot = checkout.family.snapshot().unwrap();
+    let id = snapshot.manifest().segments().last().unwrap().id;
+    snapshot
+        .open_shared_segment(id, &known_sections(), &checkout.layer.cache)
+        .unwrap()
+}
+
+fn sections(
+    segment: &Segment,
+    keep: impl Fn(aft_store::segment::SectionKind) -> bool,
+) -> BTreeMap<aft_store::segment::SectionId, (aft_store::segment::SectionInfo, Vec<u8>)> {
+    segment
+        .sections()
+        .filter(|(_, info)| keep(info.id.kind))
+        .map(|(section, info)| {
+            (
+                info.id,
+                (info, segment.read_range(section, 0..info.len).unwrap()),
+            )
+        })
+        .collect()
+}
+
+fn assert_no_delta_scratch(checkout: &Checkout) {
+    let builds = checkout
+        .family
+        .dir()
+        .join("builds")
+        .join(checkout.checkout.to_string());
+    assert!(std::fs::read_dir(builds)
+        .unwrap()
+        .all(|entry| !entry.unwrap().path().is_dir()));
+    assert!(
+        checkout.family.try_write().unwrap().is_some(),
+        "writer session still held"
+    );
+}
+
+#[test]
+fn delta_publication_streams_byte_identical_sections() {
+    let raw = |segment: &Segment| {
+        let mut bytes = std::fs::read(segment.path()).unwrap();
+        // Each writer session has its own identifier and creation timestamp.
+        // Normalize those fields and their header checksum, nothing else.
+        bytes[40..56].fill(0);
+        bytes[112..128].fill(0);
+        bytes
+    };
+    let run = |streamed| {
+        let dir = scratch();
+        let checkout = delta_fixture(dir.path());
+        refresh_delta(&checkout);
+        STREAM_DELTA.with(|value| value.set(streamed));
+        let report = checkout.publish_changes();
+        STREAM_DELTA.with(|value| value.set(true));
+        assert_eq!(report.unwrap().unwrap().fragments, 2);
+        assert_no_delta_scratch(&checkout);
+        let latest = latest_segment(&checkout);
+        (raw(&latest), sections(&latest, |_| true))
+    };
+    let (buffered, buffered_sections) = run(false);
+    let (streamed, streamed_sections) = run(true);
+    assert_eq!(streamed_sections, buffered_sections);
+    assert!(streamed == buffered, "delta segment bytes differ");
+}
+
+fn publication_crossing(stage: &'static str) {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    let dir = scratch();
+    let checkout = delta_fixture(dir.path());
+    refresh_delta(&checkout);
+    let old = checkout.family.snapshot().unwrap();
+    let before = source_work_for_test(checkout.root());
+    let counts = checkout.refresh_counts();
+    let crossed = Arc::new(AtomicBool::new(false));
+    let sample = Arc::clone(&crossed);
+    let guard = Arc::new(RefreshMemory::simulated(1, move |_, _| {
+        Some(if sample.load(Relaxed) { 2 } else { 0 })
+    }));
+    let mut added = 0;
+    assert!(with_delta_stage(
+        move |here| {
+            assert_ne!(
+                here, "before_segment",
+                "spill did not stop before finish_segment"
+            );
+            added += usize::from(here == "added");
+            assert!(
+                stage != "added" || added <= 1,
+                "a second fragment was added after crossing"
+            );
+            if here == stage {
+                assert_ne!(added, 0, "crossed before any fragment was added");
+                crossed.store(true, Relaxed);
+            }
+        },
+        || checkout.publish_changes_with(false, guard, Instant::now())
+    )
+    .unwrap()
+    .is_none());
+    assert_no_delta_scratch(&checkout);
+    assert!(checkout.engine.lock().unwrap().is_none());
+    assert_eq!(
+        checkout.refresh_counts().guard_fallbacks,
+        counts.guard_fallbacks + 1
+    );
+    assert_eq!(
+        source_work_for_test(checkout.root()).cold_builds,
+        before.cold_builds + 1
+    );
+    let newest = checkout.family.snapshot().unwrap();
+    assert_eq!(
+        newest.manifest().generation().get(),
+        old.manifest().generation().get() + 1,
+        "only the cold build may commit"
+    );
+    assert_eq!(newest.manifest().segments().len(), 1);
+
+    let cold_dir = scratch();
+    let cold = Checkout::bind(
+        Arc::clone(&checkout.layer),
+        cold_dir.path(),
+        family(),
+        checkout.root(),
+    )
+    .unwrap();
+    cold.build().unwrap();
+    let is_graph = |kind| {
+        aft_store::graph::KNOWN
+            .iter()
+            .chain(&aft_store::graph::KNOWN_OPTIONAL)
+            .any(|section| section.kind == kind)
+    };
+    assert_eq!(
+        sections(&latest_segment(&checkout), is_graph),
+        sections(&latest_segment(&cold), is_graph)
+    );
+}
+
+#[test]
+fn delta_publication_guard_crosses_after_add() {
+    publication_crossing("added");
+}
+
+#[test]
+fn delta_publication_guard_crosses_inside_finish() {
+    publication_crossing("finish");
+}
+
+#[test]
+fn delta_publication_guard_stands_down_for_reserved_build() {
+    let dir = scratch();
+    let checkout = delta_fixture(dir.path());
+    refresh_delta(&checkout);
+    let before = source_work_for_test(checkout.root());
+    let counts = checkout.refresh_counts();
+    let old_generation = checkout.family.snapshot().unwrap().manifest().generation();
+    let reserved = Arc::new(Mutex::new(None));
+    let (holder, slot) = (Arc::clone(&checkout), Arc::clone(&reserved));
+    let guard = Arc::new(RefreshMemory::simulated(1, |files, _| {
+        Some(if files > 0 { 2 } else { 0 })
+    }));
+    assert!(with_delta_stage(
+        move |here| {
+            if here == "entry" {
+                *slot.lock().unwrap() = Some(holder.reserve_build().unwrap());
+                assert!(
+                    holder.publish_changes().unwrap().is_none(),
+                    "reservation blocks entry"
+                );
+            }
+        },
+        || checkout.publish_changes_with(false, guard, Instant::now())
+    )
+    .unwrap()
+    .is_none());
+    assert_no_delta_scratch(&checkout);
+    assert!(checkout.engine.lock().unwrap().is_none());
+    assert_eq!(
+        checkout.refresh_counts().guard_fallbacks,
+        counts.guard_fallbacks + 1
+    );
+    assert_eq!(source_work_for_test(checkout.root()), before);
+    assert_eq!(
+        checkout.family.snapshot().unwrap().manifest().generation(),
+        old_generation
+    );
+    assert_eq!(checkout.live.read().unwrap().changes.len(), 2);
+
+    edit_delta(&checkout, "before.ts", "export function before() {}");
+    let publication = hold_build_publication_for_test(checkout.root());
+    let reservation = reserved.lock().unwrap().take().unwrap();
+    let holder = Arc::clone(&checkout);
+    let build = std::thread::spawn(move || holder.build_reserved(false, reservation).unwrap());
+    publication.wait_until_held();
+    edit_delta(&checkout, "after.ts", "export function after() {}");
+    drop(publication);
+    build.join().unwrap();
+    let published = checkout
+        .family
+        .snapshot()
+        .unwrap()
+        .checkout_state(checkout.checkout)
+        .unwrap()
+        .unwrap();
+    assert!(published.get(b"before.ts").is_some());
+    assert!(published.get(b"after.ts").is_none());
+    assert_eq!(
+        checkout
+            .live
+            .read()
+            .unwrap()
+            .changes
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>(),
+        [b"after.ts".to_vec()]
+    );
+    assert!(!checkout.refresh_callgraph().unwrap().unwrap().cold_build);
+    assert_eq!(checkout.publish_changes().unwrap().unwrap().paths, 1);
+    let published = checkout
+        .family
+        .snapshot()
+        .unwrap()
+        .checkout_state(checkout.checkout)
+        .unwrap()
+        .unwrap();
+    assert!(published.get(b"after.ts").is_some());
+    assert!(checkout.live.read().unwrap().changes.is_empty());
+}
+
+#[test]
+fn delta_publication_spill_io_and_cancellation_do_not_commit() {
+    let dir = scratch();
+    let checkout = delta_fixture(dir.path());
+    refresh_delta(&checkout);
+    let old_generation = checkout.family.snapshot().unwrap().manifest().generation();
+    let counts = checkout.refresh_counts();
+    let before = source_work_for_test(checkout.root());
+    for cancel in [false, true] {
+        let token = crate::executor::JobCancellation::new();
+        let _context = crate::executor::install_job_cancellation(token.clone());
+        let error = with_delta_stage(
+            move |here| {
+                assert_ne!(
+                    here, "before_segment",
+                    "spill did not stop before finish_segment"
+                );
+                if here == "finish" {
+                    if cancel {
+                        token.request_cancel();
+                    } else {
+                        DELTA_SPILL_FAIL.with(|fail| fail.set(true));
+                    }
+                }
+            },
+            || checkout.publish_changes(),
+        )
+        .unwrap_err();
+        if cancel {
+            assert!(matches!(error, DataError::Cancelled), "{error:?}");
+        } else {
+            assert!(
+                matches!(error, DataError::Store(message) if message.contains("injected delta spill write error"))
+            );
+        }
+        assert_no_delta_scratch(&checkout);
+        assert_eq!(
+            checkout.family.snapshot().unwrap().manifest().generation(),
+            old_generation
+        );
+        assert_eq!(checkout.refresh_counts(), counts);
+        assert_eq!(source_work_for_test(checkout.root()), before);
+        assert_eq!(checkout.live.read().unwrap().changes.len(), 2);
+    }
+    assert!(
+        checkout.publish_changes().unwrap().is_some(),
+        "the same edit can retry"
+    );
+}
+
+#[test]
+fn delta_publication_admits_only_the_delta_estimate_and_keeps_disk_floor() {
+    let dir = scratch();
+    let checkout = delta_fixture(dir.path());
+    refresh_delta(&checkout);
+    let capacity = 1 << 40;
+    let floor = crate::disk_floor::free_disk_floor(capacity);
+    let old_generation = checkout.family.snapshot().unwrap().manifest().generation();
+    for free in [floor - 1, floor] {
+        let _free =
+            crate::disk_floor::set_free_space_for_test(checkout.family.dir(), free, capacity);
+        assert!(matches!(
+            checkout.publish_changes(),
+            Err(DataError::DiskFloor(_))
+        ));
+        assert_no_delta_scratch(&checkout);
+        assert_eq!(
+            checkout.family.snapshot().unwrap().manifest().generation(),
+            old_generation
+        );
+    }
+    let whole = checkout
+        .view()
+        .unwrap()
+        .state()
+        .get(b"notes.txt")
+        .unwrap()
+        .stat
+        .size
+        * 8;
+    let headroom = 512 << 10;
+    assert!(headroom < whole, "the whole-checkout estimate must not fit");
+    let _free = crate::disk_floor::set_free_space_for_test(
+        checkout.family.dir(),
+        floor + headroom,
+        capacity,
+    );
+    assert_eq!(checkout.publish_changes().unwrap().unwrap().fragments, 2);
+    assert_no_delta_scratch(&checkout);
 }
 
 fn pin_readers(checkout: &Checkout, snapshot: &Snapshot, states: &[&CheckoutState]) {

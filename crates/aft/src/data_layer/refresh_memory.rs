@@ -21,9 +21,11 @@ pub(super) struct MemoryLimit {
     pub(super) files: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, thiserror::Error)]
 pub(super) enum RefreshStop {
+    #[error("call-graph memory ceiling exceeded")]
     Memory(MemoryLimit),
+    #[error("cancelled")]
     Cancelled,
 }
 
@@ -85,7 +87,14 @@ impl RefreshMemory {
         self.start.map(|_| self.peak_growth.load(Relaxed))
     }
 
-    fn check(&self) -> Result<(), RefreshStop> {
+    /// A publication adds fragments serially; check before each one.
+    pub(super) fn publication_add(&self) -> Result<(), RefreshStop> {
+        self.check()?;
+        self.files.fetch_add(1, Relaxed);
+        Ok(())
+    }
+
+    pub(super) fn check(&self) -> Result<(), RefreshStop> {
         if self
             .cancellation
             .as_ref()

@@ -4,6 +4,13 @@ use crate::data_layer::refresh_probe;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+use aft_store::graph::GraphSectionsSpill;
+use aft_store::segment::ErrorKind;
+use aft_store::spill::{self, WriteGuard};
+use std::io;
+
+use crate::data_layer::graph_store::SectionsError;
+
 #[cfg(test)]
 mod tests;
 
@@ -12,6 +19,198 @@ pub(super) struct RefreshCounters {
     refreshes: AtomicU64,
     guard_fallbacks: AtomicU64,
     precheck_fallbacks: AtomicU64,
+}
+
+pub(super) fn graph_spill_config() -> spill::Config {
+    let mut config = spill::Config::new(256 << 20);
+    // A wide merge lets ordinary large builds sort the 25-byte term records
+    // without rewriting them in intermediate runs, within the fixed budget.
+    config.fan_in = 128;
+    #[cfg(feature = "callgraph-shape-census")]
+    if let Some(bytes) = std::env::var("AFT_GRAPH_SPILL_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        config.memory_budget = bytes.max(1 << 20);
+    }
+    config
+}
+
+pub(super) struct DeltaScratch(Arc<aft_store::family::BuildScratch<DataError>>);
+
+// A delta cannot resume a spill. Close its files, then remove the workspace
+// even when a guard stops the write before the manifest commit.
+impl Drop for DeltaScratch {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.remove() {
+            log::warn!(
+                "could not remove delta workspace {}: {error}",
+                self.0.path().display()
+            );
+        }
+    }
+}
+
+impl DeltaScratch {
+    pub(super) fn new(
+        session: &mut aft_store::family::WriteSession<'_>,
+        checkout: CheckoutId,
+        dir: &Path,
+    ) -> Result<Self, DataError> {
+        let dir = dir.to_path_buf();
+        session
+            .create_scratch(checkout, move |reserve| check_disk_floor_at(&dir, reserve))
+            .map(|scratch| Self(Arc::new(scratch)))
+            .map_err(DataError::store)
+    }
+
+    pub(super) fn remove(self) -> Result<(), DataError> {
+        self.0.remove().map_err(DataError::store)
+    }
+
+    pub(super) fn spill(
+        &self,
+        files: usize,
+        estimate: u64,
+        memory: Arc<RefreshMemory>,
+    ) -> Result<GraphSectionsSpill, DeltaError> {
+        let scratch = Arc::clone(&self.0);
+        let workspace = Box::new(scratch.subdir("graph").map_err(DeltaError::io)?);
+        let reserve = Arc::new(AtomicU64::new(estimate));
+        let remaining = Arc::clone(&reserve);
+        let guard = WriteGuard::new(move || {
+            memory.check().map_err(io::Error::other)?;
+            #[cfg(test)]
+            publication_tests::delta_spill_check()?;
+            scratch
+                .check_space(remaining.load(Relaxed))
+                .map_err(io::Error::other)
+        });
+        let mut spill = GraphSectionsSpill::new(workspace, graph_spill_config(), guard)
+            .map_err(SectionsError::from)
+            .map_err(DeltaError::finish)?;
+        spill.estimate_space(files, estimate, reserve);
+        Ok(spill)
+    }
+}
+
+pub(super) enum DeltaError {
+    Data(DataError),
+    Memory(MemoryLimit),
+}
+
+impl From<DataError> for DeltaError {
+    fn from(error: DataError) -> Self {
+        Self::Data(error)
+    }
+}
+
+impl From<RefreshStop> for DeltaError {
+    fn from(stop: RefreshStop) -> Self {
+        match stop {
+            RefreshStop::Cancelled => Self::Data(DataError::Cancelled),
+            RefreshStop::Memory(limit) => Self::Memory(limit),
+        }
+    }
+}
+
+impl DeltaError {
+    fn guard_io(error: &io::Error) -> Option<Self> {
+        let cause = error.get_ref()?;
+        if let Some(stop) = cause.downcast_ref::<RefreshStop>() {
+            return Some((*stop).into());
+        }
+        if let Some(error) = cause.downcast_ref::<DataError>() {
+            return Some(error.clone().into());
+        }
+        // Sorter writes and merges wrap their I/O errors before the graph
+        // writer in turn wraps the sorter error in a segment error.
+        match cause.downcast_ref::<spill::Error>() {
+            Some(spill::Error::Io(error)) => Self::guard_io(error),
+            _ => None,
+        }
+    }
+
+    pub(super) fn io(error: io::Error) -> Self {
+        Self::guard_io(&error).unwrap_or_else(|| DataError::store(error).into())
+    }
+
+    pub(super) fn add(error: SectionsError) -> Self {
+        match error {
+            SectionsError::Input(reason) => DataError::Damaged(reason).into(),
+            other => Self::finish(other),
+        }
+    }
+
+    pub(super) fn finish(error: SectionsError) -> Self {
+        let io = match &error {
+            SectionsError::Spill(spill::Error::Io(error)) => Some(error),
+            SectionsError::Segment(error) => match error.kind() {
+                ErrorKind::Io(error) => Some(error),
+                _ => None,
+            },
+            _ => None,
+        };
+        io.and_then(Self::guard_io)
+            .unwrap_or_else(|| DataError::Store(error.to_string()).into())
+    }
+}
+
+pub(super) fn delta_estimate<'a>(
+    state: &CheckoutState,
+    files: impl Iterator<Item = &'a String>,
+) -> u64 {
+    files
+        .filter_map(|file| state.get(file.as_bytes()))
+        .fold(0u64, |bytes, record| bytes.saturating_add(record.stat.size))
+        .saturating_mul(8)
+}
+
+pub(super) fn delta_contents(
+    changes: &BTreeMap<Vec<u8>, Change>,
+    text: &TextOverlay,
+    max_indexed_len: u64,
+) -> (ContentSectionsBuilder, TextSectionsBuilder) {
+    let mut records = ContentSectionsBuilder::new();
+    let mut text_units = TextSectionsBuilder::new();
+    let mut seen = HashSet::new();
+    for (path, change) in changes {
+        let Some(record) = &change.record else {
+            continue;
+        };
+        let key = crate::data_layer::content::record_key(record.content, &record.language);
+        match change.content.get() {
+            Extracted::Parse(_, _, stored)
+            | Extracted::Config(_, stored)
+            | Extracted::Markers(stored) => {
+                records.add_encoded(key, Arc::clone(stored));
+            }
+            Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {}
+        }
+        if !seen.insert(record.content) {
+            continue;
+        }
+        let size = record.stat.size;
+        match text.get(path) {
+            Some(OverlayEntry::Content(trigrams)) => {
+                text_units.add_indexed(record.content, size, trigrams);
+            }
+            Some(OverlayEntry::Unindexed) => match record.kind {
+                PathKind::Binary => {
+                    text_units.add_unindexed(record.content, size, TextStatus::Binary);
+                }
+                PathKind::Large => {
+                    text_units.add_unindexed(record.content, size, TextStatus::Oversize);
+                }
+                PathKind::Text if size > max_indexed_len => {
+                    text_units.add_unindexed(record.content, size, TextStatus::Oversize);
+                }
+                _ => {}
+            },
+            Some(OverlayEntry::Deleted) | None => {}
+        }
+    }
+    (records, text_units)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -44,6 +243,48 @@ impl fmt::Display for RefreshWork<'_> {
 }
 
 impl Checkout {
+    pub(super) fn publish_changes_with(
+        &self,
+        by_build: bool,
+        guard: Arc<RefreshMemory>,
+        started: Instant,
+    ) -> Result<Option<DeltaReport>, DataError> {
+        match self.try_publish_changes(by_build, guard, started) {
+            Ok(report) => Ok(report),
+            Err(DeltaError::Data(error)) => Err(error),
+            Err(DeltaError::Memory(limit)) => self.publication_memory_fallback(by_build, limit),
+        }
+    }
+
+    fn publication_memory_fallback(
+        &self,
+        by_build: bool,
+        limit: MemoryLimit,
+    ) -> Result<Option<DeltaReport>, DataError> {
+        // The failed attempt has dropped its inputs and resolutions, removed
+        // the spill files, and released the writer lock. Drop the engine too.
+        let mut slot = self
+            .engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.clear_engine_slot(&mut slot);
+        self.refresh_counts.guard_fallbacks.fetch_add(1, Relaxed);
+        let reservation = if by_build { None } else { self.reserve_build() };
+        drop(slot);
+        let stand_down = !by_build && reservation.is_none();
+        crate::slog_info!(
+            "call-graph memory ceiling exceeded: growth={} ceiling={} files={}; root={} guard_fallback=true stage=publication stand_down={stand_down}",
+            limit.growth, limit.ceiling, limit.files, self.root.display()
+        );
+        if let Some(reservation) = reservation {
+            self.build_reserved(false, reservation)?;
+        } else if !stand_down {
+            // The sibling build already holds the reservation.
+            self.build_inner(false)?;
+        }
+        Ok(None)
+    }
+
     pub(crate) fn refresh_counts(&self) -> RefreshCounts {
         RefreshCounts {
             refreshes: self.refresh_counts.refreshes.load(Relaxed),

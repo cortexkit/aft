@@ -581,13 +581,18 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
                     .map(String::into_bytes)
                     .collect::<Vec<_>>(),
             )?;
-            checkout.refresh_callgraph()?;
+            let update = checkout
+                .refresh_callgraph()?
+                .ok_or("no incremental refresh")?;
+            if update.cold_build {
+                return Err("refresh rebuilt cold; refusing a cold-build substitute".into());
+            }
             checked_failures(&checkout.view().ok_or("no published view")?)?;
             save(
                 &out.join("prepublish-health.json"),
                 &json!({"stored_slices_failures": []}),
             )?;
-            checkout.publish_changes()?;
+            checkout.publish_changes()?.ok_or("no delta publication")?;
         }
         "snapshot" => {}
         _ => return Err("unknown exactness mode".into()),

@@ -56,6 +56,7 @@ mod memory_profile;
 mod recording;
 mod refresh;
 pub(crate) use refresh::RefreshCounts;
+use refresh::{delta_contents, delta_estimate, graph_spill_config, DeltaError, DeltaScratch};
 pub(crate) mod resume;
 pub(crate) mod staged_records;
 mod status_view;
@@ -1748,26 +1749,16 @@ impl Checkout {
                 .check_space(remaining.load(std::sync::atomic::Ordering::Relaxed))
                 .map_err(std::io::Error::other)
         });
-        let mut config = aft_store::spill::Config::new(256 << 20);
-        // A wide merge keeps ordinary large builds at one 25-byte run copy
-        // per term while its readers still fit well inside the fixed budget.
-        config.fan_in = 128;
-        #[cfg(feature = "callgraph-shape-census")]
-        if let Some(bytes) = std::env::var("AFT_GRAPH_SPILL_BUDGET_BYTES")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-        {
-            config.memory_budget = bytes.max(1 << 20);
-        }
-        let mut spill = aft_store::graph::GraphSectionsSpill::new(workspace, config, guard)
-            .map_err(|error| {
-                graph_spill_error(
-                    self.check_disk_floor()
-                        .err()
-                        .unwrap_or_else(|| DataError::Store(error.to_string())),
-                    &paused,
-                )
-            })?;
+        let mut spill =
+            aft_store::graph::GraphSectionsSpill::new(workspace, graph_spill_config(), guard)
+                .map_err(|error| {
+                    graph_spill_error(
+                        self.check_disk_floor()
+                            .err()
+                            .unwrap_or_else(|| DataError::Store(error.to_string())),
+                        &paused,
+                    )
+                })?;
         spill.estimate_space(inputs.parses.len(), estimate, reserve);
         sections.stream(spill);
         resume::kill_point("stage.resolve");
@@ -1832,7 +1823,7 @@ impl Checkout {
             self.leave_out_shared(&snapshot, &mut collected.text, Some(&mut sections))?;
         sections
             .prepare_finish()
-            .map_err(|error| graph_spill_error(DataError::Store(error), &paused))?;
+            .map_err(|error| graph_spill_error(DataError::Store(error.to_string()), &paused))?;
         #[cfg(feature = "test-hooks")]
         super::refresh_probe::stage("write");
         resume::kill_point("stage.write");
@@ -1844,7 +1835,7 @@ impl Checkout {
                 graph_spill_error(
                     self.check_disk_floor()
                         .err()
-                        .unwrap_or(DataError::Store(error)),
+                        .unwrap_or_else(|| DataError::Store(error.to_string())),
                     &paused,
                 )
             })?;
@@ -2954,6 +2945,19 @@ impl Checkout {
     /// ([`Self::start_from_sibling`]).
     fn publish_changes_as(&self, by_build: bool) -> Result<Option<DeltaReport>, DataError> {
         let started = Instant::now();
+        self.publish_changes_with(
+            by_build,
+            Arc::new(RefreshMemory::start(self.family.dir())),
+            started,
+        )
+    }
+
+    fn try_publish_changes(
+        &self,
+        by_build: bool,
+        guard: Arc<RefreshMemory>,
+        started: Instant,
+    ) -> Result<Option<DeltaReport>, DeltaError> {
         #[cfg(test)]
         let mut phase = publication_tests::phase("prepare");
         let (published, changes, covered, text) = {
@@ -2971,6 +2975,8 @@ impl Checkout {
                 Arc::clone(&live.text),
             )
         };
+        #[cfg(test)]
+        publication_tests::at_delta_stage("entry");
         // What the engine resolved, for exactly these changes.
         let (inputs, resolved) = {
             let Ok(slot) = self.engine.lock() else {
@@ -3014,45 +3020,8 @@ impl Checkout {
         };
         // The changed contents' records, already encoded, and their text,
         // each content once.
-        let mut records = ContentSectionsBuilder::new();
-        let mut text_units = TextSectionsBuilder::new();
-        let mut seen = HashSet::new();
-        for (path, change) in &changes {
-            let Some(record) = &change.record else {
-                continue;
-            };
-            let key = crate::data_layer::content::record_key(record.content, &record.language);
-            match change.content.get() {
-                Extracted::Parse(_, _, stored)
-                | Extracted::Config(_, stored)
-                | Extracted::Markers(stored) => {
-                    records.add_encoded(key, Arc::clone(stored));
-                }
-                Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {}
-            }
-            if !seen.insert(record.content) {
-                continue;
-            }
-            let size = record.stat.size;
-            match text.get(path) {
-                Some(OverlayEntry::Content(trigrams)) => {
-                    text_units.add_indexed(record.content, size, trigrams);
-                }
-                Some(OverlayEntry::Unindexed) => match record.kind {
-                    PathKind::Binary => {
-                        text_units.add_unindexed(record.content, size, TextStatus::Binary);
-                    }
-                    PathKind::Large => {
-                        text_units.add_unindexed(record.content, size, TextStatus::Oversize);
-                    }
-                    PathKind::Text if size > self.layer.policy.max_indexed_len => {
-                        text_units.add_unindexed(record.content, size, TextStatus::Oversize);
-                    }
-                    _ => {}
-                },
-                Some(OverlayEntry::Deleted) | None => {}
-            }
-        }
+        let (records, mut text_units) =
+            delta_contents(&changes, &text, self.layer.policy.max_indexed_len);
         let text_unit_count = text_units.len();
         let record_count = records.len();
         // A path keeps the fragment the publication stored for it unless it
@@ -3070,6 +3039,8 @@ impl Checkout {
             })
             .collect::<HashMap<_, _>>();
 
+        let estimate = delta_estimate(&inputs.state, resolved.keys());
+        self.reclaim_disk_for(estimate, true);
         let bound = self.bound_states();
         let mut session = self.writer()?;
         let started_from = published
@@ -3100,6 +3071,17 @@ impl Checkout {
             });
         #[cfg(test)]
         publication_tests::next_phase(&mut phase, "write");
+        #[cfg(test)]
+        let streamed = publication_tests::stream_delta();
+        #[cfg(not(test))]
+        let streamed = true;
+        let scratch = streamed
+            .then(|| DeltaScratch::new(&mut session, self.checkout, self.family.dir()))
+            .transpose()?;
+        let spill = scratch
+            .as_ref()
+            .map(|scratch| scratch.spill(resolved.len(), estimate, Arc::clone(&guard)))
+            .transpose()?;
         let mut pending = session.create_segment().map_err(DataError::store)?;
         text_units
             .write(pending.writer())
@@ -3115,10 +3097,16 @@ impl Checkout {
             let no_records = HashMap::new();
             let mut sections =
                 SectionsWriter::new(&inputs.state, &no_records, false, Some(records));
+            if let Some(spill) = spill {
+                sections.stream(spill);
+            }
             for (file, resolution) in &resolved {
+                guard.publication_add()?;
                 sections
                     .add(&inputs, file, &resolution.decode(file))
-                    .map_err(DataError::Damaged)?;
+                    .map_err(DeltaError::add)?;
+                #[cfg(test)]
+                publication_tests::at_delta_stage("added");
             }
             // Input terms can read other files' stored parses. Any failed
             // stored read must reject publication, not commit incomplete facts.
@@ -3127,19 +3115,29 @@ impl Checkout {
                 return Err(DataError::Damaged(format!(
                     "reading the stored call graph failed: {}",
                     failures.join("; ")
-                )));
+                ))
+                .into());
             }
             if let Some(read) = &read_by_others {
                 let left = read.leave_out(None, Some(&mut sections), |_| true);
                 shared.records = left.records;
                 shared.fragments = left.fragments;
             }
+            sections.prepare_finish().map_err(DeltaError::io)?;
+            #[cfg(test)]
+            publication_tests::at_delta_stage("finish");
             sections
                 .finish(pending.writer(), None)
-                .map_err(DataError::Store)?
+                .map_err(DeltaError::finish)?
         };
+        if let Some(scratch) = scratch {
+            scratch.remove()?;
+        }
         #[cfg(test)]
         publication_tests::next_phase(&mut phase, "state");
+        #[cfg(test)]
+        publication_tests::at_delta_stage("before_segment");
+        guard.check()?;
         let segment = session.finish_segment(pending).map_err(DataError::store)?;
         let per_path = inputs
             .state

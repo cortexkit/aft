@@ -227,9 +227,23 @@ pub(crate) fn write_sections<R: std::borrow::Borrow<FileResolution>>(
 ) -> Result<BTreeMap<String, FragmentKey>, String> {
     let mut sections = SectionsWriter::new(&inputs.state, records, all_records, encoded);
     for (file, resolution) in resolved {
-        sections.add(inputs, file, std::borrow::Borrow::borrow(resolution))?;
+        sections
+            .add(inputs, file, std::borrow::Borrow::borrow(resolution))
+            .map_err(|error| error.to_string())?;
     }
-    sections.finish(writer, memory)
+    sections
+        .finish(writer, memory)
+        .map_err(|error| error.to_string())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SectionsError {
+    #[error("{0}")]
+    Input(String),
+    #[error(transparent)]
+    Spill(#[from] aft_store::spill::Error),
+    #[error(transparent)]
+    Segment(#[from] aft_store::segment::SegmentError),
 }
 
 /// One file's fragment, built and not yet added to a [`SectionsWriter`].
@@ -423,13 +437,9 @@ impl<'i> SectionsWriter<'i> {
         self.graph = GraphOutput::Streamed(std::sync::Mutex::new(spill));
     }
 
-    pub(crate) fn prepare_finish(&self) -> Result<(), String> {
+    pub(crate) fn prepare_finish(&self) -> std::io::Result<()> {
         if let GraphOutput::Streamed(spill) = &self.graph {
-            spill
-                .lock()
-                .expect("graph spill lock")
-                .prepare_finish()
-                .map_err(|error| error.to_string())?;
+            spill.lock().expect("graph spill lock").prepare_finish()?;
         }
         Ok(())
     }
@@ -445,9 +455,10 @@ impl<'i> SectionsWriter<'i> {
         inputs: &CheckoutInputs,
         file: &String,
         resolution: &FileResolution,
-    ) -> Result<(), String> {
+    ) -> Result<(), SectionsError> {
         let built = self.built(inputs, file, resolution, &mut HashMap::new())?;
         self.insert(inputs, file, built)
+            .map_err(SectionsError::Input)
     }
 
     /// [`Self::add`] for a batch of files, whose fragments are built in
@@ -471,7 +482,8 @@ impl<'i> SectionsWriter<'i> {
                 let _label = carry.enter();
                 this.built(inputs, file, resolution, subjects)
             })
-            .collect::<Result<Vec<_>, String>>()?;
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string())?;
         for ((file, _), built) in files.iter().zip(built) {
             self.insert(inputs, file, built)?;
         }
@@ -485,7 +497,7 @@ impl<'i> SectionsWriter<'i> {
         file: &String,
         resolution: &FileResolution,
         subjects: &mut HashMap<crate::callgraph_store::fact_answers::FactQuestion, Vec<Vec<u8>>>,
-    ) -> Result<BuiltFragment, String> {
+    ) -> Result<BuiltFragment, SectionsError> {
         let facts = super::callgraph::CheckoutFacts { inputs };
         // Publication reads each fragment's parse once. Keeping newly decoded
         // parses in the shared input slots would retain them in the kept engine,
@@ -496,7 +508,11 @@ impl<'i> SectionsWriter<'i> {
             .parses
             .read(file)
             .filter(|(key, _)| !key.is_empty())
-            .ok_or_else(|| format!("parse of {file}: the stored parse could not be read"))?;
+            .ok_or_else(|| {
+                SectionsError::Input(format!(
+                    "parse of {file}: the stored parse could not be read"
+                ))
+            })?;
         let slice = FileSlice::build(file, &key, &parse, resolution);
         let mut terms = slice_terms(&slice);
         let inputs_terms = {
@@ -550,8 +566,7 @@ impl<'i> SectionsWriter<'i> {
             spill
                 .lock()
                 .expect("graph spill lock")
-                .add(fragment, packed)
-                .map_err(|e| e.to_string())?;
+                .add(fragment, packed)?;
         }
         Ok(built)
     }
@@ -618,7 +633,7 @@ impl<'i> SectionsWriter<'i> {
         mut self,
         writer: &mut SegmentWriter,
         memory: Option<&mut Vec<(String, usize)>>,
-    ) -> Result<BTreeMap<String, FragmentKey>, String> {
+    ) -> Result<BTreeMap<String, FragmentKey>, SectionsError> {
         if let Some(memory) = memory {
             use aft_store::heap::HeapBytes as _;
             let mut seen = aft_store::heap::Seen::new();
@@ -636,14 +651,13 @@ impl<'i> SectionsWriter<'i> {
                 },
             ));
         }
-        self.content.write(writer)?;
+        self.content.write(writer).map_err(SectionsError::Input)?;
         match self.graph {
             GraphOutput::Buffered(graph) => graph.write(writer),
             GraphOutput::Streamed(graph) => {
                 graph.into_inner().expect("graph spill lock").write(writer)
             }
-        }
-        .map_err(|error| error.to_string())?;
+        }?;
         Ok(self.keys)
     }
 }
