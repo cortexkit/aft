@@ -75,7 +75,7 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
         std::fs::write(&path, content).unwrap();
     }
     let project_root = std::fs::canonicalize(root.path()).unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(project_root.clone()),
@@ -335,7 +335,7 @@ fn data_layer_scenario(
         config.indexes.semantic = false;
         config.indexes.callgraph = false;
     }
-    let ctx = AppContext::new(Box::new(TreeSitterProvider::new()), config);
+    let ctx = crate::test_context(Box::new(TreeSitterProvider::new()), config);
     ctx.set_canonical_cache_root(project_root);
     (root, storage, ctx)
 }
