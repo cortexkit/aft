@@ -3647,7 +3647,8 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
         .validate_read_path("siblings-read-control", &worker.session, &path)
         .unwrap_err();
     assert_eq!(read.data["code"], crate::access_policy::ACCESS_ASK_REQUIRED);
-    let asks_before_submit = crate::context::confinement::ask_calls();
+    let asks_before_submit =
+        aft_engine::test_bridge::display_data::context::confinement::ask_calls();
     crate::commands::rewrite_tests::remote::tests::assert_siblings_submit_refused_before_connect(
         &ctx,
         launch,
@@ -3655,7 +3656,7 @@ async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact()
         &format!("runon refused: {}", not_readable(&path)),
     );
     assert_eq!(
-        crate::context::confinement::ask_calls(),
+        aft_engine::test_bridge::display_data::context::confinement::ask_calls(),
         asks_before_submit,
         "sibling submission must not enter the consent ask handler"
     );

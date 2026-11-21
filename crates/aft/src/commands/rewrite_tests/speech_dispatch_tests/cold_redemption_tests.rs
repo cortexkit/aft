@@ -58,7 +58,7 @@ fn cold_redemption_probe_child() {
             *seal.child_start_time_ms_mut() += 1;
             metadata["child_start_time_ms"] = json!(seal.child_start_time_ms());
         }
-        "sealed-birth-identity" => seal.birth_identity.push_str("-different-boot"),
+        "sealed-birth-identity" => seal.birth_identity_mut().push_str("-different-boot"),
         "outer-pid-null-with-pgid" => {
             conn.execute(
                 "UPDATE bash_tasks SET pid=NULL,pgid=?1 WHERE rowid=?2",
@@ -122,7 +122,7 @@ fn cold_redemption_probe_child() {
         "inner-session" => metadata["session_id"] = json!("different-session"),
         "inner-task" => metadata["task_id"] = json!("different-task"),
         "inner-pid" => metadata["child_pid"] = json!(1),
-        "inner-birth" => metadata["child_start_time_ms"] = json!(seal.child_start_time_ms + 1),
+        "inner-birth" => metadata["child_start_time_ms"] = json!(seal.child_start_time_ms() + 1),
         "inner-project" => metadata["project_root"] = json!("/different-project"),
         "inner-scope" => metadata["scope"]["scope_epoch"] = json!(999),
         "inner-killing" => metadata["status"] = json!("killing"),
