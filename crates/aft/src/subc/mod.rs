@@ -21725,7 +21725,6 @@ mod tests {
             }),
         );
         entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
-        use aft_engine::test_bridge::display_data::DatabaseOpenSlotTestExt as _;
         let (slot, _) = fixture.ctx.database_open_slot();
         let locked = slot.lock();
         // The job snapshot is a non-blocking read; while the scheduler holds

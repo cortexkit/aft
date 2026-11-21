@@ -5743,7 +5743,7 @@ mod render_text_tests {
     #[test]
     fn inspect_gap_fixture_golden() {
         use crate::inspect::oxc_engine::{analyze_files, AnalyzeOptions};
-        use crate::inspect::scanners::{complexity, cycles, metrics, unused_exports};
+        use crate::inspect::scanners::{complexity, metrics};
         use crate::inspect::{InspectJob, JobKey};
 
         let root = tempfile::tempdir().unwrap();

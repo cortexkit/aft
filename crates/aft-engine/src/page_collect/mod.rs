@@ -130,7 +130,7 @@ impl Limits {
 
 /// Why a referenced file is not in the bundle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum OmitReason {
+pub enum OmitReason {
     /// The session's read policy refuses it (or it is an AFT database).
     Denied,
     /// No readable regular file is there, or the reference names no file.

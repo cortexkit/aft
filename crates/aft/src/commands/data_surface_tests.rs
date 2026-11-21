@@ -3,7 +3,7 @@ mod tests {
     use crate::data_layer::checkout::DataError;
     #[cfg(target_os = "linux")]
     use crate::data_layer::surfaces::disclose_index_gaps;
-    use crate::data_layer::surfaces::{reason, report, zoom_callgraph_field, DataCheckoutProbe};
+    use crate::data_layer::surfaces::{report, zoom_callgraph_field, DataCheckoutProbe};
     use crate::memory::MemoryEstimate;
     use crate::protocol::RawRequest;
     #[cfg(target_os = "linux")]

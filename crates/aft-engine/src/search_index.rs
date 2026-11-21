@@ -932,8 +932,9 @@ pub(crate) struct PostingFilter {
     loc_mask: u8,
 }
 
+#[doc(hidden)]
 #[derive(Clone, Copy)]
-pub(crate) struct SearchFileMetadata {
+pub struct SearchFileMetadata {
     size: u64,
     modified: SystemTime,
 }

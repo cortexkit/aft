@@ -22,7 +22,7 @@ mod tests {
 
     use super::*;
     use crate::config::Config;
-    use crate::context::{App, AppContext};
+    use crate::context::AppContext;
 
     #[test]
     fn abort_with_no_wait_registered_tasks_is_a_successful_noop() {

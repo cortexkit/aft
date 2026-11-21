@@ -738,7 +738,7 @@ fn permissions_list_matches_published_ends_with_holder_sample() {
 #[tokio::test]
 async fn permissions_cingulate_route_serves_only_permissions_operations() {
     use super::super::{
-        control_flags, read_frame, run_module_loop, write_frame, App, Executor, Frame, FrameType,
+        control_flags, read_frame, run_module_loop, write_frame, Executor, Frame, FrameType,
         ModuleControlRequest, QuiescedLsp, RouteTarget, HELLO_CORR,
     };
     use std::sync::Arc;

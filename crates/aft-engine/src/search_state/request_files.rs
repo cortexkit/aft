@@ -655,7 +655,7 @@ pub(crate) mod read_probe {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use read_probe::{record_disk_read, ReadProbe};
+pub(crate) use read_probe::record_disk_read;
 
 #[cfg(test)]
 mod tests {
