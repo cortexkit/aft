@@ -3258,6 +3258,7 @@ mod tests {
         });
         assert!(!denied.success);
         assert_eq!(denied.data["code"], "sandbox_escalation_denied");
+        use aft_engine::test_bridge::bash_remote::EscalationGrantStoreTestExt as _;
         use aft_engine::test_bridge::display_data::AppContextTestExt as _;
         assert_eq!(ctx.escalation_grants().lock().len_for_test(), 2);
         crate::sandbox_spawn::clear_sandbox_spawn_test_seam(project.path());

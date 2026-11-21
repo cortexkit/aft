@@ -73,7 +73,11 @@ impl super::super::consent::ConsentTransport for BusCardEndpoint {
 #[tokio::test(start_paused = true)]
 async fn bus_secret_card_wake_applies_once_and_replay_ignores_message_id() {
     let endpoint = BusCardEndpoint::new("el_bus_secret_apply");
-    let _attachment = crate::late_result_bus::readers::TestAttachment::new(endpoint.id, true);
+    let _attachment =
+        aft_engine::test_bridge::display_data::late_result_bus::readers::TestAttachment::new(
+            endpoint.id,
+            true,
+        );
     let transport = Arc::new(SubcSecretConsent {
         transport: endpoint.clone(),
         runtime: tokio::runtime::Handle::current(),
@@ -118,7 +122,11 @@ async fn bus_secret_card_wake_applies_once_and_replay_ignores_message_id() {
 #[tokio::test(start_paused = true)]
 async fn bus_secret_detach_mid_wait_restores_existing_long_poll_and_answer() {
     let endpoint = BusCardEndpoint::new("el_bus_secret_detach");
-    let attachment = crate::late_result_bus::readers::TestAttachment::new(endpoint.id, true);
+    let attachment =
+        aft_engine::test_bridge::display_data::late_result_bus::readers::TestAttachment::new(
+            endpoint.id,
+            true,
+        );
     let transport = Arc::new(SubcSecretConsent {
         transport: endpoint.clone(),
         runtime: tokio::runtime::Handle::current(),

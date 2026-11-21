@@ -226,15 +226,14 @@ pub fn frozen_provider_approval(
 }
 
 #[cfg(unix)]
-#[derive(Debug, Default)]
-pub(crate) struct EscalationGrantStore {
-    grants: HashMap<String, EscalationGrant>,
-    provider_timer_running: bool,
-}
+#[path = "sandbox_spawn/escalation_grant_type.rs"]
+pub(crate) mod escalation_grant_type;
+#[cfg(unix)]
+pub(crate) use escalation_grant_type::EscalationGrantStore;
 
 #[cfg(unix)]
 impl EscalationGrantStore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn len_for_test(&self) -> usize {
         self.grants.len()
     }
