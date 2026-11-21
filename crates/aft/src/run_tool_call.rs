@@ -2535,5 +2535,8 @@ mod tests {
             assert_eq!(request.command, "read");
             assert!(request.params.get("command").is_none());
         }
+
+        #[cfg(test)]
+        use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     }
 }

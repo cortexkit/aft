@@ -337,9 +337,9 @@ async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
     Arc::get_mut(&mut carrier.0).unwrap().trust = BindTrust::Untrusted;
     for route in [&mut carrier, &mut policy] {
         let data = Arc::get_mut(&mut route.0).unwrap();
-        data.session = task.session_id.clone();
+        data.session = task.session_id().clone();
         if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {
-            *session_id = task.session_id.clone();
+            *session_id = task.session_id().clone();
         }
     }
     let f = Fixture {
@@ -349,19 +349,20 @@ async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
         policy,
     };
     f.record(&f.policy, "worker");
-    let mut metadata = persistence::read_task(&task.paths.json).unwrap();
+    let mut metadata = persistence::read_task(&task.paths().json).unwrap();
     metadata.call_key = Some(TaskCallKey {
         requester: "reserved:broca".into(),
         key: "call".into(),
         minted: false,
     });
-    let layout = persistence::resolve_task(f.dir.path(), &task.session_id, &task.task_id).unwrap();
+    let layout =
+        persistence::resolve_task(f.dir.path(), &task.session_id(), &task.task_id()).unwrap();
     save_row(&f, &layout, &metadata);
-    let before = std::fs::read(&task.paths.json).unwrap();
+    let before = std::fs::read(&task.paths().json).unwrap();
     let limit = f
         .ctx
         .bash_background()
-        .hard_kill_deadline(&task.task_id, &task.session_id)
+        .hard_kill_deadline(&task.task_id(), &task.session_id())
         .unwrap()
         .limit_ms;
     let started = Instant::now();
@@ -781,3 +782,6 @@ async fn command_status_frame_keys_replay_only_the_carrier_frame_not_the_viewed_
     }
     proxy_task.abort();
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;

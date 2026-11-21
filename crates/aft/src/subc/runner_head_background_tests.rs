@@ -590,3 +590,6 @@ async fn runner_head_background_task_ends_with_its_heads_scope() {
         Some(crate::bash_background::registry::SCOPE_REVOKED_REASON)
     );
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

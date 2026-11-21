@@ -2264,4 +2264,9 @@ mod tests {
         assert!(fixture.strict(IndexKind::Search));
         assert!(fixture.strict(IndexKind::Callgraph));
     }
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppTestExt as _;

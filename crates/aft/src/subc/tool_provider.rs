@@ -8432,8 +8432,8 @@ pub(in crate::subc) mod route_tests {
                 );
             ctx.update_config(|config| config.bash.worker_wait_max_ms = 3_600_000);
             let root = ProjectRootId::from_path(dir.path()).unwrap();
-            let before = std::fs::read(&task.paths.json).unwrap();
-            let before_limit = read_task(&task.paths.json).unwrap().timeout_ms.unwrap();
+            let before = std::fs::read(&task.paths().json).unwrap();
+            let before_limit = read_task(&task.paths().json).unwrap().timeout_ms.unwrap();
             let ctx = Arc::new(ctx);
             let mut arguments = json!({"taskId":task.task_id});
             if name == "bash_watch" {
@@ -8441,7 +8441,7 @@ pub(in crate::subc) mod route_tests {
             }
             let reply = exchange_with_actor(
                 json!({"name":name,"preset":"worker","arguments":arguments}),
-                task_poll_identity(&root, &task.session_id, carrier),
+                task_poll_identity(&root, &task.session_id(), carrier),
                 ctx.clone(),
                 &Arc::new(DispatchPathMetrics::new()),
                 |request, ctx| crate::commands::bash_status::handle(&request, ctx),
@@ -8450,10 +8450,10 @@ pub(in crate::subc) mod route_tests {
             let body: Value = serde_json::from_slice(&reply.body).unwrap();
             assert_eq!(reply.header.ty, FrameType::Response, "{name}: {body}");
             assert_eq!(body["isError"], false, "{name}: {body}");
-            let after = read_task(&task.paths.json).unwrap();
+            let after = read_task(&task.paths().json).unwrap();
             let live_limit = ctx
                 .bash_background()
-                .hard_kill_deadline(&task.task_id, &task.session_id)
+                .hard_kill_deadline(&task.task_id(), &task.session_id())
                 .unwrap()
                 .limit_ms;
             if carrier {
@@ -8508,12 +8508,12 @@ pub(in crate::subc) mod route_tests {
                     .metadata
                     .mark_terminal(BgTaskStatus::Completed, Some(0), None);
                 state.metadata.completion_delivered = false;
-                write_task(&task.paths.json, &state.metadata).unwrap();
+                write_task(&task.paths().json, &state.metadata).unwrap();
             }
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let reply = exchange_with_actor(
                 json!({"name":"bash_watch","preset":"worker","arguments":{"taskId":task.task_id,"timeoutMs":1}}),
-                task_poll_identity(&root, &task.session_id, carrier), Arc::new(ctx),
+                task_poll_identity(&root, &task.session_id(), carrier), Arc::new(ctx),
                 &Arc::new(DispatchPathMetrics::new()),
                 |_, _| panic!("watch uses the deferred handler"),
             ).await;
@@ -8534,14 +8534,14 @@ pub(in crate::subc) mod route_tests {
                 crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
                     None,
                 );
-            std::fs::write(&task.paths.stdout, "observed-output-marker").unwrap();
-            std::fs::write(&task.paths.stderr, "").unwrap();
+            std::fs::write(&task.paths().stdout, "observed-output-marker").unwrap();
+            std::fs::write(&task.paths().stderr, "").unwrap();
             let ctx = Arc::new(crate::test_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 original.config().as_ref().clone(),
             ));
             let root = ProjectRootId::from_path(dir.path()).unwrap();
-            let before = std::fs::read(&task.paths.json).unwrap();
+            let before = std::fs::read(&task.paths().json).unwrap();
             let mut arguments = json!({"taskId":task.task_id});
             if name == "bash_watch" {
                 arguments["pattern"] = json!("observed-output-marker");
@@ -8549,7 +8549,7 @@ pub(in crate::subc) mod route_tests {
             }
             let reply = exchange_with_actor(
                 json!({"name":name,"preset":"worker","arguments":arguments}),
-                task_poll_identity(&root, &task.session_id, true),
+                task_poll_identity(&root, &task.session_id(), true),
                 ctx.clone(),
                 &Arc::new(DispatchPathMetrics::new()),
                 |request, ctx| crate::commands::bash_status::handle(&request, ctx),
@@ -11189,6 +11189,15 @@ pub(in crate::subc) mod route_tests {
         assert_eq!(reply.header.ty, FrameType::Response);
         assert_eq!(ACTIONS.load(Ordering::SeqCst), 1);
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 }
 
 #[cfg(test)]
@@ -11301,7 +11310,7 @@ mod ledger_terminal_tests {
             .unwrap()
             .unwrap();
         let mut metadata = crate::bash_background::persistence::PersistedTask::from(row);
-        metadata.memory_policy = serde_json::from_value(json!({
+        *metadata.memory_policy_mut() = serde_json::from_value(json!({
             "mib": 64,
             "kind": "Linux task scope memory.max",
             "cgroup": cgroup,
@@ -11389,8 +11398,8 @@ mod ledger_terminal_tests {
                 .unwrap()
                 .unwrap();
             let mut metadata = crate::bash_background::persistence::PersistedTask::from(row);
-            metadata.memory_policy = None;
-            metadata.task_scope_runtime_ms = Some(60_000);
+            *metadata.memory_policy_mut() = None;
+            *metadata.task_scope_runtime_ms_mut() = Some(60_000);
             conn.execute(
                 "UPDATE bash_tasks SET metadata=?1 WHERE task_id=?2",
                 rusqlite::params![serde_json::to_string(&metadata).unwrap(), kill.task],
@@ -12203,6 +12212,9 @@ mod ledger_terminal_tests {
             "semantic_search: database_unavailable — ledger offline"
         );
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::PersistedTaskTestExt as _;
 }
 
 #[cfg(test)]
@@ -12903,4 +12915,7 @@ mod metadata_lane_tests {
         assert!(active.lock().unwrap().is_empty());
         assert!(replies.try_recv().is_err());
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 }

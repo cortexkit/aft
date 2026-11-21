@@ -802,3 +802,6 @@ fn access_policy_ordinary_project_path_filter_cost() {
     let indexed_filter = measure(&|path| filters.matches(&root, path));
     println!("TASK_PATH_FILTER_COST files=50000 baseline_ms={baseline:.3} safe_task_entry_ms={entry_filter:.3} path_filters_matches_ms={indexed_filter:.3}");
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

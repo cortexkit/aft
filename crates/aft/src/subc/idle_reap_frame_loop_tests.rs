@@ -550,3 +550,6 @@ fn reap_decisions_match_path_by_path_restore_over_random_sequences() {
     assert!(forgotten > 0, "no sweep retired a deleted root");
     assert!(standing_retained > 0, "no sweep restored a blocked root");
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

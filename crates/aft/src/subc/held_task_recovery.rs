@@ -1076,4 +1076,7 @@ pub(crate) mod tests {
             .any(|part| part == b"held-restart-output"));
         restarted.bash_background().detach();
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 }

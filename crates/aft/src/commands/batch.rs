@@ -342,6 +342,9 @@ mod audit_regressions {
             assert_eq!(store.history(session, &path).len(), 1);
         }
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }
 
 fn build_batch_output(
@@ -1382,4 +1385,7 @@ mod audit11_regressions {
             .all(|edit| edit.replacement == "v = 'b'\n    w = 'c'"));
         assert_eq!(STRING_LINE_PARSES.with(|count| count.get()), 1);
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
 }

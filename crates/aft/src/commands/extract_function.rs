@@ -777,6 +777,9 @@ mod audit11_regressions {
         .unwrap();
         assert_eq!(std::fs::read(path).unwrap(), "\u{feff}function helper() {\r\n  run();\r\n}\r\n\r\nfunction outer() {\r\n  helper();\r\n}\r\n".as_bytes());
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
 }
 
 #[cfg(test)]

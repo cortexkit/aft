@@ -257,6 +257,8 @@ mod tests {
         assert!(response.success, "{response:?}");
         BEFORE_CREATE.with(|hook| assert!(hook.borrow().is_none()));
     }
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }
 
 fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response, Response> {

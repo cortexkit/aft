@@ -457,3 +457,6 @@ fn luau_s4_main_parity_rejects_missing_callback_keys() {
     let mut actual = json!({"structuredContent":{"plan":{"callback_counts":{}}}});
     align_callback_counts_as_set(&expected, &mut actual);
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

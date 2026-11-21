@@ -413,3 +413,6 @@ fn deleted_root_task_registry_contention_is_censused_without_kill_threads() {
     let outcome = fixture.sweep();
     fixture.assert_reclaimed(outcome);
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

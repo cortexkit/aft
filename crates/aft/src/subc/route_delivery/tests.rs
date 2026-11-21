@@ -196,3 +196,8 @@ fn bound_legacy_spawn_pushes_completion_without_another_route_sync() {
     assert_eq!(done.status, BgTaskStatus::Completed);
     assert!(done.launching_identity.is_none());
 }
+
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppContextTestExt as _;

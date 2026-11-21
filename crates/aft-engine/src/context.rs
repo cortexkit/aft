@@ -902,7 +902,7 @@ pub struct StatusEmitter {
     context: Mutex<Weak<AppContext>>,
     #[cfg(test)]
     pub(crate) snapshot_builds: AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) memory_census_builds: AtomicUsize,
 }
 
@@ -1561,7 +1561,7 @@ impl StatusEmitter {
             context: Mutex::new(Weak::new()),
             #[cfg(test)]
             snapshot_builds: AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             memory_census_builds: AtomicUsize::new(0),
         }
     }
@@ -2319,15 +2319,15 @@ struct PolicyConfinementMemo {
     /// Bumped by every confining save, so an unconfined answer read before
     /// one is not remembered after it.
     generation: u64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     store_reads: usize,
     /// Runs once, between a policy read from aft.db and remembering its
     /// answer, so a test can save a policy in that window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     after_read_for_test: Option<Box<dyn FnOnce(&AppContext) + Send>>,
     /// Runs after an inconclusive memory probe, before acquiring the database
     /// handle, so a test can release a contended slot at that exact boundary.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     after_memory_miss_for_test: Option<Box<dyn FnOnce() + Send>>,
 }
 
@@ -2608,7 +2608,7 @@ impl App {
             .map(|slot| slot.as_ref().map(|(_, conn)| Arc::clone(conn)))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn with_database_slot_locked_for_test(&self, f: impl FnOnce()) {
         let _slot = self.db.lock();
         f();
@@ -2799,7 +2799,7 @@ pub struct AppContext {
     /// params and failed restores are not cached, so later calls can retry.
     launch_grants_materialized: parking_lot::Mutex<HashSet<crate::db::access_grants::ScopeKey>>,
     pub launch_grant_state: Arc<launch_grants::LaunchGrantState>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     launch_restore_attempts: AtomicUsize,
     #[cfg(test)]
     path_restriction_root_canonicalizations: AtomicUsize,
@@ -3023,9 +3023,9 @@ pub struct AppContext {
     /// Successful git worktree probes, keyed by canonical root and guarded by
     /// the root's `.git` entry shape and modification time.
     worktree_bridge_cache: parking_lot::Mutex<BTreeMap<PathBuf, WorktreeBridgeCacheEntry>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     worktree_bridge_probe_spawns: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     force_worktree_bridge_reprobe: AtomicBool,
     configure_warnings_tx: crossbeam_channel::Sender<(u64, ConfigureWarningsFrame)>,
     configure_warnings_rx: crossbeam_channel::Receiver<(u64, ConfigureWarningsFrame)>,
@@ -3373,7 +3373,7 @@ impl AppContext {
             path_restriction_root_memo: parking_lot::Mutex::new(None),
             launch_grants_materialized: parking_lot::Mutex::new(HashSet::new()),
             launch_grant_state: Arc::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             launch_restore_attempts: AtomicUsize::new(0),
             #[cfg(test)]
             path_restriction_root_canonicalizations: AtomicUsize::new(0),
@@ -3482,9 +3482,9 @@ impl AppContext {
             readonly_artifact_cache_keys: parking_lot::Mutex::new(BTreeMap::new()),
             artifact_cache_key_derivations: AtomicU64::new(0),
             worktree_bridge_cache: parking_lot::Mutex::new(BTreeMap::new()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             worktree_bridge_probe_spawns: AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             force_worktree_bridge_reprobe: AtomicBool::new(false),
             configure_warnings_tx,
             configure_warnings_rx,
@@ -4207,7 +4207,7 @@ impl AppContext {
     /// How many ignore-file walks the calling thread has run, across every
     /// context. Lets a test prove a path never walks a project on the thread
     /// that called it.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn ignore_walks_on_current_thread_for_test() -> u64 {
         IGNORE_WALKS_ON_THREAD.with(std::cell::Cell::get)
     }
@@ -4325,7 +4325,7 @@ impl AppContext {
     }
 
     /// Whether the compiled filter registry is resident.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn filter_registry_loaded(&self) -> bool {
         self.filter_registry_loaded.load(Ordering::Acquire)
     }
@@ -4450,7 +4450,7 @@ impl AppContext {
         self.subc_lifecycle.try_is_bound().map(|bound| !bound)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_unbound_build_abandon_grace_for_test(&self, grace: Duration) {
         self.subc_lifecycle.set_abandon_grace_for_test(grace);
     }
@@ -4960,7 +4960,7 @@ impl AppContext {
     /// Return a worktree probe result only while the root's `.git` marker still
     /// matches the marker present when the successful probe was cached.
     pub fn cached_worktree_bridge(&self, canonical_root: &Path) -> Option<(bool, Option<PathBuf>)> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self.force_worktree_bridge_reprobe.load(Ordering::SeqCst) {
             return None;
         }
@@ -4991,18 +4991,18 @@ impl AppContext {
         );
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn record_worktree_bridge_probe_spawn_for_test(&self) {
         self.worktree_bridge_probe_spawns
             .fetch_add(1, Ordering::SeqCst);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn worktree_bridge_probe_spawns_for_test(&self) -> u64 {
         self.worktree_bridge_probe_spawns.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn force_worktree_bridge_reprobe_for_test(&self, enabled: bool) {
         self.force_worktree_bridge_reprobe
             .store(enabled, Ordering::SeqCst);
@@ -5221,8 +5221,8 @@ impl AppContext {
         Ok(Some(key))
     }
 
-    #[cfg(test)]
-    pub fn artifact_cache_key_derivation_count_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn artifact_cache_key_derivation_count_for_test(&self) -> u64 {
         self.artifact_cache_key_derivations.load(Ordering::SeqCst)
     }
 
@@ -5408,7 +5408,7 @@ impl AppContext {
 
     /// Swap in a test-built checkpoint store that answers this context's
     /// namespace requests.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn replace_checkpoint_store_for_test(&self, mut store: CheckpointStore) {
         store.use_namespace_request(self.checkpoint_namespace_request.clone());
         *self.checkpoint.lock() = store;
@@ -5451,12 +5451,12 @@ impl AppContext {
         self.launch_grants_materialized.lock().insert(scope);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn note_launch_restore_attempt(&self) {
         self.launch_restore_attempts.fetch_add(1, Ordering::Relaxed);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn launch_restore_attempts(&self) -> usize {
         self.launch_restore_attempts.load(Ordering::Relaxed)
     }
@@ -5526,7 +5526,7 @@ impl AppContext {
 
     /// Mark persistence as initializing with nothing staged, for tests of the
     /// readiness wait itself that must control when the state changes.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn mark_database_runtime_initializing_for_test(&self) {
         let mut slot = self.database_open.lock();
         slot.epoch = slot.epoch.wrapping_add(1);
@@ -5815,20 +5815,20 @@ impl AppContext {
 
     /// Count one read of a policy key's confinement from aft.db.
     pub fn note_policy_confinement_read(&self) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.policy_confinement.lock().store_reads += 1;
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn policy_confinement_reads_for_test(&self) -> usize {
         self.policy_confinement.lock().store_reads
     }
 
     /// Run `hook` once, after the next policy read from aft.db and before its
     /// answer is remembered.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn after_next_policy_read_for_test(
         &self,
         hook: impl FnOnce(&AppContext) + Send + 'static,
@@ -5836,7 +5836,7 @@ impl AppContext {
         self.policy_confinement.lock().after_read_for_test = Some(Box::new(hook));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn run_after_policy_read_hook_for_test(&self) {
         // Taken out first: the hook may save a policy, which locks the memo.
         let hook = self.policy_confinement.lock().after_read_for_test.take();
@@ -5845,7 +5845,7 @@ impl AppContext {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn after_next_policy_memory_miss_for_test(
         &self,
         hook: impl FnOnce() + Send + 'static,
@@ -5853,7 +5853,7 @@ impl AppContext {
         self.policy_confinement.lock().after_memory_miss_for_test = Some(Box::new(hook));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn run_after_policy_memory_miss_hook_for_test(&self) {
         let hook = self
             .policy_confinement
@@ -6365,7 +6365,7 @@ impl AppContext {
         &self.config_live
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn path_restriction_root_memo_is_empty_for_test(&self) -> bool {
         self.path_restriction_root_memo.lock().is_none()
     }
@@ -6845,7 +6845,7 @@ impl AppContext {
 
     /// Holds the slot a bind holds while it scans, so a test sees the
     /// checkout as binding.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn hold_data_checkout_slot_for_test(
         &self,
     ) -> parking_lot::MutexGuard<'_, Option<Arc<crate::data_layer::runtime::DataCheckout>>> {
@@ -7197,7 +7197,7 @@ impl AppContext {
         self.data_children.set_executor(&executor);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn callgraph_executor_for_test(
         &self,
     ) -> Option<crate::executor::RootMaintenanceExecutor> {
@@ -7256,7 +7256,7 @@ impl AppContext {
 
     /// Copies of the pending Tier-2 and semantic path sets and the
     /// corpus-refresh flag, unfiltered and left in place.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn pending_reconciliation_snapshot_for_test(
         &self,
     ) -> (BTreeSet<PathBuf>, BTreeSet<PathBuf>, bool) {
@@ -8250,7 +8250,7 @@ impl AppContext {
                 })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn watcher_runtime_thread_id_for_test(&self) -> Option<std::thread::ThreadId> {
         self.watcher_runtime_identity
             .lock()
@@ -9251,7 +9251,7 @@ impl AppContext {
             .unwrap_or(pending)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn lsp_post_edit_worker_running_for_test(&self) -> bool {
         self.lsp_post_edit_worker_running.load(Ordering::Acquire)
     }

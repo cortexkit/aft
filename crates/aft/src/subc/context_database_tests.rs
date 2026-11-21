@@ -900,4 +900,9 @@ mod shared_db_tests {
         assert!(!ctx.claim_database_runtime_retry("db_set_host_state"));
         assert!(ctx.database_runtime_refusal("read", "read").is_none());
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+    #[cfg(test)]
+    use aft_engine::test_bridge::display_data::ExecutorContext as _;
 }

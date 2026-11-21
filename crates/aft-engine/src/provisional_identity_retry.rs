@@ -211,12 +211,12 @@ impl RetrySlot {
     }
 
     /// True while a retry is armed and has not given up.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn is_armed(&self) -> bool {
         self.0.lock().as_ref().is_some_and(|retry| !retry.exhausted)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn attempts_for_test(&self) -> Option<u32> {
         self.0.lock().as_ref().map(|retry| retry.attempts)
     }

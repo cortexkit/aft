@@ -1667,3 +1667,12 @@ isolated!(
         assert_eq!(crate::parser::work_counters::tree_parses() - before, 1);
     }
 );
+
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::CheckoutTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::CheckoutViewTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::VectorPlaneTestExt as _;

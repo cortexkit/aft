@@ -210,6 +210,9 @@ mod audit11_regressions {
             "\u{feff}<html>\r\n<h1>C</h1><h1>B</h1>\r\n</html>\r\n".as_bytes()
         );
     }
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::bash_remote::ToolLaunchPolicyTestExt as _;
 }
 
 #[cfg(test)]
