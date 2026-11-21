@@ -9,7 +9,9 @@ use crate::db::bash_tasks::BashTaskRow;
 use crate::exec_remote::Verdict;
 #[cfg(unix)]
 use crate::sandbox_profile::SandboxProfile;
-use crate::sandbox_spawn::{PreparedTask, SpawnPlan};
+#[cfg(unix)]
+use crate::sandbox_spawn::PreparedTask;
+use crate::sandbox_spawn::SpawnPlan;
 use serde_json::Value;
 use std::{
     collections::HashMap,

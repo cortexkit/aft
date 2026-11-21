@@ -6591,7 +6591,8 @@ mod grant_path_tests {
         assert_eq!(response.data["queue_position"], 7, "{response:?}");
         assert_eq!(response.data["remote_job_id"], id().to_string());
         let cancels = || {
-            daemon.log()()
+            daemon
+                .log()
                 .lock()
                 .unwrap()
                 .iter()
@@ -6715,7 +6716,8 @@ mod grant_path_tests {
         fn job_cancels(daemon: &Daemon) -> usize {
             // Request-level Cancel only closes an observation at ck-motor;
             // exec.cancel is the operation that stops the remote job.
-            daemon.log()()
+            daemon
+                .log()
                 .lock()
                 .unwrap()
                 .iter()

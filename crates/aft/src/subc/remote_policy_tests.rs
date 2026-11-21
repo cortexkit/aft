@@ -4,6 +4,8 @@ use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::AppContextTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::display_data::AppTestExt as _;
 use sha2::{Digest, Sha256};
 
 #[cfg(unix)]

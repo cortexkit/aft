@@ -1175,7 +1175,7 @@ mod tests {
             Some(&selected.owner),
             &[],
             dir.path(),
-            &[task.paths().session_dir.clone()],
+            &[task.paths.session_dir],
         );
         assert_eq!(routes.data["complete"], false);
         assert_eq!(routes.data["reason"], "registry_not_loaded");
