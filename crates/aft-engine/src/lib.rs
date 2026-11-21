@@ -279,7 +279,7 @@ pub(crate) use aft_base::task_temp_reads;
 pub use aft_base::task_watch_lines;
 pub use aft_base::task_watches;
 #[cfg(any(test, feature = "test-support"))]
-pub mod test_storage;
+pub(crate) mod test_storage;
 pub use aft_base::tool_gate;
 #[doc(hidden)]
 pub mod tool_call_result;
@@ -314,7 +314,7 @@ pub(crate) use aft_base::search_hot_path_measurements as search_test_counts;
 pub(crate) use aft_base::test_allocations;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "base_tests/test_env.rs"]
-pub mod test_env;
+pub(crate) mod test_env;
 #[cfg(test)]
 pub(crate) use aft_base::test_gate;
 #[cfg(all(test, windows))]
@@ -332,3 +332,6 @@ mod disk_write_hunt;
 #[path = "../tests/helpers/fake_lsp.rs"]
 pub(crate) mod fake_lsp_test_helper;
 pub(crate) use aft_base::persistence_gate;
+
+#[cfg(feature = "test-support")]
+pub mod test_bridge;

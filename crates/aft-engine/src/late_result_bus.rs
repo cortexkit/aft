@@ -28,7 +28,7 @@ use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
 
 #[doc(hidden)]
 pub mod display;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use display::with_test_reader;
 #[doc(hidden)]
 pub mod readers;

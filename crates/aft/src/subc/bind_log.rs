@@ -173,7 +173,7 @@ mod tests {
             ],
         ] {
             let reader = rich_ui::display::declared_display(&modules);
-            crate::late_result_bus::with_test_reader(reader.as_deref(), || {
+            aft_engine::test_bridge::with_test_reader(reader.as_deref(), || {
                 let (reply, route) = bind_answer(&other, "other-module", &[]);
                 assert_eq!(reply.header.ty, FrameType::Error);
                 let error: ErrorBody = serde_json::from_slice(&reply.body).unwrap();

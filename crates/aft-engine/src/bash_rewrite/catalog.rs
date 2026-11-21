@@ -324,7 +324,14 @@ pub fn baseline_source_resolves(source: &str) -> bool {
     let manifest_dir = crate::test_support::manifest_dir();
     #[cfg(not(test))]
     let manifest_dir = manifest_dir();
-    let path = manifest_dir.join(file);
+    // Catalog paths are package-relative. Handler sources stay in the upper
+    // package, while the rewrite rules move with this catalog.
+    let package = if file.starts_with("src/commands/") {
+        "aft"
+    } else {
+        "aft-engine"
+    };
+    let path = manifest_dir.join("..").join(package).join(file);
     path.is_file()
         && fs::read_to_string(path)
             .ok()
