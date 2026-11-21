@@ -79,7 +79,7 @@ thread_local! {
     static NOW_FOR_TEST: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static TIMING_FOR_TEST: std::cell::Cell<Option<Timing>> = const { std::cell::Cell::new(None) };
 }
@@ -111,7 +111,7 @@ pub(crate) fn advance_clock_for_test(elapsed: Duration) {
 }
 
 fn timing() -> Timing {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(timing) = TIMING_FOR_TEST.with(std::cell::Cell::get) {
         return timing;
     }
@@ -119,7 +119,7 @@ fn timing() -> Timing {
 }
 
 fn cache_timing() -> Timing {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some(timing) = TIMING_FOR_TEST.with(std::cell::Cell::get) {
         return timing;
     }
@@ -133,7 +133,7 @@ fn cache_timing() -> Timing {
 
 /// Run `body` with retry delays and the give-up window replaced on this
 /// thread, so a unit test can make an attempt due at once or exhaust it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn with_timing_for_test<T>(
     first_delay: Duration,
     give_up_after: Duration,

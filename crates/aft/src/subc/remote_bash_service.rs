@@ -88,7 +88,7 @@ impl Edge {
             #[cfg(all(test, target_os = "linux"))]
             let prepare = |ctx: &AppContext, folder: &Path, workdir, command| {
                 if let Some(launcher) = test_launcher {
-                    crate::sandbox_spawn::remote::prepare_with_launcher(
+                    aft_engine::test_bridge::bash_remote::sandbox_spawn::remote::prepare_with_launcher(
                         ctx, folder, workdir, command, launcher,
                     )
                 } else {

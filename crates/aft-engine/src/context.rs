@@ -1049,7 +1049,7 @@ impl Drop for ProjectApplicabilityHold {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     /// Memory estimates on this thread that walked at least one of a root's
     /// resident indexes.
@@ -1081,7 +1081,7 @@ pub(crate) fn memory_walk_now_for_test() -> Instant {
     MEMORY_WALK_CLOCK.with(|clock| clock.get().unwrap_or_else(Instant::now))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn memory_estimate_walks_for_test() -> usize {
     MEMORY_ESTIMATE_WALKS.with(std::cell::Cell::get)
 }
@@ -2415,6 +2415,11 @@ impl App {
         (self.provider_factory)()
     }
 
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn has_isolated_test_storage(&self) -> bool {
+        self.test_storage.is_some()
+    }
+
     /// All context constructors and publications share this default, including
     /// helpers in other modules. The owning App keeps the directory alive.
     #[cfg(any(test, feature = "test-support"))]
@@ -3542,7 +3547,7 @@ impl AppContext {
         &self,
         wait_for_manager: bool,
     ) -> Option<StatusBarCountValues> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STATUS_COUNT_PROBES.with(|count| count.set(count.get() + 1));
         let todos = self
             .status_bar_todos
@@ -4640,7 +4645,7 @@ impl AppContext {
     }
 
     pub fn note_configure_session_binding(&self, root: PathBuf, session_id: String) -> bool {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_configure_bind_effect_for_test(&root, &session_id, ConfigureBindEffect::Session);
         self.configured_session_roots
             .lock()
@@ -4952,7 +4957,7 @@ impl AppContext {
         if jobs.len() >= crate::executor::MAINTENANCE_QUEUE_CAP {
             return Err(job);
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_configure_bind_effect_for_test(
             &job.canonical_cache_root,
             &job.session_id,
@@ -10978,7 +10983,7 @@ impl AppContext {
     }
 
     fn memory_estimates(&self) -> [crate::memory::MemoryEstimate; 12] {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
         let walked = WalkedMemory {
             measured_at: Instant::now(),
@@ -11014,7 +11019,7 @@ impl AppContext {
 
     /// Walk every entry of the semantic index for its memory estimate.
     fn walk_semantic_memory(&self) -> crate::memory::MemoryEstimate {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[0] += 1);
         match self.semantic_index.try_read() {
             Ok(index) => index
@@ -11032,14 +11037,14 @@ impl AppContext {
 
     /// The in-process trigram index's memory: none, as with its shape.
     fn walk_trigram_memory(&self) -> crate::memory::MemoryEstimate {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[1] += 1);
         crate::memory::MemoryEstimate::estimated(0).count("files", 0)
     }
 
     /// Read the symbol cache's running memory totals without visiting entries.
     fn walk_symbol_memory(&self) -> crate::memory::MemoryEstimate {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         MEMORY_INDEX_WALKS.with(|walks| walks.borrow_mut()[2] += 1);
         match self.symbol_cache.try_read() {
             Ok(cache) => cache.estimated_memory(),
@@ -11542,18 +11547,26 @@ mod core_regressions {
 #[cfg(test)]
 thread_local! {
     static CONFIG_PUBLICATION_PROBE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
-    pub(crate) static STATUS_COUNT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod status_count_fixture {
+    thread_local! {
+        pub static STATUS_COUNT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+use status_count_fixture::STATUS_COUNT_PROBES;
+
 /// Which configure side effect a test counts per (root, session).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy)]
 enum ConfigureBindEffect {
     Session,
     Maintenance,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn configure_bind_effects(
 ) -> &'static parking_lot::Mutex<BTreeMap<(PathBuf, String), (usize, usize)>> {
     static EFFECTS: std::sync::OnceLock<
@@ -11562,7 +11575,7 @@ fn configure_bind_effects(
     EFFECTS.get_or_init(|| parking_lot::Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_configure_bind_effect_for_test(
     root: &Path,
     session_id: &str,
@@ -11581,7 +11594,7 @@ fn record_configure_bind_effect_for_test(
 /// How many times configure recorded `session_id` as bound to `root`, and how
 /// many configure maintenance jobs it queued for that pair. Tests use roots of
 /// their own, so parallel tests do not share entries.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn configure_bind_effects_for_test(root: &Path, session_id: &str) -> (usize, usize) {
     configure_bind_effects()
         .lock()

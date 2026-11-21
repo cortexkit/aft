@@ -305,7 +305,7 @@ fn parsed_text(source: &[u8]) -> &str {
 /// Parses `source` as `lang` for extraction. Every parse of this module
 /// goes through here.
 fn parse(source: &[u8], lang: LangId) -> Result<tree_sitter::Tree, ManifestJoinError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_parsed_for_test(source);
     join::single_walk::parse_source(parsed_text(source), lang)
 }
@@ -313,11 +313,11 @@ fn parse(source: &[u8], lang: LangId) -> Result<tree_sitter::Tree, ManifestJoinE
 /// The contents extraction has parsed, for tests that check what a reader
 /// leaves unparsed. Every parse in this module goes through [`parse`], or
 /// through [`reparse`], which notes its parses too.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static PARSED_FOR_TEST: std::sync::Mutex<Vec<aft_store::ids::ContentKey>> =
     std::sync::Mutex::new(Vec::new());
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_parsed_for_test(source: &[u8]) {
     PARSED_FOR_TEST
         .lock()
@@ -326,7 +326,7 @@ fn note_parsed_for_test(source: &[u8]) {
 }
 
 /// How many times extraction has parsed `source`'s content so far.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn parses_of_for_test(source: &[u8]) -> usize {
     let key = aft_store::ids::ContentKey::of(source);
     PARSED_FOR_TEST
@@ -386,7 +386,7 @@ pub fn reparse(
     }
     let lang = join::language_id(language)
         .ok_or_else(|| ManifestJoinError::UnsupportedLanguage(language.to_string()))?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     note_parsed_for_test(source);
     let text = parsed_text(source);
     if previous.language != lang {

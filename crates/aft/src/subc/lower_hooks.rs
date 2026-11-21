@@ -76,8 +76,8 @@ mod tests {
         assert!(configure::database_runtime().is_some());
         assert!(configure::command_hooks().is_some());
         assert!(crate::cache_location::reader_floor_hooks_registered());
-        assert!(crate::bash_background::frames::registered());
-        assert!(crate::edit::file_reporter_registered());
+        assert!(aft_engine::test_bridge::bash_remote::bash_background::frames::registered());
+        assert!(aft_engine::test_bridge::search_misc::edit::file_reporter_registered());
         assert!(crate::db::call_ledger::held_result_projector_registered());
         assert!(crate::commands::bash_watch::restart::registered());
         assert!(late_result_bus::hooks().is_some());
