@@ -137,7 +137,7 @@ pub struct StoreIncompleteNote {
 }
 
 #[cfg(test)]
-fn empty_receiver_note(
+pub(crate) fn empty_receiver_note(
     store: &impl CallGraphRead,
     target: &StoreNode,
     count: usize,
@@ -560,7 +560,7 @@ fn unknown_test_caller_count(sites: &[StoreCallSite]) -> usize {
         .count()
 }
 
-fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
+pub(crate) fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
     (!include_tests && count > 0).then(|| {
         TEST_FILTER_NOTE
             .replace("{count}", &count.to_string())
@@ -4960,7 +4960,3 @@ mod trace_to_tests {
         );
     }
 }
-
-#[cfg(test)]
-#[path = "callgraph_regression_tests.rs"]
-mod callgraph_regression_tests;

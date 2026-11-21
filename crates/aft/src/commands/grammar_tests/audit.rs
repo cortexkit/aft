@@ -12,7 +12,7 @@ fn run(name: &str, test: fn()) {
     let result = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!("data_layer::grammar_tests::audit::{name}"),
+            &format!("{}::{name}", module_path!().split_once("::").unwrap().1),
             "--nocapture",
         ])
         .env("AFT_S4_AUDIT_TEST", name)
@@ -1316,7 +1316,7 @@ isolated!(
     || {
         let f = fixture(true);
         write(&f.root, "bad.luau", "function broken()\n return @@@\nend\n");
-        let fallback = AppContext::new(Box::new(NoBatch(None)), (*f.ctx.config()).clone());
+        let fallback = crate::test_context(Box::new(NoBatch(None)), (*f.ctx.config()).clone());
         fallback.set_canonical_cache_root(f.root.clone());
         for ctx in [&fallback, &f.ctx] {
             for params in [
@@ -1344,7 +1344,8 @@ isolated!(
         let path = write(&f.root, "source.luau", SOURCE);
         for error in [StructureError::Syntax, StructureError::Timeout] {
             let timeout = matches!(error, StructureError::Timeout);
-            let ctx = AppContext::new(Box::new(NoBatch(Some(error))), (*f.ctx.config()).clone());
+            let ctx =
+                crate::test_context(Box::new(NoBatch(Some(error))), (*f.ctx.config()).clone());
             ctx.set_canonical_cache_root(f.root.clone());
             let response = ask(&ctx, "outline", json!({"directory":f.root}));
             assert!(response.success, "{:?}", response.data);
@@ -1547,7 +1548,7 @@ isolated!(
             );
             let mut config = (*f.ctx.config()).clone();
             config.project_root = Some(root.clone());
-            let ctx = AppContext::new(
+            let ctx = crate::test_context(
                 Box::new(NoBatch(Some(StructureError::RemoveNext(missing.clone())))),
                 config,
             );

@@ -23,7 +23,7 @@ fn grammar_registries_download_fail_and_retry_independently() {
     manifest["grammars"].as_array_mut().unwrap().push(fake);
     let manifest_path = write(dir.path(), "manifest.json", manifest.to_string());
     let result = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "data_layer::grammar_tests::multiple::grammar_registries_download_fail_and_retry_independently", "--nocapture"])
+        .args(["--exact", "commands::grammar_tests::multiple::grammar_registries_download_fail_and_retry_independently", "--nocapture"])
         .env("AFT_TEST_MULTI_GRAMMAR_ROOT", dir.path())
         .env("AFT_TEST_GRAMMAR_MANIFEST", manifest_path)
         .env("AFT_TEST_GRAMMAR_PARSE_DEADLINE_MS", "30000")
