@@ -1893,7 +1893,7 @@ pub fn warm_meaning(ctx: &dyn IndexHost) -> Option<WarmState> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
@@ -1903,7 +1903,7 @@ mod tests {
     use crate::data_layer::checkout::{CheckoutStatus, DataError, LiveMemory};
     use crate::protocol::RawRequest;
 
-    fn write(root: &Path, path: &str, text: &str) -> PathBuf {
+    pub(crate) fn write(root: &Path, path: &str, text: &str) -> PathBuf {
         let path = root.join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, text).unwrap();
@@ -2094,6 +2094,17 @@ mod tests {
         storage: &Path,
         edit: impl FnOnce(&mut crate::config::Config),
     ) -> AppContext {
+        let config = root_fixture_config(root, storage, edit);
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.set_canonical_cache_root(root.to_path_buf());
+        ctx
+    }
+
+    pub(crate) fn root_fixture_config(
+        root: &Path,
+        storage: &Path,
+        edit: impl FnOnce(&mut crate::config::Config),
+    ) -> crate::config::Config {
         write(root, "Cargo.toml", "[package]\nname = \"demo\"\n");
         write(
             root,
@@ -2107,9 +2118,7 @@ mod tests {
             ..crate::config::Config::default()
         };
         edit(&mut config);
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
-        ctx.set_canonical_cache_root(root.to_path_buf());
-        ctx
+        config
     }
 
     /// Pauses the initial build after publication but before it starts a
@@ -2237,7 +2246,7 @@ mod tests {
 
     /// Waits up to 60 s for both planes of `ctx`'s bound checkout to be
     /// ready with no edit pending.
-    fn settled(ctx: &AppContext) -> DataStoreReport {
+    pub(crate) fn settled(ctx: &AppContext) -> DataStoreReport {
         let started = Instant::now();
         loop {
             let report = report(ctx).expect("data layer on");

@@ -14485,7 +14485,46 @@ mod harness_path_tests {
 }
 
 #[cfg(test)]
+pub(crate) mod database_test_support {
+    use super::*;
+
+    pub(crate) fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
+        ctx.database_runtime_refusal("retry", "db_set_host_state")
+    }
+
+    pub(crate) fn make_database_retry_due(ctx: &AppContext) {
+        ctx.database_runtime_failure.lock().retry_at =
+            Some(Instant::now() - Duration::from_secs(1));
+    }
+
+    pub(crate) fn database_state(ctx: &AppContext) -> u8 {
+        ctx.database_runtime_state.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn database_open_attempts(ctx: &AppContext) -> u64 {
+        ctx.database_open_attempts.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn database_failure(
+        ctx: &AppContext,
+    ) -> (Option<String>, Option<Instant>, Duration) {
+        let failure = ctx.database_runtime_failure.lock();
+        (failure.error.clone(), failure.retry_at, failure.backoff)
+    }
+
+    pub(crate) fn hold_database_slot(app: &App) -> impl Drop + '_ {
+        app.db.lock()
+    }
+
+    pub(crate) fn on_database_slot_contention(callback: impl FnOnce() + 'static) {
+        DATABASE_SLOT_CONTENDED_FOR_TEST.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(callback));
+        });
+    }
+}
+#[cfg(test)]
 mod shared_db_tests {
+    use super::database_test_support::*;
     use super::*;
     use tempfile::tempdir;
 
@@ -14600,7 +14639,7 @@ mod shared_db_tests {
             true,
         );
         ctx.mark_subc_bound();
-        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 2);
+        assert_eq!(database_state(ctx.as_ref()), 2);
         ctx
     }
 
@@ -14750,7 +14789,7 @@ mod shared_db_tests {
             "idle-rebind".into(),
         );
         a.mark_subc_bound();
-        assert_eq!(a.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(database_open_attempts(&a), 1);
         assert!(!a.database_runtime_initializing());
         let second = completed_rebind_bash_task(&a, root_a.path(), storage.path());
         assert_ne!(first, second);
@@ -14781,7 +14820,7 @@ mod shared_db_tests {
         assert!(ctx.backup().lock().uses_db_pool(&shared));
         assert!(ctx.bash_background().uses_db_pool(&shared));
         assert!(!ctx.database_runtime_initializing());
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(database_open_attempts(&ctx), 1);
     }
 
     #[test]
@@ -14809,7 +14848,7 @@ mod shared_db_tests {
             .join()
             .unwrap();
         assert_rebound_backup_is_persisted(&ctx, root.path(), storage.path());
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(database_open_attempts(&ctx), 1);
     }
 
     fn failed_database_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
@@ -14845,8 +14884,8 @@ mod shared_db_tests {
             crate::database_open::DatabaseOpenRunner::ConfigureTail,
             true,
         );
-        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 3);
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(database_state(&ctx), 3);
+        assert_eq!(database_open_attempts(&ctx), 1);
         let response = ctx.database_runtime_refusal("failed", "bash").unwrap();
         assert!(serde_json::to_value(response).unwrap()["message"]
             .as_str()
@@ -14862,10 +14901,6 @@ mod shared_db_tests {
         let (second_storage, _second_root, second) = failed_database_context();
         assert_eq!(second.storage_dir(), second_storage.path());
         assert_eq!(first.storage_dir(), first_storage.path());
-    }
-
-    fn persistence_call(ctx: &AppContext) -> Option<crate::protocol::Response> {
-        ctx.database_runtime_refusal("retry", "db_set_host_state")
     }
 
     #[test]
@@ -14887,13 +14922,12 @@ mod shared_db_tests {
             refusal.is_none(),
             "repaired database stayed latched: {refusal:?}"
         );
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(database_open_attempts(&ctx), 2);
         assert!(ctx.db().is_some());
-        let failure = ctx.database_runtime_failure.lock();
-        assert!(failure.error.is_none());
-        assert!(failure.retry_at.is_none());
-        assert_eq!(failure.backoff, Duration::ZERO);
-        drop(failure);
+        let (error, retry_at, backoff) = database_failure(&ctx);
+        assert!(error.is_none());
+        assert!(retry_at.is_none());
+        assert_eq!(backoff, Duration::ZERO);
         let request: crate::protocol::RawRequest = serde_json::from_value(serde_json::json!({
             "id": "persist", "command": "db_set_host_state",
             "params": {"key": "recovered", "value": "without-rebind"}
@@ -14914,13 +14948,8 @@ mod shared_db_tests {
         for _ in 0..10 {
             assert!(persistence_call(&ctx).is_some());
         }
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(database_open_attempts(&ctx), 1);
         assert!(ctx.database_runtime_refusal("read", "read").is_none());
-    }
-
-    fn make_database_retry_due(ctx: &AppContext) {
-        ctx.database_runtime_failure.lock().retry_at =
-            Some(Instant::now() - Duration::from_secs(1));
     }
 
     fn failed_floor_context() -> (tempfile::TempDir, tempfile::TempDir, AppContext) {
@@ -14978,7 +15007,7 @@ mod shared_db_tests {
         )
         .unwrap();
         assert!(persistence_call(&ctx).is_some(), "backoff must still apply");
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 1);
+        assert_eq!(database_open_attempts(&ctx), 1);
         assert_eq!(
             crate::persisted_format::refusal_covering(
                 crate::persisted_format::PersistedStore::AftDb,
@@ -15056,7 +15085,7 @@ mod shared_db_tests {
             crate::database_open::DatabaseOpenRunner::ConfigureTail,
             true,
         );
-        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 2);
+        assert_eq!(database_state(&ctx), 2);
         (storage, root, ctx)
     }
 
@@ -15145,10 +15174,7 @@ mod shared_db_tests {
 
         change_schema_in_child(&path, crate::db::CURRENT_SCHEMA_VERSION);
         // Expire the real two-second backoff deterministically without sleeping.
-        assert_eq!(
-            ctx.database_runtime_failure.lock().backoff,
-            Duration::from_secs(2)
-        );
+        assert_eq!(database_failure(&ctx).2, Duration::from_secs(2));
         make_database_retry_due(&ctx);
         let (tx, rx) = std::sync::mpsc::channel();
         ctx.bind_status_context();
@@ -15247,19 +15273,17 @@ mod shared_db_tests {
         );
         let exhausted = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
         assert_eq!(exhausted["code"], "database_unavailable", "{exhausted}");
-        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 5);
+        assert_eq!(database_state(&ctx), 5);
 
         let app = ctx.app();
-        let held = app.db.lock();
+        let held = hold_database_slot(&app);
         let (contended_tx, contended_rx) = std::sync::mpsc::channel();
         let (released_tx, released_rx) = std::sync::mpsc::channel();
         let retry_ctx = Arc::clone(&ctx);
         let retry = std::thread::spawn(move || {
-            DATABASE_SLOT_CONTENDED_FOR_TEST.with(|hook| {
-                *hook.borrow_mut() = Some(Box::new(move || {
-                    contended_tx.send(()).unwrap();
-                    released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-                }));
+            on_database_slot_contention(move || {
+                contended_tx.send(()).unwrap();
+                released_rx.recv_timeout(Duration::from_secs(2)).unwrap();
             });
             persistence_call(&retry_ctx)
         });
@@ -15299,13 +15323,13 @@ mod shared_db_tests {
         ctx.finish_database_runtime_error("retry open".into(), false);
         make_database_retry_due(&ctx);
         let app = ctx.app();
-        let held = app.db.lock();
+        let held = hold_database_slot(&app);
         let response = serde_json::to_value(persistence_call(&ctx).unwrap()).unwrap();
         assert!(response["message"]
             .as_str()
             .unwrap()
             .contains("process-shared database connection is in use"));
-        assert_eq!(ctx.database_runtime_state.load(Ordering::Acquire), 5);
+        assert_eq!(database_state(&ctx), 5);
         drop(held);
         assert!(
             persistence_call(&ctx).is_none(),
@@ -15318,10 +15342,7 @@ mod shared_db_tests {
     #[test]
     fn permanent_database_error_is_rechecked_with_doubling_capped_backoff() {
         let (storage, _root, ctx) = failed_database_context();
-        assert_eq!(
-            ctx.database_runtime_failure.lock().backoff,
-            Duration::from_secs(2)
-        );
+        assert_eq!(database_failure(&ctx).2, Duration::from_secs(2));
         // A different unsupported version must appear in the next refusal,
         // proving that retries re-check the file rather than replaying an error.
         let conn = rusqlite::Connection::open(storage.path().join("aft.db")).unwrap();
@@ -15346,19 +15367,10 @@ mod shared_db_tests {
             assert!(message.contains("AFT retries"));
             assert!(!message.contains("rebind to retry"));
             assert_eq!(response["retryable"], true);
-            assert_eq!(
-                ctx.database_runtime_failure.lock().backoff,
-                Duration::from_secs(seconds)
-            );
-            assert_eq!(
-                ctx.database_open_attempts.load(Ordering::Acquire),
-                index as u64 + 2
-            );
+            assert_eq!(database_failure(&ctx).2, Duration::from_secs(seconds));
+            assert_eq!(database_open_attempts(&ctx), index as u64 + 2);
             assert!(persistence_call(&ctx).is_some());
-            assert_eq!(
-                ctx.database_open_attempts.load(Ordering::Acquire),
-                index as u64 + 2
-            );
+            assert_eq!(database_open_attempts(&ctx), index as u64 + 2);
             assert!(ctx.db().is_none());
         }
     }
@@ -15388,7 +15400,7 @@ mod shared_db_tests {
             1
         );
         ctx.retry_database_runtime();
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(database_open_attempts(&ctx), 2);
     }
 
     #[test]
@@ -15456,7 +15468,7 @@ mod shared_db_tests {
             "retries must not open another descriptor on a resident database"
         );
         assert!(Arc::ptr_eq(&resident, &ctx.db().unwrap()));
-        assert_eq!(ctx.database_open_attempts.load(Ordering::Acquire), 2);
+        assert_eq!(database_open_attempts(&ctx), 2);
     }
 
     #[test]

@@ -2429,7 +2429,7 @@ pub(crate) fn memory_figure_walks_for_test() -> usize {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::atomic::AtomicUsize;
 
     use super::*;
@@ -2626,14 +2626,14 @@ mod tests {
         }
     }
 
-    struct PublicationFixture {
+    pub(crate) struct PublicationFixture {
         handle: Arc<DataCheckout>,
         _root: tempfile::TempDir,
         _storage: tempfile::TempDir,
     }
 
     impl PublicationFixture {
-        fn new(settle: Duration, quiet: Duration) -> Self {
+        pub(crate) fn new(settle: Duration, quiet: Duration) -> Self {
             let root = tempfile::tempdir().unwrap();
             let storage = tempfile::tempdir().unwrap();
             let path = std::fs::canonicalize(root.path()).unwrap();
@@ -2685,7 +2685,17 @@ mod tests {
         }
 
         fn context(&self) -> crate::context::AppContext {
-            let ctx = crate::context::AppContext::new(
+            self.context_with(crate::context::AppContext::new)
+        }
+
+        pub(crate) fn context_with(
+            &self,
+            make_context: impl FnOnce(
+                Box<dyn crate::language::LanguageProvider>,
+                crate::config::Config,
+            ) -> crate::context::AppContext,
+        ) -> crate::context::AppContext {
+            let ctx = make_context(
                 Box::new(crate::parser::TreeSitterProvider::new()),
                 crate::config::Config {
                     project_root: Some(self.handle.root().to_path_buf()),
@@ -2700,7 +2710,31 @@ mod tests {
             ctx
         }
 
-        fn refreshes(&self) -> usize {
+        pub(crate) fn root(&self) -> &Path {
+            self.handle.root()
+        }
+
+        pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
+            self.handle.note_paths(paths);
+        }
+
+        pub(crate) fn record_change(&self, intent: &WriteIntent, phase: WritePhase) {
+            self.handle._listener.record_change(intent, phase);
+        }
+
+        pub(crate) fn pending(&self) -> bool {
+            pending(self.handle.checkout())
+        }
+
+        pub(crate) fn quiet_armed(&self) -> bool {
+            self.handle.quiet.armed.load(Ordering::Acquire)
+        }
+
+        pub(crate) fn wait_for_work(&self) {
+            wait_until(|| !self.handle.work.running());
+        }
+
+        pub(crate) fn refreshes(&self) -> usize {
             self.handle.work.refreshes_started.load(Ordering::SeqCst)
         }
     }
@@ -2940,19 +2974,16 @@ mod tests {
         let ctx = fixture.context();
         ctx.set_worker_only_routes(true);
         let before = fixture.refreshes();
-        let lib = fixture.handle.root().join("src/lib.rs");
-        let extra = fixture.handle.root().join("src/extra.rs");
+        let lib = fixture.root().join("src/lib.rs");
+        let extra = fixture.root().join("src/extra.rs");
         std::fs::write(&extra, "pub fn new_caller() { crate::original(); }\n").unwrap();
-        fixture.handle.note_paths(std::slice::from_ref(&extra));
+        fixture.note_paths(std::slice::from_ref(&extra));
         std::fs::write(&lib, "mod extra;\npub fn original() {}\n").unwrap();
-        fixture
-            .handle
-            ._listener
-            .record_change(&WriteIntent::Paths(vec![lib.clone()]), WritePhase::After);
+        fixture.record_change(&WriteIntent::Paths(vec![lib.clone()]), WritePhase::After);
         std::thread::sleep(quiet * 3);
         assert_eq!(fixture.refreshes(), before);
-        assert!(pending(fixture.handle.checkout()));
-        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+        assert!(fixture.pending());
+        assert!(!fixture.quiet_armed());
 
         let response = crate::commands::callers::handle_callers(
             &crate::protocol::RawRequest {
@@ -2970,9 +3001,9 @@ mod tests {
             "{:?}",
             response.data
         );
-        wait_until(|| !fixture.handle.work.running());
+        fixture.wait_for_work();
         assert_eq!(fixture.refreshes(), before + 1);
-        assert!(!pending(fixture.handle.checkout()));
+        assert!(!fixture.pending());
     }
 
     #[test]
