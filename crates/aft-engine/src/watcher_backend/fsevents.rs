@@ -88,7 +88,8 @@ fn write_during_stream_handoff_for_test(root: &Path) {
     }
 }
 
-pub(crate) struct ProjectWatcher {
+#[doc(hidden)]
+pub struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     #[cfg(test)]
