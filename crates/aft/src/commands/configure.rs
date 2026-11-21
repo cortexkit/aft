@@ -53,7 +53,7 @@ mod runtime_hook_tests {
     #[test]
     fn configure_registers_its_runtime_hooks() {
         super::register_runtime_hooks();
-        assert!(crate::runtime_drain::configure::registered());
+        assert!(aft_engine::test_bridge::display_data::configure::registered());
         assert!(aft_engine::test_bridge::display_data::configure::database_runtime().is_some());
         assert!(aft_engine::test_bridge::display_data::configure::command_hooks().is_some());
         assert!(crate::cache_location::reader_floor_hooks_registered());

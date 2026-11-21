@@ -9284,7 +9284,7 @@ mod tests {
             cache.clock_ms.store(now_ms, Ordering::Relaxed);
             let walks_before = crate::context::memory_estimate_walks_for_test();
             let census_before = cache.census_builds_for_test();
-            crate::context::with_memory_walk_clock_for_test(
+            aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
                 epoch + Duration::from_millis(now_ms),
                 || cache.refresh_for_test(&executor, &app),
             );
@@ -9386,14 +9386,15 @@ mod tests {
         let epoch = Instant::now();
         let refresh_at = |seconds| {
             cache.clock_ms.store(seconds * 1000, Ordering::Relaxed);
-            crate::context::with_memory_walk_clock_for_test(
+            aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
                 epoch + Duration::from_secs(seconds),
                 || cache.refresh_for_test(&executor, &app),
             );
         };
         refresh_at(0);
         let memory_epoch = checkout.checkout().memory_epoch();
-        let walks = crate::data_layer::runtime::memory_figure_walks_for_test();
+        let walks =
+            aft_engine::test_bridge::display_data::memory_profile::memory_figure_walks_for_test();
         for tick in 1..=40 {
             refresh_at(tick * 3);
         }
@@ -9403,7 +9404,7 @@ mod tests {
             "the fixture changed memory after its baseline walk"
         );
         assert_eq!(
-            crate::data_layer::runtime::memory_figure_walks_for_test(),
+            aft_engine::test_bridge::display_data::memory_profile::memory_figure_walks_for_test(),
             walks,
             "health walked the unchanged engine maps again"
         );
@@ -9643,14 +9644,20 @@ mod tests {
         }
         let now = Instant::now();
         cache.clock_ms.store(0, Ordering::Relaxed);
-        crate::context::with_memory_walk_clock_for_test(now, || {
-            cache.refresh_for_test(&executor, &app);
-        });
+        aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
+            now,
+            || {
+                cache.refresh_for_test(&executor, &app);
+            },
+        );
         let before = crate::inspect::cache::aggregate_memory_walks_for_test();
         cache.clock_ms.store(3_000, Ordering::Relaxed);
-        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(3), || {
-            cache.refresh_for_test(&executor, &app);
-        });
+        aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
+            now + Duration::from_secs(3),
+            || {
+                cache.refresh_for_test(&executor, &app);
+            },
+        );
         assert_eq!(
             crate::inspect::cache::aggregate_memory_walks_for_test() - before,
             0,
@@ -9674,9 +9681,12 @@ mod tests {
             .unwrap();
         let before = crate::inspect::cache::aggregate_memory_walks_for_test();
         cache.clock_ms.store(6_000, Ordering::Relaxed);
-        crate::context::with_memory_walk_clock_for_test(now + Duration::from_secs(6), || {
-            cache.refresh_for_test(&executor, &app);
-        });
+        aft_engine::test_bridge::display_data::memory_profile::with_memory_walk_clock_for_test(
+            now + Duration::from_secs(6),
+            || {
+                cache.refresh_for_test(&executor, &app);
+            },
+        );
         assert_eq!(
             crate::inspect::cache::aggregate_memory_walks_for_test() - before,
             1,
@@ -11143,7 +11153,7 @@ mod tests {
                 entries_done: None,
                 entries_total: None,
             };
-        crate::semantic_index::record_embedding_backend_build_failure_for_test(
+        aft_engine::test_bridge::search_misc::semantic::record_embedding_backend_build_failure_for_test(
             root.as_path(),
             "connection refused",
         );

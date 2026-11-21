@@ -1947,7 +1947,7 @@ mod tests {
         /// The paths the data layer's publication of the root holds, with
         /// whether it still matches the files on disk.
         fn published(&self) -> (usize, bool) {
-            let checkout = crate::data_layer::runtime::bind_foreground(
+            let checkout = aft_engine::test_bridge::display_data::bind_foreground(
                 &self.root,
                 self.storage.path(),
                 crate::data_layer::standing::planes(&self.entry.indexes),

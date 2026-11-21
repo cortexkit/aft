@@ -232,7 +232,10 @@ mod tests {
         let health = ctx.try_health_snapshot(&root);
         assert_eq!(health.search_index.unwrap().status, "off");
         assert_eq!(health.callgraph_store.unwrap().status, "off");
-        assert_eq!(health.data_store.unwrap().reason, Some(reason::NOT_BOUND));
+        assert_eq!(
+            health.data_store.unwrap().reason,
+            Some(aft_engine::test_bridge::display_data::surfaces::NOT_BOUND)
+        );
         assert_eq!(
             zoom(&ctx, &lib)["callgraph"],
             json!({"status": "unavailable", "code": "callgraph_unavailable",

@@ -294,19 +294,19 @@ fn insert(
     Outcome::Loaded
 }
 
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 thread_local! {
     /// Content records read for their outline on this thread.
     static RECORD_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Counts a content record read for its outline, for tests.
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 pub(crate) fn note_record_read() {
     RECORD_READS.with(|reads| reads.set(reads.get() + 1));
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 pub(crate) fn record_reads() -> u64 {
     RECORD_READS.with(std::cell::Cell::get)
 }
@@ -482,7 +482,7 @@ impl Drop for Claim {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn already_claimed_for_test(
     cache: &SharedSymbolCache,
     generation: u64,

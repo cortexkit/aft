@@ -1,5 +1,5 @@
 mod trace_to_tests {
-    use crate::data_layer::callgraph_store_adapter::trace_to_tests::{
+    use aft_engine::test_bridge::display_data::trace_budget::{
         impact_budget_fixture, impact_result_with_budget_for_test, IMPACT_BUDGET_NOTE_FOR_TEST,
     };
     use std::path::Path;

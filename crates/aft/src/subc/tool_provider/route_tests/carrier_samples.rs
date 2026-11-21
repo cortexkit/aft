@@ -106,7 +106,7 @@ fn fixture() -> (tempfile::TempDir, ProjectRootId, Arc<AppContext>) {
     assert!(response.success, "configure: {response:?}");
     crate::runtime_drain::drain_deferred_configure_maintenance(&ctx);
     // The index store serves search and the call graph once its build ends.
-    crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+    aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
 
     // A completed task avoids a live process and makes its duration reproducible.
     let storage = crate::bash_background::task_storage_dir(&ctx);
