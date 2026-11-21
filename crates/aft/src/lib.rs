@@ -302,6 +302,8 @@ mod gate_hermeticity_tests;
 #[cfg(test)]
 pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
+pub(crate) use aft_base::search_hot_path_measurements as search_test_counts;
+#[cfg(test)]
 pub(crate) use aft_base::test_allocations;
 #[cfg(test)]
 #[path = "base_tests/test_env.rs"]

@@ -42,6 +42,8 @@ pub mod callers;
 pub use crate::data_layer::{callgraph_roots, callgraph_store_adapter};
 pub mod checkpoint;
 pub mod configure;
+#[cfg(test)]
+mod configure_test_env;
 pub mod conflicts;
 pub mod delete_file;
 pub(crate) mod delete_tree;
