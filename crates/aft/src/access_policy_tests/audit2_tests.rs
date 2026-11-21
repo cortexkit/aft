@@ -3,6 +3,7 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::policy_path::policy_path;
 use crate::protocol::{RawRequest, Response};
+use aft_engine::test_bridge::search_misc::BackupStoreTest as _;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 

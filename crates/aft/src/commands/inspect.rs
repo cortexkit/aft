@@ -27,7 +27,9 @@ use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 #[cfg(test)]
-use aft_engine::test_bridge::search_misc::inspect::{InspectBuilderState, InspectManagerTest};
+use aft_engine::test_bridge::search_misc::inspect::{
+    InspectBuilderState, InspectCacheTest, InspectManagerTest,
+};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;

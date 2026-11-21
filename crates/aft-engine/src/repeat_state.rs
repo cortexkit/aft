@@ -198,7 +198,7 @@ impl RepeatBreaker {
         self.sessions.lock().clear();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn session_call_counts(&self) -> HashMap<String, usize> {
         self.sessions
             .lock()

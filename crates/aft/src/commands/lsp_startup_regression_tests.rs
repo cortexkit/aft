@@ -36,7 +36,7 @@ fn waiter_sees_pending_then_the_real_result() {
     assert_eq!(response["pending_servers"], serde_json::json!(["reserved"]));
     assert_eq!(
         response["unchecked_files"],
-        serde_json::json!([f.file.display().to_string()])
+        serde_json::json!([f.file().display().to_string()])
     );
     assert_eq!(
         response["lsp_servers_used"][0]["status"],

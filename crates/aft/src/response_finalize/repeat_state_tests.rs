@@ -24,7 +24,7 @@ mod tests {
         }
 
         let current = format!("repeat-growth-{}", 127);
-        let sessions = breaker.session_call_counts();
+        let sessions = aft_engine::test_bridge::search_misc::session_call_counts(&breaker);
         assert_eq!(sessions.len(), 1, "expired sessions must not accumulate");
         let count = sessions.get(&current).expect("current session remains");
         assert_eq!(*count, 1, "current call remains available");
@@ -35,6 +35,9 @@ mod tests {
             128,
             start + Duration::from_secs(cadence_secs * 127),
         );
-        assert_eq!(breaker.session_call_counts()[&current], 2);
+        assert_eq!(
+            aft_engine::test_bridge::search_misc::session_call_counts(&breaker)[&current],
+            2
+        );
     }
 }

@@ -61,7 +61,7 @@ mod callgraph_store_for_ops_tests {
         let (tx, rx) = crate::watcher_filter::watcher_dispatch_channel();
         *ctx.watcher_rx().lock() = Some(rx);
         let counters = ctx.watcher_counters();
-        counters.note_unflushed_paths([&source]);
+        aft_engine::test_bridge::search_misc::watcher::note_unflushed_paths(&counters, [&source]);
 
         let mut flushed = false;
         let response = call_tree_answer_with_capture_hook(&ctx, move |boundary| {
@@ -71,7 +71,7 @@ mod callgraph_store_for_ops_tests {
             flushed = true;
             tx.send(WatcherDispatchEvent::Paths(vec![source.clone()]))
                 .expect("dispatch the flushed file");
-            counters.clear_unflushed_paths();
+            aft_engine::test_bridge::search_misc::watcher::clear_unflushed_paths(&counters);
         });
 
         assert!(

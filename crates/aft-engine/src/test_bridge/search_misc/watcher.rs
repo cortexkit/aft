@@ -5,6 +5,17 @@ use crate::watcher_filter::{self, SharedGitignore};
 
 pub const WATCHER_EXCLUSION_LIMIT: usize = watcher_filter::WATCHER_EXCLUSION_LIMIT;
 
+pub fn note_unflushed_paths<'a>(
+    counters: &WatcherCounters,
+    paths: impl IntoIterator<Item = &'a PathBuf>,
+) {
+    counters.note_unflushed_paths(paths);
+}
+
+pub fn clear_unflushed_paths(counters: &WatcherCounters) {
+    counters.clear_unflushed_paths();
+}
+
 #[derive(Default)]
 pub struct WatcherExclusionPlan(watcher_filter::WatcherExclusionPlan);
 
