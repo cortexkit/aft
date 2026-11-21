@@ -1427,7 +1427,7 @@ impl Drop for DataCheckout {
 
 impl DataCheckout {
     /// [`Self::open_planes`] with every plane.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open(
         root: &Path,
         storage: &Path,
@@ -2340,9 +2340,9 @@ impl DataCheckout {
             counted_elsewhere,
         };
         let epoch = version();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let now = Instant::now();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let now = crate::context::memory_walk_now_for_test();
         if let Some(previous) = slot.as_ref() {
             let age = now.saturating_duration_since(previous.measured_at);

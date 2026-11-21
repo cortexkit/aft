@@ -1108,7 +1108,7 @@ fn classification_is_exhaustive(config: &Config) {
 pub struct ConfigFileWatch {
     file: PathBuf,
     shutdown: Arc<AtomicBool>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     attached: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 
@@ -1160,9 +1160,9 @@ impl ConfigFileWatch {
         let shutdown = Arc::new(AtomicBool::new(false));
         let thread_shutdown = Arc::clone(&shutdown);
         let thread_file = file.clone();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let attached = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let thread_attached = attached.clone();
         #[cfg(test)]
         let attach_gate = CONFIG_WATCH_ATTACH_GATE.with(|slot| slot.borrow().clone());
@@ -1174,7 +1174,7 @@ impl ConfigFileWatch {
                     on_change,
                     thread_shutdown,
                     counters,
-                    #[cfg(test)]
+                    #[cfg(any(test, feature = "test-support"))]
                     thread_attached,
                     #[cfg(test)]
                     attach_gate,
@@ -1190,7 +1190,7 @@ impl ConfigFileWatch {
         Self {
             file,
             shutdown,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             attached,
         }
     }
@@ -1416,7 +1416,10 @@ fn run_config_file_watch(
     on_change: Arc<dyn Fn() + Send + Sync>,
     shutdown: Arc<AtomicBool>,
     counters: Arc<crate::context::WatcherCounters>,
-    #[cfg(test)] attached: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+    #[cfg(any(test, feature = "test-support"))] attached: Arc<(
+        std::sync::Mutex<bool>,
+        std::sync::Condvar,
+    )>,
     #[cfg(test)] attach_gate: Option<Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>>,
 ) {
     let Some(dir) = file.parent().map(Path::to_path_buf) else {
@@ -1451,7 +1454,7 @@ fn run_config_file_watch(
         on_change();
     }
     let mut next_target_check = Instant::now() + CONFIG_TARGET_RECHECK;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let notify_attached = |attachment: &DirAttachment| {
         // On macOS, watch() returns after the FSEvents stream-start handshake;
         // other backends likewise register their directory before returning.
@@ -1460,7 +1463,7 @@ fn run_config_file_watch(
             attached.1.notify_all();
         }
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     notify_attached(&attachment);
 
     while !shutdown.load(Ordering::Acquire) {
@@ -1514,7 +1517,7 @@ fn run_config_file_watch(
         ) {
             on_change();
         }
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         notify_attached(&attachment);
     }
 }

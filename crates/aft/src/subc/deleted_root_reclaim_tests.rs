@@ -1,5 +1,6 @@
 use super::*;
-use crate::bash_background::{registry::root_reclaim_tests::*, BgTaskStatus};
+use crate::bash_background::BgTaskStatus;
+use aft_engine::test_bridge::bash_remote::bash_background::registry::root_reclaim_tests::*;
 
 struct ReclaimFixture {
     _dir: tempfile::TempDir,

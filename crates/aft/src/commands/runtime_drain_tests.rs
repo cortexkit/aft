@@ -189,7 +189,7 @@ fn a_watcher_rescan_reaches_the_data_layer() {
         }
     }
     assert_eq!(
-        ctx.watcher_counters().snapshot().rescans_unknown_total,
+        ctx.watcher_counters().snapshot().rescans_unknown_total(),
         1,
         "the rescan ran"
     );
@@ -217,3 +217,5 @@ use aft_engine::test_bridge::display_data::DataStoreReportTestExt as _;
 use aft_engine::test_bridge::search_misc::InspectManagerTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
+
+use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;
