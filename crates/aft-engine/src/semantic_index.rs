@@ -1515,7 +1515,7 @@ impl SemanticIndexFingerprint {
         serde_json::to_string(self).unwrap_or_else(|_| String::new())
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
         Self::from_config(config, dimension)
     }
