@@ -2393,7 +2393,7 @@ impl App {
         self.lifecycle_census.publish(snapshot);
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(all(any(test, feature = "test-support"), unix))]
     pub(crate) fn collect_and_publish_lifecycle_census_for_test(
         &self,
         contexts: &[Arc<AppContext>],
