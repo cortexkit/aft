@@ -1507,3 +1507,6 @@ mod callgraph_pending_tests {
         assert_eq!(failed.data, before);
     }
 }
+
+#[cfg(test)]
+mod context_tests;
