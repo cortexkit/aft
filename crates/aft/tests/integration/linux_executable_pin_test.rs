@@ -1,9 +1,10 @@
 use super::{
-    call_with_permissions, configure, copy_and_warm_aft, foreground, pin_directories, quote, Daemon,
+    call_with_permissions, configure, configure_with_shim_binary, copy_and_warm_aft, foreground,
+    pin_directories, quote, Daemon,
 };
 use serde_json::json;
 use std::fs::{self, Metadata};
-use std::os::unix::fs::{symlink, MetadataExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -82,7 +83,6 @@ pub(super) async fn check_shell_pin_protection(
     let ran = project.join("wrong-image-ran");
     let decoy = project.join("wrong-image");
     fs::write(&decoy, format!("#!/bin/sh\n: > {}\nexit 91\n", quote(&ran))).unwrap();
-    use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(&decoy, fs::Permissions::from_mode(0o700)).unwrap();
     fs::remove_file(alias).unwrap();
     symlink(decoy, alias).unwrap();
@@ -169,4 +169,38 @@ async fn pinned_executable_linux_concurrent_daemons_share_the_complete_pin() {
         (identity.dev(), identity.ino()),
         (surviving.dev(), surviving.ino())
     );
+}
+
+#[tokio::test]
+async fn pinned_executable_linux_shell_keeps_the_gh_shim_refusal() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let storage = home.join("storage");
+    let project = root.join("project");
+    let module = root.join("module");
+    let bin = root.join("bin");
+    for directory in [&storage, &project, &module, &bin] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    let real_gh = bin.join("gh");
+    fs::write(&real_gh, "#!/bin/sh\necho real gh\n").unwrap();
+    fs::set_permissions(&real_gh, fs::Permissions::from_mode(0o700)).unwrap();
+    let deploy = root.join("aft-deploy");
+    copy_and_warm_aft(&deploy);
+    let path =
+        std::env::join_paths([bin.as_path(), Path::new("/usr/bin"), Path::new("/bin")]).unwrap();
+    let mut aft =
+        Daemon::spawn_with_env(&deploy, &module, &home, &storage, &[("PATH", &path)]).await;
+    configure_with_shim_binary(&mut aft, &home, &project, &storage, "off", Some(&real_gh)).await;
+
+    let result = foreground(&mut aft, "gh --shim-version").await;
+    aft.shutdown().await;
+    assert_eq!(result["exit_code"], 86, "{result:?}");
+    let output = result["output"].as_str().unwrap();
+    assert!(
+        output.contains("AFT could not verify its GitHub shim"),
+        "{result:?}"
+    );
+    assert!(!output.contains("real gh"), "{result:?}");
 }

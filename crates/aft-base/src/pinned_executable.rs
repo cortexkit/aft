@@ -295,16 +295,29 @@ impl PinnedExecutable {
                     std::fs::hard_link(from, to)
                 })?;
             }
-            let shims = self.directory.join("shims");
-            if shims.join("gh").is_symlink() {
-                let target = std::fs::read_link(shims.join("gh"))?;
-                let target = if target == self.executable {
-                    destination
-                } else {
-                    target
-                };
-                crate::private_storage::create_dir(&directory.join("shims"))?;
-                std::os::unix::fs::symlink(target, directory.join("shims/gh"))?;
+            let entry = self.directory.join("shims/gh");
+            let retained = directory.join("shims/gh");
+            match std::fs::symlink_metadata(&entry) {
+                Ok(metadata) if metadata.is_symlink() => {
+                    let target = std::fs::read_link(&entry)?;
+                    let target = if target == self.executable {
+                        destination
+                    } else {
+                        target
+                    };
+                    crate::private_storage::create_dir(&directory.join("shims"))?;
+                    std::os::unix::fs::symlink(target, &retained)?;
+                }
+                Ok(metadata) if metadata.is_file() => {
+                    // An unverified candidate is replaced by a script that
+                    // refuses to run gh. Keep that script executable in the
+                    // task's PATH rather than exposing the system gh.
+                    crate::private_storage::create_dir(&directory.join("shims"))?;
+                    std::fs::copy(&entry, &retained)?;
+                }
+                Ok(_) => return Err(io::Error::other("unexpected gh shim file type")),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
             }
         }
         #[cfg(windows)]
