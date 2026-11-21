@@ -18,7 +18,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl", "aft-parse/wasm-grammars"]
 # Offline call-graph measurements only; never enabled by production builds.
 callgraph-shape-census = ["aft-base/callgraph-shape-census", "aft-parse/callgraph-shape-census"]
-test-support = ["aft-base/test-support", "aft-db/test-support", "aft-parse/test-support"]
+test-support = ["aft-base/test-support", "aft-db/test-support", "aft-parse/test-support", "dep:tempfile", "dep:filetime"]
 # Explicit opt-in for cross-process timing controls used by integration tests.
 test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-parse/test-timing-hooks"]
 # Opt-in integration hooks for native re-exec and deterministic conformance inputs;
@@ -89,6 +89,8 @@ ignore = "0.4"
 notify = "8"
 regex = "1"
 regex-syntax = "0.8"
+tempfile = { version = "3.27.0", optional = true }
+filetime = { version = "0.2.29", optional = true }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 globset = "0.4"
 sha1 = "0.10"
