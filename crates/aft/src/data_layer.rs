@@ -1,4 +1,5 @@
-// Only the modules the upper crate previously exposed are public here.
+// Keep the public analysis modules at aft::data_layer; engine implementation
+// modules used only by command handlers remain crate-private below.
 #[doc(hidden)]
 pub use aft_engine::data_layer::read_fence;
 #[cfg(feature = "test-hooks")]

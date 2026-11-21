@@ -1,4 +1,4 @@
-//! Test seams for the search, edit, and inspect command adapters.
+//! Test helpers for the search, edit, and inspect command adapters.
 
 use std::path::{Path, PathBuf};
 

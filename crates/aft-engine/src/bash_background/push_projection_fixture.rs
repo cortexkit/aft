@@ -38,7 +38,7 @@ fn build() -> BusyRoot {
     config.storage_dir = Some(storage.clone());
     let ctx = Arc::new(AppContext::from_app(app.clone(), config));
     ctx.set_canonical_cache_root(root.clone());
-    let key = ctx.memoized_artifact_cache_key(&root);
+    let _key = ctx.memoized_artifact_cache_key(&root);
     ctx.bind_status_context();
     app.register_memory_context(root.clone(), &ctx);
     for i in 0..256 {
@@ -116,7 +116,7 @@ fn build() -> BusyRoot {
         #[cfg(test)]
         storage,
         #[cfg(test)]
-        key,
+        key: _key,
         _dir: dir,
     }
 }
