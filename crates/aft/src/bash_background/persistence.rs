@@ -861,6 +861,7 @@ impl From<BashTaskRow> for PersistedTask {
             child_pid: row.pid.and_then(|value| u32::try_from(value).ok()),
             pgid: row.pgid.and_then(|value| i32::try_from(value).ok()),
             child_start_time_ms: None,
+            launch_owner: None,
             live_descendants: None,
             live_descendants_omitted: 0,
             live_descendants_unavailable: None,
