@@ -337,9 +337,9 @@ async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
     Arc::get_mut(&mut carrier.0).unwrap().trust = BindTrust::Untrusted;
     for route in [&mut carrier, &mut policy] {
         let data = Arc::get_mut(&mut route.0).unwrap();
-        data.session = task.session_id().clone();
+        data.session = task.session_id().to_owned();
         if let AuthenticatedPrincipal::RouteBind { session_id, .. } = &mut data.spawn_principal {
-            *session_id = task.session_id().clone();
+            *session_id = task.session_id().to_owned();
         }
     }
     let f = Fixture {
@@ -381,11 +381,11 @@ async fn command_watch_near_worker_kill_handoff_does_not_extend_the_wait() {
         }),
         "{body}"
     );
-    assert_eq!(std::fs::read(&task.paths.json).unwrap(), before);
+    assert_eq!(std::fs::read(&task.paths().json).unwrap(), before);
     assert_eq!(
         f.ctx
             .bash_background()
-            .hard_kill_deadline(&task.task_id, &task.session_id)
+            .hard_kill_deadline(&task.task_id(), &task.session_id())
             .unwrap()
             .limit_ms,
         limit

@@ -422,7 +422,9 @@ fn github_read_pr_fallback_discloses_stale_threads_without_changing_cache() {
         assert_eq!(
             answer
                 .content
-                .matches(crate::github_read::stale_thread_note_for_test())
+                .matches(
+                    aft_engine::test_bridge::search_misc::github_read::stale_thread_note_for_test()
+                )
                 .count(),
             1
         );

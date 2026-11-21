@@ -8966,12 +8966,12 @@ mod tests {
         );
         assert!(super::ignore_rules_load_pending(&ctx));
         let deadline = Instant::now() + Duration::from_secs(5);
-        while counters.backend_exclusions().paths.is_empty() && Instant::now() < deadline {
+        while counters.backend_exclusions().paths().is_empty() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let before = counters.backend_exclusions();
-        assert_eq!(before.matcher_generation, 0);
-        assert!(!before.paths.contains(&root.join("target")));
+        assert_eq!(before.matcher_generation(), 0);
+        assert!(!before.paths().contains(&root.join("target")));
 
         std::thread::scope(|scope| {
             scope.spawn(|| assert!(super::load_ignore_rules_if_unpublished(&ctx)));
@@ -8980,7 +8980,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while !counters
             .backend_exclusions()
-            .paths
+            .paths()
             .contains(&root.join("target"))
             && Instant::now() < deadline
         {
@@ -8988,11 +8988,11 @@ mod tests {
         }
         let after = counters.backend_exclusions();
         ctx.stop_watcher_runtime();
-        assert!(after.matcher_generation > 0);
+        assert!(after.matcher_generation() > 0);
         assert!(
-            after.paths.contains(&root.join("target")),
+            after.paths().contains(&root.join("target")),
             "running backend never installed target/: {:?}",
-            after.paths
+            after.paths()
         );
     }
 
@@ -9598,7 +9598,7 @@ mod tests {
             )
             .unwrap()
             .unwrap();
-        assert_eq!(seed.root_walks, 1);
+        assert_eq!(seed.root_walks(), 1);
         std::fs::write(sibling.join("tracked.rs"), "fn sibling_change() {}\n").unwrap();
         git_ok(&sibling, &["add", "tracked.rs"]);
         git_ok(
@@ -9647,7 +9647,8 @@ mod tests {
             .unwrap();
         assert_eq!(shared, key);
         assert_eq!(
-            again.root_walks, 0,
+            again.root_walks(),
+            0,
             "unrelated new objects cannot change cached ancestry"
         );
         assert_eq!(
@@ -9697,7 +9698,8 @@ mod tests {
             )
             .is_err());
         assert_eq!(
-            timings.root_walks, 3,
+            timings.root_walks(),
+            3,
             "failed verification must use the ordinary retry ladder"
         );
         assert_eq!(
@@ -9994,6 +9996,9 @@ mod tests {
     use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
+
+    #[cfg(test)]
+    use aft_engine::test_bridge::search_misc::WatcherBackendExclusionsTestExt as _;
 }
 
 #[cfg(test)]
