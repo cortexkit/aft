@@ -3,10 +3,6 @@ description: Build, sign, and upload the macOS x64 release artifacts
 runs:
   using: composite
   steps:
-    - uses: ./.github/actions/native-ci-state
-      with:
-        phase: python
-
     - uses: actions/setup-node@v5
       with:
         node-version: "24"

@@ -200,6 +200,11 @@ jobs:
       - uses: actions/checkout@v5
         id: checkout
 
+      - uses: ./.github/actions/native-ci-state
+        id: python-preflight
+        with:
+          phase: python
+
       - name: Acquire MOTOR macOS hold
         uses: ./.github/actions/macos-hold
         with:
@@ -213,7 +218,7 @@ jobs:
         timeout-minutes: 150
 
       - name: Release MOTOR macOS hold
-        if: always() && steps.checkout.outcome == 'success'
+        if: always() && steps.python-preflight.outcome == 'success'
         uses: ./.github/actions/macos-hold
         with:
           phase: release
@@ -232,6 +237,11 @@ jobs:
       - uses: actions/checkout@v5
         id: checkout
 
+      - uses: ./.github/actions/native-ci-state
+        id: python-preflight
+        with:
+          phase: python
+
       - name: Acquire MOTOR macOS hold
         uses: ./.github/actions/macos-hold
         with:
@@ -242,7 +252,7 @@ jobs:
         timeout-minutes: 150
 
       - name: Release MOTOR macOS hold
-        if: always() && steps.checkout.outcome == 'success'
+        if: always() && steps.python-preflight.outcome == 'success'
         uses: ./.github/actions/macos-hold
         with:
           phase: release

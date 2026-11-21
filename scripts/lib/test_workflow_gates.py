@@ -1046,7 +1046,15 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             with self.subTest(job=name):
                 steps = job["steps"]
                 self.assertEqual(steps[0], {"uses": "actions/checkout@v5", "id": "checkout"})
-                acquire, release = steps[1], steps[-1]
+                release_build = name.startswith("build-darwin-")
+                acquire_index = 2 if release_build else 1
+                if release_build:
+                    self.assertEqual(steps[1], {
+                        "uses": "./.github/actions/native-ci-state",
+                        "id": "python-preflight",
+                        "with": {"phase": "python"},
+                    })
+                acquire, release = steps[acquire_index], steps[-1]
                 conditional = name == "native-ci-cleanup"
                 shard = {"shard": "${{ matrix.shard }}"} if name == "unit-macos-libtest-shard" else {}
                 for step, phase in ((acquire, "acquire"), (release, "release")):
@@ -1054,7 +1062,8 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                     self.assertEqual(step["with"], {"phase": phase, **shard})
                 self.assertEqual(acquire.get("if"), "matrix.machine == 'mac-mini'" if conditional else None)
                 matrix_condition = "matrix.machine == 'mac-mini' && " if conditional else ""
-                self.assertEqual(release["if"], f"always() && {matrix_condition}steps.checkout.outcome == 'success'")
+                prerequisite = "python-preflight" if release_build else "checkout"
+                self.assertEqual(release["if"], f"always() && {matrix_condition}steps.{prerequisite}.outcome == 'success'")
                 if conditional:
                     limits = re.fullmatch(r"\$\{\{ matrix\.machine == 'mac-mini' && (\d+) \|\| 5 \}\}", job["timeout-minutes"])
                     assert limits is not None, "expected distinct Mac mini and narli timeouts"
@@ -1064,13 +1073,13 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
                 work_budget = work_budgets[name]
                 self.assertGreaterEqual(timeout, work_budget + wait_minutes)
                 self.assertLessEqual(renewal_minutes + work_budget + cleanup_margin_minutes, lease_minutes)
-                if name.startswith("build-darwin-"):
+                if release_build:
                     # An early grant can leave nearly the whole job timeout.
                     # All release work must be inside a separately timed step.
-                    self.assertEqual(len(steps), 4)
+                    self.assertEqual(len(steps), 5)
                     arch = name.removeprefix("build-darwin-")
-                    self.assertEqual(steps[2]["uses"], f"./.github/actions/release-darwin-{arch}")
-                    self.assertEqual(int(steps[2]["timeout-minutes"]), work_budget)
+                    self.assertEqual(steps[3]["uses"], f"./.github/actions/release-darwin-{arch}")
+                    self.assertEqual(int(steps[3]["timeout-minutes"]), work_budget)
                 else:
                     self.assertLessEqual(timeout + cleanup_margin_minutes, lease_minutes)
 
