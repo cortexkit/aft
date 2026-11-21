@@ -1,4 +1,5 @@
 use super::*;
+use crate::gh_shim::tests::speech_dispatch_support::SpeechManifest;
 use crate::db::access_grants::ScopeKey;
 use crate::gh_shim_relay::{
     RelayCall, RelayReply, RelayTransport, RouteScopes, TransportError, BOT_REQUEST_OPERATION,
@@ -363,20 +364,16 @@ impl Fixture {
             Env("AFT_STORAGE_DIR", old_storage),
             Env::set("AFT_GH_SHIM_STATE_DIR", state_dir.as_os_str()),
         ];
-        let paths = StatePaths::from_root(state_dir);
-        let mut manifest = super::tests::fixture_manifest();
+        let mut manifest = SpeechManifest::new();
         if let Some(repo) = &options.repository {
-            manifest
-                .bindings
-                .insert(repo.clone(), options.agent.clone().unwrap());
+            manifest.insert_binding(repo.clone(), options.agent.clone().unwrap());
         }
-        super::tests::write_signed_manifest(&paths, manifest.clone(), unix_seconds());
-        load_manifest(&paths, unix_seconds()).unwrap();
+        manifest.sign_and_load(state_dir);
         let (repo, agent) = options
             .repository
             .as_ref()
-            .map(|repo| manifest.bindings.get_key_value(repo).unwrap())
-            .unwrap_or_else(|| manifest.bindings.iter().next().unwrap());
+            .map(|repo| manifest.bindings().get_key_value(repo).unwrap())
+            .unwrap_or_else(|| manifest.bindings().iter().next().unwrap());
         let head = ScopeStamp::new(
             subc_protocol::Principal::Reserved {
                 module_id: "prefrontal-core".into(),
@@ -687,24 +684,7 @@ impl Fixture {
         .into_iter()
         .map(Into::into)
         .collect();
-        let Classification::Governed { tuple, canonical } =
-            classify(&args, &manifest, current_platform())
-        else {
-            panic!("fixture must govern issue comments")
-        };
-        let request =
-            canonicalize_governed(&args, &tuple, &canonical, manifest.manifest_version).unwrap();
-        let invocation = request.invocation.clone().unwrap();
-        let rung = RungDetermination::r3(
-            0,
-            manifest.manifest_version,
-            &RungRecordProvenance {
-                image_path: "/aft".into(),
-                version: "test".into(),
-                repo_key: repo.clone(),
-            },
-        );
-        let request = governed_wire_request(&rung.record, agent, request);
+        let (request, invocation) = manifest.issue_comment_wire(&args, repo, agent);
         let params = json!({"ticket":ticket,"request_nonce":"dispatch-post","request":request,"invocation":invocation});
         Self {
             _runtime: runtime,
