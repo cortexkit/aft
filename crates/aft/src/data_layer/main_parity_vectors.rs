@@ -7,7 +7,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 static ROOTS: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
 
-pub(super) fn use_constant_vectors(root: PathBuf) {
+pub(crate) fn use_constant_vectors(root: PathBuf) {
     ROOTS.lock().unwrap().insert(root);
 }
 

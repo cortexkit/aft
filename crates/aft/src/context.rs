@@ -11699,8 +11699,8 @@ mod memory_estimate_tests {
 
     #[test]
     fn query_cache_memory_is_attributed_and_released_by_idle_eviction() {
-        use crate::commands::semantic_search::{
-            comparator::CandidateResult,
+        use crate::search_state::{
+            candidate::CandidateResult,
             evidence_descriptor::EvidenceDescriptor,
             generation_token::GenerationToken,
             memo::{MemoKey, VerifiedExactSet},

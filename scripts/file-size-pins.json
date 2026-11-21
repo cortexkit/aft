@@ -79,10 +79,6 @@
     "lines": 5514,
     "reason": "Split inspect command assembly by area pending; AFT crate split lane."
   },
-  "crates/aft/src/executor/tests.rs": {
-    "lines": 5014,
-    "reason": "Split executor tests by command family pending; AFT crate split lane."
-  },
   "crates/aft/src/subc/health.rs": {
     "lines": 5568,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."

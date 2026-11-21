@@ -847,8 +847,7 @@ pub(crate) fn waiting(coverage: &Coverage) -> bool {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-#[path = "main_parity_capture.rs"]
-mod main_parity_capture;
+pub(crate) use main_parity_vectors::use_constant_vectors;
 
 #[cfg(all(test, target_os = "linux"))]
 #[path = "main_parity_vectors.rs"]
