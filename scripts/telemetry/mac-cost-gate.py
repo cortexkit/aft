@@ -16,7 +16,7 @@ import sys
 import tempfile
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +25,7 @@ HOLD_DIR = Path("/Users/Shared/motor-macos-hold")
 GRANT_DIR = Path("/Users/Shared/motor-macos-grant")
 OWNER_PREFIX = "aft-nightly-"
 MAX_HOLD_BYTES = 4096
+MAX_HOLD_DURATION = timedelta(hours=3)
 INITIAL_DURATION_SECONDS = 30 * 60
 VM_NAMES = ("com.apple.Virtualization.VirtualMachine", "Virtualization.VirtualMachine",
             "vfkit", "vmware-vmx", "prl_vm_app", "tart")
@@ -99,60 +100,88 @@ def read_hold_record(path):
         return None
 
 
+def remove_owned_hold(folder, owner, *, identity=None):
+    path = folder / "hold.json"
+    current = read_hold_record(path)
+    if current and current["owner"] == owner and (identity is None or current == identity):
+        path.unlink(missing_ok=True)
+
+
 class Hold:
-    def __init__(self, folder, end, grant_folder=GRANT_DIR, *, run_id=None):
+    def __init__(self, folder, end, grant_folder=GRANT_DIR, *, run_id=None, owner=None):
         self.folder = folder
         self.grant_folder = grant_folder
         self.end = end
-        self.identity = validate_hold_record({
-            "owner": hold_owner(run_id or os.environ.get("GITHUB_RUN_ID")),
-            "expires_at": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
-        })
+        if owner is None:
+            owner = hold_owner(run_id or os.environ.get("GITHUB_RUN_ID"))
+        self.identity = self.record(owner, end)
         self.created = False
 
+    @staticmethod
+    def record(owner, end):
+        return validate_hold_record({
+            "owner": owner,
+            "expires_at": end.isoformat(timespec="seconds").replace("+00:00", "Z"),
+        })
+
     def request(self):
+        self.publish(self.identity, previous=None)
+        self.created = True
+        print(f"MOTOR hold requested: {self.identity}", flush=True)
+
+    def publish(self, record, *, previous):
         # Publish a complete regular JSON record in one same-folder rename so
-        # MOTOR cannot observe a partially written hold. GitHub serializes the
-        # nightly jobs; an existing hold still belongs to its original owner.
+        # MOTOR cannot observe a partially written hold. The mini's single
+        # GitHub runner runs only one job at a time.
         destination = self.folder / "hold.json"
-        if os.path.lexists(destination):
+        if previous is None and os.path.lexists(destination):
             raise FileExistsError(destination)
-        contents = json.dumps(self.identity).encode("utf-8")
+        contents = json.dumps(record).encode("utf-8")
         if len(contents) > MAX_HOLD_BYTES:
             raise ValueError("MOTOR hold exceeds 4 KiB")
         temporary = None
         try:
-            with tempfile.NamedTemporaryFile(mode="wb", dir=self.folder, prefix=".aft-nightly-", delete=False) as handle:
+            with tempfile.NamedTemporaryFile(mode="wb", dir=self.folder, prefix=".aft-hold-", delete=False) as handle:
                 temporary = Path(handle.name)
                 os.fchmod(handle.fileno(), 0o644)
                 handle.write(contents)
                 handle.flush()
                 os.fsync(handle.fileno())
-            if os.path.lexists(destination):
+            if previous is not None and read_hold_record(destination) != previous:
+                raise RuntimeError("MOTOR hold changed before renewal")
+            if previous is None and os.path.lexists(destination):
                 raise FileExistsError(destination)
             temporary.replace(destination)
-            self.created = True
         finally:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
-        print(f"MOTOR hold requested: {self.identity}", flush=True)
+
+    def refresh(self, end):
+        now = utcnow()
+        if not now < self.end < end <= now + MAX_HOLD_DURATION:
+            raise ValueError("renewal must extend a live MOTOR hold to at most three hours from now")
+        if not self.granted():
+            raise RuntimeError("cannot renew without the current matching MOTOR grant")
+        record = self.record(self.identity["owner"], end)
+        self.publish(record, previous=self.identity)
+        self.identity, self.end = record, end
+        print(f"MOTOR hold renewed: {self.identity}", flush=True)
 
     def granted(self):
         return read_hold_record(self.grant_folder / "granted.json") == self.identity
 
-    def wait(self):
-        while utcnow() < self.end:
+    def wait(self, *, deadline=None):
+        deadline = min(self.end, deadline) if deadline is not None else self.end
+        while utcnow() < deadline:
             if self.granted():
                 return True
             print("waiting for MOTOR grant (release/VM jobs may still be draining)", flush=True)
-            time.sleep(min(30, max(0, (self.end - utcnow()).total_seconds())))
+            time.sleep(min(30, max(0, (deadline - utcnow()).total_seconds())))
         return False
 
     def release(self):
         if self.created:
-            current = read_hold_record(self.folder / "hold.json")
-            if current == self.identity:
-                (self.folder / "hold.json").unlink(missing_ok=True)
+            remove_owned_hold(self.folder, self.identity["owner"], identity=self.identity)
             self.created = False
 
 

@@ -26,7 +26,7 @@ never installs system software or uses sudo. The binary is rebuilt and any chang
 pins fetched **before** asking MOTOR to isolate the machine. Measurement uses
 `--prepared-only`, which refuses to build, fetch or generate missing inputs.
 
-MOTOR honours holds only during **03:00–05:00 UTC**. The check writes
+The nightly check keeps its fixed **03:00–05:00 UTC** isolation window. It writes
 `/Users/Shared/motor-macos-hold/hold.json` with a per-run owner
 `aft-nightly-<GitHub run id>` (lowercase letters, digits and hyphens, at most 64
 characters) and an RFC 3339 UTC expiry of 05:00. The record contains exactly
@@ -50,6 +50,21 @@ swap growth, grant loss/change and window expiry. Any of these makes the night
 whole measurement process group is stopped at 05:00. The hold is removed in a
 `finally` block and an always-run Actions step also removes it on cancellation.
 MOTOR owns removal of the grant file.
+
+### Mac mini holds for Tests
+
+Before switching the Tests jobs to the mini, MOTOR must honour the same
+hold/grant protocol at all hours (`hold_window = "always"`). The Tests jobs
+request a lease after checkout and wait up to 50 minutes for the exact grant
+before setup or tests. Owners use `aft-tests-<run id>-<attempt>-<job>`, with
+the shard number appended when a matrix shares a job ID. The jobs remove
+their own hold after native cleanup even when a work step fails. MOTOR still
+owns the grant file.
+
+Each job's timeout includes the grant wait and fits within one three-hour
+lease. A longer job must run `python3 scripts/ci/macos-hold.py refresh` (with
+the same `--shard`, if any) before the current lease expires and receive the
+renewed grant before continuing.
 
 Every run carries model, CPU/core count, memory, macOS version, power source
 and power settings in `machine.json`, with a post-run snapshot and a separate
