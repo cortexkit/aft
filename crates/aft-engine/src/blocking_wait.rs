@@ -47,9 +47,9 @@ pub struct ReplyBudget {
 struct WaitClock {
     awake: Instant,
     continuous: Duration,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     base_now: Option<fn() -> Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     suspend: Option<&'static std::sync::atomic::AtomicU64>,
 }
 
@@ -58,20 +58,20 @@ impl WaitClock {
         Self {
             awake: Instant::now(),
             continuous: continuous_now(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             base_now: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             suspend: None,
         }
     }
 
     fn now(self) -> Instant {
         let elapsed = continuous_now().saturating_sub(self.continuous);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let elapsed = self
             .base_now
             .map_or(elapsed, |now| now().saturating_duration_since(self.awake));
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let elapsed = elapsed
             + Duration::from_millis(
                 self.suspend
