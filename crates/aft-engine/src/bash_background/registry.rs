@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(windows)]
 use std::process::Stdio;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -1549,7 +1549,7 @@ pub(crate) struct RegistryInner {
     pub(crate) watchdog_tasks: CountedMutex<HashMap<String, Arc<BgTask>>>,
     #[cfg(any(test, feature = "test-support"))]
     reclaim_kill_attempts: AtomicUsize,
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(test)]
     process_group_sample_count: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     completion_processing_attempts: AtomicUsize,
@@ -2125,7 +2125,7 @@ impl BgTaskRegistry {
                 watchdog_tasks: CountedMutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 reclaim_kill_attempts: AtomicUsize::new(0),
-                #[cfg(any(test, feature = "test-support"))]
+                #[cfg(test)]
                 process_group_sample_count: AtomicUsize::new(0),
                 #[cfg(any(test, feature = "test-support"))]
                 completion_processing_attempts: AtomicUsize::new(0),
