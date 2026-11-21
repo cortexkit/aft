@@ -1,11 +1,11 @@
 //! Registered, typed notice text shared by `tool.catalog` and runner sends.
 
-#[cfg(test)]
-pub(crate) use crate::bash_rewrite::notices::PREFER_TOOL;
 pub(crate) use crate::bash_rewrite::notices::{
     append_text, code_search_slots, deliver, Notice, Target, CODE_SEARCH,
 };
 use crate::bash_rewrite::notices::{bash_templates, enumeration};
+#[cfg(test)]
+pub(crate) use aft_engine::test_bridge::bash_remote::PREFER_TOOL;
 use cortexkit_role_llm_runner::delivery_order::{Slot, Template};
 use std::collections::BTreeMap;
 

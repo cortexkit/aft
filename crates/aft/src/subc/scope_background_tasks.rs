@@ -2,9 +2,9 @@
 //! behind tool execution, so core can promptly check whether a worker is done.
 
 use super::*;
-#[cfg(test)]
-use crate::bash_background::scoped_tasks::{running, Remote, COMMAND_BYTES};
 use crate::bash_background::scoped_tasks::{Running, Selector};
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::{remote_running, running, COMMAND_BYTES};
 use serde::{Deserialize, Serialize};
 
 pub(super) const CAPABILITY: &str = "scope-background-tasks/v1";
@@ -1256,7 +1256,7 @@ mod tests {
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 "sleep 30",
                 crate::bash_background::BashShell::Bash,
-                crate::bash_background::registry::resolve_posix_shell(),
+                aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                 "session".into(),
                 dir.path().into(),
                 HashMap::new(),
@@ -1338,7 +1338,7 @@ mod tests {
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 "sleep 30",
                 BashShell::Bash,
-                crate::bash_background::registry::resolve_posix_shell(),
+                aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                 "session".into(),
                 dir.path().into(),
                 HashMap::new(),

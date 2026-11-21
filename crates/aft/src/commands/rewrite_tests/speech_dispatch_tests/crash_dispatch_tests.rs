@@ -95,7 +95,7 @@ async fn historical_mailbox_after_process_crash_recovers_as_unknown_not_success(
     let store = crate::gh_shim_speech::store::Store::new(root.join("aft.db"));
     assert_eq!(store.pending_legacy_for_identity(session, task).unwrap(), 1);
     assert!(!root.join("provider-posted").exists());
-    let service = crate::gh_shim_speech::service::record_service(&root);
+    let service = aft_engine::test_bridge::bash_remote::record_service(&root);
     let mut routes = RouteScopes::default();
     routes.speech = Some(service);
     let answer = crate::gh_shim_relay::relay(

@@ -1,6 +1,6 @@
 use super::*;
-use crate::bash_background::buffer::ARTIFACT_OPENS;
 use crate::bash_background::persistence::read_task_at;
+use aft_engine::test_bridge::bash_remote::ARTIFACT_OPENS;
 
 #[test]
 fn shells_v1_cached_collection_matches_fresh_rows_and_watch_frames() {

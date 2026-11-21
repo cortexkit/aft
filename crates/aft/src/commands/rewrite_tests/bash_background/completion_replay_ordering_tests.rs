@@ -1,6 +1,6 @@
 use crate::bash_background::persistence::{read_task_at, resolve_task_layout};
-use crate::bash_background::registry::test_support::ordering::*;
-use crate::bash_background::successful_spawn_response;
+use aft_engine::test_bridge::bash_remote::registry_support::ordering::*;
+use aft_engine::test_bridge::bash_remote::successful_spawn_response;
 use std::{fs, sync::Arc, time::Duration};
 
 #[test]

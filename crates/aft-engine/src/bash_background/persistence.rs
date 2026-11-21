@@ -1156,7 +1156,7 @@ pub(crate) fn remove_empty_session_directory_locked(session_dir: &Path) -> io::R
 
 fn create_private_task_store(session_dir: &Path) -> io::Result<()> {
     crate::production_storage::refuse_write(session_dir)?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     task_io_fault_for_test(false)?;
     let root = session_dir.parent().and_then(Path::parent).ok_or_else(|| {
         io::Error::new(
@@ -1685,7 +1685,7 @@ fn write_task_in_dir(
     crate::production_storage::refuse_write(&dir.path().join(name))?;
     #[cfg(test)]
     record_writes::record(&task.task_id);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     TASK_IO_FAULT.with(|slot| {
         if matches!(slot.get(), Some(TaskIoFault::RecordWriteNotFound)) {
             // Fail one record write without moving live output directories.
@@ -1700,11 +1700,11 @@ fn write_task_in_dir(
             Ok(())
         }
     })?;
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if task.status == BgTaskStatus::Running {
         task_io_fault_for_test(true)?;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if task.status == BgTaskStatus::Starting {
         starting_write_delay_for_test();
     }
@@ -1803,46 +1803,53 @@ fn sync_unchanged_metadata(
     true
 }
 
-#[cfg(test)]
-#[derive(Clone, Copy)]
-pub(crate) enum TaskIoFault {
-    LayoutEnospc,
-    RecordWriteNotFound,
-    OutputHandlesEnospc,
-    OutputHandlesMisleadingText,
-    SyncFailureAfter(usize),
-    RunningEnospc,
-    #[cfg(unix)]
-    RunningDelay(std::time::Duration),
-    RunningHook(fn() -> io::Result<()>),
-    #[cfg(unix)]
-    StartingHook(fn()),
-    /// Delays the starting-record write, which happens before the spawn
-    /// receipt commits, so a test can push that commit past the reply deadline.
-    /// Only the Unix startup tests construct it.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    StartingDelay(std::time::Duration),
-}
-
-#[cfg(test)]
-thread_local! {
-    static TASK_IO_FAULT: std::cell::Cell<Option<TaskIoFault>> = const { std::cell::Cell::new(None) };
-}
-
-#[cfg(test)]
-pub(crate) fn with_task_io_fault<T>(fault: TaskIoFault, run: impl FnOnce() -> T) -> T {
-    struct Restore(Option<TaskIoFault>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            TASK_IO_FAULT.with(|slot| slot.set(self.0));
-        }
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use test_faults::{with_task_io_fault, TaskIoFault};
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod test_faults {
+    use super::*;
+    #[derive(Clone, Copy)]
+    pub enum TaskIoFault {
+        LayoutEnospc,
+        RecordWriteNotFound,
+        OutputHandlesEnospc,
+        OutputHandlesMisleadingText,
+        SyncFailureAfter(usize),
+        RunningEnospc,
+        #[cfg(unix)]
+        RunningDelay(std::time::Duration),
+        RunningHook(fn() -> io::Result<()>),
+        #[cfg(unix)]
+        StartingHook(fn()),
+        /// Delays the starting-record write, which happens before the spawn
+        /// receipt commits, so a test can push that commit past the reply deadline.
+        /// Only the Unix startup tests construct it.
+        #[cfg_attr(not(unix), allow(dead_code))]
+        StartingDelay(std::time::Duration),
     }
-    let previous = TASK_IO_FAULT.with(|slot| slot.replace(Some(fault)));
-    let _restore = Restore(previous);
-    run()
-}
 
-#[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
+    thread_local! {
+        pub(super) static TASK_IO_FAULT: std::cell::Cell<Option<TaskIoFault>> = const { std::cell::Cell::new(None) };
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn with_task_io_fault<T>(fault: TaskIoFault, run: impl FnOnce() -> T) -> T {
+        struct Restore(Option<TaskIoFault>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TASK_IO_FAULT.with(|slot| slot.set(self.0));
+            }
+        }
+        let previous = TASK_IO_FAULT.with(|slot| slot.replace(Some(fault)));
+        let _restore = Restore(previous);
+        run()
+    }
+}
+#[cfg(any(test, feature = "test-support"))]
+use test_faults::TASK_IO_FAULT;
+
+#[cfg(any(test, feature = "test-support"))]
 fn task_io_fault_for_test(running: bool) -> io::Result<()> {
     TASK_IO_FAULT.with(|slot| match slot.get() {
         Some(TaskIoFault::LayoutEnospc) if !running => Err(task_storage_full_for_test()),
@@ -1857,7 +1864,7 @@ fn task_io_fault_for_test(running: bool) -> io::Result<()> {
     })
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn starting_write_delay_for_test() {
     #[cfg(unix)]
     if let Some(TaskIoFault::StartingHook(hook)) = TASK_IO_FAULT.with(std::cell::Cell::get) {
@@ -1868,7 +1875,7 @@ fn starting_write_delay_for_test() {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn task_storage_full_for_test() -> io::Error {
     // OS code 28 is ENOSPC on Unix but a printer error on Windows. Inject the
     // portable error kind and a stable message so the test exercises disk-full
@@ -2617,7 +2624,7 @@ pub fn randomized_atomic_replace(dir: &PinnedDir, name: &OsStr, content: &[u8]) 
 pub(crate) fn sync_task_file(file: &File, path: &Path) -> io::Result<()> {
     #[cfg(test)]
     work_counts::record_sync();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if TASK_IO_FAULT.with(|slot| match slot.get() {
         Some(TaskIoFault::SyncFailureAfter(0)) => {
             slot.set(None);
@@ -2957,7 +2964,7 @@ impl TaskIoHandles {
         mode: BgMode,
         capture_pipeline_status: bool,
     ) -> io::Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         match TASK_IO_FAULT.with(std::cell::Cell::get) {
             Some(TaskIoFault::OutputHandlesEnospc) => return Err(task_storage_full_for_test()),
             Some(TaskIoFault::OutputHandlesMisleadingText) => {

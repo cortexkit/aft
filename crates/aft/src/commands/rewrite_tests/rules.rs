@@ -4,15 +4,16 @@ mod tests {
 
     use serde_json::json;
 
-    use crate::bash_rewrite::rules::{
-        find_request, grep_basic_regex_has_dialect_conflict, grep_request,
-        should_suppress_grep_footer, HeadRule, TailRule,
-    };
+    use crate::bash_rewrite::rules::{HeadRule, TailRule};
     use crate::bash_rewrite::{RewriteDecision, RewriteRule};
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
     use crate::hashline::integration::RegistrationRequest;
     use crate::protocol::DEFAULT_SESSION_ID;
+    use aft_engine::test_bridge::bash_remote::{
+        find_request, grep_basic_regex_has_dialect_conflict, grep_request,
+        should_suppress_grep_footer,
+    };
 
     #[test]
     fn recursive_ls_declines_single_level_rewrite() {
@@ -39,7 +40,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn literal_append_rewrites_match_bash_bytes() {
-        use crate::bash_rewrite::parser::tests::LITERAL_APPEND_CASES;
+        use aft_engine::test_bridge::bash_remote::LITERAL_APPEND_CASES;
         use std::process::Command;
 
         if which::which("bash").is_err() {

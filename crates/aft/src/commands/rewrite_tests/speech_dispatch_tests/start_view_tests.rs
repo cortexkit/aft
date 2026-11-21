@@ -65,7 +65,7 @@ async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::pro
                 } else {
                     crate::sandbox_spawn::SpawnPlan::Unsandboxed
                 };
-                crate::sandbox_spawn::with_spawn_plan_for_test(plan, || {
+                aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(plan, || {
                     crate::bash_background::spawn(
                         "start-view-launch",
                         &session,
@@ -74,7 +74,7 @@ async fn launch(fixture: &Fixture, background: bool, refuse: bool) -> crate::pro
                             crate::test_gate::gate_exists("release-view", "sleep 0.02")
                         ),
                         crate::bash_background::BashShell::Bash,
-                        crate::bash_background::registry::resolve_posix_shell(),
+                        aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                         Some(project),
                         Some(HashMap::from([(
                             "AFT_GH_SHIM_STATE_DIR".into(),

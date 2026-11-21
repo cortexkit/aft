@@ -5,11 +5,11 @@ pub(crate) mod notice_templates;
 
 use super::*;
 use crate::bash_background::persistence::{RunnerCompletionDelivery, RunnerCompletionPhase};
-#[cfg(test)]
-use crate::bash_background::runner_notice_scheduler::QUEUE_CAPACITY;
 use crate::bash_background::runner_notice_scheduler::{
     retry_delay, scheduler, Follow, FollowReceipt, Next, Scheduler, SCHEDULER,
 };
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::QUEUE_CAPACITY;
 use cortexkit_role_llm_runner::{
     delivery_order::{render, template_digest, DeliveryOrder, Mode, TemplateUse},
     send::{states, SendReply, SendRequest},

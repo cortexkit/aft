@@ -357,7 +357,7 @@ fn shells_v1_database_facts_scale_with_shells_not_thirty_thousand_scope_rows() {
     );
     // A watchdog wakeup without a metadata mutation must not dirty the cache,
     // even when persisted output observation asks for refreshed rows.
-    crate::bash_background::shell_metadata::changed();
+    aft_engine::test_bridge::bash_remote::shell_metadata::changed();
     let polled = collect_at_store_revision(&executor, Some(&db), true, idle.db, 10, 1);
     assert_eq!(polled.rows.len(), 3);
     assert!(FACTS_SQL_TRACE.with(|trace| trace
@@ -731,7 +731,7 @@ fn shells_v1_spawn_facts_persist_and_legacy_records_omit_unknowns() {
     assert_eq!(call.description.as_deref(), Some("Check API types"));
     assert_eq!(call.session, "bg_worker_cedar");
     assert_eq!(call.call_id.as_deref(), Some("call-1"));
-    assert!(crate::bash_background::shell_metadata::current().is_none());
+    assert!(aft_engine::test_bridge::bash_remote::shell_metadata::current().is_none());
     encoded.as_object_mut().unwrap().remove("shell_call");
     encoded.as_object_mut().unwrap().remove("shell_revision");
     let legacy: crate::bash_background::persistence::PersistedTask =

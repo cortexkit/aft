@@ -1,4 +1,4 @@
-use crate::bash_background::registry::{test_support, BgTask};
+use aft_engine::test_bridge::bash_remote::{registry_support as test_support, BgTask};
 use std::sync::Arc;
 
 pub(crate) fn wait_fixture(

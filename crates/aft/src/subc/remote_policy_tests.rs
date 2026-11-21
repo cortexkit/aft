@@ -81,7 +81,9 @@ fn call(ctx: &AppContext, route: &RouteIdentity, name: &str, args: Value) -> Res
 
 #[test]
 fn grep_ignore_disclosure_ready_pending_and_busy_preserve_subc_text() {
-    use crate::grep_executor::{with_ignore_probe_state_for_test, IgnoreProbeStateForTest};
+    use aft_engine::test_bridge::search_misc::{
+        with_ignore_probe_state_for_test, IgnoreProbeStateForTest,
+    };
 
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
@@ -2237,13 +2239,17 @@ fn exec_remote_catalog_paramless_and_unscoped_parity() {
 #[cfg(unix)]
 #[tokio::test]
 async fn exec_remote_catalog_route_fetch_then_call_after_restart_routes() {
-    exercise_catalog_remote_bash(crate::exec_remote::wire_tests::Script::Utf8, None).await;
+    exercise_catalog_remote_bash(
+        aft_engine::test_bridge::bash_remote::remote_wire::Script::Utf8,
+        None,
+    )
+    .await;
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn runon_subc_executor_refusal_returns_error_without_local_spawn() {
-    use crate::exec_remote::wire_tests::Script;
+    use aft_engine::test_bridge::bash_remote::remote_wire::Script;
     for (script, reason) in [
         (Script::KnownRefused, "unreachable"),
         (Script::WorkspaceSetupRefused, "workspace_setup_failed"),
@@ -2255,10 +2261,11 @@ async fn runon_subc_executor_refusal_returns_error_without_local_spawn() {
 
 #[cfg(unix)]
 async fn exercise_catalog_remote_bash(
-    script: crate::exec_remote::wire_tests::Script,
+    script: aft_engine::test_bridge::bash_remote::remote_wire::Script,
     refusal: Option<&str>,
 ) {
-    let daemon = crate::exec_remote::wire_tests::daemon(script, "exec-remote/v1").await;
+    let daemon =
+        aft_engine::test_bridge::bash_remote::remote_wire::daemon(script, "exec-remote/v1").await;
     let root = tempfile::tempdir().unwrap();
     init_remote_git_fixture(root.path());
     let storage = tempfile::tempdir().unwrap();
@@ -2476,11 +2483,11 @@ async fn exec_remote_module_loop_captures_its_authenticated_daemon_endpoint() {
 #[tokio::test]
 async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
     for cancelled in [false, true] {
-        let daemon = crate::exec_remote::wire_tests::daemon(
+        let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon(
             if cancelled {
-                crate::exec_remote::wire_tests::Script::Cancel
+                aft_engine::test_bridge::bash_remote::remote_wire::Script::Cancel
             } else {
-                crate::exec_remote::wire_tests::Script::GatedAcceptance
+                aft_engine::test_bridge::bash_remote::remote_wire::Script::GatedAcceptance
             },
             "exec-remote/v1",
         )
@@ -2506,7 +2513,7 @@ async fn exec_remote_scope_drain_detaches_but_explicit_cancel_kills() {
                 },
                 crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                 "cargo test",
-                crate::bash_background::registry::resolve_posix_shell(),
+                aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                 "session".into(),
                 dir.path().into(),
                 HashMap::new(),
@@ -2668,8 +2675,8 @@ async fn drained_detached_body(
 #[cfg(unix)]
 #[tokio::test]
 async fn drained_remote_call_names_its_task_and_remote_job() {
-    let daemon = crate::exec_remote::wire_tests::daemon(
-        crate::exec_remote::wire_tests::Script::GatedAcceptance,
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon(
+        aft_engine::test_bridge::bash_remote::remote_wire::Script::GatedAcceptance,
         "exec-remote/v1",
     )
     .await;
@@ -2694,7 +2701,7 @@ async fn drained_remote_call_names_its_task_and_remote_job() {
             },
             crate::sandbox_spawn::SpawnPlan::Unsandboxed,
             "cargo test",
-            crate::bash_background::registry::resolve_posix_shell(),
+            aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
             "session".into(),
             dir.path().into(),
             HashMap::new(),
@@ -3295,8 +3302,8 @@ fn sibling_plan(siblings: &[&Path], readable: &[&Path]) -> Value {
 #[cfg(unix)]
 #[tokio::test]
 async fn siblings_pass_cores_launch_fetches_then_brocas_fetch_and_submit() {
-    let daemon = crate::exec_remote::wire_tests::daemon(
-        crate::exec_remote::wire_tests::Script::Plain,
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon(
+        aft_engine::test_bridge::bash_remote::remote_wire::Script::Plain,
         "exec-remote/v1",
     )
     .await;
@@ -3558,8 +3565,8 @@ fn siblings_owner_waiver_covers_only_the_owner_carried_worker_fetch() {
 #[tokio::test]
 async fn siblings_submit_refuses_withdrawn_catalog_grant_before_daemon_contact() {
     use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
-    let daemon = crate::exec_remote::wire_tests::daemon(
-        crate::exec_remote::wire_tests::Script::Plain,
+    let daemon = aft_engine::test_bridge::bash_remote::remote_wire::daemon(
+        aft_engine::test_bridge::bash_remote::remote_wire::Script::Plain,
         "exec-remote/v1",
     )
     .await;

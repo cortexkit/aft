@@ -7,7 +7,7 @@ fn checkpoint(
     Arc<crate::gh_shim_ticket::SpeechTicket>,
     crate::bash_background::persistence::PersistedTask,
 ) {
-    let speech = crate::gh_shim_ticket::speech_for_task("dispatch-session", task)
+    let speech = aft_engine::test_bridge::bash_remote::speech_for_task("dispatch-session", task)
         .pop()
         .expect("eligible task ticket");
     let conn = speech.prepared.context.service.store.connect().unwrap();
@@ -258,8 +258,9 @@ fn revoked_probe_child() {
             .reason,
         "revoked"
     );
-    let service = crate::gh_shim_speech::service::record_service(Path::new(&root));
-    let cold = crate::gh_shim_ticket::redeem_speech_cold(&ticket, &service).unwrap_err();
+    let service = aft_engine::test_bridge::bash_remote::record_service(Path::new(&root));
+    let cold =
+        aft_engine::test_bridge::bash_remote::redeem_speech_cold(&ticket, &service).unwrap_err();
     assert_eq!(
         cold.reason, "snapshot_invalid",
         "a revoked unsealed candidate has no redemption digest"

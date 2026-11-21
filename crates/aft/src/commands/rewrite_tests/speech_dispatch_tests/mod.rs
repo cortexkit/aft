@@ -486,7 +486,7 @@ impl Fixture {
             true,
         );
         assert!(
-            crate::gh_shim_speech::service::lookup(&root)
+            aft_engine::test_bridge::bash_remote::lookup(&root)
                 .as_ref()
                 .is_some_and(|registered| Arc::ptr_eq(registered, &service)),
             "fixture speech registration must be found through its supplied storage path: {root:?}"
@@ -505,7 +505,7 @@ impl Fixture {
                     let mut left = binding_outages.lock().unwrap();
                     if *left > 0 {
                         *left -= 1;
-                        let mut error = crate::gh_shim_speech::service::binding_refusal(
+                        let mut error = aft_engine::test_bridge::bash_remote::binding_refusal(
                             Code::AuthorityUnavailable,
                             "binding_unverifiable",
                             "connection refused",
@@ -587,12 +587,13 @@ impl Fixture {
                         },
                     );
                     let raw = ticket.value().unwrap().to_string();
-                    let incarnation = crate::gh_shim_ticket::speech_for_ticket(&raw)
+                    let incarnation = aft_engine::test_bridge::bash_remote::speech_for_ticket(&raw)
                         .unwrap()
                         .incarnation
                         .clone();
-                    let _guard = crate::gh_shim_ticket::spawn_ticket_guard(Some(&raw));
-                    crate::gh_shim_ticket::mark_spawn_background(background);
+                    let _guard =
+                        aft_engine::test_bridge::bash_remote::spawn_ticket_guard(Some(&raw));
+                    aft_engine::test_bridge::bash_remote::mark_spawn_background(background);
                     let mut environment = HashMap::new();
                     environment
                         .insert(crate::gh_shim_paths::GH_SHIM_TICKET_ENV.into(), raw.clone());
@@ -603,7 +604,7 @@ impl Fixture {
                                     crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                                     &command,
                                     crate::bash_background::BashShell::Bash,
-                                    crate::bash_background::registry::resolve_posix_shell(),
+                                    aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                                     spawn_session,
                                     project.clone(),
                                     environment,
@@ -626,7 +627,7 @@ impl Fixture {
                                         crate::sandbox_spawn::SpawnPlan::Unsandboxed,
                                         &command,
                                         crate::bash_background::BashShell::Bash,
-                                        crate::bash_background::registry::resolve_posix_shell(),
+                                        aft_engine::test_bridge::bash_remote::resolve_posix_shell(),
                                         spawn_session,
                                         project.clone(),
                                         environment,
@@ -669,7 +670,7 @@ impl Fixture {
             }
         };
         if startup_error.is_none() && options.seal_failure.is_none() && !options.foreground {
-            let warm = crate::gh_shim_ticket::speech_for_ticket(&ticket).unwrap();
+            let warm = aft_engine::test_bridge::bash_remote::speech_for_ticket(&ticket).unwrap();
             assert!(
                 warm.active.load(std::sync::atomic::Ordering::SeqCst),
                 "fixture must acquire genuine durable authority: {:?}",
@@ -1297,7 +1298,7 @@ async fn captured_dispatch_retries_unreachable_bindings_once_but_not_missing_row
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempts = calls.clone();
         let expected = {
-            let mut error = crate::gh_shim_speech::service::binding_refusal(
+            let mut error = aft_engine::test_bridge::bash_remote::binding_refusal(
                 Code::AuthorityUnavailable,
                 "binding_unverifiable",
                 "binding_read_transport: Unavailable(\"connection refused\")",
@@ -1409,7 +1410,7 @@ async fn captured_dispatch_scope_end_interrupts_a_long_post_send_wait() {
                 crate::gh_shim_speech::ScopeRole::Authority,
                 &selector,
                 &fixture.service.generation(),
-                crate::gh_shim_speech::scope::ScopedRpcEndSource::Provider,
+                aft_engine::test_bridge::bash_remote::ScopedRpcEndSource::Provider,
             )
             .unwrap();
     };

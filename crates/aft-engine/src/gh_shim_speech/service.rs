@@ -130,21 +130,9 @@ pub struct LaunchSeed {
     pub project_root: String,
 }
 
-#[derive(Clone)]
-pub(crate) struct LaunchContext {
-    pub(crate) seed: LaunchSeed,
-    pub(crate) service: Arc<Service>,
-}
-
-#[derive(Clone)]
-pub(crate) struct PreparedLaunch {
-    pub(crate) context: LaunchContext,
-    pub(crate) policy: Option<PolicySnapshot>,
-    pub(crate) classification: Option<PolicySnapshot>,
-    pub(crate) bindings: BTreeMap<String, Binding>,
-    pub(crate) denial: Option<Refusal>,
-    pub(crate) provisioned: bool,
-}
+#[path = "launch_types.rs"]
+pub(crate) mod launch_types;
+pub(crate) use launch_types::{LaunchContext, PreparedLaunch};
 
 thread_local! {static LAUNCH:RefCell<Option<LaunchContext>>=const{RefCell::new(None)};}
 #[doc(hidden)]

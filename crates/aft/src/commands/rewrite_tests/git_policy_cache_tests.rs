@@ -1,7 +1,7 @@
 use crate::config::SandboxMode;
-use crate::sandbox_spawn::git_policy_bench_support;
-use crate::sandbox_spawn::git_policy_cache_tests::{commit, git_ok, Fixture};
 use crate::sandbox_spawn::{install_sandbox_launcher_for_test, with_worker_jail};
+use aft_engine::test_bridge::bash_remote::git_policy_bench_support;
+use aft_engine::test_bridge::bash_remote::git_policy_cache_support::{commit, git_ok, Fixture};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
