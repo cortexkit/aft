@@ -3,10 +3,11 @@ use crate::lsp::client::ServerExitReason;
 use crate::lsp::registry::builtin_servers;
 use serde_json::json;
 
-use super::idle_fixture::{idle_hover_params, IdleLspFixture};
+use super::idle_fixture::idle_hover_params;
+pub(crate) use super::idle_fixture::IdleLspFixture;
 
 impl IdleLspFixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::with_server_binary(crate::fake_lsp_test_helper::fake_server_binary)
     }
 }
