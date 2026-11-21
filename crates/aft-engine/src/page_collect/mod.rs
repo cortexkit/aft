@@ -510,7 +510,8 @@ pub struct Collected {
 
 /// Where collected bytes go. The snapshot builder writes each file to the
 /// snapshot's private folder.
-pub(crate) trait SnapshotSink {
+#[doc(hidden)]
+pub trait SnapshotSink {
     fn add(&mut self, path: &str, bytes: &[u8]) -> std::io::Result<FileRecord>;
     /// The bytes stored for `path` by an earlier [`SnapshotSink::add`].
     fn bytes(&self, path: &str) -> std::io::Result<Vec<u8>>;

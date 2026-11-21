@@ -53,7 +53,8 @@ impl ReadRefusal {
 
 /// A fifth collection while [`MAX_LIVE`] snapshots are alive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Busy {
+#[doc(hidden)]
+pub struct Busy {
     /// When the oldest live snapshot expires, from now.
     pub retry_after_ms: u64,
 }

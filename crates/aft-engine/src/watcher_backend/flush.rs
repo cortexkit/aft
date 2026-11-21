@@ -17,7 +17,8 @@ use super::mailbox::Message;
 /// seen. The wait still ends as soon as the acknowledgement arrives; the larger
 /// Windows cap only bounds the worst case where it never does.
 #[cfg(windows)]
-pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(1500);
+#[doc(hidden)]
+pub const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(1500);
 #[cfg(not(windows))]
 #[doc(hidden)]
 pub const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(300);

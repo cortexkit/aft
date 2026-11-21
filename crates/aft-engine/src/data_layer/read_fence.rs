@@ -28,7 +28,8 @@ thread_local! {
 /// directory walks check each entry against. Helper threads that do a
 /// request's filesystem work carry a copy (see [`capture`] and [`inherit`]).
 #[derive(Clone, Default)]
-pub(crate) struct Fence {
+#[doc(hidden)]
+pub struct Fence {
     requests: Vec<String>,
     remote_mutation: bool,
     gate: Option<Arc<ReadGate>>,
