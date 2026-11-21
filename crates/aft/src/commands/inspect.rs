@@ -8014,7 +8014,6 @@ mod deferred_terminal_tests {
     };
     mod inspect_request_deadline_tests {
         use super::*;
-        use aft_engine::test_bridge::search_misc::inspect::InspectManagerTest as _;
 
         fn fixture() -> (tempfile::TempDir, Arc<AppContext>, RawRequest) {
             let root = tempfile::tempdir().unwrap();

@@ -105,6 +105,7 @@ pub struct Pause {
     pub(crate) entered: Receiver<()>,
     pub(crate) resume: Sender<()>,
     pub(crate) spawns: Arc<AtomicUsize>,
+    #[cfg(test)]
     pub(super) under_lock: Arc<AtomicBool>,
 }
 
@@ -130,6 +131,7 @@ pub fn pause_first_spawn(f: &Fixture) -> Pause {
         entered,
         resume,
         spawns,
+        #[cfg(test)]
         under_lock,
     }
 }

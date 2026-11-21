@@ -782,6 +782,3 @@ async fn command_status_frame_keys_replay_only_the_carrier_frame_not_the_viewed_
     }
     proxy_task.abort();
 }
-
-#[cfg(test)]
-use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;

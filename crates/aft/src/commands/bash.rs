@@ -1027,10 +1027,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(windows))]
+    use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
+    use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
     #[cfg(windows)]
     use aft_engine::test_bridge::bash_remote::WindowsShell;
-    use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, SpawnPlanTestExt as _};
-    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 
     #[test]
     fn standalone_runon_is_refused_by_name_even_with_remote_execution_enabled() {

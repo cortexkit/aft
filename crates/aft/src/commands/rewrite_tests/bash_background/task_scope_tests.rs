@@ -1,5 +1,7 @@
+#[cfg(not(target_os = "linux"))]
+use crate::bash_background;
 use crate::bash_background::registry::BgTaskRegistry;
-use crate::bash_background::{self, BashShell, HardKill, TaskSlot};
+use crate::bash_background::{BashShell, HardKill, TaskSlot};
 use crate::sandbox_spawn::SpawnPlan;
 use aft_engine::test_bridge::bash_remote::registry_support::scopes::{
     require_manager, scope_stopped, until, StopOnDrop,

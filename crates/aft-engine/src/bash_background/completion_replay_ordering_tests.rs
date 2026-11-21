@@ -1,6 +1,5 @@
 use super::test_support::ordering::*;
 use super::*;
-use serde_json::Value;
 #[test]
 fn completion_before_replay_keeps_masked_preview_without_replaying_live_push() {
     let storage = tempfile::tempdir().unwrap();

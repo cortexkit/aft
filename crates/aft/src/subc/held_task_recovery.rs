@@ -1078,5 +1078,6 @@ pub(crate) mod tests {
     }
 
     #[cfg(test)]
+    #[cfg(not(windows))]
     use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 }

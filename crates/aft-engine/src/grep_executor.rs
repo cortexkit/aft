@@ -354,7 +354,7 @@ impl IgnoredScopeProbe {
         self.result.recv_timeout(wait).ok().flatten()
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
     fn ready(result: Option<IgnoredScopeEntries>, deadline: Instant) -> Self {
         let (sender, receiver) = std::sync::mpsc::sync_channel(1);
         let _ = sender.send(result);
@@ -366,7 +366,7 @@ impl IgnoredScopeProbe {
         }
     }
 
-    #[cfg(any(test, feature = "test-hooks"))]
+    #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
     fn pending(deadline: Instant) -> Self {
         let (sender, result) = std::sync::mpsc::sync_channel(1);
         Self {

@@ -2387,14 +2387,6 @@ impl App {
         self.lifecycle_census.publish(snapshot);
     }
 
-    #[cfg(all(any(test, feature = "test-support"), unix))]
-    pub(crate) fn collect_and_publish_lifecycle_census_for_test(
-        &self,
-        contexts: &[Arc<AppContext>],
-    ) {
-        self.publish_lifecycle_census(crate::lifecycle_census::collect(self, contexts));
-    }
-
     pub fn lifecycle_census_snapshot(&self) -> crate::lifecycle_census::LifecycleCensusSnapshot {
         self.lifecycle_census.snapshot()
     }

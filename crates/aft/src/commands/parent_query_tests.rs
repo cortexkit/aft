@@ -1158,6 +1158,3 @@ fn a_child_bind_in_progress_does_not_hold_up_another_childs_watcher_paths() {
 use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::IndexHost as _;
-
-#[cfg(test)]
-use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

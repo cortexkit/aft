@@ -6,6 +6,7 @@ use crate::bash_background::registry::BgTaskRegistry;
 #[cfg(unix)]
 use crate::bash_background::BgTaskStatus;
 use crate::sandbox_spawn::SpawnPlan;
+#[cfg(not(windows))]
 use aft_engine::test_bridge::bash_remote::SpawnReceiptTestExt as _;
 use aft_engine::test_bridge::bash_remote::{with_task_io_fault, TaskIoFault};
 use std::{collections::HashMap, fs, path::Path};

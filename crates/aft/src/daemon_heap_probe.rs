@@ -1,7 +1,7 @@
 //! Isolated engine soak: keep root contexts bound while short sessions come and go.
 //! Run alone with `--ignored --nocapture --test-threads=1` for allocator measurements.
 
-use crate::context::{App, AppContext};
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 use serde_json::{json, Value};
 use std::sync::Arc;

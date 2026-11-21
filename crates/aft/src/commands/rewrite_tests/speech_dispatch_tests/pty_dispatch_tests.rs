@@ -1,7 +1,6 @@
 use super::*;
 use crate::protocol::BgTaskStatus;
 use aft_engine::test_bridge::bash_remote::AuthorityRecordTestExt as _;
-use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
 
 fn checkpoint(
     task: &str,

@@ -1,11 +1,6 @@
 use super::*;
 use aft_engine::test_bridge::bash_remote::AuthorityRecord;
 use aft_engine::test_bridge::bash_remote::AuthorityRecordTestExt as _;
-use aft_engine::test_bridge::bash_remote::LaunchAuthorityTestExt as _;
-use aft_engine::test_bridge::bash_remote::RefusalTestExt as _;
-use aft_engine::test_bridge::bash_remote::ServiceTestExt as _;
-use aft_engine::test_bridge::bash_remote::StoreTestExt as _;
-use aft_engine::test_bridge::bash_remote::StoredAuthorityTestExt as _;
 
 fn rewrite(
     store: &crate::gh_shim_speech::store::Store,

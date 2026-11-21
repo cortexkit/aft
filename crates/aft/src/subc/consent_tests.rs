@@ -8482,6 +8482,9 @@ include!("consent_approval_deadline_tests.rs");
 mod secret_fetch_cancellation;
 
 #[cfg(test)]
-use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 #[cfg(test)]
-use aft_engine::test_bridge::bash_remote::{BgTaskRegistryTestExt as _, BgTaskTestExt as _};
+#[cfg(not(windows))]
+use aft_engine::test_bridge::bash_remote::BgTaskTestExt as _;
+#[cfg(test)]
+use aft_engine::test_bridge::bash_remote::SpawnPlanTestExt as _;

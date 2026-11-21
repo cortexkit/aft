@@ -1,6 +1,4 @@
-use aft_engine::test_bridge::bash_remote::{TaskSinkTestExt as _};
 use aft_engine::test_bridge::bash_remote::DrainingRetryTestExt as _;
-use aft_engine::test_bridge::bash_remote::KeyedSubmissionTestExt as _;
 #[tokio::test]
 async fn bash_status_and_watch_show_the_persisted_remote_phase_after_a_restart() {
     for started in [false, true] {

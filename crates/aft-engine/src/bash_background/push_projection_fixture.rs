@@ -6,10 +6,13 @@ use std::sync::{MutexGuard, OnceLock};
 
 pub struct BusyRoot {
     pub(crate) ctx: Arc<AppContext>,
-    pub(crate) app: Arc<App>,
-    pub(crate) contexts: Vec<Arc<AppContext>>,
+    pub(crate) _app: Arc<App>,
+    pub(crate) _contexts: Vec<Arc<AppContext>>,
+    #[cfg(test)]
     pub(crate) root: PathBuf,
+    #[cfg(test)]
     pub(crate) storage: PathBuf,
+    #[cfg(test)]
     pub(crate) key: String,
     _dir: tempfile::TempDir,
 }
@@ -106,10 +109,13 @@ fn build() -> BusyRoot {
     assert_eq!(ctx.lsp_server_count(), 5);
     BusyRoot {
         ctx,
-        app,
-        contexts,
+        _app: app,
+        _contexts: contexts,
+        #[cfg(test)]
         root,
+        #[cfg(test)]
         storage,
+        #[cfg(test)]
         key,
         _dir: dir,
     }

@@ -804,4 +804,5 @@ fn access_policy_ordinary_project_path_filter_cost() {
 }
 
 #[cfg(test)]
+#[cfg(not(target_os = "linux"))]
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;

@@ -1,6 +1,7 @@
 use super::*;
 use crate::run_tool_call::{run_tool_call, ToolCallContext, ToolCallOutcome};
 #[cfg(test)]
+#[cfg(not(windows))]
 use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::AppContextTestExt as _;

@@ -1676,6 +1676,7 @@ struct RouteLeases {
 struct LeaseTestPause {
     acquired: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+    #[cfg(test)]
     finished: tokio::sync::Notify,
 }
 

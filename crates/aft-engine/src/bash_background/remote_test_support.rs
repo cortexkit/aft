@@ -55,20 +55,24 @@ pub(super) fn reattach_clock(root: &Path) -> Option<Arc<ReattachClock>> {
         .cloned()
 }
 
+#[cfg(test)]
 pub(super) fn crash_tasks() -> &'static Mutex<HashSet<String>> {
     static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
     TASKS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+#[cfg(test)]
 pub(super) fn simulate_crash_before_local_pid(task: &str) -> bool {
     crash_tasks().lock().unwrap().remove(task)
 }
 
+#[cfg(test)]
 pub(super) fn post_spawn_failures() -> &'static Mutex<HashSet<String>> {
     static TASKS: std::sync::OnceLock<Mutex<HashSet<String>>> = std::sync::OnceLock::new();
     TASKS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
+#[cfg(test)]
 pub(super) fn fail_running_metadata_after_spawn(task: &str) -> Result<(), String> {
     if post_spawn_failures().lock().unwrap().remove(task) {
         Err("injected running-metadata failure after spawn".into())
@@ -77,17 +81,20 @@ pub(super) fn fail_running_metadata_after_spawn(task: &str) -> Result<(), String
     }
 }
 
+#[cfg(test)]
 pub(super) struct MarkerGate {
     pub(super) entered: std::sync::mpsc::Sender<()>,
     pub(super) release: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(test)]
 pub(super) fn marker_gates() -> &'static Mutex<HashMap<String, MarkerGate>> {
     static GATES: std::sync::OnceLock<Mutex<HashMap<String, MarkerGate>>> =
         std::sync::OnceLock::new();
     GATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+#[cfg(test)]
 pub(super) fn after_local_fallback_marker(task: &str) {
     if let Some(gate) = marker_gates().lock().unwrap().remove(task) {
         gate.entered.send(()).unwrap();
