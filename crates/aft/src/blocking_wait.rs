@@ -114,7 +114,12 @@ impl ReplyBudget {
         Self::from_clocks(received_at, body, now, wall_ms)
     }
 
-    fn from_clocks(received_at: Instant, body: &Value, now: Instant, wall_ms: u64) -> Self {
+    pub(crate) fn from_clocks(
+        received_at: Instant,
+        body: &Value,
+        now: Instant,
+        wall_ms: u64,
+    ) -> Self {
         let deadline = body.get("deadline_ms").and_then(Value::as_u64).map(|ms| {
             // Pair clocks at the same point, not receipt: receipt can predate
             // decoding by a long queue wait. An expired deadline stays expired.
