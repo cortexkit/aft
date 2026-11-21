@@ -139,7 +139,12 @@ pub(crate) use windows::ProjectWatcher;
 /// excluded parent covers nothing underneath it. This lives here, in the
 /// module that picks the backend, so the derivation rules in `watcher_filter`
 /// never name a platform themselves.
-#[cfg(any(target_os = "macos", target_os = "linux", test))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "linux",
+    test,
+    feature = "test-support"
+))]
 pub(crate) const BACKEND_EXCLUSION_COVERAGE: crate::watcher_filter::WatcherExclusionCoverage =
     if cfg!(target_os = "linux") {
         crate::watcher_filter::WatcherExclusionCoverage::Subtree

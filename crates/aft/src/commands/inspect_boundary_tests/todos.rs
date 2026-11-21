@@ -288,7 +288,7 @@ mod tests {
                 ..Config::default()
             },
         );
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         let checkout = ctx.data_checkout().expect("bound");
         let deadline = Instant::now() + std::time::Duration::from_secs(60);
         let view = loop {

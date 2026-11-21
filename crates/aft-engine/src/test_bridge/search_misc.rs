@@ -232,3 +232,33 @@ pub fn request_files(
 ) -> &std::sync::Arc<crate::search_state::request_files::RequestFiles> {
     guard.files()
 }
+
+pub fn set_grep_scan_order(root: &Path, reversed: bool) {
+    crate::grep_executor::scan_order_for_test::set(root, reversed);
+}
+
+pub fn take_path_order_held_rows(root: &Path) -> usize {
+    crate::search_index::path_order_held_rows_for_test::take(root)
+}
+
+#[cfg(unix)]
+pub fn grep_root_for_test(
+    ctx: &crate::context::AppContext,
+    search_root: &Path,
+    pattern: &str,
+) -> crate::search_index::GrepResult {
+    crate::grep_executor::grep_root_for_test(ctx, search_root, pattern)
+}
+
+pub fn record_request_file_read(path: &Path) {
+    crate::search_state::request_files::record_disk_read(path);
+}
+
+pub fn keep_request_file(
+    guard: &crate::search_state::request_files::Guard,
+    path: &Path,
+    bytes: Vec<u8>,
+    stat: Option<crate::search_state::request_files::FileStat>,
+) -> std::sync::Arc<crate::search_state::request_files::RequestFile> {
+    guard.files().keep_read(path, bytes, stat)
+}

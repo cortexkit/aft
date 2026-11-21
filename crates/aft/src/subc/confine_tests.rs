@@ -851,7 +851,9 @@ fn confined_walks_refuse_a_starting_path_outside_the_fence() {
     let glob = |start: &Path| {
         crate::commands::glob::glob_root_files_for_test(&f.ctx, &f.pin, start, "**/*", 16, None)
     };
-    let grep = |start: &Path| crate::grep_executor::grep_root_for_test(&f.ctx, start, pattern);
+    let grep = |start: &Path| {
+        aft_engine::test_bridge::search_misc::grep_root_for_test(&f.ctx, start, pattern)
+    };
     let outline = |start: &Path, files_mode: bool| {
         crate::commands::outline::discover_outline_paths_for_test(start, files_mode)
     };

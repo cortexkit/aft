@@ -550,7 +550,7 @@ pub fn provision_model_files_in(
     model: &AllowedModel,
     cache_dir: &Path,
 ) -> Result<ModelFiles, String> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if let Some((name, observed)) = PROVISION_PROBE
         .get_or_init(Default::default)
         .lock()

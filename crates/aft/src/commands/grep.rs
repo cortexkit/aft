@@ -2000,7 +2000,7 @@ mod tests {
         );
         // The index store binds the root and its first build waits here.
         let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let req = serde_json::from_value(serde_json::json!({
             "id": "grep-while-building", "command": "grep",
             "pattern": "definitely_absent_token",
@@ -2264,7 +2264,7 @@ mod tests {
             },
         );
         let stored_rows = |reversed: bool| {
-            crate::grep_executor::scan_order_for_test::set(&root, reversed);
+            aft_engine::test_bridge::search_misc::set_grep_scan_order(&root, reversed);
             let req = serde_json::from_value(serde_json::json!({
                 "id": "capped-order", "command": "grep", "pattern": "needle",
                 "max_results": 1000,
@@ -2315,7 +2315,7 @@ mod tests {
             .collect();
         let expected = &every_row[..1000];
         for (threads, reversed) in [(1, false), (8, false), (1, true), (8, true)] {
-            crate::grep_executor::scan_order_for_test::set(&root, reversed);
+            aft_engine::test_bridge::search_misc::set_grep_scan_order(&root, reversed);
             let pool = rayon::ThreadPoolBuilder::new()
                 .thread_name(|index| format!("aft-rayon-grep-test-{index}"))
                 .num_threads(threads)
@@ -2362,7 +2362,7 @@ mod tests {
         let query = aft_engine::test_bridge::search_misc::decompose_grep_pattern(&pattern);
         let filters = build_path_filters(&[], &[]).unwrap();
         let max_results = 100_100;
-        crate::search_index::path_order_held_rows_for_test::take(&root);
+        aft_engine::test_bridge::search_misc::take_path_order_held_rows(&root);
         let (result, _) = snapshot
             .search_grep_profiled_with_filters_and_query_in_order(
                 &pattern,
@@ -2374,7 +2374,7 @@ mod tests {
                 GrepScanOrder::Path,
             )
             .expect("grep over a test index");
-        let peak = crate::search_index::path_order_held_rows_for_test::take(&root);
+        let peak = aft_engine::test_bridge::search_misc::take_path_order_held_rows(&root);
         assert!(
             peak <= max_results + aft_engine::test_bridge::search_misc::PATH_ORDER_BATCH_ROW_BUDGET,
             "held {peak} rows at once"

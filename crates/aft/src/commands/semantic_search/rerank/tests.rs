@@ -383,7 +383,8 @@ fn audit1432_candidate_windows_match_cached_whole_source_through_production_larg
             ] {
                 let expected = {
                     let scope = super::super::request_files::install();
-                    aft_engine::test_bridge::search_misc::request_files(&scope).keep_read(
+                    aft_engine::test_bridge::search_misc::keep_request_file(
+                        &scope,
                         &file,
                         bytes.clone(),
                         None,
@@ -552,7 +553,7 @@ fn probe_project(count: usize) -> (tempfile::TempDir, AppContext) {
     *ctx.semantic_index_status()
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-    crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+    aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
     (project, ctx)
 }
 
