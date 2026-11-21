@@ -1065,7 +1065,7 @@ pub struct BackupStore {
     pending_discards: VecDeque<PendingOperationDiscard>,
     #[cfg(test)]
     enforce_temp_path_policy: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     disk_io_count: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
     history_content_reads: Arc<AtomicU64>,
@@ -1073,11 +1073,11 @@ pub struct BackupStore {
     history_metadata_reads: AtomicU64,
     #[cfg(test)]
     migration_backups_dir_reads: AtomicU64,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fail_next_disk_write: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     release_after_next_snapshot: bool,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     discovery_entry_limit: usize,
     #[cfg(test)]
     discovery_entries_examined: Arc<AtomicU64>,
@@ -1092,7 +1092,7 @@ pub struct BackupStore {
     /// time the cleanup from its own start rather than from the caller's.
     #[cfg(test)]
     discard_started_for_tests: Option<Instant>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) discard_paths_for_tests: Vec<PathBuf>,
 }
 
@@ -1167,7 +1167,7 @@ impl BackupStore {
             pending_discards: VecDeque::new(),
             #[cfg(test)]
             enforce_temp_path_policy: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             disk_io_count: AtomicU64::new(0),
             #[cfg(any(test, feature = "test-support"))]
             history_content_reads: Arc::new(AtomicU64::new(0)),
@@ -1175,11 +1175,11 @@ impl BackupStore {
             history_metadata_reads: AtomicU64::new(0),
             #[cfg(test)]
             migration_backups_dir_reads: AtomicU64::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             fail_next_disk_write: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             release_after_next_snapshot: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             discovery_entry_limit: MAX_SESSION_DISCOVERY_ENTRIES,
             #[cfg(test)]
             discovery_entries_examined: Arc::new(AtomicU64::new(0)),
@@ -1190,7 +1190,7 @@ impl BackupStore {
             discard_outcome_for_tests: None,
             #[cfg(test)]
             discard_started_for_tests: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             discard_paths_for_tests: Vec::new(),
         }
     }
@@ -1251,7 +1251,7 @@ impl BackupStore {
         self.clear_db_mirror_sync();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn resident_entry_count(&self) -> usize {
         self.entries
             .values()
@@ -1260,17 +1260,17 @@ impl BackupStore {
             .sum()
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn fail_next_disk_write_for_tests(&mut self) {
         self.fail_next_disk_write = true;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn release_after_next_snapshot_for_tests(&mut self) {
         self.release_after_next_snapshot = true;
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn set_discovery_entry_limit_for_tests(&mut self, limit: usize) {
         self.discovery_entry_limit = limit;
     }
@@ -1560,7 +1560,7 @@ impl BackupStore {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn disk_io_count_for_tests(&self) -> u64 {
         self.disk_io_count.load(Ordering::SeqCst)
     }
@@ -1581,12 +1581,12 @@ impl BackupStore {
         self.migration_backups_dir_reads.load(Ordering::Relaxed)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn record_disk_io_for_tests(&self) {
         self.disk_io_count.fetch_add(1, Ordering::SeqCst);
     }
 
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     fn record_disk_io_for_tests(&self) {}
 
     /// Snapshot the current contents of `path` under the given session namespace.
@@ -3160,7 +3160,7 @@ impl BackupStore {
             .insert(key.to_path_buf(), stack);
         // Model route-close cleanup after a backup commits but before its
         // caller writes or rolls back the file, without a timing-dependent test.
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if std::mem::take(&mut self.release_after_next_snapshot) {
             self.release_session_memory(session);
         }
@@ -3620,7 +3620,7 @@ impl BackupStore {
         budget: BackupIoBudget,
         lock_wait: CleanupLockWait,
     ) -> Result<(), AftError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         self.discard_paths_for_tests.push(key.to_path_buf());
         budget.check(key)?;
         let _disk_lock = self.acquire_stack_disk_lock_with_cleanup_deadline(
@@ -4865,9 +4865,9 @@ impl BackupStore {
                 .map_or(budget.deadline, |override_| override_.min(budget.deadline)),
             ..budget
         };
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let entry_limit = MAX_SESSION_DISCOVERY_ENTRIES;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let entry_limit = self.discovery_entry_limit;
         status_inventory::DiscoveryLimits {
             budget,
@@ -5159,7 +5159,7 @@ impl BackupStore {
         stack: &[BackupEntry],
         db_plan: DbMirrorPlan<'_>,
     ) -> Result<(), AftError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if self.fail_next_disk_write {
             self.fail_next_disk_write = false;
             return Err(AftError::IoError {
