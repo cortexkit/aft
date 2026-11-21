@@ -1,6 +1,15 @@
-use super::*;
+use super::default_kill_tests;
 use crate::bash_background::persistence::create_task_layout;
-use crate::{context::AppContext, protocol::RawRequest};
+use crate::bash_background::persistence::write_task_at;
+use crate::bash_background::registry::test_support::{
+    insert_terminal_piped_task, register_unpersisted_watch,
+};
+use crate::bash_background::watches::WatchPattern;
+use crate::protocol::RawRequest;
+use std::{
+    fs,
+    sync::{Arc, Mutex},
+};
 
 fn request(task: &str, session: &str) -> RawRequest {
     serde_json::from_value(serde_json::json!({
@@ -47,7 +56,7 @@ fn carrier_status_never_renews_a_registered_workers_hard_kill() {
 fn carrier_status_hides_erased_watch_tombstones_while_agent_keeps_task_erased() {
     let _storage_env = crate::test_env::without_storage_override();
     let dir = tempfile::tempdir().unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             storage_dir: Some(dir.path().into()),
@@ -62,14 +71,13 @@ fn carrier_status_hides_erased_watch_tombstones_while_agent_keeps_task_erased() 
     let registry = ctx.bash_background();
     registry.set_db_pool(db.clone());
     registry.set_harness(crate::harness::Harness::Opencode);
-    let (id, _task) = tests::insert_terminal_piped_task(registry, &dir, "true", "done", "", false);
-    registry
-        .inner
-        .watch_registry
-        .lock()
-        .unwrap()
-        .register(id.clone(), WatchPattern::Substring("NEVER".into()), false)
-        .unwrap();
+    let (id, _task) = insert_terminal_piped_task(registry, &dir, "true", "done", "", false);
+    register_unpersisted_watch(
+        registry,
+        id.clone(),
+        WatchPattern::Substring("NEVER".into()),
+        false,
+    );
     crate::db::bash_tasks::delete_bash_task(&db.lock().unwrap(), "opencode", "session", &id)
         .unwrap();
     assert!(registry.has_erased_watch_reference(&id));
@@ -85,7 +93,7 @@ fn carrier_status_skips_head_worker_and_unscoped_project_fallbacks() {
     let _storage_env = crate::test_env::without_storage_override();
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().canonicalize().unwrap();
-    let ctx = AppContext::new(
+    let ctx = crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.clone()),

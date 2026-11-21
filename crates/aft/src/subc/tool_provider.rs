@@ -8409,7 +8409,9 @@ pub(in crate::subc) mod route_tests {
         use crate::bash_background::persistence::read_task;
         for carrier in [true, false] {
             let (dir, ctx, task) =
-                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+                crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
+                    None,
+                );
             ctx.update_config(|config| config.bash.worker_wait_max_ms = 3_600_000);
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let before = std::fs::read(&task.paths.json).unwrap();
@@ -8479,7 +8481,9 @@ pub(in crate::subc) mod route_tests {
         };
         for carrier in [true, false] {
             let (dir, ctx, task) =
-                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+                crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
+                    None,
+                );
             {
                 let mut state = task.lock_state().unwrap();
                 state
@@ -8509,7 +8513,9 @@ pub(in crate::subc) mod route_tests {
     async fn occipital_cold_task_reads_do_not_register_or_rewrite_tasks() {
         for name in ["bash_status", "bash_watch"] {
             let (dir, original, task) =
-                crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+                crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
+                    None,
+                );
             std::fs::write(&task.paths.stdout, "observed-output-marker").unwrap();
             std::fs::write(&task.paths.stderr, "").unwrap();
             let ctx = Arc::new(crate::test_context(

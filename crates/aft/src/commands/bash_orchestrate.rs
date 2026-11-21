@@ -1504,7 +1504,7 @@ mod tests {
                 "session_id": "quick-terminal-session",
                 "params": {"command": "printf 'quick-output\\n'; exit 7", "background": background, "pty": pty},
             })).unwrap();
-            let spawn = crate::bash_background::completed_spawn_for_test(request.clone(), &ctx);
+            let spawn = crate::commands::rewrite_tests::bash_background::spawn_reply::completed_spawn_for_test(request.clone(), &ctx);
             assert_eq!(spawn.data["status"], "failed");
             let task_id = spawn.data["task_id"].as_str().unwrap().to_string();
             let response = match build_bash_outcome(&request, &ctx, spawn) {

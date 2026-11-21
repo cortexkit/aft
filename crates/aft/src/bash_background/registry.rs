@@ -18630,14 +18630,6 @@ mod task_scope_tests;
 pub(crate) mod test_support {
     include!("registry_test_support.rs");
 }
-#[cfg(test)]
-#[path = "default_kill_test.rs"]
-pub(crate) mod default_kill_tests;
-
-#[cfg(test)]
-#[path = "carrier_observation_tests.rs"]
-mod carrier_observation_tests;
-
 #[cfg(all(test, unix))]
 #[path = "completion_replay_ordering_tests.rs"]
 mod completion_replay_ordering_tests;
@@ -19321,7 +19313,7 @@ mod tests {
         assert!(registry.live_scope_stamps().is_empty());
     }
 
-    pub(super) fn insert_terminal_piped_task(
+    pub(crate) fn insert_terminal_piped_task(
         registry: &BgTaskRegistry,
         dir: &tempfile::TempDir,
         command: &str,
@@ -19498,7 +19490,8 @@ mod tests {
 
     #[test]
     fn approved_head_status_paging_does_not_renew_default_kill() {
-        let (_dir, ctx, task) = super::default_kill_tests::wait_fixture(None);
+        let (_dir, ctx, task) =
+            crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
         fs::write(&task.paths.stdout, "output").unwrap();
         fs::write(&task.paths.stderr, "").unwrap();
         let request = serde_json::from_value(serde_json::json!({"id": "head-page", "command": "bash_status", "session_id": task.session_id, "worker_session": false, "params": {"task_id": task.task_id, "output_offset": 0}})).unwrap();
@@ -31943,7 +31936,7 @@ mod a02_tests {
     use crate::bash_background::persistence::write_task;
 
     fn terminal_fixture() -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
-        let (dir, ctx, task) = default_kill_tests::wait_fixture(None);
+        let (dir, ctx, task) = test_support::wait_fixture(None);
         {
             let mut state = task.state.lock().unwrap();
             state

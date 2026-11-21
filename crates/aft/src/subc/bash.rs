@@ -499,7 +499,7 @@ mod frame_loop_lock_tests {
     #[tokio::test]
     async fn due_remote_handback_check_never_locks_task_state_on_frame_loop() {
         let (_dir, ctx, task) =
-            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
         let root = ProjectRootId::from_path(_dir.path()).unwrap();
         let executor = Arc::new(Executor::with_config(crate::executor::ExecutorConfig {
             pool_size: 2,
@@ -573,7 +573,7 @@ mod frame_loop_lock_tests {
     #[tokio::test]
     async fn module_drain_reply_never_locks_task_state_on_frame_loop() {
         let (_dir, ctx, task) =
-            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
         let root = ProjectRootId::from_path(_dir.path()).unwrap();
         let metrics = DispatchPathMetrics::new();
         let route = RouteChannel {
@@ -707,7 +707,7 @@ mod default_kill_tests {
     async fn a02_observation_polls_the_live_child_once() {
         use std::sync::atomic::Ordering;
         let (_dir, ctx, task) =
-            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
         let child = std::process::Command::new("sleep")
             .arg("10")
             .spawn()
@@ -749,7 +749,7 @@ mod default_kill_tests {
         use std::sync::atomic::Ordering;
         const OBSERVATIONS: u64 = 50;
         let (_dir, ctx, task) =
-            crate::bash_background::registry::default_kill_tests::wait_fixture(None);
+            crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(None);
         let child = std::process::Command::new("sleep")
             .arg("10")
             .spawn()
@@ -821,7 +821,9 @@ mod default_kill_tests {
 
     async fn deferred_wait_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {
         let (_dir, ctx, task) =
-            crate::bash_background::registry::default_kill_tests::wait_fixture(explicit_timeout);
+            crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
+                explicit_timeout,
+            );
         let registry = ctx.bash_background();
         registry.begin_wait_mode_session(&task.session_id, &task.task_id);
         assert!(registry.signal_wait_mode_detach(&task.session_id));
@@ -5093,7 +5095,7 @@ mod grant_path_tests {
             &tx,
             &touch,
             &metrics,
-            crate::bash_background::completed_spawn_for_test,
+            crate::commands::rewrite_tests::bash_background::spawn_reply::completed_spawn_for_test,
             root.clone(),
             dir.path().to_path_buf(),
             session.into(),
@@ -5383,7 +5385,7 @@ mod grant_path_tests {
                 &tx,
                 &touch,
                 &metrics,
-                crate::bash_background::completed_spawn_for_test,
+                crate::commands::rewrite_tests::bash_background::spawn_reply::completed_spawn_for_test,
                 root.clone(),
                 root.as_path().into(),
                 "quick-terminal-session".into(),
