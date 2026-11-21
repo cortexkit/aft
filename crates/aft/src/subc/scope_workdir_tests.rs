@@ -137,6 +137,7 @@ fn bind_observed(
             let mut pending = HashMap::new();
             let mut installed = HashMap::new();
             let mut routes = HashMap::new();
+            let mut root_channels = RootChannels::default();
             let mut observed = scope
                 .as_ref()
                 .and_then(|stamp| stamp.workdir.as_ref())
@@ -155,7 +156,7 @@ fn bind_observed(
                 &mut installed,
                 &mut routes,
                 &mut HashMap::new(),
-                &mut HashMap::new(),
+                &mut root_channels,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -242,7 +243,7 @@ fn bind_observed(
                 false,
                 &a0,
                 &mut routes,
-                &mut HashMap::new(),
+                &mut root_channels,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
@@ -270,7 +271,7 @@ fn bind_observed(
                 true,
                 &a0,
                 &mut routes,
-                &mut HashMap::new(),
+                &mut root_channels,
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),

@@ -95,7 +95,7 @@ async fn exhausted_bind(tool: bool, completion_capacity: bool) {
         &mut installed,
         &mut HashMap::new(),
         &mut HashMap::new(),
-        &mut HashMap::new(),
+        &mut RootChannels::default(),
         &mut HashMap::new(),
         &mut HashMap::new(),
         &mut HashMap::new(),

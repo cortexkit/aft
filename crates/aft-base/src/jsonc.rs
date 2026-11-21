@@ -75,14 +75,11 @@ pub(crate) fn strip_jsonc_comments(source: &str) -> String {
 }
 
 pub(crate) fn strip_trailing_commas(source: &str) -> String {
-    let chars = source.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(source.len());
-    let mut index = 0usize;
     let mut in_string = false;
     let mut escaped = false;
 
-    while index < chars.len() {
-        let ch = chars[index];
+    for (index, ch) in source.char_indices() {
         if in_string {
             output.push(ch);
             if escaped {
@@ -92,30 +89,27 @@ pub(crate) fn strip_trailing_commas(source: &str) -> String {
             } else if ch == '"' {
                 in_string = false;
             }
-            index += 1;
             continue;
         }
 
         if ch == '"' {
             in_string = true;
             output.push(ch);
-            index += 1;
             continue;
         }
 
-        if ch == ',' {
-            let mut next = index + 1;
-            while next < chars.len() && chars[next].is_whitespace() {
-                next += 1;
-            }
-            if next < chars.len() && matches!(chars[next], '}' | ']') {
-                index += 1;
-                continue;
-            }
+        if ch == ','
+            && matches!(
+                source[index + 1..]
+                    .chars()
+                    .find(|next| !next.is_whitespace()),
+                Some('}' | ']')
+            )
+        {
+            continue;
         }
 
         output.push(ch);
-        index += 1;
     }
 
     output
@@ -127,9 +121,43 @@ mod tests {
 
     use super::{strip_jsonc, strip_jsonc_comments, strip_trailing_commas};
 
+    fn strip_like_before(source: &str) -> String {
+        let chars: Vec<_> = strip_jsonc_comments(source).chars().collect();
+        let mut in_string = false;
+        let mut escaped = false;
+        let mut output = String::new();
+        for (index, &ch) in chars.iter().enumerate() {
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == '"' {
+                    in_string = false;
+                }
+            } else if ch == '"' {
+                in_string = true;
+            } else if ch == ','
+                && matches!(
+                    chars[index + 1..].iter().find(|next| !next.is_whitespace()),
+                    Some('}' | ']')
+                )
+            {
+                continue;
+            }
+            output.push(ch);
+        }
+        output
+    }
+
+    fn assert_same_as_before(source: &str) {
+        assert_eq!(strip_jsonc(source), strip_like_before(source), "{source}");
+    }
+
     #[test]
     fn block_comments_do_not_join_json_tokens() {
         for source in ["1/**/2", "tr/**/ue", "{\"n\": 1/**/2}"] {
+            assert_same_as_before(source);
             assert!(
                 serde_json::from_str::<Value>(&strip_jsonc(source)).is_err(),
                 "{source}"
@@ -150,6 +178,7 @@ mod tests {
 }
 // real comment
 "#;
+        assert_same_as_before(source);
 
         assert_eq!(
             strip_jsonc_comments(source),
@@ -166,6 +195,7 @@ mod tests {
     #[test]
     fn strip_jsonc_comments_preserves_newlines_from_block_comments() {
         let source = "{\n/* first\nsecond */\n\"enabled\": true\n}\n";
+        assert_same_as_before(source);
 
         assert_eq!(
             strip_jsonc_comments(source),
@@ -176,6 +206,7 @@ mod tests {
     #[test]
     fn strip_trailing_commas_removes_only_commas_before_closing_brackets() {
         let source = "{\n  \"items\": [1, 2,],\n  \"nested\": {\n    \"ok\": true,\n  },\n}";
+        assert_same_as_before(source);
 
         assert_eq!(
             strip_trailing_commas(source),
@@ -186,6 +217,7 @@ mod tests {
     #[test]
     fn strip_trailing_commas_preserves_commas_inside_strings() {
         let source = r#"{"message": "comma, // and /* stay */",}"#;
+        assert_same_as_before(source);
 
         assert_eq!(
             strip_trailing_commas(source),
@@ -202,9 +234,17 @@ mod tests {
     "rust": "rustfmt", /* block comment */
   },
 }"#;
+        assert_same_as_before(source);
 
         let value = serde_json::from_str::<Value>(&strip_jsonc(source)).unwrap();
         assert_eq!(value["indexes"]["trigram"], Value::Bool(true));
         assert_eq!(value["formatter"]["rust"], Value::String("rustfmt".into()));
+    }
+
+    #[test]
+    fn strip_jsonc_matches_previous_scan_for_non_ascii() {
+        let source = r#"{"café": ["雪, // \"🦀\"", /* λίστα */], }"#;
+        assert_same_as_before(source);
+        assert_eq!(strip_jsonc(source), r#"{"café": ["雪, // \"🦀\""  ] }"#);
     }
 }
