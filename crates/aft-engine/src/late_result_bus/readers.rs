@@ -15,7 +15,8 @@ use tokio::sync::{oneshot, watch, Notify};
 
 use super::{backoff, HEALTH, IO_TIMEOUT};
 
-pub(crate) const BACKSTOP: Duration = Duration::from_secs(600);
+#[doc(hidden)]
+pub const BACKSTOP: Duration = Duration::from_secs(600);
 pub(crate) const LIVE_BACKSTOP: Duration = Duration::from_secs(30);
 // Cingulate authors incoming card message ids as {elicitation_id}:aft:{seq}.
 const CARD_ID_READER: &str = "aft";
@@ -38,7 +39,8 @@ pub(super) struct ReaderHealth {
 pub(crate) fn cards_attached() -> bool {
     *ATTACHED.borrow()
 }
-pub(crate) fn sendstate_attached() -> bool {
+#[doc(hidden)]
+pub fn sendstate_attached() -> bool {
     SEND_ATTACHED.load(Ordering::Relaxed)
 }
 
@@ -114,13 +116,15 @@ struct Wake {
     ready: Notify,
 }
 
-pub(crate) struct CardWatch {
+#[doc(hidden)]
+pub struct CardWatch {
     id: String,
     wake: Arc<Wake>,
     attachment: watch::Receiver<bool>,
 }
 
-pub(crate) fn watch_card(id: &str) -> CardWatch {
+#[doc(hidden)]
+pub fn watch_card(id: &str) -> CardWatch {
     let wake = Arc::new(Wake::default());
     let mut cards = CARDS.lock();
     cards.retain(|_, watches| {

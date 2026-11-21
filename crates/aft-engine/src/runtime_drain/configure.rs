@@ -25,7 +25,8 @@ pub(crate) type CacheRetry = fn(
     &crate::config::Config,
 ) -> crate::protocol::Response;
 
-pub(crate) struct Hooks {
+#[doc(hidden)]
+pub struct Hooks {
     pub drain: fn(&AppContext),
     pub drain_yielding: fn(&AppContext) -> bool,
     pub pending: fn(&AppContext, &mut ConfigureMaintenanceState) -> bool,
@@ -52,7 +53,8 @@ static IDLE_HOOKS: Hooks = Hooks {
     cache_retry: None,
 };
 
-pub(crate) fn register(hooks: Hooks) {
+#[doc(hidden)]
+pub fn register(hooks: Hooks) {
     let _ = HOOKS.set(hooks);
 }
 
@@ -95,7 +97,8 @@ pub(crate) fn registered() -> bool {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ConfigureMaintenanceStage {
+#[doc(hidden)]
+pub enum ConfigureMaintenanceStage {
     #[default]
     Admission,
     DatabaseRuntime,
@@ -148,7 +151,8 @@ impl ConfigureMaintenanceStage {
 }
 
 #[derive(Debug)]
-pub(crate) struct ConfigureMaintenanceContinuation {
+#[doc(hidden)]
+pub struct ConfigureMaintenanceContinuation {
     pub(crate) job: ConfigureMaintenanceJob,
     pub(crate) stage: ConfigureMaintenanceStage,
     pub(crate) replay_retry_at: Option<Instant>,
@@ -177,7 +181,8 @@ impl ConfigureMaintenanceContinuation {
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct ConfigureMaintenanceState {
+#[doc(hidden)]
+pub struct ConfigureMaintenanceState {
     pub(crate) jobs: VecDeque<ConfigureMaintenanceContinuation>,
     // Freeze retry eligibility across one full drain so a deferred unit cannot
     // become due again while other units run and monopolize the same drain.

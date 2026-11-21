@@ -2,7 +2,8 @@ use super::{Child, ParentSession};
 use crate::context::AppContext;
 
 /// One child's search engine context and what is installed in it.
-pub(crate) struct ChildEngine {
+#[doc(hidden)]
+pub struct ChildEngine {
     pub(crate) ctx: AppContext,
 }
 

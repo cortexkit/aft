@@ -24,13 +24,16 @@ use super::{mime_for, FileRecord, SnapshotSink};
 /// The storage folder that holds every snapshot.
 pub(crate) const SNAPSHOT_DIR: &str = "page-snapshots";
 /// Most snapshots alive at once, including collections in progress.
-pub(crate) const MAX_LIVE: usize = 4;
+#[doc(hidden)]
+pub const MAX_LIVE: usize = 4;
 /// How long a completed snapshot lives.
-pub(crate) const TTL: Duration = Duration::from_secs(60);
+#[doc(hidden)]
+pub const TTL: Duration = Duration::from_secs(60);
 
 /// Why `page.read` refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReadRefusal {
+#[doc(hidden)]
+pub enum ReadRefusal {
     /// The snapshot is unknown: expired, released, or never created.
     Expired,
     NotInSnapshot,
@@ -56,7 +59,8 @@ pub(crate) struct Busy {
 
 /// Why [`SnapshotStore::begin`] could not start a snapshot.
 #[derive(Debug)]
-pub(crate) enum BeginError {
+#[doc(hidden)]
+pub enum BeginError {
     Busy(Busy),
     Io(io::Error),
 }
@@ -70,7 +74,8 @@ struct StoredFile {
 /// `page.read` and `page.release` name both, and a snapshot answers only to
 /// that pair.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SnapshotOwner {
+#[doc(hidden)]
+pub struct SnapshotOwner {
     pub harness: String,
     pub session: String,
 }
@@ -90,7 +95,8 @@ struct State {
 }
 
 /// The snapshots of one AFT storage root.
-pub(crate) struct SnapshotStore {
+#[doc(hidden)]
+pub struct SnapshotStore {
     root: PathBuf,
     state: Mutex<State>,
     /// The store's clock in tests. It moves only when a test advances it,

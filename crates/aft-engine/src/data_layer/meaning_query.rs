@@ -31,7 +31,8 @@ pub(crate) const DATA_LAYER_BUILD_STAGE: &str = "data_layer_build";
 /// A data-layer meaning plane pinned at one generation of the family's
 /// vectors for one view, with what the last fill reported.
 #[derive(Debug)]
-pub(crate) struct DataMeaning {
+#[doc(hidden)]
+pub struct DataMeaning {
     pub(crate) snapshot: MeaningSnapshot,
     /// The last fill's failure, kept until a fill succeeds.
     failure: Option<FillFailure>,
@@ -133,7 +134,8 @@ impl DataMeaning {
 
 /// How this root's meaning search stands on the data layer.
 #[derive(Debug, Clone)]
-pub(crate) enum DataSemantic {
+#[doc(hidden)]
+pub enum DataSemantic {
     /// The plane serves: ready, or partial while a fill is under way (see
     /// [`DataMeaning::complete`]).
     Serving(Arc<DataMeaning>),

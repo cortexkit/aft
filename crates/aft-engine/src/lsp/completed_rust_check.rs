@@ -16,7 +16,8 @@ use super::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 mod inputs;
 use inputs::{CachedFacts, SourceInputs, UnresolvedInput};
 
-pub(crate) const BUDGET: Duration = Duration::from_secs(2);
+#[doc(hidden)]
+pub const BUDGET: Duration = Duration::from_secs(2);
 // The first completed check has no trusted hash ledger yet. Later requests
 // reuse content hashes and parsed facts, then resolve cross-file macro inputs.
 const INITIAL_CAPTURE_BUDGET: Duration = Duration::from_secs(15);

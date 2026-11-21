@@ -34,7 +34,8 @@ static HEALTH: Mutex<Health> = Mutex::new(Health {
     last_refusal_code: None,
 });
 
-pub(crate) fn health() -> Value {
+#[doc(hidden)]
+pub fn health() -> Value {
     serde_json::to_value(
         HEALTH
             .lock()
@@ -471,7 +472,8 @@ pub(crate) struct Worker {
 }
 
 /// Called only by subc startup after registration, never by a standalone shim.
-pub(crate) fn start(connection_file: PathBuf) -> Option<Worker> {
+#[doc(hidden)]
+pub fn start(connection_file: PathBuf) -> Option<Worker> {
     if !aft_base::registration::module_consumer_allowed()
         || aft_base::registration::module_id().as_deref() != Some("aft")
     {

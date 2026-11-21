@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use super::{DisplayPublish, Hooks};
 
-pub(crate) fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
+#[doc(hidden)]
+pub fn declared_display(modules: &[subc_client_rs::CatalogEntry]) -> Option<String> {
     let mut claimants: Vec<_> = modules
         .iter()
         .filter(|module| {

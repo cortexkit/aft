@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 /// its `path`, answered from the repository's own checkout in the data
 /// layer once `aft index` or another AFT has published one. A context binds
 /// it once and releases it with its other idle handles.
-pub(crate) struct ExternalSearch {
+#[doc(hidden)]
+pub struct ExternalSearch {
     pub(crate) checkout: std::sync::Arc<crate::data_layer::runtime::DataCheckout>,
     /// A search context for the repository alone, answering from
     /// `checkout` (see `AppContext::pin_data_checkout`).
@@ -120,7 +121,8 @@ type SearchDispatch =
 
 static SEARCH: std::sync::OnceLock<SearchDispatch> = std::sync::OnceLock::new();
 
-pub(crate) fn register(dispatch: SearchDispatch) {
+#[doc(hidden)]
+pub fn register(dispatch: SearchDispatch) {
     let _ = SEARCH.set(dispatch);
 }
 

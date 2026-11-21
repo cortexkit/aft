@@ -126,7 +126,8 @@ struct Batch {
 }
 
 /// Owns only bounded channels. Dropping a call never joins a blocked file reader.
-pub(crate) struct BashProgressPump {
+#[doc(hidden)]
+pub struct BashProgressPump {
     tick: Option<SyncSender<()>>,
     ready: Option<Receiver<Batch>>,
     request_id: String,

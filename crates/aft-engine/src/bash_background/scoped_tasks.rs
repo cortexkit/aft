@@ -7,7 +7,8 @@ pub(crate) const COMMAND_BYTES: usize = 2048;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Selector {
+#[doc(hidden)]
+pub struct Selector {
     pub owner: Principal,
     #[serde(rename = "ref")]
     pub scope_ref: String,
@@ -23,7 +24,8 @@ impl Selector {
 }
 
 #[derive(Debug, Serialize)]
-pub(crate) struct Running {
+#[doc(hidden)]
+pub struct Running {
     pub task_id: String,
     pub title: String,
     pub command: String,

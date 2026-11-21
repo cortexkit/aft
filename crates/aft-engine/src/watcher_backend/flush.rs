@@ -19,9 +19,11 @@ use super::mailbox::Message;
 #[cfg(windows)]
 pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(1500);
 #[cfg(not(windows))]
-pub(crate) const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(300);
+#[doc(hidden)]
+pub const BASH_FLUSH_LIMIT: Duration = Duration::from_millis(300);
 const MIN_MARKER_BUDGET: Duration = Duration::from_millis(100);
-pub(crate) use crate::watcher_markers::is_marker_path;
+#[doc(hidden)]
+pub use crate::watcher_markers::is_marker_path;
 use crate::watcher_markers::{is_flush_marker_path, GIT_MARKER_PREFIX, MARKER_PREFIX};
 
 #[derive(Debug)]

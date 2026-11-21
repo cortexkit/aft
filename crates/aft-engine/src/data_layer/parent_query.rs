@@ -22,7 +22,8 @@ const DISCOVERY_ENTRY_LIMIT_REASON: &str = "AFT stopped looking for repositories
 
 /// Named gaps collected while answering one request, deduplicated.
 #[derive(Default)]
-pub(crate) struct Gaps(Vec<Value>);
+#[doc(hidden)]
+pub struct Gaps(Vec<Value>);
 
 impl Gaps {
     pub(crate) fn push(&mut self, kind: &str, path: String, reason: String) {
@@ -109,7 +110,8 @@ impl Gaps {
 }
 
 /// Marks `body` incomplete and lists `gaps` in its `gaps` field and text.
-pub(crate) fn attach_gaps(body: &mut Value, gaps: Vec<Value>) {
+#[doc(hidden)]
+pub fn attach_gaps(body: &mut Value, gaps: Vec<Value>) {
     attach_gaps_in_order(body, gaps, false);
 }
 
@@ -158,7 +160,8 @@ fn attach_gaps_in_order(body: &mut Value, gaps: Vec<Value>, first: bool) {
 }
 
 /// True once discovery finished; otherwise records the discovering gap.
-pub(crate) fn discovered(session: &dyn ParentView, gaps: &mut Gaps) -> bool {
+#[doc(hidden)]
+pub fn discovered(session: &dyn ParentView, gaps: &mut Gaps) -> bool {
     if session.discovery().is_some() {
         return true;
     }

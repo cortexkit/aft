@@ -5,12 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-pub(crate) static SCHEDULER: OnceLock<Result<Arc<Scheduler>, String>> = OnceLock::new();
+#[doc(hidden)]
+pub static SCHEDULER: OnceLock<Result<Arc<Scheduler>, String>> = OnceLock::new();
 
 pub(crate) const QUEUE_CAPACITY: usize = 1024;
 pub(crate) type Work = Box<dyn FnMut() -> Next + Send>;
 
-pub(crate) enum Next {
+#[doc(hidden)]
+pub enum Next {
     Done,
     Retry(Duration),
 }
@@ -27,14 +29,16 @@ pub(crate) struct Scheduled {
 }
 
 #[derive(Default)]
-pub(crate) struct Follow {
+#[doc(hidden)]
+pub struct Follow {
     pub(crate) send_id: std::sync::Mutex<Option<String>>,
     pub(crate) force: AtomicBool,
     pub(crate) attached: AtomicBool,
     pub(crate) receipts: std::sync::Mutex<Vec<tokio::sync::oneshot::Sender<()>>>,
 }
 
-pub(crate) struct FollowReceipt(pub(crate) Vec<tokio::sync::oneshot::Sender<()>>);
+#[doc(hidden)]
+pub struct FollowReceipt(pub(crate) Vec<tokio::sync::oneshot::Sender<()>>);
 impl FollowReceipt {
     pub(crate) fn applied(self) {
         for done in self.0 {
@@ -44,7 +48,8 @@ impl FollowReceipt {
 }
 
 #[derive(Default)]
-pub(crate) struct Scheduler {
+#[doc(hidden)]
+pub struct Scheduler {
     // Delayed and in-flight notices count toward the same queue capacity limit.
     // Idle workers wait on the earliest deadline, not on one notice's backoff.
     pub(crate) entries: std::sync::Mutex<HashMap<String, Scheduled>>,
@@ -230,7 +235,8 @@ pub(crate) fn bus_attachment_changed(attached: bool) {
     scheduler.attachment_changed(attached);
 }
 
-pub(crate) fn scheduler() -> Option<&'static Arc<Scheduler>> {
+#[doc(hidden)]
+pub fn scheduler() -> Option<&'static Arc<Scheduler>> {
     match SCHEDULER.get_or_init(|| {
         let scheduler = Arc::new(Scheduler::default());
         for _ in 0..16 {
@@ -250,7 +256,8 @@ pub(crate) fn scheduler() -> Option<&'static Arc<Scheduler>> {
     }
 }
 
-pub(crate) fn retry_delay(attempt: usize) -> Duration {
+#[doc(hidden)]
+pub fn retry_delay(attempt: usize) -> Duration {
     Duration::from_millis((250u64 << attempt.min(8)).min(60_000))
 }
 

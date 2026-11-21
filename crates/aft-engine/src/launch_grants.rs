@@ -140,7 +140,8 @@ impl LaunchGrantState {
 
 /// Include unrestored-grant information in rendered output and structured data.
 /// This runs only for the completion being delivered, not intermediate polls.
-pub(crate) fn annotate_shell_reply(
+#[doc(hidden)]
+pub fn annotate_shell_reply(
     text: &mut String,
     response: &mut crate::protocol::Response,
     grants: &[UnrestoredGrant],

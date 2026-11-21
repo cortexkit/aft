@@ -4,7 +4,8 @@ use rusqlite::{params, Connection};
 
 /// Filter identity before limiting: unrelated requesters must neither introduce
 /// ambiguity nor hide a duplicate in the requested session.
-pub(crate) fn resolve(
+#[doc(hidden)]
+pub fn resolve(
     conn: &Connection,
     harness: &str,
     session: &str,

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-pub(crate) fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
+#[doc(hidden)]
+pub fn git_info_exclude_for_target(target: &Path) -> Option<(PathBuf, PathBuf)> {
     for repository_root in target.ancestors() {
         let git_entry = repository_root.join(".git");
         let Ok(metadata) = crate::bounded_io::metadata(&git_entry) else {

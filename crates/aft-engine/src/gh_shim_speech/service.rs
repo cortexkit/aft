@@ -47,7 +47,8 @@ fn binding_unverifiable(detail: impl Into<String>) -> Refusal {
 static UNCONFIGURED_BINDING_REFUSALS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn unconfigured_binding_refusals_total() -> u64 {
+#[doc(hidden)]
+pub fn unconfigured_binding_refusals_total() -> u64 {
     UNCONFIGURED_BINDING_REFUSALS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -110,7 +111,8 @@ pub(crate) struct TestPartners {
 }
 
 static RUN: OnceLock<Option<String>> = OnceLock::new();
-pub(crate) fn run_nonce() -> Option<&'static str> {
+#[doc(hidden)]
+pub fn run_nonce() -> Option<&'static str> {
     RUN.get_or_init(|| {
         let mut bytes = [0; 16];
         getrandom::fill(&mut bytes).ok()?;
@@ -120,7 +122,8 @@ pub(crate) fn run_nonce() -> Option<&'static str> {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct LaunchSeed {
+#[doc(hidden)]
+pub struct LaunchSeed {
     pub(crate) launch: Result<LaunchAuthority, Refusal>,
     pub(crate) lifecycle: Option<ScopeStamp>,
     pub(crate) session: String,
@@ -145,11 +148,8 @@ pub(crate) struct PreparedLaunch {
 }
 
 thread_local! {static LAUNCH:RefCell<Option<LaunchContext>>=const{RefCell::new(None)};}
-pub(crate) fn with_launch<T>(
-    seed: Option<LaunchSeed>,
-    storage: &Path,
-    run: impl FnOnce() -> T,
-) -> T {
+#[doc(hidden)]
+pub fn with_launch<T>(seed: Option<LaunchSeed>, storage: &Path, run: impl FnOnce() -> T) -> T {
     struct Restore(Option<LaunchContext>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -180,7 +180,8 @@ struct Cached {
     reply: Result<ModuleControlResponseToModule, String>,
 }
 
-pub(crate) struct Service {
+#[doc(hidden)]
+pub struct Service {
     pub(crate) store: Store,
     root: PathBuf,
     runtime: Mutex<Option<Runtime>>,
@@ -243,7 +244,8 @@ pub(crate) fn lookup(root: &Path) -> Option<Arc<Service>> {
         .cloned()
 }
 
-pub(crate) fn start(
+#[doc(hidden)]
+pub fn start(
     root: &Path,
     relay: &Arc<GhRelay>,
     describe: Describe,
@@ -1091,7 +1093,8 @@ pub(crate) fn revoke_at(path: &Path, session: &str, task: &str) -> bool {
     record_service(root).revoke_identity(session, task).is_err()
 }
 
-pub(crate) fn revocation_pending(session: &str, task: &str) -> bool {
+#[doc(hidden)]
+pub fn revocation_pending(session: &str, task: &str) -> bool {
     SERVICES
         .get_or_init(Default::default)
         .lock()

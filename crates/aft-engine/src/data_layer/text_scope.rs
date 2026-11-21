@@ -30,7 +30,8 @@ use crate::search_index::{FileEntry, PathFilters, SearchIndexSnapshot, DEFAULT_M
 /// The data layer's view of this root, when grep and glob may answer from
 /// it: the process runs the data layer, the checkout has published, and its
 /// text plane covers every path.
-pub(crate) fn ready_view(ctx: &(impl IndexHost + ?Sized)) -> Option<CheckoutView> {
+#[doc(hidden)]
+pub fn ready_view(ctx: &(impl IndexHost + ?Sized)) -> Option<CheckoutView> {
     match text_view(ctx) {
         TextView::Ready(view) => Some(view),
         _ => None,
@@ -47,7 +48,8 @@ pub(crate) fn text_view(ctx: &(impl IndexHost + ?Sized)) -> TextView {
 
 /// One search root inside a view's checkout, and the checkout's files under
 /// it as they are now.
-pub(crate) struct ViewScope {
+#[doc(hidden)]
+pub struct ViewScope {
     view: CheckoutView,
     /// The root as a checkout path, `/`-separated; empty for the whole
     /// checkout.

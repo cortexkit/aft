@@ -5,14 +5,16 @@ use std::{path::Path, sync::OnceLock};
 use subc_protocol::Principal;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub(crate) struct Identity {
+#[doc(hidden)]
+pub struct Identity {
     pub runner: Principal,
     pub call_key: String,
     pub schema_pin: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct TaskDisplay {
+#[doc(hidden)]
+pub struct TaskDisplay {
     pub identity: Identity,
     pub capture_key: String,
     pub reply_produced: bool,
@@ -22,7 +24,8 @@ pub(crate) struct TaskDisplay {
 }
 
 #[derive(Clone)]
-pub(crate) struct BashBodies {
+#[doc(hidden)]
+pub struct BashBodies {
     pub facts: Value,
     pub detail: Value,
     pub tail: Option<Value>,
@@ -112,7 +115,8 @@ use super::persistence::PersistedTask;
 type Redact<'a> = dyn Fn(&str) -> Option<String> + 'a;
 type BashTail = fn(&PersistedTask, &str, &str, &Redact<'_>) -> Option<Value>;
 
-pub(crate) const MAX_BASH_DETAIL_BYTES: u64 = 3_145_728;
+#[doc(hidden)]
+pub const MAX_BASH_DETAIL_BYTES: u64 = 3_145_728;
 
 pub(crate) type RecoveredFrame = (
     crate::db::call_ledger::RecordedFrame,
@@ -120,7 +124,8 @@ pub(crate) type RecoveredFrame = (
     Option<Vec<u8>>,
 );
 
-pub(crate) struct Hooks {
+#[doc(hidden)]
+pub struct Hooks {
     pub enabled: fn() -> bool,
     pub current_task: fn() -> Option<TaskDisplay>,
     pub bash_reply: fn(&mut TaskDisplay, BashBodies, bool),
@@ -137,7 +142,8 @@ pub(crate) struct Hooks {
 }
 static HOOKS: OnceLock<Hooks> = OnceLock::new();
 
-pub(crate) fn register(hooks: Hooks) {
+#[doc(hidden)]
+pub fn register(hooks: Hooks) {
     let _ = HOOKS.set(hooks);
 }
 #[cfg(test)]

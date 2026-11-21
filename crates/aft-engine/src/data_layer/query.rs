@@ -281,7 +281,8 @@ mod ref_site_tests {
 /// Where queries find slices and the lookups that narrow which to read.
 /// Every source can say what it holds in memory, so the memory census can
 /// count a checkout's call graph through the source it serves.
-pub(crate) trait SliceSource: aft_store::heap::HeapBytes {
+#[doc(hidden)]
+pub trait SliceSource: aft_store::heap::HeapBytes {
     fn slice(&self, path: &str) -> Option<Arc<FileSlice>>;
     /// Every file with an edge to `target_symbol` in `target_file`.
     fn caller_files(&self, target_file: &str, target_symbol: &str) -> BTreeSet<String>;
@@ -465,7 +466,8 @@ impl SliceSource for MemorySlices {
 }
 
 /// A call-graph reader over slices.
-pub(crate) struct SliceReader<S> {
+#[doc(hidden)]
+pub struct SliceReader<S> {
     source: S,
     project_root: PathBuf,
     project_key: String,
@@ -1565,4 +1567,5 @@ aft_store::heap_bytes_of_fields!(MemorySlices {
 /// all of them in one update (seconds at worst on AFT's own checkout); the
 /// command waits for it rather than answering from a graph that misses
 /// them, and gives up only if the update takes far longer than that.
-pub(crate) const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+#[doc(hidden)]
+pub const READ_WAIT: std::time::Duration = std::time::Duration::from_secs(30);

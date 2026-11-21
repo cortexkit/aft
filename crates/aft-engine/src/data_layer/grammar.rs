@@ -9,10 +9,8 @@ pub(crate) fn meaning_callgraph_off_reason(language: &str) -> String {
     serde_json::json!({"code": "callgraph_off", "language": language, "state": "callgraph_off", "message": message}).to_string()
 }
 
-pub(crate) fn prepare(
-    ctx: &crate::context::AppContext,
-    path: &std::path::Path,
-) -> Result<(), AftError> {
+#[doc(hidden)]
+pub fn prepare(ctx: &crate::context::AppContext, path: &std::path::Path) -> Result<(), AftError> {
     if let Some(entry) = crate::grammar::manifest_for_path(path) {
         crate::grammar::configure(&ctx.config());
         if let Some(registry) = crate::grammar::registry(&entry.language) {
@@ -31,7 +29,8 @@ pub(crate) fn error_response(id: &str, error: &AftError) -> crate::protocol::Res
     response
 }
 
-pub(crate) fn error_response_for_path(
+#[doc(hidden)]
+pub fn error_response_for_path(
     id: &str,
     error: &AftError,
     path: &std::path::Path,
@@ -43,7 +42,8 @@ pub(crate) fn error_response_for_path(
     response
 }
 
-pub(crate) fn is_grammar_error(error: &AftError) -> bool {
+#[doc(hidden)]
+pub fn is_grammar_error(error: &AftError) -> bool {
     matches!(
         error,
         AftError::GrammarUnavailable { .. } | AftError::GrammarParseTimeout { .. }
@@ -93,7 +93,8 @@ pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
 
 /// One non-blocking observation per grammar, shared by its gaps in a reply.
 #[derive(Default)]
-pub(crate) struct GapReply {
+#[doc(hidden)]
+pub struct GapReply {
     unavailable: std::collections::BTreeMap<&'static str, crate::grammar::GrammarUnavailable>,
 }
 
@@ -221,7 +222,8 @@ pub(crate) fn override_extraction_for_test(source: &[u8], outcome: TestExtractio
     Guard(key)
 }
 
-pub(crate) fn response(
+#[doc(hidden)]
+pub fn response(
     id: &str,
     reason: &str,
     path: &std::path::Path,

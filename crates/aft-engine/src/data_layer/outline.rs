@@ -115,7 +115,8 @@ pub(crate) fn prewarm(
 /// root) from its record in `view`, unless the cache holds them already.
 /// Returns whether the cache now holds them for the file as it is on disk.
 /// A file whose record cannot serve is left to the ordinary parse.
-pub(crate) fn warm_file(view: &CheckoutView, cache: &SharedSymbolCache, file: &Path) -> bool {
+#[doc(hidden)]
+pub fn warm_file(view: &CheckoutView, cache: &SharedSymbolCache, file: &Path) -> bool {
     let canonical =
         |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let root = canonical(view.root());
@@ -333,7 +334,8 @@ const WAIT_STEP: Duration = Duration::from_millis(250);
 /// It waits for the checkout's first call graph when none is published yet,
 /// since records are stored with it, and stops when the cache is reset, the
 /// checkout is replaced or the root is abandoned.
-pub(crate) fn root_bound(
+#[doc(hidden)]
+pub fn root_bound(
     ctx: &dyn IndexHost,
     lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
 ) {
