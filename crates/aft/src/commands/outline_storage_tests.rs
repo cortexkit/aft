@@ -347,13 +347,7 @@ pub fn separator() -> char {
         let cache = ctx.symbol_cache();
         let generation = cache.read().unwrap().generation();
         let report = prewarm(&view, &cache, generation, &|| false).unwrap();
-        assert_eq!(
-            report,
-            Prewarm {
-                loaded: sources.len() as u64,
-                ..Prewarm::default()
-            }
-        );
+        assert_eq!(report, Prewarm::with_loaded(sources.len() as u64));
 
         let cold = context(&root, tempfile::tempdir().unwrap().path());
         for source in &sources {

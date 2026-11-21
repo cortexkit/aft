@@ -672,8 +672,8 @@ fn grants_saved_target_with_non_directory_parent_is_terminal() {
     let _ask = crate::access_policy::ask_route_guard(Some(ask_route(&revived)));
     let unavailable = ctx.unrestored_launch_grants("enotdir").unwrap();
     assert_eq!(unavailable.len(), 1);
-    assert_eq!(unavailable[0].path, target);
-    assert!(!unavailable[0].retryable);
+    assert_eq!(unavailable[0].path(), &target);
+    assert!(!unavailable[0].retryable());
     let db = ctx.db().unwrap();
     assert!(store::list(&db.lock().unwrap(), &scope_key(&revived))
         .unwrap()

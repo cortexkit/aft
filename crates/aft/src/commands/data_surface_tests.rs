@@ -13,6 +13,7 @@ mod tests {
     use aft_engine::test_bridge::display_data::surfaces::{
         root_fixture_config, settled, write, READY,
     };
+    use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
     use serde_json::{json, Value};
     use std::path::Path;
     #[cfg(target_os = "linux")]
