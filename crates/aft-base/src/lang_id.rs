@@ -60,7 +60,10 @@ pub fn language_by_extension(path: &Path) -> Option<LangId> {
         return Some(LangId::Groovy);
     }
 
-    let ext = path.extension()?.to_str()?;
+    native_language_by_extension(path.extension()?.to_str()?)
+}
+
+pub fn native_language_by_extension(ext: &str) -> Option<LangId> {
     match ext {
         "ts" | "mts" | "cts" => Some(LangId::TypeScript),
         "tsx" => Some(LangId::Tsx),

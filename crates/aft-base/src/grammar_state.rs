@@ -49,6 +49,14 @@ pub struct GrammarUnavailable {
     pub retry_after_ms: Option<u64>,
 }
 
+pub fn display_name(language: &str) -> &str {
+    if language == "luau" {
+        "Luau"
+    } else {
+        language
+    }
+}
+
 impl GrammarUnavailable {
     pub fn new(language: &str, state: GrammarState) -> Self {
         let message = match state {
@@ -65,10 +73,7 @@ impl GrammarUnavailable {
         Self {
             language: language.into(),
             state,
-            message: message.replace(
-                "<language>",
-                if language == "luau" { "Luau" } else { language },
-            ),
+            message: message.replace("<language>", display_name(language)),
             cause: None,
             retry_after_ms: None,
         }

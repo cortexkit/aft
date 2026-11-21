@@ -7,6 +7,23 @@ use tree_sitter::Node;
 use crate::imports::{ImportBlock, ImportForm, ImportGroup, ImportKind, ImportStatement};
 use crate::symbols::SymbolKind;
 
+pub const LUAU_EXTRACTOR_VERSION: u32 = 3;
+
+pub(crate) fn extractor_version() -> u32 {
+    #[cfg(feature = "test-hooks")]
+    {
+        static VERSION: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+            std::env::var("AFT_TEST_GRAMMAR_EXTRACTOR_VERSION")
+                .ok()
+                .map(|v| v.parse().expect("test extractor version"))
+                .unwrap_or(LUAU_EXTRACTOR_VERSION)
+        });
+        *VERSION
+    }
+    #[cfg(not(feature = "test-hooks"))]
+    LUAU_EXTRACTOR_VERSION
+}
+
 // Validate the syntax used by extraction before marking the Luau grammar ready.
 // The grammar registry reads these on every target that builds downloaded
 // grammars, Windows ARM64 included.

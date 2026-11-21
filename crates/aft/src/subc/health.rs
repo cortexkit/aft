@@ -11320,7 +11320,7 @@ mod tests {
                     files_embedded: 100_000,
                     files_too_large: 1_234,
                     files_failed: 1_234,
-                    files_luau_outline_failed: 0,
+                    files_grammar_outline_failed: 0,
                     files_pending: 20_988,
                     files_past_cap: 99_999,
                     chunks: 9_999_999,

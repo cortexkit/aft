@@ -70,8 +70,9 @@ fn fixture(ready: bool) -> Fixture {
     let storage = dir.join("storage");
     write(&dir, "clock", "0");
     let ctx = context(&root, &storage);
-    let registry = crate::grammar::configure(&ctx.config());
-    let manifest = crate::grammar::manifest();
+    crate::grammar::configure(&ctx.config());
+    let registry = crate::grammar::registry("luau").unwrap();
+    let manifest = crate::grammar::manifest("luau").unwrap();
     let wasm = std::fs::read(
         crate::test_support::manifest_dir()
             .join("tests/fixtures/grammars")
@@ -92,7 +93,7 @@ fn fixture(ready: bool) -> Fixture {
         root,
         storage,
         ctx,
-        registry,
+        registry: Arc::clone(registry),
         wasm,
     }
 }
@@ -214,6 +215,7 @@ fn timeout_refusals() {
         &runtime.view().unwrap(),
         &[f.root.clone()],
         &mut response,
+        |_| true,
     );
     assert_eq!(response.data["gaps"][1]["kind"], "grammar_parse_timeout");
     assert!(!response.data["text"].as_str().unwrap().ends_with('\n'));
@@ -442,6 +444,7 @@ fn trace_gaps() {
         &runtime.view().unwrap(),
         &[f.root.clone()],
         &mut response,
+        |_| true,
     );
     assert_eq!(response.data["gaps"][0]["kind"], "existing");
     assert_eq!(response.data["gaps"].as_array().unwrap().len(), 4);
@@ -909,7 +912,7 @@ fn todo_gaps(terminal: bool) {
             || {
                 runtime.view().filter(|view| {
                     view.current_state().skipped_parses().is_empty()
-                        && !runtime.checkout().has_unpublished_luau_changes()
+                        && !runtime.checkout().has_unpublished_grammar_changes()
                 })
             },
             "grammar-ready TODO gap did not publish",
@@ -1018,7 +1021,7 @@ fn publication_retry() {
     let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
     drop(publication);
     runtime.wait_for_memory_profile_idle_for_test();
-    assert!(runtime.checkout().has_unpublished_luau_changes());
+    assert!(runtime.checkout().has_unpublished_grammar_changes());
     let response = meaning_query(&f.ctx);
     assert!(response.success, "{:?}", response.data);
     assert_eq!(response.data["complete"], false, "{:?}", response.data);
@@ -1028,13 +1031,13 @@ fn publication_retry() {
         .iter()
         .any(|path| path == "source.luau"));
     drop(low);
-    // Observe only: neither view() nor has_unpublished_luau_changes() starts
+    // Observe only: neither view() nor has_unpublished_grammar_changes() starts
     // refresh work. The failed publication must have armed its own retry.
     until(
         || {
             runtime.view().filter(|view| {
                 view.current_state().skipped_parses().is_empty()
-                    && !runtime.checkout().has_unpublished_luau_changes()
+                    && !runtime.checkout().has_unpublished_grammar_changes()
             })
         },
         "failed Luau publication had no retry driver",
@@ -1132,7 +1135,7 @@ fn todos_during_publication(deferred: bool) {
     };
     let view = runtime.view().unwrap();
     assert!(view.current_state().skipped_parses().is_empty());
-    assert!(runtime.checkout().has_unpublished_luau_changes());
+    assert!(runtime.checkout().has_unpublished_grammar_changes());
     for _ in 0..2 {
         let start = Instant::now();
         let response = inspect_category(&f.ctx, &f.root, "todos");
@@ -1454,7 +1457,7 @@ isolated!(
         loop {
             if runtime.view().is_some_and(|view| {
                 view.current_state().skipped_parses().is_empty()
-                    && !runtime.checkout().has_unpublished_luau_changes()
+                    && !runtime.checkout().has_unpublished_grammar_changes()
             }) {
                 break;
             }

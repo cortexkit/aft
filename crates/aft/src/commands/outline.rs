@@ -14,6 +14,7 @@ use serde::Serialize;
 use super::url_resolution::resolve_file_or_url;
 use crate::commands::read::{handle_github_outline, is_github_read_target};
 use crate::context::AppContext;
+use crate::data_layer::grammar::downloaded_language;
 use crate::edit;
 use crate::error::AftError;
 use crate::file_kind::is_test_file;
@@ -1676,7 +1677,7 @@ fn handle_outline_files_mode(
         .filter_map(|row| match row {
             OutlineTableRow::File(file_id) => {
                 let entry = &file_entries[*file_id];
-                (detect_language(&entry.absolute_path) != Some(LangId::Luau)
+                (downloaded_language(&entry.absolute_path).is_none()
                     || entry.symbols.is_some())
                 .then(|| entry.absolute_path.clone())
             }
@@ -2129,7 +2130,7 @@ fn populate_rendered_file_symbols(
         .collect::<HashSet<_>>();
     // A directory rollup hides symbol rows, not the files' parse coverage.
     for (file_id, entry) in file_entries.iter_mut().enumerate() {
-        let dynamic = detect_language(&entry.absolute_path) == Some(LangId::Luau);
+        let dynamic = downloaded_language(&entry.absolute_path).is_some();
         if !rendered.contains(&file_id) && !dynamic {
             continue;
         }
@@ -2739,18 +2740,18 @@ fn outline_many_files(
         let metadata = match crate::bounded_io::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => {
-                writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+                writer.content_incomplete |= downloaded_language(&path).is_some();
                 skipped_files.push((index, SkippedFile::new(file, "file_not_found")));
                 continue;
             }
         };
         if metadata.len() > MAX_OUTLINE_FILE_BYTES {
-            writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+            writer.content_incomplete |= downloaded_language(&path).is_some();
             skipped_files.push((index, SkippedFile::new(rel_path, "too_large")));
             continue;
         }
 
-        if detect_language(&path) == Some(LangId::Luau) {
+        if downloaded_language(&path).is_some() {
             let parsed = crate::data_layer::grammar::prepare(ctx, &path).and_then(|_| {
                 batch_parser
                     .as_mut()
@@ -2781,7 +2782,7 @@ fn outline_many_files(
             &path,
             Some(batch_parser.as_mut().unwrap_or(&mut fallback_parser)),
         ) {
-            writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+            writer.content_incomplete |= downloaded_language(&path).is_some();
             batch_parser
                 .as_mut()
                 .unwrap_or(&mut fallback_parser)
@@ -2823,7 +2824,7 @@ fn outline_many_files(
                 }
             }
             Err(error) => {
-                writer.content_incomplete |= detect_language(&path) == Some(LangId::Luau);
+                writer.content_incomplete |= downloaded_language(&path).is_some();
                 if crate::data_layer::grammar::is_grammar_error(&error) {
                     let mut gap = error.to_error_json();
                     gap["path"] = serde_json::json!(path);

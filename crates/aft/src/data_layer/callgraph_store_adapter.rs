@@ -1798,8 +1798,7 @@ impl TraceFileFacts {
         }
         let source = std::fs::read_to_string(file)?;
         let parsed = match detect_language_from_source(file, &source).or_else(|| {
-            crate::parser::detect_language_any(file, cfg!(feature = "wasm-grammars"))
-                .filter(|language| *language == crate::parser::LangId::Luau)
+            crate::parser::dynamic_language_for_extension(file, cfg!(feature = "wasm-grammars"))
         }) {
             Some(lang) => {
                 #[cfg(test)]
@@ -2596,17 +2595,21 @@ pub(crate) fn response_with_view(
     view: Option<&crate::data_layer::checkout::CheckoutView>,
     queried_paths: &[&Path],
 ) -> Response {
-    // Luau requires cannot cross into built-in languages. A missing Luau
-    // caller can affect a Luau traversal, but not a built-in-only answer.
-    if queried_paths.iter().any(|path| {
-        crate::parser::detect_language_any(path, cfg!(feature = "wasm-grammars"))
-            == Some(crate::parser::LangId::Luau)
-    }) {
+    // Missing callers in downloaded grammars only affect traversals in those languages.
+    let languages: std::collections::BTreeSet<_> = queried_paths
+        .iter()
+        .filter_map(|path| super::grammar::downloaded_language(path))
+        .collect();
+    if !languages.is_empty() {
         if let Some(view) = view {
             crate::data_layer::surfaces::disclose_parse_gaps(
                 view,
                 &[view.root().to_path_buf()],
                 &mut response,
+                |path| {
+                    super::grammar::downloaded_language(path)
+                        .is_some_and(|language| languages.contains(language))
+                },
             );
         }
     }

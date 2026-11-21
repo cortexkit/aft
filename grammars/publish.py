@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish one content-addressed grammar, never replacing a release asset."""
+"""Publish verified grammar builds, never replacing a release asset."""
 
 import argparse
 import json
@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from build import digest, require_equal
+from build import build_entries, digest, require_equal
 
 
 def gh(args):
@@ -53,12 +53,16 @@ def publish(artifact, entry, repository, tag, scratch):
     return "uploaded"
 
 
+def publish_grammars(artifacts):
+    for entry, _, pin in build_entries():
+        repository = pin["publication"]["repository"]
+        tag = pin["publication"]["tag"]
+        publish(artifacts / f"{entry['sha256']}.wasm", entry, repository, tag,
+                artifacts / "publish-scratch")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifacts", type=Path, required=True)
-    parser.add_argument("--pin", type=Path, default=Path(__file__).with_name("luau.pin.json"))
     args = parser.parse_args()
-    pin = json.loads(args.pin.read_text())
-    entry = json.loads((args.artifacts / "manifest-a.json").read_text())
-    publish(args.artifacts / entry["file"], entry, pin["publication"]["repository"],
-            pin["publication"]["tag"], args.artifacts / "publish-scratch")
+    publish_grammars(args.artifacts)

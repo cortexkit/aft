@@ -19,6 +19,12 @@ use crate::protocol::{RawRequest, Response};
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
 mod audit;
+#[cfg(all(
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
+mod multiple;
 
 fn write(root: &Path, path: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
     let path = root.join(path);
@@ -375,8 +381,9 @@ fn scenario(phase: &str) {
     let ts = "export function builtin() { return 1; }\n";
     write(&dir, "clock", "0");
     let ctx = context(&root, &storage);
-    let registry = crate::grammar::configure(&ctx.config());
-    let manifest = crate::grammar::manifest();
+    crate::grammar::configure(&ctx.config());
+    let registry = crate::grammar::registry("luau").unwrap();
+    let manifest = crate::grammar::manifest("luau").unwrap();
     let wasm = std::fs::read(
         crate::test_support::manifest_dir()
             .join("tests/fixtures/grammars")

@@ -481,10 +481,11 @@ pub(crate) fn disclose_index_gaps(
 }
 
 /// Adds only host-owned grammar diagnostics, preserving gap-free responses.
-pub(crate) fn disclose_parse_gaps(
+pub(super) fn disclose_parse_gaps(
     view: &super::checkout::CheckoutView,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
+    include: impl Fn(&Path) -> bool,
 ) {
     if !cfg!(feature = "wasm-grammars") || view.current_state().skipped_parses().is_empty() {
         return;
@@ -496,9 +497,10 @@ pub(crate) fn disclose_parse_gaps(
     let reply = super::grammar::GapReply::capture();
     for (relative, reason) in view.current_state().skipped_parses() {
         let path = view.root().join(String::from_utf8_lossy(relative).as_ref());
-        if !roots
-            .iter()
-            .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
+        if !include(&path)
+            || !roots
+                .iter()
+                .any(|scope| path.starts_with(scope) || scope.starts_with(&path))
             || !fence.admits_walk_entry(&path)
         {
             continue;
@@ -704,7 +706,7 @@ pub(crate) struct MeaningCoverage {
     pub(crate) files_embedded: usize,
     pub(crate) files_too_large: usize,
     pub(crate) files_failed: usize,
-    pub(crate) files_luau_outline_failed: usize,
+    pub(crate) files_grammar_outline_failed: usize,
     pub(crate) files_pending: usize,
     pub(crate) files_past_cap: usize,
     pub(crate) chunks: usize,
@@ -720,7 +722,7 @@ impl MeaningCoverage {
             files_embedded: coverage.files_embedded,
             files_too_large: coverage.files_too_large,
             files_failed: coverage.files_failed.len(),
-            files_luau_outline_failed: coverage.luau_outline_failures().count(),
+            files_grammar_outline_failed: coverage.grammar_outline_failures().count(),
             files_pending: coverage.pending.len(),
             files_past_cap: coverage.past_cap,
             chunks: coverage.chunks,
@@ -762,7 +764,7 @@ impl MeaningReport {
                     value["files_skipped"] = json!(coverage.files_skipped);
                     value["complete"] = false.into();
                 }
-                if coverage.files_luau_outline_failed > 0 {
+                if coverage.files_grammar_outline_failed > 0 {
                     value["complete"] = false.into();
                 }
                 if let Some(error) = error {
@@ -2854,7 +2856,7 @@ mod tests {
             files_embedded: 30,
             files_too_large: 1,
             files_failed: 2,
-            files_luau_outline_failed: 0,
+            files_grammar_outline_failed: 0,
             files_pending: 7,
             files_past_cap: 0,
             chunks: 300,
@@ -2971,7 +2973,7 @@ mod tests {
                     coverage: MeaningCoverage {
                         files: 2,
                         files_failed: 2,
-                        files_luau_outline_failed: luau_failed,
+                        files_grammar_outline_failed: luau_failed,
                         ..MeaningCoverage::default()
                     },
                     error: None,

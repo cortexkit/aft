@@ -3352,7 +3352,7 @@ impl CheckoutSemanticGaps {
                 .filter_map(|(path, reason)| reply.value(reason, path))
                 .collect(),
             pending: coverage.pending.clone(),
-            failed: coverage.luau_outline_failures().cloned().collect(),
+            failed: coverage.grammar_outline_failures().cloned().collect(),
             unvouched: false,
             unavailable: None,
             fill_failure: None,

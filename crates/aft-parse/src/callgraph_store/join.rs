@@ -546,7 +546,6 @@ pub fn language_id(language: &str) -> Option<LangId> {
         "swift" => LangId::Swift,
         "php" => LangId::Php,
         "lua" => LangId::Lua,
-        "luau" => LangId::Luau,
         "perl" => LangId::Perl,
         "yaml" => LangId::Yaml,
         "pascal" => LangId::Pascal,
@@ -554,7 +553,7 @@ pub fn language_id(language: &str) -> Option<LangId> {
         "groovy" => LangId::Groovy,
         "objc" => LangId::ObjC,
         "toml" => LangId::Toml,
-        _ => return None,
+        _ => return crate::grammar::extractor_language(language),
     })
 }
 

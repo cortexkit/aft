@@ -37,8 +37,11 @@ unmodified real-project conformance test from
 `features.luau` adds types, methods, require forms and scanner delimiters. The
 corpus manifest records file hashes and provenance; corpus code is never run.
 
-The job emits `artifacts/<sha256>.wasm`, `manifest-a.json`, `manifest-b.json`
-and `verification.json`. B is exactly A with one extra custom section named
+The job rebuilds each production manifest entry and any new grammar with a
+reviewed pin but no manifest entry yet. It checks the artifact's hash and size,
+loads it through the named grammar export, and parses the required sample before
+bundling it. The Luau verification also emits `manifest-a.json`, `manifest-b.json` and
+`verification.json`. B is exactly A with one extra custom section named
 `aft.fixture.identity` containing `B`. Both modules are loadable and have
 identical parse behavior. The checked-in fixtures and manifests live under
 `crates/aft/tests/fixtures/grammars/`; they are test-only, not the production
@@ -53,15 +56,17 @@ notices with the corpus and grammar artifacts.
 ## Publication
 
 Pull requests and manual dispatches verify without write credentials. Only a
-push on `main` that changes `grammars/luau.pin.json` can publish.
+push on `main` that changes a grammar pin or the production manifest can publish.
 The separate publication job receives only the verified artifact bundle and
 uses a narrowly scoped GitHub token; compilation never receives that token.
 
-`publish.py` publishes A on the independent `grammars-1` release of
-`cortexkit/aft`. The asset name is its complete SHA-256 plus `.wasm`. An
+`publish.py` publishes only verified manifest or candidate pin entries on the
+independent `grammars-1` release of `cortexkit/aft`, never marking it latest.
+The asset name is its complete SHA-256 plus `.wasm`. An
 existing name is downloaded and byte-compared; equality succeeds without an
 upload, inequality fails without replacement. Uploads never use `--clobber`.
 Publication jobs serialize, and an external upload race fails rather than
 replacing anything. Re-running publication is safe. B remains a test artifact.
-The loader's production-manifest review must follow successful publication
-and independently verify the release asset's hash and size.
+The loader workflow independently verifies each published asset's hash and size.
+See [Adding a downloadable grammar](../docs/grammars.md#adding-a-downloadable-grammar)
+for the two-PR sequence.

@@ -5,10 +5,13 @@ on:
     paths:
       - .github/workflows/grammar-build.yml
       - grammars/**
+      - crates/aft-parse/src/grammar/manifest.json
       - crates/aft/tests/fixtures/grammars/**
   push:
     branches: [main]
-    paths: [grammars/luau.pin.json]
+    paths:
+      - grammars/*.pin.json
+      - crates/aft-parse/src/grammar/manifest.json
   workflow_dispatch:
 
 permissions:
@@ -26,11 +29,11 @@ jobs:
         run: |
           python3 --version
           python3 -m unittest discover -s grammars -p 'test_*.py' -v
-      - name: Compile twice and verify fixtures and Zed parse trees
+      - name: Rebuild and parse-check manifest and candidate grammars
         run: python3 grammars/build.py --output target/grammar-build
       - uses: actions/upload-artifact@v4
         with:
-          name: verified-luau-grammar
+          name: verified-grammars
           path: target/grammar-build/artifacts/
           if-no-files-found: error
 
@@ -51,9 +54,9 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          name: verified-luau-grammar
+          name: verified-grammars
           path: target/grammar-build/artifacts/
-      - name: Upload missing hash or verify existing bytes
+      - name: Upload missing grammar assets or verify existing bytes
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 grammars/publish.py --artifacts target/grammar-build/artifacts

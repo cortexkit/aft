@@ -33,7 +33,7 @@ pub(crate) mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("grammars");
             crate::private_storage::create_dir_all(&root).unwrap();
-            let manifest = crate::grammar::manifest();
+            let manifest = crate::grammar::manifest("luau").unwrap();
             let fixture = crate::test_support::manifest_dir()
                 .join("tests/fixtures/grammars")
                 .join(format!("{}.wasm", manifest.sha256));
@@ -44,7 +44,8 @@ pub(crate) mod tests {
             .unwrap();
             let mut config = crate::config::Config::default();
             config.storage_dir = Some(directory.path().to_path_buf());
-            crate::grammar::configure(&config).stored().unwrap();
+            crate::grammar::configure(&config);
+            crate::grammar::registry("luau").unwrap().stored().unwrap();
             directory
         });
     }

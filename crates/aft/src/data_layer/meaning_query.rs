@@ -68,7 +68,7 @@ impl DataMeaning {
             && self
                 .snapshot
                 .coverage()
-                .luau_outline_failures()
+                .grammar_outline_failures()
                 .next()
                 .is_none()
     }

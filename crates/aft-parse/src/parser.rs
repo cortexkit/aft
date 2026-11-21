@@ -9,7 +9,7 @@ use crate::callgraph_store::join::Parser;
 use streaming_iterator::StreamingIterator;
 #[cfg(not(any(test, feature = "test-support")))]
 use tree_sitter::Parser;
-use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
+use tree_sitter::{Node, Query, QueryCursor, Tree};
 
 use crate::cache_freshness::{self};
 use crate::callgraph::resolve_module_path;
@@ -18,8 +18,9 @@ use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 mod file_language;
-use file_language::dynamic_language_for_extension;
-pub use file_language::is_luau_path;
+pub use file_language::dynamic_language_for_extension;
+mod grammar_selection;
+pub use grammar_selection::grammar_for;
 pub mod dead_code_facts;
 pub mod outline_facts;
 pub mod todo_markers;
@@ -843,46 +844,6 @@ fn markdown_line_block_bound(line: &[u8]) -> usize {
     markers + columns / 2 + 1
 }
 
-/// Returns the tree-sitter Language grammar for a given LangId.
-pub fn grammar_for(lang: LangId) -> Result<Language, AftError> {
-    Ok(match lang {
-        LangId::Luau => return crate::grammar::registry().stored().map_err(Into::into),
-        LangId::TypeScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
-        LangId::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
-        LangId::JavaScript => tree_sitter_javascript::LANGUAGE.into(),
-        LangId::Python => tree_sitter_python::LANGUAGE.into(),
-        LangId::Rust => tree_sitter_rust::LANGUAGE.into(),
-        LangId::Go => tree_sitter_go::LANGUAGE.into(),
-        LangId::C => tree_sitter_c::LANGUAGE.into(),
-        LangId::Cpp => tree_sitter_cpp::LANGUAGE.into(),
-        LangId::Cuda => tree_sitter_cuda::LANGUAGE.into(),
-        LangId::Metal => tree_sitter_cpp::LANGUAGE.into(),
-        LangId::Zig => tree_sitter_zig::LANGUAGE.into(),
-        LangId::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
-        LangId::Bash => tree_sitter_bash::LANGUAGE.into(),
-        LangId::Html => tree_sitter_html::LANGUAGE.into(),
-        LangId::Markdown => tree_sitter_md::LANGUAGE.into(),
-        LangId::Solidity => tree_sitter_solidity::LANGUAGE.into(),
-        LangId::Scss => tree_sitter_scss::language(),
-        LangId::Vue => tree_sitter_vue::LANGUAGE.into(),
-        LangId::Json => tree_sitter_json::LANGUAGE.into(),
-        LangId::Scala => tree_sitter_scala::LANGUAGE.into(),
-        LangId::Java => tree_sitter_java::LANGUAGE.into(),
-        LangId::Ruby => tree_sitter_ruby::LANGUAGE.into(),
-        LangId::Kotlin => tree_sitter_kotlin_sg::LANGUAGE.into(),
-        LangId::Swift => tree_sitter_swift::LANGUAGE.into(),
-        LangId::Php => tree_sitter_php::LANGUAGE_PHP.into(),
-        LangId::Lua => tree_sitter_lua::LANGUAGE.into(),
-        LangId::Perl => tree_sitter_perl::LANGUAGE.into(),
-        LangId::Yaml => tree_sitter_yaml::LANGUAGE.into(),
-        LangId::Pascal => tree_sitter_pascal::LANGUAGE.into(),
-        LangId::R => tree_sitter_r::LANGUAGE.into(),
-        LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
-        LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
-        LangId::Toml => tree_sitter_toml::LANGUAGE.into(),
-    })
-}
-
 /// Returns the query pattern string for a given LangId, if implemented.
 fn query_for(lang: LangId) -> Option<&'static str> {
     match lang {
@@ -1350,10 +1311,11 @@ pub fn parse_with_parser(
     let no_tree = || AftError::ParseError {
         message: format!("tree-sitter parse returned None for {}", path.display()),
     };
-    if lang != LangId::Luau {
+    let Some(language) = crate::grammar::extractor_name(lang) else {
         return parser.parse(source, old_tree).ok_or_else(no_tree);
-    }
-    let deadline = luau_parse_deadline();
+    };
+    let deadline =
+        crate::grammar::parse_deadline(language).expect("extractor has a parse deadline");
     let start = std::time::Instant::now();
     let mut expired = false;
     // This bounds host parsing, but cannot interrupt one lex or scanner call
@@ -1376,7 +1338,7 @@ pub fn parse_with_parser(
     if expired || start.elapsed() >= deadline {
         return Err(AftError::GrammarParseTimeout {
             path: path.display().to_string(),
-            language: "luau".into(),
+            language: language.into(),
             timeout_ms: deadline.as_millis().min(u64::MAX as u128) as u64,
         });
     }
@@ -1386,8 +1348,8 @@ pub fn parse_with_parser(
 /// A Wasm language must have a store attached before set_language can run it.
 pub fn initialize_parser(parser: &mut tree_sitter::Parser, lang: LangId) -> Result<(), AftError> {
     let grammar = grammar_for(lang)?;
-    if lang == LangId::Luau {
-        crate::grammar::prepare_parser(parser)?;
+    if let Some(language) = crate::grammar::extractor_name(lang) {
+        crate::grammar::prepare_parser(parser, language)?;
     }
     parser
         .set_language(&grammar)

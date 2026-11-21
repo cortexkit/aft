@@ -94,16 +94,14 @@ fn config_language(path: &Path) -> String {
 /// [`TodoLanguage::name`]), such as `markers-markdown`.
 pub const MARKERS_PREFIX: &str = "markers-";
 
-/// Record identity is language-local: changing Luau never invalidates a
+/// Record identity is language-local: changing a downloaded grammar never invalidates a
 /// built-in language's records. Extraction always receives the bare name.
 pub fn keyed_language(language: &str) -> std::borrow::Cow<'_, str> {
-    if language == "luau" {
-        format!(
-            "luau@{}:{}",
-            crate::grammar::manifest().sha256,
-            crate::grammar::extractor_version()
-        )
-        .into()
+    if let (Some(entry), Some(version)) = (
+        crate::grammar::manifest(language),
+        crate::grammar::extractor_version(language),
+    ) {
+        format!("{language}@{}:{version}", entry.sha256).into()
     } else {
         language.into()
     }
@@ -117,26 +115,29 @@ pub fn record_key(
     aft_store::content::RecordKey::new(content, &keyed_language(language), EXTRACTOR_VERSION)
 }
 
-/// A publication containing Luau cannot pair an older grammar's fragments
+/// A publication with downloaded grammars cannot pair older grammar fragments
 /// with newer records another checkout wrote to the shared store.
 pub(super) fn graph_version(
     state: &aft_store::checkout::CheckoutState,
 ) -> std::borrow::Cow<'static, str> {
-    if state.paths().iter().any(|record| {
-        std::str::from_utf8(&record.path).is_ok_and(|path| {
-            crate::parser::is_luau_path(Path::new(path), cfg!(feature = "wasm-grammars"))
+    let grammars: std::collections::BTreeSet<_> = state
+        .paths()
+        .iter()
+        .filter_map(|record| {
+            let path = Path::new(std::str::from_utf8(&record.path).ok()?);
+            super::grammar::downloaded_language(path)
         })
-    }) {
-        format!("{EXTRACTOR_VERSION}+{}", keyed_language("luau")).into()
-    } else {
+        .collect();
+    if grammars.is_empty() {
         EXTRACTOR_VERSION.into()
+    } else {
+        let mut version = EXTRACTOR_VERSION.to_owned();
+        for language in grammars {
+            version.push('+');
+            version.push_str(&keyed_language(language));
+        }
+        version.into()
     }
-}
-
-fn source_language(path: &Path) -> Option<LangId> {
-    crate::callgraph_extractor::source_language(path).or_else(|| {
-        crate::parser::is_luau_path(path, cfg!(feature = "wasm-grammars")).then_some(LangId::Luau)
-    })
 }
 
 /// Whether `language` (as [`language_for`] chose it) is one the call graph
@@ -178,7 +179,8 @@ fn parsed_or_embedded_path(path: &[u8]) -> bool {
     };
     let path = Path::new(path);
     path.extension().is_some_and(|extension| extension == "h")
-        || source_language(path).is_some()
+        || crate::callgraph_extractor::source_language(path).is_some()
+        || super::grammar::downloaded_language(path).is_some()
         || crate::semantic_index::is_semantic_indexed_extension(path)
 }
 
@@ -217,7 +219,10 @@ pub fn language_for(path: &str, source: &[u8]) -> Option<String> {
             None => return Some(format!("{MARKERS_PREFIX}{}", TodoLanguage::Lexical.name())),
         }
     } else {
-        match source_language(path) {
+        if let Some(language) = super::grammar::downloaded_language(path) {
+            return Some(language.into());
+        }
+        match crate::callgraph_extractor::source_language(path) {
             Some(language) => language,
             None if CSharpProjects::has_project_root(source) => {
                 return Some(CSHARP_PROJECT_CONFIG.to_string())
@@ -997,7 +1002,8 @@ mod tests {
             storage_dir: Some(directory.path().into()),
             ..Default::default()
         };
-        let registry = crate::grammar::configure(&config);
+        crate::grammar::configure(&config);
+        let registry = crate::grammar::registry("luau").unwrap();
         let source = b"local function f() return 1 end";
         let classified = super::language_for("f.luau", source);
         assert_eq!(

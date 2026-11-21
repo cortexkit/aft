@@ -628,9 +628,7 @@ impl Work {
             match result {
                 Ok(report) => {
                     let retried_grammar = work.checkout.retry_grammar_gaps().unwrap_or(false);
-                    if !retried_grammar {
-                        work.ensure_grammar_driver();
-                    }
+                    work.ensure_grammar_driver();
                     *work
                         .retry
                         .lock()
@@ -725,7 +723,7 @@ impl Work {
             return;
         }
         // Luau chunk maps use published outlines, unlike built-in chunking.
-        let publish = if self.checkout.has_unpublished_luau_changes() {
+        let publish = if self.checkout.has_unpublished_grammar_changes() {
             Publish::Always
         } else {
             publish
@@ -781,9 +779,8 @@ impl Work {
                     let retried_grammar = work.checkout.retry_grammar_gaps().unwrap_or(false);
                     if retried_grammar {
                         *work.publish_requested.lock() = Publish::Always;
-                    } else {
-                        work.ensure_grammar_driver();
                     }
+                    work.ensure_grammar_driver();
                     if result
                         .as_ref()
                         .is_ok_and(|stats| stats.as_ref().is_some_and(|stats| stats.cold_build))
@@ -938,10 +935,8 @@ impl Work {
         #[cfg(feature = "wasm-grammars")]
         if self.checkout.view().is_some_and(|view| {
             view.current_state().paths().iter().any(|record| {
-                super::vectors::native_path(&record.path).is_some_and(|path| {
-                    crate::parser::detect_language_any(&path, true)
-                        == Some(crate::parser::LangId::Luau)
-                })
+                super::vectors::native_path(&record.path)
+                    .is_some_and(|path| super::grammar::downloaded_language(&path).is_some())
             })
         }) {
             self.start_fill();
@@ -1091,13 +1086,13 @@ impl Work {
     }
 
     /// Grammar I/O belongs to maintenance, never to a call-graph reader. A
-    /// checkout without unavailable Luau members needs no polling thread.
+    /// checkout without unavailable grammar members needs no polling thread.
     fn ensure_grammar_driver(self: &Arc<Self>) {
         #[cfg(feature = "wasm-grammars")]
         {
             if self.stopped.load(Ordering::Acquire)
                 || !self.checkout.planes().callgraph
-                || !self.checkout.has_grammar_gaps()
+                || self.checkout.grammar_gap_languages().is_empty()
                 || self.grammar_driving.swap(true, Ordering::AcqRel)
             {
                 return;
@@ -1108,7 +1103,6 @@ impl Work {
                 .name("aft-grammar-refresh".into())
                 .spawn(move || {
                     let _flag = flag;
-                    let registry = crate::grammar::registry();
                     #[cfg(all(
                         test,
                         feature = "wasm-grammars",
@@ -1121,52 +1115,58 @@ impl Work {
                             super::test_gates::Point::GrammarSubscription,
                         );
                     }
-                    let ready = registry.subscribe();
+                    let (wake, ready) = std::sync::mpsc::channel();
+                    let mut subscriptions = std::collections::BTreeMap::new();
                     loop {
-                        let event = ready.recv_timeout(Duration::from_secs(1));
                         let Some(work) = weak
                             .upgrade()
                             .filter(|work| !work.stopped.load(Ordering::Acquire))
                         else {
                             break;
                         };
-                        match event {
-                            Ok(_) => {
-                                if work.checkout.retry_grammar_gaps().unwrap_or(false) {
-                                    work.start_refresh(Publish::Always, false);
-                                }
-                                if !work.checkout.has_grammar_gaps() {
-                                    break;
-                                }
+                        let languages = work.checkout.grammar_gap_languages();
+                        subscriptions.retain(|language, _| languages.contains(language));
+                        for language in languages {
+                            let Some(registry) = crate::grammar::registry(language) else {
+                                continue;
+                            };
+                            if registry.status_snapshot().is_some_and(|status| {
+                                !matches!(
+                                    status.state,
+                                    crate::grammar::GrammarState::NotDownloaded
+                                        | crate::grammar::GrammarState::Downloading
+                                        | crate::grammar::GrammarState::NetworkRetry
+                                        | crate::grammar::GrammarState::StorageRetry
+                                )
+                            }) {
+                                subscriptions.remove(language);
+                                continue;
                             }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-                                if work.checkout.has_grammar_gaps() =>
-                            {
-                                // A ready notification is not proof that every
-                                // affected file was reread. Retry maintenance
-                                // after transient scan or read failures too.
-                                if registry.status_snapshot().is_none() {
-                                    if work.checkout.retry_grammar_gaps().unwrap_or(false) {
-                                        work.start_refresh(Publish::Always, false);
-                                    }
-                                    continue;
-                                }
+                            subscriptions
+                                .entry(language)
+                                .or_insert_with(|| registry.subscribe_to(wake.clone()));
+                        }
+                        if subscriptions.is_empty() {
+                            break;
+                        }
+                        drop(work);
+                        let _ = ready.recv_timeout(Duration::from_secs(1));
+                        let Some(work) = weak
+                            .upgrade()
+                            .filter(|work| !work.stopped.load(Ordering::Acquire))
+                        else {
+                            break;
+                        };
+                        // Retry a failed reread even if no further readiness event arrives.
+                        if work.checkout.retry_ready_grammar_gaps().unwrap_or(false) {
+                            work.start_refresh(Publish::Always, false);
+                        }
+                        for language in work.checkout.grammar_gap_languages() {
+                            if let Some(registry) = crate::grammar::registry(language) {
                                 if registry.retry_due() {
                                     let _ = registry.request();
                                 }
-                                if registry.status_snapshot().is_some_and(|state| {
-                                    !matches!(
-                                        state.state,
-                                        crate::grammar::GrammarState::NotDownloaded
-                                            | crate::grammar::GrammarState::Downloading
-                                            | crate::grammar::GrammarState::NetworkRetry
-                                            | crate::grammar::GrammarState::StorageRetry
-                                    )
-                                }) {
-                                    break;
-                                }
                             }
-                            _ => break,
                         }
                     }
                 });
