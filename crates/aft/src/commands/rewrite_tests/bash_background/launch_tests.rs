@@ -1,9 +1,11 @@
+use crate::bash_background;
 use crate::bash_background::persistence::session_tasks_dir;
 #[cfg(unix)]
 use crate::bash_background::persistence::{read_task_at, resolve_task_layout};
 use crate::bash_background::persistence::{with_task_io_fault, TaskIoFault};
 use crate::bash_background::registry::BgTaskRegistry;
-use crate::bash_background::{self, BgTaskStatus};
+#[cfg(unix)]
+use crate::bash_background::BgTaskStatus;
 use crate::sandbox_spawn::SpawnPlan;
 use std::{collections::HashMap, fs, path::Path};
 #[cfg(unix)]
