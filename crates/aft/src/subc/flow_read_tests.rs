@@ -783,17 +783,15 @@ fn pause_read() -> (file_read_exact::ReadHooks, ReadPause) {
     let (entered_tx, entered) = std::sync::mpsc::sync_channel(1);
     let (resume, resumed) = std::sync::mpsc::sync_channel(1);
     let resumed = StdMutex::new(resumed);
-    let hooks = file_read_exact::ReadHooks {
-        mid_read: Some(Arc::new(move || {
+    let hooks =
+        aft_engine::test_bridge::search_misc::file_read_exact::with_mid_read(Arc::new(move || {
             let _ = entered_tx.send(());
             resumed
                 .lock()
                 .unwrap()
                 .recv_timeout(Duration::from_secs(10))
                 .expect("test releases the paused read");
-        })),
-        ..file_read_exact::ReadHooks::default()
-    };
+        }));
     (
         hooks,
         ReadPause {
