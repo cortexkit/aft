@@ -150,6 +150,7 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
                 .build()
             else {
                 failure("bus_runtime");
+                NOTICE_VIEWS_READY.fail("bus_runtime");
                 return;
             };
             runtime.block_on(async {
@@ -158,8 +159,12 @@ pub(crate) fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Op
                     _ = readers::sweep_cards() => {},
                 }
             });
+            NOTICE_VIEWS_READY.fail("bus_worker_stopped");
         })
-        .map_err(|_| failure("bus_worker"))
+        .map_err(|_| {
+            failure("bus_worker");
+            NOTICE_VIEWS_READY.fail("bus_worker");
+        })
         .ok()?;
     Some(Worker {
         stop: Some(stop),

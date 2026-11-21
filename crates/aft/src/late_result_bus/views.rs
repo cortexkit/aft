@@ -95,6 +95,9 @@ impl<'a> Publication<'a> {
         for (pin, bytes) in values {
             let identity = (pin.clone(), blake3::hash(&bytes));
             if bytes.len() > declaration().max_value_bytes as usize {
+                if pin.starts_with("nv1:") {
+                    self.notice_views.fail("notice_view_oversized");
+                }
                 if self.skipped.insert(identity) {
                     HEALTH.lock().views.skips += 1;
                     log::warn!(
