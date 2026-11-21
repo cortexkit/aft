@@ -1,8 +1,18 @@
-use super::*;
+use crate::bash_background::secrets::test_support::*;
+use crate::bash_background::secrets::*;
+use crate::context::AppContext;
 use crate::protocol::RawRequest;
+use crate::protocol::Response;
+use crate::sandbox_spawn::SpawnPlan;
+use crate::secret::SecretVault;
 use crate::secret::{ApiKeyTarget, Material, ReleasedApiKey, UseAnswer};
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::{
+    collections::HashMap,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(unix)]
 #[path = "secrets_audit_tests.rs"]
@@ -22,7 +32,7 @@ struct Vault {
 impl Vault {
     fn new(_port: u16) -> Arc<Self> {
         #[cfg(unix)]
-        TEST_HTTPS_PORT.with(|slot| slot.set((_port != 0).then_some(_port)));
+        set_https_port((_port != 0).then_some(_port));
         Arc::new(Self {
             resolves: AtomicUsize::new(0),
             materials: AtomicUsize::new(0),
@@ -105,15 +115,15 @@ fn with_vault<R>(vault: Arc<dyn SecretVault>, run: impl FnOnce() -> R) -> R {
     struct Restore(Option<Arc<dyn SecretVault>>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            TEST_VAULT.with(|slot| slot.replace(self.0.take()));
+            replace_vault(self.0.take());
         }
     }
-    let _restore = Restore(TEST_VAULT.with(|slot| slot.replace(Some(vault))));
+    let _restore = Restore(replace_vault(Some(vault)));
     run()
 }
 
 fn context(root: &Path, storage: &Path) -> AppContext {
-    AppContext::new(
+    crate::test_context(
         Box::new(crate::parser::TreeSitterProvider::new()),
         crate::config::Config {
             project_root: Some(root.to_owned()),
@@ -192,13 +202,12 @@ async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution()
                 .with_no_client_auth(),
         )
         .unwrap();
-        Arc::new(Mutex::new(Runtime {
+        unarmed_runtime(
             proxy,
-            bundle: storage.path().join("unused-trust.pem"),
-            lifetime: lifetime_scope.clone(),
-            authorization: authorization_scope.clone(),
-            armed: false,
-        }))
+            storage.path().join("unused-trust.pem"),
+            lifetime_scope.clone(),
+            authorization_scope.clone(),
+        )
     };
     let layout = crate::bash_background::persistence::allocate_task_layout(
         storage.path(),
@@ -333,8 +342,8 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
             }
         });
     }
-    let task = super::super::persistence::allocate_task_layout(
-        &super::super::task_storage_dir(&ctx),
+    let task = crate::bash_background::persistence::allocate_task_layout(
+        &crate::bash_background::task_storage_dir(&ctx),
         "ordinary",
     )
     .unwrap();
@@ -350,7 +359,7 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
     assert_eq!(ordinary, SpawnPlan::Unsandboxed);
     let reply = crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx);
     assert_eq!(code(&reply), Some("secret_refused"), "{reply:?}");
-    super::super::persistence::delete_resolved_task(&task).unwrap();
+    crate::bash_background::persistence::delete_resolved_task(&task).unwrap();
 }
 
 #[cfg(target_os = "linux")]
@@ -491,7 +500,7 @@ fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
     if std::env::var_os(CHILD).is_none() {
         let home = tempfile::tempdir().unwrap();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "bash_background::secrets::tests::secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write", "--nocapture", "--test-threads=1"])
+        command.args(["--exact", "commands::rewrite_tests::bash_background::secrets::tests::secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1").env("HOME", home.path());
         for key in [
             "XDG_CONFIG_HOME",
@@ -611,7 +620,7 @@ fn secret_bash_legacy_remote_is_refused_before_any_job() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let ctx = context(root.path(), storage.path());
-    let launch = super::super::RemoteLaunch {
+    let launch = crate::bash_background::RemoteLaunch {
         explicit_runon: false,
         connection_file: None,
         harness: "broca".into(),
@@ -633,7 +642,7 @@ fn secret_bash_legacy_remote_is_refused_before_any_job() {
     };
     let vault = Vault::new(443);
     let reply = with_vault(vault.clone(), || {
-        super::super::with_remote_policy(Some(launch), || {
+        crate::bash_background::with_remote_policy(Some(launch), || {
             crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
         })
     });
@@ -698,7 +707,7 @@ fn secret_bash_windows_refuses_all_profiles_without_a_job() {
             head: mode,
             worker: mode,
         };
-        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
         let vault = Vault::new(443);
         let reply = with_vault(vault.clone(), || {
             crate::commands::bash::handle(&request("echo '{{ck-secret:test}}'"), &ctx)
@@ -858,7 +867,7 @@ fn secret_bash_real_pipeline_background_pty_environment_and_key_scan() {
     const CHILD: &str = "AFT_SECRET_BASH_NATIVE_TEST";
     if std::env::var_os(CHILD).is_none() {
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "bash_background::secrets::tests::secret_bash_real_pipeline_background_pty_environment_and_key_scan", "--nocapture", "--test-threads=1"])
+            .args(["--exact", "commands::rewrite_tests::bash_background::secrets::tests::secret_bash_real_pipeline_background_pty_environment_and_key_scan", "--nocapture", "--test-threads=1"])
             .env(CHILD, "1").output().unwrap();
         assert!(
             result.status.success(),
@@ -907,13 +916,11 @@ fn native_pipeline() {
         // pipeline with a local upstream anchor, not macOS system-store trust.
         let mut roots = rustls::RootCertStore::empty();
         roots.add(ca.der().clone()).unwrap();
-        TEST_UPSTREAM.with(|slot| {
-            slot.replace(Some(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(roots)
-                    .with_no_client_auth(),
-            ))
-        });
+        set_upstream(
+            rustls::ClientConfig::builder()
+                .with_root_certificates(roots)
+                .with_no_client_auth(),
+        );
     }
     let leaf_key = rcgen::KeyPair::generate().unwrap();
     let leaf = rcgen::CertificateParams::new(vec!["localhost".into()])
@@ -1056,7 +1063,7 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
             lifetime = serde_json::from_value(json!({"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-run","kind":"ephemeral","scope_epoch":index as u64 + 1,"owner_authorized":true,"parent":{"owner":{"kind":"reserved","module_id":"prefrontal"},"ref":"secret-bash","scope_epoch":1},"parent_state":"linked"})).unwrap();
         }
         let launch = || {
-            super::super::registry::with_scope_spawn(Some(lifetime.clone()), || {
+            crate::bash_background::registry::with_scope_spawn(Some(lifetime.clone()), || {
                 crate::commands::bash::handle(&req, &ctx)
             })
         };
@@ -1167,15 +1174,17 @@ assert open(sys.argv[2], 'rb').read() in open(paths[0], 'rb').read().replace(b'\
         } else {
             ctx.bash_background().detach();
             assert!(
-                super::super::process::is_process_alive(pid as u32),
+                crate::bash_background::process::is_process_alive(pid as u32),
                 "detach should leave the child alive but revoke its proxy"
             );
             assert!(
                 std::net::TcpStream::connect(address).is_err(),
                 "detach left listener alive while child was alive"
             );
-            assert!(super::super::process::is_process_alive(pid as u32));
-            super::super::process::terminate_pgid(pid, None);
+            assert!(crate::bash_background::process::is_process_alive(
+                pid as u32
+            ));
+            crate::bash_background::process::terminate_pgid(pid, None);
         }
         assert!(
             std::net::TcpStream::connect(address).is_err(),

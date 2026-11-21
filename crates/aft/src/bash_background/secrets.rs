@@ -439,5 +439,48 @@ thread_local! {
 }
 
 #[cfg(test)]
-#[path = "secrets_tests.rs"]
-mod tests;
+pub(crate) mod test_support {
+    use super::*;
+
+    #[cfg(unix)]
+    pub(crate) fn set_https_port(port: Option<u16>) {
+        TEST_HTTPS_PORT.with(|slot| slot.set(port));
+    }
+
+    pub(crate) fn replace_vault(
+        vault: Option<Arc<dyn SecretVault>>,
+    ) -> Option<Arc<dyn SecretVault>> {
+        TEST_VAULT.with(|slot| slot.replace(vault))
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn set_upstream(config: rustls::ClientConfig) {
+        TEST_UPSTREAM.with(|slot| slot.replace(Some(config)));
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unarmed_runtime(
+        proxy: SecretProxy,
+        bundle: PathBuf,
+        lifetime: crate::secret::SecretScope,
+        authorization: crate::secret::SecretScope,
+    ) -> SharedRuntime {
+        Arc::new(Mutex::new(Runtime {
+            proxy,
+            bundle,
+            lifetime,
+            authorization,
+            armed: false,
+        }))
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn native_roots() -> Result<Vec<u8>, ()> {
+        super::native_roots()
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn write_bundle(path: &Path, ca: &str) -> Result<(), ()> {
+        super::write_bundle(path, ca)
+    }
+}

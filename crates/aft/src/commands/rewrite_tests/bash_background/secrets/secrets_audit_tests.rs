@@ -12,7 +12,9 @@ fn isolated(name: &str, run: impl FnOnce()) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!("bash_background::secrets::tests::audit_followups::{name}"),
+            &format!(
+                "commands::rewrite_tests::bash_background::secrets::tests::audit_followups::{name}"
+            ),
             "--nocapture",
             "--test-threads=1",
         ])
@@ -77,13 +79,11 @@ impl Fixture {
         {
             let mut roots = rustls::RootCertStore::empty();
             roots.add(ca.der().clone()).unwrap();
-            TEST_UPSTREAM.with(|slot| {
-                slot.replace(Some(
-                    rustls::ClientConfig::builder()
-                        .with_root_certificates(roots)
-                        .with_no_client_auth(),
-                ))
-            });
+            set_upstream(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth(),
+            );
         }
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
