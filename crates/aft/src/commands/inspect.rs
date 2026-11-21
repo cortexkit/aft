@@ -27,7 +27,9 @@ use crate::lsp::roots::ServerKey;
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 #[cfg(test)]
-use aft_engine::test_bridge::search_misc::inspect::{InspectBuilderState, InspectManagerTest};
+use aft_engine::test_bridge::search_misc::inspect::{
+    InspectBuilderState, InspectCacheTest, InspectManagerTest,
+};
 
 const DEFAULT_TOP_K: usize = 20;
 const MAX_TOP_K: usize = 100;
@@ -9283,7 +9285,7 @@ mod deferred_terminal_tests {
         ctx.update_config(|config| config.indexes.callgraph = true);
         // Dead code reads its call graph from the root's index-store
         // checkout, so the run can only complete once that graph is built.
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         let mut config = ctx.config().as_ref().clone();
         config.indexes.callgraph = true;
         let snapshot = InspectSnapshot::new(

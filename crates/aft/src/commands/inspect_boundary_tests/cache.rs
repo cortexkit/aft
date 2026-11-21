@@ -2,7 +2,8 @@ mod tests {
     use crate::config::Config;
     use crate::inspect::{InspectCategory, InspectSnapshot, JobKey};
     use aft_engine::test_bridge::search_misc::inspect::{
-        contribution_set_hash_for_version_for_test, TIER2_CONTRIBUTION_CACHE_VERSION,
+        contribution_set_hash_for_version_for_test, InspectCacheTest as _,
+        TIER2_CONTRIBUTION_CACHE_VERSION,
     };
     use std::collections::HashSet;
     use std::fs;

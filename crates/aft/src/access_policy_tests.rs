@@ -2,6 +2,8 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::language::StubProvider;
 use crate::protocol::RawRequest;
+#[cfg(unix)]
+use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
 use serde_json::json;
 use std::path::{Path, PathBuf};
 
@@ -912,7 +914,7 @@ fn scratch_read_context() -> (
     std::fs::write(scratch.join("scratch.rs"), "fn scratch_marker() {}\n").unwrap();
     let task = ctx
         .bash_background()
-        .task_for_test("bash-0123456789abcdef")
+        .test_task("bash-0123456789abcdef")
         .unwrap();
     task.lock_state().unwrap().metadata.sandbox_temp_dir = Some(scratch.clone());
     let db = std::sync::Arc::new(std::sync::Mutex::new(
@@ -1151,7 +1153,7 @@ fn scratch_read_bridge_capability_is_session_scoped() {
         .is_session_owned_scratch_path("policy-session", &scratch));
     let task = ctx
         .bash_background()
-        .task_for_test("bash-0123456789abcdef")
+        .test_task("bash-0123456789abcdef")
         .unwrap();
     task.lock_state().unwrap().metadata.sandbox_temp_dir = None;
     assert!(!ctx
@@ -1414,7 +1416,7 @@ fn scratch_read_allocator_path_uses_the_task_record() {
     let (_directory, ctx, _scratch, _scope) = scratch_read_context();
     let task = ctx
         .bash_background()
-        .task_for_test("bash-0123456789abcdef")
+        .test_task("bash-0123456789abcdef")
         .unwrap();
     let allocated = Cleanup(
         aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap(),
@@ -1444,7 +1446,7 @@ fn scratch_read_right_after_command_exit_reads_kept_scratch_without_ask() {
     let (_directory, ctx, _scratch, _scope) = scratch_read_context();
     let task = ctx
         .bash_background()
-        .task_for_test("bash-0123456789abcdef")
+        .test_task("bash-0123456789abcdef")
         .unwrap();
     let scratch =
         aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap();
@@ -1525,7 +1527,7 @@ fn scratch_read_after_command_exit_is_not_found_without_ask() {
     let (directory, ctx, _scratch, _scope) = scratch_read_context();
     let task = ctx
         .bash_background()
-        .task_for_test("bash-0123456789abcdef")
+        .test_task("bash-0123456789abcdef")
         .unwrap();
     let scratch =
         aft_engine::test_bridge::bash_remote::create_task_temp_dir(&task.paths.io_dir).unwrap();

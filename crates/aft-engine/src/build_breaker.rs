@@ -29,7 +29,7 @@ static NEXT_ATTEMPT: AtomicU64 = AtomicU64::new(1);
 // the exact open-count assertions the health rollup test makes about its own
 // thread, and a shared injected read failure would be consumed by whichever
 // test's health rollup reads a breaker first.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static OPEN_CALLS_FOR_TEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static FAIL_NEXT_ACTIVE_SUSPENSIONS_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -108,7 +108,7 @@ pub struct BuildDeathBreaker {
 
 impl BuildDeathBreaker {
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         OPEN_CALLS_FOR_TEST.with(|calls| calls.set(calls.get() + 1));
         let path = path.into();
         if let Some(parent) = path.parent() {
@@ -395,12 +395,12 @@ impl BuildDeathBreaker {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reset_open_calls_for_test() {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.set(0));
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn open_calls_for_test() -> u64 {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.get())
     }

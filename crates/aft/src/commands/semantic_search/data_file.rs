@@ -117,7 +117,7 @@ fn is_data_file_after_metadata(
         file.take(DATA_FILE_MIN_BYTES).read_to_end(&mut bytes)?;
         crate::large_read::record_whole(crate::large_read::Site::DataFile, bytes.len());
         #[cfg(test)]
-        super::request_files::record_disk_read(path);
+        aft_engine::test_bridge::search_misc::record_request_file_read(path);
         Ok(bytes)
     })();
     read.is_ok_and(|bytes| bytes.len() as u64 >= DATA_FILE_MIN_BYTES || has_long_line(&bytes))
@@ -226,7 +226,7 @@ mod tests {
             std::fs::write(&path, &grown).unwrap()
         }));
         let fetched = super::super::request_files::read_through(
-            Some(scope.files()),
+            Some(aft_engine::test_bridge::search_misc::request_files(&scope)),
             &path,
             super::super::request_files::read_whole_file,
         )

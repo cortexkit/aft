@@ -102,7 +102,7 @@ fn scenario(name: &str, files: &[(&str, &str)]) -> Scenario {
             build_hold = Some(crate::data_layer::runtime::hold_builds_for_test(
                 &project_root,
             ));
-            crate::data_layer::surfaces::bind_for_test(&ctx);
+            aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         }
         "unavailable" => ctx.set_cache_writer_capabilities(false, true),
         "partially_ready" => {
@@ -342,6 +342,7 @@ fn data_layer_scenario(
 
 #[test]
 fn aft_zoom_callgraph_matches_the_shared_fixtures() {
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     for name in SCENARIOS {
         let expected = expected("aft_zoom.callgraph", name);
         let (root, _storage, ctx) = data_layer_scenario(name, &[EXAMPLE_FUNCTION]);

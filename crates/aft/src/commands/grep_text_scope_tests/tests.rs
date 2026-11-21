@@ -15,7 +15,9 @@ use crate::search_index::{
     SearchIndexSnapshot,
 };
 
-use aft_engine::test_bridge::search_misc::decompose_grep_pattern;
+use aft_engine::test_bridge::search_misc::{
+    decompose_grep_pattern, search::SearchSnapshotTest as _,
+};
 
 /// A checkout under construction: its root, its store, and the next
 /// modification time to give a file, so files order by when they were
@@ -114,7 +116,7 @@ fn grep_both(
     (
         render(&search(today)),
         render(&search(&candidates)),
-        candidates.file_entries().len(),
+        candidates.file_entry_count(),
     )
 }
 

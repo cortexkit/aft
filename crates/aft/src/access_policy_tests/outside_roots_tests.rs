@@ -144,7 +144,7 @@ impl Fixture {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             crate::context::SemanticIndexStatus::Disabled;
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         (ctx, nested, outside_repo)
     }
 

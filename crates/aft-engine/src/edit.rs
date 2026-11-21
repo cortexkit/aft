@@ -356,9 +356,9 @@ fn write_source_in_place(
         use std::os::unix::fs::PermissionsExt;
         let wanted = original.permissions().mode() & 0o7777;
         let now = file.metadata()?.permissions().mode() & 0o7777;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let forced = FORCE_MODE_RESTORE_FAILURE.with(std::cell::Cell::get);
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let forced = false;
         if now != wanted || forced {
             // Read the mode back: some file systems accept the call but drop
@@ -1065,7 +1065,7 @@ pub fn line_col_to_byte(source: &str, line: u32, col: u32) -> usize {
             return line_start + (col as usize).min(line_text.len());
         }
         line_start += segment.len();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         LINE_OFFSET_BYTES_SCANNED.with(|count| count.set(count.get() + segment.len()));
     }
 
@@ -1088,7 +1088,7 @@ impl LineOffsets {
             .map(|segment| {
                 let offset = start;
                 start += segment.len();
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 LINE_OFFSET_BYTES_SCANNED.with(|count| count.set(count.get() + segment.len()));
                 offset
             })
@@ -1300,7 +1300,7 @@ pub struct SourceLineIndex<'a> {
 impl<'a> SourceLineIndex<'a> {
     #[doc(hidden)]
     pub fn new(source: &'a str) -> Self {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         A03_LINE_INDEX_PASSES.with(|count| count.set(count.get() + 1));
         let mut starts = vec![0];
         let mut lines = Vec::new();
@@ -1707,7 +1707,7 @@ fn construct_diff_with_timeout<'a>(
     after: &'a str,
     timeout: std::time::Duration,
 ) -> similar::TextDiff<'a, 'a, 'a, str> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     A03_DIFF_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Diff);
     similar::TextDiff::configure()
@@ -2813,15 +2813,15 @@ pub(crate) fn first_syntax_error_line(mut node: tree_sitter::Node<'_>) -> Option
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    pub(crate) static LINE_OFFSET_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static LINE_OFFSET_BYTES_SCANNED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static EXCERPT_COPIED_LINES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static WRITE_PIPELINE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Makes the next in-place writes behave as if the system dropped the
     /// file's mode and refused to restore it, so callers' warning plumbing
     /// can be tested without a file owned by another user.
-    pub(crate) static FORCE_MODE_RESTORE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    pub(crate) static A03_DIFF_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static A03_LINE_INDEX_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static FORCE_MODE_RESTORE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub static A03_DIFF_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub static A03_LINE_INDEX_PASSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub static A03_HANDLER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub static A03_SYNTAX_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

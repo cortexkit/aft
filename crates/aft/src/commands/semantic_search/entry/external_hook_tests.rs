@@ -33,7 +33,9 @@ fn fixture() -> (tempfile::TempDir, AppContext, PathBuf, RawRequest) {
     };
     let external = crate::path_identity::canonicalize_normalized(&external);
     let configured = crate::path_identity::canonicalize_normalized(&configured);
-    crate::data_layer::surfaces::serve_text_index_for_test(&context(external.clone()));
+    aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&context(
+        external.clone(),
+    ));
     let request = RawRequest {
         id: "external-hook".to_owned(),
         command: "semantic_search".to_owned(),
@@ -52,7 +54,7 @@ fn external_search_hook_preserves_direct_child_response_bytes() {
     req.params = serde_json::json!({"pattern":"hook_parity_witness", "path":external});
     crate::subc::lower_hooks::register();
     let handle = ExternalSearch::of(&caller, &external).expect("published external checkout");
-    let direct = with_absolute_result_paths(|| handle_parent_child_search(&req, &handle.engine));
+    let direct = with_absolute_result_paths(|| handle_parent_child_search(&req, &handle.engine()));
     let (hooked, drift) = handle.search(&req, &caller);
     assert!(direct.success, "{direct:?}");
     assert_eq!(direct.data["fully_degraded"], false, "{direct:?}");
@@ -101,3 +103,4 @@ fn external_search_without_hook_uses_existing_bounded_fallback() {
         .unwrap()
         .contains(&external.join("src/lib.rs").display().to_string()));
 }
+use aft_engine::test_bridge::display_data::ExternalSearchTestExt as _;

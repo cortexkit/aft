@@ -218,7 +218,7 @@ impl SearchIndex {
 impl SearchIndexSnapshot {
     /// The files this snapshot answers for, with the size and content hash it
     /// records for each and the modification time observed when it was built.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn file_entries(&self) -> &[FileEntry] {
         &self.files
     }
@@ -294,7 +294,7 @@ impl SearchIndexSnapshot {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn has_file_in_scope(&self, search_root: &Path) -> bool {
         let search_root = canonicalize_for_search_membership(search_root);
         self.files.iter().any(|file| {
@@ -1087,39 +1087,16 @@ pub(crate) fn keep_path_ordered_batch<T>(
 /// so tests can prove the scan's memory stays within its row budget
 /// whatever the files hold. Outside tests it does nothing.
 pub(crate) fn note_path_order_held_rows(search_root: &Path, rows: usize) {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     path_order_held_rows_for_test::note(search_root, rows);
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let _ = (search_root, rows);
 }
 
 /// Test-only record of the most rows a path-ordered scan held at once, by
 /// search root.
-#[cfg(test)]
-pub(crate) mod path_order_held_rows_for_test {
-    use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
-
-    static PEAKS: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
-
-    pub(crate) fn note(root: &Path, rows: usize) {
-        if let Ok(mut peaks) = PEAKS.get_or_init(Default::default).lock() {
-            let peak = peaks.entry(root.to_path_buf()).or_default();
-            *peak = (*peak).max(rows);
-        }
-    }
-
-    /// The most rows held at once since the last call, and resets it.
-    pub(crate) fn take(root: &Path) -> usize {
-        PEAKS
-            .get_or_init(Default::default)
-            .lock()
-            .ok()
-            .and_then(|mut peaks| peaks.remove(root))
-            .unwrap_or(0)
-    }
-}
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod path_order_held_rows_for_test;
 
 #[derive(Clone, Debug, Default)]
 #[doc(hidden)]

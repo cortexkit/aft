@@ -3830,7 +3830,7 @@ fn presence_check_after_unstamped_stat(
         Some(file) if file.stat().is_some() => file,
         Some(_) => {
             #[cfg(test)]
-            request_files::record_disk_read(path);
+            aft_engine::test_bridge::search_misc::record_request_file_read(path);
             let stamp = file_stamp(path);
             after_stat();
             // Reopen unstamped source through the streaming reader even when
@@ -5022,7 +5022,10 @@ mod code_references {
         #[test]
         fn code_reference_cache_reuses_content_but_separates_grammar_and_edits() {
             let source = "fn CachedParseMarker(x: ExternalCacheType) { x; } // CommentCacheOnly";
-            let file = request_files::RequestFile::unshared(source.as_bytes().to_vec(), None);
+            let file = aft_engine::test_bridge::search_misc::search::unshared_request_file(
+                source.as_bytes().to_vec(),
+                None,
+            );
             let mut parser = crate::parser::FileParser::new();
             let before = crate::parser::work_counters::tree_parses();
             assert_eq!(
@@ -5051,7 +5054,10 @@ mod code_references {
             assert_eq!(crate::parser::work_counters::tree_parses(), after);
             // A Rust-looking name in a Python comment is not a Python identifier.
             let text = "# fn CachedGrammarMarker() {}";
-            let bytes = request_files::RequestFile::unshared(text.as_bytes().to_vec(), None);
+            let bytes = aft_engine::test_bridge::search_misc::search::unshared_request_file(
+                text.as_bytes().to_vec(),
+                None,
+            );
             for extension in ["rs", "py", "h", "c"] {
                 let path = PathBuf::from(format!("same.{extension}"));
                 assert_eq!(
@@ -5065,7 +5071,10 @@ mod code_references {
                 );
             }
             let changed = "// ExternalCacheType";
-            let bytes = request_files::RequestFile::unshared(changed.as_bytes().to_vec(), None);
+            let bytes = aft_engine::test_bridge::search_misc::search::unshared_request_file(
+                changed.as_bytes().to_vec(),
+                None,
+            );
             assert_eq!(
                 cached(
                     Path::new("first.rs"),
@@ -8170,9 +8179,12 @@ fn audit1432_presence_unstamped_growth_streams_without_a_false_skip() {
     let file = root.path().join("presence.txt");
     fs::write(&file, b"initial\n").unwrap();
     let files = request_files::install();
-    files
-        .files()
-        .keep_read(&file, b"old unstamped\n".to_vec(), None);
+    aft_engine::test_bridge::search_misc::keep_request_file(
+        &files,
+        &file,
+        b"old unstamped\n".to_vec(),
+        None,
+    );
     let mut grown = b"x\n".repeat((17 << 20) / 2);
     grown.extend_from_slice(b"needle_at_tail\n");
     let _scope = crate::bounded_io::enter_disclosure_if_absent();
@@ -9820,7 +9832,7 @@ fn read_bounded_snippet_lines(path: &Path, plan: SnippetReadPlan) -> Option<Snip
     #[cfg(test)]
     crate::search_hot_path_measurements::record_file_read_path(path);
     #[cfg(test)]
-    request_files::record_disk_read(path);
+    aft_engine::test_bridge::search_misc::record_request_file_read(path);
     let size = file.metadata().map_or(0, |metadata| metadata.len());
     let mut reader = std::io::BufReader::new(CountedRead { file, read: 0 });
     let lines = bounded_snippet_lines_from(&mut reader, plan);
@@ -10863,6 +10875,9 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aft_engine::test_bridge::display_data::{
+        note_checkout_outcome_for_test, CheckoutTestExt as _, DataCheckoutTestExt as _,
+    };
 
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;
@@ -10956,7 +10971,7 @@ mod tests {
         let (_dir, root, ctx) = first_text_index_fixture();
         let hold = crate::data_layer::runtime::hold_builds_for_test(&root);
         let _graph_hold = crate::data_layer::checkout::hold_call_graph_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         assert!(first_text_index_wait_needed(&ctx));
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_ctx = Arc::clone(&ctx);
@@ -11003,7 +11018,7 @@ mod tests {
     fn first_text_index_search_times_out_after_eight_seconds_with_unchanged_refusal() {
         let (_dir, root, ctx) = first_text_index_fixture();
         let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let req = semantic_request("first_index_needle", 5);
         let expected = SearchLaneStatus::observe_current(&ctx)
             .refusal(&req.id, &ctx)
@@ -11030,9 +11045,10 @@ mod tests {
             if !failed {
                 ctx.update_config(|config| config.indexes.trigram = false);
             }
-            crate::data_layer::surfaces::bind_for_test(&ctx);
+            aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
             if failed {
-                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+                note_checkout_outcome_for_test::<()>(
+                    &ctx.data_checkout().unwrap(),
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),
@@ -11052,7 +11068,7 @@ mod tests {
         for cancel in [false, true] {
             let (_dir, root, ctx) = first_text_index_fixture();
             let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-            crate::data_layer::surfaces::bind_for_test(&ctx);
+            aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
             let token = crate::executor::JobCancellation::new();
             let worker_token = token.clone();
             let worker_ctx = Arc::clone(&ctx);
@@ -11072,7 +11088,8 @@ mod tests {
             if cancel {
                 token.request_cancel();
             } else {
-                ctx.data_checkout().unwrap().note_outcome_for_test::<()>(
+                note_checkout_outcome_for_test::<()>(
+                    &ctx.data_checkout().unwrap(),
                     "build",
                     &Err(crate::data_layer::checkout::DataError::Store(
                         "test build failed".into(),
@@ -11098,7 +11115,7 @@ mod tests {
     fn first_text_index_search_respects_request_deadline() {
         let (_dir, root, ctx) = first_text_index_fixture();
         let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let started = Instant::now();
         let _budget = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(
             Duration::from_millis(80),
@@ -11117,7 +11134,7 @@ mod tests {
         use crate::response_finalize::DispatchOutcome;
         let (_dir, root, ctx) = first_text_index_fixture();
         let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-        crate::data_layer::surfaces::bind_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
         let executor = Executor::new();
         let root_id = ProjectRootId::from_path(&root).unwrap();
         executor.register_actor(root_id.clone(), Arc::clone(&ctx));
@@ -11187,7 +11204,7 @@ mod tests {
         for ending in ["cancel", "drain", "timeout"] {
             let (_dir, root, ctx) = first_text_index_fixture();
             let _hold = crate::data_layer::runtime::hold_builds_for_test(&root);
-            crate::data_layer::surfaces::bind_for_test(&ctx);
+            aft_engine::test_bridge::display_data::surfaces::bind_for_test(&ctx);
             let req = semantic_request("first_index_needle", 5);
             let timeout = if ending == "timeout" {
                 Duration::from_millis(80)
@@ -11245,7 +11262,7 @@ mod tests {
         }
         let ctx = test_context(&root);
         *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Disabled;
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         take_literal_presence_counts();
         (project, ctx)
     }
@@ -11319,7 +11336,9 @@ mod tests {
         let relative = Path::new("src").join("lib.rs").display().to_string();
         for ready in [false, true] {
             if ready {
-                crate::data_layer::surfaces::serve_text_index_for_test(&indexed);
+                aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(
+                    &indexed,
+                );
                 assert!(
                     crate::commands::data_search::ExternalSearch::of(&caller, &external).is_some()
                 );
@@ -11751,7 +11770,7 @@ mod tests {
     }
 
     fn install_ready_search_index(ctx: &AppContext, _project_root: &Path) {
-        crate::data_layer::surfaces::serve_text_index_for_test(ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(ctx);
     }
 
     #[test]
@@ -12335,7 +12354,7 @@ mod tests {
         .expect("symlink fixture file");
         let ctx = test_context(&root);
         ctx.set_canonical_cache_root(root.clone());
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         (project, root, ctx)
     }
 
@@ -12594,7 +12613,7 @@ mod tests {
         std::fs::write(&source_file, source).expect("write source file");
         let ctx = test_context(project);
         ctx.set_canonical_cache_root(project.to_path_buf());
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = status;
@@ -12649,7 +12668,7 @@ mod tests {
         // ONNX Runtime and its install lock there.
         ctx.update_config(|config| config.storage_dir = Some(storage.to_path_buf()));
         ctx.set_canonical_cache_root(root.clone());
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::ready();
@@ -16091,7 +16110,7 @@ mod split_request_tests {
         *ctx.semantic_index_status()
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = SemanticIndexStatus::Disabled;
-        crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
+        aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&ctx);
         ctx
     }
 

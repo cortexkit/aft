@@ -66,6 +66,16 @@ pub trait BackendSlotTest {
     fn reconcile(&self, inputs: slot::BuildInputs);
 }
 
+pub trait BuildInputsTestExt {
+    fn search_mut(&mut self) -> &mut SearchConfig;
+}
+
+impl BuildInputsTestExt for slot::BuildInputs {
+    fn search_mut(&mut self) -> &mut SearchConfig {
+        &mut self.search
+    }
+}
+
 impl BackendSlotTest for slot::BackendSlot {
     fn set_constructor_for_test(&self, constructor: Constructor, backoff: Duration) {
         self.set_constructor_for_test(constructor, backoff);
@@ -101,3 +111,7 @@ pub mod fixture {
 }
 
 pub mod onnx;
+
+pub fn set_cache_unavailable(inputs: &mut slot::BuildInputs, value: bool) {
+    inputs.cache_unavailable = value;
+}

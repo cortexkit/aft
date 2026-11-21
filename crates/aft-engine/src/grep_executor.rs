@@ -653,11 +653,11 @@ pub fn project_root(ctx: &impl IndexHost) -> PathBuf {
 /// The test-only finishing order for a path-ordered fallback batch, or
 /// `None` (outside tests always) to search the batch in parallel.
 fn path_batch_order_for_test(search_root: &Path) -> Option<bool> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         scan_order_for_test::get(search_root)
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         let _ = search_root;
         None
@@ -667,7 +667,7 @@ fn path_batch_order_for_test(search_root: &Path) -> Option<bool> {
 /// Test-only override of the order in which the files of a path-ordered
 /// fallback batch finish: when set for a search root, the batch's files are
 /// searched one at a time, forward or reversed, instead of in parallel.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod scan_order_for_test {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
@@ -791,7 +791,7 @@ pub fn resolve_grep_scope(
 /// Runs one grep below a single starting path the way a request does once its
 /// scope is resolved, without that resolution or its path checks, so tests
 /// can show what the search itself does with a starting path.
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 pub(crate) fn grep_root_for_test(
     ctx: &impl IndexHost,
     search_root: &Path,
