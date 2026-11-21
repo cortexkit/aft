@@ -22,9 +22,9 @@ pub use attachments::{
     DownloadedGithubImage, GithubImageAttachment, GithubImageDownloader,
     ReqwestGithubImageDownloader, MAX_GITHUB_IMAGE_ATTACHMENTS, MAX_GITHUB_IMAGE_ATTACHMENT_BYTES,
 };
-pub(crate) use cache::worker_stopped;
 #[cfg(test)]
 pub(crate) use cache::tests::uncached_running_read;
+pub(crate) use cache::worker_stopped;
 pub use cache::{
     apply_selector, sqlite_cache_store, GithubReadCacheStore, GithubReadClock,
     GithubReadCompletion, GithubReadDeferred, GithubReadEngine, GithubReadFreshness,

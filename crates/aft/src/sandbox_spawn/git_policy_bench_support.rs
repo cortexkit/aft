@@ -55,7 +55,8 @@ pub(crate) fn use_unbatched(unbatched: bool) {
 }
 
 pub(crate) fn evict(root: &Path) {
-    let key = super::git_policy_cache_key(root, &super::git_policy_environment(root), true).unwrap();
+    let key =
+        super::git_policy_cache_key(root, &super::git_policy_environment(root), true).unwrap();
     super::git_policy_cache().lock().unwrap().remove(&key);
 }
 

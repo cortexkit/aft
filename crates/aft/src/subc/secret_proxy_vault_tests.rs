@@ -7,7 +7,9 @@ use crate::secret_proxy::SecretProxy;
 use aft_base::secret_proxy::tests::{Client, Server, K1, MARKER};
 use serde_json::json;
 
-use aft_base::secret_proxy::tests::vault_tests::{condition, live_config, record, Clock, PhoneGuard};
+use aft_base::secret_proxy::tests::vault_tests::{
+    condition, live_config, record, Clock, PhoneGuard,
+};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_vault_fetch_uses_the_concrete_target_and_holds_for_the_phone() {

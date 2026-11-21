@@ -342,6 +342,11 @@ pub struct GithubReadEngine {
 }
 
 impl GithubReadEngine {
+    #[cfg(test)]
+    pub(crate) fn flights_empty_for_test(&self) -> bool {
+        self.state.lock().flights.is_empty()
+    }
+
     pub fn new(
         cache: Arc<dyn GithubReadCacheStore>,
         fetcher: Arc<dyn GithubFetcher>,
@@ -1479,7 +1484,7 @@ pub(crate) mod tests {
                 ))
             );
         }
-        assert!(engine.state.lock().flights.is_empty());
+        assert!(engine.flights_empty_for_test());
         assert_eq!(
             wait_for(start()).unwrap().freshness,
             GithubReadFreshness::Fetched
@@ -1612,5 +1617,4 @@ pub(crate) mod tests {
             .unwrap();
         (start, release, started)
     }
-
 }
