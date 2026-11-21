@@ -545,7 +545,7 @@ mod tests {
     #[test]
     fn audit1432_ranked_collection_documents_request_wide_retained_text_bound() {
         use crate::pattern_compile::{compile, CompileOpts, CompileResult};
-        use crate::search_index::{PathFilters, SearchIndex};
+        use crate::search_index::PathFilters;
         const FILES: usize = 6;
         const LINES: usize = 12;
         const KEEP: usize = 3;
@@ -943,7 +943,7 @@ mod tests {
     #[test]
     fn collector_examines_source_first_and_counts_every_line() {
         use crate::pattern_compile::{compile, CompileOpts, CompileResult};
-        use crate::search_index::{PathFilters, SearchIndex};
+        use crate::search_index::PathFilters;
 
         let project = tempfile::tempdir().expect("project dir");
         let root = std::fs::canonicalize(project.path()).expect("canonical root");
