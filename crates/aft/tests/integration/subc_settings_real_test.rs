@@ -404,20 +404,17 @@ async fn subc_settings_real_dev_daemon_reviews_applies_and_serves_declaration_pe
     })
     .await;
 
-    // The daemon's schema accepts this integer. Only AFT enforces its upper bound.
+    // The schema permits an omitted model; AFT requires one for Synapse.
     fs::write(
         daemon.user_file(),
-        r#"{"memory":"lean","formatter_timeout_secs":601}"#,
+        r#"{"memory":"lean","semantic":{"backend":"synapse"}}"#,
     )
     .unwrap();
     let (kind, refused) = rpc(&mut operator, json!({"op":"config.plan"})).await;
     assert_eq!(kind, subc_protocol::FrameType::Error, "{refused}");
     assert_eq!(refused["code"], "module_review_refused", "{refused}");
-    assert!(
-        refused.to_string().contains("/formatter_timeout_secs"),
-        "{refused}"
-    );
-    assert!(!refused.to_string().contains("601"), "{refused}");
+    assert!(refused.to_string().contains("/semantic/model"), "{refused}");
+    assert!(!refused.to_string().contains("synapse"), "{refused}");
 
     fs::write(daemon.user_file(), r#"{"memory":"balanced"}"#).unwrap();
     let generation = approve(&mut operator, "config.plan").await;
