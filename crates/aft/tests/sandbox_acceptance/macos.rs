@@ -8,6 +8,18 @@ const GENERIC: &str = "disposable-keychain-generic-item";
 const INTERNET: &str = "disposable-keychain-internet-item";
 const GIT_ACCOUNT: &str = "aft-sandbox-acceptance-fixture";
 const PREFIX: &str = "aft-sandbox-acceptance-";
+const ATTRIBUTES: [&str; 10] = [
+    "-a",
+    GIT_ACCOUNT,
+    "-r",
+    "htps",
+    "-t",
+    "dflt",
+    "-P",
+    "443",
+    "-p",
+    "acceptance",
+];
 
 pub(super) struct Keychain {
     path: PathBuf,
@@ -102,31 +114,22 @@ impl GitItem {
                 .trim()
                 .trim_matches('"'),
         );
-        assert!(output.status.success() && keychain.is_absolute() && keychain.is_file(),
-            "osxkeychain acceptance requires the Mac mini runner's provisioned default keychain; refusing to create one");
+        assert!(output.status.success()
+                && keychain == Path::new("/Users/ghrunner/Library/Keychains/ci.keychain-db")
+                && keychain.is_file(),
+            "osxkeychain acceptance will only seed the Mac mini runner's dedicated default ci.keychain");
 
         // Look up only the reserved fixture account. Never dump all items or
         // remove an item whose server name does not match the fixture prefix.
         loop {
             let output = Command::new("/usr/bin/security")
-                .args([
-                    "find-internet-password",
-                    "-a",
-                    GIT_ACCOUNT,
-                    "-r",
-                    "htps",
-                    "-t",
-                    "dflt",
-                    "-P",
-                    "443",
-                    "-p",
-                    "acceptance",
-                ])
+                .arg("find-internet-password")
+                .args(ATTRIBUTES)
                 .arg(&keychain)
                 .output()
                 .unwrap();
             if output.status.code() == Some(44) {
-                break; // security's exit status for errSecItemNotFound.
+                break; // security's exit status when no item matches.
             }
             assert!(
                 output.status.success(),
@@ -150,24 +153,8 @@ impl GitItem {
 
         checked(
             Command::new("/usr/bin/security")
-                .args([
-                    "add-internet-password",
-                    "-A",
-                    "-s",
-                    host,
-                    "-a",
-                    GIT_ACCOUNT,
-                    "-r",
-                    "htps",
-                    "-t",
-                    "dflt",
-                    "-P",
-                    "443",
-                    "-p",
-                    "acceptance",
-                    "-w",
-                    INTERNET,
-                ])
+                .args(["add-internet-password", "-A", "-s", host, "-w", INTERNET])
+                .args(ATTRIBUTES)
                 .arg(&keychain),
         );
         Self {
@@ -179,21 +166,8 @@ impl GitItem {
     fn delete_command(keychain: &Path, host: &str) -> Command {
         let mut command = Command::new("/usr/bin/security");
         command
-            .args([
-                "delete-internet-password",
-                "-s",
-                host,
-                "-a",
-                GIT_ACCOUNT,
-                "-r",
-                "htps",
-                "-t",
-                "dflt",
-                "-P",
-                "443",
-                "-p",
-                "acceptance",
-            ])
+            .args(["delete-internet-password", "-s", host])
+            .args(ATTRIBUTES)
             .arg(keychain);
         command
     }

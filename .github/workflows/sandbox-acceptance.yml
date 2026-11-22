@@ -82,6 +82,17 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Require and unlock the Mac mini test keychain
+        shell: bash
+        run: |
+          default=$(security default-keychain -d user)
+          default=${default#*\"}
+          default=${default%\"}
+          if [[ "$default" != /Users/ghrunner/Library/Keychains/ci.keychain-db ]]; then
+            echo '::error::The Mac mini runner must use its provisioned ci.keychain as the default keychain.'
+            exit 1
+          fi
+          security unlock-keychain -p "" ci.keychain
       - name: Run the role and credential acceptance matrix
         shell: bash
         run: |
