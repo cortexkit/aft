@@ -890,7 +890,13 @@ mod tests {
             assert!(!text.lines().any(|line| line.starts_with("PATH=")));
             assert!(!text.contains(REMOVALS_ENV));
         };
-        for plan in [SpawnPlan::Unsandboxed, SpawnPlan::RelaxedUnenforced] {
+        for plan in [
+            SpawnPlan::Unsandboxed,
+            SpawnPlan::Unenforced {
+                mode: crate::config::SandboxMode::Standard,
+                worker_gh_fence: false,
+            },
+        ] {
             let mut command = std::process::Command::new("/usr/bin/env");
             crate::agent_child_env::apply_to_command(&mut command, &env);
             crate::sandbox_spawn::apply_sandbox_environment(&plan, &mut command, &env);
@@ -930,7 +936,10 @@ mod tests {
         let mut command = std::process::Command::new("/bin/sh");
         command.args(["-c", "printf '%s' \"$PATH\""]);
         crate::sandbox_spawn::apply_sandbox_environment(
-            &SpawnPlan::RelaxedUnenforced,
+            &SpawnPlan::Unenforced {
+                mode: crate::config::SandboxMode::Standard,
+                worker_gh_fence: false,
+            },
             &mut command,
             &env,
         );

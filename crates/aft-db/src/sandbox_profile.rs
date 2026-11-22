@@ -191,7 +191,8 @@ pub enum WorkerGhFence {
     /// The jail denies reads and writes of every canary file, including the
     /// account-home anchor. The launcher verifies each deny before execution.
     Canary { paths: Vec<PathBuf> },
-    /// This Unix worker profile has no canary deny (off or relaxed Linux). The
+    /// This Unix worker profile has no canary deny (Off, Credentials, or Standard
+    /// without an enforcing backend). The
     /// launcher reports the missing fence; Windows reports its lack of a native
     /// backend separately through spawn diagnostics.
     Unenforced,
@@ -281,7 +282,7 @@ impl SandboxProfile {
                 self.deny_prefixes,
                 "deny_prefixes",
                 &mut deny_paths,
-                preserve_aliases,
+                self.mode != crate::config::SandboxMode::Off,
             )?,
             data_policy: self
                 .data_policy
@@ -292,7 +293,7 @@ impl SandboxProfile {
                 self.write_deny,
                 "write_deny",
                 &mut deny_paths,
-                preserve_aliases,
+                self.mode != crate::config::SandboxMode::Off,
             )?,
             write_deny_nested: canonicalize_denies(
                 self.write_deny_nested,
@@ -306,7 +307,7 @@ impl SandboxProfile {
                 self.read_deny,
                 "read_deny",
                 &mut deny_paths,
-                preserve_aliases,
+                self.mode != crate::config::SandboxMode::Off,
             )?,
             socket_deny: canonicalize_optional_paths(
                 self.socket_deny,
@@ -557,10 +558,11 @@ fn canonicalize_denies(
     if preserve_aliases {
         // Protect the alias as well as its target: replacing a config symlink
         // must not replace an immutable file with worker-controlled contents.
-        for path in paths {
-            validate_normalized(&path, field)?;
-            canonical.push(path);
-        }
+        canonical.extend(
+            paths
+                .into_iter()
+                .filter(|path| validate_normalized(path, field).is_ok()),
+        );
         canonical.sort_unstable();
         canonical.dedup();
     }

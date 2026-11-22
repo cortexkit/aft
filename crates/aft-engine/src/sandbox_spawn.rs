@@ -429,8 +429,11 @@ impl PreparedTask {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnPlan {
     Unsandboxed,
-    /// Windows relaxed commands run without OS protection and must report it.
-    RelaxedUnenforced,
+    /// Windows Credentials and Standard install no OS policy.
+    Unenforced {
+        mode: SandboxMode,
+        worker_gh_fence: bool,
+    },
     Host {
         shell_path: PathBuf,
         environment: ChildEnvironment,
@@ -465,6 +468,32 @@ impl SpawnPlan {
             return plan.policy();
         }
         self
+    }
+
+    pub(crate) fn unenforced_warning(&self) -> Option<String> {
+        match self {
+            Self::Unenforced {
+                mode,
+                worker_gh_fence,
+            } => {
+                let blocks = match mode {
+                    SandboxMode::Credentials => "credential floor,sandbox.read_deny",
+                    SandboxMode::Standard => "all filesystem read/write denies",
+                    SandboxMode::Off | SandboxMode::Strict => return None,
+                };
+                let gh = if *worker_gh_fence {
+                    ",operator gh fence: unenforced"
+                } else {
+                    ""
+                };
+                Some(format!("sandbox: profile={mode} unenforced=[{blocks}{gh}] (Windows has no native sandbox backend; command runs with full user rights)\n"))
+            }
+            Self::Unsandboxed if worker_jail_active() => Some(
+                "sandbox: profile=off unenforced=[operator gh fence: unenforced (no OS sandbox)]\n"
+                    .into(),
+            ),
+            _ => None,
+        }
     }
 
     #[cfg(unix)]
@@ -634,13 +663,12 @@ impl SpawnPlan {
         match self.policy() {
             Self::Launcher { profile, .. } => match profile.mode {
                 SandboxMode::Strict => None,
-                // The native backends currently apply Standard's policy to Credentials.
-                SandboxMode::Standard | SandboxMode::Credentials if cfg!(target_os = "macos") => None,
+                SandboxMode::Standard if cfg!(target_os = "macos") => None,
                 SandboxMode::Standard => Some(
                     "sandbox profile standard on Linux does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
                 ),
                 SandboxMode::Credentials => Some(
-                    "sandbox profile credentials on Linux does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
+                    "sandbox profile credentials does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
                 ),
                 SandboxMode::Off => Some(
                     "sandbox profile off runs the worker shell without the worker jail",
@@ -1474,10 +1502,12 @@ fn platform_sandbox_plan(
     }
     match mode {
         SandboxMode::Off => return Some(SpawnPlan::Unsandboxed),
-        // Windows currently uses the same unenforced plan for both levels.
         SandboxMode::Standard | SandboxMode::Credentials => {
             return Some(if requested_tier == RequestedSandboxTier::Native {
-                SpawnPlan::RelaxedUnenforced
+                SpawnPlan::Unenforced {
+                    mode,
+                    worker_gh_fence: worker_jail_active(),
+                }
             } else {
                 worker_jail_refusal(&format!(
                     "the command asked to leave the configured {mode} profile"
@@ -1539,8 +1569,8 @@ fn resolve_sandbox_spawn_with_mode(
         return plan;
     }
 
-    // Strict must fail closed without a backend. Relaxed explicitly reports
-    // unenforced denies instead, so Windows workers can run their default profile.
+    // Strict must fail closed without a backend. Credentials and Standard
+    // explicitly report their unenforced denies on Windows.
     if let Some(plan) = platform_sandbox_plan(mode, requested_tier, cfg!(unix)) {
         return plan;
     }
@@ -1723,18 +1753,21 @@ fn build_native_profile(
     task_bundle_dir: &Path,
     mode: SandboxMode,
 ) -> Result<SandboxProfile, String> {
-    let home = std::env::var_os("HOME")
+    let env_home = std::env::var_os("HOME")
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| {
             "HOME is not set, so credential and cache paths cannot be resolved".to_string()
         })?;
-    if !home.is_absolute() {
-        return Err(format!("HOME must be absolute: {}", home.display()));
+    if !env_home.is_absolute() {
+        return Err(format!("HOME must be absolute: {}", env_home.display()));
     }
-    let home = home
-        .canonicalize()
-        .map_err(|error| format!("failed to canonicalize HOME {}: {error}", home.display()))?;
+    let home = env_home.canonicalize().map_err(|error| {
+        format!(
+            "failed to canonicalize HOME {}: {error}",
+            env_home.display()
+        )
+    })?;
     if !home.is_dir() {
         return Err(format!("HOME is not a directory: {}", home.display()));
     }
@@ -1811,15 +1844,25 @@ fn build_native_profile(
         };
     }
 
-    let git_policies = project_roots
-        .iter()
-        .map(|root| resolve_git_policy(root))
-        .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
-        // The native launchers use the Standard profile until they enforce a distinct credential floor.
-        if matches!(mode, SandboxMode::Standard | SandboxMode::Credentials) {
-            return build_relaxed_profile(
+        let finalize = |mut profile: SandboxProfile| -> Result<SandboxProfile, String> {
+            add_credential_floor(&mut profile, &env_home, &project_roots)?;
+            let profile = profile
+                .canonicalize_for_launch()
+                .map_err(|error| error.to_string())?;
+            verify_worker_gh_fence(&profile)?;
+            Ok(profile)
+        };
+        if mode == SandboxMode::Credentials {
+            return finalize(build_credentials_profile(ctx, &env_home, &temp_dir)?);
+        }
+        let git_policies = project_roots
+            .iter()
+            .map(|root| resolve_git_policy(root))
+            .collect::<Result<Vec<_>, _>>()?;
+        if mode == SandboxMode::Standard {
+            return finalize(build_relaxed_profile(
                 ctx,
                 &home,
                 &project_roots,
@@ -1827,11 +1870,7 @@ fn build_native_profile(
                 &session_store,
                 &task_io_dir,
                 &temp_dir,
-            )
-            .map(|mut profile| {
-                profile.mode = mode;
-                profile
-            });
+            )?);
         }
         let mut policy = ctx.access_policy("").map_err(|response| {
             response.data["message"]
@@ -2018,7 +2057,7 @@ fn build_native_profile(
         profile.write_deny.extend(shell_write_deny);
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
-        add_credential_floor(&mut profile, &home, &project_roots)?;
+        add_credential_floor(&mut profile, &env_home, &project_roots)?;
         if jailed {
             profile.read_deny.extend(canary_dirs.iter().cloned());
             profile.write_deny.extend(canary_dirs.iter().cloned());
@@ -2132,7 +2171,39 @@ fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
     Ok(())
 }
 
-/// Build relaxed's protected-path list without predicting the caches, sockets
+#[cfg(unix)]
+fn build_credentials_profile(
+    ctx: &AppContext,
+    home: &Path,
+    temp: &Path,
+) -> Result<SandboxProfile, String> {
+    let mut profile = SandboxProfile::build(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        temp.to_path_buf(),
+    )
+    .map_err(|error| error.to_string())?;
+    profile.mode = SandboxMode::Credentials;
+    profile.worker_jail = worker_jail_active();
+    if profile.worker_jail {
+        profile.worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
+    }
+    for path in &ctx.config().sandbox.read_deny {
+        let path = crate::access_policy::expand_home(path, home);
+        let denies = crate::sandbox_profile::resolve_env_deny_paths(path, "sandbox.read_deny")
+            .map_err(|error| error.to_string())?;
+        profile.read_deny.extend(denies.iter().cloned());
+        profile.write_deny.extend(denies);
+    }
+    Ok(profile)
+}
+
+/// Build Standard's protected-path list without predicting the caches, sockets
 /// or services a build will need. Each backend reports which denies it enforces.
 #[cfg(unix)]
 fn build_relaxed_profile(
@@ -2328,12 +2399,8 @@ fn build_relaxed_profile(
         temp_dir: temp.to_path_buf(),
         worker_gh_fence,
     };
-    add_credential_floor(&mut profile, home, roots)?;
     protect_worker_credential_services(&mut profile, home)?;
-    profile
-        .canonicalize_for_launch()
-        .map_err(|error| error.to_string())
-        .and_then(|profile| verify_worker_gh_fence(&profile).map(|()| profile))
+    Ok(profile)
 }
 
 /// Mark only authenticated, sandboxed workers for credential-service isolation.
@@ -2542,7 +2609,7 @@ fn git_worktree_registration_inputs(common_dir: &Path) -> Option<GitPolicyInputs
 }
 
 /// Credential clients may use HOME, the password database, or explicit config
-/// overrides. Include read/write denies for every location in both profiles,
+/// overrides. Include read/write denies for every location at every non-Off level,
 /// without private-store exceptions. Backends enforce them or report their limits.
 #[cfg(unix)]
 fn add_credential_floor(
@@ -2550,9 +2617,30 @@ fn add_credential_floor(
     home: &Path,
     roots: &[PathBuf],
 ) -> Result<(), String> {
-    let account = crate::production_storage::account_home().ok();
+    let account = credential_account_home().map_err(|error| {
+        format!("cannot resolve account home for the credential floor: {error}")
+    })?;
+    add_credential_floor_with_account_home(profile, home, &account, roots)
+}
+
+#[cfg(unix)]
+fn credential_account_home() -> std::io::Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(home) = level_policy_tests::account_home_override() {
+        return home;
+    }
+    crate::production_storage::account_home()
+}
+
+#[cfg(unix)]
+fn add_credential_floor_with_account_home(
+    profile: &mut SandboxProfile,
+    home: &Path,
+    account: &Path,
+    roots: &[PathBuf],
+) -> Result<(), String> {
     let (denies, cargo_homes) =
-        credential_floor_paths(home, account.as_deref(), roots, |key| std::env::var_os(key))?;
+        credential_floor_paths(home, Some(account), roots, |key| std::env::var_os(key))?;
     profile.read_deny.extend(denies.iter().cloned());
     profile.write_deny.extend(denies);
     add_relaxed_cargo_credential_denies(profile, cargo_homes)
@@ -6240,7 +6328,7 @@ fn isolated_environment_for_plan(
             }
             Some(environment)
         }
-        SpawnPlan::RelaxedUnenforced => Some(sandboxed_child_environment(
+        SpawnPlan::Unenforced { .. } => Some(sandboxed_child_environment(
             request_environment,
             &std::env::temp_dir(),
         )),
@@ -6613,7 +6701,7 @@ fn command_argv_for_plan(
     marker_fds: Option<(RawFd, RawFd)>,
 ) -> Result<(OsString, Vec<OsString>, Option<File>), String> {
     match plan.policy() {
-        SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {
+        SpawnPlan::Unsandboxed | SpawnPlan::Unenforced { .. } | SpawnPlan::Host { .. } => {
             Ok((program.to_os_string(), args.to_vec(), None))
         }
         SpawnPlan::Refused { code, .. } => Err((*code).to_string()),
@@ -7283,7 +7371,14 @@ pub(crate) mod environment_tests {
                 let mut command = Command::new("/usr/bin/env");
                 let request = request_environment();
                 crate::agent_child_env::apply_to_command(&mut command, &request);
-                apply_sandbox_environment(&SpawnPlan::RelaxedUnenforced, &mut command, &request);
+                apply_sandbox_environment(
+                    &SpawnPlan::Unenforced {
+                        mode: SandboxMode::Standard,
+                        worker_gh_fence: false,
+                    },
+                    &mut command,
+                    &request,
+                );
                 let output = command.output().unwrap();
                 assert!(output.status.success());
                 let environment = String::from_utf8(output.stdout)
@@ -7304,7 +7399,10 @@ pub(crate) mod environment_tests {
             || {
                 let dir = tempfile::tempdir().unwrap();
                 let (command, _) = pty_command_for_plan(
-                    &SpawnPlan::RelaxedUnenforced,
+                    &SpawnPlan::Unenforced {
+                        mode: SandboxMode::Standard,
+                        worker_gh_fence: false,
+                    },
                     OsStr::new("unused-shell"),
                     &[],
                     &dir.path().join("task.json"),
@@ -7598,7 +7696,10 @@ mod tests {
         }
         for plan in [
             SpawnPlan::Unsandboxed,
-            SpawnPlan::RelaxedUnenforced,
+            SpawnPlan::Unenforced {
+                mode: SandboxMode::Standard,
+                worker_gh_fence: false,
+            },
             SpawnPlan::Host {
                 shell_path: PathBuf::from("/bin/sh"),
                 environment: ChildEnvironment::new(),
@@ -10299,33 +10400,6 @@ mod policy_tests {
         )
     }
 
-    #[test]
-    fn windows_relaxed_profile_runs_unenforced_but_strict_refuses() {
-        assert_eq!(
-            platform_sandbox_plan(SandboxMode::Standard, RequestedSandboxTier::Native, false),
-            Some(SpawnPlan::RelaxedUnenforced)
-        );
-        assert_eq!(
-            platform_sandbox_plan(SandboxMode::Off, RequestedSandboxTier::Native, false),
-            Some(SpawnPlan::Unsandboxed)
-        );
-        let strict =
-            platform_sandbox_plan(SandboxMode::Strict, RequestedSandboxTier::Native, false)
-                .unwrap();
-        assert_eq!(strict.refusal_code(), Some("sandbox_unavailable"));
-        assert_eq!(strict.refusal_message(), Some("sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"));
-        for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
-            assert!(platform_sandbox_plan(SandboxMode::Standard, tier, false)
-                .unwrap()
-                .refusal_code()
-                .is_some());
-        }
-        assert_eq!(
-            platform_sandbox_plan(SandboxMode::Standard, RequestedSandboxTier::Native, true),
-            None
-        );
-    }
-
     #[cfg(unix)]
     fn normalized_tool_profile(profile: &SandboxProfile) -> serde_json::Value {
         fn normalize(value: &mut serde_json::Value, temp: &str) {
@@ -13012,6 +13086,10 @@ mod worker_gh_fence_tests {
         }
     }
 }
+
+#[cfg(all(test, any(unix, windows)))]
+#[path = "sandbox_spawn/level_policy_tests.rs"]
+mod level_policy_tests;
 
 #[cfg(all(test, unix))]
 mod credential_floor_tests {

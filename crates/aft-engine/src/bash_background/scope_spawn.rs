@@ -125,7 +125,7 @@ pub(super) fn spawn_detached_child(
         let _ = (shell_path, scope);
         use crate::windows_shell::shell_candidates;
         match spawn_plan {
-            SpawnPlan::Unsandboxed | SpawnPlan::RelaxedUnenforced | SpawnPlan::Host { .. } => {}
+            SpawnPlan::Unsandboxed | SpawnPlan::Unenforced { .. } | SpawnPlan::Host { .. } => {}
             SpawnPlan::Refused { code, .. } => return Err((*code).to_string()),
             SpawnPlan::Launcher { .. } => return Err("sandbox_unavailable".to_string()),
         }

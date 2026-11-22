@@ -363,7 +363,10 @@ fn gh_shim_broker_t6_environment_strip_pty_and_exec_reinsertion() {
             "PTY inherited {key}"
         );
     }
-    let plan = crate::sandbox_spawn::SpawnPlan::RelaxedUnenforced;
+    let plan = crate::sandbox_spawn::SpawnPlan::Unenforced {
+        mode: crate::config::SandboxMode::Standard,
+        worker_gh_fence: true,
+    };
     let serialized = crate::sandbox_spawn::approved_environment_for_plan(&plan, &environment);
     for key in [
         crate::gh_shim_paths::GH_SHIM_TICKET_ENV,

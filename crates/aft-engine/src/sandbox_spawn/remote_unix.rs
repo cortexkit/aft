@@ -71,7 +71,7 @@ pub(crate) fn prepare_with_launcher(
     let env_home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or(home);
+        .unwrap_or_else(|| home.clone());
     let launcher = launcher.canonicalize().map_err(os_error)?;
     let scratch = Scratch(native::create_provider_temp_layout().map_err(os_error)?);
     let shell = Path::new("/bin/bash").canonicalize().map_err(os_error)?;
@@ -138,7 +138,12 @@ pub(crate) fn prepare_with_launcher(
     )
     .map_err(|error| error.to_string())?;
     profile.data_policy = private;
-    native::add_credential_floor(&mut profile, &env_home, &[folder.to_path_buf()])?;
+    native::add_credential_floor_with_account_home(
+        &mut profile,
+        &env_home,
+        &home,
+        &[folder.to_path_buf()],
+    )?;
     let profile = profile
         .canonicalize_for_launch()
         .map_err(|error| error.to_string())?;
@@ -405,6 +410,77 @@ impl Captured {
             text.into_owned()
         } else {
             format!("{text}\n[{} more output bytes omitted]", self.omitted)
+        }
+    }
+}
+
+#[cfg(test)]
+mod level_policy_tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_level_policy_prepared_remote_strict_keeps_keychains_and_narrow_grants() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let folder = root.join("checkout");
+        let unrelated = root.join("unrelated-grant");
+        std::fs::create_dir(&folder).unwrap();
+        std::fs::create_dir(&unrelated).unwrap();
+        let denied = root.join("private-notes");
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(folder.clone()),
+                storage_dir: Some(root.join("store")),
+                ..Default::default()
+            },
+        );
+        ctx.update_config(|config| {
+            config.github.shim = false;
+            config.sandbox.profile.head = crate::config::SandboxMode::Off;
+            config.sandbox.write_allow = vec![unrelated.clone()];
+            config.sandbox.read_deny = vec![denied.clone()];
+        });
+        let start = prepare_with_launcher(
+            &ctx,
+            &folder,
+            folder.clone(),
+            "true".into(),
+            std::env::current_exe().unwrap(),
+        )
+        .unwrap();
+        let profile: SandboxProfile =
+            serde_json::from_str(start.profile.to_str().unwrap()).unwrap();
+        assert_eq!(profile.mode, crate::config::SandboxMode::Strict);
+        assert_eq!(profile.writable_roots, [folder.clone()]);
+        assert!(profile.writable_files.is_empty() && profile.cache_roots.is_empty());
+        assert!(profile.data_policy.write_allow.is_empty());
+        assert!(profile.data_policy.read_allow.is_empty());
+        assert!(profile.read_allow.contains(&folder));
+        assert!(profile.read_allow.contains(&profile.temp_dir));
+        assert!(!profile.read_allow.contains(&unrelated));
+        assert!(profile.read_deny.contains(&denied) && profile.write_deny.contains(&denied));
+        let account = crate::production_storage::account_home().unwrap();
+        let env_home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .unwrap_or_else(|| account.clone());
+        for home in [account, env_home] {
+            let keychains = home.join("Library/Keychains");
+            assert!(
+                profile.read_deny.contains(&keychains),
+                "{}",
+                keychains.display()
+            );
+            assert!(
+                profile.write_deny.contains(&keychains),
+                "{}",
+                keychains.display()
+            );
+            assert!(!profile
+                .read_allow
+                .iter()
+                .any(|grant| keychains.starts_with(grant) || grant.starts_with(&keychains)));
         }
     }
 }

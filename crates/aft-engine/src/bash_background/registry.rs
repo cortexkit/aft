@@ -18078,10 +18078,8 @@ fn write_unenforced_sandbox_warning(
     handles: &TaskIoHandles,
     artifact: TaskArtifact,
 ) -> Result<(), String> {
-    let warning = match plan {
-        SpawnPlan::RelaxedUnenforced => "sandbox: profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced] (Windows has no native sandbox backend; command runs with full user rights)\n",
-        SpawnPlan::Unsandboxed if crate::sandbox_spawn::worker_jail_active() => "sandbox: profile=off unenforced=[operator gh fence: unenforced (no OS sandbox)]\n",
-        _ => return Ok(()),
+    let Some(warning) = plan.unenforced_warning() else {
+        return Ok(());
     };
     // Write before the child starts, using the same capture handle offset so
     // both pipes and PTYs retain the warning alongside the command's output.
@@ -18737,37 +18735,35 @@ mod tests {
     }
 
     #[test]
-    fn windows_relaxed_warning_survives_pipe_and_pty_capture() {
+    fn windows_sandbox_warning_survives_pipe_and_pty_capture() {
+        use crate::config::SandboxMode;
+
         let root = tempfile::tempdir().unwrap();
         for (mode, artifact) in [
             (BgMode::Pipes, TaskArtifact::Stderr),
             (BgMode::Pty, TaskArtifact::Pty),
         ] {
-            let task = allocate_task_layout(root.path(), "warning-session").unwrap();
-            let handles = TaskIoHandles::create(&task, mode.clone(), false).unwrap();
-            write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact).unwrap();
-            let path = match mode {
-                BgMode::Pipes => &task.paths.stderr,
-                BgMode::Pty => &task.paths.pty,
-            };
-            assert_eq!(std::fs::read(path).unwrap(), b"");
-            write_unenforced_sandbox_warning(&SpawnPlan::RelaxedUnenforced, &handles, artifact)
-                .unwrap();
-            handles
-                .clone_file(artifact)
-                .unwrap()
-                .write_all(b"child-output\n")
-                .unwrap();
-            let output = std::fs::read_to_string(path).unwrap();
-            assert!(
-                output.contains("profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"),
-                "{output}"
-            );
-            assert!(
-                output.contains("command runs with full user rights"),
-                "{output}"
-            );
-            assert!(output.ends_with("child-output\n"), "{output}");
+            for (profile, worker, expected) in [
+                (SandboxMode::Credentials, false, "profile=credentials unenforced=[credential floor,sandbox.read_deny]"),
+                (SandboxMode::Credentials, true, "profile=credentials unenforced=[credential floor,sandbox.read_deny,operator gh fence: unenforced]"),
+                (SandboxMode::Standard, false, "profile=standard unenforced=[all filesystem read/write denies]"),
+                (SandboxMode::Standard, true, "profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"),
+            ] {
+                let task = allocate_task_layout(root.path(), "warning-session").unwrap();
+                let handles = TaskIoHandles::create(&task, mode.clone(), false).unwrap();
+                let path = match mode {
+                    BgMode::Pipes => &task.paths.stderr,
+                    BgMode::Pty => &task.paths.pty,
+                };
+                write_unenforced_sandbox_warning(
+                    &SpawnPlan::Unenforced { mode: profile, worker_gh_fence: worker },
+                    &handles,
+                    artifact,
+                ).unwrap();
+                handles.clone_file(artifact).unwrap().write_all(b"child-output\n").unwrap();
+                assert_eq!(std::fs::read_to_string(path).unwrap(),
+                    format!("sandbox: {expected} (Windows has no native sandbox backend; command runs with full user rights)\nchild-output\n"));
+            }
         }
     }
 
@@ -18780,18 +18776,23 @@ mod tests {
         ] {
             let task = allocate_task_layout(root.path(), "off-worker-warning").unwrap();
             let handles = TaskIoHandles::create(&task, mode.clone(), false).unwrap();
-            crate::sandbox_spawn::with_worker_jail(true, || {
-                write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact)
-                    .unwrap()
-            });
             let path = match mode {
                 BgMode::Pipes => &task.paths.stderr,
                 BgMode::Pty => &task.paths.pty,
             };
+            crate::sandbox_spawn::with_worker_jail(false, || {
+                write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact)
+                    .unwrap()
+            });
+            assert_eq!(std::fs::read(path).unwrap(), b"");
+            crate::sandbox_spawn::with_worker_jail(true, || {
+                write_unenforced_sandbox_warning(&SpawnPlan::Unsandboxed, &handles, artifact)
+                    .unwrap()
+            });
             let output = std::fs::read_to_string(path).unwrap();
-            assert!(
-                output.contains("profile=off unenforced=[operator gh fence: unenforced"),
-                "{output}"
+            assert_eq!(
+                output,
+                "sandbox: profile=off unenforced=[operator gh fence: unenforced (no OS sandbox)]\n"
             );
         }
     }
@@ -27127,7 +27128,10 @@ mod tests {
             "bash_background::registry::tests::windows_relaxed_unenforced_pipe_spawn_strips_daemon_environment",
             || {
                 let (registry, _dir, task_id) = spawn_windows_registry_command_with_plan(
-                    SpawnPlan::RelaxedUnenforced,
+                    SpawnPlan::Unenforced {
+                        mode: crate::config::SandboxMode::Standard,
+                        worker_gh_fence: true,
+                    },
                     "cmd /d /c set",
                     request_environment(),
                 );

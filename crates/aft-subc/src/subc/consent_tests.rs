@@ -6453,7 +6453,13 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
                 match mode {
                     crate::config::SandboxMode::Standard
                     | crate::config::SandboxMode::Credentials => {
-                        assert_eq!(native, SpawnPlan::RelaxedUnenforced);
+                        assert_eq!(
+                            native,
+                            SpawnPlan::Unenforced {
+                                mode,
+                                worker_gh_fence: true
+                            }
+                        );
                     }
                     crate::config::SandboxMode::Strict => {
                         assert_eq!(native.refusal_code(), Some("sandbox_unavailable"));

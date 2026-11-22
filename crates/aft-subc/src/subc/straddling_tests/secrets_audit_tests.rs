@@ -323,7 +323,10 @@ fn audit_resolved_relaxed_secret_plan_refuses() {
             c.sandbox.profile.worker = crate::config::SandboxMode::Standard;
         });
         let reply = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(
-            SpawnPlan::RelaxedUnenforced,
+            SpawnPlan::Unenforced {
+                mode: crate::config::SandboxMode::Standard,
+                worker_gh_fence: false,
+            },
             || f.launch("echo '{{ck-secret:test}}'", false, json!({})),
         );
         assert_eq!(code(&reply), Some("secrets_sandbox_required"));

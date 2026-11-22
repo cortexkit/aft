@@ -402,6 +402,11 @@ fn apply_sandbox(profile: &SandboxProfile) -> Result<(), SandboxLaunchError> {
     seatbelt::apply(profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Seatbelt profile: {error}"))
     })?;
+    if profile.mode == aft::config::SandboxMode::Credentials
+        && profile.worker_gh_fence == Some(aft::sandbox_profile::WorkerGhFence::Unenforced)
+    {
+        eprintln!("sandbox-launch: profile=credentials unenforced=[operator gh fence: unenforced (credentials profile)]");
+    }
     verify_worker_gh_fence(profile)
 }
 

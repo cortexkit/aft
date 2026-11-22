@@ -66,7 +66,7 @@ pub(crate) fn save_local_launch(
         .ok_or("local fallback payload absent")?;
     let policy = match plan.policy() {
         SpawnPlan::Unsandboxed => SavedSpawnPolicy::Unsandboxed,
-        SpawnPlan::RelaxedUnenforced => {
+        SpawnPlan::Unenforced { .. } => {
             return Err("an unenforced Windows plan cannot be saved on Unix".into());
         }
         SpawnPlan::Host { shell_path, .. } => SavedSpawnPolicy::Host {

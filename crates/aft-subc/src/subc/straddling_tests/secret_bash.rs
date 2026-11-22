@@ -679,7 +679,10 @@ fn secret_bash_nonqualifying_plans_precede_scope_and_rewrite() {
     let vault = Vault::new(443);
     let plans = [
         SpawnPlan::Unsandboxed,
-        SpawnPlan::RelaxedUnenforced,
+        SpawnPlan::Unenforced {
+            mode: crate::config::SandboxMode::Standard,
+            worker_gh_fence: false,
+        },
         SpawnPlan::Host {
             shell_path: "/bin/sh".into(),
             environment: Default::default(),
