@@ -762,13 +762,6 @@ mod tests {
     #[test]
     fn home_root_callgraph_warmup_is_terminally_disabled() {
         let _env_lock = crate::test_env::process_env_lock();
-        // HOME also feeds the global git-ignore fingerprint that search-cache
-        // tests stamp and revalidate under their own dedicated lock. Those tests
-        // do not take the process env lock, so mutating HOME under the env lock
-        // alone still races them; hold both (env lock first, consistently).
-        let _gitignore_env_lock = crate::global_gitignore_env_test_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = tempfile::tempdir().unwrap();
         let storage = tempfile::tempdir().unwrap();
         let _home = EnvGuard::set("HOME", root.path().as_os_str());
