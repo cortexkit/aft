@@ -755,6 +755,89 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
 }
 
 #[test]
+fn edit_no_match_startup_then_daemon_registration_captures_once() {
+    // Registration is process-wide; a new harness process also lets us exercise
+    // the unregistered and standalone paths before daemon hooks can leak in.
+    const CHILD: &str = "AFT_TEST_REPEAT_EDIT_REPORTER_REGISTRATION";
+    if std::env::var_os(CHILD).is_none() {
+        let name = concat!(
+            module_path!(),
+            "::edit_no_match_startup_then_daemon_registration_captures_once"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name.split_once("::").unwrap().1, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let f = fixture("edit", "repeat-edit-reporter-registration");
+    let root = f._dir.path();
+    let path = root.join("a.txt");
+    std::fs::write(&path, "the original text\n").unwrap();
+    let ctx = Arc::new(crate::test_context(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        crate::config::Config {
+            project_root: Some(root.into()),
+            storage_dir: Some(root.join("storage")),
+            ..Default::default()
+        },
+    ));
+    let request = serde_json::from_value(json!({
+        "id":"miss", "command":"edit_match", "file":path,
+        "match":"absent", "replacement":"new"
+    }))
+    .unwrap();
+    let run_edit = || {
+        serde_json::to_value(crate::commands::edit_match::handle_edit_match(
+            &request, &ctx,
+        ))
+        .unwrap()
+    };
+    let unregistered = run_edit();
+    assert_eq!(unregistered["code"], "match_not_found");
+
+    crate::subc::register_tool_callbacks();
+    assert_eq!(run_edit(), unregistered);
+    assert_eq!(edit_hunks::NO_MATCH_CAPTURES.with(std::cell::Cell::get), 0);
+    assert!(!crate::db::call_ledger::held_result_projector_registered());
+
+    // The actual attached entry runs both daemon registration sites before
+    // attempting to open the connection file. No daemon is needed for this test.
+    let missing = root.join("missing-connection.json");
+    let result = crate::subc::run_subc_mode_with_registration(
+        &missing,
+        Arc::clone(&ctx),
+        Arc::new(crate::context::Executor::new()),
+        |_, _| panic!("the missing connection file cannot dispatch a tool"),
+        None,
+        None,
+    );
+    assert!(
+        matches!(result, Err(crate::subc::SubcError::ConnectionFile { .. })),
+        "{result:?}"
+    );
+    assert!(crate::db::call_ledger::held_result_projector_registered());
+
+    // Activate the capture without `enter`, which also registers lower hooks.
+    let _active = Guard(ACTIVE.with(|slot| slot.replace(Some(Arc::clone(&f.capture)))));
+    f.capture.lock().unwrap().masker = Some(crate::log_redact::SecretValues::from_environment([]));
+    assert_eq!(run_edit(), unregistered);
+    assert_eq!(edit_hunks::NO_MATCH_CAPTURES.with(std::cell::Cell::get), 1);
+    let capture = f.capture.lock().unwrap();
+    let (record, detail) = capture.file_snapshot.as_ref().unwrap();
+    assert_eq!(record["reason"], "no_match");
+    assert_eq!(detail.as_ref().unwrap()["noMatchChange"], 1);
+}
+
+#[test]
 fn batch_edit_no_match_publishes_plain_hunks_with_scalar_marks() {
     let f = fixture("edit", "display-batch-no-match");
     let ctx = crate::subc::test_support::test_ctx();

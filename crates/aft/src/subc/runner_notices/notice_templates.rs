@@ -1,16 +1,14 @@
 //! Registered, typed notice text shared by `tool.catalog` and runner sends.
 
-pub(crate) use crate::bash_rewrite::notices::{
-    append_text, code_search_slots, deliver, Notice, Target, CODE_SEARCH,
-};
+#[cfg(test)]
+pub(crate) use crate::bash_rewrite::notices::Target;
 use crate::bash_rewrite::notices::{bash_templates, enumeration};
+pub(crate) use crate::bash_rewrite::notices::{code_search_slots, deliver, Notice, CODE_SEARCH};
+pub(crate) use crate::response_finalize::{DRIFTING, IDENTICAL};
 #[cfg(test)]
 pub(crate) use aft_engine::test_bridge::bash_remote::PREFER_TOOL;
 use cortexkit_role_llm_runner::delivery_order::{Slot, Template};
 use std::collections::BTreeMap;
-
-pub(crate) const IDENTICAL: &str = "aft.repeat_call.identical";
-pub(crate) const DRIFTING: &str = "aft.repeat_call.drifting";
 
 pub(crate) fn templates(preset: &str) -> Vec<Template> {
     let mut templates = if preset == "reader" {

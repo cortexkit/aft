@@ -527,6 +527,7 @@ fn main() {
         startup_phase("context_start");
         aft::commands::configure::register_runtime_hooks();
         aft::commands::register_shell_handlers();
+        aft::subc::register_tool_callbacks();
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
@@ -654,6 +655,7 @@ fn main() {
 
     aft::commands::configure::register_runtime_hooks();
     aft::commands::register_shell_handlers();
+    aft::subc::register_tool_callbacks();
     let app = App::default_shared();
     let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
     // Same catalog as in subc mode, written before the first request.

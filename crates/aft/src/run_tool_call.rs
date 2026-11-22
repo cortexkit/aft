@@ -3,6 +3,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use crate::bash_rewrite::notices::{self, Notice, Target};
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
@@ -684,7 +685,7 @@ pub fn finish_tool_call_response(
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallResult {
     response.notices.route = format_context.runner_notice.clone().map(|route| route as _);
-    crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
+    notices::deliver(&mut response, None);
     if surface_downgraded {
         attach_hashline_downgrade(&mut response);
     }
@@ -791,13 +792,18 @@ impl RepeatObservation {
                 self.bash_watch_available,
                 crate::response_finalize::repeat_breaker::escalation_starts_at(intervention.count),
             );
-            response.notices.items.push(crate::subc::runner_notices::notice_templates::Notice::template(
-                if intervention.outputs_identical { crate::subc::runner_notices::notice_templates::IDENTICAL } else { crate::subc::runner_notices::notice_templates::DRIFTING },
+            let template = if intervention.outputs_identical {
+                crate::response_finalize::IDENTICAL
+            } else {
+                crate::response_finalize::DRIFTING
+            };
+            response.notices.items.push(Notice::template(
+                template,
                 serde_json::json!({"count": intervention.count, "span": intervention.span.as_secs(), "instruction": instruction}),
                 standalone,
-                crate::subc::runner_notices::notice_templates::Target::Text,
+                Target::Text,
             ));
-            crate::subc::runner_notices::notice_templates::deliver(response, Some(text));
+            notices::deliver(response, Some(text));
         }
     }
 }
