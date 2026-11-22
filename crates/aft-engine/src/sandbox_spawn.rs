@@ -2143,7 +2143,7 @@ fn build_native_profile(
         refuse_store_overlap(&profile, &session_store, &task_io_dir)?;
 
         #[cfg(target_os = "linux")]
-        let profile = launcher_image::finish_linux_profile(profile, &home, &git_policies)?;
+        let profile = launcher_image::finish_profile(profile, &home, &git_policies, &task_io_dir)?;
         verify_worker_gh_fence(&profile)?;
 
         Ok(profile)

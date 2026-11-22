@@ -184,6 +184,10 @@ pub struct LinuxMountPolicy {
     /// Broad write denies that would also remove an allowed checkout write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deferred_read_only: Vec<PathBuf>,
+    /// Task-local symlink to the retained AFT executable. Keep the alias spelling
+    /// so bubblewrap can restore just that file if it masks the task directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_executable_alias: Option<PathBuf>,
     pub cargo_homes: Vec<PathBuf>,
     /// Strict credential writes enforced by mounts when active, and still
     /// mandatory Landlock denies on direct fallback.

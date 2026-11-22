@@ -180,9 +180,10 @@ fn prepare_inner(mut profile: SandboxProfile, snapshot: &Snapshot) -> InnerProfi
 
 fn exec_bwrap(args: &LaunchArgs, profile: SandboxProfile) -> Result<(), SandboxLaunchError> {
     let unavailable = |error: io::Error| SandboxLaunchError::unavailable(error.to_string());
-    let snapshot = Snapshot::take(&profile).map_err(SandboxLaunchError::unavailable)?;
-    let inner = prepare_inner(profile, &snapshot);
     let executable = std::env::current_exe().map_err(unavailable)?;
+    let snapshot =
+        Snapshot::take(&profile, &executable).map_err(SandboxLaunchError::unavailable)?;
+    let inner = prepare_inner(profile, &snapshot);
     let handoff = handoff::Handoff::new().map_err(unavailable)?;
     let mut profile_fd = memfd(c"aft-bwrap-profile").map_err(unavailable)?;
     serde_json::to_writer(&mut profile_fd, &inner)
@@ -242,6 +243,16 @@ fn append_mounts(command: &mut Command, snapshot: Snapshot) -> io::Result<(File,
                 append(&[b"--perms", b"0444", b"--ro-bind-data", fd.as_bytes(), path]);
                 files.push(file);
             }
+        }
+    }
+    if let Some((source, alias)) = &snapshot.task_executable_bind {
+        for arg in [
+            b"--ro-bind".as_slice(),
+            source.as_os_str().as_bytes(),
+            alias.as_os_str().as_bytes(),
+        ] {
+            argv.extend_from_slice(arg);
+            argv.push(0);
         }
     }
     // Remount only the tmpfs, not its writable exception submounts.

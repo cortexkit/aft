@@ -116,7 +116,7 @@ impl Roles {
 fn bwrap_roles_snapshot_preserves_nested_controls_and_only_exact_exceptions() {
     let root = tempfile::tempdir().unwrap();
     let f = Roles::new(root.path(), true);
-    let snapshot = Snapshot::take(&f.profile).unwrap();
+    let snapshot = Snapshot::take(&f.profile, &std::env::current_exe().unwrap()).unwrap();
     let mounts = snapshot.mounts;
     for (path, mode) in [
         (&f.broad, Mount::DeferredReadOnly),

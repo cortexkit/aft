@@ -7,6 +7,8 @@ use std::process::Output;
 mod failure_tests;
 #[path = "roles_tests.rs"]
 mod roles_tests;
+#[path = "task_executable_tests.rs"]
+mod task_executable_tests;
 
 const SEED: &str = "s5-disposable-secret";
 
@@ -108,7 +110,7 @@ fn bwrap_core_strict_fallback_restores_checkout_relative_kube_mandatory_deny() {
         fallback_write_deny: vec![kube.clone()],
         ..Default::default()
     });
-    let snapshot = Snapshot::take(&profile).unwrap();
+    let snapshot = Snapshot::take(&profile, &std::env::current_exe().unwrap()).unwrap();
     let inner = prepare_inner(profile.clone(), &snapshot);
     assert_eq!(snapshot.mounts[&kube], Mount::EmptyFile);
     assert!(inner.profile.write_deny.is_empty());
@@ -470,7 +472,7 @@ fn bwrap_core_standard_reports_missing_controls_but_not_enforced_store_masks() {
         deferred_read_only: vec![root.path().to_path_buf(), absent.clone()],
         ..Default::default()
     });
-    let snapshot = Snapshot::take(&profile).unwrap();
+    let snapshot = Snapshot::take(&profile, &std::env::current_exe().unwrap()).unwrap();
     assert_eq!(snapshot.mounts[&hooks], Mount::ReadOnly);
     assert_eq!(snapshot.mounts[root.path()], Mount::DeferredReadOnly);
     assert_eq!(snapshot.mounts[&elsewhere], Mount::PrivateDir);

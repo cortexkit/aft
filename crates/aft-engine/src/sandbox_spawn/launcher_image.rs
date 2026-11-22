@@ -27,10 +27,11 @@ impl LauncherIdentity {
     }
 }
 
-pub(super) fn finish_linux_profile(
+pub(super) fn finish_profile(
     mut profile: SandboxProfile,
     home: &Path,
     git_policies: &[super::GitPolicy],
+    task_io: &Path,
 ) -> Result<SandboxProfile, String> {
     if let Some(pin) = crate::pinned_executable::linux_task_pin().map_err(|e| e.to_string())? {
         // Landlock rules are additive. Protect the entire cache from broad
@@ -41,6 +42,9 @@ pub(super) fn finish_linux_profile(
             .expect("Linux pin stored under an image identity directory");
         profile.data_policy.deny.push(cache.to_path_buf());
         profile.data_policy.read_allow.push(pin);
+        if let Some(mounts) = &mut profile.linux_mounts {
+            mounts.task_executable_alias = Some(crate::pinned_executable::task_executable(task_io));
+        }
     }
 
     let git_read_roots = git_policies

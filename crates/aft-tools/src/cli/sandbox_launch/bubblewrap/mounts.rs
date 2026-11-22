@@ -30,22 +30,28 @@ impl Mount {
 #[derive(Debug)]
 pub(super) struct Snapshot {
     pub mounts: BTreeMap<PathBuf, Mount>,
+    pub task_executable_bind: Option<(PathBuf, PathBuf)>,
     pub unenforced: Vec<String>,
 }
 
 impl Snapshot {
-    pub fn take(profile: &SandboxProfile) -> Result<Self, String> {
+    pub fn take(profile: &SandboxProfile, executable: &Path) -> Result<Self, String> {
         let policy = profile.linux_mounts.as_ref().expect("local mount policy");
         let mut snapshot = Self::from_policy(policy)?;
         if profile.mode != SandboxMode::Credentials {
             snapshot.add_role_mounts(profile, policy)?;
         }
-        snapshot.finish()
+        let mut snapshot = snapshot.finish()?;
+        if let Some(alias) = &policy.task_executable_alias {
+            snapshot.add_task_executable_bind(profile, alias, executable)?;
+        }
+        Ok(snapshot)
     }
 
     fn from_policy(policy: &LinuxMountPolicy) -> Result<Self, String> {
         let mut snapshot = Self {
             mounts: BTreeMap::new(),
+            task_executable_bind: None,
             unenforced: Vec::new(),
         };
         // Rescan immediately before building mount arguments: Cargo can create
@@ -85,6 +91,45 @@ impl Snapshot {
     #[cfg(test)]
     pub fn take_policy(policy: &LinuxMountPolicy) -> Result<Self, String> {
         Self::from_policy(policy)?.finish()
+    }
+
+    fn add_task_executable_bind(
+        &mut self,
+        profile: &SandboxProfile,
+        alias: &Path,
+        executable: &Path,
+    ) -> Result<(), String> {
+        if !alias.is_absolute()
+            || !alias
+                .parent()
+                .is_some_and(|parent| parent.canonicalize().as_deref().ok() == Some(parent))
+            || !std::fs::read_link(alias).is_ok_and(|target| target == executable)
+        {
+            return Err(format!(
+                "task executable alias {} does not directly name the running AFT image",
+                alias.display()
+            ));
+        }
+        let covering_mount =
+            |path: &Path| path.ancestors().find_map(|p| self.mounts.get(p).copied());
+        if covering_mount(alias) != Some(Mount::PrivateDir) {
+            return Ok(());
+        }
+        if covering_mount(executable)
+            .is_some_and(|mount| mount.masks() || mount == Mount::PrivateDir)
+            || (profile.mode == SandboxMode::Strict
+                && !profile.read_allow.iter().any(|path| path == executable))
+        {
+            return Err(format!(
+                "cannot restore task executable alias {}: the running AFT image lacks an exact read grant or is masked",
+                alias.display()
+            ));
+        }
+        // The private tmpfs hides the original symlink. Bind the same inode
+        // at its old name so Strict's exact Landlock grant on the pin also
+        // covers execution through the alias without granting its parent.
+        self.task_executable_bind = Some((executable.to_path_buf(), alias.to_path_buf()));
+        Ok(())
     }
 
     fn add_role_mounts(
