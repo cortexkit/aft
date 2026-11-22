@@ -160,7 +160,7 @@ fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
 #[cfg(unix)]
 #[tokio::test]
 async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution() {
-    use crate::subc::scope_watch::{revision, Source};
+    use aft_base::scope_watch::{revision, Source};
     use std::ffi::OsString;
     use std::os::unix::process::CommandExt;
     struct Session(std::process::Child);
@@ -515,8 +515,14 @@ fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
     if std::env::var_os(CHILD).is_none() {
         let home = tempfile::tempdir().unwrap();
         let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args(["--exact", "commands::rewrite_tests::bash_background::secrets::tests::secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").env("HOME", home.path());
+        let test = format!(
+            "{}::secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write",
+            module_path!().split_once("::").unwrap().1
+        );
+        command
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("HOME", home.path());
         for key in [
             "XDG_CONFIG_HOME",
             "XDG_CACHE_HOME",
@@ -530,7 +536,7 @@ fn secret_bash_sandbox_raise_real_spawn_blocks_off_profile_write() {
         }
         let output = command.output().unwrap();
         assert!(
-            output.status.success(),
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
             "{}\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
@@ -883,11 +889,17 @@ fn secret_bash_real_pipeline_background_pty_environment_and_key_scan() {
     // environment without racing unrelated tests' process-wide TLS cache.
     const CHILD: &str = "AFT_SECRET_BASH_NATIVE_TEST";
     if std::env::var_os(CHILD).is_none() {
+        let test = format!(
+            "{}::secret_bash_real_pipeline_background_pty_environment_and_key_scan",
+            module_path!().split_once("::").unwrap().1
+        );
         let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "commands::rewrite_tests::bash_background::secrets::tests::secret_bash_real_pipeline_background_pty_environment_and_key_scan", "--nocapture", "--test-threads=1"])
-            .env(CHILD, "1").output().unwrap();
+            .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
         assert!(
-            result.status.success(),
+            result.status.success() && String::from_utf8_lossy(&result.stdout).contains("1 passed"),
             "{}\n{}",
             String::from_utf8_lossy(&result.stdout),
             String::from_utf8_lossy(&result.stderr)

@@ -13,9 +13,7 @@ fn isolated(name: &str, run: impl FnOnce()) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!(
-                "commands::rewrite_tests::bash_background::secrets::tests::audit_followups::{name}"
-            ),
+            &format!("{}::{name}", module_path!().split_once("::").unwrap().1),
             "--nocapture",
             "--test-threads=1",
         ])
@@ -23,7 +21,7 @@ fn isolated(name: &str, run: impl FnOnce()) {
         .output()
         .unwrap();
     assert!(
-        output.status.success(),
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
         "{}\n{}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
@@ -419,7 +417,7 @@ fn audit_arm_failure_cleans_transferred_scratch() {
 fn audit_killing_revokes_before_term_grace() {
     isolated("audit_killing_revokes_before_term_grace", || {
         let f = Fixture::new();
-        use crate::subc::scope_watch::{revision, Source};
+        use aft_base::scope_watch::{revision, Source};
         let before_arm = revision(Source::Shell);
         let command = format!(
             "trap ':' TERM; : > ready; {}; {}; : > term-request; while :; do sleep 0.05; done",

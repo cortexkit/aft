@@ -27,7 +27,10 @@ fn bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes() {
     const SECRET: &str = "unpredictable-long-credential-value";
     const TICKET: &str = "d34db33f89ab01cd7654ef2098ac1357";
     let (_dir, ctx, task) = terminal_fixture();
-    super::default_kill_tests::assert_worker_wait_limit(&ctx);
+    assert_eq!(
+        crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx),
+        1_800_000
+    );
     let (mut metadata, buffer) = {
         let state = task.test_lock_state().unwrap();
         (state.metadata().clone(), state.buffer().clone())
@@ -68,7 +71,10 @@ fn bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes() {
 #[test]
 fn display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot() {
     let (_dir, ctx, task) = terminal_fixture();
-    super::default_kill_tests::assert_worker_wait_limit(&ctx);
+    assert_eq!(
+        crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx),
+        1_800_000
+    );
     let pin = crate::subc::tool_views::SHIPPED
         .keys()
         .find(|pin| pin.starts_with("tp1:bash:"))

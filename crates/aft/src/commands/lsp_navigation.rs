@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::{mpsc, Arc};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -10,33 +10,32 @@ use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 const DEFERRED_NAVIGATION_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct DeferredNavigationGate {
     started: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_NAVIGATION_GATE: LazyLock<Mutex<Option<DeferredNavigationGate>>> =
     LazyLock::new(|| Mutex::new(None));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_NAVIGATION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_NAVIGATION_WORKERS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
 type NavigationHandler = fn(&RawRequest, &AppContext) -> Response;
 
-#[cfg(test)]
-pub(crate) fn deferred_navigation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn deferred_navigation_test_lock() -> std::sync::MutexGuard<'static, ()> {
     DEFERRED_NAVIGATION_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(test)]
-pub(crate) fn install_deferred_navigation_gate_for_test(
-) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_deferred_navigation_gate_for_test() -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
     let (started_tx, started_rx) = mpsc::sync_channel(1);
     let (release_tx, release_rx) = mpsc::sync_channel(1);
     *DEFERRED_NAVIGATION_GATE
@@ -48,20 +47,20 @@ pub(crate) fn install_deferred_navigation_gate_for_test(
     (started_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_NAVIGATION_SEEN_RESTRICT: Mutex<Option<bool>> = Mutex::new(None);
 
 /// What `restrict_to_project_root` the last deferred navigation worker saw
 /// once past its test gate.
-#[cfg(test)]
-pub(crate) fn take_deferred_navigation_seen_restrict_for_test() -> Option<bool> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn take_deferred_navigation_seen_restrict_for_test() -> Option<bool> {
     DEFERRED_NAVIGATION_SEEN_RESTRICT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_deferred_navigation_config_for_test(ctx: &AppContext) {
     *DEFERRED_NAVIGATION_SEEN_RESTRICT
         .lock()
@@ -69,8 +68,8 @@ fn record_deferred_navigation_config_for_test(ctx: &AppContext) {
         Some(ctx.config().restrict_to_project_root);
 }
 
-#[cfg(test)]
-pub(crate) fn deferred_navigation_worker_count_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn deferred_navigation_worker_count_for_test() -> usize {
     DEFERRED_NAVIGATION_WORKERS.load(std::sync::atomic::Ordering::SeqCst)
 }
 
@@ -143,7 +142,7 @@ fn navigation_requires_deferred_execution(req: &RawRequest, ctx: &AppContext) ->
         .navigation_requires_deferred_execution(&file_path, &config)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_at_deferred_navigation_gate_for_test() {
     let gate = DEFERRED_NAVIGATION_GATE
         .lock()
@@ -164,13 +163,13 @@ fn wait_at_deferred_navigation_gate_for_test() {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn wait_at_deferred_navigation_gate_for_test() {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct DeferredNavigationWorkerGuard;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl DeferredNavigationWorkerGuard {
     fn new() -> Self {
         DEFERRED_NAVIGATION_WORKERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -178,7 +177,7 @@ impl DeferredNavigationWorkerGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for DeferredNavigationWorkerGuard {
     fn drop(&mut self) {
         DEFERRED_NAVIGATION_WORKERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
@@ -222,13 +221,13 @@ fn defer_lsp_navigation(
         let _io = crate::bounded_io::enter(io_budget);
         let _ask_route = crate::access_policy::ask_route_guard(Some(ask_route));
         let _grant_scope = crate::access_policy::scope_guard(grant_scope);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let _worker = DeferredNavigationWorkerGuard::new();
         let _config_pin = ctx.pin_config_to(admitted_config);
         let _cancellation = crate::executor::install_job_cancellation(worker_cancellation);
         let _force_restrict = force_restrict.then(|| ctx.force_restrict_guard(&request.id));
         wait_at_deferred_navigation_gate_for_test();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         record_deferred_navigation_config_for_test(&ctx);
         let response = if crate::executor::current_job_cancelled() {
             navigation_cancelled_response(&request.id, &request.command)

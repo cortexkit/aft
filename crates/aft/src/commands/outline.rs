@@ -3027,8 +3027,8 @@ fn discover_outline_files_with_options(
 /// The files and directories one outline walk discovers below `directory`
 /// (`files_mode` picks the files-mode walk), so tests outside this module can
 /// see what a walk yields without the request's earlier path checks.
-#[cfg(all(test, unix))]
-pub(crate) fn discover_outline_paths_for_test(directory: &Path, files_mode: bool) -> Vec<String> {
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub fn discover_outline_paths_for_test(directory: &Path, files_mode: bool) -> Vec<String> {
     let discovery = discover_outline_files_with_options(directory, files_mode);
     let mut paths = discovery.files;
     paths.extend(discovery.directories);

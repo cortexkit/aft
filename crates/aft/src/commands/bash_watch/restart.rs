@@ -235,7 +235,7 @@ static SETTLE_WATCH: OnceLock<SettleWatch> = OnceLock::new();
 pub fn register(settle: SettleWatch) {
     let _ = SETTLE_WATCH.set(settle);
 }
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn registered() -> bool {
     SETTLE_WATCH.get().is_some()
 }

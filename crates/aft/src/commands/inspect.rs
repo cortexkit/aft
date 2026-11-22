@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -141,43 +141,42 @@ impl InspectRequestDeadline {
 static DEFERRED_INSPECT_ROOTS: LazyLock<(Mutex<BTreeSet<PathBuf>>, Condvar)> =
     LazyLock::new(|| (Mutex::new(BTreeSet::new()), Condvar::new()));
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct DeferredInspectBodyGate {
     request_id: Option<String>,
     started: mpsc::SyncSender<()>,
     release: mpsc::Receiver<()>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_INSPECT_BODY_GATE: LazyLock<Mutex<Option<DeferredInspectBodyGate>>> =
     LazyLock::new(|| Mutex::new(None));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_INSPECT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DEFERRED_INSPECT_SHORT_CIRCUIT_TO_STAT: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-#[cfg(test)]
-pub(crate) fn deferred_inspect_test_lock() -> std::sync::MutexGuard<'static, ()> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn deferred_inspect_test_lock() -> std::sync::MutexGuard<'static, ()> {
     DEFERRED_INSPECT_TEST_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-#[cfg(test)]
-pub(crate) fn install_deferred_inspect_body_gate_for_test(
-) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_deferred_inspect_body_gate_for_test() -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
     install_deferred_inspect_body_gate(None)
 }
 
-#[cfg(test)]
-pub(crate) fn install_deferred_inspect_body_gate_for_request_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_deferred_inspect_body_gate_for_request_for_test(
     request_id: &str,
 ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
     install_deferred_inspect_body_gate(Some(request_id.to_string()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn install_deferred_inspect_body_gate(
     request_id: Option<String>,
 ) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
@@ -193,15 +192,14 @@ fn install_deferred_inspect_body_gate(
     (started_rx, release_tx)
 }
 
-#[cfg(test)]
-pub(crate) fn install_deferred_inspect_stat_gate_for_test(
-) -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_deferred_inspect_stat_gate_for_test() -> (mpsc::Receiver<()>, mpsc::SyncSender<()>) {
     DEFERRED_INSPECT_SHORT_CIRCUIT_TO_STAT.store(true, std::sync::atomic::Ordering::SeqCst);
     install_deferred_inspect_body_gate_for_test()
 }
 
-#[cfg(test)]
-pub(crate) fn deferred_inspect_root_count_for_test(ctx: &AppContext) -> usize {
+#[cfg(any(test, feature = "test-support"))]
+pub fn deferred_inspect_root_count_for_test(ctx: &AppContext) -> usize {
     // Unrelated inspect tests may hold permits for other roots in parallel.
     // Only this fixture's normalized root is evidence of its worker's lifetime.
     let config = ctx.config();
@@ -220,7 +218,7 @@ pub(crate) fn deferred_inspect_root_count_for_test(ctx: &AppContext) -> usize {
     )
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline, request_id: &str) {
     let mut slot = DEFERRED_INSPECT_BODY_GATE
         .lock()
@@ -253,19 +251,19 @@ fn wait_at_deferred_inspect_body_gate_for_test(deadline: InspectRequestDeadline,
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn wait_at_deferred_inspect_body_gate_for_test(
     _deadline: InspectRequestDeadline,
     _request_id: &str,
 ) {
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
     DEFERRED_INSPECT_SHORT_CIRCUIT_TO_STAT.swap(false, std::sync::atomic::Ordering::SeqCst)
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn take_deferred_inspect_stat_short_circuit_for_test() -> bool {
     false
 }

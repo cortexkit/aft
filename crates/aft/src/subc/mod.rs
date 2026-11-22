@@ -212,6 +212,10 @@ mod call_policy;
 pub(crate) mod call_yield;
 mod carrier_read_only;
 pub(crate) mod lower_hooks;
+#[cfg(test)]
+mod straddling_tests;
+#[cfg(test)]
+use aft_base::subc_fake;
 pub use lower_hooks::register_tool_callbacks;
 #[cfg(test)]
 mod tool_result_tests;
@@ -12816,7 +12820,7 @@ pub(crate) mod test_support {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(ctx),
+            crate::tools_test_support::deferred_inspect_root_count_for_test(ctx),
             0
         );
     }
@@ -12903,14 +12907,14 @@ pub(crate) mod test_support {
 
     #[test]
     fn deferred_inspect_releases_lane_for_bind_and_mutation() {
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("deferred-inspect-storm");
         std::fs::write(dir.path().join("README.md"), "# Fixture\n").expect("fixture");
         let ctx = inspect_context(dir.path());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, release_tx) =
-            crate::commands::inspect::install_deferred_inspect_stat_gate_for_test();
+            crate::tools_test_support::install_deferred_inspect_stat_gate_for_test();
         let (mut pending, _cancellation) =
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-storm");
         started_rx
@@ -12932,7 +12936,7 @@ pub(crate) mod test_support {
             );
         }
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
+            crate::tools_test_support::deferred_inspect_root_count_for_test(&ctx),
             1,
             "writer admissions must not finish the detached inspect"
         );
@@ -13012,14 +13016,14 @@ pub(crate) mod test_support {
 
     #[test]
     fn deferred_inspect_honors_the_shared_request_deadline() {
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("deferred-inspect-deadline");
         std::fs::write(dir.path().join("README.md"), "# Fixture\n").expect("fixture");
         let ctx = inspect_context_with_timeout(dir.path(), Some(10_000));
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+            crate::tools_test_support::install_deferred_inspect_body_gate_for_request_for_test(
                 "subc-inspect-deadline",
             );
         let started = Instant::now();
@@ -13059,15 +13063,15 @@ pub(crate) mod test_support {
 
     #[test]
     fn deferred_navigation_worker_keeps_the_admitted_config() {
-        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let _serial = crate::tools_test_support::deferred_navigation_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("deferred-navigation-admitted-config");
         let (ctx, source) = cold_navigation_context(dir.path());
         assert!(!ctx.config().restrict_to_project_root);
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, release_tx) =
-            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
-        let _ = crate::commands::lsp_navigation::take_deferred_navigation_seen_restrict_for_test();
+            crate::tools_test_support::install_deferred_navigation_gate_for_test();
+        let _ = crate::tools_test_support::take_deferred_navigation_seen_restrict_for_test();
         let (mut pending, cancellation) = submit_deferred_navigation_setup(
             &executor,
             &root,
@@ -13086,7 +13090,7 @@ pub(crate) mod test_support {
         let deadline = Instant::now() + Duration::from_secs(5);
         let seen = loop {
             if let Some(seen) =
-                crate::commands::lsp_navigation::take_deferred_navigation_seen_restrict_for_test()
+                crate::tools_test_support::take_deferred_navigation_seen_restrict_for_test()
             {
                 break seen;
             }
@@ -13104,13 +13108,13 @@ pub(crate) mod test_support {
 
     #[test]
     fn deferred_cold_navigation_releases_lsp_lane_for_reads_and_mutation() {
-        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let _serial = crate::tools_test_support::deferred_navigation_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("deferred-cold-navigation");
         let (ctx, source) = cold_navigation_context(dir.path());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+            crate::tools_test_support::install_deferred_navigation_gate_for_test();
         let (mut pending, cancellation) = submit_deferred_navigation_setup(
             &executor,
             &root,
@@ -13140,7 +13144,7 @@ pub(crate) mod test_support {
             );
         }
         assert_eq!(
-            crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test(),
+            crate::tools_test_support::deferred_navigation_worker_count_for_test(),
             1,
             "lane admissions must not finish the detached navigation"
         );
@@ -13149,7 +13153,7 @@ pub(crate) mod test_support {
         let terminal = wait_for_navigation_terminal(&mut pending, &ctx);
         assert!(!terminal.success);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0 {
+        while crate::tools_test_support::deferred_navigation_worker_count_for_test() != 0 {
             assert!(
                 Instant::now() < deadline,
                 "cancelled navigation worker did not settle"
@@ -13161,13 +13165,13 @@ pub(crate) mod test_support {
 
     #[test]
     fn cancelling_pending_navigation_removes_entry_without_reply() {
-        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let _serial = crate::tools_test_support::deferred_navigation_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("cancelled-pending-navigation");
         let (ctx, source) = cold_navigation_context(dir.path());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+            crate::tools_test_support::install_deferred_navigation_gate_for_test();
         let (pending, _cancellation) = submit_deferred_navigation_setup(
             &executor,
             &root,
@@ -13209,7 +13213,7 @@ pub(crate) mod test_support {
         assert!(registry.cancel_request(route, 71));
         assert!(registry.is_empty());
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0 {
+        while crate::tools_test_support::deferred_navigation_worker_count_for_test() != 0 {
             assert!(
                 Instant::now() < deadline,
                 "pending cancellation did not settle the detached worker"
@@ -13224,11 +13228,11 @@ pub(crate) mod test_support {
 
     #[tokio::test]
     async fn deferred_navigation_producer_notifies_completion() {
-        let _serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let _serial = crate::tools_test_support::deferred_navigation_test_lock();
         let (dir, _) = test_root("navigation-producer-wake");
         let (ctx, source) = cold_navigation_context(dir.path());
         let (started_rx, release_tx) =
-            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+            crate::tools_test_support::install_deferred_navigation_gate_for_test();
         let wake = crate::pending_response::DeferredResponseWake::default();
         let _scope = wake.install();
         let DispatchOutcome::Deferred(mut pending) =
@@ -13260,12 +13264,12 @@ pub(crate) mod test_support {
 
     #[tokio::test]
     async fn deferred_inspect_producer_notifies_completion() {
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let (dir, _) = test_root("inspect-producer-wake");
         std::fs::write(dir.path().join("README.md"), "# Fixture\n").unwrap();
         let ctx = inspect_context(dir.path());
         let (started_rx, release_tx) =
-            crate::commands::inspect::install_deferred_inspect_stat_gate_for_test();
+            crate::tools_test_support::install_deferred_inspect_stat_gate_for_test();
         let wake = crate::pending_response::DeferredResponseWake::default();
         let _scope = wake.install();
         let DispatchOutcome::Deferred(mut pending) =
@@ -13884,14 +13888,14 @@ pub(crate) mod test_support {
 
     #[test]
     fn same_root_deferred_inspects_are_single_flight() {
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("single-flight-deferred-inspect");
         std::fs::write(dir.path().join("README.md"), "# Fixture\n").expect("fixture");
         let ctx = inspect_context(dir.path());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, release_tx) =
-            crate::commands::inspect::install_deferred_inspect_stat_gate_for_test();
+            crate::tools_test_support::install_deferred_inspect_stat_gate_for_test();
         let (mut first, _first_cancellation) =
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-first");
         started_rx
@@ -13901,7 +13905,7 @@ pub(crate) mod test_support {
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-second");
 
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
+            crate::tools_test_support::deferred_inspect_root_count_for_test(&ctx),
             1,
             "only one detached body may run for a root"
         );
@@ -13910,7 +13914,7 @@ pub(crate) mod test_support {
         let second_terminal = wait_for_inspect_terminal(&mut second, &ctx);
         assert_eq!(second_terminal.data["inspect_terminal"], "interrupted");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
+            crate::tools_test_support::deferred_inspect_root_count_for_test(&ctx),
             1,
             "cancelling the queued request must not release the active flight"
         );
@@ -13919,7 +13923,7 @@ pub(crate) mod test_support {
         let first_terminal = wait_for_inspect_terminal(&mut first, &ctx);
         assert_eq!(first_terminal.data["inspect_terminal"], "fresh");
         assert_eq!(
-            crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx),
+            crate::tools_test_support::deferred_inspect_root_count_for_test(&ctx),
             0
         );
     }
@@ -13946,7 +13950,7 @@ pub(crate) mod test_support {
             epoch: 1,
         };
         let active: ActiveToolCalls = Arc::default();
-        let (started, release) = crate::commands::delete_file::install_delete_gate_for_test(&tree);
+        let (started, release) = crate::tools_test_support::install_delete_gate_for_test(&tree);
         let (pending_tx, pending_rx) = std::sync::mpsc::sync_channel(1);
         let worker_ctx = Arc::clone(&ctx);
         let setup = submit_active_tool_call(
@@ -14027,7 +14031,7 @@ pub(crate) mod test_support {
 
     #[test]
     fn route_abandonment_cancels_detached_inspect_thread() {
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("cancelled-deferred-inspect");
         std::fs::write(dir.path().join("README.md"), "# Fixture\n").expect("fixture");
@@ -14039,7 +14043,7 @@ pub(crate) mod test_support {
             epoch: 1,
         };
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_request_for_test(
+            crate::tools_test_support::install_deferred_inspect_body_gate_for_request_for_test(
                 "subc-inspect-abandoned",
             );
         let (mut pending, cancellation) =
@@ -14291,14 +14295,14 @@ pub(crate) mod test_support {
 
     #[test]
     fn shutdown_drain_emits_terminal_and_clears_pending_inspect() {
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let executor = Arc::new(Executor::new());
         let (dir, root) = test_root("shutdown-deferred-inspect");
         std::fs::write(dir.path().join("README.md"), "# Fixture\n").expect("fixture");
         let ctx = inspect_context(dir.path());
         executor.register_actor(root.clone(), Arc::clone(&ctx));
         let (started_rx, _release_tx) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::tools_test_support::install_deferred_inspect_body_gate_for_test();
         let (pending, cancellation) =
             submit_deferred_inspect_setup(&executor, &root, &ctx, "subc-inspect-shutdown");
         let route = RouteChannel {
@@ -14352,7 +14356,7 @@ pub(crate) mod test_support {
         );
         finish_active_tool_call(&active, route, 42);
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test(&ctx) != 0 {
+        while crate::tools_test_support::deferred_inspect_root_count_for_test(&ctx) != 0 {
             assert!(Instant::now() < deadline, "shutdown cancellation was inert");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -14366,8 +14370,8 @@ pub(crate) mod test_support {
     /// though it is also an active tool call, and reports ordinary calls apart.
     #[test]
     fn module_drain_answers_deferred_inspect_and_navigation_with_terminals() {
-        let _inspect_serial = crate::commands::inspect::deferred_inspect_test_lock();
-        let _navigation_serial = crate::commands::lsp_navigation::deferred_navigation_test_lock();
+        let _inspect_serial = crate::tools_test_support::deferred_inspect_test_lock();
+        let _navigation_serial = crate::tools_test_support::deferred_navigation_test_lock();
         let executor = Arc::new(Executor::new());
         let (inspect_dir, inspect_root) = test_root("drain-deferred-inspect");
         std::fs::write(inspect_dir.path().join("README.md"), "# Fixture\n").expect("fixture");
@@ -14378,7 +14382,7 @@ pub(crate) mod test_support {
         executor.register_actor(navigation_root.clone(), Arc::clone(&navigation_ctx));
 
         let (inspect_started_rx, _inspect_release) =
-            crate::commands::inspect::install_deferred_inspect_body_gate_for_test();
+            crate::tools_test_support::install_deferred_inspect_body_gate_for_test();
         let (inspect_pending, inspect_cancellation) = submit_deferred_inspect_setup(
             &executor,
             &inspect_root,
@@ -14389,7 +14393,7 @@ pub(crate) mod test_support {
             .recv_timeout(Duration::from_secs(1))
             .expect("detached inspect reaches its gate");
         let (navigation_started_rx, _navigation_release) =
-            crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
+            crate::tools_test_support::install_deferred_navigation_gate_for_test();
         let (navigation_pending, navigation_cancellation) = submit_deferred_navigation_setup(
             &executor,
             &navigation_root,
@@ -14501,8 +14505,8 @@ pub(crate) mod test_support {
         assert_eq!(by_corr[&52].data["retryable"], true);
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        while crate::commands::inspect::deferred_inspect_root_count_for_test(&inspect_ctx) != 0
-            || crate::commands::lsp_navigation::deferred_navigation_worker_count_for_test() != 0
+        while crate::tools_test_support::deferred_inspect_root_count_for_test(&inspect_ctx) != 0
+            || crate::tools_test_support::deferred_navigation_worker_count_for_test() != 0
         {
             assert!(
                 Instant::now() < deadline,
@@ -16872,7 +16876,7 @@ mod tests {
         // The inspect below must not run while a deferred-inspect test has
         // armed its process-wide stat short-circuit: this request could take
         // that short-circuit and answer with an empty fresh result.
-        let _serial = crate::commands::inspect::deferred_inspect_test_lock();
+        let _serial = crate::tools_test_support::deferred_inspect_test_lock();
         let (_root_dir, root) = test_root("quiesced-root-lsp");
         std::fs::write(
             root.as_path().join("Cargo.toml"),
@@ -19943,10 +19947,10 @@ mod tests {
         let mut tails_running = 0usize;
         let mut peak_tails = 0usize;
         let watcher_started = |root: &ProjectRootId| {
-            crate::commands::configure::configure_unit_records_for_root(root.as_path())
+            crate::tools_test_support::configure_unit_records_for_root(root.as_path())
                 .into_iter()
-                .find(|record| record.stage == "watcher")
-                .map(|record| record.finished_at)
+                .find(|record| record.stage() == "watcher")
+                .map(|record| record.finished_at())
         };
         loop {
             while let Ok((root, kind, requeue)) = done_rx.try_recv() {
@@ -20319,7 +20323,7 @@ mod tests {
         // The configure-tail maintenance tick, as the module loop runs it, and
         // the loop's submission of any replay that tick hands back.
         let (commit_reached, commit_release) =
-            crate::commands::configure::gate_configure_commit_for_test(canonical_root.clone());
+            crate::tools_test_support::gate_configure_commit_for_test(canonical_root.clone());
         let replay_response = Arc::new(parking_lot::Mutex::new(None));
         let standing = Arc::new(standing::StandingActor::new(
             ctx.app(),
@@ -20660,7 +20664,7 @@ mod tests {
         release: Option<crossbeam_channel::Sender<()>>,
         tail: Option<tokio::sync::oneshot::Receiver<Response>>,
         held_stage: &'static str,
-        _gate: crate::commands::configure::ConfigureTailStageGateGuard,
+        _gate: crate::tools_test_support::ConfigureTailStageGateGuard,
         _git_env: Option<crate::test_env::HermeticGitEnvGuard>,
     }
 
@@ -20684,7 +20688,7 @@ mod tests {
         fn start_on(executor: Arc<Executor>, held_stage: &'static str) -> Self {
             let configured = ConfiguredRoot::new(&executor);
             let (gate, tail_held, release) =
-                crate::commands::configure::gate_configure_tail_stage_for_test(
+                crate::tools_test_support::gate_configure_tail_stage_for_test(
                     configured.canonical_root.clone(),
                     held_stage,
                 );
@@ -20863,12 +20867,12 @@ mod tests {
         // first bind's, and the root-scoped tail stages ran exactly once.
         assert_eq!(fixture.ctx.configure_generation(), generation);
         let records =
-            crate::commands::configure::configure_unit_records_for_root(&fixture.canonical_root);
+            crate::tools_test_support::configure_unit_records_for_root(&fixture.canonical_root);
         for stage in ["project_runtime", "watcher", "process_flags"] {
             assert_eq!(
                 records
                     .iter()
-                    .filter(|record| record.stage == stage)
+                    .filter(|record| record.stage() == stage)
                     .count(),
                 1,
                 "{stage} ran more than once: {records:?}"
@@ -21125,7 +21129,7 @@ mod tests {
                     .expect("saturate the root's cold-build limiter"),
             );
             let (gate, _held, release) =
-                crate::commands::configure::gate_configure_tail_stage_for_test(
+                crate::tools_test_support::gate_configure_tail_stage_for_test(
                     root.canonical_root.clone(),
                     "process_flags",
                 );

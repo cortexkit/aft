@@ -241,9 +241,6 @@ pub(crate) use aft_engine::status_push;
 pub(crate) use aft_engine::status_snapshot;
 pub mod subc;
 pub use aft_base::subc_config;
-#[cfg(test)]
-#[path = "../tests/helpers/subc_fake.rs"]
-mod subc_fake;
 pub mod subc_format;
 pub mod subc_translate;
 pub use aft_engine::symbol_diff;
@@ -294,10 +291,13 @@ pub(crate) use aft_base::test_gate;
 pub(crate) use aft_base::test_support;
 #[cfg(test)]
 pub(crate) use aft_engine::test_bridge::test_env;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod tools_test_support;
+#[cfg(any(test, feature = "test-support"))]
 mod upper_test_context;
 #[cfg(test)]
-pub(crate) use upper_test_context::{test_app, test_context};
+pub(crate) use tools_test_support::{test_app, test_context};
 // The fake LSP builder also compiles in integration tests under this helper name.
 #[cfg(test)]
 use test_support as test_helpers;

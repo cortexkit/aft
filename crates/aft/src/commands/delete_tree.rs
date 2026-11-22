@@ -522,7 +522,7 @@ pub(crate) fn delete_recorded_tree(
             children.entry(parent).or_default().push(entry);
         }
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     crate::commands::delete_file::delete_gate_for_test(&root.path);
     platform::delete_tree(root, &children, &mut progress, req_id, authorize).map_err(|mut error| {
         error.files_deleted = progress.files;

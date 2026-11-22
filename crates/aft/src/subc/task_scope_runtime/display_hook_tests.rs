@@ -131,7 +131,7 @@ fn daemon_startup_hooks_publish_display_and_shipped_views() {
                 )
                 .await
                 .unwrap();
-                let hello = crate::subc_fake::read_frame(&mut stream)
+                let hello = crate::subc::subc_fake::read_frame(&mut stream)
                     .await
                     .unwrap()
                     .unwrap();

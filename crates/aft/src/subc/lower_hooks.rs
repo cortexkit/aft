@@ -102,7 +102,7 @@ mod tests {
         assert!(aft_engine::test_bridge::bash_remote::bash_background::frames::registered());
         assert!(aft_engine::test_bridge::search_misc::edit::file_reporter_registered());
         assert!(crate::db::call_ledger::held_result_projector_registered());
-        assert!(crate::commands::bash_watch::restart::registered());
+        assert!(crate::tools_test_support::watch_restart_registered());
         assert!(late_result_bus::hooks().is_some());
     }
 

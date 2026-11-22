@@ -600,8 +600,8 @@ mod tests {
 
     #[test]
     fn route_census_shows_running_bash_and_watch_without_reading_output_or_waiting_on_state() {
-        use crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture;
         use crate::task_watches::WatchPattern;
+        use crate::tools_test_support::wait_fixture;
         let (dir, ctx, task) = wait_fixture(None);
         let root = ProjectRootId::from_path(dir.path()).unwrap();
         let registry = ctx.bash_background();
