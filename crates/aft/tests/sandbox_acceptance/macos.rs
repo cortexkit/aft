@@ -114,7 +114,7 @@ impl Keychain {
             );
             keychain.git_item = Some(GitItem::seed(host, account_home, helper, copy_host, copy));
         } else {
-            eprintln!("osxkeychain item not tested: only the Mac mini CI runner provisions a default keychain for this probe");
+            eprintln!("git osxkeychain helper not tested: set AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN=1 only on a runner whose processes run in a user login session");
         }
         keychain
     }

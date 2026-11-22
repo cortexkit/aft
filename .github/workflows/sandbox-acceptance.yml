@@ -96,8 +96,9 @@ jobs:
     # MOTOR manages the build fleet that normally shares this host.
     # Each job timeout includes 50 minutes for MOTOR to drain the fleet VMs.
     timeout-minutes: 95
-    env:
-      AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN: '1'
+    # The git osxkeychain oracle stays off here (no AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN):
+    # the runner's processes have no user login session, so the helper sees
+    # the System keychain. The security CLI pair still measures the keychain block.
     steps:
       - uses: actions/checkout@v5
         id: checkout
