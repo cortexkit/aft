@@ -61,12 +61,12 @@ def reconcile(before, after, platform):
 
     missing, extra = expected - actual, actual - expected
     if missing or extra:
-        raise ValueError(f'{missing.total()} missing, {extra.total()} extra\n'
+        raise ValueError(f'{sum(missing.values())} missing, {sum(extra.values())} extra\n'
                          f'missing: {sorted(missing.items())[:40]}\n'
                          f'extra: {sorted(extra.items())[:40]}')
     digest = hashlib.sha256(''.join('\t'.join(row) + '\n' for row in sorted(actual.elements())).encode())
-    print(f'{platform}: {original.total()} baseline, {moved_new.total()} moved, '
-          f'{sum(additions.values())} added, {actual.total()} current, 0 missing, 0 extra; '
+    print(f'{platform}: {sum(original.values())} baseline, {sum(moved_new.values())} moved, '
+          f'{sum(additions.values())} added, {sum(actual.values())} current, 0 missing, 0 extra; '
           f'sha256={digest.hexdigest()}')
 
 

@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 
 fn isolated(name: &str, run: impl FnOnce()) {
     if std::env::var("AFT_S4_AUDIT_CHILD").as_deref() == Ok(name) {
-        run();
+        // These cases exercise the real launcher and proxy after launch admission.
+        // A host that hides the Yama sysctl should not decide that admission.
+        with_safe_ptrace(run);
         return;
     }
     let output = std::process::Command::new(std::env::current_exe().unwrap())
