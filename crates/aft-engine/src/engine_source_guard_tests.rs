@@ -22,7 +22,7 @@ const UPPER: &[&str] = &[
     "upper_test_context",
     "test_context",
 ];
-const REGISTERING_HELPER: &str = "upper_test_context.rs";
+const REGISTERING_HELPER: &str = "aft-tools/src/upper_test_context.rs";
 
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     &source[node.byte_range()]
@@ -263,8 +263,6 @@ enum Scan {
 #[derive(Clone, Copy, Default)]
 struct Scope {
     inline: bool,
-    root: bool,
-    upper: bool,
     test: bool,
 }
 
@@ -296,7 +294,7 @@ impl Guard {
     fn file(&mut self, path: &Path, module_dir: &Path, scope: Scope, aliases: &[&str]) {
         let source =
             std::fs::read_to_string(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-        if scope.upper {
+        if matches!(self.scan, Scan::UpperRegistration) {
             self.upper_files.insert(path.canonicalize().unwrap());
         }
         self.source(path, module_dir, scope, &source, aliases);
@@ -311,6 +309,9 @@ impl Guard {
         aliases: &[&str],
     ) {
         scope.test |= ignored_file(path.strip_prefix(&self.root).unwrap_or(path));
+        // The registering helper also builds as a test-support library input.
+        scope.test |= matches!(self.scan, Scan::UpperRegistration)
+            && path == self.root.join(REGISTERING_HELPER);
         scope.inline = false;
         let syntax = self.parser.parse(source, None).unwrap();
         self.walk(syntax.root_node(), path, module_dir, scope, source, aliases);
@@ -330,9 +331,6 @@ impl Guard {
             child.kind() == "inner_attribute_item"
                 && attribute(*child).is_some_and(|attr| test_cfg(attr, source))
         });
-        if !self.visits(scope) {
-            return;
-        }
         let mut aliases = outer_aliases.to_vec();
         if matches!(self.scan, Scan::UpperRegistration) {
             for child in &kids {
@@ -362,29 +360,26 @@ impl Guard {
                     &aliases,
                 );
             } else {
-                child_scope.root = false;
-                if self.visits(child_scope) {
-                    if let Some((included, expands)) = included_rust(child, source) {
-                        let file = path.parent().unwrap().join(included);
-                        let upper = matches!(self.scan, Scan::Engine)
-                            && file
-                                .canonicalize()
-                                .is_ok_and(|file| self.upper_files.contains(&file));
-                        if upper {
-                            self.report(child, path, source);
-                        } else if expands {
-                            self.file(&file, module_dir, child_scope, &aliases);
-                        }
+                if let Some((included, expands)) = included_rust(child, source) {
+                    let file = path.parent().unwrap().join(included);
+                    let upper = matches!(self.scan, Scan::Engine)
+                        && file
+                            .canonicalize()
+                            .is_ok_and(|file| self.upper_files.contains(&file));
+                    if upper {
+                        self.report(child, path, source);
+                    } else if expands {
+                        self.file(&file, module_dir, child_scope, &aliases);
                     }
-                    match self.scan {
-                        Scan::Engine => self.check(child, path, source),
-                        Scan::UpperRegistration if child_scope.test => {
-                            self.check_registration(child, path, source, &aliases);
-                        }
-                        Scan::UpperRegistration => {}
-                    }
-                    self.walk(child, path, module_dir, child_scope, source, &aliases);
                 }
+                match self.scan {
+                    Scan::Engine => self.check(child, path, source),
+                    Scan::UpperRegistration if child_scope.test => {
+                        self.check_registration(child, path, source, &aliases);
+                    }
+                    Scan::UpperRegistration => {}
+                }
+                self.walk(child, path, module_dir, child_scope, source, &aliases);
             }
             attrs.clear();
         }
@@ -401,11 +396,6 @@ impl Guard {
         aliases: &[&str],
     ) {
         let name = text(node.child_by_field_name("name").unwrap(), source);
-        scope.upper |= scope.root && UPPER.contains(&name);
-        scope.root = false;
-        if !self.visits(scope) {
-            return;
-        }
         let override_path = attrs
             .iter()
             .filter_map(|it| attribute(*it))
@@ -437,13 +427,6 @@ impl Guard {
                 default_dir.join("mod.rs")
             };
             self.file(&file, &default_dir, scope, aliases);
-        }
-    }
-
-    fn visits(&self, scope: Scope) -> bool {
-        match self.scan {
-            Scan::Engine => true,
-            Scan::UpperRegistration => scope.root || scope.upper,
         }
     }
 
@@ -504,13 +487,13 @@ impl Guard {
 fn production_engine_sources_do_not_reach_the_upper_crate() {
     let manifest = crate::test_helpers::manifest_dir();
     let root = manifest.join("src");
-    let upper = manifest.join("../aft/src");
-    let scope = Scope {
-        root: true,
-        ..Scope::default()
-    };
-    let mut registration = Guard::new(&upper, Scan::UpperRegistration);
-    registration.file(&upper.join("lib.rs"), &upper, scope, &[]);
+    let crates = manifest.join("..");
+    let scope = Scope::default();
+    let mut registration = Guard::new(&crates, Scan::UpperRegistration);
+    for name in ["aft", "aft-tools", "aft-subc"] {
+        let upper = crates.join(name).join("src");
+        registration.file(&upper.join("lib.rs"), &upper, scope, &[]);
+    }
     assert!(
         registration.findings.is_empty(),
         "use crate::test_context in upper library tests:\n{}",
@@ -551,10 +534,7 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
     std::fs::write(root.join("test_only.rs"), "use crate::commands::test_only;").unwrap();
     std::fs::write(root.join("sibling.rs"), "use crate::{commands::sibling};").unwrap();
     std::fs::write(root.join("commands.rs"), "").unwrap();
-    let scope = Scope {
-        root: true,
-        ..Scope::default()
-    };
+    let scope = Scope::default();
     let mut guard = Guard::new(root, Scan::Engine);
     guard
         .upper_files
@@ -608,13 +588,13 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
             fn standalone() { aft::context::AppContext::new(); }
         }
         #[cfg(test)]
-        mod engine_tests { fn keep() { AppContext::new(); } }
+        mod any_upper_module { fn direct() { AppContext::new(); } }
         "#,
         &[],
     );
     assert_eq!(
         registration.findings.len(),
-        4,
+        5,
         "{:?}",
         registration.findings
     );
@@ -623,6 +603,7 @@ fn production_engine_source_guard_distinguishes_test_code_and_path_segments() {
         "Alias::new()",
         "Outer::new()",
         "aft::context::AppContext::new()",
+        "AppContext::new()",
     ]) {
         assert!(finding.contains(expected), "{finding}");
     }

@@ -796,7 +796,7 @@ mod tests {
     #[test]
     fn disabled_callgraph_is_terminal_instead_of_retrying() {
         let storage = tempfile::tempdir().unwrap();
-        let ctx = AppContext::new(
+        let ctx = crate::test_context(
             Box::new(TreeSitterProvider::new()),
             Config {
                 storage_dir: Some(storage.path().to_path_buf()),

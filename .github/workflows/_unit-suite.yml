@@ -86,13 +86,15 @@ jobs:
         run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
-      - name: Audit native engine compiler inputs (Linux)
+      - name: Audit native compiler inputs (Linux)
         run: |
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
-      - name: Audit packaged engine test-support inputs
+      - name: Audit packaged library test inputs
         run: |
-          cargo check --locked -p aft-engine --lib --features test-support,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-packaged-build.jsonl"
+          cargo check --locked -p aft-engine -p aft-tools -p aft-subc --lib \
+            --features aft-engine/test-support,aft-engine/test-hooks,aft-tools/test-support,aft-tools/test-hooks,aft-subc/test-hooks,aft-subc/test-runner-notice-fixtures \
+            --message-format=json > "$RUNNER_TEMP/aft-engine-packaged-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-packaged-build.jsonl" --packaged
       - name: Engine source and shell registration guards (default features)
         run: |
@@ -940,7 +942,7 @@ jobs:
           path: target/cargo-timings/
           if-no-files-found: error
 
-      - name: Audit native engine compiler inputs (macOS)
+      - name: Audit native compiler inputs (macOS)
         run: |
           # Keep the archive's codegen setting so Cargo can reuse its libtest build.
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
