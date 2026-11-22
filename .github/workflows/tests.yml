@@ -147,14 +147,24 @@ jobs:
         run: |
           python3 scripts/check-crate-source-paths.py --self-test
           python3 scripts/check-crate-source-paths.py
-      - name: Keep engine dependencies below the daemon edge
+      - name: Keep dependencies pointing down the AFT crate stack
         run: |
           python3 crates/aft-engine/checks/dependency-direction.py
-          for fixture in direct-dev two-hop-dev-build; do
+          for fixture in crates/aft-engine/checks/fixtures/*.json; do
+            case "${fixture##*/}" in
+              direct-dev.json|two-hop-dev-build.json) pair="aft-engine -> agent-file-tools" ;;
+              engine-to-tools-*.json) pair="aft-engine -> aft-tools" ;;
+              engine-to-subc.json) pair="aft-engine -> aft-subc" ;;
+              tools-to-subc-*.json) pair="aft-tools -> aft-subc" ;;
+              tools-to-facade.json) pair="aft-tools -> agent-file-tools" ;;
+              subc-to-facade.json) pair="aft-subc -> agent-file-tools" ;;
+              *) echo "::error::Dependency direction fixture $fixture has no expected pair"; exit 1 ;;
+            esac
             status=0
-            python3 crates/aft-engine/checks/dependency-direction.py --metadata "crates/aft-engine/checks/fixtures/$fixture.json" || status=$?
-            if [ "$status" -ne 1 ]; then
-              echo "::error::Dependency direction fixture $fixture must exit 1, got $status"
+            stderr=$(python3 crates/aft-engine/checks/dependency-direction.py --metadata "$fixture" 2>&1 >/dev/null) || status=$?
+            printf '%s\n' "$stderr" >&2
+            if [[ "$status" -ne 1 || "$stderr" != *"forbidden dependency: $pair (path: "* ]]; then
+              echo "::error::Dependency direction fixture $fixture must exit 1 and report $pair in stderr; got exit $status"
               exit 1
             fi
           done

@@ -1,0 +1,17 @@
+{
+  "packages": [
+    {"id": "aft-engine", "name": "aft-engine"},
+    {"id": "helper", "name": "helper"},
+    {"id": "aft-tools", "name": "aft-tools"}
+  ],
+  "workspace_members": ["aft-engine", "helper", "aft-tools"],
+  "resolve": {"nodes": [
+    {"id": "aft-engine", "deps": [
+      {"pkg": "helper", "dep_kinds": [{"kind": null, "target": null}]}
+    ]},
+    {"id": "helper", "deps": [
+      {"pkg": "aft-tools", "dep_kinds": [{"kind": "dev", "target": "cfg(windows)"}]}
+    ]},
+    {"id": "aft-tools", "deps": []}
+  ]}
+}

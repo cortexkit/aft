@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {"id": "aft-subc", "name": "aft-subc"},
+    {"id": "agent-file-tools", "name": "agent-file-tools"}
+  ],
+  "workspace_members": ["aft-subc", "agent-file-tools"],
+  "resolve": {"nodes": [
+    {"id": "aft-subc", "deps": [
+      {"pkg": "agent-file-tools", "dep_kinds": [{"kind": "dev", "target": null}]}
+    ]},
+    {"id": "agent-file-tools", "deps": []}
+  ]}
+}
