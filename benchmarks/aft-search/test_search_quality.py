@@ -526,6 +526,7 @@ class PageZeroProjectionTests(unittest.TestCase):
 
 class ToolSchemaFenceTests(unittest.TestCase):
     path = "crates/aft/src/subc_tool_schemas.json"
+    moved_path = "crates/aft-subc/src/subc_tool_schemas.json"
 
     def setUp(self) -> None:
         self.base: dict[str, Any] = {
@@ -638,23 +639,76 @@ class ToolSchemaFenceTests(unittest.TestCase):
 
     def test_blob_reader_uses_merge_base_and_explicit_head_not_worktree(self) -> None:
         with mock.patch("search_quality_lib.subprocess.run") as git:
-            git.side_effect = [mock.Mock(returncode=0, stdout=b"merge-base-sha\n"), mock.Mock(returncode=0, stdout=b"base"), mock.Mock(returncode=0, stdout=b"head")]
+            git.side_effect = [
+                mock.Mock(returncode=0, stdout=b"merge-base-sha\n"),
+                mock.Mock(returncode=0, stdout=b"base"), mock.Mock(returncode=1),
+                mock.Mock(returncode=0, stdout=b"head"), mock.Mock(returncode=1),
+            ]
             root = Path("/repo")
             self.assertEqual(read_tool_schema_blobs("base-ref", "head-ref", [self.path], root=root), (b"base", b"head"))
             self.assertEqual([call.args[0] for call in git.call_args_list], [
                 ["git", "merge-base", "base-ref", "head-ref"],
                 ["git", "show", f"merge-base-sha:{self.path}"],
+                ["git", "show", f"merge-base-sha:{self.moved_path}"],
                 ["git", "show", f"head-ref:{self.path}"],
+                ["git", "show", f"head-ref:{self.moved_path}"],
             ])
             self.assertTrue(all(call.kwargs["cwd"] == root for call in git.call_args_list))
 
     def test_blob_reader_leaves_missing_head_for_fail_closed_classification(self) -> None:
         with mock.patch("search_quality_lib.subprocess.run") as git:
-            git.side_effect = [mock.Mock(returncode=0, stdout=b"base-sha\n"), mock.Mock(returncode=0, stdout=b"base"), mock.Mock(returncode=1, stdout=b"")]
+            git.side_effect = [
+                mock.Mock(returncode=0, stdout=b"base-sha\n"),
+                mock.Mock(returncode=0, stdout=b"base"), mock.Mock(returncode=1),
+                mock.Mock(returncode=1), mock.Mock(returncode=1),
+            ]
             self.assertEqual(read_tool_schema_blobs("base", "head", [self.path], root=Path("/repo")), (b"base", None))
         with mock.patch("search_quality_lib.subprocess.run") as git:
             self.assertIsNone(read_tool_schema_blobs("base", "head", ["README.md"], root=Path("/repo")))
             git.assert_not_called()
+
+    def test_blob_reader_follows_schema_rename_across_revisions(self) -> None:
+        blob = json.dumps(self.base).encode()
+        with mock.patch("search_quality_lib.subprocess.run") as git:
+            git.side_effect = [
+                mock.Mock(returncode=0, stdout=b"base-sha\n"),
+                mock.Mock(returncode=0, stdout=blob), mock.Mock(returncode=1),
+                mock.Mock(returncode=1), mock.Mock(returncode=0, stdout=blob),
+            ]
+            paths = [self.path, self.moved_path]
+            blobs = read_tool_schema_blobs("base", "head", paths, root=Path("/repo"))
+        self.assertEqual(blobs, (blob, blob))
+        self.assertEqual(derive_slice_class(paths, schema_blobs=blobs), "non_ranking")
+
+    def test_moved_schema_search_only_diff_stays_fenced(self) -> None:
+        head = copy.deepcopy(self.base)
+        head["search"]["properties"]["query"]["description"] = "New search guidance"
+        before, after = json.dumps(self.base).encode(), json.dumps(head).encode()
+        with mock.patch("search_quality_lib.subprocess.run") as git:
+            git.side_effect = [
+                mock.Mock(returncode=0, stdout=b"base-sha\n"),
+                mock.Mock(returncode=1), mock.Mock(returncode=0, stdout=before),
+                mock.Mock(returncode=1), mock.Mock(returncode=0, stdout=after),
+            ]
+            paths = [self.moved_path]
+            blobs = read_tool_schema_blobs("base", "head", paths, root=Path("/repo"))
+        self.assertEqual(blobs, (before, after))
+        notes = []
+        self.assertEqual(derive_slice_class(paths, schema_blobs=blobs, notes=notes), "ranking")
+        self.assertEqual(notes, [f"ranking_fence:{self.moved_path}:search_or_shared_changed"])
+
+    def test_duplicate_schema_locations_fail_closed(self) -> None:
+        blob = json.dumps(self.base).encode()
+        with mock.patch("search_quality_lib.subprocess.run") as git:
+            git.side_effect = [
+                mock.Mock(returncode=0, stdout=b"base-sha\n"),
+                mock.Mock(returncode=0, stdout=blob), mock.Mock(returncode=1),
+                mock.Mock(returncode=0, stdout=blob), mock.Mock(returncode=0, stdout=blob),
+            ]
+            paths = [self.moved_path]
+            blobs = read_tool_schema_blobs("base", "head", paths, root=Path("/repo"))
+        self.assertEqual(blobs, (blob, None))
+        self.assertEqual(derive_slice_class(paths, schema_blobs=blobs), "ranking")
 
     def test_diff_paths_keeps_deleted_schema_path_visible_even_for_a_rename(self) -> None:
         with mock.patch("search_quality.subprocess.run", return_value=mock.Mock(returncode=0, stdout=self.path + "\n")) as git:
@@ -733,6 +787,7 @@ class EngineUnwiredGateTests(unittest.TestCase):
     def test_split_preserves_ranking_fence_at_each_moved_owner(self) -> None:
         source = "crates/aft/src/"
         engine = "crates/aft-engine/src/"
+        tools = "crates/aft-tools/src/"
         semantic = source + "commands/semantic_search/"
         engine_state = engine + "search_state/"
         moves = [
@@ -755,8 +810,13 @@ class EngineUnwiredGateTests(unittest.TestCase):
         ]
         moves += [(source + "lib.rs", f"crates/{crate}/src/lib.rs") for crate in ("aft-base", "aft-db", "aft-parse")]
         moves += [
-            (source + "search_b2/" + file, semantic + "planner/" + file)
+            (source + "search_b2/" + file, tools + "commands/semantic_search/planner/" + file)
             for file in ("lane_plan.rs", "readiness.rs")
+        ]
+        moves += [
+            (source + "commands/semantic_search.rs", tools + "commands/semantic_search/mod.rs"),
+            (semantic + "scoring.rs", tools + "commands/semantic_search/scoring.rs"),
+            (source + "lib.rs", tools + "lib.rs"),
         ]
         moves += [
             (semantic + file, engine_state + file)
@@ -772,15 +832,15 @@ class EngineUnwiredGateTests(unittest.TestCase):
                 self.assertEqual(derive_slice_class([old]), "ranking")
                 self.assertEqual(derive_slice_class([new]), derive_slice_class([old]))
 
-    def test_either_crate_root_requires_and_accepts_the_split_descriptor(self) -> None:
+    def test_facade_tools_and_engine_roots_require_and_accept_the_split_descriptor(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        descriptor_path = root / "benchmarks/aft-search/slice-descriptors/crate-split-step3.json"
+        descriptor_path = root / "benchmarks/aft-search/slice-descriptors/crate-split-step4.json"
         descriptor = json.loads(descriptor_path.read_text())
         self.assertIn(TOOL_CALL_PARITY_FIXTURE_SOURCE, descriptor["fixtures"])
         for fixture in descriptor["fixtures"]:
             self.assertTrue((root / fixture).is_file(), fixture)
 
-        for crate in ("aft", "aft-engine"):
+        for crate in ("aft", "aft-tools", "aft-engine"):
             path = f"crates/{crate}/src/lib.rs"
             with self.subTest(path=path):
                 derived, missing_ranking = resolve_descriptor(None, [path])

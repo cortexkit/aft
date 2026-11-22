@@ -56,6 +56,7 @@ METRICS = ("mrr_at_10", "hit_at_1", "hit_at_5")
 RANKING_FENCE_PREFIXES = (
     "crates/aft/src/commands/semantic_search.rs",
     "crates/aft/src/commands/semantic_search/",
+    "crates/aft-tools/src/commands/semantic_search/",
     # Keep former owners fenced too: the merge queue can compare against a
     # revision before the split, where deletions still appear at those paths.
     "crates/aft/src/search_index.rs",
@@ -71,6 +72,7 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft-base/src/ort_pin.rs",
     "crates/aft/src/embed/",
     "crates/aft/src/lib.rs",
+    "crates/aft-tools/src/lib.rs",
     "crates/aft-engine/src/lib.rs",
     "crates/aft-base/src/lib.rs",
     "crates/aft-db/src/lib.rs",
@@ -100,7 +102,10 @@ RANKING_FENCE_PREFIXES = (
     "packages/opencode-plugin/src/__tests__/semantic",
     "benchmarks/aft-search/engine-fixtures/",
 )
-TOOL_SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json"
+TOOL_SCHEMA_PATHS = (
+    "crates/aft/src/subc_tool_schemas.json",
+    "crates/aft-subc/src/subc_tool_schemas.json",
+)
 # Only these known tool entries can be excluded from the search surface. New
 # catalog keys remain shared until reviewed, rather than silently bypassing it.
 NON_SEARCH_SCHEMA_ENTRIES = frozenset({
@@ -688,19 +693,28 @@ def validate_scored_population(manifest: Mapping[str, Any], score: Mapping[str, 
 
 def read_tool_schema_blobs(base: str | None, head: str, paths: Sequence[str], *, root: Path) -> tuple[bytes | None, bytes | None] | None:
     """Read committed blobs from the same merge-base diff used for path names."""
-    if TOOL_SCHEMA_PATH not in paths:
+    if not any(path in paths for path in TOOL_SCHEMA_PATHS):
         return None
     if not base:
         return (None, None)
+
+    def read_revision(revision: str) -> bytes | None:
+        # Resolve the location on each side independently so a rename compares
+        # the two artifacts. If both locations exist, neither is authoritative.
+        blob = None
+        for path in TOOL_SCHEMA_PATHS:
+            result = subprocess.run(["git", "show", f"{revision}:{path}"], cwd=root, capture_output=True, check=False)
+            if result.returncode == 0:
+                if blob is not None:
+                    return None
+                blob = result.stdout
+        return blob
+
     try:
         merge_base = subprocess.run(["git", "merge-base", base, head], cwd=root, capture_output=True, check=False)
         if merge_base.returncode:
             return (None, None)
-        blobs = []
-        for revision in (merge_base.stdout.decode().strip(), head):
-            result = subprocess.run(["git", "show", f"{revision}:{TOOL_SCHEMA_PATH}"], cwd=root, capture_output=True, check=False)
-            blobs.append(result.stdout if result.returncode == 0 else None)
-        return (blobs[0], blobs[1])
+        return (read_revision(merge_base.stdout.decode().strip()), read_revision(head))
     except (OSError, UnicodeError):
         return (None, None)
 
@@ -768,7 +782,7 @@ def _search_schema_surface(blob: bytes | None, side: str) -> dict[str, Any]:
     return surface
 
 
-def _tool_schema_fenced(schema_blobs: tuple[bytes | None, bytes | None] | None, notes: list[str]) -> bool:
+def _tool_schema_fenced(schema_blobs: tuple[bytes | None, bytes | None] | None, path: str, notes: list[str]) -> bool:
     try:
         if schema_blobs is None:
             raise InputFault("comparison_unavailable")
@@ -779,7 +793,7 @@ def _tool_schema_fenced(schema_blobs: tuple[bytes | None, bytes | None] | None, 
     except (InputFault, RecursionError, UnicodeError) as error:
         fenced = True
         reason = f"fail_closed:{error}"
-    notes.append(f"ranking_fence:{TOOL_SCHEMA_PATH}:{reason}")
+    notes.append(f"ranking_fence:{path}:{reason}")
     return fenced
 
 
@@ -797,7 +811,8 @@ def _same_json_value(left: Any, right: Any) -> bool:
 def derive_slice_class(paths: Sequence[str], *, schema_blobs: tuple[bytes | None, bytes | None] | None = None, notes: list[str] | None = None) -> str:
     if not isinstance(paths, list) or any(not isinstance(path, str) or path.startswith("/") or ".." in Path(path).parts for path in paths):
         raise InputFault("unresolvable_diff")
-    schema_fenced = TOOL_SCHEMA_PATH in paths and _tool_schema_fenced(schema_blobs, notes if notes is not None else [])
+    schema_path = next((path for path in reversed(TOOL_SCHEMA_PATHS) if path in paths), None)
+    schema_fenced = schema_path is not None and _tool_schema_fenced(schema_blobs, schema_path, notes if notes is not None else [])
     return "ranking" if schema_fenced or any(any(path == prefix or path.startswith(prefix) for prefix in RANKING_FENCE_PREFIXES) for path in paths) else "non_ranking"
 
 
