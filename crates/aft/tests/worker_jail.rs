@@ -464,12 +464,12 @@ impl Jail {
 
     #[cfg(target_os = "macos")]
     async fn relaxed(standalone: bool) -> Self {
-        Self::start_with_profile(None, None, true, "relaxed", standalone).await
+        Self::start_with_profile(None, None, true, "standard", standalone).await
     }
 
     #[cfg(target_os = "macos")]
     async fn relaxed_with_env(configure: impl FnOnce(&Path, &mut Command)) -> Self {
-        Self::start_with_layout_and_env(None, None, true, "relaxed", false, false, configure).await
+        Self::start_with_layout_and_env(None, None, true, "standard", false, false, configure).await
     }
 
     async fn start_with_profile(
@@ -1135,7 +1135,7 @@ impl Jail {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn worker_allow_paths_bash_writes_work_grant_but_not_siblings() {
-    for profile in ["relaxed", "strict"] {
+    for profile in ["standard", "strict"] {
         let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
         jail.bind_grant_head().await;
         // Wait for persistence before catalog materializes the worker's grants.
@@ -1224,7 +1224,7 @@ async fn granted_checkout_fixture(profile: &str) -> (Jail, Vec<(PathBuf, PathBuf
 
 #[cfg(target_os = "macos")]
 async fn assert_granted_checkout_control_denied(relative: &str, git_control: bool) {
-    for profile in ["relaxed", "strict"] {
+    for profile in ["standard", "strict"] {
         let (mut jail, checkouts) = granted_checkout_fixture(profile).await;
         for (root, git_dir) in checkouts {
             let working = root.join("working-file");
@@ -1289,7 +1289,7 @@ async fn worker_granted_checkout_linux_reports_unenforced_controls() {
     if !native_available() {
         return;
     }
-    for profile in ["relaxed", "strict"] {
+    for profile in ["standard", "strict"] {
         let (mut jail, checkouts) = granted_checkout_fixture(profile).await;
         let output = jail.bash("printf LINUX_GRANT_REPORT").await;
         assert!(output.contains("LINUX_GRANT_REPORT"), "{profile}: {output}");
@@ -1389,7 +1389,7 @@ async fn relaxed_env_symlink_config_target_is_denied() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn relaxed_denies_private_file_ancestor_rename() {
-    let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
+    let mut jail = Jail::start_with_layout(None, None, true, "standard", false, true).await;
     let auth = jail.base.join("custom-relay/auth");
     let moved = jail.base.join("custom-relay/moved");
     let before = std::fs::read(auth.join("connection.json")).unwrap();
@@ -1456,7 +1456,7 @@ async fn relaxed_denies_nested_sibling_parent_rename_but_allows_own_content_rena
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn relaxed_denies_custom_cargo_home_credentials() {
-    let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
+    let mut jail = Jail::start_with_layout(None, None, true, "standard", false, true).await;
     for name in ["credentials", "credentials.toml"] {
         let path = jail.base.join("custom-cargo").join(name);
         let reply = jail.bash(&format!("cat {}", quote(&path))).await;
@@ -1468,7 +1468,7 @@ async fn relaxed_denies_custom_cargo_home_credentials() {
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn relaxed_checkout_at_work_is_writable_but_sibling_is_not() {
-    let mut jail = Jail::start_with_layout(None, None, true, "relaxed", false, true).await;
+    let mut jail = Jail::start_with_layout(None, None, true, "standard", false, true).await;
     assert_eq!(jail.worktree, jail.home.join("Work"));
     let own = jail.worktree.join("own-write");
     let sibling = jail.worktree.join("sibling/README.md");
@@ -1601,8 +1601,8 @@ async fn worker_credential_floor_covers_daemon_home_and_config_overrides() {
         "home/.pypirc",
         "home/.cargo/credentials.toml",
     ];
-    for profile in ["strict", "relaxed"] {
-        if profile == "relaxed" && cfg!(target_os = "linux") {
+    for profile in ["strict", "standard"] {
+        if profile == "standard" && cfg!(target_os = "linux") {
             continue;
         }
         let mut jail = Jail::start_with_layout_and_env(
@@ -1826,7 +1826,7 @@ for home in homes:
             raise AssertionError(f'canary data access allowed: {marker}, flags={flags}')
 print('CANARY_METADATA_ONLY')
 "#;
-    for profile in ["strict", "relaxed"] {
+    for profile in ["strict", "standard"] {
         let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
         let reply = jail
             .bash(&format!("python3 -B -c {}", quote(Path::new(script))))
@@ -1898,11 +1898,11 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
     // protecting its GitHub credentials. Relaxed Linux leaves those reads unenforced.
     run(Command::new(aft_binary::aft_binary()).args(["sandbox-launch", "--support"]));
     let mut jail =
-        Jail::start_with_layout_and_env(None, None, true, "relaxed", false, false, |base, _| {
+        Jail::start_with_layout_and_env(None, None, true, "standard", false, false, |base, _| {
             let config = base.join("xdg/config/cortexkit/aft.jsonc");
             let mut value: Value =
                 serde_json::from_slice(&std::fs::read(&config).unwrap()).unwrap();
-            value["sandbox"]["profile"]["head"] = json!("relaxed");
+            value["sandbox"]["profile"]["head"] = json!("standard");
             std::fs::write(config, value.to_string()).unwrap();
         })
         .await;
@@ -1948,7 +1948,7 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
             })).await;
             jail.assert_bash_completed(session, &shell);
             assert!(
-                shell.to_string().contains("profile=relaxed unenforced=["),
+                shell.to_string().contains("profile=standard unenforced=["),
                 "{shell}"
             );
             assert_eq!(
@@ -1988,7 +1988,7 @@ async fn relaxed_linux_names_unenforced_denies_and_keeps_broad_access() {
     if !native_available() {
         return;
     }
-    let mut jail = Jail::start_with_profile(None, None, true, "relaxed", false).await;
+    let mut jail = Jail::start_with_profile(None, None, true, "standard", false).await;
     let home = jail.base.join("home");
     std::fs::write(home.join(".ssh/probe"), "linux-secret-unenforced").unwrap();
     let reply = jail
@@ -2000,11 +2000,11 @@ async fn relaxed_linux_names_unenforced_denies_and_keeps_broad_access() {
         .await;
     assert!(reply.contains("BROAD_2"), "{reply}");
     assert!(reply.contains("linux-secret-unenforced"), "{reply}");
-    assert!(reply.contains("profile=relaxed unenforced=["), "{reply}");
+    assert!(reply.contains("profile=standard unenforced=["), "{reply}");
     // Relaxed Linux cannot deny the gh-shim canary, so the worker gets no
     // shim-level fence; the launcher names that alongside the other denies.
     assert!(
-        reply.contains("operator gh fence: unenforced (relaxed profile)"),
+        reply.contains("operator gh fence: unenforced (standard profile)"),
         "{reply}"
     );
     let stripped = jail.bash(STRIPPED_GH).await;
@@ -3638,7 +3638,7 @@ async fn worker_jail_session_dbus_socket_is_reachable_and_reported_unenforced() 
     if !native_available() {
         return;
     }
-    for profile in ["strict", "relaxed"] {
+    for profile in ["strict", "standard"] {
         let mut listener = None;
         let mut socket = PathBuf::new();
         let mut jail = Jail::start_with_layout_and_env(
@@ -4059,7 +4059,7 @@ async fn worker_gh_read_relaxed_cross_command_capability_file_and_socket_isolati
     if !native_available() {
         return;
     }
-    cross_command_broker_isolation("relaxed").await;
+    cross_command_broker_isolation("standard").await;
 }
 
 async fn cross_command_broker_isolation(profile: &str) {
@@ -4220,7 +4220,7 @@ async fn worker_gh_read_relaxed_shell_reads_through_broker() {
     if !native_available() {
         return;
     }
-    let mut jail = gh_read_jail_with_profile("relaxed").await;
+    let mut jail = gh_read_jail_with_profile("standard").await;
     let reply = jail
         .bash(
             r#"set -eu
@@ -4250,7 +4250,7 @@ async fn worker_gh_read_relaxed_linux_withholds_broker_and_logs_reason() {
     if !native_available() {
         return;
     }
-    let mut jail = gh_read_jail_with_profile("relaxed").await;
+    let mut jail = gh_read_jail_with_profile("standard").await;
     let reply = jail
         .bash(
             r#"test -z "${AFT_GH_READ_SOCKET+x}" && test -z "${AFT_GH_READ_CAPABILITY_FILE+x}" && test -z "${AFT_GH_SHIM_STATE_DIR+x}" && test ! -e "$TMPDIR/.gh-read-capability" && echo RELAXED_LINUX_NO_BROKER"#,
@@ -4262,7 +4262,7 @@ async fn worker_gh_read_relaxed_linux_withholds_broker_and_logs_reason() {
     assert!(
         trace.lines().any(|line| line.contains("WARN")
             && line.contains("gh_shim worker_read unavailable")
-            && line.contains("reason=sandbox profile relaxed on Linux does not protect the shared task-temp root")),
+            && line.contains("reason=sandbox profile standard on Linux does not protect the shared task-temp root")),
         "{trace}"
     );
 }

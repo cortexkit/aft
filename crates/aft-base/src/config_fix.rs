@@ -270,16 +270,26 @@ fn migrate_block(
             }
         }
     }
-    if let Some(profile) = translated
+    if let Some(Value::Object(profile)) = translated
         .get("sandbox")
         .and_then(|sandbox| sandbox.get("profile"))
     {
-        if raw
+        let previous = raw
             .get("sandbox")
-            .and_then(|sandbox| sandbox.get("profile"))
-            != Some(profile)
-        {
-            doc.set(&path_of(prefix, &["sandbox", "profile"]), profile)?;
+            .and_then(|sandbox| sandbox.get("profile"));
+        if previous.is_none() {
+            doc.set(
+                &path_of(prefix, &["sandbox", "profile"]),
+                &Value::Object(profile.clone()),
+            )?;
+        } else {
+            for role in ["worker", "head"] {
+                if let Some(value) = profile.get(role) {
+                    if previous.and_then(|previous| previous.get(role)) != Some(value) {
+                        doc.set(&path_of(prefix, &["sandbox", "profile", role]), value)?;
+                    }
+                }
+            }
         }
     }
 

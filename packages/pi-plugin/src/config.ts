@@ -9,6 +9,7 @@ import {
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
+  DEFAULT_SANDBOX_PROFILES,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
   hasMalformedCacheDirChoice,
@@ -32,6 +33,8 @@ import {
   type RawIndexesConfig,
   REMOVED_DATA_LAYER_PATHS,
   type ResolvedIndexesConfig,
+  SANDBOX_MODES,
+  type SandboxMode,
   readConfigTiers,
   removedConfigKeyErrors,
   resolveCortexKitConfigPaths,
@@ -346,8 +349,8 @@ export interface ConfigureExperimentalOverrides {
 
 /** Sandbox settings for first-party Pi processes. */
 export interface SandboxConfig {
-  /** Defaults to relaxed for authenticated Alfonso worker stamps; other sessions use off. */
-  profile?: { worker?: "off" | "relaxed" | "strict"; head?: "off" | "relaxed" | "strict" };
+  /** Defaults to standard for sessions authenticated as Alfonso workers; other sessions use off. */
+  profile?: { worker?: SandboxMode; head?: SandboxMode };
   /** Additional absolute directories where sandboxed commands may write. User config only. */
   write_allow?: string[];
   /** Additional absolute paths sandboxed commands may not read. Project config may add entries. */
@@ -962,8 +965,8 @@ const ShellConfigSchema = z.object({ env_provider: ShellEnvProviderSchema.option
 const SandboxConfigSchema = z.object({
   profile: z
     .object({
-      worker: z.enum(["off", "relaxed", "strict"]).optional(),
-      head: z.enum(["off", "relaxed", "strict"]).optional(),
+      worker: z.enum(SANDBOX_MODES).optional(),
+      head: z.enum(SANDBOX_MODES).optional(),
     })
     .optional(),
   write_allow: z.array(z.string()).optional(),
@@ -1954,10 +1957,9 @@ function mergeSandboxConfig(
   trusted = false,
 ): SandboxConfig | undefined {
   if (base === undefined && project === undefined) return undefined;
-  const order = { off: 0, relaxed: 1, strict: 2 };
   const profile = {
-    worker: base?.profile?.worker ?? "relaxed",
-    head: base?.profile?.head ?? "off",
+    worker: base?.profile?.worker ?? DEFAULT_SANDBOX_PROFILES.worker,
+    head: base?.profile?.head ?? DEFAULT_SANDBOX_PROFILES.head,
   } as const;
   // A harnesses.<name>.sandbox block must not invent a profile for an omitted role:
   // that default could later override an explicit user choice during the project merge.
@@ -1966,7 +1968,10 @@ function mergeSandboxConfig(
     : { ...profile };
   for (const role of ["worker", "head"] as const) {
     const requested = project?.profile?.[role];
-    if (requested !== undefined && (trusted || order[requested] >= order[profile[role]]))
+    if (
+      requested !== undefined &&
+      (trusted || SANDBOX_MODES.indexOf(requested) >= SANDBOX_MODES.indexOf(profile[role]))
+    )
       next[role] = requested;
   }
   const readDeny = trusted
@@ -2129,11 +2134,10 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   if (override.memory !== undefined) stripped.push("memory");
   if (override.durability?.macos_full_sync !== undefined)
     stripped.push("durability.macos_full_sync");
-  const order = { off: 0, relaxed: 1, strict: 2 };
   for (const role of ["worker", "head"] as const) {
     const requested = override.sandbox?.profile?.[role];
-    const floor = base.sandbox?.profile?.[role] ?? (role === "worker" ? "relaxed" : "off");
-    if (requested !== undefined && order[requested] < order[floor])
+    const floor = base.sandbox?.profile?.[role] ?? DEFAULT_SANDBOX_PROFILES[role];
+    if (requested !== undefined && SANDBOX_MODES.indexOf(requested) < SANDBOX_MODES.indexOf(floor))
       stripped.push(`sandbox.profile.${role}`);
   }
   if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)

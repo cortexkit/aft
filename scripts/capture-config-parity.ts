@@ -564,14 +564,14 @@ const CASES: ParityCase[] = [
     {
       name: `sandbox_profiles_project_loosen_${harness}`,
       harness,
-      user: { sandbox: { profile: { worker: "strict", head: "relaxed" } } },
-      project: { sandbox: { profile: { worker: "off", head: "off" } } },
+      user: { sandbox: { profile: { worker: "strict", head: "standard" } } },
+      project: { sandbox: { profile: { worker: "off", head: "credentials" } } },
     },
     {
       name: `sandbox_profiles_project_harden_${harness}`,
       harness,
-      user: { sandbox: { profile: { worker: "off", head: "off" } } },
-      project: { sandbox: { profile: { worker: "strict", head: "relaxed" } } },
+      user: { sandbox: { profile: { worker: "off", head: "credentials" } } },
+      project: { sandbox: { profile: { worker: "relaxed" } } },
     },
     {
       name: `sandbox_profiles_user_harness_partial_${harness}`,
@@ -587,7 +587,7 @@ const CASES: ParityCase[] = [
     {
       name: `sandbox_profiles_legacy_false_canonical_${harness}`,
       harness,
-      user: { sandbox: { enabled: false, profile: { worker: "strict" } } },
+      user: { sandbox: { enabled: false, profile: { head: "strict" } } },
     },
   ]),
   {

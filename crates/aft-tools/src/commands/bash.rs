@@ -3056,7 +3056,7 @@ mod tests {
     #[test]
     fn relaxed_worker_outside_rm_requires_approval() {
         assert_worker_outside_rm_asks(
-            crate::config::SandboxMode::Relaxed,
+            crate::config::SandboxMode::Standard,
             crate::sandbox_spawn::AuthenticatedPrincipal::FirstParty,
         );
     }
@@ -3074,7 +3074,7 @@ mod tests {
     #[test]
     fn untrusted_worker_outside_rm_requires_approval() {
         assert_worker_outside_rm_asks(
-            crate::config::SandboxMode::Relaxed,
+            crate::config::SandboxMode::Standard,
             crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
                 trust: crate::sandbox_spawn::PrincipalTrust::Untrusted,
                 route_channel: 9,
@@ -3124,7 +3124,7 @@ mod tests {
             config.bash_permissions = true;
         });
         let request = spawn_test_request("strict-uncontained", "rm /outside-project/file", false);
-        for mode in [SandboxMode::Off, SandboxMode::Relaxed] {
+        for mode in [SandboxMode::Off, SandboxMode::Standard] {
             let plan = worker_permission_test_plan(mode, project.path(), storage.path());
             let response = with_worker_jail(true, || {
                 with_spawn_plan_for_test(plan, || handle(&request, &ctx))

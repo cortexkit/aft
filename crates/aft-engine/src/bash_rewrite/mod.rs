@@ -127,18 +127,20 @@ pub fn try_rewrite_for_request(
     if REWRITES_OFF.with(std::cell::Cell::get) {
         return None;
     }
-    // Windows relaxed shells must reach task capture to report that their
-    // filesystem denies are unenforced, even when a rewrite would otherwise fit.
-    let unenforced_relaxed = cfg!(windows)
-        && crate::sandbox_spawn::effective_sandbox_mode(ctx, principal)
-            == crate::config::SandboxMode::Relaxed;
-    if native_sandbox_enforced(ctx, principal) || unenforced_relaxed {
+    // Run Windows Standard and Credentials commands through the shell runner so
+    // its captured output reports that filesystem denies are unenforced.
+    let unenforced_sandbox = cfg!(windows)
+        && matches!(
+            crate::sandbox_spawn::effective_sandbox_mode(ctx, principal),
+            crate::config::SandboxMode::Standard | crate::config::SandboxMode::Credentials
+        );
+    if native_sandbox_enforced(ctx, principal) || unenforced_sandbox {
         dispatch::record_native(
             request_id,
             catalog::ControlRole::Sandbox,
             "dispatch.native.sandbox",
-            if unenforced_relaxed {
-                "relaxed sandbox must report unenforced denies"
+            if unenforced_sandbox {
+                "sandbox must report unenforced denies"
             } else {
                 "native sandbox is enforced"
             },

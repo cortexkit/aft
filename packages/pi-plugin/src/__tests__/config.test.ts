@@ -844,8 +844,27 @@ describe("loadAftConfig", () => {
       HOME: fixture.home,
       XDG_CONFIG_HOME: fixture.xdgConfigHome,
     });
-    expect(JSON.parse(result.stdout).sandbox.profile).toEqual({ worker: "off", head: "relaxed" });
+    expect(JSON.parse(result.stdout).sandbox.profile).toEqual({ worker: "off", head: "standard" });
     expect(JSON.parse(result.stdout).sandbox.read_deny).toEqual(["/tmp/project-secret"]);
+  });
+
+  test("sandbox project relaxed translates before hardening only the worker", () => {
+    const fixture = createConfigFixture();
+    writeFileSync(
+      fixture.userConfigPath,
+      JSON.stringify({ sandbox: { profile: { worker: "off", head: "credentials" } } }),
+    );
+    const project = JSON.stringify({ sandbox: { profile: { worker: "relaxed" } } });
+    writeFileSync(fixture.projectConfigPath, project);
+    const result = runConfigLoader(fixture.projectDirectory, {
+      HOME: fixture.home,
+      XDG_CONFIG_HOME: fixture.xdgConfigHome,
+    });
+    expect(JSON.parse(result.stdout).sandbox.profile).toEqual({
+      worker: "standard",
+      head: "credentials",
+    });
+    expect(readFileSync(fixture.projectConfigPath, "utf8")).toBe(project);
   });
 
   test("git.co_author uses ordinary project-over-user precedence", () => {

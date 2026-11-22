@@ -44,11 +44,11 @@ fn configure_native_policy(
     read_deny: &[PathBuf],
 ) -> Value {
     // `sandbox.enabled` was replaced by per-role profiles: true meant strict
-    // for both roles, false meant relaxed workers and unconfined heads.
+    // for both roles, false meant Standard workers and unconfined heads.
     let (worker, head) = if enabled {
         ("strict", "strict")
     } else {
-        ("relaxed", "off")
+        ("standard", "off")
     };
     aft.send(
         &json!({

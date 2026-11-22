@@ -860,6 +860,17 @@ fn translate_block(
     drop_no_effect_paths(map, &prefix, out);
     translate_experimental_paths(map, &prefix, out);
     if let Some(Value::Object(sandbox)) = map.get_mut("sandbox") {
+        if let Some(Value::Object(profile)) = sandbox.get_mut("profile") {
+            for role in ["worker", "head"] {
+                if let Some(value) = profile
+                    .get_mut(role)
+                    .filter(|value| value.as_str() == Some("relaxed"))
+                {
+                    *value = Value::from(crate::config::SandboxMode::Standard.as_str());
+                    record_retired(out, &prefix, &format!("sandbox.profile.{role}"));
+                }
+            }
+        }
         if let Some(enabled) = sandbox.remove("enabled") {
             record_retired(out, &prefix, "sandbox.enabled");
             match enabled.as_bool() {
@@ -868,10 +879,16 @@ fn translate_block(
                         .entry("profile")
                         .or_insert_with(|| Value::Object(Map::new()));
                     if let Value::Object(profile) = profile {
-                        for (role, mode) in [
-                            ("worker", if enabled { "strict" } else { "relaxed" }),
-                            ("head", if enabled { "strict" } else { "off" }),
-                        ] {
+                        let defaults = crate::config::SandboxRoles::default();
+                        for (role, default) in
+                            [("worker", defaults.worker), ("head", defaults.head)]
+                        {
+                            let mode = if enabled {
+                                crate::config::SandboxMode::Strict
+                            } else {
+                                default
+                            }
+                            .as_str();
                             if profile.get(role).is_some_and(|value| value != mode) {
                                 superseded(out, format!("{prefix}sandbox.enabled"), format!("sandbox.profile.{role} takes precedence over sandbox.enabled"));
                             }
@@ -1430,6 +1447,16 @@ fn project_block(block: &Map<String, Value>) -> Value {
         };
         if let Some(value) = value {
             legacy_paths.insert(path.to_string(), value.clone());
+        }
+    }
+    if let Some(profile) = block
+        .get("sandbox")
+        .and_then(|sandbox| sandbox.get("profile"))
+    {
+        for role in ["worker", "head"] {
+            if profile.get(role).is_some_and(|value| value == "relaxed") {
+                legacy_paths.insert(format!("sandbox.profile.{role}"), Value::from("relaxed"));
+            }
         }
     }
     projected.insert("legacy_paths".to_string(), Value::Object(legacy_paths));

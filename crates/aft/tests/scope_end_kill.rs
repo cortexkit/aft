@@ -919,7 +919,7 @@ async fn first_party_worker_bash_runs_with_default_relaxed_and_reports_unenforce
         assert!(output.contains("relaxed-worker-ran"), "{output}");
         assert!(
             output.contains(
-                "profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"
+                "profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"
             ),
             "{output}"
         );

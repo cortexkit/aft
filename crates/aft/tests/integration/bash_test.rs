@@ -188,7 +188,7 @@ fn tool_spawned_shells_carry_no_sdk_default_consumer_identity_material() {
             "storage_dir": storage,
             "config": user_config(serde_json::json!({
                 "bash": { "background": true },
-                "sandbox": { "profile": { "worker": "relaxed", "head": "off" } }
+                "sandbox": { "profile": { "worker": "standard", "head": "off" } }
             })),
         })
         .to_string(),

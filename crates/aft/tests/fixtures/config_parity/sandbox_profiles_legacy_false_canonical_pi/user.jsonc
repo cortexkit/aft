@@ -2,7 +2,7 @@
   "sandbox": {
     "enabled": false,
     "profile": {
-      "worker": "strict"
+      "head": "strict"
     }
   }
 }

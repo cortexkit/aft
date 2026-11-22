@@ -15,8 +15,8 @@
   "restrict_to_project_root": false,
   "sandbox": {
     "profile": {
-      "head": "relaxed",
-      "worker": "strict"
+      "head": "credentials",
+      "worker": "standard"
     }
   }
 }

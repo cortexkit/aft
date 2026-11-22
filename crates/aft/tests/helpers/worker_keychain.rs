@@ -81,7 +81,7 @@ fn default_keychain() -> PathBuf {
 #[tokio::test]
 async fn worker_jail_throwaway_keychain_is_unreadable() {
     let fixture = Keychain::create();
-    for profile in ["strict", "relaxed"] {
+    for profile in ["strict", "standard"] {
         let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
         // The disposable keychain is outside both protected Keychains directories.
         // This direct file read must succeed; the following API query must fail.
@@ -113,7 +113,7 @@ async fn worker_jail_default_keychain_file_is_unreadable() {
     let path = default_keychain();
     // Confirm the file is nonempty without exposing its contents in test output.
     assert!(!std::fs::read(&path).unwrap().is_empty());
-    for profile in ["strict", "relaxed"] {
+    for profile in ["strict", "standard"] {
         let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
         let reply = jail
             .bash(&format!(
@@ -145,7 +145,7 @@ async fn head_shell_throwaway_keychain_remains_readable() {
 
 #[tokio::test]
 async fn worker_jail_keychain_build_and_tls_compatibility() {
-    for profile in ["strict", "relaxed"] {
+    for profile in ["strict", "standard"] {
         let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
         std::fs::write(
             jail.worktree.join("src/main.rs"),
@@ -235,7 +235,7 @@ async fn worker_jail_login_keychain_test_item_is_unreadable() {
     );
     let outside = run(Command::new("/bin/sh").args(["-c", &query]));
     assert_eq!(outside.trim(), SECRET);
-    for profile in ["strict", "relaxed"] {
+    for profile in ["strict", "standard"] {
         let mut jail = Jail::start_with_profile(None, None, true, profile, false).await;
         let reply = jail.bash(&format!("{query}; echo QUERY_STATUS=$?")).await;
         assert!(

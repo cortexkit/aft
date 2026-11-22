@@ -602,7 +602,7 @@ Omit an optional setting instead of using `null`.
 
   // Shell profiles by role; untrusted routes always use strict.
   "sandbox": {
-    "profile": { "worker": "relaxed", "head": "off" },
+    "profile": { "worker": "standard", "head": "off" },
     // Additional strict-profile writable roots. User config only.
     "write_allow": [],
     // Additional paths to hide from sandboxed commands.
@@ -833,32 +833,33 @@ Head agents can use AFT's read-only tools in the main checkout and linked worktr
 ```jsonc
 {
   "sandbox": {
-    "profile": { "worker": "relaxed", "head": "off" }
+    "profile": { "worker": "standard", "head": "off" }
   }
 }
 ```
 
-These are the defaults. Stamped Alfonso workers use `worker`; heads, unstamped routes, standalone invocations and default sessions use `head`. Untrusted binds, including `mcp:*` and unverified principals, always use `strict`, even when both configured roles are `off`. A project may only harden a role (`off` < `relaxed` < `strict`), never loosen the user's choice. Project `read_deny` entries accumulate; `write_allow` is user-only and adds grants to `strict`, not exceptions to `relaxed`'s fixed denies. Live changes apply to new commands; running tasks keep their original profile.
+These are the defaults. Sessions authenticated as Alfonso workers use `worker`; heads, standalone invocations and other trusted sessions without that worker identity use `head`. Untrusted binds, including `mcp:*` and unverified principals, always use `strict`, even when both configured roles are `off`. A project may only harden a role (`off` < `credentials` < `standard` < `strict`), never loosen the user's choice. If a project sets only one role, the other stays unchanged. Project `read_deny` entries accumulate. The user-only `write_allow` adds grants to `strict` only; it does not carve out exceptions to fixed denies. Live changes apply to new commands; running tasks keep their original profile.
 
 - **`off`** installs no OS sandbox. AFT's file-tool permission asks still apply. Governed `gh`, Git co-author hooks and credential stripping are independent of the OS policy; Unix worker launches retain the short private task temporary directory even with this profile.
-- **`relaxed`** is allow-by-default on macOS, with the fixed denies below. Caches, `~/Library` outside protected paths, `/tmp`, `/var/folders`, Mach services, network access, browsers, Xcode and Unix sockets remain available. Shared compile servers such as sccache and configured rustc wrappers are allowed.
+- **`credentials`** selects the credential-protection level. The current launchers use the same policy as `standard` for this setting, including the Linux and Windows limits below.
+- **`standard`** replaces `relaxed`. It is allow-by-default on macOS, with the fixed denies below. Caches, `~/Library` outside protected paths, `/tmp`, `/var/folders`, Mach services, network access, browsers, Xcode and Unix sockets remain available. Shared compile servers such as sccache and configured rustc wrappers are allowed.
 - **`strict`** retains the existing native jail: writes are limited to the project, private task temp, configured write grants and build caches. Stamped workers additionally get narrowly scoped shared Git metadata and operator-configured build-target grants. Their sccache channels and rustc wrappers remain blocked because a compile server could write outside that jail. Strict's existing secret floor, socket denies and platform limitations are unchanged.
 
 Sandboxed commands receive `/private/tmp/aft-w/<hex>` on macOS (`/tmp/aft-w/<hex>` on Linux) through `TMPDIR`, `TMP` and `TEMP`. The AFT-managed `gh` shim (the command wrapper that routes GitHub operations through AFT's permission checks) stays first on the command PATH, Git co-author hooks still run, and child environments do not inherit daemon credentials.
 
-**Worker signals:** on macOS, worker commands in both `strict` and `relaxed` can signal only processes that the same command started. On Linux, both modes enforce this limit only when the kernel supports Landlock signal scoping (ABI 6 or newer); older kernels do not enforce it, and the command reports `signal_scope=not_enforced`. To stop a process from an earlier command, use `bash_kill`. On macOS a `kill -0` existence check of any process still works. On Linux kernels that enforce the limit, Landlock has no exception for it, so `kill -0` of a process outside the command fails with `EPERM`. That error still means the process exists; only `ESRCH` means it is gone.
+**Worker signals:** on macOS, worker commands in both `strict` and `standard` can signal only processes that the same command started. On Linux, both modes enforce this limit only when the kernel supports Landlock signal scoping (ABI 6 or newer); older kernels do not enforce it, and the command reports `signal_scope=not_enforced`. To stop a process from an earlier command, use `bash_kill`. On macOS a `kill -0` existence check of any process still works. On Linux kernels that enforce the limit, Landlock has no exception for it, so `kill -0` of a process outside the command fails with `EPERM`. That error still means the process exists; only `ESRCH` means it is gone.
 
-**Worker `gh` fence:** strict Linux/macOS and relaxed macOS worker shells deny a canary under the account home returned by the password database, and under the daemon's `HOME` when its canonical path differs. Launch refuses if the password-database account home cannot be resolved or its canary cannot be prepared, a grant overlaps a canary, or any canary remains readable after sandbox application. Head shells retain read access to both canaries. macOS permits only marker/ancestor metadata for the probe, not data reads or writes.
+**Worker `gh` fence:** strict Linux/macOS and standard macOS worker shells deny a canary under the account home returned by the password database, and under the daemon's `HOME` when its canonical path differs. Launch refuses if the password-database account home cannot be resolved or its canary cannot be prepared, a grant overlaps a canary, or any canary remains readable after sandbox application. Head shells retain read access to both canaries. macOS permits only marker/ancestor metadata for the probe, not data reads or writes.
 
-**No proven fence on `off`, relaxed Linux, or Windows.** These modes report `operator gh fence: unenforced` in their unenforced list. Their ticket and worker environment markers still refuse native `gh` while present, but clearing the environment can remove that protection. Do not treat these modes as an environment-proof worker boundary. An outer sandbox alone does not identify a worker. If it also denies the same canary file, the shim may mistake that denial for AFT's worker-jail fence.
+**No proven fence on `off`, standard Linux, or Windows.** These modes report `operator gh fence: unenforced` in their unenforced list. The worker markers in the child environment still let the shim refuse native `gh`, but clearing the environment can remove that protection. Do not treat these modes as an environment-proof worker boundary. An outer sandbox alone does not identify a worker. If it also denies the same canary file, the shim may mistake that denial for AFT's worker-jail fence.
 
 The canary governs dispatch through the shim only. Running the upstream `gh` binary directly bypasses the shim. Credential files, environment tokens, keychain services, and requests to launch commands through host services (for example, launchd or systemd) require independent sandbox policies. Denying keychain files alone does not prove that login-keychain service queries are blocked.
 
-Strict native profiles and relaxed macOS profiles enforce credential-file denies for both the daemon's `HOME` and the password-database account home, subject to the Linux limitations below. Relaxed Linux includes these paths in its unenforced report instead. GitHub config denies cover each home's `.config/gh` and configured `GH_CONFIG_DIR` and `XDG_CONFIG_HOME/gh` paths; defaults remain protected when overrides are set. SSH, cloud CLI, GnuPG, netrc, Git credential-store, Docker, npm, PyPI, Kubernetes and Cargo credential paths follow the same home handling. Relative overrides resolve from the checkout, and both symlink aliases and targets are protected. Unresolvable credential paths or failures to inspect an existing Cargo credential directory refuse the launch rather than silently dropping part of the floor.
+Strict native profiles and standard macOS profiles enforce credential-file denies for both the daemon's `HOME` and the password-database account home, subject to the Linux limitations below. Standard Linux includes these paths in its unenforced report instead. GitHub config denies cover each home's `.config/gh` and configured `GH_CONFIG_DIR` and `XDG_CONFIG_HOME/gh` paths; defaults remain protected when overrides are set. SSH, cloud CLI, GnuPG, netrc, Git credential-store, Docker, npm, PyPI, Kubernetes and Cargo credential paths follow the same home handling. Relative overrides resolve from the checkout, and both symlink aliases and targets are protected. Unresolvable credential paths or failures to inspect an existing Cargo credential directory refuse the launch rather than silently dropping part of the floor.
 
 **macOS setuid limitation:** Seatbelt refuses to execute setuid tools, including `/bin/ps` and `top`, even with an allow-default profile. `pgrep` and `pkill` work in sandboxed shells. Select `off` when a command genuinely needs `ps`; AFT does not add an unsandboxed-exec exception or copy platform binaries to evade this restriction.
 
-### Relaxed deny list (macOS)
+### Standard deny list (macOS)
 
 Read and write protection covers:
 
@@ -874,11 +875,11 @@ Additional write denies cover:
 - `~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.profile`, `~/.gitconfig`, `~/.config/git` and `~/Library/LaunchAgents`.
 - The repository's Git `config`, linked `config.worktree`, default and effective hooks directories, core's hook stubs, and the resolved `mason.originalHooksPath` target. Git binding files and executable project policy (`.cortexkit/aft.jsonc`, `.cortexkit/aft/filters`) remain protected too.
 
-Deny targets are re-canonicalized at launch, including missing/dangling targets; relaxed also retains alias paths and matches ASCII case aliases for protected names on case-insensitive volumes. Write protection includes replacing enclosing governance directories, not just overwriting their files.
+Deny targets are re-canonicalized at launch, including missing/dangling targets; standard also retains alias paths and matches ASCII case aliases for protected names on case-insensitive volumes. Write protection includes replacing enclosing governance directories, not just overwriting their files.
 
 ### Linux and Windows guarantee boundary
 
-**Linux `relaxed` does not enforce these denies.** Landlock grants are additive: root-wide read/write grants cannot subtract a credential, sibling checkout, config file or hooks subtree. To preserve default-allow semantics, relaxed grants broad access and prints every unenforced read and write deny by path, including the `~/.cargo/credentials*` filename prefix, in `sandbox-launch: profile=relaxed unenforced=[...]`. It must not be treated as a secret or write boundary on Linux. No extra sandbox dependency is installed.
+**Linux `standard` does not enforce these denies.** Landlock grants are additive: root-wide read/write grants cannot subtract a credential, sibling checkout, config file or hooks subtree. To preserve default-allow semantics, standard grants broad access and prints every unenforced read and write deny by path, including the `~/.cargo/credentials*` filename prefix, in `sandbox-launch: profile=standard unenforced=[...]`. It must not be treated as a secret or write boundary on Linux. No extra sandbox dependency is installed.
 
 Linux `strict` retains the existing Landlock allowlist and requires ABI V3 or newer. Invalid profiles, unavailable kernels and writable grants that overlap mandatory credential/private-store denies fail closed with `sandbox_unavailable`: Landlock cannot subtract those secrets from a writable parent. The strict guarantee applies to canonical paths without pre-existing aliases into a granted tree:
 
@@ -886,16 +887,19 @@ Linux `strict` retains the existing Landlock allowlist and requires ABI V3 or ne
 - Unix-domain socket connects are not mediated. TCP/DNS remain open; strict's default/operator-selected sccache loopback ports are reported as unenforced because blocking only those destinations would require restricting all other ports too.
 - Project reads may be split around nested denies using children present at launch. Newly created root-level files may remain unreadable until the next command recomputes grants. Shared `/tmp` and sensitive runtime trees are not granted by strict.
 - `/proc` is readable for tooling. With Yama `ptrace_scope=0`, another same-UID process can expose environment or memory; missing/unreadable Yama configuration produces a conservative exposure warning.
-- In Linux strict, Cargo credential files found by the launch-time scan and their resolved symlink targets receive denies. Landlock cannot express credential filename-prefix denies, so future matching filenames are reported as `credential_filename_prefix_future_entries_unenforced_on_landlock` rather than claimed protected by a prefix rule. Relaxed Linux reports the entire credential floor as unenforced.
+- In Linux strict, Cargo credential files found by the launch-time scan and their resolved symlink targets receive denies. Landlock cannot express credential filename-prefix denies, so future matching filenames are reported as `credential_filename_prefix_future_entries_unenforced_on_landlock` rather than claimed protected by a prefix rule. Standard Linux reports the entire credential floor as unenforced.
 
-Windows has no OS sandbox backend. `relaxed` runs with full user rights and reports `profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced]` in captured output, including PTY output. Like Linux relaxed, it is **not** a secret or write boundary. `strict` refuses execution with `sandbox_unavailable`: `sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux`. Untrusted and MCP routes are forced strict and therefore refuse. `off` runs without an OS sandbox; worker commands report the unenforced `gh` fence, while head commands remain quiet.
+Windows has no OS sandbox backend. `standard` runs with full user rights and reports `profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced]` in captured output, including PTY output. Like Linux standard, it is **not** a secret or write boundary. `strict` refuses execution with `sandbox_unavailable`: `sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux`. Untrusted and MCP routes are forced strict and therefore refuse. `off` runs without an OS sandbox; worker commands report the unenforced `gh` fence, while head commands remain quiet.
 
-### Retired `sandbox.enabled`
+### Retired sandbox settings
 
-From v0.64 a config file that still sets this key is refused with `removed_config_key:sandbox.enabled; run npx @cortexkit/aft doctor --fix`. `doctor --fix` rewrites it as below while preserving JSONC comments and unrelated keys. AFT rewrites the user file the same way, with a backup, when it loads it; shared project config is not rewritten automatically.
+AFT replaces `"relaxed"` with `"standard"` in `sandbox.profile.worker` or `sandbox.profile.head`. It rewrites the user file once, with a notice and a backup of the original. It translates project files in memory with a notice and leaves them untouched. The translated value follows the same raise-only rule: a project worker at `relaxed` raises a user worker at `off` to `standard`. Run `npx @cortexkit/aft doctor --fix` to rewrite retired values explicitly.
+
+`sandbox.enabled` is also retired. AFT rewrites it in the user file on load, with a backup, but does not automatically rewrite shared project config. From v0.64, a user file that still contains the key after an attempted rewrite is refused with `removed_config_key:sandbox.enabled; run npx @cortexkit/aft doctor --fix`. `doctor --fix` rewrites it as below while preserving JSONC comments and unrelated keys.
 
 - `true` becomes `{ "worker": "strict", "head": "strict" }`.
-- `false` (or an absent key) uses the new defaults, `{ "worker": "relaxed", "head": "off" }`.
+- Explicit `false` becomes `{ "worker": "standard", "head": "off" }`.
+- An absent `sandbox.enabled` key contributes no values and does not itself trigger a rewrite. Other retired settings are still migrated.
 - Explicit `sandbox.profile` role values take precedence over the legacy boolean.
 
 Heads previously ran without an OS sandbox unless `sandbox.enabled: true` was set. Thus default head `off` preserves default head behavior, while the translation preserves confinement for explicit `true`. The old boolean never controlled the forced stamped-worker jail; explicit `false` does **not** pin workers to strict after this cutover.

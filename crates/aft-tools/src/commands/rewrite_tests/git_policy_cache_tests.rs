@@ -53,7 +53,7 @@ fn relaxed_worker_bash_spawn_latency() {
     config.github.shim = false;
     config.git.co_author = "off".into();
     config.bash.linux_scope = false;
-    config.sandbox.profile.worker = SandboxMode::Relaxed;
+    config.sandbox.profile.worker = SandboxMode::Standard;
     let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let _launcher = install_sandbox_launcher_for_test(&root, launcher);
     let mut samples: [Vec<(f64, usize)>; 2] = [Vec::new(), Vec::new()];

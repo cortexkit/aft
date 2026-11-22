@@ -11,7 +11,7 @@ async fn optional_worker_broker_remote_local_fallback_without_service_runs() {
 #[tokio::test]
 async fn optional_worker_broker_relaxed_remote_local_fallback_with_service_has_no_broker() {
     let _state = crate::test_env::gh_shim_state_guard();
-    remote_local_fallback_has_no_broker(crate::config::SandboxMode::Relaxed, true).await;
+    remote_local_fallback_has_no_broker(crate::config::SandboxMode::Standard, true).await;
 }
 
 async fn remote_local_fallback_has_no_broker(

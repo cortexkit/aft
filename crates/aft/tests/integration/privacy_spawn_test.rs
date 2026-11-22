@@ -24,7 +24,7 @@ fn configure(aft: &mut AftProcess, project: &Path, storage: &Path, sandbox: bool
     let (worker, head) = if sandbox {
         ("strict", "strict")
     } else {
-        ("relaxed", "off")
+        ("standard", "off")
     };
     let response = aft.send(&json!({
         "id": "cfg-privacy", "session_id": SESSION, "command": "configure",

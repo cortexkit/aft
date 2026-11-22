@@ -9,6 +9,7 @@ import {
   type ConfigTier,
   DATA_LAYER_RETIRED_PATHS,
   DEFAULT_DISABLED_TOOLS,
+  DEFAULT_SANDBOX_PROFILES,
   DEFAULT_WORKER_WAIT_MAX_MS,
   deliverMigrationNoticeOnce,
   hasMalformedCacheDirChoice,
@@ -31,6 +32,7 @@ import {
   partitionProjectDisables,
   REMOVED_DATA_LAYER_PATHS,
   type ResolvedIndexesConfig,
+  SANDBOX_MODES,
   readConfigTiers,
   removedConfigKeyErrors,
   resolveCortexKitConfigPaths,
@@ -453,8 +455,8 @@ const SandboxConfigSchema = z.object({
   /** Project overrides may only harden a role's user-selected profile. */
   profile: z
     .object({
-      worker: z.enum(["off", "relaxed", "strict"]).optional(),
-      head: z.enum(["off", "relaxed", "strict"]).optional(),
+      worker: z.enum(SANDBOX_MODES).optional(),
+      head: z.enum(SANDBOX_MODES).optional(),
     })
     .optional(),
   /** Additional absolute directories where sandboxed commands may write. User config only. */
@@ -1861,10 +1863,9 @@ function mergeSandboxConfig(
   trusted = false,
 ): AftConfig["sandbox"] {
   if (base === undefined && project === undefined) return undefined;
-  const order = { off: 0, relaxed: 1, strict: 2 };
   const profile = {
-    worker: base?.profile?.worker ?? "relaxed",
-    head: base?.profile?.head ?? "off",
+    worker: base?.profile?.worker ?? DEFAULT_SANDBOX_PROFILES.worker,
+    head: base?.profile?.head ?? DEFAULT_SANDBOX_PROFILES.head,
   } as const;
   // A harnesses.<name>.sandbox block must not invent a profile for an omitted role:
   // that default could later override an explicit user choice during the project merge.
@@ -1873,7 +1874,10 @@ function mergeSandboxConfig(
     : { ...profile };
   for (const role of ["worker", "head"] as const) {
     const requested = project?.profile?.[role];
-    if (requested !== undefined && (trusted || order[requested] >= order[profile[role]]))
+    if (
+      requested !== undefined &&
+      (trusted || SANDBOX_MODES.indexOf(requested) >= SANDBOX_MODES.indexOf(profile[role]))
+    )
       next[role] = requested;
   }
   const readDeny = trusted
@@ -2078,11 +2082,10 @@ function getStrippedTopLevelKeys(override: AftConfig, base: AftConfig): string[]
   if (override.memory !== undefined) stripped.push("memory");
   if (override.durability?.macos_full_sync !== undefined)
     stripped.push("durability.macos_full_sync");
-  const order = { off: 0, relaxed: 1, strict: 2 };
   for (const role of ["worker", "head"] as const) {
     const requested = override.sandbox?.profile?.[role];
-    const floor = base.sandbox?.profile?.[role] ?? (role === "worker" ? "relaxed" : "off");
-    if (requested !== undefined && order[requested] < order[floor])
+    const floor = base.sandbox?.profile?.[role] ?? DEFAULT_SANDBOX_PROFILES[role];
+    if (requested !== undefined && SANDBOX_MODES.indexOf(requested) < SANDBOX_MODES.indexOf(floor))
       stripped.push(`sandbox.profile.${role}`);
   }
   if (typeof override.bash === "object" && override.bash.disclaim_privacy === false)

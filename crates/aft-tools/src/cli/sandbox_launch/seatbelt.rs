@@ -49,7 +49,11 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
 }
 
 fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
-    if profile.mode == aft::config::SandboxMode::Relaxed {
+    // Seatbelt currently renders the Standard policy for Credentials, too.
+    if matches!(
+        profile.mode,
+        aft::config::SandboxMode::Standard | aft::config::SandboxMode::Credentials
+    ) {
         return render_relaxed_profile(profile);
     }
     let mut source = String::from(
@@ -293,7 +297,7 @@ fn secret_bash_task_ports_are_denied_only_for_secret_profiles() {
     .unwrap();
     for mode in [
         aft::config::SandboxMode::Strict,
-        aft::config::SandboxMode::Relaxed,
+        aft::config::SandboxMode::Standard,
     ] {
         profile.mode = mode;
         profile.secret_proxy = false;
@@ -675,7 +679,7 @@ mod tests {
         .unwrap();
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             profile.worker_jail = false;
@@ -706,7 +710,7 @@ mod tests {
         .unwrap();
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             profile.worker_jail = false;
@@ -760,7 +764,7 @@ mod tests {
         ];
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let source = render_profile(&profile).unwrap();
@@ -774,7 +778,7 @@ mod tests {
                     "missing final keychain file deny: {source}"
                 );
                 assert!(source.find(&deny).unwrap() > source.rfind("(allow ").unwrap());
-                if mode == aft::config::SandboxMode::Relaxed {
+                if mode == aft::config::SandboxMode::Standard {
                     for ancestor in path.ancestors().skip(1) {
                         let unlink_deny = format!(
                             "(deny file-write-unlink (literal \"{}\"))",
@@ -817,7 +821,7 @@ mod tests {
         });
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let source = render_profile(&profile).unwrap();
@@ -979,7 +983,7 @@ mod tests {
         };
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let source = render_profile(&profile).unwrap();
@@ -1138,7 +1142,7 @@ mod tests {
             temp,
         )
         .unwrap();
-        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.mode = aft::config::SandboxMode::Standard;
         let source = render_profile(&profile).unwrap();
         for ancestor in [&group, &work, &root] {
             let rule = format!(
@@ -1182,7 +1186,7 @@ mod tests {
             temp,
         )
         .unwrap();
-        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.mode = aft::config::SandboxMode::Standard;
         profile.data_policy.deny.push(secret.clone());
         profile.data_policy.read_allow.push(secret.clone());
         profile.data_policy.write_allow.push(secret.clone());
@@ -1244,7 +1248,7 @@ mod tests {
             temp,
         )
         .unwrap();
-        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.mode = aft::config::SandboxMode::Standard;
         let source = render_profile(&profile).unwrap();
         assert!(
             source.contains(&format!(
@@ -1293,7 +1297,7 @@ mod tests {
             temp,
         )
         .unwrap();
-        profile.mode = aft::config::SandboxMode::Relaxed;
+        profile.mode = aft::config::SandboxMode::Standard;
         profile.deny_prefixes.push(root.join(".cargo/credentials"));
         let source = render_profile(&profile).unwrap();
         assert!(source.starts_with("(version 1)\n(allow default)\n"));
@@ -1371,7 +1375,7 @@ mod session_read_tests {
         profile.data_policy.session_task_read_dir = Some(session);
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let source = render_profile(&profile).unwrap();
@@ -1465,7 +1469,7 @@ mod data_ancestor_read_tests {
         let own = hash.join("own");
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let source = render_profile(&profile).unwrap();
@@ -1506,7 +1510,7 @@ mod data_ancestor_read_tests {
                     );
                 }
             }
-            let own_filter = if mode == aft::config::SandboxMode::Relaxed {
+            let own_filter = if mode == aft::config::SandboxMode::Standard {
                 relaxed_filter(&own, false).unwrap()
             } else {
                 format!("(subpath \"{}\")", escape_path(&own).unwrap())
@@ -1535,7 +1539,7 @@ mod data_ancestor_read_tests {
         assert_eq!(profile.data_policy.read_files.len(), 2);
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let source = render_profile(&profile).unwrap();
@@ -1564,7 +1568,7 @@ mod data_ancestor_read_tests {
                 assert!(!profile.writable_files.contains(path));
             }
             let seeds = container.join(".rust-build-seeds");
-            let directory_filter = if mode == aft::config::SandboxMode::Relaxed {
+            let directory_filter = if mode == aft::config::SandboxMode::Standard {
                 relaxed_filter(&seeds, false).unwrap()
             } else {
                 format!("(subpath \"{}\")", escape_path(&seeds).unwrap())
@@ -1652,7 +1656,7 @@ mod data_ancestor_read_tests {
         std::fs::write(&allowed, "exception readable").unwrap();
         for mode in [
             aft::config::SandboxMode::Strict,
-            aft::config::SandboxMode::Relaxed,
+            aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
             let rendered = root.join("profile.sb");

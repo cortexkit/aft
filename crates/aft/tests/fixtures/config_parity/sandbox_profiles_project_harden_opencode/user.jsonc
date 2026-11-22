@@ -2,7 +2,7 @@
   "sandbox": {
     "profile": {
       "worker": "off",
-      "head": "off"
+      "head": "credentials"
     }
   }
 }

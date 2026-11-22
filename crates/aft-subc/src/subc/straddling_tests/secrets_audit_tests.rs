@@ -319,8 +319,8 @@ fn audit_resolved_relaxed_secret_plan_refuses() {
     isolated("audit_resolved_relaxed_secret_plan_refuses", || {
         let f = Fixture::new();
         f.ctx.update_config(|c| {
-            c.sandbox.profile.head = crate::config::SandboxMode::Relaxed;
-            c.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;
+            c.sandbox.profile.head = crate::config::SandboxMode::Standard;
+            c.sandbox.profile.worker = crate::config::SandboxMode::Standard;
         });
         let reply = aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test(
             SpawnPlan::RelaxedUnenforced,

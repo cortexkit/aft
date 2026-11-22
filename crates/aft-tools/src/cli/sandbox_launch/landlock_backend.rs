@@ -46,7 +46,11 @@ fn apply_with_write_policy(
     profile: &SandboxProfile,
     remote_folder: Option<&Path>,
 ) -> Result<AppliedLandlock, String> {
-    if profile.mode == aft::config::SandboxMode::Relaxed {
+    // The Linux launcher currently uses Standard's Landlock policy for Credentials.
+    if matches!(
+        profile.mode,
+        aft::config::SandboxMode::Standard | aft::config::SandboxMode::Credentials
+    ) {
         // Landlock cannot subtract protected paths from a root-wide grant.
         // Grant reads and writes beneath /, then list each unenforced path on
         // stderr in emit_linux_warning; relaxed is not a Linux access boundary.

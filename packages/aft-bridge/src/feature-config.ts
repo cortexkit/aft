@@ -699,6 +699,10 @@ function translateExperimentalPaths(
   if (Object.keys(experimental).length === 0) delete map.experimental;
 }
 
+export const SANDBOX_MODES = ["off", "credentials", "standard", "strict"] as const;
+export type SandboxMode = (typeof SANDBOX_MODES)[number];
+export const DEFAULT_SANDBOX_PROFILES = { worker: "standard", head: "off" } as const;
+
 /**
  * Translate the retired keys of one tier/harness block in place.
  *
@@ -720,6 +724,14 @@ function translateBlock(
   translateDataLayerPaths(map, prefix, out);
   dropNoEffectPaths(map, prefix, out);
   translateExperimentalPaths(map, prefix, out);
+  if (isRecord(map.sandbox) && isRecord(map.sandbox.profile)) {
+    for (const role of ["worker", "head"] as const) {
+      if (map.sandbox.profile[role] === "relaxed") {
+        map.sandbox.profile[role] = "standard";
+        recordRetired(out, prefix, `sandbox.profile.${role}`);
+      }
+    }
+  }
   if (isRecord(map.sandbox) && Object.hasOwn(map.sandbox, "enabled")) {
     const sandbox = map.sandbox;
     const enabled = sandbox.enabled;
@@ -728,16 +740,16 @@ function translateBlock(
     if (typeof enabled === "boolean") {
       if (sandbox.profile === undefined) sandbox.profile = {};
       if (isRecord(sandbox.profile)) {
-        const modes = { worker: enabled ? "strict" : "relaxed", head: enabled ? "strict" : "off" };
         for (const role of ["worker", "head"] as const) {
-          if (sandbox.profile[role] !== undefined && sandbox.profile[role] !== modes[role]) {
+          const mode = enabled ? "strict" : DEFAULT_SANDBOX_PROFILES[role];
+          if (sandbox.profile[role] === undefined) sandbox.profile[role] = mode;
+          else if (sandbox.profile[role] !== mode) {
             superseded(
               out,
               `${prefix}sandbox.enabled`,
               `sandbox.profile.${role} takes precedence over sandbox.enabled`,
             );
           }
-          sandbox.profile[role] ??= modes[role];
         }
       }
     } else
@@ -1130,6 +1142,12 @@ function projectBlock(block: JsonRecord): JsonRecord {
       const leaf = path.slice(dot + 1);
       if (isRecord(container) && Object.hasOwn(container, leaf))
         legacyPaths[path] = container[leaf];
+    }
+  }
+  if (isRecord(block.sandbox) && isRecord(block.sandbox.profile)) {
+    for (const role of ["worker", "head"] as const) {
+      if (block.sandbox.profile[role] === "relaxed")
+        legacyPaths[`sandbox.profile.${role}`] = "relaxed";
     }
   }
   const gates: JsonRecord = {};

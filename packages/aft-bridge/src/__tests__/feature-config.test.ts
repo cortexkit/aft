@@ -30,6 +30,18 @@ import {
 } from "../feature-config.js";
 import { deliverMigrationNoticeOnce } from "../migration-notices.js";
 
+test("retired sandbox values get a notice identity distinct from current values", () => {
+  const current = { sandbox: { profile: { worker: "standard" } } };
+  const old = { sandbox: { profile: { worker: "relaxed" } } };
+  expect(noticeDigest(noticeProjection(old))).not.toBe(noticeDigest(noticeProjection(current)));
+  const translation = translateConfigDocument(old, "project");
+  expect(old).toEqual(current);
+  expect(translation.retiredKeys).toEqual(["sandbox.profile.worker"]);
+  expect(legacyConfigNoticeMessage("/project/aft.jsonc", translation)).toContain(
+    "uses retired keys (sandbox.profile.worker)",
+  );
+});
+
 test("retired runon gate translates user blocks and drops project gates with a notice", () => {
   for (const [legacy, enabled, expected] of [
     [false, true, false],
@@ -211,7 +223,7 @@ describe("feature-config policy", () => {
       expect(document.sandbox).toEqual({
         profile: enabled
           ? { worker: "strict", head: "strict" }
-          : { worker: "relaxed", head: "off" },
+          : { worker: "standard", head: "off" },
       });
       expect(translated.retiredKeys).toContain("sandbox.enabled");
     }

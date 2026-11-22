@@ -393,11 +393,11 @@
       }
     },
     "sandbox": {
-      "description": "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict.",
+      "description": "Shell sandbox profiles: stamped workers default to standard, all other sessions to off; untrusted routes always use strict.",
       "type": "object",
       "properties": {
         "profile": {
-          "description": "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict).",
+          "description": "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < credentials < standard < strict).",
           "type": "object",
           "properties": {
             "worker": {
@@ -405,7 +405,8 @@
               "type": "string",
               "enum": [
                 "off",
-                "relaxed",
+                "credentials",
+                "standard",
                 "strict"
               ]
             },
@@ -414,14 +415,15 @@
               "type": "string",
               "enum": [
                 "off",
-                "relaxed",
+                "credentials",
+                "standard",
                 "strict"
               ]
             }
           }
         },
         "write_allow": {
-          "description": "Additional absolute writable directories. User-scoped only; project config cannot add write access.",
+          "description": "Additional absolute writable directories for strict only. User-scoped only; project config cannot add write access.",
           "type": "array",
           "items": {
             "type": "string"
@@ -1268,11 +1270,11 @@
             }
           },
           "sandbox": {
-            "description": "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict.",
+            "description": "Shell sandbox profiles: stamped workers default to standard, all other sessions to off; untrusted routes always use strict.",
             "type": "object",
             "properties": {
               "profile": {
-                "description": "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict).",
+                "description": "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < credentials < standard < strict).",
                 "type": "object",
                 "properties": {
                   "worker": {
@@ -1280,7 +1282,8 @@
                     "type": "string",
                     "enum": [
                       "off",
-                      "relaxed",
+                      "credentials",
+                      "standard",
                       "strict"
                     ]
                   },
@@ -1289,14 +1292,15 @@
                     "type": "string",
                     "enum": [
                       "off",
-                      "relaxed",
+                      "credentials",
+                      "standard",
                       "strict"
                     ]
                   }
                 }
               },
               "write_allow": {
-                "description": "Additional absolute writable directories. User-scoped only; project config cannot add write access.",
+                "description": "Additional absolute writable directories for strict only. User-scoped only; project config cannot add write access.",
                 "type": "array",
                 "items": {
                   "type": "string"

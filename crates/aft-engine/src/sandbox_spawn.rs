@@ -621,8 +621,8 @@ impl SpawnPlan {
     /// isolation needs an OS policy that keeps each worker out of the shared
     /// task-temp root: the worker must not read another task's capability
     /// file or replace another task's broker socket with its own listener.
-    /// Strict enforces that on macOS and Linux. Relaxed enforces it only on
-    /// macOS (Seatbelt applies its denies); relaxed Linux grants all of `/`
+    /// Strict enforces that on macOS and Linux. The allow-by-default launcher
+    /// enforces it only on macOS (Seatbelt applies its denies); on Linux it grants all of `/`
     /// and enforces no deny. Off is the operator's explicit opt-out of the
     /// jail. This is the only profile rule for the broker, so the profiles
     /// cannot drift apart.
@@ -634,9 +634,13 @@ impl SpawnPlan {
         match self.policy() {
             Self::Launcher { profile, .. } => match profile.mode {
                 SandboxMode::Strict => None,
-                SandboxMode::Relaxed if cfg!(target_os = "macos") => None,
-                SandboxMode::Relaxed => Some(
-                    "sandbox profile relaxed on Linux does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
+                // The native backends currently apply Standard's policy to Credentials.
+                SandboxMode::Standard | SandboxMode::Credentials if cfg!(target_os = "macos") => None,
+                SandboxMode::Standard => Some(
+                    "sandbox profile standard on Linux does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
+                ),
+                SandboxMode::Credentials => Some(
+                    "sandbox profile credentials on Linux does not protect the shared task-temp root, so another worker could read this command's capability or replace its broker socket",
                 ),
                 SandboxMode::Off => Some(
                     "sandbox profile off runs the worker shell without the worker jail",
@@ -1470,11 +1474,14 @@ fn platform_sandbox_plan(
     }
     match mode {
         SandboxMode::Off => return Some(SpawnPlan::Unsandboxed),
-        SandboxMode::Relaxed => {
+        // Windows currently uses the same unenforced plan for both levels.
+        SandboxMode::Standard | SandboxMode::Credentials => {
             return Some(if requested_tier == RequestedSandboxTier::Native {
                 SpawnPlan::RelaxedUnenforced
             } else {
-                worker_jail_refusal("the command asked to leave the configured relaxed profile")
+                worker_jail_refusal(&format!(
+                    "the command asked to leave the configured {mode} profile"
+                ))
             });
         }
         SandboxMode::Strict => {}
@@ -1810,7 +1817,8 @@ fn build_native_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
-        if mode == SandboxMode::Relaxed {
+        // The native launchers use the Standard profile until they enforce a distinct credential floor.
+        if matches!(mode, SandboxMode::Standard | SandboxMode::Credentials) {
             return build_relaxed_profile(
                 ctx,
                 &home,
@@ -1819,7 +1827,11 @@ fn build_native_profile(
                 &session_store,
                 &task_io_dir,
                 &temp_dir,
-            );
+            )
+            .map(|mut profile| {
+                profile.mode = mode;
+                profile
+            });
         }
         let mut policy = ctx.access_policy("").map_err(|response| {
             response.data["message"]
@@ -2298,7 +2310,7 @@ fn build_relaxed_profile(
     let mut profile = SandboxProfile {
         secret_proxy: false,
         v: crate::sandbox_profile::SANDBOX_PROFILE_VERSION,
-        mode: SandboxMode::Relaxed,
+        mode: SandboxMode::Standard,
         worker_jail: false,
         keychain_deny: Vec::new(),
         deny_prefixes: Vec::new(),
@@ -2729,15 +2741,15 @@ fn credential_paths_with_resolver(
 
 /// Prepare the shell environment after injecting managed Git/GitHub settings.
 /// Strict workers clear rustc wrappers and SCCACHE_* channels: an external compile
-/// server could write outside its client's write-limited jail. Relaxed and off
+/// server could write outside its client's write-limited jail. Non-Strict modes
 /// preserve compile-server addressing settings, not remote-cache credentials.
-/// Relaxed shells and all workers keep the operator's CARGO_HOME/RUSTUP_HOME;
+/// Allow-by-default shells and all workers keep the operator's CARGO_HOME/RUSTUP_HOME;
 /// credential stripping happens separately in sandboxed_child_environment.
 pub(crate) fn apply_worker_jail_environment(
     environment: &mut HashMap<String, String>,
     mode: SandboxMode,
 ) {
-    if !worker_jail_active() && mode != SandboxMode::Relaxed {
+    if !worker_jail_active() && !matches!(mode, SandboxMode::Standard | SandboxMode::Credentials) {
         return;
     }
     if mode == SandboxMode::Strict {
@@ -7576,7 +7588,7 @@ mod tests {
             temp.path().to_path_buf(),
         )
         .unwrap();
-        for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+        for mode in [SandboxMode::Off, SandboxMode::Standard, SandboxMode::Strict] {
             profile.mode = mode;
             let plan = SpawnPlan::launcher_for_test(profile.clone(), PathBuf::from("aft"));
             assert_eq!(
@@ -7676,7 +7688,7 @@ mod tests {
             temp.to_path_buf(),
         )
         .unwrap();
-        profile.mode = SandboxMode::Relaxed;
+        profile.mode = SandboxMode::Standard;
         profile.read_deny = denies.clone();
         profile.write_deny = denies;
         add_relaxed_cargo_credential_denies(&mut profile, cargo_homes).unwrap();
@@ -10290,7 +10302,7 @@ mod policy_tests {
     #[test]
     fn windows_relaxed_profile_runs_unenforced_but_strict_refuses() {
         assert_eq!(
-            platform_sandbox_plan(SandboxMode::Relaxed, RequestedSandboxTier::Native, false),
+            platform_sandbox_plan(SandboxMode::Standard, RequestedSandboxTier::Native, false),
             Some(SpawnPlan::RelaxedUnenforced)
         );
         assert_eq!(
@@ -10303,13 +10315,13 @@ mod policy_tests {
         assert_eq!(strict.refusal_code(), Some("sandbox_unavailable"));
         assert_eq!(strict.refusal_message(), Some("sandbox profile strict is not enforced on Windows; select sandbox.profile off or run on macOS/Linux"));
         for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
-            assert!(platform_sandbox_plan(SandboxMode::Relaxed, tier, false)
+            assert!(platform_sandbox_plan(SandboxMode::Standard, tier, false)
                 .unwrap()
                 .refusal_code()
                 .is_some());
         }
         assert_eq!(
-            platform_sandbox_plan(SandboxMode::Relaxed, RequestedSandboxTier::Native, true),
+            platform_sandbox_plan(SandboxMode::Standard, RequestedSandboxTier::Native, true),
             None
         );
     }
@@ -10383,7 +10395,7 @@ mod policy_tests {
         #[cfg(target_os = "linux")]
         let _inventory = fixed_read_inventory::install(root.path());
         for jailed in [false, true] {
-            for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+            for mode in [SandboxMode::Off, SandboxMode::Standard, SandboxMode::Strict] {
                 for principal in [AuthenticatedPrincipal::FirstParty, untrusted.clone()] {
                     ctx.update_config(|config| {
                         config.sandbox.profile.head =
@@ -10394,7 +10406,8 @@ mod policy_tests {
                     hook(root.path(), PolicyParityPhase::BeforeTool);
                     let reads = if principal_requires_strict(&principal)
                         || mode == SandboxMode::Strict
-                        || (mode == SandboxMode::Relaxed && (!jailed || !cfg!(target_os = "linux")))
+                        || (mode == SandboxMode::Standard
+                            && (!jailed || !cfg!(target_os = "linux")))
                     {
                         2
                     } else {
@@ -10772,7 +10785,7 @@ mod policy_tests {
         with_worker_jail(true, || {
             assert_eq!(
                 effective_sandbox_mode(&ctx, &AuthenticatedPrincipal::FirstParty),
-                SandboxMode::Relaxed
+                SandboxMode::Standard
             )
         });
         ctx.update_config(|config| config.sandbox.profile.worker = SandboxMode::Off);
@@ -10830,7 +10843,7 @@ mod policy_tests {
         with_worker_jail(true, || {
             assert_eq!(
                 effective_sandbox_mode(&ctx, &principal),
-                SandboxMode::Relaxed
+                SandboxMode::Standard
             );
         });
         ctx.update_config(|config| config.sandbox.profile.head = SandboxMode::Strict);
@@ -10853,8 +10866,8 @@ mod policy_tests {
             session_id: "first-party-mcp".into(),
             principal_id: Some("direct".into()),
         };
-        for head in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
-            for worker in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+        for head in [SandboxMode::Off, SandboxMode::Standard, SandboxMode::Strict] {
+            for worker in [SandboxMode::Off, SandboxMode::Standard, SandboxMode::Strict] {
                 ctx.update_config(|config| {
                     config.sandbox.profile.head = head;
                     config.sandbox.profile.worker = worker;
@@ -10879,7 +10892,7 @@ mod policy_tests {
             ("RUSTC_WRAPPER".into(), "/operator/sccache".into()),
         ]);
         with_worker_jail(true, || {
-            apply_worker_jail_environment(&mut environment, SandboxMode::Relaxed)
+            apply_worker_jail_environment(&mut environment, SandboxMode::Standard)
         });
         assert_eq!(environment["SCCACHE_SERVER_PORT"], "4321");
         assert_eq!(environment["RUSTC_WRAPPER"], "/operator/sccache");

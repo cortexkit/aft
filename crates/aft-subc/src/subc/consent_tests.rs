@@ -6438,19 +6438,21 @@ fn consent_worker_jail_never_runs_a_shell_unconfined() {
         SpawnPlan::Unsandboxed
     ));
     for mode in [
-        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Credentials,
+        crate::config::SandboxMode::Standard,
         crate::config::SandboxMode::Strict,
     ] {
         ctx.update_config(|config| config.sandbox.profile.worker = mode);
         with_worker_jail(true, || {
             // The worker profile is independent of the head profile. Windows
-            // relaxed is explicitly unenforced; strict must still fail closed.
+            // Credentials and Standard are explicitly unenforced; Strict must still fail closed.
             let native = resolve(RequestedSandboxTier::Native);
             #[cfg(windows)]
             {
                 assert!(!native.is_native_launcher(), "{native:?}");
                 match mode {
-                    crate::config::SandboxMode::Relaxed => {
+                    crate::config::SandboxMode::Standard
+                    | crate::config::SandboxMode::Credentials => {
                         assert_eq!(native, SpawnPlan::RelaxedUnenforced);
                     }
                     crate::config::SandboxMode::Strict => {

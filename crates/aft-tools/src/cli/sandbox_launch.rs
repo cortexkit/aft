@@ -499,7 +499,11 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
     } else {
         ""
     };
-    if profile.mode == aft::config::SandboxMode::Relaxed {
+    // Both modes currently use the same allow-by-default Landlock policy.
+    if matches!(
+        profile.mode,
+        aft::config::SandboxMode::Standard | aft::config::SandboxMode::Credentials
+    ) {
         let mut denies = Vec::new();
         if profile.worker_jail {
             denies.push("session_dbus_keyring".to_string());
@@ -519,12 +523,15 @@ fn emit_linux_warning(profile: &SandboxProfile, applied: landlock_backend::Appli
             denies.push(format!("read:{}*", path.display()));
             denies.push(format!("write:{}*", path.display()));
         }
-        // Relaxed Linux cannot deny the gh-shim canary, so the shim
+        // The allow-by-default Landlock policy cannot deny the gh-shim canary, so the shim
         // cannot recognize this worker shell. Say so with the other denies.
         if profile.worker_gh_fence == Some(aft::sandbox_profile::WorkerGhFence::Unenforced) {
-            denies.push("operator gh fence: unenforced (relaxed profile)".to_string());
+            denies.push(format!(
+                "operator gh fence: unenforced ({} profile)",
+                profile.mode
+            ));
         }
-        eprintln!("sandbox-launch: profile=relaxed unenforced=[{}] (Landlock cannot subtract denies from default-allow root grants){session_bus_reason}", denies.join(","));
+        eprintln!("sandbox-launch: profile={} unenforced=[{}] (Landlock cannot subtract denies from default-allow root grants){session_bus_reason}", profile.mode, denies.join(","));
         return;
     }
     let write_roots = profile.write_allow_roots();

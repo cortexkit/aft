@@ -631,7 +631,8 @@ impl Config {
 #[serde(rename_all = "lowercase")]
 pub enum SandboxMode {
     Off,
-    Relaxed,
+    Credentials,
+    Standard,
     Strict,
 }
 
@@ -643,11 +644,18 @@ impl Default for SandboxMode {
 
 impl std::fmt::Display for SandboxMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
+        f.write_str(self.as_str())
+    }
+}
+
+impl SandboxMode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
             Self::Off => "off",
-            Self::Relaxed => "relaxed",
+            Self::Credentials => "credentials",
+            Self::Standard => "standard",
             Self::Strict => "strict",
-        })
+        }
     }
 }
 
@@ -661,7 +669,7 @@ pub struct SandboxRoles {
 impl Default for SandboxRoles {
     fn default() -> Self {
         Self {
-            worker: SandboxMode::Relaxed,
+            worker: SandboxMode::Standard,
             head: SandboxMode::Off,
         }
     }

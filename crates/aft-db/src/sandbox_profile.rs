@@ -259,7 +259,10 @@ impl SandboxProfile {
         }
 
         let mut deny_paths = HashMap::new();
-        let preserve_aliases = self.mode == crate::config::SandboxMode::Relaxed;
+        let preserve_aliases = matches!(
+            self.mode,
+            crate::config::SandboxMode::Standard | crate::config::SandboxMode::Credentials
+        );
         let writable_files = canonicalize_files(self.writable_files, "writable_files")?;
         let (read_allow, read_allow_listed) =
             canonicalize_read_grants(self.read_allow, self.read_allow_listed, &writable_files)?;
@@ -1504,7 +1507,7 @@ mod tests {
             root,
         )
         .unwrap();
-        profile.mode = crate::config::SandboxMode::Relaxed;
+        profile.mode = crate::config::SandboxMode::Standard;
         profile.write_deny.push(alias.clone());
         let profile = profile.canonicalize_for_launch().unwrap();
         assert!(profile.write_deny.contains(&alias));

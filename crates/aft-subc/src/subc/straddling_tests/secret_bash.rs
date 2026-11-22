@@ -335,7 +335,7 @@ fn secret_bash_sandbox_raise_role_and_task_plans() {
     for worker in [false, true] {
         crate::sandbox_spawn::with_worker_jail(worker, || {
             let expected = if worker {
-                crate::config::SandboxMode::Relaxed
+                crate::config::SandboxMode::Standard
             } else {
                 crate::config::SandboxMode::Off
             };
@@ -716,7 +716,7 @@ fn secret_bash_nonqualifying_plans_precede_scope_and_rewrite() {
 fn secret_bash_windows_refuses_all_profiles_without_a_job() {
     for mode in [
         crate::config::SandboxMode::Off,
-        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Standard,
         crate::config::SandboxMode::Strict,
     ] {
         let root = tempfile::tempdir().unwrap();

@@ -41,7 +41,7 @@ fn exercise_profile(
     use aft_engine::test_bridge::bash_remote::with_spawn_plan_for_test;
     let profile_allows_broker = match mode {
         SandboxMode::Strict => true,
-        SandboxMode::Relaxed => cfg!(target_os = "macos"),
+        SandboxMode::Standard | SandboxMode::Credentials => cfg!(target_os = "macos"),
         SandboxMode::Off => false,
     };
     let broker_expected = service_available && shim_enabled && profile_allows_broker;
@@ -113,7 +113,7 @@ fn exercise_profile(
             let reason = if mode == SandboxMode::Off {
                 "reason=sandbox profile off runs the worker shell without the worker jail"
             } else if !profile_allows_broker {
-                "reason=sandbox profile relaxed on Linux does not protect the shared task-temp root"
+                "reason=sandbox profile standard on Linux does not protect the shared task-temp root"
             } else if !shim_enabled {
                 "shim is disabled"
             } else {
@@ -214,7 +214,7 @@ async fn optional_worker_broker_relaxed_worker_is_provided_on_macos_only() {
     let _state = crate::test_env::gh_shim_state_guard();
     exercise_profile(
         "foreground",
-        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Standard,
         true,
         true,
     );
@@ -224,7 +224,7 @@ async fn optional_worker_broker_relaxed_background_worker_is_provided_on_macos_o
     let _state = crate::test_env::gh_shim_state_guard();
     exercise_profile(
         "background",
-        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Standard,
         true,
         true,
     );
@@ -233,7 +233,7 @@ async fn optional_worker_broker_relaxed_background_worker_is_provided_on_macos_o
 fn optional_worker_broker_relaxed_without_service_runs() {
     exercise_profile(
         "foreground",
-        crate::config::SandboxMode::Relaxed,
+        crate::config::SandboxMode::Standard,
         true,
         false,
     );

@@ -10274,9 +10274,9 @@ pub(in crate::subc) mod route_tests {
         }
         for (worker_mode, untrusted) in [
             (SandboxMode::Off, false),
-            (SandboxMode::Relaxed, false),
+            (SandboxMode::Standard, false),
             (SandboxMode::Strict, false),
-            (SandboxMode::Relaxed, true),
+            (SandboxMode::Standard, true),
         ] {
             let (_project, storage, ctx, mut identity) = worker_route(
                 RouteRole::ToolProviderV1,
@@ -10352,7 +10352,7 @@ pub(in crate::subc) mod route_tests {
             );
             let reads = usize::from(
                 expected == SandboxMode::Strict
-                    || (expected == SandboxMode::Relaxed && !cfg!(target_os = "linux")),
+                    || (expected == SandboxMode::Standard && !cfg!(target_os = "linux")),
             );
             crate::worker_jail_canary::with_test_preparation_home(storage.path(), reads, || {
                 let response = job(&ctx);
@@ -10422,7 +10422,7 @@ pub(in crate::subc) mod route_tests {
             );
         ctx.update_config(|config| {
             config.gh_shim.binary_path = Some(operator_binary);
-            config.sandbox.profile.worker = crate::config::SandboxMode::Relaxed;
+            config.sandbox.profile.worker = crate::config::SandboxMode::Standard;
         });
         let data = Arc::get_mut(&mut identity.0).unwrap();
         let mut scope = stamp("worker");

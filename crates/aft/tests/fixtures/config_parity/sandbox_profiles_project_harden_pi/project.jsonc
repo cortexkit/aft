@@ -1,8 +1,7 @@
 {
   "sandbox": {
     "profile": {
-      "worker": "strict",
-      "head": "relaxed"
+      "worker": "relaxed"
     }
   }
 }

@@ -208,7 +208,7 @@ pub struct RawAftConfig {
     #[schemars(description = "Pi and OMP harness-specific configuration.")]
     pub pi: Option<RawPi>,
     #[schemars(
-        description = "Shell sandbox profiles: stamped workers default to relaxed, all other sessions to off; untrusted routes always use strict."
+        description = "Shell sandbox profiles: stamped workers default to standard, all other sessions to off; untrusted routes always use strict."
     )]
     pub sandbox: Option<RawSandbox>,
     #[schemars(
@@ -968,11 +968,11 @@ pub struct RawRemoteExec {
 #[serde(default)]
 pub struct RawSandbox {
     #[schemars(
-        description = "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < relaxed < strict)."
+        description = "User-selected sandbox profiles by role. Projects may only select a stricter profile (off < credentials < standard < strict)."
     )]
     pub profile: Option<RawSandboxRoles>,
     #[schemars(
-        description = "Additional absolute writable directories. User-scoped only; project config cannot add write access."
+        description = "Additional absolute writable directories for strict only. User-scoped only; project config cannot add write access."
     )]
     pub write_allow: Option<Vec<PathBuf>>,
     #[schemars(
@@ -3544,18 +3544,19 @@ fn resolve_sandbox_config(raw: Option<&RawSandbox>) -> SandboxConfig {
     let Some(raw) = raw else {
         return SandboxConfig::default();
     };
+    let defaults = crate::config::SandboxRoles::default();
     SandboxConfig {
         profile: crate::config::SandboxRoles {
             worker: raw
                 .profile
                 .as_ref()
                 .and_then(|profile| profile.worker)
-                .unwrap_or(crate::config::SandboxMode::Relaxed),
+                .unwrap_or(defaults.worker),
             head: raw
                 .profile
                 .as_ref()
                 .and_then(|profile| profile.head)
-                .unwrap_or(crate::config::SandboxMode::Off),
+                .unwrap_or(defaults.head),
         },
         write_allow: raw.write_allow.clone().unwrap_or_default(),
         read_deny: raw.read_deny.clone().unwrap_or_default(),
@@ -5780,7 +5781,7 @@ mod tests {
                             "api_key_env": "EVIL_KEY"
                           },
                           "subc": { "connection_file": "/tmp/evil-subc.json" },
-                          "sandbox": { "profile": { "worker": "relaxed", "head": "off" }, "write_allow": ["/project/write"] }
+                          "sandbox": { "profile": { "worker": "standard", "head": "off" }, "write_allow": ["/project/write"] }
                         }
                       }
                     }"#,
@@ -6404,12 +6405,12 @@ mod tests {
     fn sandbox_profiles_default_by_role_and_project_cannot_loosen() {
         let defaults = resolve_config(&[tier("user", "{}")]);
         let sandbox = serde_json::to_value(&defaults.config.sandbox).unwrap();
-        assert_eq!(sandbox["profile"]["worker"], "relaxed");
+        assert_eq!(sandbox["profile"]["worker"], "standard");
         assert_eq!(sandbox["profile"]["head"], "off");
         let result = resolve_config(&[
             tier(
                 "user",
-                r#"{"sandbox":{"profile":{"worker":"strict","head":"relaxed"}}}"#,
+                r#"{"sandbox":{"profile":{"worker":"strict","head":"standard"}}}"#,
             ),
             tier(
                 "project",
@@ -6418,12 +6419,13 @@ mod tests {
         ]);
         let sandbox = serde_json::to_value(&result.config.sandbox).unwrap();
         assert_eq!(sandbox["profile"]["worker"], "strict");
-        assert_eq!(sandbox["profile"]["head"], "relaxed");
+        assert_eq!(sandbox["profile"]["head"], "standard");
         assert!(drop_keys(&result).contains(&"sandbox.profile.worker".to_string()));
         assert!(drop_keys(&result).contains(&"sandbox.profile.head".to_string()));
         for role in ["worker", "head"] {
-            for (floor_rank, floor) in ["off", "relaxed", "strict"].into_iter().enumerate() {
-                for (next_rank, next) in ["off", "relaxed", "strict"].into_iter().enumerate() {
+            let modes = ["off", "credentials", "standard", "strict"];
+            for (floor_rank, floor) in modes.into_iter().enumerate() {
+                for (next_rank, next) in modes.into_iter().enumerate() {
                     let user =
                         serde_json::json!({"sandbox":{"profile":{(role):floor}}}).to_string();
                     let project =
@@ -6457,7 +6459,7 @@ mod tests {
                 "project",
                 r#"{
                   "sandbox": {
-                    "profile": { "worker": "relaxed", "head": "off" },
+                    "profile": { "worker": "standard", "head": "off" },
                     "write_allow": ["/project/write"],
                     "read_deny": ["/project/secret", "/user/secret"]
                   }
@@ -6512,7 +6514,7 @@ mod tests {
             ),
             tier(
                 "project",
-                r#"{ "sandbox": { "profile": { "worker": "relaxed", "head": "off" } } }"#,
+                r#"{ "sandbox": { "profile": { "worker": "standard", "head": "off" } } }"#,
             ),
         ]);
         assert!(opt_out.config.sandbox.head_enabled());

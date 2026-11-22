@@ -18079,7 +18079,7 @@ fn write_unenforced_sandbox_warning(
     artifact: TaskArtifact,
 ) -> Result<(), String> {
     let warning = match plan {
-        SpawnPlan::RelaxedUnenforced => "sandbox: profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced] (Windows has no native sandbox backend; command runs with full user rights)\n",
+        SpawnPlan::RelaxedUnenforced => "sandbox: profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced] (Windows has no native sandbox backend; command runs with full user rights)\n",
         SpawnPlan::Unsandboxed if crate::sandbox_spawn::worker_jail_active() => "sandbox: profile=off unenforced=[operator gh fence: unenforced (no OS sandbox)]\n",
         _ => return Ok(()),
     };
@@ -18760,7 +18760,7 @@ mod tests {
                 .unwrap();
             let output = std::fs::read_to_string(path).unwrap();
             assert!(
-                output.contains("profile=relaxed unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"),
+                output.contains("profile=standard unenforced=[all filesystem read/write denies,operator gh fence: unenforced]"),
                 "{output}"
             );
             assert!(

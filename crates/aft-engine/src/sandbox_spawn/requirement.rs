@@ -24,11 +24,7 @@ impl SandboxRequirement {
     }
 
     pub(crate) fn raise(self, mode: SandboxMode) -> SandboxMode {
-        match (mode, self.mode) {
-            (SandboxMode::Strict, _) | (_, SandboxMode::Strict) => SandboxMode::Strict,
-            (SandboxMode::Relaxed, _) | (_, SandboxMode::Relaxed) => SandboxMode::Relaxed,
-            _ => SandboxMode::Off,
-        }
+        mode.max(self.mode)
     }
 
     #[doc(hidden)]
@@ -150,7 +146,12 @@ mod tests {
             requirement.reason,
             SandboxRequirementReason::SecretPlaceholder
         );
-        for mode in [SandboxMode::Off, SandboxMode::Relaxed, SandboxMode::Strict] {
+        for mode in [
+            SandboxMode::Off,
+            SandboxMode::Credentials,
+            SandboxMode::Standard,
+            SandboxMode::Strict,
+        ] {
             assert_eq!(requirement.raise(mode), SandboxMode::Strict);
         }
         assert_eq!(requirement.check_request(RequestedSandboxTier::Native, false).unwrap_err(),

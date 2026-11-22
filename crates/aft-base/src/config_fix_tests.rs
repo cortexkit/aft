@@ -5,7 +5,7 @@ use serde_json::json;
 
 #[test]
 fn sandbox_profile_cutover_matches_doctor_and_preserves_explicit_roles() {
-    for (enabled, worker, head) in [(true, "strict", "strict"), (false, "relaxed", "off")] {
+    for (enabled, worker, head) in [(true, "strict", "strict"), (false, "standard", "off")] {
         let source = format!("{{\n// operator choice\n\"sandbox\":{{\"enabled\":{enabled},}},\n}}");
         let migrated = migrate_config_text(&source, FixTier::User).unwrap();
         assert!(migrated.changed);
@@ -48,6 +48,117 @@ fn sandbox_profile_cutover_matches_doctor_and_preserves_explicit_roles() {
     assert_eq!(
         value["harnesses"]["pi"]["sandbox"]["profile"],
         json!({"worker":"strict","head":"off"})
+    );
+}
+
+#[test]
+fn sandbox_profile_only_user_rewrite_is_once_and_empty_config_is_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    let load = || {
+        with_backup_dir_for_test(dir.path(), || {
+            crate::subc_config::read_local_cortexkit_config_tiers_for_harness(
+                Some(&path),
+                dir.path(),
+                None,
+            )
+        })
+    };
+    fs::write(&path, "{}\n").unwrap();
+    assert!(load().1.is_none());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "{}\n");
+    assert!(backups(dir.path()).is_empty());
+
+    let old = "{\"sandbox\":{\"profile\":{\n// Keep this comment\n\"worker\":\"relaxed\"}}}\n";
+    fs::write(&path, old).unwrap();
+    let (tiers, migration) = load();
+    let Some(UserConfigMigration::Migrated { backup, notice, .. }) = migration else {
+        panic!("expected a user rewrite, got {migration:?}");
+    };
+    assert!(notice.contains("sandbox.profile.worker"), "{notice}");
+    assert_eq!(fs::read_to_string(backup).unwrap(), old);
+    let current = fs::read_to_string(&path).unwrap();
+    assert_eq!(tiers[0].doc, current, "load must use the rewritten file");
+    assert!(current.contains("// Keep this comment"), "{current}");
+    let value = parse_document(&current).unwrap();
+    assert_eq!(value["sandbox"]["profile"], json!({"worker":"standard"}));
+    assert!(load().1.is_none());
+    assert_eq!(fs::read_to_string(&path).unwrap(), current);
+    assert_eq!(backups(dir.path()).len(), 1);
+}
+
+#[test]
+fn sandbox_profile_project_relaxed_hardens_only_the_worker_without_rewrite() {
+    use crate::config::SandboxMode;
+
+    let dir = tempfile::tempdir().unwrap();
+    let user = dir.path().join("user.jsonc");
+    fs::write(
+        &user,
+        r#"{"sandbox":{"profile":{"worker":"off","head":"credentials"}}}"#,
+    )
+    .unwrap();
+    let project_dir = dir.path().join(".cortexkit");
+    fs::create_dir(&project_dir).unwrap();
+    let project = project_dir.join("aft.jsonc");
+    let old = "{\"sandbox\":{\"profile\":{\"worker\":\"relaxed\"}}}\n";
+    fs::write(&project, old).unwrap();
+
+    let (tiers, migration) = crate::subc_config::read_local_cortexkit_config_tiers_for_harness(
+        Some(&user),
+        dir.path(),
+        None,
+    );
+    assert!(migration.is_none());
+    let resolved = resolve_config_for_harness(&tiers, None);
+    assert!(resolved.errors.is_empty(), "{:?}", resolved.errors);
+    assert_eq!(
+        resolved.config.sandbox.profile.worker,
+        SandboxMode::Standard
+    );
+    assert_eq!(
+        resolved.config.sandbox.profile.head,
+        SandboxMode::Credentials
+    );
+    assert_eq!(fs::read_to_string(&project).unwrap(), old);
+}
+
+#[test]
+fn absent_sandbox_enabled_does_not_block_other_retirements_or_relocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("legacy.jsonc");
+    let destination = dir.path().join("current").join("aft.jsonc");
+    let old = r#"{"bash":{"runon_enabled":false}}"#;
+    fs::write(&source, old).unwrap();
+    let migration = with_backup_dir_for_test(dir.path(), || {
+        migrate_user_config_to(&source, &destination, 4096, |path| fs::remove_file(path)).unwrap()
+    });
+    let Some(UserConfigMigration::Migrated { backup, .. }) = migration else {
+        panic!("expected a relocated file, got {migration:?}");
+    };
+    assert!(!source.exists());
+    assert_eq!(fs::read_to_string(backup).unwrap(), old);
+    let current = parse_document(&fs::read_to_string(destination).unwrap()).unwrap();
+    assert_eq!(current["remote_exec"]["enabled"], false);
+    assert!(current["bash"].get("runon_enabled").is_none());
+    assert!(current.get("sandbox").is_none());
+}
+
+#[test]
+fn doctor_fix_rewrites_relaxed_sandbox_profiles() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    fs::write(
+        &path,
+        r#"{"harnesses":{"pi":{"sandbox":{"profile":{"worker":"strict","head":"relaxed"}}}}}"#,
+    )
+    .unwrap();
+    let outcomes = fix_files(&[(path.clone(), FixTier::Project)]);
+    assert_eq!(outcomes[0].status, "rewritten", "{outcomes:?}");
+    let current = parse_document(&fs::read_to_string(path).unwrap()).unwrap();
+    assert_eq!(
+        current["harnesses"]["pi"]["sandbox"]["profile"],
+        json!({"worker":"strict","head":"standard"})
     );
 }
 

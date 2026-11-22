@@ -219,6 +219,9 @@ mod tests {
                 || key.0.ends_with(".lsp.idle_minutes")
                 || key.0.ends_with(".inspect.duplicates.expected_mirrors")
                 || key.0.ends_with(".initialization_options")
+                || key.0.ends_with(".sandbox")
+                || key.0.ends_with(".sandbox.profile")
+                || key.0.ends_with(".sandbox.write_allow")
             {
                 continue;
             }
