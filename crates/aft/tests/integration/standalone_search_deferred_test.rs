@@ -157,6 +157,12 @@ fn standalone_configure_replays_completed_task_before_queued_completion_drain() 
 }
 
 fn read_http_request(stream: &mut TcpStream) -> String {
+    // On macOS an accepted socket inherits O_NONBLOCK from a nonblocking
+    // listener, so a read before the request arrives fails with WouldBlock
+    // instead of waiting. Make the timeout below the only limit.
+    stream
+        .set_nonblocking(false)
+        .expect("make embedding stream blocking");
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("set embedding read timeout");
