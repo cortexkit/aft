@@ -18,7 +18,7 @@
 //! [`ToolLaunchPolicy`] carries the session shell's launch policy to those tools.
 
 use std::cell::RefCell;
-#[cfg(any(test, target_os = "linux"))]
+#[cfg(any(test, unix))]
 use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
 #[cfg(unix)]
