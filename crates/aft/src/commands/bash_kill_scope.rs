@@ -7,7 +7,8 @@ use subc_protocol::Principal;
 use crate::bash_background::registry::BgTaskRegistry;
 use crate::protocol::Response;
 
-pub(crate) const BASH_KILL_SCOPE_OPERATION: &str = "bash.kill_scope";
+/// The operation name for stopping shell tasks owned by a scope.
+pub const BASH_KILL_SCOPE_OPERATION: &str = "bash.kill_scope";
 
 /// Stop a cancelled worker's bash tasks without revoking its scope.
 ///
@@ -34,7 +35,7 @@ pub(crate) fn handle_bash_kill_scope(
 /// would enforce even the task's own time limit. Each such task is marked
 /// `from_saved_record` in the reply. If a saved task of this scope cannot be
 /// recovered, the reply is an error naming it, never a completed stop.
-pub(crate) fn handle_bash_kill_scope_with_saved_tasks(
+pub fn handle_bash_kill_scope_with_saved_tasks(
     params: Value,
     principal: Option<&Principal>,
     registries: &[BgTaskRegistry],

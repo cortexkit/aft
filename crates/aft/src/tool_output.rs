@@ -12,32 +12,23 @@ use crate::protocol::Response;
 #[cfg(test)]
 pub(crate) use aft_engine::test_bridge::search_misc::cleanup_expired;
 
+/// Maximum size in bytes of rendered tool text before saving the full output separately.
 pub const TEXT_LIMIT: usize = 50 * 1024;
 /// Existing list producers reserve 10 KiB for their envelope, disclosures,
 /// reminders and status bar rather than spending the final transport budget.
 pub(crate) const LIST_BODY_BYTES: usize = TEXT_LIMIT - 10 * 1024;
-pub const CUT_TRAILER: &str = "[output cut at 50 KB of <total> KB; full result saved to <path>; read it with read and a line range]";
+const CUT_TRAILER: &str = "[output cut at 50 KB of <total> KB; full result saved to <path>; read it with read and a line range]";
 // Agents see this trailer, and the project owner approved its exact wording;
 // keep it byte-identical, and get the owner's approval before changing it.
-pub const SAVE_FAILED_TRAILER: &str =
+const SAVE_FAILED_TRAILER: &str =
     "[output cut at 50 KB of <total> KB; the full result could not be saved: <reason>]";
 /// Called after reminders and the status bar, so the host never cuts off recovery text.
-pub(crate) fn cap(
-    ctx: &AppContext,
-    session: &str,
-    tool: &str,
-    response: &Response,
-    text: &mut String,
-) {
+pub fn cap(ctx: &AppContext, session: &str, tool: &str, response: &Response, text: &mut String) {
     cap_with_scope(&OutputScope::new(ctx, session, None), tool, response, text);
 }
 
-pub(crate) fn cap_with_scope(
-    scope: &OutputScope,
-    tool: &str,
-    response: &Response,
-    text: &mut String,
-) {
+/// Cap rendered text using the caller's existing output-retention scope.
+pub fn cap_with_scope(scope: &OutputScope, tool: &str, response: &Response, text: &mut String) {
     if text.len() <= TEXT_LIMIT {
         if let Some((start, envelope)) = native_envelope_line(&response.data, text) {
             if start + envelope.len() < text.trim_end_matches('\n').len() {

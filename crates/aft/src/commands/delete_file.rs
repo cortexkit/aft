@@ -720,7 +720,8 @@ fn delete_one_or_dir(
 /// resolve all locations under the admitted config before releasing the gate.
 /// Ancestors of the root and mixed batches remain writers, as do external
 /// backed-up deletes (their undo state still belongs to the actor).
-pub(crate) fn handle_delete_deferred_with_restriction(
+/// Prepare a deletion with the transport's permission restriction.
+pub fn handle_delete_deferred_with_restriction(
     req: &RawRequest,
     ctx: std::sync::Arc<AppContext>,
     force_restrict: bool,

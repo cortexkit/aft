@@ -364,7 +364,7 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
 /// restores the watcher and queues this again. Degraded roots (the home
 /// directory among them) get the same explicit empty matcher the watcher drain
 /// installs for them, because walking them for ignore files is too costly.
-pub(crate) fn load_ignore_rules_if_unpublished(ctx: &AppContext) -> bool {
+pub fn load_ignore_rules_if_unpublished(ctx: &AppContext) -> bool {
     if ctx.gitignore_published() {
         return true;
     }
@@ -382,7 +382,7 @@ pub(crate) fn load_ignore_rules_if_unpublished(ctx: &AppContext) -> bool {
 /// Whether a watcher is running for this root with ignore rules that were
 /// never loaded, so the caller must queue [`load_ignore_rules_if_unpublished`]
 /// off its own thread.
-pub(crate) fn ignore_rules_load_pending(ctx: &AppContext) -> bool {
+pub fn ignore_rules_load_pending(ctx: &AppContext) -> bool {
     ctx.watcher_runtime_active() && !ctx.gitignore_published()
 }
 
@@ -2258,7 +2258,8 @@ fn prepared_cache_warning(
 /// The newer connect's settings stand, and the next probe checks them; an old
 /// request re-run over them would restore its storage root, harness and other
 /// process settings.
-pub(crate) fn handle_cache_recovery(
+/// Recover the configured cache for the request's project context.
+pub fn handle_cache_recovery(
     req: &RawRequest,
     connect_generation: u64,
     ctx: &AppContext,
@@ -3870,7 +3871,8 @@ fn cancel_unbound_configure_jobs(
     ctx.cancel_unbound_artifact_work();
 }
 
-pub(crate) fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
+/// Cancel queued configure maintenance while draining a project context.
+pub fn cancel_deferred_configure_maintenance(ctx: &AppContext) -> usize {
     // An unbound or quiesced root stops both identity and cache recovery.
     crate::provisional_identity_retry::cancel(ctx);
     let parked = ctx

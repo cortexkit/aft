@@ -128,14 +128,14 @@ mod tests {
     #[test]
     fn code_search_nudge_standalone_appends_once_only_to_native_terminal_results() {
         let root = fixture();
-        let context = crate::subc_format::BashCodeSearchHint {
-            command: "cd src && echo marker && rg foo . | head".into(),
-            workdir: None,
-            search_tool: Some("aft_search".into()),
-            grep_tool: Some("grep".into()),
-            shell_tool: "bash".into(),
-            runner_notice: None,
-        };
+        let context = crate::subc_format::BashCodeSearchHint::new(
+            "cd src && echo marker && rg foo . | head".into(),
+            None,
+            Some("aft_search".into()),
+            Some("grep".into()),
+            "bash".into(),
+            None,
+        );
         let mut response = crate::protocol::Response::success(
             "call",
             serde_json::json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "matches"}),

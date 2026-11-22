@@ -377,7 +377,7 @@ async fn codemode_worker_background_task_is_visible_only_to_catalog_binding_and_
         if route.call_mode == subc_protocol::call_mode::CallMode::Codemode {
             continue;
         }
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let _wake = wake.install();
         let watch = with_route(route, || {
             crate::commands::bash_watch::handle_deferred(

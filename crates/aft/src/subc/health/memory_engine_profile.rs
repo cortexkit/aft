@@ -43,7 +43,7 @@ fn bound_context(root: &Path, storage: &Path) -> Arc<AppContext> {
     let checkout = ctx.data_checkout().expect("bind checkout");
     assert!(matches!(
         checkout.fresh_view(Duration::from_secs(300)),
-        crate::data_layer::runtime::Fresh::Ready(_)
+        aft_engine::data_layer::runtime::Fresh::Ready(_)
     ));
     checkout.wait_for_memory_profile_idle_for_test();
     ctx

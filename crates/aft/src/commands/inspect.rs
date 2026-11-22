@@ -1363,7 +1363,8 @@ pub(crate) fn handle_inspect_deferred_with_restriction(
     handle_inspect_deferred_with_reply_deadline(req, ctx, force_restrict, None)
 }
 
-pub(crate) fn handle_inspect_deferred_with_reply_deadline(
+/// Prepare an inspect reply with the transport's restriction and deadline.
+pub fn handle_inspect_deferred_with_reply_deadline(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     force_restrict: bool,

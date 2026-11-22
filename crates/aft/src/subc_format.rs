@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::protocol::Response;
 use serde_json::Value;
@@ -25,6 +26,23 @@ pub enum OutlineMode {
     Files,
     DirectoryJson,
 }
+
+/// A per-call route for ordered code-search notices, supplied by the daemon.
+pub trait CodeSearchNotice: aft_base::pending_notices::NoticeSink + std::any::Any {
+    /// Compare route identity without comparing the remaining delivery budget.
+    fn same_route(&self, other: &dyn CodeSearchNotice) -> bool;
+
+    /// Record why a candidate shell search was not eligible for a notice.
+    fn log_code_search_ineligible(&self, reason: &'static str);
+}
+
+impl PartialEq for dyn CodeSearchNotice {
+    fn eq(&self, other: &Self) -> bool {
+        self.same_route(other)
+    }
+}
+
+impl Eq for dyn CodeSearchNotice {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FormatContext {
@@ -57,22 +75,42 @@ pub struct FormatContext {
     /// Per-call native shell steering facts retained across deferred rendering.
     pub bash_code_search_hint: Option<BashCodeSearchHint>,
     #[doc(hidden)]
-    pub runner_notice: Option<crate::subc::runner_notices::CodeSearchNotice>,
+    pub runner_notice: Option<Arc<dyn CodeSearchNotice>>,
 }
 
 /// Native shell guidance facts carried with a deferred call's render context.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BashCodeSearchHint {
-    pub(crate) command: String,
-    pub(crate) workdir: Option<String>,
-    pub(crate) search_tool: Option<String>,
-    pub(crate) grep_tool: Option<String>,
-    pub(crate) shell_tool: String,
-    pub(crate) runner_notice: Option<crate::subc::runner_notices::CodeSearchNotice>,
+    command: String,
+    workdir: Option<String>,
+    search_tool: Option<String>,
+    grep_tool: Option<String>,
+    shell_tool: String,
+    runner_notice: Option<Arc<dyn CodeSearchNotice>>,
 }
 
 impl BashCodeSearchHint {
-    pub(crate) fn deliver(&self, response: &mut crate::protocol::Response, root: &Path) {
+    /// Retain the command, available tool names and notice route across a deferred shell call.
+    pub fn new(
+        command: String,
+        workdir: Option<String>,
+        search_tool: Option<String>,
+        grep_tool: Option<String>,
+        shell_tool: String,
+        runner_notice: Option<Arc<dyn CodeSearchNotice>>,
+    ) -> Self {
+        Self {
+            command,
+            workdir,
+            search_tool,
+            grep_tool,
+            shell_tool,
+            runner_notice,
+        }
+    }
+
+    /// Deliver guidance for a terminal native shell reply if the search is eligible.
+    pub fn deliver(&self, response: &mut crate::protocol::Response, root: &Path) {
         // Only foreground terminal native replies carry both status and task
         // identity. Rewrites, background launches and replies handing a still-
         // running foreground task back to the caller are left alone.
@@ -99,7 +137,7 @@ impl BashCodeSearchHint {
                 return;
             }
         };
-        response.notices.route = self.runner_notice.clone().map(|route| route.into_sink());
+        response.notices.route = self.runner_notice.clone().map(|route| route as _);
         response
             .notices
             .items
@@ -1227,7 +1265,8 @@ fn div_floor_i64(value: i64, divisor: i64) -> i64 {
     }
 }
 
-pub(crate) fn civil_from_days(days: i64) -> (i64, i64, i64) {
+/// Convert days since the Unix epoch into a Gregorian year, month, and day.
+pub fn civil_from_days(days: i64) -> (i64, i64, i64) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

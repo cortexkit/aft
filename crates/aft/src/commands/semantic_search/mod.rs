@@ -398,7 +398,8 @@ const FIRST_TEXT_INDEX_WAIT: Duration = Duration::from_secs(8);
 
 /// Admission uses the same predicate as the wait, so only cold searches leave
 /// the executor. A semantic lane that can already answer needs no text wait.
-pub(crate) fn first_text_index_wait_needed(ctx: &AppContext) -> bool {
+/// Check whether search is still waiting for the first text-index publication.
+pub fn first_text_index_wait_needed(ctx: &AppContext) -> bool {
     let lanes = SearchLaneStatus::observe_current(ctx);
     lanes.trigram.effective == IndexEffective::Building
         && ctx
@@ -448,7 +449,8 @@ fn wait_for_first_text_index(ctx: &AppContext) -> extensions::ReadinessWait {
 
 /// The cold-search continuation uses the existing pending-response transport,
 /// leaving the executor free to publish the index it is waiting for.
-pub(crate) fn handle_first_index_search_deferred(
+/// Prepare a search that may wait for the initial index within the reply deadline.
+pub fn handle_first_index_search_deferred(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     force_restrict: bool,

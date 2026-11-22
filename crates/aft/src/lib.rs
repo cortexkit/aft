@@ -258,7 +258,7 @@ pub use aft_engine::synapse_embed;
 #[cfg(test)]
 pub(crate) use aft_engine::test_bridge::test_storage;
 pub(crate) use aft_engine::tool_call_result;
-pub(crate) mod tool_output;
+pub mod tool_output;
 pub use aft_base::tool_path;
 pub(crate) use aft_base::tool_progress;
 use aft_base::view_storage_reserve;

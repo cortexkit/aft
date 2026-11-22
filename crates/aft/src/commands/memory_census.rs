@@ -45,7 +45,8 @@ pub fn render_memory_census(
     render_memory_census_with_roots(snapshot, roots)
 }
 
-pub(crate) fn render_memory_census_with_roots(
+/// Render the memory census using already-rendered project root rows.
+pub fn render_memory_census_with_roots(
     snapshot: &crate::memory::MemorySnapshot,
     roots: Map<String, Value>,
 ) -> Value {
@@ -196,7 +197,8 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
 /// Cache only snapshot-derived rows. Process counters and lifecycle overlays
 /// remain live, and the health publisher adds the current index-walk ages.
 #[derive(Default)]
-pub(crate) struct CensusRootRows {
+/// Cache rendered root rows across memory-census snapshots.
+pub struct CensusRootRows {
     rows: std::collections::BTreeMap<String, (RootRowInputs, Value)>,
 }
 
@@ -251,10 +253,8 @@ impl From<&crate::memory::RootMemorySnapshot> for RootRowInputs {
 }
 
 impl CensusRootRows {
-    pub(crate) fn render(
-        &mut self,
-        snapshot: &crate::memory::MemorySnapshot,
-    ) -> Map<String, Value> {
+    /// Render root rows and reuse cached rows whose displayed inputs did not change.
+    pub fn render(&mut self, snapshot: &crate::memory::MemorySnapshot) -> Map<String, Value> {
         self.rows
             .retain(|root, _| snapshot.roots.contains_key(root));
         snapshot

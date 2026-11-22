@@ -180,6 +180,21 @@ impl aft_base::pending_notices::NoticeSink for CodeSearchNotice {
     }
 }
 
+impl crate::subc_format::CodeSearchNotice for CodeSearchNotice {
+    fn same_route(&self, other: &dyn crate::subc_format::CodeSearchNotice) -> bool {
+        let other: &dyn std::any::Any = other;
+        other.downcast_ref::<Self>() == Some(self)
+    }
+
+    fn log_code_search_ineligible(&self, reason: &'static str) {
+        let (session, harness) = self.log_target();
+        crate::slog_info!(
+            "runner code-search nudge call_key={} session={session} harness={harness} not eligible reason={reason}",
+            self.call_key
+        );
+    }
+}
+
 pub(super) fn code_search_notice(
     route: &RouteIdentity,
     call_key: &str,
@@ -266,10 +281,6 @@ pub(super) fn nudge_request(
 }
 
 impl CodeSearchNotice {
-    pub(crate) fn into_sink(self) -> Arc<dyn aft_base::pending_notices::NoticeSink> {
-        Arc::new(self)
-    }
-
     pub(super) fn with_preset(mut self, role: super::tool_provider::CallerRole) -> Self {
         self.preset = match role {
             super::tool_provider::CallerRole::Head => "head",
@@ -278,14 +289,6 @@ impl CodeSearchNotice {
         }
         .into();
         self
-    }
-
-    pub(crate) fn log_code_search_ineligible(&self, reason: &'static str) {
-        let (session, harness) = self.log_target();
-        crate::slog_info!(
-            "runner code-search nudge call_key={} session={session} harness={harness} not eligible reason={reason}",
-            self.call_key
-        );
     }
 
     fn log_target(&self) -> (&str, &str) {

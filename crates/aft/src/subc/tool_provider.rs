@@ -687,7 +687,7 @@ pub(super) fn catalog(
 // delay outside AFT's execution clock. Declare four minutes beyond the wait so
 // the reply-budget safety reserve preserves a full default 30-minute wait.
 // This extends the caller's reply window, never the command's hard timeout.
-pub(crate) use crate::commands::blocking_wait::WORKER_REPLY_MARGIN_MS;
+pub(crate) use crate::blocking_wait::WORKER_REPLY_MARGIN_MS;
 const MAX_DECLARED_REPLY_MS: u64 = 86_400_000;
 
 /// Render a catalog directly from arguments for catalog conformance fixtures.
@@ -7486,7 +7486,7 @@ pub(in crate::subc) mod route_tests {
         let (deferred_tx, mut deferred_rx) = mpsc::unbounded_channel();
         let deferred_tx = super::super::DeferredResponseSender {
             entries: deferred_tx,
-            wake: crate::response_finalize::DeferredResponseWake::default(),
+            wake: crate::pending_response::DeferredResponseWake::default(),
         };
         let frame = decoded.frame;
         handle_tool_call_with_capabilities(
@@ -9233,7 +9233,7 @@ pub(in crate::subc) mod route_tests {
                 &ctx,
                 None,
             )
-            .map(|prepared| prepared.request.command)
+            .map(|prepared| prepared.into_parts().0.command)
             .map_err(|_| ())
         };
         for (bare, plugin, arguments) in renamed {
@@ -11846,7 +11846,7 @@ mod ledger_terminal_tests {
                     params: json!({"task_id":"pending-watch", "timeout_ms":10000}),
                     lsp_hints: None,
                 },
-                crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                crate::blocking_wait::ReplyBudget::new(Instant::now(), None),
                 10000,
             ),
         );
@@ -12493,7 +12493,7 @@ mod authorization_failure_tests {
             repeat: None,
             worker_session: false,
             worker_preset: false,
-            reply_budget: crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+            reply_budget: crate::blocking_wait::ReplyBudget::new(Instant::now(), None),
             asked_at: Instant::now(),
             expires_at: Instant::now() + Duration::from_secs(60),
         }

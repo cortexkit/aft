@@ -162,7 +162,7 @@ impl Fixture {
             false,
             route.role == tool_provider::RouteRole::ToolProviderV1,
             remote_policy::RemoteSource::None,
-            crate::commands::blocking_wait::ReplyBudget::new(
+            crate::blocking_wait::ReplyBudget::new(
                 Instant::now(),
                 Some(Instant::now() + Duration::from_secs(120)),
             ),

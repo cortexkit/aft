@@ -560,7 +560,7 @@ mod frame_loop_lock_tests {
                 Arc::new(drain::BashCallClaim::default()),
                 None,
                 false,
-                crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                crate::blocking_wait::ReplyBudget::new(Instant::now(), None),
             ),
         )
         .await
@@ -913,7 +913,7 @@ fn detached_call_message(target: &drain::BashDetachTarget) -> String {
     let cached = target.reply_cache.snapshot();
     format!(
         "{}{}",
-        crate::commands::bash_orchestrate::format_detached_call_message(
+        format_detached_call_message(
             &target.task_id,
             cached.remote.as_ref(),
             cached.inputs_captured == Some(false),
@@ -1366,10 +1366,7 @@ pub(super) fn finalized_bash_result(
     allow_bg_completions: bool,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
 ) -> ToolCallResult {
-    response.notices.route = format_context
-        .runner_notice
-        .clone()
-        .map(|route| route.into_sink());
+    response.notices.route = format_context.runner_notice.clone().map(|route| route as _);
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if let Some(hint) = &format_context.bash_code_search_hint {
         let root = ctx.config().project_root.clone().unwrap_or_default();
@@ -1399,10 +1396,7 @@ fn bash_result_from_response(
     mut response: Response,
     format_context: &crate::subc_format::FormatContext,
 ) -> ToolCallResult {
-    response.notices.route = format_context
-        .runner_notice
-        .clone()
-        .map(|route| route.into_sink());
+    response.notices.route = format_context.runner_notice.clone().map(|route| route as _);
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     let mut text =
         crate::subc_format::format_response_with_context("bash", &response, format_context);
@@ -1472,6 +1466,96 @@ fn bash_background_launch_response(
 // command timeout rather than appended to the caller's existing budget.
 const REMOTE_INPUT_CAPTURE_WAIT: Duration = Duration::from_secs(60);
 use crate::commands::bash_orchestrate::{with_capture_warning, REMOTE_INPUT_CAPTURE_WARNING};
+
+/// The message of the `detached` error that a call the server completes
+/// (a tool-provider v1 route) gets when AFT restarts while the call is held.
+/// The runner shows the agent only that error's code and message, not its
+/// structured detail, so the message itself must name the task, and for a
+/// build-server task its job, or the caller has no ID to pass to
+/// bash_watch, bash_status or bash_kill.
+pub(crate) fn format_detached_call_message(
+    task_id: &str,
+    remote: Option<&crate::bash_background::registry::remote::RemoteProgress>,
+    inputs_uncaptured: bool,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> String {
+    let remote = remote
+        .map(|progress| {
+            format!(
+                " {}",
+                crate::commands::bash_orchestrate::remote_job_sentence(Some(progress))
+            )
+        })
+        .unwrap_or_default();
+    let capture = if inputs_uncaptured {
+        format!("\n{REMOTE_INPUT_CAPTURE_WARNING}")
+    } else {
+        String::new()
+    };
+    format!(
+        "call detached; command still running in the background as {}\nDetached because AFT is restarting.{remote}{capture}",
+        crate::commands::bash_orchestrate::format_background_handoff_tail(task_id, worker_session, bash_watch_available),
+    )
+}
+
+/// Hands a still-running foreground command to the background because the
+/// module is about to restart. Same promotion as a user-message detach, so the
+/// task keeps running, is persisted, and delivers its completion later.
+pub(crate) fn detach_bash_for_module_drain(
+    ctx: &AppContext,
+    task_id: &str,
+    session_id: &str,
+    request_id: &str,
+    worker_session: bool,
+    bash_watch_available: bool,
+) -> Response {
+    let response = match ctx.bash_background().promote_typed(task_id, session_id) {
+        Ok(_) => {
+            let snapshot = ctx
+                .bash_background()
+                .observed_status(task_id, session_id, 0);
+            let output_path = snapshot
+                .as_ref()
+                .and_then(|task| task.output_path.as_deref());
+            let stderr_path = snapshot
+                .as_ref()
+                .and_then(|task| task.stderr_path.as_deref());
+            crate::slog_info!("bash drain detach persisted: task_id={task_id} output={output_path:?} stderr={stderr_path:?}");
+            Response::success(
+                request_id,
+                json!({
+                    "output": format!(
+                        "{}{}\nOutput: {}",
+                        crate::commands::bash_orchestrate::format_module_drain_detach_message(
+                            task_id,
+                            worker_session,
+                            bash_watch_available,
+                        ),
+                        crate::commands::bash_orchestrate::kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
+                        output_path.unwrap_or("unavailable")
+                    ),
+                    "task_id": task_id,
+                    "status": "running",
+                    "output_path": output_path,
+                    "stderr_path": stderr_path,
+                }),
+            )
+        }
+        Err(message) if message.is_missing_task() => Response::error(
+            request_id,
+            "task_not_found",
+            crate::commands::bash_status::format_unknown_task_message(task_id),
+        ),
+        Err(message) => Response::error(request_id, "execution_failed", message.to_string()),
+    };
+    crate::commands::bash_orchestrate::with_runon_capture_state(
+        ctx.bash_background(),
+        task_id,
+        session_id,
+        response,
+    )
+}
 
 async fn warn_if_runon_capture_missing(
     registry: crate::bash_background::BgTaskRegistry,
@@ -1725,7 +1809,7 @@ async fn await_runon_launch_reply(
     server_completion: bool,
     reply_deadline: Option<Instant>,
     background_runon: bool,
-    reply_budget: crate::commands::blocking_wait::ReplyBudget,
+    reply_budget: crate::blocking_wait::ReplyBudget,
 ) -> Option<Response> {
     let deadline = deadline?;
     let task_id = response.data.get("task_id")?.as_str()?.to_owned();
@@ -2010,7 +2094,7 @@ pub(super) fn submit_deferred_bash(
     worker_jail: bool,
     server_completion: bool,
     remote_source: super::remote_policy::RemoteSource,
-    reply_budget: impl Into<crate::commands::blocking_wait::ReplyBudget>,
+    reply_budget: impl Into<crate::blocking_wait::ReplyBudget>,
 ) {
     let reply_budget = reply_budget.into();
     let program = super::secret_consent::current_identity().filter(|identity| {
@@ -2054,7 +2138,7 @@ pub(super) fn submit_deferred_bash(
                 let approved_budget = if permissions.is_empty() {
                     reply_budget
                 } else {
-                    crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None)
+                    crate::blocking_wait::ReplyBudget::new(Instant::now(), None)
                 };
                 let (tx, mut rx) = mpsc::channel(2);
                 let _scope = crate::access_policy::scope_guard(Some(
@@ -2329,28 +2413,31 @@ pub(super) fn submit_deferred_bash(
             arguments.get("background").and_then(Value::as_bool) != Some(true)
                 && arguments.get("pty").and_then(Value::as_bool) != Some(true)
         })
-        .map(|command| crate::subc_format::BashCodeSearchHint {
-            command: command.into(),
-            workdir: arguments
-                .get("workdir")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            search_tool: (search_registered && crate::tool_gate::catalog_keeps("search", disabled))
-                .then(|| {
-                    if worker_preset {
-                        "search"
-                    } else {
-                        "aft_search"
-                    }
-                    .into()
-                }),
-            grep_tool: crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
-            shell_tool: format_context
-                .host_tool_names
-                .as_ref()
-                .map_or("bash", |names| names.shell())
-                .into(),
-            runner_notice: format_context.runner_notice.clone(),
+        .map(|command| {
+            crate::subc_format::BashCodeSearchHint::new(
+                command.into(),
+                arguments
+                    .get("workdir")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                (search_registered && crate::tool_gate::catalog_keeps("search", disabled)).then(
+                    || {
+                        if worker_preset {
+                            "search"
+                        } else {
+                            "aft_search"
+                        }
+                        .into()
+                    },
+                ),
+                crate::tool_gate::catalog_keeps("grep", disabled).then(|| "grep".into()),
+                format_context
+                    .host_tool_names
+                    .as_ref()
+                    .map_or("bash", |names| names.shell())
+                    .into(),
+                format_context.runner_notice.clone(),
+            )
         });
     let server_completion = server_completion || run_scoped;
     if matches!(ask_route, crate::access_policy::AskRoute::Plugin { .. }) {
@@ -3532,7 +3619,7 @@ fn log_runon_refusal(route: RouteChannel, session: &str, response: &Response) {
 
 async fn wait_for_bash_reply_deadline(
     deadline: Instant,
-    reply_budget: crate::commands::blocking_wait::ReplyBudget,
+    reply_budget: crate::blocking_wait::ReplyBudget,
 ) {
     // Fixtures that test a reply produced by the wait task itself, such as a
     // failed promotion, hold this timer. Otherwise a slow runner lets the
@@ -3629,8 +3716,8 @@ mod suspend_deadline_tests {
     async fn bash_reply_deadline_is_due_on_first_resume_poll() {
         let suspend = Box::leak(Box::new(AtomicU64::new(0)));
         let receipt = Instant::now();
-        let budget = crate::commands::blocking_wait::ReplyBudget::new(receipt, None)
-            .with_suspend_clock(suspend);
+        let budget =
+            crate::blocking_wait::ReplyBudget::new(receipt, None).with_suspend_clock(suspend);
         let deadline = receipt + Duration::from_secs(270);
         assert!(wait_for_bash_reply_deadline(deadline, budget)
             .now_or_never()
@@ -3825,7 +3912,7 @@ async fn run_deferred_bash_wait(
     claim: Arc<drain::BashCallClaim>,
     repeat: Option<crate::run_tool_call::RepeatObservation>,
     server_completion: bool,
-    reply_budget: crate::commands::blocking_wait::ReplyBudget,
+    reply_budget: crate::blocking_wait::ReplyBudget,
 ) {
     let run_scoped = cancel.run_scope.is_some();
     let Some(wait_ctx) = executor.actor_context(&root) else {
@@ -4097,7 +4184,7 @@ async fn run_deferred_bash_wait(
                                     return abandon_bash_poll(request_id_for_poll, &mut poll_control_tx);
                                 }
                                 let response =
-                                    crate::commands::bash_orchestrate::detach_bash_for_module_drain(
+                                    detach_bash_for_module_drain(
                                         ctx,
                                         &task_id_for_poll,
                                         &session_for_poll,
@@ -6281,7 +6368,7 @@ mod grant_path_tests {
         root: &ProjectRootId,
         dispatch: DispatchFn,
         arguments: Value,
-        received_at: impl Into<crate::commands::blocking_wait::ReplyBudget>,
+        received_at: impl Into<crate::blocking_wait::ReplyBudget>,
         server_completion: bool,
     ) -> mpsc::Receiver<BashDeferredCompletion> {
         let metrics = Arc::new(DispatchPathMetrics::new());
@@ -6314,7 +6401,7 @@ mod grant_path_tests {
         root: &ProjectRootId,
         dispatch: DispatchFn,
         arguments: Value,
-        received_at: impl Into<crate::commands::blocking_wait::ReplyBudget>,
+        received_at: impl Into<crate::blocking_wait::ReplyBudget>,
         server_completion: bool,
         worker_session: bool,
         metrics: Arc<DispatchPathMetrics>,
@@ -6395,7 +6482,7 @@ mod grant_path_tests {
                     let mut timing = BashTimingForTest::new(started.into_std());
                     Arc::get_mut(&mut timing).unwrap().reply_uses_clock = true;
                     BashTimingForTest::release(&timing.admission);
-                    let budget = crate::commands::blocking_wait::ReplyBudget::new(
+                    let budget = crate::blocking_wait::ReplyBudget::new(
                         started.into_std(),
                         Some((started + Duration::from_secs(3)).into_std()),
                     ).with_runtime_clock();
@@ -7942,7 +8029,7 @@ mod grant_path_tests {
                     false,
                     None,
                     false,
-                    crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                    crate::blocking_wait::ReplyBudget::new(Instant::now(), None),
                 )
                 .await
                 .is_none(),
@@ -8429,8 +8516,7 @@ mod grant_path_tests {
     ) -> (BashDeferredCompletion, Instant) {
         let received = Instant::now();
         let transport_deadline = received + Duration::from_secs(5);
-        let budget =
-            crate::commands::blocking_wait::ReplyBudget::new(received, Some(transport_deadline));
+        let budget = crate::blocking_wait::ReplyBudget::new(received, Some(transport_deadline));
         let mut replies = with_bash_timing_for_test(Some(BashTimingForTest::new(received)), || {
             deadline_test_call_owned(
                 executor,
@@ -9538,7 +9624,7 @@ mod grant_path_tests {
                         Some(if expire_read { Instant::now() - Duration::from_secs(2) } else { Instant::now() + Duration::from_secs(60) }), &cancel,
                         &drain::BashCallClaim::default(), false,
                         (!background && !expire_read).then(Instant::now), background,
-                        crate::commands::blocking_wait::ReplyBudget::new(Instant::now(), None),
+                        crate::blocking_wait::ReplyBudget::new(Instant::now(), None),
                     ).await;
                     drop(state);
                     release_tx.send(()).unwrap();
@@ -9776,10 +9862,8 @@ mod grant_path_tests {
         use aft_engine::test_bridge::bash_remote::remote_wire::Script;
         let (daemon, _dir, root, executor, _ctx) = capture_fixture(Script::GatedAcceptance).await;
         let started = Instant::now();
-        let budget = crate::commands::blocking_wait::ReplyBudget::new(
-            started,
-            Some(started + Duration::from_secs(2)),
-        );
+        let budget =
+            crate::blocking_wait::ReplyBudget::new(started, Some(started + Duration::from_secs(2)));
         let mut rx = with_bash_timing_for_test(Some(BashTimingForTest::new(started)), || {
             deadline_test_call_owned(
                 &executor,
@@ -10391,10 +10475,8 @@ mod grant_path_tests {
         let identity = super::super::test_support::route_identity(&root, DEADLINE_SESSION);
         // Backdate receipt instead of sleeping through the permission prompt.
         let received_at = Instant::now() - Duration::from_secs(25);
-        let reply_budget = crate::commands::blocking_wait::ReplyBudget::new(
-            received_at,
-            Some(received_at + client_window),
-        );
+        let reply_budget =
+            crate::blocking_wait::ReplyBudget::new(received_at, Some(received_at + client_window));
         let prompt_deadline = received_at + Duration::from_secs(60);
         assert!(Instant::now() < prompt_deadline);
         let mut pending = HashMap::from([(

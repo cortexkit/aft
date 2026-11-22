@@ -22,6 +22,74 @@ fn notice_route(session: &str) -> CodeSearchNotice {
 }
 
 #[test]
+fn handed_down_code_search_notice_preserves_equality_and_debug() {
+    use crate::subc_format::{BashCodeSearchHint, FormatContext};
+
+    let notice = |seconds| CodeSearchNotice {
+        address: None,
+        call_key: "notice-call".into(),
+        preset: "worker".into(),
+        remaining: Arc::new(std::sync::Mutex::new(Duration::from_secs(seconds))),
+    };
+    let render = |notice| {
+        let runner_notice: Arc<dyn crate::subc_format::CodeSearchNotice> = Arc::new(notice);
+        FormatContext {
+            bash_code_search_hint: Some(BashCodeSearchHint::new(
+                "rg needle".into(),
+                None,
+                Some("search".into()),
+                None,
+                "bash".into(),
+                Some(runner_notice.clone()),
+            )),
+            runner_notice: Some(runner_notice),
+            ..FormatContext::default()
+        }
+    };
+
+    let baseline = render(notice(2));
+    assert_eq!(baseline, render(notice(1)));
+    for changed in [
+        CodeSearchNotice {
+            address: notice_route("notice-equality").address,
+            ..notice(2)
+        },
+        CodeSearchNotice {
+            call_key: "another-call".into(),
+            ..notice(2)
+        },
+        CodeSearchNotice {
+            preset: "head".into(),
+            ..notice(2)
+        },
+    ] {
+        let changed = render(changed);
+        assert_ne!(
+            baseline.bash_code_search_hint,
+            changed.bash_code_search_hint
+        );
+        assert_ne!(baseline.runner_notice, changed.runner_notice);
+    }
+    let route_debug = concat!(
+        "CodeSearchNotice { address: None, call_key: \"notice-call\", preset: \"worker\", ",
+        "remaining: Mutex { data: 2s, poisoned: false, .. } }",
+    );
+    assert_eq!(
+        format!("{baseline:?}"),
+        format!(concat!(
+            "FormatContext {{ agent_specified_range: false, outline_mode: Text, callgraph_op: None, ",
+            "callgraph_include_unresolved: false, zoom_target_label: None, ast_dry_run: false, ",
+            "import_op: None, import_remove_name: None, import_file_arg: None, import_module_arg: None, ",
+            "move_file_arg: None, move_dest_arg: None, safety_op: None, safety_file_arg: None, ",
+            "safety_name_arg: None, bash_output_mode: None, worker_session: false, bash_watch_available: None, ",
+            "host_tool_names: None, bash_code_search_hint: Some(BashCodeSearchHint {{ command: \"rg needle\", ",
+            "workdir: None, search_tool: Some(\"search\"), grep_tool: None, shell_tool: \"bash\", ",
+            "runner_notice: Some({0}) }}), runner_notice: Some({0}) }}",
+        ), route_debug),
+    );
+}
+
+#[test]
 fn notice_templates_rewritten_bash_sends_once_without_footers() {
     install(PathBuf::from("unused-test-notice-connection"));
     for (command, id) in [
@@ -64,7 +132,7 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
             &ctx,
             &session,
             &crate::subc_format::FormatContext {
-                runner_notice: Some(notice_route(&session)),
+                runner_notice: Some(Arc::new(notice_route(&session))),
                 ..Default::default()
             },
             false,
@@ -179,7 +247,7 @@ fn notice_templates_repeat_observations_send_typed_counts_without_appending() {
                 .is_none());
         }
         let mut response = Response::success("notice-call", json!({"text":"unchanged"}));
-        response.notices.route = Some(notice_route(&session).into_sink());
+        response.notices.route = Some(Arc::new(notice_route(&session)));
         let mut text = "unchanged".to_owned();
         crate::run_tool_call::RepeatObservation::for_agent_call(
             &session, "read", &args, false, true, true,
@@ -232,7 +300,7 @@ fn notice_templates_refusal_falls_back_once_at_user_authority() {
             }
         };
         let mut response = Response::success("notice-call", json!({"text":"body"}));
-        response.notices.route = Some(notice_route(&session).into_sink());
+        response.notices.route = Some(Arc::new(notice_route(&session)));
         response.notices.items.push(Notice::template(
             id,
             slots,
@@ -266,7 +334,7 @@ fn notice_templates_unordered_runner_gets_no_nudge() {
     let capture = test_endpoint::capture("notice-legacy", false);
     capture.delivery_order(Some(false));
     let mut response = Response::success("notice-call", json!({"text":"body"}));
-    response.notices.route = Some(notice_route("notice-legacy").into_sink());
+    response.notices.route = Some(Arc::new(notice_route("notice-legacy")));
     response.notices.items.push(
         crate::subc::runner_notices::notice_templates::Notice::template(
             crate::subc::runner_notices::notice_templates::PREFER_TOOL,
@@ -350,7 +418,7 @@ fn notice_templates_diagnostics_remain_free_text_tool_result_sends() {
         }],
     );
     let mut response = Response::success("notice-call", json!({"text":"body"}));
-    response.notices.route = Some(notice_route(session).into_sink());
+    response.notices.route = Some(Arc::new(notice_route(session)));
     crate::response_finalize::finalize_response_for_dispatch_root(
         &mut response,
         &ctx,
@@ -489,14 +557,14 @@ fn code_search_nudge_runner_send_is_once_and_leaves_result_bytes_unchanged() {
         preset: "worker".into(),
         remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
     };
-    let context = crate::subc_format::BashCodeSearchHint {
-        command: "echo marker; rg foo".into(),
-        workdir: None,
-        search_tool: Some("search".into()),
-        grep_tool: Some("grep".into()),
-        shell_tool: "bash".into(),
-        runner_notice: Some(notice),
-    };
+    let context = crate::subc_format::BashCodeSearchHint::new(
+        "echo marker; rg foo".into(),
+        None,
+        Some("search".into()),
+        Some("grep".into()),
+        "bash".into(),
+        Some(Arc::new(notice)),
+    );
     let root = tempfile::tempdir().unwrap();
     let response = crate::protocol::Response::success(
         "call-17",
@@ -597,13 +665,13 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
             &ctx,
             session,
             &crate::subc_format::FormatContext {
-                bash_code_search_hint: Some(crate::subc_format::BashCodeSearchHint {
-                    command: "rg foo".into(),
-                    workdir: None,
-                    search_tool: Some("search".into()),
-                    grep_tool: Some("grep".into()),
-                    shell_tool: "bash".into(),
-                    runner_notice: Some(CodeSearchNotice {
+                bash_code_search_hint: Some(crate::subc_format::BashCodeSearchHint::new(
+                    "rg foo".into(),
+                    None,
+                    Some("search".into()),
+                    Some("grep".into()),
+                    "bash".into(),
+                    Some(Arc::new(CodeSearchNotice {
                         address: Some(Address {
                             module: "broca".into(),
                             identity: BindIdentity::new("broca", session),
@@ -613,8 +681,8 @@ fn code_search_nudge_runner_deadline_preserves_result_bytes_and_drops_once() {
                         call_key: "call-deadline".into(),
                         preset: "worker".into(),
                         remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
-                    }),
-                }),
+                    })),
+                )),
                 ..format_context
             },
             false,
@@ -705,13 +773,13 @@ fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_addr
             "expired" => capture.reply(SendReply::new(states::EXPIRED)),
             _ => {}
         }
-        let context = crate::subc_format::BashCodeSearchHint {
-            command: "grep -rn foo src/".into(),
-            workdir: None,
-            search_tool: Some("aft_search".into()),
-            grep_tool: Some("grep".into()),
-            shell_tool: "shell".into(),
-            runner_notice: Some(CodeSearchNotice {
+        let context = crate::subc_format::BashCodeSearchHint::new(
+            "grep -rn foo src/".into(),
+            None,
+            Some("aft_search".into()),
+            Some("grep".into()),
+            "shell".into(),
+            Some(Arc::new(CodeSearchNotice {
                 address: (!missing).then(|| Address {
                     module: "broca".into(),
                     identity: BindIdentity::new("broca", &session),
@@ -721,8 +789,8 @@ fn code_search_nudge_runner_drops_refused_undelivered_unordered_and_missing_addr
                 call_key: format!("call-{case}"),
                 preset: "worker".into(),
                 remaining: Arc::new(std::sync::Mutex::new(CODE_SEARCH_NOTICE_TIMEOUT)),
-            }),
-        };
+            })),
+        );
         let mut response = crate::protocol::Response::success(
             "call",
             json!({"task_id": "native", "status": "completed", "exit_code": 0, "output": "hit"}),
@@ -769,14 +837,14 @@ fn code_search_nudge_runner_logs_only_search_candidates_that_are_not_eligible() 
         ("grep foo fixture.txt", Some("search targets a file")),
     ] {
         let mut response = Response::success("notice-call", data.clone());
-        let context = crate::subc_format::BashCodeSearchHint {
-            command: command.into(),
-            workdir: None,
-            search_tool: Some("aft_search".into()),
-            grep_tool: Some("grep".into()),
-            shell_tool: "bash".into(),
-            runner_notice: Some(notice_route("ineligible-code-search")),
-        };
+        let context = crate::subc_format::BashCodeSearchHint::new(
+            command.into(),
+            None,
+            Some("aft_search".into()),
+            Some("grep".into()),
+            "bash".into(),
+            Some(Arc::new(notice_route("ineligible-code-search"))),
+        );
         let (_, logs) =
             crate::logging::capture_log_lines(|| context.deliver(&mut response, root.path()));
         let expected: Vec<_> = reason.into_iter().map(|reason| format!("INFO runner code-search nudge call_key=notice-call session=ineligible-code-search harness=broca not eligible reason={reason}")).collect();

@@ -59,7 +59,8 @@ pub fn append_repeat_breaker_reminder(
     );
 }
 
-pub(crate) fn repeat_instruction(
+/// Render the repeat-breaker instruction for the caller's available wait tools.
+pub fn repeat_instruction(
     worker_session: bool,
     bash_watch_available: bool,
     escalated: bool,
@@ -153,7 +154,8 @@ pub fn finalize_tool_response(
 /// Native plugin calls share tool dispatch with agent calls, but their replies are not
 /// shown to the agent. They must leave cancelled-call notices pending for a visible reply.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn finalize_tool_response_with_visibility(
+/// Finalize a reply using the caller's permitted bash status visibility.
+pub fn finalize_tool_response_with_visibility(
     response: &mut Response,
     text: &mut String,
     ctx: &AppContext,
@@ -177,7 +179,7 @@ pub(crate) fn finalize_tool_response_with_visibility(
 /// Shell delivery can render the body again after checking whether the runner
 /// received the command.
 /// Leave it whole until the writer applies the budget to that final rendering.
-pub(crate) fn finalize_redisplayed_bash_response(
+pub fn finalize_redisplayed_bash_response(
     response: &mut Response,
     text: &mut String,
     ctx: &AppContext,
@@ -360,6 +362,7 @@ pub enum DispatchOutcome {
 pub type PendingResponsePoll = Box<dyn FnMut(&AppContext) -> Option<Response> + Send>;
 pub type PendingResponseShutdown = Box<dyn FnMut(&AppContext) -> Response + Send>;
 
+#[cfg(test)]
 pub(crate) use crate::pending_response::DeferredResponseWake;
 pub use crate::pending_response::{
     pending_response_channel, PendingResponseReceiver, PendingResponseSender,
@@ -833,11 +836,13 @@ fn finalize_prefix(
     (publish, counts)
 }
 
-pub(crate) const MAX_RESULT_BYTES: usize = cortexkit_role_tool_provider::result::MAX_RESULT_BYTES;
+/// The exclusive serialized size limit for a tool result.
+pub const MAX_RESULT_BYTES: usize = cortexkit_role_tool_provider::result::MAX_RESULT_BYTES;
 pub(crate) const TOO_LARGE_SENTENCE: &str =
     "reply too large to send ({size} MiB, limit 3 MiB); {action}";
 
-pub(crate) fn too_large(id: &str, size: usize, action: &str) -> Response {
+/// Create the standard reply for a tool result that exceeds the wire limit.
+pub fn too_large(id: &str, size: usize, action: &str) -> Response {
     let message = TOO_LARGE_SENTENCE
         .replace("{size}", &format!("{:.2}", size as f64 / (1024.0 * 1024.0)))
         .replace("{action}", action);

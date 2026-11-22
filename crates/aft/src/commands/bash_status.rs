@@ -14,7 +14,8 @@ const PREVIEW_BYTES: usize = RUNNING_OUTPUT_PREVIEW_BYTES;
 /// one-line replies below instead.
 pub(crate) const UNKNOWN_TASK_GUIDANCE: &str = "No record of this task exists for this session. If this ID came from a bash tool result or completion notice, its record was lost (for example across an AFT restart); otherwise it is not a task ID. Either way, re-run the command instead of polling.";
 
-pub(crate) fn format_unknown_task_message(task_id: &str) -> String {
+/// Render the standard missing-task explanation for status and handoff replies.
+pub fn format_unknown_task_message(task_id: &str) -> String {
     format!("background task not found: {task_id}. {UNKNOWN_TASK_GUIDANCE}")
 }
 
@@ -68,7 +69,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 /// `observation_only` is transport-owned, never read from tool arguments.
-pub(crate) fn handle_with_observation_only(
+pub fn handle_with_observation_only(
     req: &RawRequest,
     ctx: &AppContext,
     observation_only: bool,

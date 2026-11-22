@@ -12,7 +12,7 @@
 //! loop picks up its result. A cancelled call or a module drain cancels that
 //! thread through the job's cancellation.
 
-pub(crate) mod restart;
+pub mod restart;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -37,7 +37,7 @@ use crate::task_watch_lines::EACH_LINE_NEEDS_BACKGROUND;
 
 /// The wait a primary session's watch gets when it passes no timeout. Mirrors
 /// `DEFAULT_PRIMARY_WATCH_TIMEOUT_MS` in `packages/aft-bridge/src/bash-hints.ts`.
-pub(crate) const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS: u64 = 30_000;
+pub const DEFAULT_PRIMARY_WATCH_TIMEOUT_MS: u64 = 30_000;
 /// The largest timeout a worker may pass, as in the plugins' tool schema.
 pub(crate) const MAX_WATCH_TIMEOUT_MS: u64 = 1_800_000;
 /// How much recent output a regex watch keeps for matching across reads.
@@ -292,7 +292,7 @@ pub(crate) fn handle_deferred_with_budget(
 
 /// An observation-only transport may wait on output, but cannot renew, recover,
 /// or otherwise change the task that produced it. The flag is not a tool argument.
-pub(crate) fn handle_deferred_with_observation_only(
+pub fn handle_deferred_with_observation_only(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     budget: crate::commands::blocking_wait::ReplyBudget,
@@ -306,14 +306,14 @@ pub(crate) fn handle_deferred_with_observation_only(
 /// when a person sends a message while the watch waits; the watched task is
 /// left running.
 #[derive(Default)]
-pub(crate) struct YieldSignal {
+pub struct YieldSignal {
     requested: AtomicBool,
-    pub(crate) restart: std::sync::Mutex<restart::WatchRestart>,
+    restart: std::sync::Mutex<restart::WatchRestart>,
 }
 
 impl YieldSignal {
     /// Ask the watch to end. False when it was already asked.
-    pub(crate) fn request(&self) -> bool {
+    pub fn request(&self) -> bool {
         !self.requested.swap(true, Ordering::SeqCst)
     }
 
@@ -324,7 +324,7 @@ impl YieldSignal {
 
 /// [`handle_deferred_with_observation_only`] for a watch that `yield_signal`
 /// can end early. The watch thread holds the signal until it ends.
-pub(crate) fn handle_deferred_yieldable(
+pub fn handle_deferred_yieldable(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     budget: crate::commands::blocking_wait::ReplyBudget,

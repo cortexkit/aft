@@ -273,7 +273,7 @@ pub(in crate::subc) async fn submit(
     dispatch: DispatchFn,
     capabilities: ProofCapabilities,
     request_meta: RequestFrameMeta,
-    reply_budget: crate::commands::blocking_wait::ReplyBudget,
+    reply_budget: crate::blocking_wait::ReplyBudget,
 ) -> Result<(), SubcError> {
     let route = route_key(frame.header.channel, frame.header.epoch);
     let id = format!("subc-{}-{}", route.channel, frame.header.corr);

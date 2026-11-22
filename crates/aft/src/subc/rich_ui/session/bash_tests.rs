@@ -107,7 +107,7 @@ async fn exchange_watch_received_at(
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = DeferredResponseSender {
         entries: deferred_tx,
-        wake: crate::response_finalize::DeferredResponseWake::default(),
+        wake: crate::pending_response::DeferredResponseWake::default(),
     };
     handle_tool_call_with_capabilities(
         &writer,

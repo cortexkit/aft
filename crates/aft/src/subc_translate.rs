@@ -187,7 +187,8 @@ fn parse_stringified_collection(
     Ok(())
 }
 
-pub(crate) fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
+/// Normalize the aliases accepted by zoom and reject conflicts.
+pub fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(), TranslateError> {
     let mut batch = Vec::new();
     if let Some(mut value) = map.remove("batch") {
         parse_stringified_collection(&mut value, "batch", "an array of {target, symbols}", false)?;
@@ -247,10 +248,8 @@ pub(crate) fn normalize_zoom_aliases(map: &mut Map<String, Value>) -> Result<(),
     Ok(())
 }
 
-pub(crate) fn normalize_path_arguments(
-    bare_name: &str,
-    args: Value,
-) -> Result<Value, TranslateError> {
+/// Normalize the path and option aliases accepted in an agent tool call.
+pub fn normalize_path_arguments(bare_name: &str, args: Value) -> Result<Value, TranslateError> {
     let mut map = match args {
         Value::Object(map) => map,
         _ => return Err(invalid_request("tool arguments must be an object")),
@@ -1111,7 +1110,8 @@ fn agent_args_map(args: Value) -> Map<String, Value> {
     }
 }
 
-pub(crate) use crate::host_tool_names::supports_tool;
+/// Check whether a bare tool name has a translation into the tools protocol.
+pub use crate::host_tool_names::supports_tool;
 
 fn insert_resolved_file(map: &mut Map<String, Value>, project_root: &Path, file_path: &str) {
     let resolved = resolve_path_from_project_root(project_root, file_path);
@@ -1315,7 +1315,8 @@ fn translate_bash_task_tool(bare_name: &str, args: Value) -> Translated {
 }
 
 /// Decode model-shaped booleans without treating arbitrary nonempty strings as true.
-pub(crate) fn model_boolean(value: &Value) -> Option<bool> {
+/// Read a JSON boolean or its supported model-facing string form.
+pub fn model_boolean(value: &Value) -> Option<bool> {
     match value {
         Value::Bool(value) => Some(*value),
         Value::Number(num) if num.as_f64() == Some(1.0) => Some(true),
@@ -2424,7 +2425,8 @@ fn search_path_exists(project_root: &Path, raw: &str) -> bool {
     resolve_path_from_project_root(project_root, raw).exists()
 }
 
-pub(crate) fn split_search_path_arg(project_root: &Path, raw: &str) -> Vec<String> {
+/// Split search path arguments into their resolved root and path filter.
+pub fn split_search_path_arg(project_root: &Path, raw: &str) -> Vec<String> {
     if search_path_exists(project_root, raw) || !raw.chars().any(char::is_whitespace) {
         return vec![raw.to_string()];
     }

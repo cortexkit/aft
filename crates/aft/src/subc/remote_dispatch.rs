@@ -121,10 +121,10 @@ impl FileTool {
                 if tool.arguments.get("ref").is_some() {
                     // Git revision reads can open an ancestor or linked worktree's
                     // object store outside the registered folder.
-                    return Err(crate::revision_read::disabled(&prepared.request));
+                    return Err(crate::revision_read::disabled(prepared.request()));
                 }
                 if mode == Mode::ReadWrite {
-                    let paths = edit_paths::operands(&prepared.request)?;
+                    let paths = edit_paths::operands(prepared.request())?;
                     tool.check_writes(ctx, &paths)?;
                     return Ok(paths);
                 }
