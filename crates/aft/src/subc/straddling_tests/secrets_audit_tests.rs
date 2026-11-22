@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 
 fn isolated(name: &str, run: impl FnOnce()) {
     if std::env::var("AFT_S4_AUDIT_CHILD").as_deref() == Ok(name) {
-        // These cases exercise the real launcher and proxy after launch admission.
-        // A host that hides the Yama sysctl should not decide that admission.
+        // Some Linux runners hide the kernel's ptrace policy setting. Supply
+        // the test value for that preflight read; the sandbox and proxy still run.
         with_safe_ptrace(run);
         return;
     }
