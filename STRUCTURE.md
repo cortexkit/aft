@@ -7,9 +7,9 @@ it stays current and this document does not list them.
 ## Top level
 
 ```text
-crates/aft/            `agent-file-tools`: the `aft` binary, compatibility facade, and integration tests
-crates/aft-tools/      Native CLI, tool-call pipeline, and command handlers
-crates/aft-subc/       Subc daemon integration and tool catalog assets
+crates/aft/            `agent-file-tools`: the `aft` binary and library facade, auxiliary binaries, examples, integration tests
+crates/aft-tools/      `aft-tools`: native CLI, tool-call pipeline, and command handlers
+crates/aft-subc/       `aft-subc`: Subc daemon integration and tool catalog assets
 crates/aft-engine/     Shared runtime: project contexts, indexes, edit engines, LSP, watchers, shell runtime
 crates/aft-base/       Shared foundation: protocol, config, executor, bash compression, secrets, locks, URL fetch
 crates/aft-db/         SQLite stores (`aft.db`), access policy, sandbox profile, write ledger
@@ -42,24 +42,29 @@ main.rs            Process entry point
 `crates/aft/tests/` holds the Rust integration suites, compiled as a few test
 binaries (`integration`, `rest`, `engine`, `semantic`, `alert`,
 `list_envelope`, `watcher_integration` and some single-purpose ones listed in
-`crates/aft/Cargo.toml`), plus `fixtures/` and `helpers/`.
+`crates/aft/Cargo.toml`), plus `fixtures/` and `helpers/`. The
+`aft-test-scope-owner` binary is in `crates/aft/tests/helpers/scope_owner.rs`;
+example targets are in `crates/aft/examples/`.
 
 ## `crates/aft-tools/src/` and `crates/aft-subc/src/`
 
-`aft-tools` owns `cli/` (native subcommands) and `commands/` (protocol command
-handlers, with `tool_call.rs` as the agent tool entry). The tool-call pipeline
-lives in `run_tool_call.rs`, `subc_translate.rs`, `subc_format.rs`,
+`aft-tools` (library `aft_tools`) owns `cli/` (native subcommands) and
+`commands/` (protocol command handlers, with `tool_call.rs` as the agent tool
+entry). The tool-call pipeline shared by standalone and daemon mode lives in
+`run_tool_call.rs`, `subc_translate.rs`, `subc_format.rs`,
 `response_finalize.rs`, `bounded_io_command.rs` and `tool_output.rs`.
 `data_layer.rs` adapts the engine's `data_layer/` and exposes the
 `trace_measure::run` runner in `trace_measure_run.rs`.
 
-`aft-subc` owns `subc/`: daemon binds, trust, tool-provider registration, remote
-calls, scopes, code mode, consent, push notifications, graceful shutdown, and
-health checks. It embeds the
+`aft-subc` (library `aft_subc`) owns `subc/`: daemon binds, trust, tool-provider
+registration, remote calls, scopes, code mode, consent, push notifications,
+graceful shutdown, and health checks. It embeds the
 [tool schemas](crates/aft-subc/src/subc_tool_schemas.json) and
 [tool presets](crates/aft-subc/src/subc_tool_presets.json).
-The daemon depends on the tools, not the reverse; see the
-[boundary inventory](crates/aft-tools/BOUNDARY.md) for shared interfaces.
+`aft-subc` depends on `aft-tools`, not the reverse. Daemon tests that need
+handler fixtures use `aft-tools/test-support`. See the
+[boundary inventory](crates/aft-tools/BOUNDARY.md) for shared interfaces and test
+fixtures.
 
 ## `crates/aft-engine/src/`
 
