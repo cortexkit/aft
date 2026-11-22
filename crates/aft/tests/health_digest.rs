@@ -25,8 +25,8 @@ fn canonical_name_fixture_matches_the_management_operation() {
 #[test]
 fn health_digest_is_absent_from_agent_tool_registries_and_descriptions() {
     let agent_tool_surfaces = [
-        include_str!("../src/subc_tool_schemas.json"),
-        include_str!("../src/subc/manifest.rs"),
+        include_str!("../../aft-subc/src/subc_tool_schemas.json"),
+        include_str!("../../aft-subc/src/subc/manifest.rs"),
         include_str!("../../../packages/opencode-plugin/src/tool-registration.ts"),
         include_str!("../../../packages/pi-plugin/src/tool-registration.ts"),
     ];
@@ -79,7 +79,7 @@ fn management_operation_dispatches_without_agent_text() {
 
 #[test]
 fn implementation_does_not_touch_alert_or_observation_state() {
-    let implementation = include_str!("../src/commands/health_digest.rs")
+    let implementation = include_str!("../../aft-tools/src/commands/health_digest.rs")
         .split("#[cfg(test)]")
         .next()
         .expect("production implementation precedes its unit tests");

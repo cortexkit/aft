@@ -237,7 +237,7 @@ fn plugin_call_bash_bridge_names_are_admitted_by_subc_gate() {
 #[test]
 fn management_operations_stay_out_of_schema_derived_agent_surfaces() {
     let schema: serde_json::Map<String, serde_json::Value> =
-        serde_json::from_str(include_str!("../../src/subc_tool_schemas.json"))
+        serde_json::from_str(include_str!("../../../aft-subc/src/subc_tool_schemas.json"))
             .expect("embedded subc tool schema artifact");
     for operation in MANAGEMENT_OPERATIONS {
         assert!(
@@ -250,7 +250,7 @@ fn management_operations_stay_out_of_schema_derived_agent_surfaces() {
         );
     }
 
-    let manifest_source = include_str!("../../src/subc/manifest.rs");
+    let manifest_source = include_str!("../../../aft-subc/src/subc/manifest.rs");
     assert!(manifest_source.contains("ProviderRole::ManagementSurface"));
     assert!(manifest_source.contains("HEALTH_DIGEST_OPERATION.to_string()"));
     assert!(manifest_source.contains("MEMORY_CENSUS_OPERATION.to_string()"));

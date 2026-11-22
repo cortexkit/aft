@@ -1,4 +1,3 @@
-mod cli;
 mod standalone_input;
 
 #[cfg(test)]
@@ -55,6 +54,7 @@ use aft::lsp::child_registry::LspChildRegistry;
 use aft::protocol::{EchoParams, PushFrame, RawRequest, Response};
 use aft::response_finalize::{DispatchOutcome, PendingResponse, PendingResponses};
 use aft::runtime_registry::RuntimeRegistry;
+use aft_tools::cli;
 use standalone_input::{
     HeldInput, InputBudget, InputFrame, OversizedLine, MAX_HELD_BYTES, MAX_HELD_ITEMS,
     MAX_LINE_BYTES, MAX_RETAINED_BYTES, MAX_RETAINED_ITEMS,

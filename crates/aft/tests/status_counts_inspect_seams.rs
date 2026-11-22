@@ -18,9 +18,9 @@ fn truthful_count_shape_keeps_proven_values_and_omits_unproven_categories() {
 #[test]
 fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seams() {
     let context = include_str!("../../aft-engine/src/context.rs");
-    let inspect = include_str!("../src/commands/inspect.rs");
-    let response_finalize = include_str!("../src/response_finalize.rs");
-    let subc_format = include_str!("../src/subc_format.rs");
+    let inspect = include_str!("../../aft-tools/src/commands/inspect.rs");
+    let response_finalize = include_str!("../../aft-tools/src/response_finalize.rs");
+    let subc_format = include_str!("../../aft-tools/src/subc_format.rs");
     let main = include_str!("../src/main.rs");
 
     assert!(context.contains("pub struct StatusBarCountValues"));
@@ -81,8 +81,8 @@ fn truthful_counts_and_inspect_payload_stay_out_of_agent_response_transport_seam
 
 #[test]
 fn inspect_outcomes_continue_to_feed_the_fleet_segment_without_freezing_text() {
-    let inspect = include_str!("../src/commands/inspect.rs");
-    let response_finalize = include_str!("../src/response_finalize.rs");
+    let inspect = include_str!("../../aft-tools/src/commands/inspect.rs");
+    let response_finalize = include_str!("../../aft-tools/src/response_finalize.rs");
 
     assert!(inspect.contains("refresh_status_bar_counts(ctx, &outcomes);"));
     assert!(inspect.contains("ctx.update_status_bar_todos("));
@@ -120,7 +120,7 @@ fn inspect_outcomes_continue_to_feed_the_fleet_segment_without_freezing_text() {
 
 #[test]
 fn blocking_inspect_is_the_only_alert_observation_source_in_its_command_module() {
-    let inspect = include_str!("../src/commands/inspect.rs");
+    let inspect = include_str!("../../aft-tools/src/commands/inspect.rs");
 
     assert!(inspect.contains("AcceptedObservationBatch::from_diagnostic_snapshots("));
     assert_eq!(

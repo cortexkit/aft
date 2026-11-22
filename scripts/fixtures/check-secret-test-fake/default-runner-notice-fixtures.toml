@@ -1,0 +1,8 @@
+[package]
+name = "aft-subc"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["test-runner-notice-fixtures"]
+test-runner-notice-fixtures = []

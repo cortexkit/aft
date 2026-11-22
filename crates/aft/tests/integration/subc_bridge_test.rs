@@ -13302,7 +13302,7 @@ async fn drive_module_hello_health_manifest_daemon(input: FakeDaemonInput) {
         ])
     );
     let schema_count = serde_json::from_str::<serde_json::Map<String, Value>>(include_str!(
-        "../../src/subc_tool_schemas.json"
+        "../../../aft-subc/src/subc_tool_schemas.json"
     ))
     .expect("embedded subc tool schemas should be a JSON object")
     .len();
