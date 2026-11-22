@@ -732,18 +732,26 @@ class EngineUnwiredGateTests(unittest.TestCase):
 
     def test_split_preserves_ranking_fence_at_each_moved_owner(self) -> None:
         source = "crates/aft/src/"
+        engine = "crates/aft-engine/src/"
         semantic = source + "commands/semantic_search/"
-        state = source + "search_state/"
+        engine_state = engine + "search_state/"
         moves = [
-            (semantic + "comparator.rs", state + "candidate.rs"),
-            (semantic + "mod.rs", state + "mod.rs"),
-            (semantic + "exact_lane.rs", source + "search_index/exact_lane.rs"),
-            (semantic + "plan_table.rs", source + "search_b2/plan_table.rs"),
+            (semantic + "comparator.rs", engine_state + "candidate.rs"),
+            (semantic + "mod.rs", engine_state + "mod.rs"),
+            (semantic + "exact_lane.rs", engine + "search_index/exact_lane.rs"),
+            (semantic + "plan_table.rs", engine + "search_b2/plan_table.rs"),
             (source + "query_shape.rs", "crates/aft-base/src/query_shape.rs"),
             (source + "semantic_index.rs", "crates/aft-base/src/ort_pin.rs"),
             (source + "parser.rs", "crates/aft-parse/src/parser.rs"),
             (source + "parser.rs", "crates/aft-parse/src/parser/file_language.rs"),
             (source + "parser.rs", "crates/aft-base/src/lang_id.rs"),
+        ]
+        moves += [
+            (source + file, engine + file)
+            for file in (
+                "search_index.rs", "search_index/exact_lane.rs", "search_b2/router.rs",
+                "search_state/mod.rs", "semantic_index.rs", "parser.rs",
+            )
         ]
         moves += [(source + "lib.rs", f"crates/{crate}/src/lib.rs") for crate in ("aft-base", "aft-db", "aft-parse")]
         moves += [
@@ -751,7 +759,7 @@ class EngineUnwiredGateTests(unittest.TestCase):
             for file in ("lane_plan.rs", "readiness.rs")
         ]
         moves += [
-            (semantic + file, state + file)
+            (semantic + file, engine_state + file)
             for file in (
                 "evidence_descriptor.rs", "generation_token.rs", "memo.rs", "request_files.rs", "waits.rs",
                 "rerank/fixture.rs", "rerank/mod.rs", "rerank/onnx.rs", "rerank/remote.rs", "rerank/slot.rs", "rerank/synapse.rs",
@@ -763,6 +771,24 @@ class EngineUnwiredGateTests(unittest.TestCase):
                 self.assertTrue((root / new).is_file(), "update the fence when its owner moves")
                 self.assertEqual(derive_slice_class([old]), "ranking")
                 self.assertEqual(derive_slice_class([new]), derive_slice_class([old]))
+
+    def test_either_crate_root_requires_and_accepts_the_split_descriptor(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        descriptor_path = root / "benchmarks/aft-search/slice-descriptors/crate-split-step3.json"
+        descriptor = json.loads(descriptor_path.read_text())
+        self.assertIn(TOOL_CALL_PARITY_FIXTURE_SOURCE, descriptor["fixtures"])
+        for fixture in descriptor["fixtures"]:
+            self.assertTrue((root / fixture).is_file(), fixture)
+
+        for crate in ("aft", "aft-engine"):
+            path = f"crates/{crate}/src/lib.rs"
+            with self.subTest(path=path):
+                derived, missing_ranking = resolve_descriptor(None, [path])
+                self.assertEqual(derived["slice_class"], "ranking")
+                self.assertTrue(missing_ranking)
+                resolved, missing_ranking = resolve_descriptor(descriptor, [path])
+                self.assertEqual(resolved["slice_class"], "engine_unwired")
+                self.assertFalse(missing_ranking)
 
     def test_engine_unwired_rejects_a_non_ranking_diff_class(self) -> None:
         result = self.gate(self.score, ["scripts/telemetry/cost-gate.sh"])
