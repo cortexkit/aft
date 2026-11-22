@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use crate::bash_background::persistence::{
     read_task, resolve_task_layout, session_tasks_dir, unix_millis, write_task, write_task_at,
     TaskPaths,

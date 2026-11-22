@@ -1,3 +1,5 @@
+#![cfg(test)]
+
 use super::*;
 use cortexkit_role_tool_provider::call::ToolCallRequest as ProviderCall;
 use serde::Deserialize;
