@@ -83,7 +83,7 @@ pub(crate) fn watch_waiting(signal: &crate::commands::bash_watch::YieldSignal, w
     signal.restart.lock().unwrap().wait = Some(wait);
 }
 
-/// Reserve a waiting watch for handoff, before any ledger lock is taken.
+/// Reserve a waiting watch for handoff; takes only the restart lock.
 pub fn reserve_watch_hold(signal: &YieldSignal) -> bool {
     let mut state = signal.restart.lock().unwrap();
     if state.wait.is_none() || state.finished || state.reserved {

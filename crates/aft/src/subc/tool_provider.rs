@@ -9084,9 +9084,9 @@ pub(in crate::subc) mod route_tests {
                     None,
                 )
                 .unwrap();
-                assert_eq!(result.request.command, "batch");
-                assert_eq!(result.request.params["edits"][0]["match"], "old");
-                assert_eq!(result.request.params["edits"][0]["replacement"], "new");
+                assert_eq!(result.request().command, "batch");
+                assert_eq!(result.request().params["edits"][0]["match"], "old");
+                assert_eq!(result.request().params["edits"][0]["replacement"], "new");
                 registration();
                 let capture = ctx.hashline_bindings().capture(root.as_path(), session);
                 assert!(crate::hashline::integration::effective_for_capture(
