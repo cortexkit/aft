@@ -8,7 +8,7 @@ const GENERIC: &str = "disposable-keychain-generic-item";
 const INTERNET: &str = "disposable-keychain-internet-item";
 const GIT_ACCOUNT: &str = "aft-sandbox-acceptance-fixture";
 const PREFIX: &str = "aft-sandbox-acceptance-";
-const ATTRIBUTES: [&str; 10] = [
+const GIT_ITEM_ATTRIBUTES: [&str; 10] = [
     "-a",
     GIT_ACCOUNT,
     "-r",
@@ -119,12 +119,11 @@ impl GitItem {
                 && keychain.is_file(),
             "osxkeychain acceptance will only seed the Mac mini runner's dedicated default ci.keychain");
 
-        // Look up only the reserved fixture account. Never dump all items or
-        // remove an item whose server name does not match the fixture prefix.
+        // Check the reserved account even if an earlier run seeded different
+        // protocol attributes. Remove only a server with the fixture prefix.
         loop {
             let output = Command::new("/usr/bin/security")
-                .arg("find-internet-password")
-                .args(ATTRIBUTES)
+                .args(["find-internet-password", "-a", GIT_ACCOUNT])
                 .arg(&keychain)
                 .output()
                 .unwrap();
@@ -154,7 +153,7 @@ impl GitItem {
         checked(
             Command::new("/usr/bin/security")
                 .args(["add-internet-password", "-A", "-s", host, "-w", INTERNET])
-                .args(ATTRIBUTES)
+                .args(GIT_ITEM_ATTRIBUTES)
                 .arg(&keychain),
         );
         Self {
@@ -166,8 +165,7 @@ impl GitItem {
     fn delete_command(keychain: &Path, host: &str) -> Command {
         let mut command = Command::new("/usr/bin/security");
         command
-            .args(["delete-internet-password", "-s", host])
-            .args(ATTRIBUTES)
+            .args(["delete-internet-password", "-s", host, "-a", GIT_ACCOUNT])
             .arg(keychain);
         command
     }
