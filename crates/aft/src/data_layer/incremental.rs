@@ -97,6 +97,7 @@ pub(super) enum UpdateError {
     Resolve(ManifestJoinError),
     Limit(RefreshLimit),
     Stop(RefreshStop),
+    Churn(super::callgraph::CacheChurn),
     Data(super::checkout::DataError),
 }
 

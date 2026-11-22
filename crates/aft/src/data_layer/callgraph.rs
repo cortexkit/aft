@@ -45,6 +45,7 @@ use crate::callgraph_store::{
 
 mod binding_batch;
 mod decoded_cache;
+pub(super) use decoded_cache::CacheChurn;
 mod key_order;
 mod site_records;
 mod spool;
@@ -2710,6 +2711,11 @@ impl MethodCallInputs {
     }
 
     #[cfg(test)]
+    pub(super) fn projection_lookups_for_test(&self) -> usize {
+        self.projections.lookups()
+    }
+
+    #[cfg(test)]
     pub(super) fn projected_methods_for_test(
         &self,
         inputs: &CheckoutInputs,
@@ -2908,6 +2914,20 @@ impl MethodCallInputs {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
+        self.projections
+            .begin_pass(guard.is_some() && self.stored.is_some());
+        let results = self.resolve_site_pass(inputs, resolved, paths, guard);
+        self.projections.end_pass();
+        results
+    }
+
+    fn resolve_site_pass(
+        &self,
+        inputs: &CheckoutInputs,
+        resolved: &(dyn ResolutionLookup + Sync),
+        paths: &[&String],
+        guard: Option<&RefreshMemory>,
+    ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, UpdateError> {
         let source = SiteSource::new(inputs, resolved, self);
         let projects = inputs.csharp_projects();
         let results = if paths.len() <= SMALL_SITE_RUN {
@@ -2940,11 +2960,7 @@ impl MethodCallInputs {
         {
             return Err(ManifestJoinError::Parse(error).into());
         }
-        #[cfg(feature = "test-hooks")]
-        if self.stored.is_some() && std::env::var_os("AFT_REFRESH_PROFILE").is_some() {
-            let (held, peak, evicted, table, peak_table) = self.projections.counts();
-            log::info!("refresh declarer cache: held={held} peak={peak} evicted={evicted} table={table} peak_table={peak_table}");
-        }
+        source.check_churn()?;
         Ok(results)
     }
 }
@@ -2982,20 +2998,25 @@ impl<'s> SiteSource<'s> {
     }
 
     fn project(&self, path: &str, note: bool) -> Option<Arc<SiteFile>> {
-        let cache = &self.calls.projections;
-        if let Some(file) = cache.get(path) {
-            return Some(file);
-        }
         if self.calls.stored.is_none()
             || self.calls.own.contains(path)
             || !self.inputs.parses.contains_key(path)
         {
             return None;
         }
-        if note {
-            self.calls.computed_while_resolving.note(path);
+        self.calls.projections.get_or_project(path, || {
+            if note {
+                self.calls.computed_while_resolving.note(path);
+            }
+            self.compute(path)
+        })
+    }
+
+    fn check_churn(&self) -> Result<(), UpdateError> {
+        match self.calls.projections.churn() {
+            Some(churn) => Err(UpdateError::Churn(churn)),
+            None => Ok(()),
         }
-        self.compute(path).map(|file| cache.insert(path, file))
     }
 
     /// The file's pass-4 inputs, from its parse and resolution read without
@@ -3031,7 +3052,7 @@ impl<'s> SiteSource<'s> {
         &self,
         paths: &[&String],
         guard: Option<&RefreshMemory>,
-    ) -> Result<(), RefreshStop> {
+    ) -> Result<(), UpdateError> {
         let mut members = BTreeSet::new();
         for path in paths {
             guard.file()?;
@@ -3055,6 +3076,7 @@ impl<'s> SiteSource<'s> {
         let carry = crate::alloc_trace::carry();
         declarers.par_iter().try_for_each(|file| {
             guard.file()?;
+            self.check_churn()?;
             let _label = carry.enter();
             self.project(file, false);
             Ok(())
@@ -3154,6 +3176,7 @@ fn resolve_chunk(
         .iter()
         .map(|path| {
             guard.file()?;
+            source.check_churn()?;
             let (_, parse) = inputs
                 .parses
                 .get(path)
@@ -3167,7 +3190,11 @@ fn resolve_chunk(
             let mut sites = Vec::new();
             for site in parse.iter_bound_dispatch_sites() {
                 guard.site()?;
+                source.check_churn()?;
                 let resolution = memoized.resolve(path, &site);
+                // Finish reading the current site's facts before stopping;
+                // an early missing fact would change the resolver's answer.
+                source.check_churn()?;
                 // This runs for memo hits too, and before Rust's ordinary-edge
                 // preservation can omit a supplemental method-call row.
                 #[cfg(feature = "callgraph-shape-census")]

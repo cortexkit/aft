@@ -428,7 +428,11 @@ impl Checkout {
                 }
                 (served.is_some().then_some(work.stats), served)
             }
-            Ok(Ok(fallback @ (EngineUpdate::Cold(_) | EngineUpdate::Memory(_)))) => {
+            Ok(Ok(
+                fallback @ (EngineUpdate::Cold(_)
+                | EngineUpdate::Memory(_)
+                | EngineUpdate::Churn(_)),
+            )) => {
                 // No incremental engine or its decoded state overlaps the cold
                 // builder. Watcher events keep recording over the publication.
                 self.clear_engine_slot(&mut slot);
@@ -453,6 +457,15 @@ impl Checkout {
                         crate::slog_info!(
                             "call-graph refresh exceeded its memory ceiling: growth={} ceiling={} sites={} files={}; rebuilding cold; root={} guard_fallback=true {work}",
                             limit.growth, limit.ceiling, limit.sites, limit.files, self.root.display()
+                        );
+                    }
+                    EngineUpdate::Churn(limit) => {
+                        self.refresh_counts.guard_fallbacks.fetch_add(1, Relaxed);
+                        #[cfg(feature = "test-hooks")]
+                        refresh_probe::stage("cache_churn_fallback");
+                        crate::slog_info!(
+                            "call-graph refresh exceeded its declarer cache churn limit: redecodes={} distinct={} budget={}; rebuilding cold; root={} guard_fallback=true reason=cache_churn {work}",
+                            limit.redecodes, limit.distinct, limit.budget, self.root.display()
                         );
                     }
                     EngineUpdate::Applied(..) => {
@@ -593,6 +606,7 @@ impl Checkout {
             Ok(update) => Ok(update),
             Err(UpdateError::Limit(limit)) => Ok(EngineUpdate::Cold(limit)),
             Err(UpdateError::Stop(RefreshStop::Memory(limit))) => Ok(EngineUpdate::Memory(limit)),
+            Err(UpdateError::Churn(limit)) => Ok(EngineUpdate::Churn(limit)),
             Err(UpdateError::Stop(RefreshStop::Cancelled)) => Err(DataError::Cancelled),
             Err(UpdateError::Resolve(error)) => Err(DataError::Resolve(error.to_string())),
             Err(UpdateError::Data(error)) => Err(error),

@@ -402,6 +402,7 @@ enum EngineUpdate {
     Applied(Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>),
     Cold(RefreshLimit),
     Memory(MemoryLimit),
+    Churn(super::callgraph::CacheChurn),
 }
 
 /// A checkout's single queued or running build. Dropping a queued task also

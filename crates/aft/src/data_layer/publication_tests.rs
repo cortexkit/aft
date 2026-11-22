@@ -500,6 +500,24 @@ fn bounded_declarer_cache_evicts_mid_pass_and_rebases_without_stale_facts() {
 }
 
 #[test]
+fn unprojectable_path_does_not_touch_declarer_cache() {
+    let fixture = checkout(
+        &[("decl.go", "package p\ntype T struct{}\nfunc (T) Run() {}\n")],
+        &[],
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (segment, fragments) = write(&fixture, dir.path(), 1);
+    let live = Engine::published("publication", &fixture, vec![segment], &fragments).live;
+    let calls = live.call_inputs_for_test();
+    let methods = |path| calls.projected_methods_for_test(&live.inputs, &live.resolved, path);
+    let before = calls.projection_lookups_for_test();
+    assert!(methods("absent.go").is_none());
+    assert_eq!(calls.projection_lookups_for_test(), before);
+    assert_eq!(methods("decl.go").unwrap(), ["Run"]);
+    assert_eq!(calls.projection_lookups_for_test(), before + 1);
+}
+
+#[test]
 fn oversized_stored_declarer_is_read_without_cache_admission() {
     let declaration = format!(
         "package p\ntype T struct{{}}\n{}",
