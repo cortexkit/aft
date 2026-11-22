@@ -51,13 +51,26 @@ fn sandbox_level_policy_windows_selects_real_roles_and_refuses_forced_strict() {
                 let plan = resolve(&ctx, &AuthenticatedPrincipal::FirstParty, dir.path());
                 match mode {
                     SandboxMode::Off => assert_eq!(plan, SpawnPlan::Unsandboxed),
-                    SandboxMode::Credentials | SandboxMode::Standard => assert_eq!(
-                        plan,
-                        SpawnPlan::Unenforced {
-                            mode,
-                            worker_gh_fence: worker
-                        },
-                    ),
+                    SandboxMode::Credentials | SandboxMode::Standard => {
+                        assert_eq!(
+                            plan,
+                            SpawnPlan::Unenforced {
+                                mode,
+                                worker_gh_fence: worker
+                            }
+                        );
+                        for tier in [RequestedSandboxTier::Disabled, RequestedSandboxTier::Host] {
+                            let bypass = resolve_sandbox_spawn(
+                                &ctx,
+                                &AuthenticatedPrincipal::FirstParty,
+                                tier,
+                                SandboxTaskKind::BashForeground,
+                                dir.path(),
+                                None,
+                            );
+                            assert_eq!(bypass.refusal_code(), Some("sandbox_unavailable"));
+                        }
+                    }
                     SandboxMode::Strict => {
                         assert_eq!(plan.refusal_code(), Some("sandbox_unavailable"))
                     }
@@ -206,16 +219,16 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
         std::fs::create_dir(path).unwrap();
     }
     symlink(&home, &home_alias).unwrap();
-    symlink(&material, material.join("gh-parent")).unwrap();
+    std::fs::create_dir(material.join("gcloud-real")).unwrap();
     std::fs::create_dir(material.join("cargo")).unwrap();
     symlink(material.join("cargo"), material.join("cargo-alias")).unwrap();
     for name in ["aws", "kube-two", "cargo/Credentials-example"] {
         std::fs::write(material.join(name), "disposable fixture").unwrap();
     }
     symlink(material.join("aws"), material.join("aws-alias")).unwrap();
-    // Resolve a missing default from an existing symlinked ancestor.
     std::fs::create_dir(account.join(".config")).unwrap();
-    symlink(material.join("gh-parent"), account.join(".config/gcloud")).unwrap();
+    symlink(material.join("gcloud-real"), account.join(".config/gcloud")).unwrap();
+    // Resolve a missing default from an existing symlinked ancestor.
     std::fs::create_dir(home.join(".kube")).unwrap();
     symlink(&material, home.join(".kube/other")).unwrap();
     symlink(home.join(".kube/other/future"), home.join(".kube/config")).unwrap();
@@ -265,7 +278,7 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
             "cargo/Credentials-example",
             "cargo-alias/Credentials-example",
             "future",
-            "",
+            "gcloud-real",
         ]
         .map(|path| material.join(path)),
     );
