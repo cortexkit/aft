@@ -2,6 +2,7 @@ use aft::config::SandboxMode;
 use aft::sandbox_profile::{LinuxMountPolicy, SandboxProfile, WorkerGhFence};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +44,9 @@ impl Snapshot {
         }
         if let Some(alias) = &policy.task_executable_alias {
             snapshot.add_task_executable_bind(profile, alias, executable)?;
+        }
+        if let Some(socket) = &policy.worker_read_broker_socket {
+            snapshot.add_worker_read_broker_socket(profile, socket)?;
         }
         snapshot.finish()
     }
@@ -111,18 +115,14 @@ impl Snapshot {
         }
         // Check explicit masks before redundant mounts beneath private tmpfs
         // are dropped. A hidden path is not an exception to a hard deny.
-        let masked = |path: &Path| {
-            path.ancestors()
-                .any(|p| self.mounts.get(p).is_some_and(|m| m.masks()))
-        };
         let covering_mount = |path: &Path| {
             path.ancestors()
                 .find_map(|p| self.mounts.get(p).copied().filter(|m| *m != Mount::Guard))
         };
-        if masked(alias) || covering_mount(alias) != Some(Mount::PrivateDir) {
+        if self.hard_masked(alias) || covering_mount(alias) != Some(Mount::PrivateDir) {
             return Ok(());
         }
-        if masked(executable)
+        if self.hard_masked(executable)
             || covering_mount(executable) == Some(Mount::PrivateDir)
             || (profile.mode == SandboxMode::Strict
                 && !profile.read_allow.iter().any(|path| path == executable))
@@ -136,6 +136,64 @@ impl Snapshot {
         // at its old name so Strict's exact Landlock grant on the pin also
         // covers execution through the alias without granting its parent.
         self.task_executable_bind = Some((executable.to_path_buf(), alias.to_path_buf()));
+        Ok(())
+    }
+
+    fn hard_masked(&self, path: &Path) -> bool {
+        path.ancestors()
+            .any(|p| self.mounts.get(p).is_some_and(|m| m.masks()))
+    }
+
+    fn add_worker_read_broker_socket(
+        &mut self,
+        profile: &SandboxProfile,
+        socket: &Path,
+    ) -> Result<(), String> {
+        let invalid = || {
+            format!(
+                "invalid worker GitHub read broker socket: {}",
+                socket.display()
+            )
+        };
+        let temp = &profile.temp_dir;
+        let name = temp
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| aft_base::task_temp_reads::task_name(name))
+            .ok_or_else(invalid)?;
+        if !profile.worker_jail
+            || profile.mode != SandboxMode::Strict
+            || !socket.is_absolute()
+            || socket != temp.with_file_name(format!("{name}.gh-read.sock"))
+        {
+            return Err(invalid());
+        }
+        if self.hard_masked(socket)
+            || profile
+                .read_deny
+                .iter()
+                .chain(&profile.socket_deny)
+                .any(|deny| socket.starts_with(deny))
+        {
+            return Ok(());
+        }
+        let parent = temp.parent().expect("absolute task temp with a file name");
+        if self.mounts.get(parent) != Some(&Mount::PrivateDir) {
+            return Ok(());
+        }
+        match socket.symlink_metadata() {
+            Ok(metadata)
+                if metadata.file_type().is_socket()
+                    && metadata.uid() == unsafe { libc::geteuid() }
+                    && parent.canonicalize().as_deref().ok() == Some(parent) => {}
+            // A revoked broker may remove its endpoint before the shell starts.
+            Err(error) if missing(&error) => return Ok(()),
+            _ => return Err(invalid()),
+        }
+        // Keep the host socket inode, not the directory containing other tasks'
+        // sockets and broker ownership records. The child cannot replace it.
+        self.mounts
+            .insert(socket.to_path_buf(), Mount::ReadException);
         Ok(())
     }
 

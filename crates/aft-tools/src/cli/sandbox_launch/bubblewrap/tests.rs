@@ -9,6 +9,8 @@ mod failure_tests;
 mod roles_tests;
 #[path = "task_executable_tests.rs"]
 mod task_executable_tests;
+#[path = "worker_read_broker_tests.rs"]
+mod worker_read_broker_tests;
 
 const SEED: &str = "s5-disposable-secret";
 

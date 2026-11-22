@@ -1394,7 +1394,7 @@ pub fn spawn_with_secrets(
             }
             let root = project_root.as_deref().unwrap_or(&workdir);
             provision_worker_read_broker(
-                &plan,
+                &mut plan,
                 remote.is_some(),
                 &gh_shim_ticket,
                 &task.paths.task_id,
@@ -1734,8 +1734,8 @@ pub(crate) fn spawn(
 }
 
 /// Decide, in one place, whether a jailed worker's shell receives the host-local
-/// GitHub read broker (socket, capability file and shim state directory in its
-/// private task temp). Strict and relaxed native launches both go through
+/// GitHub read broker (a socket beside its private task temp, and a capability
+/// file and shim state directory inside it). Strict and relaxed launches go through
 /// here, so their broker behaviour cannot drift apart. A remote launch or a
 /// profile that cannot protect the broker removes any broker paths from the
 /// child environment and logs the reason; provisioning failures are logged by
@@ -1743,7 +1743,7 @@ pub(crate) fn spawn(
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn provision_worker_read_broker(
-    plan: &crate::sandbox_spawn::SpawnPlan,
+    plan: &mut crate::sandbox_spawn::SpawnPlan,
     remote: bool,
     ticket: &crate::gh_shim_ticket::PendingTicket,
     task_id: &str,
@@ -1782,6 +1782,16 @@ fn provision_worker_read_broker(
         env,
         shim_enabled,
     );
+    // Provisioning clears inherited broker paths; only a successful setup
+    // publishes its own socket. Strict bubblewrap hides the socket's parent.
+    #[cfg(target_os = "linux")]
+    if let crate::sandbox_spawn::SpawnPlan::Launcher { profile, .. } = plan {
+        if let Some(mounts) = &mut profile.linux_mounts {
+            mounts.worker_read_broker_socket = env
+                .get(crate::gh_shim_worker_broker::SOCKET_ENV)
+                .map(PathBuf::from);
+        }
+    }
 }
 
 fn execution_error_response(request_id: &str, native: bool, message: String) -> Response {

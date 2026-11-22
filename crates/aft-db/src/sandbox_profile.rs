@@ -188,6 +188,9 @@ pub struct LinuxMountPolicy {
     /// so bubblewrap can restore just that file if it masks the task directory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_executable_alias: Option<PathBuf>,
+    /// The provisioned worker read broker socket, outside the writable task temp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_read_broker_socket: Option<PathBuf>,
     pub cargo_homes: Vec<PathBuf>,
     /// Strict credential writes enforced by mounts when active, and still
     /// mandatory Landlock denies on direct fallback.
