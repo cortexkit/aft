@@ -750,15 +750,28 @@ mod macos_native_tests {
     #[test]
     fn files_and_agent_socket_follow_the_real_head_profile() {
         const FIXTURE: &str = "AFT_SEATBELT_NATIVE_FIXTURE";
+        const CONNECT: &str = "AFT_SEATBELT_CONNECT_PATH";
+        let name = concat!(
+            module_path!(),
+            "::files_and_agent_socket_follow_the_real_head_profile"
+        );
+        let test = name.split_once("::").unwrap().1;
+        let exe = std::env::current_exe().unwrap();
+        if let Some(path) = std::env::var_os(CONNECT) {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => println!("socket connected"),
+                Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                    println!("socket denied");
+                }
+                Err(error) => panic!("socket fixture failed: {error}"),
+            }
+            return;
+        }
         let Some(base) = std::env::var_os(FIXTURE).map(PathBuf::from) else {
             let dir = tempfile::tempdir().unwrap();
             let root = dir.path().canonicalize().unwrap();
-            let test = concat!(
-                module_path!(),
-                "::files_and_agent_socket_follow_the_real_head_profile"
-            );
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", test.split_once("::").unwrap().1, "--nocapture"])
+            let output = Command::new(&exe)
+                .args(["--exact", test, "--nocapture"])
                 .env(FIXTURE, &root)
                 .env("HOME", root.join("home"))
                 .env("CARGO_HOME", root.join("checkout/cargo"))
@@ -823,15 +836,19 @@ mod macos_native_tests {
             UnixListener::bind(&per_call).unwrap(),
         ];
         symlink(&agent, &alias).unwrap();
-        let connect = |profile, socket: &Path| {
-            command(profile, "/usr/bin/nc")
-                .args(["-z", "-U", "-w", "2"])
-                .arg(socket)
-                .output()
-                .unwrap()
+        let connect = |profile: Option<&Path>, socket: &Path, expected: &str| {
+            let output = assert_success(
+                command(profile, exe.to_str().unwrap())
+                    .args(["--exact", test, "--nocapture"])
+                    .env(CONNECT, socket)
+                    .output()
+                    .unwrap(),
+            );
+            let stdout = String::from_utf8_lossy(&output);
+            assert!(stdout.contains(expected), "{socket:?}: {stdout}");
         };
         for socket in [&agent, &alias, &per_call] {
-            assert_success(connect(None, socket));
+            connect(None, socket, "socket connected");
         }
 
         let mut strict = None;
@@ -841,10 +858,9 @@ mod macos_native_tests {
                 file_oracle(&profile, &base.join(name));
             }
             for socket in [&agent, &alias] {
-                let output = connect(Some(&profile), socket);
-                assert!(!output.status.success(), "{level} {socket:?}: {output:?}");
+                connect(Some(&profile), socket, "socket denied");
             }
-            assert_success(connect(Some(&profile), &per_call));
+            connect(Some(&profile), &per_call, "socket connected");
 
             if level == SandboxMode::Credentials {
                 assert_eq!(
@@ -1015,7 +1031,7 @@ mod macos_native_tests {
             "-w",
             ITEM,
         ]);
-        let query = |profile| {
+        let query = |profile: Option<&Path>| {
             command(profile, "/usr/bin/security")
                 .args([
                     "find-generic-password",
@@ -1153,7 +1169,7 @@ mod macos_native_tests {
             panic!("failed to seed the data-protection fixture: {output:?}");
         }
         let item = Item { exe, service };
-        let query = |profile| {
+        let query = |profile: Option<&Path>| {
             command(profile, item.exe.to_str().unwrap())
                 .args(["find", &item.service])
                 .output()
@@ -1192,7 +1208,7 @@ mod macos_native_tests {
             ),
         )
         .unwrap();
-        let verify = |profile| {
+        let verify = |profile: Option<&Path>| {
             assert_success(
                 command(profile, "/usr/bin/security")
             // -c supplies the certificate to verify, not a trusted anchor (-r).
@@ -1215,7 +1231,7 @@ mod macos_native_tests {
         };
         assert!(url.starts_with("https://"));
         let dir = tempfile::tempdir().unwrap();
-        let fetch = |profile| {
+        let fetch = |profile: Option<&Path>| {
             // nscurl uses NSURLSession with the platform's default certificate trust.
             let output = command(profile, "/usr/bin/nscurl")
                 .args([
