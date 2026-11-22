@@ -13,6 +13,7 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const HOME_PROCESS: &str = "AFT_SANDBOX_ACCEPTANCE_HOME_PROCESS";
+const REQUIRE_OSXKEYCHAIN: &str = "AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN";
 const LEVELS: [SandboxMode; 4] = [
     SandboxMode::Off,
     SandboxMode::Credentials,
@@ -68,6 +69,10 @@ fn isolated(test_name: &str, run: impl FnOnce(&Path)) {
             .env_clear()
             .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
             .env(HOME_PROCESS, &base)
+            .env(
+                REQUIRE_OSXKEYCHAIN,
+                std::env::var_os(REQUIRE_OSXKEYCHAIN).unwrap_or_default(),
+            )
             .env("HOME", base.join("home"))
             .env("XDG_CONFIG_HOME", base.join("home/.config"))
             .env("XDG_DATA_HOME", base.join("xdg/data"))

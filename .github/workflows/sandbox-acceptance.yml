@@ -72,6 +72,8 @@ jobs:
     name: Sandbox acceptance (Mac mini Seatbelt)
     runs-on: [self-hosted, mac-mini]
     timeout-minutes: 45
+    env:
+      AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN: '1'
     steps:
       - uses: actions/checkout@v5
         with:

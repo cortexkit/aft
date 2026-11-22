@@ -1,4 +1,4 @@
-use super::{checked, credentials, path_arg};
+use super::{checked, credentials, path_arg, REQUIRE_OSXKEYCHAIN};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -6,22 +6,32 @@ const PASSWORD: &str = "disposable-keychain-password";
 const ACCOUNT: &str = "aft-acceptance";
 const GENERIC: &str = "disposable-keychain-generic-item";
 const INTERNET: &str = "disposable-keychain-internet-item";
+const GIT_ACCOUNT: &str = "aft-sandbox-acceptance-fixture";
+const PREFIX: &str = "aft-sandbox-acceptance-";
 
-pub(super) struct Keychain(PathBuf);
+pub(super) struct Keychain {
+    path: PathBuf,
+    _git_item: Option<GitItem>,
+}
 
 impl Keychain {
     pub(super) fn add_lookups(root: &Path, fixture: &mut credentials::Fixture) -> Self {
-        let keychain = Self(root.join("project/acceptance.keychain-db"));
-        let host = format!("aft-sandbox-{}.invalid", std::process::id());
+        let mut keychain = Self {
+            path: root.join("project/acceptance.keychain-db"),
+            _git_item: None,
+        };
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let host = format!("{PREFIX}{}-{stamp}.invalid", std::process::id());
         let security = |args: &[&str]| {
             checked(
                 Command::new("/usr/bin/security")
                     .args(args)
-                    .arg(&keychain.0),
+                    .arg(&keychain.path),
             );
         };
-        // A uniquely named temporary keychain joins the search list so Git can
-        // find it. Cleanup removes this keychain, not the user's other entries.
         security(&["create-keychain", "-p", PASSWORD]);
         security(&["unlock-keychain", "-p", PASSWORD]);
         security(&[
@@ -34,33 +44,26 @@ impl Keychain {
             "-w",
             GENERIC,
         ]);
-        security(&[
-            "add-internet-password",
-            "-A",
-            "-s",
-            &host,
-            "-a",
-            ACCOUNT,
-            "-r",
-            "htps",
-            "-w",
-            INTERNET,
-        ]);
         fixture.lookup(
             "keychain_item",
             "/usr/bin/security",
             format!(
                 "@TOOL@ find-generic-password -s {host} -a {ACCOUNT} -w {}",
-                path_arg(&keychain.0)
+                path_arg(&keychain.path)
             ),
             GENERIC.into(),
         );
-        fixture.lookup(
-            "git_osxkeychain",
-            credentials::git_helper("osxkeychain"),
-            format!("printf '%s\\n' protocol=https host={host} username={ACCOUNT} '' | @TOOL@ get"),
-            format!("password={INTERNET}"),
-        );
+        if std::env::var(REQUIRE_OSXKEYCHAIN).as_deref() == Ok("1") {
+            keychain._git_item = Some(GitItem::seed(&host));
+            fixture.lookup(
+                "git_osxkeychain",
+                credentials::git_helper("osxkeychain"),
+                format!("printf '%s\\n' protocol=https host={host}:443 path=acceptance username={GIT_ACCOUNT} '' | @TOOL@ get"),
+                format!("password={INTERNET}"),
+            );
+        } else {
+            eprintln!("osxkeychain item not tested: only the Mac mini CI runner provisions a default keychain for this probe");
+        }
         keychain
     }
 
@@ -69,7 +72,7 @@ impl Keychain {
         // A successful byte read isolates service denial from file denial.
         format!(
             "\n/bin/cat {} >/dev/null && printf 'KEYCHAIN_BYTES_READABLE\\n'\n",
-            path_arg(&self.0)
+            path_arg(&self.path)
         )
     }
 }
@@ -78,7 +81,136 @@ impl Drop for Keychain {
     fn drop(&mut self) {
         let _ = Command::new("/usr/bin/security")
             .arg("delete-keychain")
-            .arg(&self.0)
+            .arg(&self.path)
             .output();
+    }
+}
+
+struct GitItem {
+    keychain: PathBuf,
+    host: String,
+}
+
+impl GitItem {
+    fn seed(host: &str) -> Self {
+        let output = Command::new("/usr/bin/security")
+            .args(["default-keychain", "-d", "user"])
+            .output()
+            .expect("check Mac mini CI default keychain");
+        let keychain = PathBuf::from(
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .trim_matches('"'),
+        );
+        assert!(output.status.success() && keychain.is_absolute() && keychain.is_file(),
+            "osxkeychain acceptance requires the Mac mini runner's provisioned default keychain; refusing to create one");
+
+        // Look up only the reserved fixture account. Never dump all items or
+        // remove an item whose server name does not match the fixture prefix.
+        loop {
+            let output = Command::new("/usr/bin/security")
+                .args([
+                    "find-internet-password",
+                    "-a",
+                    GIT_ACCOUNT,
+                    "-r",
+                    "htps",
+                    "-t",
+                    "dflt",
+                    "-P",
+                    "443",
+                    "-p",
+                    "acceptance",
+                ])
+                .arg(&keychain)
+                .output()
+                .unwrap();
+            if output.status.code() == Some(44) {
+                break; // security's exit status for errSecItemNotFound.
+            }
+            assert!(
+                output.status.success(),
+                "could not check for stale osxkeychain fixtures: {output:?}"
+            );
+            let attributes = String::from_utf8(output.stdout).unwrap();
+            let stale = attributes
+                .lines()
+                .find_map(|line| {
+                    line.trim()
+                        .strip_prefix("\"srvr\"<blob>=\"")?
+                        .strip_suffix('"')
+                })
+                .expect("osxkeychain fixture item did not report its server name");
+            assert!(
+                stale.starts_with(PREFIX) && stale.ends_with(".invalid"),
+                "unexpected item for the reserved osxkeychain fixture account; refusing deletion"
+            );
+            checked(&mut Self::delete_command(&keychain, stale));
+        }
+
+        checked(
+            Command::new("/usr/bin/security")
+                .args([
+                    "add-internet-password",
+                    "-A",
+                    "-s",
+                    host,
+                    "-a",
+                    GIT_ACCOUNT,
+                    "-r",
+                    "htps",
+                    "-t",
+                    "dflt",
+                    "-P",
+                    "443",
+                    "-p",
+                    "acceptance",
+                    "-w",
+                    INTERNET,
+                ])
+                .arg(&keychain),
+        );
+        Self {
+            keychain,
+            host: host.into(),
+        }
+    }
+
+    fn delete_command(keychain: &Path, host: &str) -> Command {
+        let mut command = Command::new("/usr/bin/security");
+        command
+            .args([
+                "delete-internet-password",
+                "-s",
+                host,
+                "-a",
+                GIT_ACCOUNT,
+                "-r",
+                "htps",
+                "-t",
+                "dflt",
+                "-P",
+                "443",
+                "-p",
+                "acceptance",
+            ])
+            .arg(keychain);
+        command
+    }
+}
+
+impl Drop for GitItem {
+    fn drop(&mut self) {
+        let output = Self::delete_command(&self.keychain, &self.host).output();
+        if !matches!(&output, Ok(output) if output.status.success()) {
+            eprintln!(
+                "failed to delete the disposable osxkeychain fixture {}: {output:?}",
+                self.host
+            );
+            assert!(
+                std::thread::panicking(),
+                "osxkeychain fixture cleanup failed"
+            );
+        }
     }
 }
