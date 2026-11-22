@@ -167,6 +167,35 @@ fn sandbox_level_policy_refuses_unresolved_account_home_for_credentials_head() {
     });
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_level_policy_required_plan_refusal_names_the_secret_requirement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _, io, _fixture) = unix_fixture(dir.path());
+    let requirement = SandboxRequirement::for_command("echo '{{ck-secret:test}}'").unwrap();
+    let rejected = SpawnPlan::Refused {
+        code: "sandbox_unavailable",
+        message: "test launcher unavailable".into(),
+        mismatch_class: None,
+    };
+    let plan = with_spawn_plan_for_test(rejected, || {
+        resolve_command_sandbox_spawn(
+            &ctx,
+            &AuthenticatedPrincipal::FirstParty,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::BashForeground,
+            &io,
+            None,
+            Some(requirement),
+        )
+    });
+    assert_eq!(plan.refusal_code(), Some("secrets_sandbox_required"));
+    assert!(plan
+        .refusal_message()
+        .unwrap()
+        .contains("test launcher unavailable"));
+}
+
 #[cfg(unix)]
 #[test]
 fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor() {

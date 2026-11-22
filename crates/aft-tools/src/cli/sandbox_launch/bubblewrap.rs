@@ -3,18 +3,18 @@ use super::{
     signal_scope_label, verify_worker_gh_fence, LaunchArgs, SandboxLaunchError,
 };
 use aft::config::SandboxMode;
-use aft::sandbox_profile::{LinuxMountPolicy, SandboxProfile};
+use aft::sandbox_profile::{LinuxMountPolicy, SandboxProfile, WorkerGhFence};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{self, Seek, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 
 mod mounts;
 use mounts::{Mount, Snapshot};
+mod handoff;
 
 #[cfg(test)]
 mod tests;
@@ -37,21 +37,31 @@ impl Fallback {
 }
 
 pub(super) fn launch(args: &LaunchArgs, profile: SandboxProfile) -> Result<(), SandboxLaunchError> {
-    let mounts = profile.linux_mounts.as_ref().expect("local mount policy");
+    launch_with_probe(args, profile, probe)
+}
+
+fn launch_with_probe(
+    args: &LaunchArgs,
+    profile: SandboxProfile,
+    probe: impl FnOnce() -> Result<Option<Fallback>, String>,
+) -> Result<(), SandboxLaunchError> {
+    if let Some(fd) = args.failure_fd {
+        // Keep the engine's failure descriptor writable here. Bubblewrap and
+        // the inner launcher use a separate descriptor to report setup status.
+        seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
+    }
     if let Some(reason) = probe().map_err(SandboxLaunchError::unavailable)? {
+        let mounts = profile.linux_mounts.as_ref().expect("local mount policy");
         for_blocked_mount_layer(&profile, mounts, reason);
         let profile = fallback_profile(profile)?;
-        if let Some(fd) = args.failure_fd {
-            seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
-        }
         super::apply_sandbox(&profile)?;
         return exec_target(&args.command);
     }
     exec_bwrap(args, profile)
 }
 
-fn bwrap_command() -> Command {
-    let mut command = Command::new(BWRAP);
+fn bwrap_command(path: &Path) -> Command {
+    let mut command = Command::new(path);
     // Keep the network, PID namespace, devices and terminal the command had
     // before launch. Prevent the payload from creating a user namespace of its own.
     command.args(["--unshare-user", "--disable-userns", "--dev-bind", "/", "/"]);
@@ -59,14 +69,18 @@ fn bwrap_command() -> Command {
 }
 
 fn probe() -> Result<Option<Fallback>, String> {
-    match std::fs::metadata(BWRAP) {
+    probe_at(Path::new(BWRAP))
+}
+
+fn probe_at(path: &Path) -> Result<Option<Fallback>, String> {
+    match std::fs::metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Ok(Some(Fallback::Missing))
         }
         Err(error) => return Err(format!("cannot inspect {BWRAP}: {error}")),
         Ok(_) => {}
     }
-    let output = bwrap_command()
+    let output = bwrap_command(path)
         .current_dir("/")
         .env("LC_ALL", "C")
         .args(["--", "/usr/bin/true"])
@@ -76,7 +90,9 @@ fn probe() -> Result<Option<Fallback>, String> {
         return Ok(None);
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if stderr.starts_with("bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces.") {
+    if output.status.code() == Some(1)
+        && stderr.starts_with("bwrap: No permissions to create a new namespace, likely because the kernel does not allow non-privileged user namespaces.")
+    {
         return Ok(Some(Fallback::UserNamespaceUnavailable));
     }
     Err(format!(
@@ -90,6 +106,15 @@ fn fallback_profile(mut profile: SandboxProfile) -> Result<SandboxProfile, Sandb
     if let Some(mounts) = profile.linux_mounts.take() {
         profile.write_deny.extend(mounts.fallback_write_deny);
     }
+    if matches!(
+        profile.mode,
+        SandboxMode::Credentials | SandboxMode::Standard
+    ) && profile.worker_gh_fence.is_some()
+    {
+        // Relaxed Landlock cannot hide the file the gh shim uses to tell worker
+        // shells from head shells.
+        profile.worker_gh_fence = Some(WorkerGhFence::Unenforced);
+    }
     profile
         .canonicalize_for_launch()
         .map_err(|error| SandboxLaunchError::unavailable(error.to_string()))
@@ -100,8 +125,17 @@ fn for_blocked_mount_layer(profile: &SandboxProfile, policy: &LinuxMountPolicy, 
     for path in policy.credential_masks.iter().chain(&policy.read_masks) {
         unenforced.push(format!("mask:{}", path.display()));
     }
-    for path in &policy.read_only {
+    for path in policy.read_only.iter().chain(&policy.deferred_read_only) {
         unenforced.push(format!("read_only_bind:{}", path.display()));
+    }
+    for path in &profile.data_policy.deny {
+        unenforced.push(format!("mask:{}", path.display()));
+    }
+    for path in &profile.socket_deny {
+        unenforced.push(format!("socket_deny:{}", path.display()));
+    }
+    if profile.mode != SandboxMode::Strict && !profile.loopback_tcp_connect_deny.is_empty() {
+        unenforced.push("sccache_server_unblockable_on_landlock".to_string());
     }
     for path in &policy.cargo_homes {
         unenforced.push(format!("mask:{}*", path.join("credentials").display()));
@@ -156,7 +190,7 @@ fn prepare_inner(mut profile: SandboxProfile, snapshot: &Snapshot) -> InnerProfi
             ));
         }
     }
-    if profile.worker_gh_fence == Some(aft::sandbox_profile::WorkerGhFence::Unenforced) {
+    if profile.worker_gh_fence == Some(WorkerGhFence::Unenforced) {
         unenforced.push(format!(
             "operator gh fence: unenforced ({} profile)",
             profile.mode
@@ -176,13 +210,13 @@ fn exec_bwrap(args: &LaunchArgs, profile: SandboxProfile) -> Result<(), SandboxL
         .map_err(SandboxLaunchError::unavailable)?;
     let inner = prepare_inner(profile, &snapshot);
     let executable = std::env::current_exe().map_err(unavailable)?;
-    aft::launch_fds::close_inherited().map_err(SandboxLaunchError::unavailable)?;
+    let handoff = handoff::Handoff::new().map_err(unavailable)?;
     let mut profile_fd = memfd(c"aft-bwrap-profile").map_err(unavailable)?;
     serde_json::to_writer(&mut profile_fd, &inner)
         .map_err(|error| SandboxLaunchError::unavailable(error.to_string()))?;
     profile_fd.rewind().map_err(unavailable)?;
 
-    let mut command = bwrap_command();
+    let mut command = bwrap_command(Path::new(BWRAP));
     let (_mount_args, _empty_files) = append_mounts(&mut command, snapshot).map_err(unavailable)?;
     command
         .arg("--")
@@ -192,13 +226,13 @@ fn exec_bwrap(args: &LaunchArgs, profile: SandboxProfile) -> Result<(), SandboxL
     if let Some(path) = &args.failure_marker {
         command.arg("--failure-marker").arg(path);
     }
-    if let Some(fd) = args.failure_fd {
-        command.arg("--failure-fd").arg(fd.to_string());
-    }
-    let error = command.arg("--").args(&args.command).exec();
-    Err(SandboxLaunchError::unavailable(format!(
-        "cannot execute {BWRAP}: {error}"
-    )))
+    command
+        .arg("--failure-fd")
+        .arg(handoff::INNER_FD.to_string())
+        .arg("--")
+        .args(&args.command);
+    let status = handoff.supervise(&mut command)?;
+    handoff::exit_with_status(status)
 }
 
 fn append_mounts(command: &mut Command, snapshot: Snapshot) -> io::Result<(File, Vec<File>)> {
@@ -250,14 +284,17 @@ fn memfd(name: &std::ffi::CStr) -> io::Result<File> {
 pub(super) fn apply_inner(args: &LaunchArgs) -> Result<(), SandboxLaunchError> {
     let fd = args
         .profile_fd
-        .ok_or_else(|| SandboxLaunchError::usage("--bwrap-inner needs --profile-fd"))?;
+        .ok_or_else(|| SandboxLaunchError::unavailable("--bwrap-inner needs --profile-fd"))?;
+    let failure_fd = args
+        .failure_fd
+        .filter(|&failure_fd| failure_fd == handoff::INNER_FD && failure_fd != fd)
+        .ok_or_else(|| {
+            SandboxLaunchError::unavailable("--bwrap-inner needs its setup descriptor")
+        })?;
     let InnerProfile {
         profile,
         unenforced,
-    } = read_profile(fd)?;
-    if let Some(fd) = args.failure_fd {
-        seal_failure_fd(fd).map_err(SandboxLaunchError::unavailable)?;
-    }
+    } = read_profile(fd).map_err(|error| SandboxLaunchError::unavailable(error.to_string()))?;
     let applied = landlock_backend::apply(&profile).map_err(|error| {
         SandboxLaunchError::unavailable(format!("failed to apply Landlock ruleset: {error}"))
     })?;
@@ -279,5 +316,12 @@ pub(super) fn apply_inner(args: &LaunchArgs) -> Result<(), SandboxLaunchError> {
         profile.mode,
         unenforced.join(",")
     );
-    Ok(())
+    super::write_marker_fd(failure_fd, handoff::COMPLETE).map_err(|error| {
+        SandboxLaunchError::unavailable(format!("cannot acknowledge bubblewrap setup: {error}"))
+    })?;
+    seal_failure_fd(failure_fd).map_err(SandboxLaunchError::unavailable)
+}
+
+pub(super) fn mark_inner_failure(fd: i32) -> io::Result<()> {
+    super::write_marker_fd(fd, handoff::FAILED)
 }

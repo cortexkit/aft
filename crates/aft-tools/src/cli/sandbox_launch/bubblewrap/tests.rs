@@ -3,6 +3,9 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Output;
 
+#[path = "failure_tests.rs"]
+mod failure_tests;
+
 const SEED: &str = "s5-disposable-secret";
 
 fn seed(path: &Path) {

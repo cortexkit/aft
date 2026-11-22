@@ -98,12 +98,16 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
         }
         #[cfg(target_os = "linux")]
         if args.bwrap_inner {
-            if args.remote_strict || args.profile_file.is_some() || args.profile_json.is_some() {
-                return Err(SandboxLaunchError::usage(
-                    "--bwrap-inner accepts only a local descriptor-backed profile",
-                ));
-            }
-            report_failure(&args, bubblewrap::apply_inner(&args))?;
+            let setup =
+                if args.remote_strict || args.profile_file.is_some() || args.profile_json.is_some()
+                {
+                    Err(SandboxLaunchError::unavailable(
+                        "--bwrap-inner accepts only a local descriptor-backed profile",
+                    ))
+                } else {
+                    bubblewrap::apply_inner(&args)
+                };
+            report_failure(&args, setup)?;
             return exec_target(&args.command);
         }
 
@@ -371,6 +375,11 @@ fn report_failure(
             let _ = write_failure_marker(path);
         }
         if let Some(fd) = args.failure_fd {
+            #[cfg(target_os = "linux")]
+            if args.bwrap_inner {
+                let _ = bubblewrap::mark_inner_failure(fd);
+                return setup;
+            }
             let _ = write_failure_fd(fd);
         }
     }
@@ -390,6 +399,11 @@ fn write_failure_marker(path: &Path) -> std::io::Result<()> {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
+    write_marker_fd(fd, b"sandbox_unavailable")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn write_marker_fd(fd: RawFd, marker: &[u8]) -> std::io::Result<()> {
     // Validate first: building a `File` from a closed descriptor aborts
     // under Rust's IO-safety checks instead of returning an error.
     if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
@@ -398,7 +412,7 @@ fn write_failure_fd(fd: RawFd) -> std::io::Result<()> {
     // SAFETY: the descriptor is open and belongs to the supervising caller;
     // ManuallyDrop leaves it open so this write does not close it.
     let mut file = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(fd) });
-    file.write_all(b"sandbox_unavailable")
+    file.write_all(marker)
 }
 
 #[cfg(unix)]
