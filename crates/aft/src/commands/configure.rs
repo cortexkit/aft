@@ -119,14 +119,14 @@ fn wait_on_configure_semantic_snapshot_gate_for_test(_request_id: &str) {}
 /// configure is admitted as the root's exclusive writer, before any change
 /// and before the commit seal: where a bind that loses a race with route
 /// teardown must still stop.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigureGateStage {
     WriterAdmitted,
     ConfigPublished,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct ConfigureCommitGate {
     root: PathBuf,
     stage: ConfigureGateStage,
@@ -134,7 +134,7 @@ struct ConfigureCommitGate {
     release: crossbeam_channel::Receiver<()>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static CONFIGURE_COMMIT_GATE: std::sync::Mutex<Vec<ConfigureCommitGate>> =
     std::sync::Mutex::new(Vec::new());
 
@@ -142,8 +142,8 @@ static CONFIGURE_COMMIT_GATE: std::sync::Mutex<Vec<ConfigureCommitGate>> =
 /// Returns a receiver that fires when that configure parks and a sender that
 /// releases it. Gates for other roots, used by tests running in parallel, are
 /// independent.
-#[cfg(test)]
-pub(crate) fn gate_configure_commit_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn gate_configure_commit_for_test(
     root: PathBuf,
 ) -> (
     crossbeam_channel::Receiver<()>,
@@ -154,7 +154,7 @@ pub(crate) fn gate_configure_commit_for_test(
 
 /// Arm a one-shot gate at `stage` for the next configure of `root` that
 /// reaches it.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn gate_configure_stage_for_test(
     root: PathBuf,
     stage: ConfigureGateStage,
@@ -176,7 +176,7 @@ pub(crate) fn gate_configure_stage_for_test(
     (reached_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_configure_gate_for_test(root: &Path, stage: ConfigureGateStage) {
     let gate = {
         let mut gates = CONFIGURE_COMMIT_GATE
@@ -193,20 +193,20 @@ fn wait_on_configure_gate_for_test(root: &Path, stage: ConfigureGateStage) {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_configure_commit_gate_for_test(root: &Path) {
     wait_on_configure_gate_for_test(root, ConfigureGateStage::ConfigPublished);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_configure_writer_gate_for_test(root: &Path) {
     wait_on_configure_gate_for_test(root, ConfigureGateStage::WriterAdmitted);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn wait_on_configure_commit_gate_for_test(_root: &Path) {}
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn wait_on_configure_writer_gate_for_test(_root: &Path) {}
 
 #[cfg(test)]
@@ -4144,7 +4144,7 @@ fn run_configure_maintenance_unit(
 
 /// A test hook that holds one root's configure tail at the start of one stage,
 /// standing in for a stage that runs long on a large root.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct ConfigureTailStageGate {
     root: PathBuf,
     stage: &'static str,
@@ -4153,7 +4153,7 @@ struct ConfigureTailStageGate {
     worker: Option<(thread::JoinHandle<()>, crossbeam_channel::Receiver<()>)>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn configure_tail_stage_gates() -> &'static std::sync::Mutex<Vec<ConfigureTailStageGate>> {
     static GATES: std::sync::OnceLock<std::sync::Mutex<Vec<ConfigureTailStageGate>>> =
         std::sync::OnceLock::new();
@@ -4161,14 +4161,14 @@ fn configure_tail_stage_gates() -> &'static std::sync::Mutex<Vec<ConfigureTailSt
 }
 
 /// Removes its root's stage gate when dropped.
-#[cfg(test)]
-pub(crate) struct ConfigureTailStageGateGuard {
+#[cfg(any(test, feature = "test-support"))]
+pub struct ConfigureTailStageGateGuard {
     root: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl ConfigureTailStageGateGuard {
-    pub(crate) fn join_storage_sweep_worker(&self) {
+    pub fn join_storage_sweep_worker(&self) {
         let worker = configure_tail_stage_gates()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4191,7 +4191,7 @@ impl ConfigureTailStageGateGuard {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl Drop for ConfigureTailStageGateGuard {
     fn drop(&mut self) {
         self.join_storage_sweep_worker();
@@ -4207,8 +4207,8 @@ impl Drop for ConfigureTailStageGateGuard {
 /// `"view_payload_check"` for the payload check inside the view load. The
 /// first receiver fires once the tail is held; a send on the returned sender
 /// lets it continue.
-#[cfg(test)]
-pub(crate) fn gate_configure_tail_stage_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn gate_configure_tail_stage_for_test(
     root: PathBuf,
     stage: &'static str,
 ) -> (
@@ -4231,7 +4231,7 @@ pub(crate) fn gate_configure_tail_stage_for_test(
     (ConfigureTailStageGateGuard { root }, reached_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaintenanceStage) {
     wait_on_configure_tail_gate_for_test(root, stage.label(), false);
 }
@@ -4240,7 +4240,7 @@ fn wait_on_configure_tail_stage_gate_for_test(root: &Path, stage: ConfigureMaint
 /// signals that the gate was reached, then waits for the release. With
 /// `test_release_only`, only the test may release it; otherwise a 60 s timer
 /// also does, so a failed test never leaves a worker parked for good.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_configure_tail_gate_for_test(root: &Path, label: &str, test_release_only: bool) {
     let gate = configure_tail_stage_gates()
         .lock()
@@ -4260,36 +4260,49 @@ fn wait_on_configure_tail_gate_for_test(root: &Path, label: &str, test_release_o
     }
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn wait_on_configure_tail_stage_gate_for_test(_root: &Path, _stage: ConfigureMaintenanceStage) {}
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn wait_on_configure_replay_gate_for_test(root: &Path, label: &str) {
     wait_on_configure_tail_gate_for_test(root, label, false);
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn wait_on_configure_replay_gate_for_test(_root: &Path, _label: &str) {}
 
 /// One finished configure-tail unit, as recorded for tests: the job's root and
 /// generation, the stage that ran, and when it finished.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Debug)]
-pub(crate) struct ConfigureUnitRecord {
+pub struct ConfigureUnitRecord {
     pub(crate) root: PathBuf,
     pub(crate) generation: u64,
     pub(crate) stage: &'static str,
     pub(crate) finished_at: std::time::Instant,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
+impl ConfigureUnitRecord {
+    /// Name of the stage that ran.
+    pub fn stage(&self) -> &'static str {
+        self.stage
+    }
+
+    /// When the stage finished.
+    pub fn finished_at(&self) -> std::time::Instant {
+        self.finished_at
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
 fn configure_unit_records() -> &'static std::sync::Mutex<Vec<ConfigureUnitRecord>> {
     static RECORDS: std::sync::OnceLock<std::sync::Mutex<Vec<ConfigureUnitRecord>>> =
         std::sync::OnceLock::new();
     RECORDS.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn record_configure_unit_for_test(job: &ConfigureMaintenanceJob, stage: ConfigureMaintenanceStage) {
     configure_unit_records()
         .lock()
@@ -4302,7 +4315,7 @@ fn record_configure_unit_for_test(job: &ConfigureMaintenanceJob, stage: Configur
         });
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn record_configure_unit_for_test(
     _job: &ConfigureMaintenanceJob,
     _stage: ConfigureMaintenanceStage,
@@ -4311,8 +4324,8 @@ fn record_configure_unit_for_test(
 
 /// Configure-tail units that ran for `root`, in order. Tests run in parallel,
 /// so every test reads only its own roots.
-#[cfg(test)]
-pub(crate) fn configure_unit_records_for_root(root: &Path) -> Vec<ConfigureUnitRecord> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn configure_unit_records_for_root(root: &Path) -> Vec<ConfigureUnitRecord> {
     configure_unit_records()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)

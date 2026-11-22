@@ -696,8 +696,8 @@ fn glob_from_view(
 /// Runs one `glob_root` discovery and returns the files it found, the source
 /// that answered, and how many walk entries it visited, so tests outside this
 /// module can check which branch a call took and whether it walked at all.
-#[cfg(all(test, unix))]
-pub(crate) fn glob_root_files_for_test(
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub fn glob_root_files_for_test(
     ctx: &AppContext,
     project_root: &Path,
     search_root: &Path,

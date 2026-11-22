@@ -38,59 +38,15 @@ fn token_path(node: Node<'_>, source: &str) -> bool {
     })
 }
 
-// A mixed predicate like `any(test, unix)` is still production code. Use the
-// token tree so comments, whitespace, and trailing commas don't affect cfg.
-fn cfg_without_test(args: Node<'_>, source: &str, operator: &str) -> Option<bool> {
-    fn predicate(nodes: &[Node<'_>], source: &str) -> Option<bool> {
-        match nodes {
-            [name] if text(*name, source) == "test" => Some(false),
-            [name, args] if args.kind() == "token_tree" => {
-                cfg_without_test(*args, source, text(*name, source))
-            }
-            _ => None,
-        }
+fn source_path(value: Node<'_>, source: &str, file: &Path) -> String {
+    let spelling = text(value, source);
+    if value.kind() == "raw_string_literal" {
+        let (_, quoted) = spelling.split_once('"').unwrap();
+        quoted.rsplit_once('"').unwrap().0.to_owned()
+    } else {
+        serde_json::from_str(spelling)
+            .unwrap_or_else(|_| panic!("unsupported module path in {}: {spelling}", file.display()))
     }
-
-    let mut cursor = args.walk();
-    let tokens = args
-        .children(&mut cursor)
-        .filter(|token| !token.is_extra())
-        .collect::<Vec<_>>();
-    let mut clauses = tokens[1..tokens.len() - 1]
-        .split(|token| text(*token, source) == ",")
-        .filter(|clause| !clause.is_empty())
-        .map(|clause| predicate(clause, source));
-    match operator {
-        "all" | "any" => {
-            let decisive = operator == "any";
-            let mut known = true;
-            for value in clauses {
-                if value == Some(decisive) {
-                    return Some(decisive);
-                }
-                known &= value.is_some();
-            }
-            known.then_some(!decisive)
-        }
-        "not" => clauses.next().flatten().map(|v| !v),
-        "cfg" => clauses.next().flatten(),
-        _ => None,
-    }
-}
-
-fn is_test(attr: Node<'_>, source: &str) -> bool {
-    let name = attr.named_child(0).unwrap();
-    match text(name, source) {
-        "cfg" => attr
-            .child_by_field_name("arguments")
-            .is_some_and(|args| cfg_without_test(args, source, "cfg") == Some(false)),
-        "test" | "tokio::test" => true,
-        _ => false,
-    }
-}
-
-fn test_module(name: &str) -> bool {
-    name == "tests" || name.ends_with("_tests")
 }
 
 struct Guard {
@@ -119,19 +75,6 @@ impl Guard {
         let path = file
             .canonicalize()
             .unwrap_or_else(|error| panic!("cannot locate {}: {error}", file.display()));
-        if path == self.src.join("main.rs")
-            || path.starts_with(self.src.join("bin"))
-            || path.starts_with(self.src.with_file_name("tests"))
-            || path
-                .strip_prefix(&self.src)
-                .is_ok_and(|relative| relative.iter().any(|part| part == "tests"))
-            || path
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .is_some_and(test_module)
-        {
-            return;
-        }
         let source = std::fs::read_to_string(&path)
             .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
         let tree = self.parser.parse(&source, None).unwrap();
@@ -141,16 +84,6 @@ impl Guard {
     fn walk(&mut self, node: Node<'_>, file: &Path, dir: &Path, source: &str, inline: bool) {
         let mut attrs = Vec::new();
         let mut cursor = node.walk();
-        if matches!(node.kind(), "source_file" | "declaration_list" | "block")
-            && node
-                .named_children(&mut cursor)
-                .filter(|child| !child.is_extra())
-                .take_while(|child| child.kind() == "inner_attribute_item")
-                .filter_map(|child| child.named_child(0))
-                .any(|attr| is_test(attr, source))
-        {
-            return;
-        }
         for child in node
             .named_children(&mut cursor)
             .filter(|child| !child.is_extra())
@@ -159,27 +92,39 @@ impl Guard {
                 attrs.extend(child.named_child(0));
                 continue;
             }
-            if !attrs.iter().any(|attr| is_test(*attr, source)) {
-                match child.kind() {
-                    "mod_item" => self.module(child, file, dir, source, inline, &attrs),
-                    "use_declaration" => {
-                        if imports_subc(child.child_by_field_name("argument").unwrap(), source) {
-                            self.report(child, file, source);
-                        }
+            match child.kind() {
+                "mod_item" => self.module(child, file, dir, source, inline, &attrs),
+                "macro_invocation"
+                    if child
+                        .child_by_field_name("macro")
+                        .is_some_and(|name| text(name, source) == "include") =>
+                {
+                    // Unlike include_str!, include! inserts Rust into this module.
+                    let args = child.named_child(1).unwrap();
+                    let literal = args.named_child(0).unwrap();
+                    let path = file
+                        .parent()
+                        .unwrap()
+                        .join(source_path(literal, source, file));
+                    self.file(&path, dir);
+                }
+                "use_declaration" => {
+                    if imports_subc(child.child_by_field_name("argument").unwrap(), source) {
+                        self.report(child, file, source);
                     }
-                    _ => {
-                        let reference = match child.kind() {
-                            "scoped_identifier" | "scoped_type_identifier" => child
-                                .named_children(&mut child.walk())
-                                .any(|part| segment(part, source)),
-                            "token_tree" => token_path(child, source),
-                            _ => false,
-                        };
-                        if reference {
-                            self.report(child, file, source);
-                        }
-                        self.walk(child, file, dir, source, inline);
+                }
+                _ => {
+                    let reference = match child.kind() {
+                        "scoped_identifier" | "scoped_type_identifier" => child
+                            .named_children(&mut child.walk())
+                            .any(|part| segment(part, source)),
+                        "token_tree" => token_path(child, source),
+                        _ => false,
+                    };
+                    if reference {
+                        self.report(child, file, source);
                     }
+                    self.walk(child, file, dir, source, inline);
                 }
             }
             attrs.clear();
@@ -201,23 +146,14 @@ impl Guard {
             .parent()
             .is_some_and(|parent| parent.kind() == "source_file")
             && file == self.src.join("lib.rs");
-        if (at_root && FACADE_MODULES.contains(&name)) || test_module(name) {
+        if at_root && FACADE_MODULES.contains(&name) {
             return;
         }
         let override_path = attrs.iter().find_map(|attr| {
             if text(attr.named_child(0)?, source) != "path" {
                 return None;
             }
-            let value = attr.child_by_field_name("value").unwrap();
-            let spelling = text(value, source);
-            let name: String = if value.kind() == "raw_string_literal" {
-                let (_, quoted) = spelling.split_once('"').unwrap();
-                quoted.rsplit_once('"').unwrap().0.to_owned()
-            } else {
-                serde_json::from_str(spelling).unwrap_or_else(|_| {
-                    panic!("unsupported module path in {}: {spelling}", file.display())
-                })
-            };
+            let name = source_path(attr.child_by_field_name("value").unwrap(), source, file);
             let base = if inline { dir } else { file.parent().unwrap() };
             Some(base.join(name))
         });
@@ -254,7 +190,7 @@ impl Guard {
 }
 
 #[test]
-fn production_tools_module_tree_does_not_reference_subc() {
+fn tools_module_tree_does_not_reference_subc() {
     let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let forbidden = Guard::scan(&src);
     assert!(
@@ -287,14 +223,14 @@ fn source_guard_detects_planted_paths_in_tools_modules_only() {
         #[cfg(test)]
         #[path = "../tests/helper.rs"]
         mod fixture;
-        mod tests { use crate::subc; }
+        mod tests { use crate::subc_fake; }
         mod layout_tests;
-        mod inner_only { #![cfg(test)] use crate::subc; }
+        mod inner_only { #![cfg(test)] use crate::subc_config; }
         #[test]
-        fn fixture_test() { crate::subc::test(); }
+        fn fixture_test() { crate::subc_format::test(); }
         fn cfg_in_block() {
             #[cfg(test)]
-            let _ = crate::subc::test();
+            let _ = crate::subc_format::test();
             crate::subc_translate::real();
         }
         use crate::{subc_config, subc_translate, subc_fake, subc_format};
@@ -308,18 +244,24 @@ fn source_guard_detects_planted_paths_in_tools_modules_only() {
         "src/subc/mod.rs",
         "src/main.rs",
         "src/bin/helper.rs",
-        "tests/helper.rs",
-        "src/conditional.rs",
-        "src/layout_tests.rs",
-        "src/tools/tests/helper.rs",
+        "tests/not_linked.rs",
         "src/not_a_module.rs",
     ] {
         write(file, "use crate::subc;");
     }
     write(
         "src/tools.rs",
-        "mod nested; #[path = \"tests/helper.rs\"] #[cfg(test)] mod helper;",
+        "mod nested; #[path = \"tests/helper.rs\"] #[cfg(test)] mod helper; include!(\"included.rs\");",
     );
+    for file in [
+        "tests/helper.rs",
+        "src/conditional.rs",
+        "src/layout_tests.rs",
+        "src/tests/helper.rs",
+        "src/included.rs",
+    ] {
+        write(file, "use crate::subc_fake;");
+    }
     write("src/tools/nested/mod.rs", "mod leaf;");
     write("src/tools/nested/leaf.rs", "const OK: &str = \"subc\";");
     write("src/inline/overridden.rs", "mod child;");
@@ -357,4 +299,49 @@ fn source_guard_detects_planted_paths_in_tools_modules_only() {
             "{finding}"
         );
     }
+
+    for (file, marker) in [
+        ("tests/helper.rs", "fixture"),
+        ("src/conditional.rs", "conditional"),
+        ("src/layout_tests.rs", "layout"),
+        ("src/tests/helper.rs", "linked_tests_dir"),
+        ("src/included.rs", "included"),
+    ] {
+        write(file, &format!("use crate::{{subc as {marker}}};"));
+    }
+    write(
+        "src/cfg_shapes.rs",
+        "mod tests { use super::subc; }\n\
+         mod inner_test { #![cfg(test)] use crate::subc; }\n\
+         #[test] fn planted() { aft::subc::run(); }",
+    );
+    let root = src.join("lib.rs");
+    let source = std::fs::read_to_string(&root).unwrap();
+    write(
+        "src/lib.rs",
+        &format!("{source}\n#[cfg(test)] mod cfg_shapes;"),
+    );
+    let found = Guard::scan(&src);
+    assert_eq!(found.len(), findings.len() + 8, "{found:#?}");
+    for marker in [
+        "fixture",
+        "conditional",
+        "layout",
+        "linked_tests_dir",
+        "included",
+    ] {
+        assert!(
+            found
+                .iter()
+                .any(|line| line.ends_with(&format!("subc as {marker}}};"))),
+            "{found:#?}"
+        );
+    }
+    assert_eq!(
+        found
+            .iter()
+            .filter(|line| line.starts_with("cfg_shapes.rs:"))
+            .count(),
+        3
+    );
 }

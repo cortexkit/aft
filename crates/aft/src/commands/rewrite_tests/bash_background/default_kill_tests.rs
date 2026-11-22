@@ -1,20 +1,4 @@
-use aft_engine::test_bridge::bash_remote::{registry_support as test_support, BgTask};
-use std::sync::Arc;
-
-pub(crate) fn wait_fixture(
-    explicit_timeout: Option<u64>,
-) -> (tempfile::TempDir, crate::context::AppContext, Arc<BgTask>) {
-    let (dir, ctx, task) = test_support::wait_fixture(explicit_timeout);
-    assert_worker_wait_limit(&ctx);
-    (dir, ctx, task)
-}
-
-pub(super) fn assert_worker_wait_limit(ctx: &crate::context::AppContext) {
-    assert_eq!(
-        crate::commands::bash_orchestrate::worker_wait_max_ms(ctx),
-        1_800_000
-    );
-}
+use crate::tools_test_support::wait_fixture;
 
 fn message_detach_limit(worker_session: bool, explicit_timeout: Option<u64>) -> u64 {
     let (_dir, ctx, task) = wait_fixture(explicit_timeout);

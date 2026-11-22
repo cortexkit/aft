@@ -441,38 +441,8 @@ async fn tool_result_oversized_first_search_result_is_visible_saved_and_counted_
                     "configure" => crate::commands::configure::handle_configure(&request, ctx),
                     "read" => crate::commands::read::handle_read(&request, ctx),
                     "semantic_search" => {
-                        use crate::commands::semantic_search::HybridResult;
                         let root = ctx.config().project_root.clone().unwrap();
-                        let first = HybridResult {
-                            file: root
-                                .join("oversized-first-result")
-                                .join("x".repeat(60 * 1024)),
-                            name: "first".into(),
-                            kind: crate::symbols::SymbolKind::FileSummary,
-                            start_line: 1,
-                            end_line: 1,
-                            exported: false,
-                            score: 1.0,
-                            source: "lexical",
-                            semantic_score: None,
-                            lexical_score: Some(1.0),
-                            hybrid_boosted: false,
-                            exact: true,
-                            exact_phrase_count: 1,
-                            exact_window_lines: None,
-                            fusion_score: 1.0,
-                            snippet: "first match".into(),
-                        };
-                        let second = HybridResult {
-                            file: root.join("second.rs"),
-                            name: "second".into(),
-                            ..first.clone()
-                        };
-                        crate::commands::semantic_search::ranked_response_for_test(
-                            &request,
-                            &root,
-                            vec![first, second],
-                        )
+                        crate::tools_test_support::ranked_oversized_first_response(&request, &root)
                     }
                     _ => Response::error(&request.id, "unsupported", "unsupported fixture tool"),
                 },

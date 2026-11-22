@@ -39,18 +39,18 @@ pub(crate) fn count_unlink_for_test() {
     DELETE_OPERATIONS.with(|ops| ops.borrow_mut().unlinks += 1);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 type DeleteGate = (
     std::sync::mpsc::SyncSender<()>,
     std::sync::mpsc::Receiver<()>,
 );
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static DELETE_GATES: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<PathBuf, DeleteGate>>,
 > = std::sync::LazyLock::new(Default::default);
 
-#[cfg(test)]
-pub(crate) fn install_delete_gate_for_test(
+#[cfg(any(test, feature = "test-support"))]
+pub fn install_delete_gate_for_test(
     path: &Path,
 ) -> (
     std::sync::mpsc::Receiver<()>,
@@ -65,7 +65,7 @@ pub(crate) fn install_delete_gate_for_test(
     (started_rx, release_tx)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn delete_gate_for_test(path: &Path) {
     let gate = DELETE_GATES.lock().unwrap().remove(path);
     if let Some((started, release)) = gate {

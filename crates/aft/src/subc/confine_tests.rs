@@ -787,7 +787,7 @@ fn confined_glob_with_explicit_session_never_returns_task_output() {
     let paths = owned_task_output(&f);
     // Unconfined, a glob naming the owning session's output file is answered
     // from the task record instead of a directory walk.
-    let (files, source, _) = crate::commands::glob::glob_root_files_for_test(
+    let (files, source, _) = crate::tools_test_support::glob_root_files_for_test(
         &f.ctx,
         &f.pin,
         &paths.stdout,
@@ -803,7 +803,7 @@ fn confined_glob_with_explicit_session_never_returns_task_output() {
     let opens = crate::bounded_io::tests::watch_opens(&paths.stdout);
     let (files, source, visited) =
         confinement::with_root(&f.ctx, "confine-glob-task-output", || {
-            Ok(crate::commands::glob::glob_root_files_for_test(
+            Ok(crate::tools_test_support::glob_root_files_for_test(
                 &f.ctx,
                 &f.pin,
                 &paths.stdout,
@@ -851,13 +851,13 @@ fn confined_walks_refuse_a_starting_path_outside_the_fence() {
     let sentinel = f.live.join("sentinel.rs");
     let pattern = "outside_secret|pinned_token";
     let glob = |start: &Path| {
-        crate::commands::glob::glob_root_files_for_test(&f.ctx, &f.pin, start, "**/*", 16, None)
+        crate::tools_test_support::glob_root_files_for_test(&f.ctx, &f.pin, start, "**/*", 16, None)
     };
     let grep = |start: &Path| {
         aft_engine::test_bridge::search_misc::grep_root_for_test(&f.ctx, start, pattern)
     };
     let outline = |start: &Path, files_mode: bool| {
-        crate::commands::outline::discover_outline_paths_for_test(start, files_mode)
+        crate::tools_test_support::discover_outline_paths_for_test(start, files_mode)
     };
 
     // Unconfined, each walk does reach the outside tree.

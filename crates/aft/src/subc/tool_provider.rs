@@ -8408,10 +8408,7 @@ pub(in crate::subc) mod route_tests {
     async fn task_poll_deadline_case(name: &str) {
         use crate::bash_background::persistence::read_task;
         for carrier in [true, false] {
-            let (dir, ctx, task) =
-                crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
-                    None,
-                );
+            let (dir, ctx, task) = crate::tools_test_support::wait_fixture(None);
             ctx.update_config(|config| config.bash.worker_wait_max_ms = 3_600_000);
             let root = ProjectRootId::from_path(dir.path()).unwrap();
             let before = std::fs::read(&task.paths().json).unwrap();
@@ -8480,10 +8477,7 @@ pub(in crate::subc) mod route_tests {
             BgTaskStatus,
         };
         for carrier in [true, false] {
-            let (dir, ctx, task) =
-                crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
-                    None,
-                );
+            let (dir, ctx, task) = crate::tools_test_support::wait_fixture(None);
             {
                 let mut state = task.lock_state().unwrap();
                 state
@@ -8512,10 +8506,7 @@ pub(in crate::subc) mod route_tests {
     #[tokio::test]
     async fn occipital_cold_task_reads_do_not_register_or_rewrite_tasks() {
         for name in ["bash_status", "bash_watch"] {
-            let (dir, original, task) =
-                crate::commands::rewrite_tests::bash_background::default_kill_tests::wait_fixture(
-                    None,
-                );
+            let (dir, original, task) = crate::tools_test_support::wait_fixture(None);
             std::fs::write(&task.paths().stdout, "observed-output-marker").unwrap();
             std::fs::write(&task.paths().stderr, "").unwrap();
             let ctx = Arc::new(crate::test_context(
@@ -11835,7 +11826,7 @@ mod ledger_terminal_tests {
         let (writer, mut receiver) = tokio::sync::mpsc::channel(10);
         let metrics = std::sync::Arc::new(DispatchPathMetrics::new());
         let signal = metrics.watch_yields.register(route, 7);
-        crate::commands::bash_watch::restart::watch_waiting(
+        crate::tools_test_support::install_watch_wait_fixture(
             &signal,
             crate::subc::call_yield::WatchWait::new(
                 ctx.clone(),

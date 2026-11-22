@@ -1,4 +1,3 @@
-use super::default_kill_tests;
 use crate::bash_background::persistence::create_task_layout;
 use crate::bash_background::persistence::write_task_at;
 use crate::bash_background::watches::WatchPattern;
@@ -22,7 +21,7 @@ fn request(task: &str, session: &str) -> RawRequest {
 #[test]
 fn carrier_status_never_renews_a_registered_workers_hard_kill() {
     let _storage_env = crate::test_env::without_storage_override();
-    let (_dir, ctx, task) = default_kill_tests::wait_fixture(None);
+    let (_dir, ctx, task) = crate::tools_test_support::wait_fixture(None);
     let before = ctx
         .bash_background()
         .hard_kill_deadline(task.task_id(), task.session_id())

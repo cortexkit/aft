@@ -1,69 +1,6 @@
 use super::*;
 use crate::commands::data_search::ExternalSearch;
-
-fn fixture() -> (tempfile::TempDir, AppContext, PathBuf, RawRequest) {
-    let fixture = tempfile::tempdir().unwrap();
-    let storage = fixture.path().join("storage");
-    let configured = fixture.path().join("configured");
-    let external = fixture.path().join("external");
-    for root in [&configured, &external] {
-        std::fs::create_dir_all(root.join("src")).unwrap();
-        assert!(std::process::Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(root)
-            .status()
-            .unwrap()
-            .success());
-    }
-    std::fs::write(
-        external.join("src/lib.rs"),
-        "pub fn hook_parity_witness() {}\n",
-    )
-    .unwrap();
-    let context = |root: PathBuf| {
-        let mut config = crate::config::Config {
-            project_root: Some(root),
-            storage_dir: Some(storage.clone()),
-            ..Default::default()
-        };
-        config.indexes.trigram = true;
-        config.indexes.semantic = false;
-        config.indexes.callgraph = false;
-        crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config)
-    };
-    let external = crate::path_identity::canonicalize_normalized(&external);
-    let configured = crate::path_identity::canonicalize_normalized(&configured);
-    aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test(&context(
-        external.clone(),
-    ));
-    let request = RawRequest {
-        id: "external-hook".to_owned(),
-        command: "semantic_search".to_owned(),
-        session_id: None,
-        lsp_hints: None,
-        params: serde_json::json!({"query":"hook_parity_witness", "hint":"literal", "path":external}),
-    };
-    (fixture, context(configured), external, request)
-}
-
-#[test]
-fn external_search_hook_preserves_direct_child_response_bytes() {
-    let (_fixture, caller, external, mut req) = fixture();
-    // Pattern-only search has one callback, so its callback-count object has
-    // no hash-map key ordering to obscure a byte-for-byte comparison.
-    req.params = serde_json::json!({"pattern":"hook_parity_witness", "path":external});
-    crate::subc::lower_hooks::register();
-    let handle = ExternalSearch::of(&caller, &external).expect("published external checkout");
-    let direct = with_absolute_result_paths(|| handle_parent_child_search(&req, &handle.engine()));
-    let (hooked, drift) = handle.search(&req, &caller);
-    assert!(direct.success, "{direct:?}");
-    assert_eq!(direct.data["fully_degraded"], false, "{direct:?}");
-    assert_eq!(drift, 0);
-    assert_eq!(
-        serde_json::to_string(&hooked).unwrap(),
-        serde_json::to_string(&direct).unwrap()
-    );
-}
+use crate::tools_test_support::external_search_fixture as fixture;
 
 #[test]
 fn external_search_without_hook_uses_existing_bounded_fallback() {
@@ -103,4 +40,3 @@ fn external_search_without_hook_uses_existing_bounded_fallback() {
         .unwrap()
         .contains(&external.join("src/lib.rs").display().to_string()));
 }
-use aft_engine::test_bridge::display_data::ExternalSearchTestExt as _;

@@ -652,6 +652,12 @@ mod entry;
 use aft_engine::test_bridge::search_misc as test_bridge;
 pub use entry::handle_semantic_search;
 
+/// Render a direct child search with the absolute paths used by the external search hook.
+#[cfg(any(test, feature = "test-support"))]
+pub fn direct_external_search_for_test(req: &RawRequest, ctx: &AppContext) -> Response {
+    with_absolute_result_paths(|| handle_parent_child_search(req, ctx))
+}
+
 /// Parent-folder children may have no publication yet. Their reader engines
 /// must still run the bounded exact/lexical scan while the indexes warm.
 pub(crate) fn handle_parent_child_search(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -7302,7 +7308,7 @@ fn search_response(req: &RawRequest, mut parts: SearchResponseParts<'_>) -> Resp
 
 /// Build protocol fixtures with the production ranked renderer and its own
 /// admitted-result count, without requiring matching files in a search index.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn ranked_response_for_test(
     req: &RawRequest,
     root: &Path,
