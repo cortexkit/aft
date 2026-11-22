@@ -9,7 +9,7 @@ const FIRST_TEXT_INDEX_WAIT: Duration = Duration::from_secs(8);
 
 /// Admission uses the same predicate as the wait, so only cold searches leave
 /// the executor. A semantic lane that can already answer needs no text wait.
-pub(crate) fn first_text_index_wait_needed(ctx: &AppContext) -> bool {
+pub fn first_text_index_wait_needed(ctx: &AppContext) -> bool {
     let lanes = SearchLaneStatus::observe_current(ctx);
     lanes.trigram.effective == IndexEffective::Building
         && ctx

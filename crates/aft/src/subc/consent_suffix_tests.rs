@@ -17,7 +17,7 @@ pub(super) fn worker_suffix_file(f: &Fixture, relative: &str) -> PathBuf {
 }
 
 pub(super) fn build_suffix_inventory(f: &Fixture) {
-    let checkout = crate::data_layer::runtime::DataCheckout::open_planes(
+    let checkout = aft_engine::data_layer::runtime::DataCheckout::open_planes(
         &f.worker.project_root,
         &f.dir.path().join("suffix-index"),
         None,
@@ -26,7 +26,7 @@ pub(super) fn build_suffix_inventory(f: &Fixture) {
     .unwrap();
     assert!(matches!(
         checkout.fresh_view(Duration::from_secs(120)),
-        crate::data_layer::runtime::Fresh::Ready(_)
+        aft_engine::data_layer::runtime::Fresh::Ready(_)
     ));
     f.ctx.pin_data_checkout(checkout);
     assert!(f.ctx.data_view().is_some());

@@ -12,7 +12,7 @@
 //! never asked here; such a path counts as denied.
 
 use super::*;
-use crate::commands::file_read_exact::{self, OpenedFile, ReadExactRefusal};
+use crate::file_read_exact::{self, OpenedFile, ReadExactRefusal};
 use crate::page_collect::snapshot::{BeginError, SnapshotOwner, SnapshotStore};
 use crate::page_collect::{self as page, Limits, PageSource, ReadFailure};
 

@@ -2351,7 +2351,7 @@ async fn exercise_catalog_remote_bash(
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = DeferredResponseSender {
         entries: deferred_tx,
-        wake: crate::response_finalize::DeferredResponseWake::default(),
+        wake: crate::pending_response::DeferredResponseWake::default(),
     };
     handle_tool_call(
         &writer,

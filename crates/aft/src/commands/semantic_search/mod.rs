@@ -141,7 +141,7 @@ use crate::semantic_index::{
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 use checkout_gaps::CheckoutSemanticGaps;
-pub(crate) use first_text_wait::first_text_index_wait_needed;
+pub use first_text_wait::first_text_index_wait_needed;
 use first_text_wait::wait_for_first_text_index;
 
 const DEFAULT_TOP_K: usize = 10;
@@ -384,7 +384,8 @@ impl extensions::ReadinessSource for RuntimeReadinessSource<'_> {
 
 /// The cold-search continuation uses the existing pending-response transport,
 /// leaving the executor free to publish the index it is waiting for.
-pub(crate) fn handle_first_index_search_deferred(
+/// Prepare a search that may wait for the initial index within the reply deadline.
+pub fn handle_first_index_search_deferred(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     force_restrict: bool,

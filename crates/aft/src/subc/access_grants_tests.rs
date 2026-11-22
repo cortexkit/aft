@@ -1295,7 +1295,7 @@ async fn first_read_path_response(
         |request, ctx| crate::commands::read::handle_read(&request, ctx),
         &DeferredResponseSender {
             entries,
-            wake: crate::response_finalize::DeferredResponseWake::default(),
+            wake: crate::pending_response::DeferredResponseWake::default(),
         },
         false,
         1024 * 1024,

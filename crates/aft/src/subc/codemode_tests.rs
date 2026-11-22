@@ -184,7 +184,7 @@ fn tool_output_cap_codemode_uses_the_owning_sessions_output_scope() {
         },
     )
     .with_test_checkpoint_store();
-    let scope = Arc::new(crate::tool_output::OutputScope::new(
+    let scope = Arc::new(crate::output_store::OutputScope::new(
         &ctx,
         "head-a-session",
         Some("opencode"),
@@ -482,7 +482,7 @@ fn audited_read(
             let (entries, _deferred_rx) = mpsc::unbounded_channel();
             let deferred_tx = DeferredResponseSender {
                 entries,
-                wake: crate::response_finalize::DeferredResponseWake::default(),
+                wake: crate::pending_response::DeferredResponseWake::default(),
             };
             handle_tool_call(
                 &writer,

@@ -84,7 +84,7 @@ impl WaitHarness {
             false,
             true,
             super::remote_policy::RemoteSource::None,
-            crate::commands::blocking_wait::ReplyBudget::with_deadline(now, now + reply_window),
+            crate::blocking_wait::ReplyBudget::with_deadline(now, now + reply_window),
         );
         let task_id = tokio::time::timeout(Duration::from_secs(5), async {
             loop {

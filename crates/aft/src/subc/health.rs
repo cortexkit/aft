@@ -9138,7 +9138,7 @@ mod tests {
         let checkout = ctx.data_checkout().unwrap();
         assert!(matches!(
             checkout.fresh_view(Duration::from_secs(60)),
-            crate::data_layer::runtime::Fresh::Ready(_)
+            aft_engine::data_layer::runtime::Fresh::Ready(_)
         ));
         // A published ready view can precede the build worker's completion.
         // Wait before recording the edit so its refresh cannot be skipped.

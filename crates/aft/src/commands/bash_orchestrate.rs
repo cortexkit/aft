@@ -22,7 +22,8 @@ const DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 // Leave room for polling and the kill worker to publish its terminal status.
 const WORKER_KILL_HANDOFF_MARGIN: Duration = Duration::from_secs(5);
 
-pub(crate) fn worker_kill_deadline_within_handoff_margin(remaining: Option<Duration>) -> bool {
+/// Check if a worker task is close enough to its kill deadline to await terminal status.
+pub fn worker_kill_deadline_within_handoff_margin(remaining: Option<Duration>) -> bool {
     remaining.is_some_and(|remaining| remaining <= WORKER_KILL_HANDOFF_MARGIN)
 }
 
@@ -117,7 +118,7 @@ pub use crate::shell_format::format_seconds;
 /// caller's role and available tools. A primary session is woken by a completion
 /// reminder. A delegated worker (`worker_session`) never is: it is directed to
 /// `bash_watch` only when its catalog includes that tool.
-fn format_background_handoff_tail(
+pub fn format_background_handoff_tail(
     task_id: &str,
     worker_session: bool,
     bash_watch_available: bool,
@@ -208,7 +209,7 @@ fn unix_millis_now() -> u64 {
 }
 
 /// [`kill_deadline_sentence`] for a task in `registry`, on its own line.
-pub(crate) fn kill_deadline_note(
+pub fn kill_deadline_note(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
     session_id: &str,
@@ -224,7 +225,7 @@ pub(crate) fn kill_deadline_note(
 
 /// Formats published deadline inputs at reply time so remaining-time wording
 /// stays current without reacquiring the task's state lock.
-pub(crate) fn kill_deadline_note_from_parts(
+pub fn kill_deadline_note_from_parts(
     execution_note: Option<&str>,
     deadline: Option<(HardKillDeadline, u64)>,
     worker_session: bool,
@@ -747,7 +748,8 @@ pub fn build_bash_outcome_with_wake(
     ))
 }
 
-pub(crate) fn poll_bash_status(
+/// Read foreground task state and the requested output preview.
+pub fn poll_bash_status(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
@@ -764,13 +766,15 @@ pub(crate) fn poll_bash_status(
     )
 }
 
-pub(crate) enum BashStep {
+/// The next action for a foreground shell call after polling its task.
+pub enum BashStep {
     Done(Response),
     Promote,
     Wait,
 }
 
-pub(crate) fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
+/// Build the missing-task reply for a foreground shell call.
+pub fn task_not_found_response(request_id: &str, task_id: &str) -> Response {
     Response::error(
         request_id,
         "task_not_found",
@@ -778,7 +782,8 @@ pub(crate) fn task_not_found_response(request_id: &str, task_id: &str) -> Respon
     )
 }
 
-pub(crate) fn decide_bash_step(
+/// Choose whether a foreground shell call has finished, must be promoted, or should keep waiting.
+pub fn decide_bash_step(
     snapshot: BgTaskSnapshot,
     deadline: Instant,
     block_to_completion: bool,
@@ -801,7 +806,7 @@ pub(crate) fn decide_bash_step(
 /// own reply. For delegated workers only, its hard kill is pushed one more
 /// limit away so the worker has time to wait again.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn promote_bash(
+pub fn promote_bash(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
@@ -874,7 +879,8 @@ pub(crate) fn promote_bash(
     with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
-pub(crate) fn detach_wait_mode_bash(
+/// Hand a blocking shell call back as a background task after a user message.
+pub fn detach_wait_mode_bash(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
@@ -914,7 +920,7 @@ pub(crate) fn detach_wait_mode_bash(
 /// `timeout`, or 30 minutes without one, capped by the configured blocking
 /// wait limit for both head and worker sessions. Transports may wait longer,
 /// but the remote hand-back never exceeds 30 minutes.
-pub(crate) fn remote_block_handback_ms(timeout: Option<u64>, blocking_cap_ms: Option<u64>) -> u64 {
+pub fn remote_block_handback_ms(timeout: Option<u64>, blocking_cap_ms: Option<u64>) -> u64 {
     let budget = timeout
         .unwrap_or(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS)
         .min(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS);
@@ -941,7 +947,7 @@ pub(crate) fn format_remote_handback_message(
 
 /// `Remote job: <id>. Phase: <where it is>.` for a build-server task; a task
 /// with no progress recorded yet is still submitting.
-fn remote_job_sentence(progress: Option<&RemoteProgress>) -> String {
+pub fn remote_job_sentence(progress: Option<&RemoteProgress>) -> String {
     let job = progress
         .and_then(|progress| progress.job_id)
         .map_or_else(|| "not assigned yet".to_string(), |id| id.to_string());
@@ -949,37 +955,10 @@ fn remote_job_sentence(progress: Option<&RemoteProgress>) -> String {
     format!("Remote job: {job}. Phase: {}.", phase.describe())
 }
 
-/// The message of the `detached` error that a call the server completes
-/// (a tool-provider v1 route) gets when AFT restarts while the call is held.
-/// The runner shows the agent only that error's code and message, not its
-/// structured detail, so the message itself must name the task, and for a
-/// build-server task its job, or the caller has no ID to pass to
-/// bash_watch, bash_status or bash_kill.
-pub(crate) fn format_detached_call_message(
-    task_id: &str,
-    remote: Option<&RemoteProgress>,
-    inputs_uncaptured: bool,
-    worker_session: bool,
-    bash_watch_available: bool,
-) -> String {
-    let remote = remote
-        .map(|progress| format!(" {}", remote_job_sentence(Some(progress))))
-        .unwrap_or_default();
-    let capture = if inputs_uncaptured {
-        format!("\n{REMOTE_INPUT_CAPTURE_WARNING}")
-    } else {
-        String::new()
-    };
-    format!(
-        "call detached; command still running in the background as {}\nDetached because AFT is restarting.{remote}{capture}",
-        format_background_handoff_tail(task_id, worker_session, bash_watch_available),
-    )
-}
-
 /// Moves a blocking call's remote task to the background once the call has
 /// waited as long as it may (the budget from [`remote_block_handback_ms`]),
 /// and replies with the task's job id and phase.
-pub(crate) fn handback_remote_bash(
+pub fn handback_remote_bash(
     ctx: &AppContext,
     task_id: &str,
     session_id: &str,
@@ -1034,60 +1013,8 @@ pub(crate) fn handback_remote_bash(
     with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
 }
 
-/// Hands a still-running foreground command to the background because the
-/// module is about to restart. Same promotion as a user-message detach, so the
-/// task keeps running, is persisted, and delivers its completion later.
-pub(crate) fn detach_bash_for_module_drain(
-    ctx: &AppContext,
-    task_id: &str,
-    session_id: &str,
-    request_id: &str,
-    worker_session: bool,
-    bash_watch_available: bool,
-) -> Response {
-    let response = match ctx.bash_background().promote_typed(task_id, session_id) {
-        Ok(_) => {
-            let snapshot = ctx
-                .bash_background()
-                .observed_status(task_id, session_id, 0);
-            let output_path = snapshot
-                .as_ref()
-                .and_then(|task| task.output_path.as_deref());
-            let stderr_path = snapshot
-                .as_ref()
-                .and_then(|task| task.stderr_path.as_deref());
-            crate::slog_info!("bash drain detach persisted: task_id={task_id} output={output_path:?} stderr={stderr_path:?}");
-            Response::success(
-                request_id,
-                json!({
-                    "output": format!(
-                        "{}{}\nOutput: {}",
-                        format_module_drain_detach_message(
-                            task_id,
-                            worker_session,
-                            bash_watch_available,
-                        ),
-                        kill_deadline_note(ctx.bash_background(), task_id, session_id, worker_session),
-                        output_path.unwrap_or("unavailable")
-                    ),
-                    "task_id": task_id,
-                    "status": "running",
-                    "output_path": output_path,
-                    "stderr_path": stderr_path,
-                }),
-            )
-        }
-        Err(message) if message.is_missing_task() => Response::error(
-            request_id,
-            "task_not_found",
-            crate::commands::bash_status::format_unknown_task_message(task_id),
-        ),
-        Err(message) => Response::error(request_id, "execution_failed", message.to_string()),
-    };
-    with_runon_capture_state(ctx.bash_background(), task_id, session_id, response)
-}
-
-pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running.";
+/// Warning shown while a remote runner has not confirmed that it captured the inputs.
+pub const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirmed the inputs were copied yet. Do not change or delete input files until bash_status shows the job queued or running.";
 
 /// Keep launch, detach and recovered status replies consistent until the runner's
 /// Accepted stream record confirms input capture. The warning tells the caller to
@@ -1096,7 +1023,7 @@ pub(crate) const REMOTE_INPUT_CAPTURE_WARNING: &str = "The runner hasn't confirm
 /// A live reply always names the phase, even when the reply it wraps carries
 /// no phase of its own (the worker-limit and drain-detach replies only carry
 /// `status`), so an agent waiting on acceptance never sees a phaseless task.
-pub(crate) fn with_capture_warning(response: &Response) -> Response {
+pub fn with_capture_warning(response: &Response) -> Response {
     let mut response = Response {
         id: response.id.clone(),
         success: response.success,
@@ -1146,7 +1073,7 @@ pub(crate) fn with_capture_warning(response: &Response) -> Response {
 /// advice and without the capture warning, so the caller is never told to wait
 /// for queued or running states the task will not reach. A task still in
 /// flight gets the `starting` reply with the capture warning.
-pub(crate) fn runon_uncaptured_reply(
+pub fn runon_uncaptured_reply(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
     session: &str,
@@ -1181,14 +1108,15 @@ pub(crate) fn runon_uncaptured_reply(
 
 /// Whether this reply describes a task still in flight (`running`, `starting`,
 /// or no status at all), which `with_capture_warning` presents as `starting`.
-pub(crate) fn reply_announces_live_task(response: &Response) -> bool {
+pub fn reply_announces_live_task(response: &Response) -> bool {
     matches!(
         response.data["status"].as_str(),
         None | Some("running" | "starting")
     )
 }
 
-pub(crate) fn with_runon_capture_state(
+/// Annotate a live remote task reply with its input-capture state.
+pub fn with_runon_capture_state(
     registry: &crate::bash_background::BgTaskRegistry,
     task_id: &str,
     session: &str,
@@ -1204,7 +1132,7 @@ pub(crate) fn with_runon_capture_state(
 /// A finished task's reply. It never carries the input-capture warning: that
 /// warning asks the caller to wait for queued or running states a finished task
 /// will not reach, even when the runner never confirmed capture.
-pub(crate) fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
+pub fn foreground_result_response(request_id: &str, snapshot: BgTaskSnapshot) -> Response {
     let task_line = foreground_task_line(&snapshot);
     let (mut output, foreground_envelope) =
         if let Some(envelope) = snapshot.bash_output_list_envelope.as_ref() {
@@ -1440,7 +1368,8 @@ fn parse_params(req: &RawRequest) -> Option<BashOrchestrateParams> {
     serde_json::from_value::<BashOrchestrateParams>(raw_params).ok()
 }
 
-pub(crate) fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
+/// Resolve the foreground wait window, including the test override.
+pub fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
     std::env::var(TEST_FOREGROUND_WAIT_ENV)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -1449,7 +1378,7 @@ pub(crate) fn resolve_foreground_wait_window_ms(configured: u64) -> u64 {
 
 /// The worker wait limit in force: `bash.worker_wait_max_ms`, or the test
 /// override (see `TEST_WORKER_WAIT_ENV`).
-pub(crate) fn worker_wait_max_ms(ctx: &AppContext) -> u64 {
+pub fn worker_wait_max_ms(ctx: &AppContext) -> u64 {
     std::env::var(TEST_WORKER_WAIT_ENV)
         .ok()
         .and_then(|raw| raw.parse::<u64>().ok())
@@ -1461,15 +1390,12 @@ pub(crate) fn worker_wait_max_ms(ctx: &AppContext) -> u64 {
 /// Ordinary foreground calls use the
 /// shorter foreground window. The cap returns control without changing an
 /// explicit command timeout, which still governs the process's lifetime.
-pub(crate) fn blocking_wait_cap_ms(blocking: bool, limit_ms: u64) -> Option<u64> {
+pub fn blocking_wait_cap_ms(blocking: bool, limit_ms: u64) -> Option<u64> {
     blocking.then(|| crate::commands::blocking_wait::clamp_worker_wait_ms(limit_ms))
 }
 
-pub(crate) fn select_foreground_wait_window_ms(
-    configured: u64,
-    timeout: Option<u64>,
-    wait: bool,
-) -> u64 {
+/// Choose the foreground wait window for the caller's wait mode.
+pub fn select_foreground_wait_window_ms(configured: u64, timeout: Option<u64>, wait: bool) -> u64 {
     if wait {
         timeout.unwrap_or(DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS)
     } else {

@@ -714,7 +714,7 @@ struct PendingSubcResponses {
 #[derive(Clone)]
 struct DeferredResponseSender {
     entries: mpsc::UnboundedSender<PendingSubcResponse>,
-    wake: crate::response_finalize::DeferredResponseWake,
+    wake: crate::pending_response::DeferredResponseWake,
 }
 
 impl DeferredResponseSender {
@@ -749,7 +749,7 @@ impl PendingSubcResponses {
     fn poll_if_woken(
         &mut self,
         executor: &Executor,
-        wake: &crate::response_finalize::DeferredResponseWake,
+        wake: &crate::pending_response::DeferredResponseWake,
     ) -> Vec<ResolvedSubcResponse> {
         if self.needs_deadline_poll()
             && self
@@ -1408,7 +1408,7 @@ pub(crate) fn recovered_bash_frame(
     snapshot: crate::bash_background::registry::BgTaskSnapshot,
     key: &crate::db::call_ledger::Key,
     project_root: &Path,
-    output_scope: Option<crate::tool_output::OutputScope>,
+    output_scope: Option<crate::output_store::OutputScope>,
 ) -> Option<(
     crate::db::call_ledger::RecordedFrame,
     String,
@@ -1697,7 +1697,7 @@ impl RouteIdentity {
 
 #[derive(Debug)]
 struct RouteIdentityData {
-    output_scope: OnceLock<Arc<crate::tool_output::OutputScope>>,
+    output_scope: OnceLock<Arc<crate::output_store::OutputScope>>,
     root: ProjectRootId,
     /// Resolved scope workdir, or the daemon-filled root when no workdir is stamped.
     /// The daemon's project id is retained alongside it in `scope.project_id`;
@@ -1920,7 +1920,7 @@ struct PendingBashAsk {
     worker_session: bool,
     /// The call selected the catalog's worker preset rather than a plugin flag.
     worker_preset: bool,
-    reply_budget: crate::commands::blocking_wait::ReplyBudget,
+    reply_budget: crate::blocking_wait::ReplyBudget,
     asked_at: Instant,
     expires_at: Instant,
 }
@@ -4859,7 +4859,7 @@ where
         mpsc::channel::<bash::BashDeferredCompletion>(256);
     let (deferred_response_tx, mut deferred_response_rx) =
         mpsc::unbounded_channel::<PendingSubcResponse>();
-    let deferred_wake = crate::response_finalize::DeferredResponseWake::default();
+    let deferred_wake = crate::pending_response::DeferredResponseWake::default();
     let deferred_response_tx = DeferredResponseSender {
         entries: deferred_response_tx,
         wake: deferred_wake.clone(),
@@ -6764,9 +6764,7 @@ where
             })?;
             let measure = queued.tool_response_trace.is_some();
             let dequeued = measure.then(Instant::now);
-            let dequeued_cpu = measure
-                .then(crate::run_tool_call::ThreadCpuSample::now)
-                .flatten();
+            let dequeued_cpu = measure.then(crate::clock::ThreadCpuSample::now).flatten();
             metrics.writer_active.store(true, Ordering::Relaxed);
             let write_timing = write_frame_contiguous(
                 &mut write,
@@ -6799,7 +6797,7 @@ where
                     write_timing.write_started,
                     write_timing.write_finished,
                     write_timing.frame_bytes,
-                    crate::run_tool_call::ThreadCpuSample::elapsed(
+                    crate::clock::ThreadCpuSample::elapsed(
                         dequeued_cpu,
                         write_timing.write_started_cpu,
                     ),
@@ -6833,7 +6831,7 @@ where
 
 struct FrameWriteTiming {
     write_started: Instant,
-    write_started_cpu: Option<crate::run_tool_call::ThreadCpuSample>,
+    write_started_cpu: Option<crate::clock::ThreadCpuSample>,
     write_finished: Instant,
     frame_bytes: usize,
 }
@@ -6864,9 +6862,7 @@ where
     buffer.extend_from_slice(&header);
     buffer.extend_from_slice(body);
     let write_started = measure.then(Instant::now);
-    let write_started_cpu = measure
-        .then(crate::run_tool_call::ThreadCpuSample::now)
-        .flatten();
+    let write_started_cpu = measure.then(crate::clock::ThreadCpuSample::now).flatten();
     writer
         .write_all(buffer)
         .await
@@ -8338,7 +8334,7 @@ async fn handle_control_request(
                             };
                             if response.success {
                                 output_identity.output_scope.get_or_init(|| {
-                                    Arc::new(crate::tool_output::OutputScope::new(
+                                    Arc::new(crate::output_store::OutputScope::new(
                                         ctx,
                                         &output_identity.session,
                                         Some(&output_identity.harness),
@@ -10429,10 +10425,8 @@ async fn handle_tool_call_with_capabilities(
         Ok(envelope) => envelope,
         Err(error) => return refuse_undecodable_route_request(tx, frame, &error, metrics).await,
     };
-    let mut reply_budget = crate::commands::blocking_wait::ReplyBudget::from_envelope(
-        phase_trace.received_at(),
-        &envelope,
-    );
+    let mut reply_budget =
+        crate::blocking_wait::ReplyBudget::from_envelope(phase_trace.received_at(), &envelope);
     let request_meta = RequestFrameMeta {
         ver: frame.header.ver,
         flags: frame.header.flags,
@@ -10480,7 +10474,7 @@ async fn handle_tool_call_with_capabilities(
         .is_some_and(|meta| meta.idle_artifacts_evicted);
     if let Some(ctx) = executor.actor_context(&identity.root) {
         identity.output_scope.get_or_init(|| {
-            Arc::new(crate::tool_output::OutputScope::new(
+            Arc::new(crate::output_store::OutputScope::new(
                 &ctx,
                 &identity.session,
                 Some(&identity.harness),
@@ -10910,7 +10904,7 @@ async fn handle_tool_call_with_capabilities(
     format_context.runner_notice =
         runner_notices::code_search_notice(&identity, call_key.as_deref().unwrap_or(&request_id))
             .filter(|_| fork_tool.is_none())
-            .map(|notice| notice.with_preset(role));
+            .map(|notice| Arc::new(notice.with_preset(role)) as _);
     // Pin the response ID only for the fixture's exact probe inputs. Other
     // calls and frame correlation keep their ordinary identities; all native
     // handlers, formatters and wire rendering still run unchanged.
@@ -11478,27 +11472,28 @@ async fn handle_tool_call_with_capabilities(
                         });
                         response
                     }
-                    Ok(mut prepared) => {
+                    Ok(prepared) => {
+                        let (mut request, surface_downgraded) = prepared.into_parts();
                         if bare_name_for_run == "inspect"
                             && access_grants::alfonso_worker(&identity_for_run)
                         {
-                            prepared.request.params[crate::protocol::WORKER_SESSION_FIELD] =
+                            request.params[crate::protocol::WORKER_SESSION_FIELD] =
                                 Value::Bool(true);
                         }
                         let outcome = if bare_name_for_run == "inspect" {
                             crate::commands::inspect::handle_inspect_deferred_with_reply_deadline(
-                                &prepared.request,
+                                &request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                                 Some(reply_budget.deadline),
                             )
                         } else if bare_name_for_run == "search" {
                             phase_trace.note_arg_shape(crate::run_tool_call::tool_call_arg_shape(
-                                &prepared.request,
+                                &request,
                             ));
                             let wait_fields = phase_trace.deferred_search_wait_fields();
                             crate::commands::semantic_search::handle_first_index_search_deferred(
-                                &prepared.request,
+                                &request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                                 reply_budget.deadline,
@@ -11506,13 +11501,13 @@ async fn handle_tool_call_with_capabilities(
                             )
                         } else if bare_name_for_run == "delete" {
                             crate::commands::delete_file::handle_delete_deferred_with_restriction(
-                                &prepared.request,
+                                &request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                             )
                         } else if bare_name_for_run == "bash_watch" {
                             crate::commands::bash_watch::handle_deferred_yieldable(
-                                &prepared.request,
+                                &request,
                                 Arc::clone(&deferred_ctx),
                                 reply_budget,
                                 carrier_read_only::restricted(&identity_for_run),
@@ -11521,7 +11516,7 @@ async fn handle_tool_call_with_capabilities(
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
-                                &prepared.request,
+                                &request,
                                 Arc::clone(&deferred_ctx),
                                 matches!(bind_trust, BindTrust::Untrusted),
                                 Some(reply_budget.deadline),
@@ -11540,7 +11535,7 @@ async fn handle_tool_call_with_capabilities(
                                 let _ = setup_tx.send(DeferredSetupOutcome::Deferred {
                                     pending,
                                     io_budget: io_budget.clone(),
-                                    surface_downgraded: prepared.surface_downgraded,
+                                    surface_downgraded,
                                     phase_trace,
                                 });
                                 Response::success(
@@ -11575,7 +11570,7 @@ async fn handle_tool_call_with_capabilities(
                                     &bare_name_for_run,
                                     &format_context_for_run,
                                     response,
-                                    prepared.surface_downgraded,
+                                    surface_downgraded,
                                     Some(&finalizer),
                                     Some(&mut phase_trace),
                                 );
@@ -11989,8 +11984,8 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
     let stepped_aside = runtime_drain::drain_deferred_configure_maintenance_yielding(ctx);
     runtime_drain::drain_configure_warning_events(ctx);
     if !stepped_aside {
-        crate::data_layer::runtime::root_bound(ctx);
-        crate::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
+        aft_engine::data_layer::runtime::root_bound(ctx);
+        aft_engine::data_layer::outline::root_bound(ctx, ctx.subc_lifecycle_admission());
     }
     let identity_replay = (!stepped_aside && ctx.configure_tail_idle())
         .then(|| crate::provisional_identity_retry::poll(ctx))
@@ -13233,7 +13228,7 @@ pub(crate) mod test_support {
         let (ctx, source) = cold_navigation_context(dir.path());
         let (started_rx, release_tx) =
             crate::commands::lsp_navigation::install_deferred_navigation_gate_for_test();
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let _scope = wake.install();
         let DispatchOutcome::Deferred(mut pending) =
             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
@@ -13270,7 +13265,7 @@ pub(crate) mod test_support {
         let ctx = inspect_context(dir.path());
         let (started_rx, release_tx) =
             crate::commands::inspect::install_deferred_inspect_stat_gate_for_test();
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let _scope = wake.install();
         let DispatchOutcome::Deferred(mut pending) =
             crate::commands::inspect::handle_inspect_deferred_with_restriction(
@@ -13340,7 +13335,7 @@ pub(crate) mod test_support {
             "worker_session": true,
         }))
         .expect("watch request");
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let mut pending = {
             let _scope = wake.install();
             let DispatchOutcome::Deferred(pending) =
@@ -13517,7 +13512,7 @@ pub(crate) mod test_support {
         let (entries, mut deferred_rx) = mpsc::unbounded_channel();
         let deferred_tx = DeferredResponseSender {
             entries,
-            wake: crate::response_finalize::DeferredResponseWake::default(),
+            wake: crate::pending_response::DeferredResponseWake::default(),
         };
         handle_tool_call(
             &writer,
@@ -13650,7 +13645,7 @@ pub(crate) mod test_support {
         let (dir, root) = test_root("deferred-wake-counter");
         let ctx = Arc::new(AppContext::from_app(crate::test_app(), Config::default()));
         executor.register_actor(root.clone(), ctx);
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let (tx, rx) = {
             let _scope = wake.install();
             crate::response_finalize::pending_response_channel()
@@ -13776,7 +13771,7 @@ pub(crate) mod test_support {
             "params": { "wait": case != "promotion", "timeout": 60_000 },
         }))
         .unwrap();
-        let wake = crate::response_finalize::DeferredResponseWake::default();
+        let wake = crate::pending_response::DeferredResponseWake::default();
         let DispatchOutcome::Deferred(pending) =
             crate::commands::bash_orchestrate::build_bash_outcome(
                 &request,
@@ -20972,7 +20967,7 @@ mod tests {
             let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
             let deferred_tx = DeferredResponseSender {
                 entries: deferred_tx,
-                wake: crate::response_finalize::DeferredResponseWake::default(),
+                wake: crate::pending_response::DeferredResponseWake::default(),
             };
             tokio::time::timeout(
                 dispatch_guard,

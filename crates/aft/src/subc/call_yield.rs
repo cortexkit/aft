@@ -226,9 +226,11 @@ impl WatchYields {
 
 #[cfg(test)]
 use crate::commands::bash_watch::restart::{copy_watch_response, watch_is_held};
-pub(crate) use crate::commands::bash_watch::restart::{
-    watch_can_hold, watch_finished, watch_unknown, WatchWait,
-};
+pub(crate) use crate::commands::bash_watch::restart::{watch_finished, watch_unknown, WatchWait};
+
+pub(super) fn watch_can_hold(signal: &crate::commands::bash_watch::YieldSignal) -> bool {
+    crate::commands::bash_watch::restart::reserve_watch_hold(signal)
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn hold_watch(
@@ -244,43 +246,19 @@ pub(super) async fn hold_watch(
     let retained = frame.body.clone();
     let structured = !matches!(identity.trust, super::BindTrust::Untrusted);
     let reset_signal = signal.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), String> {
-        let mut state = signal.restart.lock().unwrap();
-        let wait = state.wait.as_ref().ok_or("watch is no longer waiting")?;
-        let db = wait.ctx.db().ok_or("Call ledger is unavailable")?;
-        let mut body: Value = serde_json::from_slice(&retained).map_err(|e| e.to_string())?;
-        body["_aft_restart_watch"] = wait.checkpoint();
-        body["_aft_watch_incarnation"] =
-            serde_json::json!(crate::db::call_ledger::provider_incarnation());
-        body["_aft_include_structured"] = serde_json::json!(structured);
-        {
-            let conn = db.lock().map_err(|e| e.to_string())?;
-            crate::db::call_ledger::hold_watch(&conn, &key, &body.to_string().into_bytes())
-                .map_err(|e| e.to_string())?;
-        }
-        if state.unknown {
-            let conn = db.lock().map_err(|e| e.to_string())?;
-            crate::db::call_ledger::settle(
-                &conn,
-                &key,
-                &crate::db::call_ledger::unknown_held_result(),
-                "outcome_unknown",
-                None,
-                crate::db::call_ledger::now_ms(),
-            )
-            .map_err(|e| e.to_string())?;
-        } else if let Some(response) = state.response.take() {
-            let wait = state.wait.take().unwrap();
-            settle_watch(&wait, &key, structured, response);
-        } else {
-            state.held = Some((key, structured));
-        }
-        Ok(())
+    tokio::task::spawn_blocking(move || {
+        crate::commands::bash_watch::restart::persist_watch_hold(
+            &signal,
+            key,
+            structured,
+            &retained,
+            settle_watch,
+        )
     })
     .await
     .map_err(|_| super::SubcError::WriterClosed)?
     .map_err(|error| {
-        reset_signal.restart.lock().unwrap().reserved = false;
+        crate::commands::bash_watch::restart::clear_watch_hold(&reset_signal);
         log::warn!("watch hold persistence failed: {error}");
         super::SubcError::WriterClosed
     })?;
@@ -315,18 +293,17 @@ pub(crate) fn settle_watch(
     structured: bool,
     response: crate::protocol::Response,
 ) {
-    let root = wait.ctx.config().project_root.clone().unwrap_or_default();
-    let format = crate::subc_format::FormatContext::from_tool_call(
-        "bash_watch",
-        &wait.request.params,
-        &root,
-    );
+    let ctx = wait.ctx();
+    let request = wait.request();
+    let root = ctx.config().project_root.clone().unwrap_or_default();
+    let format =
+        crate::subc_format::FormatContext::from_tool_call("bash_watch", &request.params, &root);
     let finalizer = |response: &mut crate::protocol::Response, text: &mut String| {
         crate::response_finalize::finalize_tool_response(
             response,
             text,
-            &wait.ctx,
-            wait.request.session(),
+            &ctx,
+            request.session(),
             "bash_watch",
             structured,
         );
@@ -358,7 +335,7 @@ pub(crate) fn settle_watch(
             body: outgoing.frame.body,
         };
         let frame = super::project_held_ledger_result(&frame, source.as_deref(), structured)?;
-        let db = wait.ctx.db().ok_or("Call ledger is unavailable")?;
+        let db = ctx.db().ok_or("Call ledger is unavailable")?;
         let conn = db.lock().map_err(|e| e.to_string())?;
         crate::db::call_ledger::settle_with_tool_result_source(
             &conn,
@@ -446,7 +423,7 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
             }
             let now = std::time::Instant::now();
             Some((
-                crate::commands::blocking_wait::ReplyBudget::with_deadline(
+                crate::blocking_wait::ReplyBudget::with_deadline(
                     now.checked_sub(std::time::Duration::from_millis(
                         (now_ms - started_ms) as u64,
                     ))?,
@@ -478,18 +455,12 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
             params: saved["params"].clone(),
         };
         let signal = Arc::new(crate::commands::bash_watch::YieldSignal::default());
-        {
-            let mut state = signal.restart.lock().unwrap();
-            state.reserved = true;
-            state.held = Some((key.clone(), body["_aft_include_structured"] == true));
-            state.resume = Some((budget, limit_ms));
-            state.wait = Some(WatchWait::new(
-                ctx.clone(),
-                request.clone(),
-                budget,
-                limit_ms,
-            ));
-        }
+        crate::commands::bash_watch::restart::recover_watch_hold(
+            &signal,
+            key,
+            body["_aft_include_structured"] == true,
+            WatchWait::new(ctx.clone(), request.clone(), budget, limit_ms),
+        );
         let principal = serde_json::from_value(saved["principal"].clone());
         let Ok(principal) = principal else {
             watch_unknown(&signal);
@@ -550,7 +521,7 @@ mod tests {
         let wait = WatchWait::new(
             ctx.clone(),
             request,
-            crate::commands::blocking_wait::ReplyBudget::new(std::time::Instant::now(), None),
+            crate::blocking_wait::ReplyBudget::new(std::time::Instant::now(), None),
             3000,
         );
         let key = ledger::Key {
@@ -576,7 +547,7 @@ mod tests {
         );
         let format = crate::subc_format::FormatContext::from_tool_call(
             "bash_watch",
-            &wait.request.params,
+            &wait.request().params,
             dir.path(),
         );
         let finalizer = |response: &mut crate::protocol::Response, text: &mut String| {
@@ -648,7 +619,7 @@ mod tests {
         }
         let _stop = StopChild(metadata.pgid.unwrap());
         let watch: crate::protocol::RawRequest = serde_json::from_value(json!({"id":"watch", "command":"bash_watch", "session_id":"restart-worker", "task_id":task,"timeout_ms":3000})).unwrap();
-        let budget = crate::commands::blocking_wait::ReplyBudget::with_deadline(
+        let budget = crate::blocking_wait::ReplyBudget::with_deadline(
             std::time::Instant::now() - std::time::Duration::from_millis(750),
             std::time::Instant::now() + std::time::Duration::from_secs(10),
         );

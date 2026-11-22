@@ -12,7 +12,7 @@ mod backup_bookkeeping_tests;
 mod outline_wait_probe;
 #[cfg(test)]
 mod pipeline_path_tests;
-pub(crate) use crate::clock::ThreadCpuSample;
+use crate::clock::ThreadCpuSample;
 #[allow(unused_imports)]
 pub(crate) use crate::tool_progress as progress;
 
@@ -116,15 +116,18 @@ pub(crate) mod read_trace;
 pub use crate::tool_progress::{ToolCallPhaseCpu, ToolCallPhaseDurations, WaitingOn};
 
 impl PhaseTrace {
-    pub(crate) fn received_at(&self) -> Instant {
+    /// Return the time the tool call was received.
+    pub fn received_at(&self) -> Instant {
         self.frame_decoded
     }
 
-    pub(crate) fn launch_restore_wait(&self) -> std::time::Duration {
+    /// Return the time spent waiting for a launch restore.
+    pub fn launch_restore_wait(&self) -> std::time::Duration {
         self.launch_restore_wait
     }
 
-    pub(crate) fn note_launch_restore_wait(&mut self, elapsed: std::time::Duration) {
+    /// Record time spent waiting for a launch restore.
+    pub fn note_launch_restore_wait(&mut self, elapsed: std::time::Duration) {
         self.launch_restore_wait = elapsed;
     }
 
@@ -183,7 +186,8 @@ impl PhaseTrace {
         self.cpu.translate_done = ThreadCpuSample::now();
     }
 
-    pub(crate) fn mark_execute_done(&mut self) {
+    /// Mark the end of synchronous tool execution.
+    pub fn mark_execute_done(&mut self) {
         self.execute_done = Some(Instant::now());
         self.cpu.execute_done = ThreadCpuSample::now();
         let (waiting_on, waiting_on_build_id, wait_ms) = crate::logging::take_tool_call_wait();
@@ -193,7 +197,8 @@ impl PhaseTrace {
         self.edit_phases = crate::logging::take_edit_phase_times();
     }
 
-    pub(crate) fn mark_execute_done_after_await(&mut self) {
+    /// Record completion of execution after the deferred wait.
+    pub fn mark_execute_done_after_await(&mut self) {
         // Matching endpoint thread IDs cannot detect a hop away and back, nor
         // CPU consumed by unrelated tasks while a deferred response was pending.
         self.cpu.execute_suspended = true;
@@ -213,7 +218,8 @@ impl PhaseTrace {
 
     /// The cold-search worker records named waits on its own thread; the
     /// terminal response harvests them for the usual slow-call fields.
-    pub(crate) fn deferred_search_wait_fields(
+    /// Capture timing fields for a deferred search waiting for its first index.
+    pub fn deferred_search_wait_fields(
         &mut self,
     ) -> std::sync::Arc<std::sync::Mutex<Option<String>>> {
         let fields = std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -222,11 +228,13 @@ impl PhaseTrace {
     }
 
     /// Record the argument shape the slow-call line reports for this call.
-    pub(crate) fn note_arg_shape(&mut self, shape: String) {
+    /// Record the argument shape without retaining the argument values.
+    pub fn note_arg_shape(&mut self, shape: String) {
         self.arg_shape = Some(shape);
     }
 
-    pub(crate) fn mark_provider_read_done(&mut self) {
+    /// Record the completion and timing of provider-side reads.
+    pub fn mark_provider_read_done(&mut self) {
         // Provider reads have no tool translation, formatting, or finalization
         // phases; keep their executor wait and operation time in the shared trace.
         self.setup_done = self.job_admitted;
@@ -356,7 +364,8 @@ pub struct ToolCallContext {
     pub host_tool_names: Option<crate::host_tool_names::HostToolNames>,
 }
 
-pub(crate) fn ensure_hashline_registration(
+/// Register the session's hashline binding before using the head edit surface.
+pub fn ensure_hashline_registration(
     app_ctx: &AppContext,
     project_root: &std::path::Path,
     session: &str,
@@ -401,10 +410,8 @@ pub(crate) fn ensure_hashline_registration(
 }
 
 /// The root a session's hashline binding is registered and captured under.
-pub(crate) fn hashline_binding_root(
-    app_ctx: &AppContext,
-    project_root: &std::path::Path,
-) -> PathBuf {
+/// Resolve the project root used for a session's hashline binding.
+pub fn hashline_binding_root(app_ctx: &AppContext, project_root: &std::path::Path) -> PathBuf {
     app_ctx
         .canonical_cache_root_opt()
         .unwrap_or_else(|| project_root.to_path_buf())
@@ -420,7 +427,8 @@ pub(crate) fn hashline_binding_root(
 /// then mints tags as it did before. No record, an unreadable one or no
 /// database means the standard grammar, as for a head whose catalog was
 /// served before edit modes were recorded.
-pub(crate) fn resolve_head_edit_mode(
+/// Resolve the requested head edit mode to the surface the runtime can use.
+pub fn resolve_head_edit_mode(
     app_ctx: &AppContext,
     project_root: &std::path::Path,
     session: &str,
@@ -478,12 +486,26 @@ fn append_hashline_downgrade_text(text: &mut String) {
     text.push_str(crate::commands::configure::HASHLINE_DOWNGRADE_MESSAGE);
 }
 
-pub(crate) struct PreparedToolCall {
-    pub(crate) request: RawRequest,
-    pub(crate) surface_downgraded: bool,
+/// A translated request and whether its requested edit surface was downgraded.
+pub struct PreparedToolCall {
+    request: RawRequest,
+    surface_downgraded: bool,
 }
 
-pub(crate) fn prepare_tool_call(
+impl PreparedToolCall {
+    /// Borrow the translated request for preflight without dispatching the tool.
+    pub fn request(&self) -> &RawRequest {
+        &self.request
+    }
+
+    /// Consume the prepared call for dispatch, keeping its downgrade flag for formatting.
+    pub fn into_parts(self) -> (RawRequest, bool) {
+        (self.request, self.surface_downgraded)
+    }
+}
+
+/// Translate and prepare a tool call before dispatch.
+pub fn prepare_tool_call(
     bare_name: &str,
     args: Value,
     format_context: &crate::subc_format::FormatContext,
@@ -644,7 +666,8 @@ pub(crate) fn prepare_tool_call(
     })
 }
 
-pub(crate) fn finish_tool_call_response(
+/// Render a dispatched tool reply and run its optional finalizer.
+pub fn finish_tool_call_response(
     bare_name: &str,
     format_context: &crate::subc_format::FormatContext,
     mut response: Response,
@@ -652,10 +675,7 @@ pub(crate) fn finish_tool_call_response(
     finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
 ) -> ToolCallResult {
-    response.notices.route = format_context
-        .runner_notice
-        .clone()
-        .map(|route| route.into_sink());
+    response.notices.route = format_context.runner_notice.clone().map(|route| route as _);
     crate::subc::runner_notices::notice_templates::deliver(&mut response, None);
     if surface_downgraded {
         attach_hashline_downgrade(&mut response);
@@ -688,7 +708,7 @@ pub(crate) fn finish_tool_call_response(
 /// path that skips observation leaves the breaker blind to that tool: a model
 /// can then repeat one bash command indefinitely without being steered.
 #[derive(Debug, Clone)]
-pub(crate) struct RepeatObservation {
+pub struct RepeatObservation {
     session_id: String,
     call: crate::response_finalize::repeat_breaker::RepeatCall,
     /// Picks the reminder's wording: a delegated worker is never told to end
@@ -717,7 +737,7 @@ impl RepeatObservation {
     /// because that is the call the model repeats.
     ///
     /// `worker_session` is the caller's role (see `RawRequest::worker_session`).
-    pub(crate) fn for_agent_call(
+    pub fn for_agent_call(
         session_id: &str,
         tool: &str,
         args: &Value,
@@ -743,7 +763,7 @@ impl RepeatObservation {
     /// trailers are attached. Those decorations carry moving counts, so hashing
     /// afterward would make identical results appear different forever and
     /// silently prevent the breaker from firing.
-    pub(crate) fn observe(self, app_ctx: &AppContext, response: &mut Response, text: &mut String) {
+    pub fn observe(self, app_ctx: &AppContext, response: &mut Response, text: &mut String) {
         let output_hash = if self.call.is_reset_only() {
             0
         } else {
@@ -1076,7 +1096,8 @@ fn target_kind(target: &str) -> String {
 /// sizes of the match and replacement text. Paths, file contents and edit
 /// text are never included, so the line can name what made a call slow
 /// without exposing what it touched.
-pub(crate) fn tool_call_arg_shape(request: &RawRequest) -> String {
+/// Summarize a tool request's shape for tracing without logging its values.
+pub fn tool_call_arg_shape(request: &RawRequest) -> String {
     let params = &request.params;
     let text_len = |value: &Value| value.as_str().map_or(0, str::len);
     let mut fields = vec![format!("cmd={}", request.command)];
@@ -1171,7 +1192,8 @@ fn raw_request_from_translated(
     })
 }
 
-pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
+/// Remove the agent-only preview argument before request translation.
+pub fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
     if let Some(map) = args.as_object_mut() {
         map.remove("preview");
     }

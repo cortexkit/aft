@@ -93,7 +93,8 @@ pub(crate) fn handle_lsp_navigation_deferred_with_restriction(
     handle_lsp_navigation_deferred_with_reply_deadline(req, ctx, force_restrict, None)
 }
 
-pub(crate) fn handle_lsp_navigation_deferred_with_reply_deadline(
+/// Prepare an LSP navigation reply with the transport's restriction and deadline.
+pub fn handle_lsp_navigation_deferred_with_reply_deadline(
     req: &RawRequest,
     ctx: Arc<AppContext>,
     force_restrict: bool,

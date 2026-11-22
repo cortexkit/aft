@@ -1,8 +1,9 @@
 //! Defer carrier polling without holding an executor slot or using worker waits.
 
 use super::super::*;
-use crate::commands::blocking_wait::ReplyBudget;
-use crate::response_finalize::{DeferredResponseWake, DispatchOutcome, PendingResponse};
+use crate::blocking_wait::ReplyBudget;
+use crate::pending_response::DeferredResponseWake;
+use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
 pub(super) struct Watch {
     budget: ReplyBudget,

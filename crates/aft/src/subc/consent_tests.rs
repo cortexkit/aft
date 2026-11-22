@@ -1154,7 +1154,7 @@ impl Fixture {
         let (entries, _deferred_rx) = mpsc::unbounded_channel();
         let deferred_tx = DeferredResponseSender {
             entries,
-            wake: crate::response_finalize::DeferredResponseWake::default(),
+            wake: crate::pending_response::DeferredResponseWake::default(),
         };
         // As on the frame loop, a scoped worker's saved confinement is read
         // off the loop first when memory cannot answer for it.

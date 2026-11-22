@@ -1181,7 +1181,7 @@ pub(super) struct ToolResponsePolicy {
     pub(super) trust: BindTrust,
     pub(super) tool_result_body: bool,
     pub(super) model_only: bool,
-    pub(super) output_scope: Option<Arc<crate::tool_output::OutputScope>>,
+    pub(super) output_scope: Option<Arc<crate::output_store::OutputScope>>,
 }
 
 impl ToolResponsePolicy {
@@ -2218,7 +2218,7 @@ pub(super) mod tests {
             let route = result_route(Some(principal), "opencode", CallMode::Codemode);
             route
                 .output_scope
-                .set(Arc::new(crate::tool_output::OutputScope::new(
+                .set(Arc::new(crate::output_store::OutputScope::new(
                     &ctx,
                     "result-session",
                     Some("opencode"),
@@ -2252,7 +2252,7 @@ pub(super) mod tests {
         let route = result_route(Some("reserved:broca"), "opencode", CallMode::Codemode);
         route
             .output_scope
-            .set(Arc::new(crate::tool_output::OutputScope::new(
+            .set(Arc::new(crate::output_store::OutputScope::new(
                 &ctx,
                 "result-session",
                 Some("opencode"),

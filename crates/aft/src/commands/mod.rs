@@ -24,7 +24,8 @@ pub mod bash_abort_inflight;
 pub mod bash_artifact_owned;
 pub mod bash_drain_completions;
 pub mod bash_kill;
-pub(crate) mod bash_kill_scope;
+/// Scope-owned shell task cancellation, including tasks recovered from disk.
+pub mod bash_kill_scope;
 pub mod bash_notify;
 pub mod bash_orchestrate;
 pub mod bash_owned_tasks;
@@ -104,6 +105,7 @@ mod meaning_query_tests;
 pub mod memory_census;
 pub mod move_file;
 pub mod move_symbol;
+pub mod policy_environment;
 pub use crate::grep_executor::multi_path;
 pub mod organize_imports;
 #[cfg(test)]

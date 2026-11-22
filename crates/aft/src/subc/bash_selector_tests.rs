@@ -86,7 +86,7 @@ pub(super) async fn call_v1_bash(
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = super::DeferredResponseSender {
         entries: deferred_tx,
-        wake: crate::response_finalize::DeferredResponseWake::default(),
+        wake: crate::pending_response::DeferredResponseWake::default(),
     };
     handle_tool_call(
         &writer,
@@ -229,7 +229,7 @@ async fn route_cancel_test_tool(
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = super::DeferredResponseSender {
         entries: deferred_tx,
-        wake: crate::response_finalize::DeferredResponseWake::default(),
+        wake: crate::pending_response::DeferredResponseWake::default(),
     };
     handle_tool_call(
         &writer,
@@ -763,7 +763,7 @@ async fn v1_bash_wait_limit_case(worker: bool) {
     let (deferred_tx, _deferred_rx) = mpsc::unbounded_channel();
     let deferred_tx = DeferredResponseSender {
         entries: deferred_tx,
-        wake: crate::response_finalize::DeferredResponseWake::default(),
+        wake: crate::pending_response::DeferredResponseWake::default(),
     };
     let started = Instant::now();
     handle_tool_call(

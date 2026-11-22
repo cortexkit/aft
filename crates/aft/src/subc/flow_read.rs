@@ -1,6 +1,6 @@
 //! Call-scoped Basal routes delegate read-only operations, never general tools.
 use super::*;
-use crate::commands::file_read_exact::{self, ReadExactRefusal as Refusal};
+use crate::file_read_exact::{self, ReadExactRefusal as Refusal};
 use subc_protocol::{
     scope::{ScopeKind, ScopeStamp, ScopeStatus},
     session::ModuleControlResponseToModule,
