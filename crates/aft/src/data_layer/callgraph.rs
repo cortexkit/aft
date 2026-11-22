@@ -30,8 +30,8 @@ use rayon::prelude::*;
 
 use crate::callgraph_store::facts::{BlobKey, DirEntry, EntryKind, ProjectFacts};
 use crate::callgraph_store::join::dispatch::{
-    associated_reference, dependency, DispatchFiles, MemoizedResolver, Resolution, Resolver,
-    SiteHint,
+    associated_reference, dependency, DispatchFiles, DispatchParse, DispatchParseOwner,
+    MemoizedResolver, Resolution, Resolver, SiteHint,
 };
 use crate::callgraph_store::join::{
     bind_file, dispatch_type_targets_for, finish_binding, resolve_file, BlobRef, BlobRefKind,
@@ -44,6 +44,7 @@ use crate::callgraph_store::{
 };
 
 mod binding_batch;
+mod decoded_cache;
 mod key_order;
 mod site_records;
 mod spool;
@@ -2615,19 +2616,26 @@ impl SiteFile {
     }
 }
 
+impl DispatchParseOwner for SiteFile {
+    fn parse(&self) -> &ParseBlob {
+        &self.parse
+    }
+}
+
 /// Every file's pass-4 inputs, as a live checkout keeps them.
 ///
 /// Built from every file, the inputs are all in memory. Started from a
-/// publication, they are computed per file the first time pass 4 reads a
-/// file, and files are found by method name through the terms the
-/// publication stored (see `graph_store::method_terms`); a file whose
+/// publication, they are projected on demand, and files are found by method
+/// name through the terms it stored (see `graph_store::method_terms`); a file whose
 /// inputs changed since is filed in memory instead.
 #[derive(Default)]
 pub(crate) struct MethodCallInputs {
     #[cfg(feature = "callgraph-shape-census")]
     census: Mutex<super::shape_census::Census>,
-    /// Each file's inputs computed so far, for the current checkout.
+    /// Current inputs filed in memory, and old inputs saved until an update compares them.
     files: HashMap<String, Arc<SiteFile>>,
+    /// Replaceable projections from the current publication only.
+    projections: decoded_cache::DecodedCache<SiteFile>,
     /// The publication whose terms find every file not in `own`.
     stored: Option<Arc<super::graph_store::StoredSlices>>,
     /// Files filed in memory: every file when nothing is stored, otherwise
@@ -2680,6 +2688,45 @@ impl MethodCallInputs {
         self.computed_while_resolving.take()
     }
 
+    #[cfg(test)]
+    pub(super) fn set_projection_budget_for_test(&mut self, bytes: usize) {
+        self.projections = decoded_cache::DecodedCache::new(bytes);
+    }
+
+    #[cfg(test)]
+    pub(super) fn projection_counts_for_test(&self) -> (usize, usize, usize) {
+        let (held, peak, evicted, _, _) = self.projections.counts();
+        (held, peak, evicted)
+    }
+
+    #[cfg(test)]
+    pub(super) fn kept_for_test(&self, path: &str) -> bool {
+        self.files.contains_key(path)
+    }
+
+    #[cfg(test)]
+    pub(super) fn cached_for_test(&self, path: &str) -> Option<Arc<SiteFile>> {
+        self.projections.peek(path)
+    }
+
+    #[cfg(test)]
+    pub(super) fn projected_methods_for_test(
+        &self,
+        inputs: &CheckoutInputs,
+        resolved: &Resolutions,
+        path: &str,
+    ) -> Option<Vec<String>> {
+        let source = SiteSource::new(inputs, resolved, self);
+        Some(
+            source
+                .site(path)?
+                .method_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        )
+    }
+
     /// Every file's inputs, from `resolved`.
     pub(crate) fn build(inputs: &CheckoutInputs, resolved: &(dyn ResolutionLookup + Sync)) -> Self {
         let carry = crate::alloc_trace::carry();
@@ -2723,20 +2770,12 @@ impl MethodCallInputs {
         }
     }
 
-    /// These inputs found through `stored`'s method terms from now on (the
-    /// hashed method names a publication files each file's fragment under),
-    /// as [`Self::stored`] finds them, keeping every file's inputs computed so
-    /// far: `stored` is the publication of the parses and resolutions they
-    /// were computed from, so its terms file every file as the in-memory
-    /// filing does. `None` for inputs built from every file, which find
-    /// nothing through stored terms.
+    /// The new publication covers the current parses and resolutions. Its
+    /// terms replace the in-memory filings, and old projections must not be
+    /// reused across publications. An engine built in memory is not rebased.
     pub(crate) fn rebased(self, stored: Arc<super::graph_store::StoredSlices>) -> Option<Self> {
         self.stored.as_ref()?;
-        Some(Self {
-            files: self.files,
-            stored: Some(stored),
-            ..Self::default()
-        })
+        Some(Self::stored(stored))
     }
 
     /// Files `path` in memory as declaring `file`'s methods.
@@ -2796,6 +2835,10 @@ impl MethodCallInputs {
         if self.files.contains_key(path) {
             return;
         }
+        if let Some(file) = self.projections.get(path) {
+            self.files.insert(path.to_string(), file);
+            return;
+        }
         if let (Some(parse), Some(resolution)) = (parse, resolution) {
             self.files
                 .insert(path.to_string(), Arc::new(SiteFile::new(parse, resolution)));
@@ -2812,6 +2855,7 @@ impl MethodCallInputs {
         path: &str,
         resolution: Option<&FileResolution>,
     ) -> (BTreeSet<String>, bool) {
+        self.projections.remove(path);
         let new = resolution
             .zip(inputs.parses.get(path))
             .map(|(file, (_, parse))| Arc::new(SiteFile::new(parse, file)));
@@ -2843,7 +2887,7 @@ impl MethodCallInputs {
     /// Pass 4 for `paths`: each file's kept method-call sites and the
     /// dependency keys their resolutions read. A few files run on this
     /// thread; more run in parallel chunks, each with its own resolver.
-    /// Inputs computed on the way are kept for later updates.
+    /// Stored inputs computed on the way can be evicted while the pass runs.
     pub(crate) fn resolve_sites(
         &mut self,
         inputs: &CheckoutInputs,
@@ -2861,12 +2905,10 @@ impl MethodCallInputs {
         paths: &[&String],
         guard: Option<&RefreshMemory>,
     ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, UpdateError> {
-        // Most updates reach no method-call site; the source below lists
-        // every parsed file, so skip it then.
         if paths.is_empty() {
             return Ok(Vec::new());
         }
-        let source = SiteSource::new(inputs, resolved, self, guard)?;
+        let source = SiteSource::new(inputs, resolved, self);
         let projects = inputs.csharp_projects();
         let results = if paths.len() <= SMALL_SITE_RUN {
             source.load_declarers(paths, guard)?;
@@ -2898,18 +2940,17 @@ impl MethodCallInputs {
         {
             return Err(ManifestJoinError::Parse(error).into());
         }
-        let loaded = source.into_loaded(guard)?;
-        for (path, file) in loaded {
-            guard.file()?;
-            self.files.insert(path, file);
+        #[cfg(feature = "test-hooks")]
+        if self.stored.is_some() && std::env::var_os("AFT_REFRESH_PROFILE").is_some() {
+            let (held, peak, evicted, table, peak_table) = self.projections.counts();
+            log::info!("refresh declarer cache: held={held} peak={peak} evicted={evicted} table={table} peak_table={peak_table}");
         }
         Ok(results)
     }
 }
 
 /// The method-call resolver's view of a checkout's pass-4 inputs during one
-/// run: the inputs kept, and any other file's computed the first time it is
-/// read.
+/// run: edited inputs and the publication's replaceable projections.
 struct SiteSource<'s> {
     /// Resolver callbacks return `Option`; keep failed stored inputs so an
     /// unreadable file declaring a method cannot silently make calls unresolved.
@@ -2917,37 +2958,10 @@ struct SiteSource<'s> {
     inputs: &'s CheckoutInputs,
     resolved: &'s (dyn ResolutionLookup + Sync),
     calls: &'s MethodCallInputs,
-    /// Every parsed file whose inputs are not kept, computed on first read.
-    loaded: HashMap<&'s str, std::sync::OnceLock<Option<Arc<SiteFile>>>>,
 }
 
 impl<'s> SiteSource<'s> {
     fn new(
-        inputs: &'s CheckoutInputs,
-        resolved: &'s (dyn ResolutionLookup + Sync),
-        calls: &'s MethodCallInputs,
-        guard: Option<&RefreshMemory>,
-    ) -> Result<Self, RefreshStop> {
-        let mut loaded = HashMap::new();
-        for path in inputs.parses.keys() {
-            guard.file()?;
-            if !calls.files.contains_key(path.as_str()) {
-                loaded.insert(path.as_str(), std::sync::OnceLock::new());
-            }
-        }
-        Ok(Self {
-            inputs,
-            resolved,
-            calls,
-            loaded,
-            error: Mutex::new(None),
-        })
-    }
-
-    /// The source over `calls` when it keeps every parsed file's inputs, as
-    /// a cold build's do: no file is computed on first read, so the parsed
-    /// files are not listed.
-    fn kept(
         inputs: &'s CheckoutInputs,
         resolved: &'s (dyn ResolutionLookup + Sync),
         calls: &'s MethodCallInputs,
@@ -2956,22 +2970,32 @@ impl<'s> SiteSource<'s> {
             inputs,
             resolved,
             calls,
-            loaded: HashMap::new(),
             error: Mutex::new(None),
         }
     }
 
-    fn site(&self, path: &str) -> Option<&SiteFile> {
+    fn site(&self, path: &str) -> Option<Arc<SiteFile>> {
         if let Some(file) = self.calls.files.get(path) {
+            return Some(Arc::clone(file));
+        }
+        self.project(path, true)
+    }
+
+    fn project(&self, path: &str, note: bool) -> Option<Arc<SiteFile>> {
+        let cache = &self.calls.projections;
+        if let Some(file) = cache.get(path) {
             return Some(file);
         }
-        self.loaded
-            .get(path)?
-            .get_or_init(|| {
-                self.calls.computed_while_resolving.note(path);
-                self.compute(path)
-            })
-            .as_deref()
+        if self.calls.stored.is_none()
+            || self.calls.own.contains(path)
+            || !self.inputs.parses.contains_key(path)
+        {
+            return None;
+        }
+        if note {
+            self.calls.computed_while_resolving.note(path);
+        }
+        self.compute(path).map(|file| cache.insert(path, file))
     }
 
     /// The file's pass-4 inputs, from its parse and resolution read without
@@ -2995,16 +3019,14 @@ impl<'s> SiteSource<'s> {
         file
     }
 
-    /// Computes, in parallel, the inputs of every file that declares a
-    /// method named like one a site of `paths` calls.
+    /// Warms the cache in parallel for the methods called by `paths`.
     ///
     /// The resolver reads every declarer of a called method's name, one
     /// after another on the thread resolving the site. A file not read since
     /// the engine started is computed then, from its stored parse and
     /// resolution, so the first update after a restart that reaches a
     /// common method name waits on decoding each of its declarers in turn.
-    /// Computing them here first leaves the resolver finding them computed;
-    /// what it reads, and what it records reading, is unchanged.
+    /// Computing them here first avoids those waits when the projections fit.
     fn load_declarers(
         &self,
         paths: &[&String],
@@ -3034,9 +3056,7 @@ impl<'s> SiteSource<'s> {
         declarers.par_iter().try_for_each(|file| {
             guard.file()?;
             let _label = carry.enter();
-            if let Some(slot) = self.loaded.get(file.as_str()) {
-                slot.get_or_init(|| self.compute(file));
-            }
+            self.project(file, false);
             Ok(())
         })
     }
@@ -3055,25 +3075,15 @@ impl<'s> SiteSource<'s> {
             })
             .unwrap_or_default()
     }
-
-    fn into_loaded(
-        self,
-        guard: Option<&RefreshMemory>,
-    ) -> Result<Vec<(String, Arc<SiteFile>)>, RefreshStop> {
-        let mut loaded = Vec::new();
-        for (path, slot) in self.loaded {
-            guard.file()?;
-            if let Some(Some(file)) = slot.into_inner() {
-                loaded.push((path.to_string(), file));
-            }
-        }
-        Ok(loaded)
-    }
 }
 
 impl<'a, 's: 'a> DispatchFiles<'a> for SiteSource<'s> {
-    fn file(&'a self, path: &str) -> Option<&'a ParseBlob> {
-        self.site(path).map(|file| &file.parse)
+    fn file(&'a self, path: &str) -> Option<DispatchParse<'a>> {
+        if let Some(file) = self.calls.files.get(path) {
+            return Some(DispatchParse::Borrowed(&file.parse));
+        }
+        let file = self.project(path, true)?;
+        Some(DispatchParse::Shared(file))
     }
 
     fn files_with_method(&self, name: &str) -> Vec<String> {
@@ -3148,12 +3158,12 @@ fn resolve_chunk(
                 .parses
                 .get(path)
                 .ok_or_else(|| ManifestJoinError::Parse(format!("missing parse for {path}")))?;
-            let calls = &source
+            let ordinary = source
                 .site(path)
+                .map(|file| (parse.language == "rust").then(|| file.ordinary.clone()))
                 .ok_or_else(|| {
                     ManifestJoinError::Parse(format!("missing method-call inputs for {path}"))
-                })?
-                .ordinary;
+                })?;
             let mut sites = Vec::new();
             for site in parse.iter_bound_dispatch_sites() {
                 guard.site()?;
@@ -3169,11 +3179,11 @@ fn resolve_chunk(
                 );
                 // Keep proven self-call and scoped module-function bindings
                 // when dispatch facts do not identify a project receiver type.
-                if parse.language == "rust"
-                    && resolution.external > 0
+                if resolution.external > 0
                     && resolution.targets.is_empty()
-                    && calls.edges.contains(&site.ordinal)
-                    && calls.syntax.contains(&site.ordinal)
+                    && ordinary.as_ref().is_some_and(|calls| {
+                        calls.edges.contains(&site.ordinal) && calls.syntax.contains(&site.ordinal)
+                    })
                 {
                     continue;
                 }
@@ -3467,6 +3477,7 @@ aft_store::heap_bytes_of_fields!(SiteFile {
 aft_store::heap_bytes_of_fields!(MethodCallInputs {
     census,
     files,
+    projections,
     stored,
     own,
     methods,
@@ -3477,6 +3488,7 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
 #[cfg(not(feature = "callgraph-shape-census"))]
 aft_store::heap_bytes_of_fields!(MethodCallInputs {
     files,
+    projections,
     stored,
     own,
     methods,

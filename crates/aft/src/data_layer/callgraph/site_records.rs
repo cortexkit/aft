@@ -34,8 +34,8 @@ use rayon::prelude::*;
 use crate::callgraph_store::join::dispatch::projected::{
     FileRecord, ProjectedMro, ProjectedType, Projections, Recorded,
 };
-use crate::callgraph_store::join::dispatch::{DispatchFiles, Resolver};
-use crate::callgraph_store::join::{ManifestJoinError, ParseBlob};
+use crate::callgraph_store::join::dispatch::{DispatchFiles, DispatchParse, Resolver};
+use crate::callgraph_store::join::ManifestJoinError;
 
 use super::super::checkout::DataError;
 use super::{CheckoutInputs, MethodCallInputs, NoResolutions, SiteSource};
@@ -396,7 +396,7 @@ pub(super) fn project_batch(
     batch: &[&String],
     records: &mut RecordWriter,
 ) -> Result<(), ManifestJoinError> {
-    let source = SiteSource::kept(inputs, &NoResolutions, calls);
+    let source = SiteSource::new(inputs, &NoResolutions, calls);
     let chunk = batch
         .len()
         .div_ceil(rayon::current_num_threads() * 4)
@@ -983,8 +983,9 @@ impl Projections for Pinned<'_> {
 }
 
 impl<'a, 's: 'a> DispatchFiles<'a> for Pinned<'s> {
-    fn file(&'a self, path: &str) -> Option<&'a ParseBlob> {
-        self.record(path).map(FileRecord::facts)
+    fn file(&'a self, path: &str) -> Option<DispatchParse<'a>> {
+        self.record(path)
+            .map(|record| DispatchParse::Borrowed(record.facts()))
     }
 
     fn files_with_method(&self, name: &str) -> Vec<String> {

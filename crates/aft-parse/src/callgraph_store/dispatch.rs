@@ -2078,7 +2078,7 @@ macro_rules! census_exit {
 }
 
 /// Same-named methods in path order, each file's in file order.
-type NamedMethods<'a> = std::sync::Arc<Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>>;
+type NamedMethods<'a> = std::sync::Arc<Vec<(String, view::MethodGroup<'a>, Cow<'a, MethodHint>)>>;
 
 /// The same-named methods of every file a source lists, loaded once and
 /// handed to several resolvers over that source (see
@@ -2097,12 +2097,50 @@ impl SharedMethods<'_> {
     }
 }
 
+/// Borrow a parse kept by the caller, or share a projection that the cache
+/// may evict before the read finishes.
+pub enum DispatchParse<'a> {
+    Borrowed(&'a ParseBlob),
+    Shared(std::sync::Arc<dyn DispatchParseOwner>),
+}
+
+pub trait DispatchParseOwner: Send + Sync {
+    fn parse(&self) -> &ParseBlob;
+}
+
+impl<'a> DispatchParse<'a> {
+    fn borrowed(self) -> Option<&'a ParseBlob> {
+        match self {
+            Self::Borrowed(parse) => Some(parse),
+            Self::Shared(_) => None,
+        }
+    }
+
+    fn select<T: Clone>(&self, get: impl FnOnce(&ParseBlob) -> Option<&T>) -> Option<Cow<'a, T>> {
+        match self {
+            Self::Borrowed(parse) => get(parse).map(Cow::Borrowed),
+            Self::Shared(parse) => get(parse.parse()).cloned().map(Cow::Owned),
+        }
+    }
+}
+
+impl std::ops::Deref for DispatchParse<'_> {
+    type Target = ParseBlob;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(parse) => parse,
+            Self::Shared(parse) => parse.parse(),
+        }
+    }
+}
+
 /// What the method-call resolver reads about a checkout's files, when they
 /// are loaded on demand instead of all held in its maps. Each answer must
 /// equal what those maps give for the same files.
 pub trait DispatchFiles<'a> {
     /// `path`'s facts, or `None` when it has none.
-    fn file(&'a self, path: &str) -> Option<&'a ParseBlob>;
+    fn file(&'a self, path: &str) -> Option<DispatchParse<'a>>;
     /// Every file with a method named `name`, in path order. May list a few
     /// that have none; the resolver checks each file's facts.
     fn files_with_method(&self, name: &str) -> Vec<String>;
@@ -2299,43 +2337,58 @@ impl<'a> Resolver<'a> {
             None => self.associated_sites.contains(&(file.to_string(), ordinal)),
         }
     }
-    /// `path`'s facts without recording a dependency.
+    /// Borrow facts whose addresses can identify them in cold-build records.
     fn lookup(&self, path: &str) -> Option<&'a ParseBlob> {
+        self.lookup_handle(path)?.borrowed()
+    }
+
+    /// `path`'s facts without recording a dependency.
+    fn lookup_handle(&self, path: &str) -> Option<DispatchParse<'a>> {
         match self.source {
             Some(source) => source.file(path),
-            None => self.files.get(path).copied(),
+            None => self
+                .files
+                .get(path)
+                .map(|parse| DispatchParse::Borrowed(parse)),
         }
     }
     /// Every file with facts directly in `file`'s directory, in path order.
     fn directory_files<'r>(
         &'r self,
-        file: &str,
+        file: &'r str,
         name: &'r str,
-    ) -> Vec<(String, view::Directory<'r, 'a>)> {
+    ) -> impl Iterator<Item = (String, view::Directory<'r, 'a>)> + 'r {
         self.depend(dependency::directory_type(file, name));
         let directory = std::path::Path::new(file).parent();
-        match self.source {
+        let stored = match self.source {
             Some(source) => {
                 let directory_name = directory
                     .map(|parent| parent.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                source
-                    .files_in(&directory_name)
-                    .into_iter()
-                    .filter_map(|path| {
-                        source
-                            .file(&path)
-                            .map(|parse| (path, view::Directory::new(parse, name)))
-                    })
-                    .collect()
+                source.files_in(&directory_name)
             }
-            None => self
-                .files
-                .iter()
-                .filter(|(f, _)| std::path::Path::new(f).parent() == directory)
-                .map(|(f, p)| (f.clone(), view::Directory::new(p, name)))
-                .collect(),
-        }
+            None => Vec::new(),
+        };
+        stored
+            .into_iter()
+            .filter_map(move |path| {
+                self.source?
+                    .file(&path)
+                    .map(|parse| (path, view::Directory::new(parse, name)))
+            })
+            .chain(
+                self.files
+                    .iter()
+                    .filter(move |(f, _)| {
+                        self.source.is_none() && std::path::Path::new(f).parent() == directory
+                    })
+                    .map(move |(f, p)| {
+                        (
+                            f.clone(),
+                            view::Directory::new(DispatchParse::Borrowed(p), name),
+                        )
+                    }),
+            )
     }
     test_support_visibility! {
     /// Whether some Go file declares an interface requiring a method named
@@ -2348,7 +2401,7 @@ impl<'a> Resolver<'a> {
                     .go_files_requiring(name)
                     .iter()
                     .filter_map(|path| source.file(path))
-                    .any(requires),
+                    .any(|parse| requires(&parse)),
                 None => self.files.values().any(|p| requires(p)),
             }
         }
@@ -2371,7 +2424,7 @@ impl<'a> Resolver<'a> {
     }
     fn file<'r>(&'r self, path: &'r str) -> Option<view::File<'r, 'a>> {
         self.depend(dependency::file(path));
-        self.lookup(path)
+        self.lookup_handle(path)
             .map(|parse| view::File::new(self, path, parse))
     }
     /// The facts of a file the caller already found through [`Self::file`]
@@ -2403,8 +2456,23 @@ impl<'a> Resolver<'a> {
             let Some(parse) = source.file(&file) else {
                 continue;
             };
-            for (group, method) in view::methods(parse).filter(|(_, m)| m.name == member) {
-                methods.push((file.clone(), group, method));
+            match parse {
+                DispatchParse::Borrowed(parse) => {
+                    for (group, method) in view::methods(parse).filter(|(_, m)| m.name == member) {
+                        methods.push((file.clone(), group, Cow::Borrowed(method)));
+                    }
+                }
+                DispatchParse::Shared(_) => {
+                    // Memoize method facts, not the source parse: a common
+                    // method may have more declarers than fit in the cache.
+                    for method in parse.dispatch.methods.iter().filter(|m| m.name == member) {
+                        methods.push((
+                            file.clone(),
+                            view::MethodGroup::projected(&parse),
+                            Cow::Owned(method.clone()),
+                        ));
+                    }
+                }
             }
         }
         std::sync::Arc::new(methods)
@@ -2444,7 +2512,7 @@ impl<'a> Resolver<'a> {
                 return methods;
             }
             let index = self.methods_by_name.get_or_init(|| {
-                let mut index: HashMap<&'a str, Vec<(String, view::MethodGroup<'a>, &'a MethodHint)>> =
+                let mut index: HashMap<&'a str, Vec<(String, view::MethodGroup<'a>, Cow<'a, MethodHint>)>> =
                     HashMap::new();
                 for (file, parse) in &self.files {
                     self.note_file_visit();
@@ -2453,7 +2521,7 @@ impl<'a> Resolver<'a> {
                         index.entry(method.name.as_str()).or_default().push((
                             file.clone(),
                             group,
-                            method,
+                            Cow::Borrowed(method),
                         ));
                     }
                 }
@@ -2466,12 +2534,21 @@ impl<'a> Resolver<'a> {
         }
     }
     test_support_visibility! {
-    fn project_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
-            if let Some(projections) = self.projections() {
-                return self.replay_projection(projections, file, name);
+    fn project_type(&self, file: &str, name: &str) -> Option<(String, &'a TypeHint)> {
+            // A cold-build record locates the type's index by its original address.
+            match self.project_type_hint(file, name)? {
+                (file, Cow::Borrowed(ty)) => Some((file, ty)),
+                (_, Cow::Owned(_)) => None,
             }
-            self.project_type_at_depth(file, name, 0)
         }
+    }
+    fn project_type_hint(&self, file: &str, name: &str) -> Option<(String, Cow<'a, TypeHint>)> {
+        if let Some(projections) = self.projections() {
+            return self
+                .replay_projection(projections, file, name)
+                .map(|(file, ty)| (file, Cow::Borrowed(ty)));
+        }
+        self.project_type_at_depth(file, name, 0)
     }
     fn note_file_visit(&self) {
         #[cfg(any(test, feature = "test-support"))]
@@ -2482,7 +2559,7 @@ impl<'a> Resolver<'a> {
         file: &str,
         name: &str,
         depth: usize,
-    ) -> Option<(String, &TypeHint)> {
+    ) -> Option<(String, Cow<'a, TypeHint>)> {
         if depth > 16 {
             return None;
         }
@@ -2500,12 +2577,12 @@ impl<'a> Resolver<'a> {
                 target = found;
                 (&target.0, &target.1)
             } else {
-                self.file(file)?.return_hint(expression)?;
+                self.file(file)?.return_type(expression)?;
                 local = (file.to_string(), expression.to_string());
                 (&local.0, &local.1)
             };
-            let returned = self.file(target_file)?.return_hint(symbol)?;
-            return self.project_type_at_depth(target_file, &returned.ty, depth + 1);
+            let returned = self.file(target_file)?.return_type(symbol)?;
+            return self.project_type_at_depth(target_file, &returned, depth + 1);
         }
         let parse = self.file(file)?;
         if parse.language() == "go" && parse.go_package().is_none() {
@@ -2522,21 +2599,31 @@ impl<'a> Resolver<'a> {
         }
         if ["go", "java", "csharp"].contains(&parse.language()) {
             self.depend(dependency::directory(file));
-            let in_directory = self.directory_files(file, name);
-            let mut candidates = in_directory
-                .iter()
-                .filter(|(f, p)| {
-                    self.note_file_visit();
-                    p.language() == parse.language()
-                        && (parse.language() != "go"
-                            || (p.go_package() == parse.go_package()
-                                && (file.ends_with("_test.go") || !f.ends_with("_test.go"))))
-                })
-                .flat_map(|(f, p)| p.types_named().map(move |t| (f.clone(), t)));
-            if let Some(candidate) = candidates.next() {
-                if candidates.next().is_none() {
-                    return Some(candidate);
+            let mut found = None;
+            let mut ambiguous = false;
+            for (f, p) in self.directory_files(file, name) {
+                // Check every directory read for failure, as with the eager
+                // listing, even after the result is known to be ambiguous.
+                if ambiguous {
+                    continue;
                 }
+                self.note_file_visit();
+                if p.language() == parse.language()
+                    && (parse.language() != "go"
+                        || (p.go_package() == parse.go_package()
+                            && (file.ends_with("_test.go") || !f.ends_with("_test.go"))))
+                {
+                    for ty in p.types_named() {
+                        if found.is_some() {
+                            ambiguous = true;
+                            break;
+                        }
+                        found = Some((f.clone(), ty));
+                    }
+                }
+            }
+            if found.is_some() && !ambiguous {
+                return found;
             }
         }
         // Relative imports are resolved only to manifest members. Library imports
@@ -2609,12 +2696,14 @@ impl<'a> Resolver<'a> {
         receiver: &str,
         depth: usize,
         member: Option<&str>,
-    ) -> Option<(String, &TypeHint)> {
+    ) -> Option<(String, Cow<'a, TypeHint>)> {
         let expression = receiver.strip_prefix("@field:")?;
         let (base, field_name) = expression.rsplit_once('|')?;
         let (base_file, ty) = self.project_type_at_depth(file, base, depth + 1)?;
-        let field = self.known_file(&base_file).field(&ty.name, field_name)?;
-        self.project_smart_field(&base_file, &field.ty, depth + 1, member)
+        let field = self
+            .known_file(&base_file)
+            .field_type(&ty.name, field_name)?;
+        self.project_smart_field(&base_file, &field, depth + 1, member)
     }
 
     fn project_smart_field(
@@ -2623,7 +2712,7 @@ impl<'a> Resolver<'a> {
         name: &str,
         depth: usize,
         member: Option<&str>,
-    ) -> Option<(String, &TypeHint)> {
+    ) -> Option<(String, Cow<'a, TypeHint>)> {
         if depth > 16 {
             return None;
         }
@@ -2640,7 +2729,8 @@ impl<'a> Resolver<'a> {
         self.project_smart_field(file, inner, depth + 1, member)
     }
     fn methods(&self, file: &str, owner: &str, name: &str, associated: bool) -> Vec<Target> {
-        let language = self.known_file(file).language();
+        let facts = self.known_file(file);
+        let language = facts.language();
         self.methods_named(name)
             .iter()
             .filter(|(method_file, p, m)| {
@@ -2649,7 +2739,7 @@ impl<'a> Resolver<'a> {
                         || associated
                         || rust_receiver_shape(&m.shape) != Some(false))
                     && self
-                        .project_type(method_file, &m.owner)
+                        .project_type_hint(method_file, &m.owner)
                         .is_some_and(|(f, t)| f == file && t.name == owner)
             })
             .map(|(method_file, _, m)| Target {
@@ -2677,7 +2767,7 @@ impl<'a> Resolver<'a> {
         let mut frontier = ty
             .bases
             .iter()
-            .filter_map(|base| self.project_type(file, base))
+            .filter_map(|base| self.project_type_hint(file, base))
             .collect::<Vec<_>>();
         while !frontier.is_empty() {
             let mut hits = Vec::new();
@@ -2690,7 +2780,7 @@ impl<'a> Resolver<'a> {
                 next.extend(
                     ty.bases
                         .iter()
-                        .filter_map(|base| self.project_type(&file, base)),
+                        .filter_map(|base| self.project_type_hint(&file, base)),
                 );
             }
             if !hits.is_empty() {
@@ -2713,13 +2803,13 @@ impl<'a> Resolver<'a> {
         }
         ty.bases
             .iter()
-            .filter_map(|b| self.project_type(file, b))
+            .filter_map(|b| self.project_type_hint(file, b))
             .any(|(f, t)| {
-                (f == base_file && t.name == base) || self.subtype(&f, t, base_file, base, seen)
+                (f == base_file && t.name == base) || self.subtype(&f, &t, base_file, base, seen)
             })
     }
     test_support_visibility! {
-    fn python_base_type(&self, file: &str, name: &str) -> Option<(String, &TypeHint)> {
+    fn python_base_type(&self, file: &str, name: &str) -> Option<(String, Cow<'a, TypeHint>)> {
             let mut file = file.to_string();
             let mut name = name.to_string();
             let mut visited = BTreeSet::new();
@@ -2786,7 +2876,7 @@ impl<'a> Resolver<'a> {
         for base in &ty.bases {
             if let Some((base_file, base_ty)) = self.python_base_type(file, base) {
                 bases.push((base_file.clone(), base_ty.name.clone()));
-                sequences.push(self.python_mro(&base_file, base_ty, active, memo)?);
+                sequences.push(self.python_mro(&base_file, &base_ty, active, memo)?);
             } else {
                 // Unknown bases are opaque barriers, not permission to search
                 // later bases by name. The built-in object is a known leaf.
@@ -2830,12 +2920,12 @@ impl<'a> Resolver<'a> {
     }
 
     fn python_super(&self, file: &str, owner: &str, member: &str) -> Resolution {
-        let Some((owner_file, ty)) = self.project_type(file, owner) else {
+        let Some((owner_file, ty)) = self.project_type_hint(file, owner) else {
             return self.unknown("python", member);
         };
         let mro = match self.projections() {
             Some(projections) => self.replay_mro(projections, file, owner),
-            None => self.python_mro(&owner_file, ty, &mut BTreeSet::new(), &mut BTreeMap::new()),
+            None => self.python_mro(&owner_file, &ty, &mut BTreeSet::new(), &mut BTreeMap::new()),
         };
         let Some(mro) = mro else {
             return self.unknown("python", member);
@@ -2937,10 +3027,10 @@ impl<'a> Resolver<'a> {
                         .find(|m| &m.symbol == symbol)
                         .is_some_and(|m| {
                             m.trait_name.is_some()
-                                || self.project_type(file, &m.owner).is_some_and(|(_, t)| {
+                                || self.project_type_hint(file, &m.owner).is_some_and(|(_, t)| {
                                     t.interface
                                         || t.bases.iter().any(|base| {
-                                            self.project_type(file, base)
+                                            self.project_type_hint(file, base)
                                                 .is_some_and(|(_, b)| b.interface)
                                         })
                                 })
@@ -2977,12 +3067,11 @@ impl<'a> Resolver<'a> {
         if site.dynamic || site.receiver.is_some() {
             return None;
         }
-        let parse = self.lookup(file)?;
+        let parse = self.lookup_handle(file)?;
         let facts = parse.dispatch.static_facts.as_deref()?;
         let answer = self.static_call(
             file,
-            &parse.language,
-            facts,
+            &parse,
             facts.site_key(site.ordinal)?,
             site.member.as_deref()?,
         )?;
@@ -2998,7 +3087,7 @@ impl<'a> Resolver<'a> {
     /// Resolve with the existing receiver rules, after checking static
     /// evidence separately. Unknown answers can then be shared across files.
     pub fn resolve_nonstatic(&self, file: &str, site: &SiteHint) -> Resolution {
-        let parse = self.lookup(file).expect("resolved file has facts");
+        let parse = self.lookup_handle(file).expect("resolved file has facts");
         if site.dynamic {
             return census_exit!(
                 self,
@@ -3047,7 +3136,7 @@ impl<'a> Resolver<'a> {
             }
         }
         let projection = receiver_projection(&parse.language, receiver, member);
-        let Some((type_file, ty)) = self.project_type(file, &projection) else {
+        let Some((type_file, ty)) = self.project_type_hint(file, &projection) else {
             return census_exit!(
                 self,
                 "missing_type",
@@ -3058,7 +3147,7 @@ impl<'a> Resolver<'a> {
             );
         };
         let associated = parse.language == "rust" && self.associated_site(file, site.ordinal);
-        let mut exact = self.nearest(&type_file, ty, member, &mut BTreeSet::new(), associated);
+        let mut exact = self.nearest(&type_file, &ty, member, &mut BTreeSet::new(), associated);
         if parse.language == "rust" {
             // An older method shape may not distinguish an instance method from
             // an associated function. Keep it live without an exact edge.
@@ -3086,8 +3175,8 @@ impl<'a> Resolver<'a> {
                     }
                 );
             }
-            let methods = self
-                .known_file(&type_file)
+            let type_facts = self.known_file(&type_file);
+            let methods = type_facts
                 .methods_named_here(member)
                 .into_iter()
                 .filter(|m| {
@@ -3111,8 +3200,8 @@ impl<'a> Resolver<'a> {
                     .collect();
             } else if !ty.interface {
                 exact.retain(|target| {
-                    let Some(method) = self
-                        .known_file(&target.file)
+                    let target_facts = self.known_file(&target.file);
+                    let Some(method) = target_facts
                         .methods_named_here(member)
                         .into_iter()
                         .find(|m| m.symbol == target.symbol)
@@ -3130,12 +3219,12 @@ impl<'a> Resolver<'a> {
                         return true;
                     }
                     let Some((trait_file, declaration)) =
-                        self.project_type(&target.file, trait_name)
+                        self.project_type_hint(&target.file, trait_name)
                     else {
                         return false;
                     };
                     let caller_name = trait_name.rsplit("::").next().unwrap_or(trait_name);
-                    self.project_type(file, caller_name).is_some_and(
+                    self.project_type_hint(file, caller_name).is_some_and(
                         |(caller_file, caller_trait)| {
                             caller_file == trait_file && caller_trait.name == declaration.name
                         },
@@ -3167,7 +3256,6 @@ impl<'a> Resolver<'a> {
             .collect::<BTreeSet<_>>();
         if ty.interface || (!ty.closed && !["rust", "go"].contains(&parse.language.as_str())) {
             for (candidate_file, candidate, method) in self.methods_named(member).iter() {
-                let (candidate_file, candidate, method) = (candidate_file, *candidate, *method);
                 if candidate.language() != parse.language {
                     continue;
                 }
@@ -3182,28 +3270,34 @@ impl<'a> Resolver<'a> {
                 }
                 {
                     let implements = method.trait_name.as_deref().is_some_and(|name| {
-                        self.project_type(candidate_file, name)
+                        self.project_type_hint(candidate_file, name)
                             .is_some_and(|(f, t)| f == type_file && t.name == ty.name)
                     }) || candidate
                         .owner_type(self, candidate_file, &method.owner)
                         .is_some_and(|sub| {
                             self.subtype(
                                 candidate_file,
-                                sub,
+                                &sub,
                                 &type_file,
                                 &ty.name,
                                 &mut BTreeSet::new(),
                             )
                         })
                         || (parse.language == "go" && ty.interface && {
-                            let required = self
-                                .known_file(&type_file)
+                            let type_facts = self.known_file(&type_file);
+                            let required = type_facts
                                 .go_methods()
                                 .iter()
                                 .filter(|m| m.owner == ty.name)
                                 .map(|m| (m.name.as_str(), m.shape.as_str()))
                                 .collect::<BTreeSet<_>>();
-                            !required.is_empty() && candidate.implements(&method.owner, &required)
+                            !required.is_empty()
+                                && candidate.implements_at(
+                                    self,
+                                    candidate_file,
+                                    &method.owner,
+                                    &required,
+                                )
                         });
                     if implements && !(candidate_file == &type_file && method.owner == ty.name) {
                         targets.insert(Target {
@@ -3272,7 +3366,7 @@ impl Resolver<'_> {
     /// every site with an equal key the same answer, recording the same
     /// dependency keys.
     pub fn resolution_key(&self, file: &str, site: &SiteHint) -> ResolutionKey {
-        let parse = self.lookup(file).expect("resolved file has facts");
+        let parse = self.lookup_handle(file).expect("resolved file has facts");
         let language = &parse.language;
         let static_receiver = parse
             .dispatch
@@ -3345,7 +3439,7 @@ impl<'r, 'a> MemoizedResolver<'r, 'a> {
                 fallback.static_receiver = None;
                 fallback.scope = self
                     .resolver
-                    .lookup(file)
+                    .lookup_handle(file)
                     .expect("resolved file has facts")
                     .language
                     .clone();

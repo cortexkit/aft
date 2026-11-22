@@ -1,7 +1,8 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use super::super::{dependency, typescript, Resolution, Resolver, Target};
+use super::super::{dependency, typescript, DispatchParse, Resolution, Resolver, Target};
 use super::extract::join;
 use super::{csharp_projects::ProjectId, relative_module, Declaration, Scope, StaticFacts};
 
@@ -11,8 +12,28 @@ const MISSING_STATIC_EXPORT: u32 = u32::MAX;
 
 struct Type<'a> {
     file: String,
-    facts: &'a StaticFacts,
-    declaration: &'a Declaration,
+    declaration: Cow<'a, Declaration>,
+    scope: Cow<'a, Scope>,
+}
+
+impl<'a> Type<'a> {
+    fn from_parse(file: &str, parse: &DispatchParse<'a>, index: usize) -> Option<Self> {
+        // A pending base walk needs only the selected declaration and its
+        // scope, not the file's other declarations or its cache handle.
+        let declaration = parse.select(|p| p.dispatch.static_facts.as_ref()?.types.get(index))?;
+        let scope = parse.select(|p| {
+            p.dispatch
+                .static_facts
+                .as_ref()?
+                .scopes
+                .get(declaration.scope as usize)
+        })?;
+        Some(Self {
+            file: file.to_string(),
+            declaration,
+            scope,
+        })
+    }
 }
 
 impl<'a> Resolver<'a> {
@@ -29,10 +50,10 @@ impl<'a> Resolver<'a> {
                 })
         };
         match self.source {
-            Some(source) => source
-                .files_with_static_type(&key)
-                .iter()
-                .any(|path| self.lookup(path).is_some_and(declares)),
+            Some(source) => source.files_with_static_type(&key).iter().any(|path| {
+                self.lookup_handle(path)
+                    .is_some_and(|parse| declares(&parse))
+            }),
             None => self.files.values().copied().any(declares),
         }
     }
@@ -83,50 +104,40 @@ impl<'a> Resolver<'a> {
                 .map(|(path, _)| path.clone())
                 .collect(),
         };
-        files
-            .into_iter()
-            .flat_map(|file| {
-                let facts = self
-                    .lookup(&file)
-                    .filter(|parse| parse.language == language)
-                    .and_then(|parse| parse.dispatch.static_facts.as_deref());
-                facts.into_iter().flat_map(move |facts| {
-                    let file = file.clone();
-                    facts
-                        .types
-                        .iter()
-                        .filter(move |ty| ty.name == name)
-                        .map(move |declaration| Type {
-                            file: file.clone(),
-                            facts,
-                            declaration,
-                        })
-                })
-            })
-            .collect()
+        let mut types = Vec::new();
+        for file in files {
+            let Some(parse) = self.lookup_handle(&file).filter(|p| p.language == language) else {
+                continue;
+            };
+            types.extend(Self::static_types_in(&file, &parse, name));
+        }
+        types
+    }
+
+    fn static_types_in<'p>(
+        file: &'p str,
+        parse: &'p DispatchParse<'a>,
+        name: &'p str,
+    ) -> impl Iterator<Item = Type<'a>> + 'p {
+        parse.dispatch.static_facts.iter().flat_map(move |facts| {
+            facts
+                .types
+                .iter()
+                .enumerate()
+                .filter(move |(_, ty)| ty.name == name)
+                .filter_map(move |(index, _)| Type::from_parse(file, parse, index))
+        })
     }
 
     fn ts_static_types(&self, file: &str, name: &str) -> Vec<Type<'a>> {
-        let Some((path, ty)) = self.project_type(file, name) else {
+        let Some((path, ty)) = self.project_type_hint(file, name) else {
             return Vec::new();
         };
         self.depend(dependency::file(&path));
-        let Some(facts) = self
-            .lookup(&path)
-            .and_then(|parse| parse.dispatch.static_facts.as_deref())
-        else {
+        let Some(parse) = self.lookup_handle(&path) else {
             return Vec::new();
         };
-        facts
-            .types
-            .iter()
-            .filter(|declaration| declaration.name == ty.name)
-            .map(|declaration| Type {
-                file: path.clone(),
-                facts,
-                declaration,
-            })
-            .collect()
+        Self::static_types_in(&path, &parse, &ty.name).collect()
     }
 
     pub(in super::super) fn static_import_projection(
@@ -137,9 +148,9 @@ impl<'a> Resolver<'a> {
         let (path, symbol) = self.type_target(file, key)?;
         self.depend(dependency::file(&path));
         let index = self
-            .lookup(&path)
-            .and_then(|parse| parse.dispatch.static_facts.as_deref())
-            .and_then(|facts| {
+            .lookup_handle(&path)
+            .and_then(|parse| {
+                let facts = parse.dispatch.static_facts.as_deref()?;
                 let mut types = facts
                     .types
                     .iter()
@@ -163,13 +174,8 @@ impl<'a> Resolver<'a> {
             Some(projections) => self.replay_static_import(projections, file, &key),
             None => self.static_import_projection(file, &key),
         }?;
-        let facts = self.lookup(&path)?.dispatch.static_facts.as_deref()?;
-        let declaration = facts.types.get(index as usize)?;
-        Some(vec![Type {
-            file: path,
-            facts,
-            declaration,
-        }])
+        let parse = self.lookup_handle(&path)?;
+        Some(vec![Type::from_parse(&path, &parse, index as usize)?])
     }
 
     fn csharp_type(&self, file: &str, scope: &Scope, owner: &str, name: &str) -> Vec<Type<'a>> {
@@ -209,7 +215,7 @@ impl<'a> Resolver<'a> {
                 .trim_start_matches("static:")
                 .trim_start_matches("global::");
             for candidate in self.csharp_project_types(project, &join(prefix, name)) {
-                if seen.insert((candidate.file.clone(), candidate.declaration.name.as_str())) {
+                if seen.insert((candidate.file.clone(), candidate.declaration.name.clone())) {
                     found.push(candidate);
                 }
             }
@@ -254,7 +260,7 @@ impl<'a> Resolver<'a> {
         name: &str,
         seen: &mut BTreeSet<(String, String)>,
     ) -> bool {
-        let ty = owner.declaration;
+        let ty = &owner.declaration;
         if ty
             .values
             .binary_search_by(|value| value.as_str().cmp(name))
@@ -270,12 +276,7 @@ impl<'a> Resolver<'a> {
             // A base expression is outside the declaring type's body, so it
             // can see the enclosing type and namespace, not its own members.
             let prefix = ty.name.rsplit_once('.').map_or("", |(prefix, _)| prefix);
-            let bases = self.csharp_type(
-                &owner.file,
-                &owner.facts.scopes[ty.scope as usize],
-                prefix,
-                base,
-            );
+            let bases = self.csharp_type(&owner.file, &owner.scope, prefix, base);
             bases.len() == 1
                 && bases
                     .iter()
@@ -289,7 +290,7 @@ impl<'a> Resolver<'a> {
         let mut seen = BTreeSet::new();
         let mut pending = vec![owner];
         while let Some(ty) = pending.pop() {
-            if !seen.insert((ty.file.clone(), ty.declaration.name.as_str())) {
+            if !seen.insert((ty.file.clone(), ty.declaration.name.clone())) {
                 continue;
             }
             if ty
@@ -300,7 +301,7 @@ impl<'a> Resolver<'a> {
             {
                 return false;
             }
-            let scope = &ty.facts.scopes[ty.declaration.scope as usize];
+            let scope = &ty.scope;
             for base in &ty.declaration.bases {
                 // An unreadable superclass could contribute a field with
                 // this name. It cannot establish absence of shadowing.
@@ -319,11 +320,12 @@ impl<'a> Resolver<'a> {
     pub(in super::super) fn static_call(
         &self,
         file: &str,
-        language: &str,
-        facts: &'a StaticFacts,
+        parse: &DispatchParse<'a>,
         receiver: u32,
         member: &str,
     ) -> Option<Resolution> {
+        let language = parse.language.as_str();
+        let facts = parse.dispatch.static_facts.as_deref()?;
         let receiver = &facts.receivers[receiver as usize];
         let scope = &facts.scopes[receiver.scope as usize];
         let mut pending = match language {
@@ -332,11 +334,7 @@ impl<'a> Resolver<'a> {
                 if let Some(owner) = receiver.owner {
                     let root = receiver.name.split('.').next()?;
                     if !self.java_clear_receiver_scope(
-                        Type {
-                            file: file.to_string(),
-                            facts,
-                            declaration: &facts.types[owner as usize],
-                        },
+                        Type::from_parse(file, parse, owner as usize)?,
                         root,
                     ) {
                         return None;
@@ -421,11 +419,7 @@ impl<'a> Resolver<'a> {
                 types
             }
             _ if typescript::supported(language) => match receiver.owner {
-                Some(index) => vec![Type {
-                    file: file.to_string(),
-                    facts,
-                    declaration: &facts.types[index as usize],
-                }],
+                Some(index) => vec![Type::from_parse(file, parse, index as usize)?],
                 None => self.ts_import_type(file, &receiver.name, receiver.module.as_deref()?)?,
             },
             _ => return None,
@@ -452,7 +446,7 @@ impl<'a> Resolver<'a> {
                     });
                 }
             }
-            let scope = &ty.facts.scopes[ty.declaration.scope as usize];
+            let scope = &ty.scope;
             for base in &ty.declaration.bases {
                 pending.extend(match language {
                     "java" => self.java_type(&ty.file, scope, base).unwrap_or_default(),

@@ -310,6 +310,15 @@ fn streamed_fixture_segment_equals_buffered_including_shared_fragments() {
 /// build publishes it.
 fn write(fixture: &Fixture, dir: &Path, id: u64) -> (Arc<Segment>, Fragments) {
     let resolved = resolve_checkout(&fixture.inputs, 2).unwrap();
+    write_resolved(fixture, dir, id, &resolved)
+}
+
+fn write_resolved(
+    fixture: &Fixture,
+    dir: &Path,
+    id: u64,
+    resolved: &BTreeMap<String, FileResolution>,
+) -> (Arc<Segment>, Fragments) {
     let path = dir.join(format!("{id}.seg"));
     let fragments = write_segment(
         &path,
@@ -320,7 +329,7 @@ fn write(fixture: &Fixture, dir: &Path, id: u64) -> (Arc<Segment>, Fragments) {
             created_unix_ms: 0,
         },
         &fixture.inputs,
-        &resolved,
+        resolved,
         &fixture.records,
     )
     .unwrap();
@@ -334,6 +343,185 @@ fn write(fixture: &Fixture, dir: &Path, id: u64) -> (Arc<Segment>, Fragments) {
         .unwrap(),
     );
     (segment, fragments)
+}
+
+#[test]
+fn bounded_declarer_cache_evicts_mid_pass_and_rebases_without_stale_facts() {
+    const BUDGET: usize = 4 * 1024;
+    const EDITED: &str = "p/zz-shape.go";
+    const FIRST: &str = "other/first.go";
+    const SECOND: &str = "other/second.go";
+    let mut base = Tree::default()
+        .file(EDITED, "package p\ntype Shape struct{}\n")
+        .file(
+            FIRST,
+            "package other\ntype First struct{}\nfunc (First) Run() {}\n",
+        )
+        .file(
+            SECOND,
+            "package other\ntype Second struct{}\nfunc (Second) Run() {}\n",
+        );
+    // More than one resolver chunk must read the same stored declarers.
+    for i in 0..72 {
+        base = base.file(
+            &format!("p/site{i:02}.go"),
+            &format!("package p\nfunc Site{i:02}(x Shape) {{ x.Run() }}\n"),
+        );
+    }
+    let step1 = base.clone().file(
+        EDITED,
+        "package p\ntype Shape struct{}\nfunc (Shape) Run() {}\n",
+    );
+    let step2 = step1.clone().without(FIRST).file(
+        EDITED,
+        "package p\ntype Shape struct{}\nfunc (Shape) Walk() {}\n",
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let tiny_dir = tempfile::tempdir().unwrap();
+    let full_dir = tempfile::tempdir().unwrap();
+    let before = base.fixture();
+    let (segment, fragments) = write(&before, dir.path(), 1);
+    let start = || {
+        Engine::published(
+            "publication",
+            &before,
+            vec![Arc::clone(&segment)],
+            &fragments,
+        )
+        .live
+    };
+    let mut tiny = start();
+    let mut full = start();
+    let methods = |live: &LiveCheckout, path: &str| {
+        live.call_inputs_for_test()
+            .projected_methods_for_test(&live.inputs, &live.resolved, path)
+    };
+    for path in [FIRST, SECOND] {
+        tiny.set_projection_budget_for_test(BUDGET);
+        assert_eq!(methods(&tiny, path).unwrap(), ["Run"]);
+        assert!(
+            tiny.call_inputs_for_test().cached_for_test(path).is_some(),
+            "{path} must fit by itself"
+        );
+    }
+
+    for (round, step) in [step1.fixture(), step2.fixture()].into_iter().enumerate() {
+        tiny.set_projection_budget_for_test(BUDGET);
+        full.set_projection_budget_for_test(usize::MAX);
+        let method = if round == 0 { "Run" } else { "Walk" };
+        for live in [&mut tiny, &mut full] {
+            // Compare the edit against a warm projection of the old base.
+            assert_eq!(
+                methods(live, EDITED).unwrap(),
+                if round == 0 { vec![] } else { vec!["Run"] }
+            );
+            assert_eq!(methods(live, FIRST).unwrap(), ["Run"]);
+            live.take_first_reads();
+            let changed = changed(&live.inputs, &step.inputs);
+            let stats = live
+                .update(next(&live.inputs, &step, &changed), &changed)
+                .unwrap();
+            assert!(stats.sites_resolved > 64, "{stats:?}");
+            let calls = live.call_inputs_for_test();
+            assert!(calls.kept_for_test(EDITED));
+            assert!(calls.cached_for_test(EDITED).is_none());
+            assert_eq!(methods(live, EDITED).unwrap(), [method]);
+            if round == 1 {
+                assert!(methods(live, FIRST).is_none());
+                assert!(calls.cached_for_test(FIRST).is_none());
+            }
+            let has_edited_target = live
+                .resolved
+                .read("p/site00.go")
+                .unwrap()
+                .sites
+                .iter()
+                .flat_map(|site| &site.resolution.targets)
+                .any(|target| target.file == EDITED);
+            assert_eq!(has_edited_target, round == 0);
+        }
+        let (held, peak, evicted) = tiny.call_inputs_for_test().projection_counts_for_test();
+        assert!(held <= peak && peak <= BUDGET && evicted > 0);
+        assert_eq!(
+            full.call_inputs_for_test().projection_counts_for_test().2,
+            0
+        );
+        if round == 0 {
+            let (_, reads) = tiny.take_first_reads();
+            assert!(
+                reads.iter().filter(|p| p.as_str() == SECOND).count() > 1,
+                "{reads:?}"
+            );
+        }
+
+        let publish = |live: &LiveCheckout, dir: &Path| {
+            let resolutions = live
+                .resolved
+                .iter()
+                .map(|(path, file)| (path.clone(), file.clone()))
+                .collect();
+            write_resolved(&step, dir, round as u64 + 2, &resolutions)
+        };
+        let (tiny_segment, tiny_fragments) = publish(&tiny, tiny_dir.path());
+        let (full_segment, full_fragments) = publish(&full, full_dir.path());
+        assert_eq!(tiny_fragments, full_fragments);
+        assert_eq!(
+            std::fs::read(tiny_segment.path()).unwrap(),
+            std::fs::read(full_segment.path()).unwrap()
+        );
+
+        assert_eq!(methods(&tiny, SECOND).unwrap(), ["Run"]);
+        let old = Arc::downgrade(&tiny.call_inputs_for_test().cached_for_test(SECOND).unwrap());
+        let rebase = |live: LiveCheckout, segment, fragments: &Fragments| {
+            let stored =
+                Arc::new(StoredSlices::open(vec![segment], &step.inputs, fragments).unwrap());
+            live.rebased(step.inputs.state.clone(), stored).unwrap()
+        };
+        tiny = rebase(tiny, tiny_segment, &tiny_fragments);
+        full = rebase(full, full_segment, &full_fragments);
+        assert!(
+            old.upgrade().is_none(),
+            "a projection outlived its publication"
+        );
+        assert_eq!(
+            tiny.call_inputs_for_test().projection_counts_for_test(),
+            (0, 0, 0)
+        );
+        assert!(!tiny.call_inputs_for_test().kept_for_test(EDITED));
+        assert_eq!(methods(&tiny, EDITED).unwrap(), [method]);
+        assert!(tiny
+            .call_inputs_for_test()
+            .cached_for_test(EDITED)
+            .is_some());
+        if round == 1 {
+            assert!(methods(&tiny, FIRST).is_none());
+        }
+    }
+}
+
+#[test]
+fn oversized_stored_declarer_is_read_without_cache_admission() {
+    let declaration = format!(
+        "package p\ntype T struct{{}}\n{}",
+        (0..256)
+            .map(|i| format!("func (T) Method{i}() {{}}\n"))
+            .collect::<String>()
+    );
+    let fixture = checkout(&[("decl.go", &declaration)], &[]);
+    let dir = tempfile::tempdir().unwrap();
+    let (segment, fragments) = write(&fixture, dir.path(), 1);
+    let mut live = Engine::published("publication", &fixture, vec![segment], &fragments).live;
+    live.set_projection_budget_for_test(4 * 1024);
+    let calls = live.call_inputs_for_test();
+    for _ in 0..2 {
+        let methods = calls
+            .projected_methods_for_test(&live.inputs, &live.resolved, "decl.go")
+            .unwrap();
+        assert_eq!(methods.len(), 256);
+        assert!(methods.iter().any(|method| method == "Method255"));
+        assert_eq!(calls.projection_counts_for_test(), (0, 0, 0));
+        assert!(calls.cached_for_test("decl.go").is_none());
+    }
 }
 
 /// One way of running the incremental engine over a sequence.

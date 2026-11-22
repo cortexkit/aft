@@ -914,6 +914,16 @@ impl LiveCheckout {
         )
     }
 
+    #[cfg(test)]
+    pub(super) fn call_inputs_for_test(&self) -> &MethodCallInputs {
+        &self.calls
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_projection_budget_for_test(&mut self, bytes: usize) {
+        self.calls.set_projection_budget_for_test(bytes);
+    }
+
     /// The files whose recorded method-call sites read the method `name`:
     /// what a change to a declaration of it admits. For measurement.
     #[cfg(all(test, unix))]
