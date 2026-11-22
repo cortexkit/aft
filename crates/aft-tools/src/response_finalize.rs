@@ -376,7 +376,7 @@ pub use crate::pending_response::{
 /// cannot silently opt out of both mechanisms.
 ///
 /// ```compile_fail
-/// use aft::response_finalize::PendingResponse;
+/// use aft_tools::response_finalize::PendingResponse;
 /// let _pending = PendingResponse {
 ///     request_id: "unwoken".into(),
 ///     session_id: "session".into(),

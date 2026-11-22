@@ -73,7 +73,7 @@ async fn historical_mailbox_after_process_crash_recovers_as_unknown_not_success(
             .args([
                 "--exact",
                 concat!(module_path!(), "::crash_after_bound_commit_child")
-                    .trim_start_matches("aft::"),
+                    .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::")),
                 "--nocapture",
             ])
             .env("AFT_TEST_BOUND_CRASH", "1")

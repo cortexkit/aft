@@ -346,7 +346,7 @@ fn surface_audit_locks_the_only_request_schema_change_and_runtime_hooks() {
     }
 
     let artifact: Value = serde_json::from_str(
-        &std::fs::read_to_string(root.join("crates/aft/src/subc_tool_schemas.json"))
+        &std::fs::read_to_string(root.join("crates/aft-subc/src/subc_tool_schemas.json"))
             .expect("generated tool schema artifact"),
     )
     .expect("generated tool schema JSON");

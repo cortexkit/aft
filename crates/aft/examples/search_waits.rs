@@ -751,7 +751,7 @@ fn edit_until(ctx: &AppContext, files: &[PathBuf], every: Duration, stop: &Atomi
 /// largest first, to edit.
 fn edit_targets(root: &Path, count: usize) -> Vec<PathBuf> {
     let mut found = Vec::new();
-    let mut stack = vec![root.join("crates/aft/src/commands")];
+    let mut stack = vec![root.join("crates/aft-tools/src/commands")];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;

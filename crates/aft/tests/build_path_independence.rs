@@ -26,7 +26,7 @@ fn rust_crates_do_not_embed_the_checkout_path() {
         .to_path_buf();
     let mut sources = Vec::new();
     rust_sources(&crates, &mut sources);
-    assert!(sources.contains(&crates.join("aft/src/test_support.rs")));
+    assert!(sources.contains(&crates.join("aft-tools/src/test_support.rs")));
     sources.sort();
 
     let forbidden = compile_time_checkout_path();

@@ -10,12 +10,12 @@ use std::sync::{
 
 fn sample(ctx: &AppContext, root: &std::path::Path, mode: usize, scenario: &str) {
     let args = match mode % 4 {
-        0 => serde_json::json!({"target": "crates/aft/src/run_tool_call.rs"}),
+        0 => serde_json::json!({"target": "crates/aft-tools/src/run_tool_call.rs"}),
         1 => {
-            serde_json::json!({"target": ["crates/aft/src/run_tool_call.rs", "crates/aft/src/commands/outline.rs"]})
+            serde_json::json!({"target": ["crates/aft-tools/src/run_tool_call.rs", "crates/aft-tools/src/commands/outline.rs"]})
         }
-        2 => serde_json::json!({"target": "crates/aft/src/run_tool_call", "files": true}),
-        _ => serde_json::json!({"target": "crates/aft/src/run_tool_call"}),
+        2 => serde_json::json!({"target": "crates/aft-tools/src/run_tool_call", "files": true}),
+        _ => serde_json::json!({"target": "crates/aft-tools/src/run_tool_call"}),
     };
     let format = crate::subc_format::FormatContext::from_tool_call("outline", &args, root);
     let tool_ctx = ToolCallContext {
@@ -115,7 +115,7 @@ fn outline_off_cpu_wait_probe() {
         let edit_stop = Arc::clone(&stop);
         let edit_checkout = Arc::clone(&checkout);
         let writer = scope.spawn(move || {
-            let relative = "crates/aft/src/run_tool_call.rs";
+            let relative = "crates/aft-tools/src/run_tool_call.rs";
             let path = edit_root.join(relative);
             let original = std::fs::read_to_string(&path).unwrap();
             let mut edits = 0;
@@ -183,7 +183,7 @@ fn outline_off_cpu_wait_probe() {
     std::thread::scope(|scope| {
         let (arrived_tx, arrived_rx) = std::sync::mpsc::sync_channel(0);
         let ctx_for_writer = Arc::clone(&ctx);
-        let path = root.join("crates/aft/src/run_tool_call.rs");
+        let path = root.join("crates/aft-tools/src/run_tool_call.rs");
         let owner = scope.spawn(move || {
             let mut store = ctx_for_writer.backup().lock();
             let id = store

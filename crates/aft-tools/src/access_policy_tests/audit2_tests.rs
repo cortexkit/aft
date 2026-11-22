@@ -1147,7 +1147,7 @@ fn audit2_fixtures_follow_the_runtime_checkout() {
                 module_path!(),
                 "::audit2_fixtures_follow_the_runtime_checkout"
             )
-            .trim_start_matches("aft::"),
+            .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::")),
             "--nocapture",
         ])
         .env(CHILD, "1")

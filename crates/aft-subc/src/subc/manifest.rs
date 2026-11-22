@@ -1082,20 +1082,20 @@ mod tests {
         for name in schema_names {
             assert!(
                 is_subc_agent_core_tool(name),
-                "tool {name:?} is missing from is_subc_agent_core_tool in crates/aft/src/subc/manifest.rs"
+                "tool {name:?} is missing from is_subc_agent_core_tool in crates/aft-subc/src/subc/manifest.rs"
             );
             assert!(
                 manifest_names.contains(name),
-                "tool {name:?} is missing from build_manifest in crates/aft/src/subc/manifest.rs"
+                "tool {name:?} is missing from build_manifest in crates/aft-subc/src/subc/manifest.rs"
             );
             assert!(
                 command_lane_explicit(name).is_some(),
-                "tool {name:?} is missing an explicit command_lane arm in crates/aft/src/subc/manifest.rs"
+                "tool {name:?} is missing an explicit command_lane arm in crates/aft-subc/src/subc/manifest.rs"
             );
             if !TRANSLATION_EXEMPT.contains(&name) {
                 assert!(
                     supports_tool(name),
-                    "tool {name:?} is missing from supports_tool in crates/aft/src/subc_translate.rs"
+                    "tool {name:?} is missing from supports_tool in crates/aft-tools/src/subc_translate.rs"
                 );
             }
         }

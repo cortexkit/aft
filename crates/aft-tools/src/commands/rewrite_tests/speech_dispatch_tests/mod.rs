@@ -956,7 +956,8 @@ fn cancel_from_sibling(root: &Path, scope: &ScopeStamp) -> Value {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            concat!(module_path!(), "::cancel_child").trim_start_matches("aft::"),
+            concat!(module_path!(), "::cancel_child")
+                .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::")),
             "--nocapture",
         ])
         .env("AFT_TEST_DISPATCH_CANCEL_ROOT", root)

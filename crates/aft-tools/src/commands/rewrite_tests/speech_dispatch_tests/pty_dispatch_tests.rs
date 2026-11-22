@@ -280,7 +280,8 @@ fn probe_revoked_in_a_new_process(fixture: &Fixture) {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            concat!(module_path!(), "::revoked_probe_child").trim_start_matches("aft::"),
+            concat!(module_path!(), "::revoked_probe_child")
+                .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::")),
             "--nocapture",
         ])
         .env(
