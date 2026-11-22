@@ -1,0 +1,116 @@
+[package]
+name = "aft-subc"
+version = "0.68.1"
+edition = "2021"
+description = "Subconscious daemon integration for Agent Foundational Toolkit"
+license = "MIT"
+repository = "https://github.com/cortexkit/aft"
+rust-version.workspace = true
+exclude = ["tests/", "examples/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
+autotests = false
+
+[lib]
+name = "aft_subc"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
+
+[features]
+test-timing-hooks = ["aft-base/test-timing-hooks", "aft-engine/test-timing-hooks"]
+test-hooks = ["aft-base/test-hooks", "aft-db/test-hooks", "aft-engine/test-hooks"]
+# Lets the facade's test executable exercise runner notice delivery and recovery.
+test-runner-notice-fixtures = []
+
+[dependencies]
+aft-tools = { path = "../aft-tools", version = "=0.68.1" }
+aft-engine = { path = "../aft-engine", version = "=0.68.1" }
+aft-base = { path = "../aft-base", version = "0.68.1" }
+aft-db = { path = "../aft-db", version = "0.68.1" }
+aft-store = { path = "../aft-store", version = "0.68.1" }
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+lsp-types = "0.97"
+crossbeam-channel = "0.5"
+parking_lot = "0.12"
+libc = "0.2"
+getrandom = "0.3"
+tree-sitter = "=0.26.7"
+tree-sitter-rust = "0.24"
+similar = "2"
+regex = "1"
+sha2 = { version = "0.10", features = ["compress"] }
+blake3 = "1"
+rustc-demangle = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.68.1" }
+# Shared secret placeholder and audit record types.
+secret-rules = { path = "../secret-rules", version = "0.68.1", package = "aft-secret-rules" }
+zeroize = "1"
+bytes = "1"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+rcgen = "0.13"
+which = "7"
+url = "2"
+content_inspector = "0.2.4"
+base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# Keep protocol and transport pinned in lockstep: the transport Frame codec and
+# the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
+# runs only at the --subc transport edge; AFT's command core stays synchronous.
+cortexkit-persona = "=0.3.0"
+cortexkit-role-tool-provider = "=0.15.18"
+cortexkit-role-llm-runner = "=0.8.53"
+cortexkit-role-tool-display = "=0.1.14"
+cortexkit-role-agent-data = "=0.3.3"
+cortexkit-role-user-commands = "=0.1.4"
+cortexkit-project-identity = "=0.1.5"
+jsonschema = { version = "0.33", default-features = false }
+serde_path_to_error = "0.1"
+subc-protocol = "=0.37.4"
+subc-control = "=0.42.2"
+subc-transport = "=0.18.0"
+subc-client-rs = "=0.41.4"
+subc-config = "=0.1.4"
+# The one reader of the daemon's launch nonce (pipe first, environment copy
+# second). subc-client-rs reads through the same cached accessor, so this pin
+# must match the version subc-client-rs depends on.
+subc-os = { version = "=0.1.42", features = ["tokio"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+vt100 = "0.16"
+vte = "0.15"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+# The app catalog checker belongs to view tests, not the shipped tool provider.
+cortexkit-occipital-lang = "=0.1.15"
+cortexkit-occipital-registry = "=0.1.8"
+aft-tools = { path = "../aft-tools", version = "=0.68.1", features = ["test-support"] }
+aft-engine = { path = "../aft-engine", version = "=0.68.1", features = ["test-support"] }
+aft-base = { path = "../aft-base", version = "0.68.1", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.68.1", features = ["test-support"] }
+cortexkit-test-support = "=0.1.14"
+cortexkit-role-tool-provider = { version = "=0.15.18", features = ["test-vectors"] }
+cortexkit-role-agent-data = { version = "=0.3.3", features = ["test-vectors"] }
+tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
+filetime = "0.2"
