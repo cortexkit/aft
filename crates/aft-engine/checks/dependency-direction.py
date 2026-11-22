@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reject any Cargo dependency path from aft-engine to agent-file-tools."""
+"""Reject Cargo dependency paths that point up the AFT crate stack."""
 
 import argparse
 from collections import deque
@@ -9,29 +9,35 @@ import subprocess
 import sys
 
 
-def upper_dependency(metadata):
+FORBIDDEN_TARGETS = {
+    "aft-engine": {"aft-tools", "aft-subc", "agent-file-tools"},
+    "aft-tools": {"aft-subc", "agent-file-tools"},
+    "aft-subc": {"agent-file-tools"},
+}
+
+
+def forbidden_paths(metadata):
     names = {package["id"]: package["name"] for package in metadata["packages"]}
-    engine, = (key for key in metadata["workspace_members"] if names[key] == "aft-engine")
     graph = {node["id"]: node["deps"] for node in metadata["resolve"]["nodes"]}
-    pending = deque([(engine,)])
-    visited = {engine}
-    while pending:
-        path = pending.popleft()
-        package = path[-1]
-        if names[package] == "agent-file-tools":
-            return path
-        for dep in graph[package]:
-            child = dep["pkg"]
-            if child in visited:
-                continue
-            allowed = {None, "normal", "build"}
-            if package == engine:
-                allowed.add("dev")
-            if not any(kind["kind"] in allowed for kind in dep["dep_kinds"]):
-                continue
-            visited.add(child)
-            pending.append((*path, child))
-    return None
+    for root in metadata["workspace_members"]:
+        targets = FORBIDDEN_TARGETS.get(names[root])
+        if not targets:
+            continue
+
+        pending: deque[tuple[str, ...]] = deque([(root,)])
+        visited = {root}
+        while pending:
+            path = pending.popleft()
+            package = path[-1]
+            if names[package] in targets:
+                yield tuple(names[key] for key in path)
+
+            # Even a dev-only or platform-specific edge counts on an indirect path.
+            for dep in graph[package]:
+                child = dep["pkg"]
+                if child not in visited:
+                    visited.add(child)
+                    pending.append((*path, child))
 
 
 def main():
@@ -44,11 +50,15 @@ def main():
         ]))
     else:
         metadata = json.loads(args.metadata.read_bytes())
-    forbidden = upper_dependency(metadata)
-    if forbidden is not None:
-        print("engine depends on upper package: " + " -> ".join(forbidden), file=sys.stderr)
+    violations = list(forbidden_paths(metadata))
+    if violations:
+        for path in violations:
+            print(
+                f"forbidden dependency: {path[0]} -> {path[-1]} (path: {' -> '.join(path)})",
+                file=sys.stderr,
+            )
         return 1
-    print("aft-engine has no dependency path to agent-file-tools")
+    print("No upward dependency paths among AFT crates")
     return 0
 
 
