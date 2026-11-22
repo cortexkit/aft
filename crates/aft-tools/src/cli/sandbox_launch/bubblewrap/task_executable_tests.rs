@@ -123,6 +123,21 @@ fn bwrap_roles_snapshot_rejects_retargeted_or_masked_task_executable() {
 }
 
 #[test]
+fn bwrap_roles_snapshot_keeps_task_executable_hidden_under_a_hard_mask() {
+    let root = tempfile::tempdir().unwrap();
+    let mut f = TaskImage::new(root.path());
+    f.profile
+        .linux_mounts
+        .as_mut()
+        .unwrap()
+        .credential_masks
+        .push(f.alias.parent().unwrap().to_path_buf());
+    let snapshot = f.snapshot().unwrap();
+    assert!(snapshot.task_executable_bind.is_none());
+    assert!(!snapshot.mounts.contains_key(f.shim.parent().unwrap()));
+}
+
+#[test]
 fn bwrap_roles_live_strict_runs_governed_gh_through_task_executable_alias() {
     let Some(launcher) = enforcing_launcher() else {
         return;

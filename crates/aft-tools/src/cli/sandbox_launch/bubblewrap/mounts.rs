@@ -41,11 +41,10 @@ impl Snapshot {
         if profile.mode != SandboxMode::Credentials {
             snapshot.add_role_mounts(profile, policy)?;
         }
-        let mut snapshot = snapshot.finish()?;
         if let Some(alias) = &policy.task_executable_alias {
             snapshot.add_task_executable_bind(profile, alias, executable)?;
         }
-        Ok(snapshot)
+        snapshot.finish()
     }
 
     fn from_policy(policy: &LinuxMountPolicy) -> Result<Self, String> {
@@ -110,13 +109,21 @@ impl Snapshot {
                 alias.display()
             ));
         }
-        let covering_mount =
-            |path: &Path| path.ancestors().find_map(|p| self.mounts.get(p).copied());
-        if covering_mount(alias) != Some(Mount::PrivateDir) {
+        // Check explicit masks before redundant mounts beneath private tmpfs
+        // are dropped. A hidden path is not an exception to a hard deny.
+        let masked = |path: &Path| {
+            path.ancestors()
+                .any(|p| self.mounts.get(p).is_some_and(|m| m.masks()))
+        };
+        let covering_mount = |path: &Path| {
+            path.ancestors()
+                .find_map(|p| self.mounts.get(p).copied().filter(|m| *m != Mount::Guard))
+        };
+        if masked(alias) || covering_mount(alias) != Some(Mount::PrivateDir) {
             return Ok(());
         }
-        if covering_mount(executable)
-            .is_some_and(|mount| mount.masks() || mount == Mount::PrivateDir)
+        if masked(executable)
+            || covering_mount(executable) == Some(Mount::PrivateDir)
             || (profile.mode == SandboxMode::Strict
                 && !profile.read_allow.iter().any(|path| path == executable))
         {
