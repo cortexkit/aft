@@ -742,6 +742,53 @@ fn assert_ambiguous_field(f: &Fixture, field: &str) {
 }
 
 #[test]
+fn codemode_head_ambiguity_logs_each_candidate_and_its_stamp_owner() {
+    let mut f = linked_fixture();
+    let root = f.head_root.clone();
+    second_head(&mut f, &root, "another-head-session", BindTrust::FirstParty);
+    let third = route(
+        &root,
+        "third-head-session",
+        head_stamp("head-a", "agent-a"),
+        CallMode::Classic,
+    );
+    f.routes.insert(channel(4), third);
+    with_principal_id(&mut f.routes, channel(3), "reserved:thalamus-harness");
+
+    let body = call("read", json!({"path": "notes.txt"}));
+    let (admission, logs) =
+        crate::logging::capture_log_lines(|| admit(&f.routes, channel(9), Some(&body)));
+    let error = refusal(admission);
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    let detail = error.detail.unwrap();
+    assert_eq!(detail["reason"], "head_route_ambiguous");
+    assert_eq!(detail["channels"], json!([1, 3]));
+
+    let candidates: Vec<_> = logs
+        .iter()
+        .filter(|line| line.contains("codemode head route ambiguity candidate:"))
+        .collect();
+    assert_eq!(candidates.len(), 3, "{logs:?}");
+    for (line, channel) in candidates.iter().zip([1, 3, 4]) {
+        assert!(
+            line.contains(&format!("channel={channel} epoch=1")),
+            "{line}"
+        );
+        assert!(
+            line.contains("stamp_owner=\"reserved:prefrontal\""),
+            "{line}"
+        );
+        assert!(line.contains("scope_kind=head"), "{line}");
+        assert!(
+            line.contains(&format!("root={:?}", root.as_path())),
+            "{line}"
+        );
+    }
+    assert!(candidates[1].contains("principal_id=\"reserved:thalamus-harness\""));
+    assert!(candidates[1].contains("session=\"another-head-session\""));
+}
+
+#[test]
 fn codemode_head_routes_that_disagree_on_root_are_ambiguous() {
     let mut f = linked_fixture();
     let (_other_dir, other_root) = test_root("codemode-second-head");
