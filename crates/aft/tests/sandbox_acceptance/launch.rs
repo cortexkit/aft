@@ -195,6 +195,12 @@ impl Shell {
                 .unwrap()
                 .unwrap_or_default();
             let transcript = format!("{stdout}\n{stderr}");
+            let role = if self.worker { "worker" } else { "head" };
+            for line in transcript.lines() {
+                if line.starts_with("PROBE ") || line.starts_with("sandbox-launch:") {
+                    eprintln!("{role} {mode}: {line}");
+                }
+            }
             assert!(
                 snapshot.exit_code == Some(0)
                     && !snapshot.sandbox_unavailable

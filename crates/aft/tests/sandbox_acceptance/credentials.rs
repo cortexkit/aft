@@ -162,15 +162,36 @@ impl Fixture {
         });
     }
 
-    pub(super) fn script(&self) -> String {
-        let mut script = String::from(
+    pub(super) fn script(&self, measure_setuid: bool) -> String {
+        let stderr_path = path_arg(&self.copies.join("probe-stderr"));
+        let mut script = format!("probe_stderr={stderr_path}\n");
+        script.push_str(
             r#"observe() {
     name=$1; shift
-    result=$("$@" 2>&1); code=$?
+    stdout=$("$@" 2>"$probe_stderr"); code=$?
+    stderr=$(/bin/cat "$probe_stderr")
+    # Read just the first line without printing any credential stdout.
+    stderr_first=
+    IFS= read -r stderr_first <"$probe_stderr" || true
+    [ -n "$stdout" ] && stdout_empty=no || stdout_empty=yes
+    printf 'PROBE %s: command=%s; exit=%s; stdout_empty=%s; stderr=%s\n' \
+        "$name" "$*" "$code" "$stdout_empty" "${stderr_first:-<none>}"
+    result=$stdout
+    if [ -n "$stderr" ]; then
+        if [ -n "$result" ]; then result=$(printf '%s\n%s' "$result" "$stderr"); else result=$stderr; fi
+    fi
     printf 'BEGIN %s\n%s\nEND %s %s\n' "$name" "$result" "$name" "$code"
 }
 "#,
         );
+        if measure_setuid {
+            script.push_str("observe sudo /usr/bin/sudo -n /usr/bin/true\n");
+            if cfg!(target_os = "macos") {
+                script.push_str("observe setuid_ps /bin/ps -p \"$$\" -o pid=\n");
+            } else {
+                script.push_str("observe setuid_passwd /usr/bin/passwd -S\n");
+            }
+        }
         writeln!(
             script,
             "observe copied_public {} {}",
@@ -213,6 +234,7 @@ impl Fixture {
             path_arg(&self.moved)
         )
         .unwrap();
+        script.push_str("/bin/rm -f \"$probe_stderr\"\n");
         script
     }
 

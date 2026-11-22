@@ -150,13 +150,13 @@ fn credentials(root: &Path, worker: bool) {
     let shell = launch::Shell::new(root, worker);
     #[cfg(target_os = "macos")]
     let keychain = macos::Keychain::add_lookups(root, &mut fixture);
-    let script = fixture.script();
-    #[cfg(target_os = "macos")]
-    let script = script + &keychain.readable_file_check();
-
     for mode in LEVELS {
         let enabled = mode != SandboxMode::Off;
         let label = format!("{} {mode}", if worker { "worker" } else { "head" });
+        let measure_setuid = !worker && matches!(mode, SandboxMode::Off | SandboxMode::Credentials);
+        let script = fixture.script(measure_setuid);
+        #[cfg(target_os = "macos")]
+        let script = script + &keychain.readable_file_check();
         let run = shell.run(mode, &script, enabled);
         fixture.assert_oracle(&label, &run, enabled);
         #[cfg(target_os = "macos")]
