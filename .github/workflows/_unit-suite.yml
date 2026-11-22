@@ -86,7 +86,27 @@ jobs:
         run: cargo nextest archive --features wasm-grammars --features test-hooks --workspace -E '(kind(lib) | kind(bin) | kind(test)) - binary(=watcher_integration)' --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
-      - name: Shell handler registration in upper unit tests
+      - name: Audit native engine compiler inputs (Linux)
+        run: |
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+      - name: Audit packaged engine test-support inputs
+        run: |
+          cargo check --locked -p aft-engine --lib --features test-support,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-packaged-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-packaged-build.jsonl" --packaged
+      - name: Engine source and shell registration guards (default features)
+        run: |
+          output="$RUNNER_TEMP/engine-source-guards.txt"
+          if ! cargo test -p aft-engine --lib -- engine_source_guard_tests > "$output" 2>&1; then
+            cat "$output"
+            exit 1
+          fi
+          cat "$output"
+          if ! grep -Eq '^test result: ok\. [1-9][0-9]* passed;' "$output"; then
+            echo '::error::No engine source or registration guard tests ran'
+            exit 1
+          fi
+      - name: Engine source and shell registration guards (nextest archive)
         run: python3 scripts/check-shell-registration.py --archive-file "$LINUX_NEXTEST_ARCHIVE"
         env:
           LINUX_NEXTEST_ARCHIVE: ${{ runner.temp }}/linux-nextest.tar.zst
@@ -525,7 +545,7 @@ jobs:
         run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          cargo test --features wasm-grammars -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- gh_shim --test-threads=1
+          cargo test --features wasm-grammars -p agent-file-tools -p aft-engine -p aft-base -p aft-db --features test-hooks --lib -- gh_shim --test-threads=1
           binary_listing="$(cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- --list)"
           [[ "$binary_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]]
           cargo test --features wasm-grammars -p agent-file-tools --features test-hooks --bin aft -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition --test-threads=1
@@ -909,6 +929,14 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           MACOS_LIBTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
+
+      - name: Audit native engine compiler inputs (macOS)
+        run: |
+          # Keep the archive's codegen setting so Cargo can reuse its libtest build.
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       # Keep the build's timing report even when a later step fails; it is the
       # evidence for diagnosing slow archive builds.
@@ -1690,6 +1718,15 @@ jobs:
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
           WINDOWS_NEXTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/windows-nextest.tar.zst
+
+      - name: Audit native engine compiler inputs (Windows)
+        shell: pwsh
+        run: |
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       # Run the exact archive-built harness while its local PDB still exists.
       # A package-scoped cargo test --features wasm-grammars changes workspace feature unification and

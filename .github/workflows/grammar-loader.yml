@@ -38,8 +38,8 @@ jobs:
           if cmake --version; then exit 1; fi
           rm -f "$AFT_NO_CMAKE_MARKER"
           cargo check --locked -p agent-file-tools
-          cargo test --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- grammar_disabled_
-          cargo test --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact
+          cargo test --locked -p agent-file-tools -p aft-engine -p aft-base -p aft-db --features test-hooks --lib -- grammar_disabled_
+          cargo test --locked -p aft-engine --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact
           test ! -e "$AFT_NO_CMAKE_MARKER"
           cargo tree --locked -p agent-file-tools -e features > default-features.txt
           python3 - <<'PY'
@@ -105,7 +105,7 @@ jobs:
 
       - name: Loader state and compile tests
         run: |
-          cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib -- grammar_
+          cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-engine -p aft-base -p aft-db --features test-hooks --lib -- grammar_
       - name: Process restart and concurrent publication
         run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --test integration -- grammar_loader
       # The no-Luau parity half needs a second, feature-less debug build of the
@@ -114,12 +114,12 @@ jobs:
       # OS, so it runs on Linux and Windows; macOS still runs every Luau test.
       - name: Luau extraction tests (macOS)
         if: runner.os == 'macOS'
-        run: cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- luau_s
+        run: cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-engine --features test-hooks --lib -- luau_s
       - name: Luau extraction and index-store feature matrix
         if: runner.os != 'macOS' && matrix.os != 'windows-11-arm'
         run: |
-          AFT_S4_NO_LUAU_PARITY=luau-ci cargo test --features wasm-grammars --locked -p agent-file-tools --features test-hooks --lib -- luau_s
-          AFT_S4_NO_LUAU_PARITY=luau-ci cargo test --locked -p agent-file-tools --features test-hooks --lib -- luau_s4_no_luau_luaurc_parity
+          AFT_S4_NO_LUAU_PARITY=luau-ci cargo test --features wasm-grammars --locked -p agent-file-tools -p aft-engine --features test-hooks --lib -- luau_s
+          AFT_S4_NO_LUAU_PARITY=luau-ci cargo test --locked -p aft-engine --features test-hooks --lib -- luau_s4_no_luau_luaurc_parity
           python3 crates/aft/tests/fixtures/grammars/compare_no_luau.py luau-ci
           rm -rf luau-ci
       - name: Native Windows ARM64 load-and-parse smoke
@@ -178,7 +178,7 @@ jobs:
 
       - name: ARM64 compile with Pulley
         run: |
-          cargo check --features wasm-grammars --locked -p agent-file-tools --features test-hooks --tests --target aarch64-pc-windows-msvc
+          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-engine --features test-hooks --tests --target aarch64-pc-windows-msvc
           cargo tree --features wasm-grammars --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path

@@ -14,9 +14,9 @@ def main():
     if args.archive_file:
         command += ["--archive-file", str(args.archive_file.resolve())]
     else:
-        command += ["-p", "agent-file-tools", "--lib", "--features", "wasm-grammars,test-hooks"]
+        command += ["-p", "aft-engine", "--lib", "--features", "wasm-grammars,test-hooks"]
     command += [
-        "-E", "package(=agent-file-tools) & kind(lib) & test(~engine_source_guard_tests::)",
+        "-E", "package(=aft-engine) & kind(lib) & test(~engine_source_guard_tests::)",
     ]
     return subprocess.call(command, cwd=Path(__file__).resolve().parents[1])
 

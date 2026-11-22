@@ -1070,7 +1070,7 @@ jobs:
       # Cargo's local registry overlay, without needing unpublished siblings on
       # crates.io. Stable Cargo >=1.90 supports this selection mode.
       - name: Rehearse crates.io publishing
-        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p agent-file-tools
+        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-engine -p agent-file-tools
 
       # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
       # sizes). A publish dry run does not enforce the registry's upload limit.
@@ -1080,6 +1080,8 @@ jobs:
           import json
           from pathlib import Path
           import subprocess
+          import tarfile
+          import tomllib
 
           metadata = json.loads(subprocess.check_output([
               "cargo", "metadata", "--format-version", "1", "--no-deps",
@@ -1088,7 +1090,7 @@ jobs:
           # Multi-package publish stages archives in tmp-crate and tmp-registry;
           # single-package packaging leaves them directly in the package folder.
           crates = sorted(crate_dir.rglob("*.crate"))
-          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools"}
+          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "agent-file-tools"}
           filenames = {crate.name for crate in crates}
           found = {
               package["name"] for package in metadata["packages"]
@@ -1102,6 +1104,19 @@ jobs:
               print(f"{crate.relative_to(crate_dir)}: {size} bytes ({size / limit:.1%} of 10 MiB)")
               if size >= limit:
                   raise SystemExit(f"::error::{crate.name} must be under {limit} bytes")
+
+          # Check Cargo's normalized manifest, not the workspace's path dependency.
+          version = next(p["version"] for p in metadata["packages"] if p["name"] == "agent-file-tools")
+          upper_package = f"agent-file-tools-{version}"
+          for crate in crates:
+              if crate.name != f"{upper_package}.crate":
+                  continue
+              with tarfile.open(crate, "r:gz") as archive:
+                  with archive.extractfile(f"{upper_package}/Cargo.toml") as manifest:
+                      pin = tomllib.load(manifest)["dependencies"].get("aft-engine", {}).get("version")
+              if pin != f"={version}":
+                  raise SystemExit(f"::error::{crate.name} must require aft-engine ={version}; found {pin!r}")
+              print(f"{crate.relative_to(crate_dir)}: requires aft-engine {pin}")
           PY
 
       - name: Download darwin-arm64 binary

@@ -260,17 +260,24 @@ results.push(updateCargoPathDep(cargoPath, "aft-store", version, dryRun));
 const basePath = join(root, "crates", "aft-base", "Cargo.toml");
 const dbPath = join(root, "crates", "aft-db", "Cargo.toml");
 const parsePath = join(root, "crates", "aft-parse", "Cargo.toml");
+const enginePath = join(root, "crates", "aft-engine", "Cargo.toml");
 results.push(updateCargoToml(basePath, version, dryRun));
 results.push(updateCargoToml(dbPath, version, dryRun));
 results.push(updateCargoToml(parsePath, version, dryRun));
+results.push(updateCargoToml(enginePath, version, dryRun));
 results.push(updateCargoPathDep(basePath, "aft-store", version, dryRun));
 results.push(updateCargoPathDep(basePath, "secret-rules", version, dryRun));
 results.push(updateCargoPathDep(dbPath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(parsePath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
+for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules"]) {
+  results.push(updateCargoPathDep(enginePath, dep, version, dryRun));
+}
 results.push(updateCargoPathDep(cargoPath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-db", version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-parse", version, dryRun));
+// Status uses the engine's package version, which must match the CLI's version.
+results.push(updateCargoPathDep(cargoPath, "aft-engine", `=${version}`, dryRun));
 
 // Report
 let updateCount = 0;
