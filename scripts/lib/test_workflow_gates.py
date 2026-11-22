@@ -34,6 +34,19 @@ GATE_TEXT = (Path(__file__).resolve().parents[2] / "scripts/rust-test-gate.sh").
 PROOF_TEXT = (Path(__file__).resolve().parents[2] / "scripts/rust-test-inventory-proof.py").read_text()
 
 
+ENGINE_SOURCE_AUDIT = re.compile(
+    r'cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json'
+    r'(?: --config "\$LIBTEST_CARGO_CONFIG")? > "(?P<json>\$(?:env:)?RUNNER_TEMP/aft-engine-build\.jsonl)"\n'
+    r'python(?:3)? crates/aft-engine/checks/source-inputs\.py "(?P=json)"'
+)
+
+
+def cargo_test_execution_lines(run: str) -> list[str]:
+    lines = run.splitlines()
+    return [line for i, line in enumerate(lines) if "cargo test" in line
+            and not ENGINE_SOURCE_AUDIT.fullmatch("\n".join(lines[i:i + 2]))]
+
+
 def workflow_job(job_id: str) -> str:
     match = re.search(
         rf"(?ms)^  {re.escape(job_id)}:\n(.*?)(?=^  [a-z0-9_-]+:\n|\Z)",
@@ -763,11 +776,24 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
             for job_id in suite["jobs"]:
                 if job_id.startswith("unit-windows-") and job_id != "unit-windows-nextest-archive":
                     self.assertNotIn("ci-windows-probes.py", workflow_job(job_id))
-        self.assertFalse(any(line.startswith("cargo test ") for command in commands for line in command.splitlines()))
+        for command in commands:
+            self.assertEqual(cargo_test_execution_lines(command), [], command)
+        audit = next(step for step in archive["steps"] if step.get("name") == "Audit native engine compiler inputs (Windows)")
+        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
+        self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
         python = next(i for i, step in enumerate(archive["steps"]) if step.get("uses") == "actions/setup-python@v6")
         tls = next(i for i, step in enumerate(archive["steps"]) if "--probe tls" in step.get("run", ""))
         self.assertEqual(archive["steps"][python]["with"]["python-version"], "3.14")
         self.assertLess(python, tls)
+
+    def test_only_compile_only_cargo_test_followed_by_engine_audit_is_allowed(self) -> None:
+        build = ('cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks '
+                 '--message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"')
+        audit = 'python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"'
+        self.assertEqual(cargo_test_execution_lines(f"{build}\n{audit}"), [])
+        executes = build.replace(" --no-run", "")
+        self.assertEqual(cargo_test_execution_lines(f"{executes}\n{audit}"), [executes])
+        self.assertEqual(cargo_test_execution_lines(build), [build])
 
     def test_windows_libtest_shards_select_only_archive_partitions(self) -> None:
         root = Path(__file__).resolve().parents[2]
@@ -1101,9 +1127,13 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(job["timeout-minutes"], "140")
         cargo_steps = [step["run"] for step in job["steps"] if "run" in step]
         build_steps = [command for command in cargo_steps if re.search(r"\bcargo (nextest|test)\b", command)]
-        self.assertEqual(len(build_steps), 3)
+        self.assertEqual(len(build_steps), 4)
         for command in build_steps:
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
+        audit = next(step for step in job["steps"] if step.get("name") == "Audit native engine compiler inputs (macOS)")
+        self.assertIn(audit["run"], build_steps)
+        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
+        self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
         archive = next(command for command in build_steps if "nextest archive" in command)
         self.assertIn("--timings", archive)
         self.assertIn('/usr/bin/time -l cargo nextest archive', archive)
@@ -1779,10 +1809,11 @@ while [[ "$1" != --output ]]; do shift; done
                     else:
                         self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
                     self.assertRegex(run, r"cargo (build|rustc|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
-                if any(command in run for command in (
+                runs_tests = cargo_test_execution_lines(run) or any(command in run for command in (
                     "rust-test-gate.sh", "ci-windows-probes.py", "bun run test:unit", "bun test ",
-                    "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1", "cargo test",
-                )) and not ("-- --list" in run and "-- --exact" not in run):
+                    "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1",
+                ))
+                if runs_tests and not ("-- --list" in run and "-- --exact" not in run):
                     checked += 1
                     self.assertNotIn("CARGO_TARGET_DIR", env, name)
                     self.assertNotIn("CARGO_BUILD_TARGET_DIR", env, name)

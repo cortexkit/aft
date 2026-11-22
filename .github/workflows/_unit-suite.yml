@@ -1709,8 +1709,8 @@ jobs:
       - name: Audit native engine compiler inputs (Windows)
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
