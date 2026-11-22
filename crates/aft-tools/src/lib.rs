@@ -36,7 +36,7 @@
 static TEST_ALLOCATOR: aft_base::test_allocations::CountingAllocator =
     aft_base::test_allocations::CountingAllocator;
 
-pub(crate) use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
+pub(crate) use aft_base::{slog_debug, slog_info, slog_warn};
 
 // Keep the CLI’s `aft::` paths when compiled as part of this library.
 extern crate self as aft;
@@ -97,8 +97,10 @@ pub(crate) use aft_base::config_resolve;
 pub(crate) use aft_base::cross_volume;
 pub(crate) use aft_engine::config_live;
 pub(crate) use aft_engine::context;
+pub(crate) use aft_engine::db;
 pub mod data_layer;
 pub(crate) use aft_base::developer_tools;
+#[cfg(all(test, feature = "wasm-grammars"))]
 pub(crate) use aft_base::disk_floor;
 pub(crate) use aft_base::durability;
 pub(crate) use aft_base::effective_path;
@@ -237,7 +239,6 @@ pub(crate) use aft_engine::write_ledger;
 pub(crate) use aft_base::windows_command;
 pub(crate) use aft_base::windows_path;
 pub(crate) use aft_base::worker_jail_canary;
-pub(crate) use aft_engine::windows_shell;
 
 #[cfg(all(test, target_os = "linux"))]
 mod daemon_heap_probe;
@@ -256,8 +257,9 @@ pub(crate) use aft_engine::test_bridge::test_env;
 pub mod tools_test_support;
 #[cfg(any(test, feature = "test-support"))]
 mod upper_test_context;
+// The shared fake LSP builder uses the facade integration helper's module name.
 #[cfg(test)]
-pub(crate) use aft_base::persistence_gate;
+use test_support as test_helpers;
 #[cfg(test)]
 pub(crate) use tools_test_support::{test_app, test_context};
 

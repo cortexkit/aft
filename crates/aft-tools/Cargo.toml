@@ -48,10 +48,12 @@ toml = { version = "0.8", default-features = false, features = ["parse"] }
 sha2 = { version = "0.10", features = ["compress"] }
 blake3 = "1"
 rustc-demangle = "0.1"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
 # Shared secret placeholder and audit record types.
 secret-rules = { path = "../secret-rules", version = "0.66.0", package = "aft-secret-rules" }
 bytes = "1"
 futures-util = "0.3"
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
 # Shared CortexKit-neutral path-canonicalization primitive (ProjectRootId).
 # Lives in github.com/cortexkit/commons (product-neutral, used without subc);
 # its CI runs the cfg(windows) verbatim/UNC/drive-case vectors continuously.
