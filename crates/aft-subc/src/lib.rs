@@ -51,7 +51,7 @@ pub(crate) use aft_base::config_resolve;
 #[cfg(test)]
 pub(crate) use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
-#[cfg(unix)]
+#[cfg(any(test, unix))]
 pub(crate) use aft_base::effective_path;
 #[cfg(all(test, unix))]
 pub(crate) use aft_base::environment;
