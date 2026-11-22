@@ -1,0 +1,93 @@
+name: Sandbox acceptance
+
+on:
+  merge_group:
+    types: [checks_requested]
+  push:
+    branches: [main, 'train/**', 'release/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Sandbox acceptance (Linux bubblewrap)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Require the real bubblewrap namespace backend
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y -o Acquire::Retries=5 bubblewrap openssh-client python3
+          test -x /usr/bin/python3
+          # Ubuntu 24.04 may block unprivileged user namespaces via AppArmor.
+          # This setting is changed only on the disposable GitHub-hosted VM.
+          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          /usr/bin/bwrap --unshare-user --ro-bind / / -- /bin/true
+      - name: Run the role and credential acceptance matrix
+        shell: bash
+        run: |
+          bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
+            cargo test --features test-hooks -p agent-file-tools --test sandbox_acceptance -- role_matrix --ignored --test-threads=1 --nocapture
+      - name: Run the governed GitHub read through the native worker jail
+        shell: bash
+        env:
+          AFT_REQUIRE_LANDLOCK: '1'
+        run: |
+          bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
+            cargo test --features test-hooks -p agent-file-tools --test worker_jail -- \
+            worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied --exact --nocapture
+      - name: Run active bubblewrap launcher and engine regressions
+        shell: bash
+        run: |
+          cargo build -p agent-file-tools --features test-timing-hooks --bin aft
+          export AFT_TEST_BWRAP_AFT="${CARGO_TARGET_DIR:-$PWD/target}/debug/aft"
+          test -x "$AFT_TEST_BWRAP_AFT"
+          run_test() { bash crates/aft/tests/sandbox_acceptance/ci-test.sh "$@"; }
+          run_test cargo test -p aft-tools --features test-timing-hooks --lib -- bwrap_roles bwrap_core bwrap_failures --nocapture
+          run_test cargo test -p aft-engine --features test-hooks --lib -- bwrap_composition --nocapture
+          # Expand the cgroup path within the new scope, not in this shell.
+          # shellcheck disable=SC2016
+          if systemd-run --user --scope --quiet --property=MemoryMax=256M /bin/sh -c '
+            group=$(cut -d: -f3 /proc/self/cgroup)
+            test "$(cat "/sys/fs/cgroup${group}/memory.max")" = 268435456
+          '; then
+            run_test cargo test -p aft-engine --features test-hooks --lib -- bwrap_composition_memory_uses_the_real_task_scope --ignored --nocapture
+          else
+            echo 'No user systemd scope with an effective cgroup memory limit; memory composition case not run.'
+          fi
+
+  macos:
+    name: Sandbox acceptance (Mac mini Seatbelt)
+    runs-on: [self-hosted, mac-mini]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Run the role and credential acceptance matrix
+        shell: bash
+        run: |
+          bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
+            cargo test --features test-hooks -p agent-file-tools --test sandbox_acceptance -- role_matrix --ignored --test-threads=1 --nocapture
+      - name: Run the governed GitHub read through the native worker jail
+        shell: bash
+        run: |
+          bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
+            cargo test --features test-hooks -p agent-file-tools --test worker_jail -- \
+            worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied --exact --nocapture

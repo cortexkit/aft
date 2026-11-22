@@ -76,6 +76,11 @@ path = "tests/watcher_integration/main.rs"
 name = "sandbox_launch_probe"
 path = "tests/sandbox_launch_probe.rs"
 
+[[test]]
+name = "sandbox_acceptance"
+path = "tests/sandbox_acceptance/main.rs"
+required-features = ["test-hooks"]
+
 # A stamped worker's shell under the real native sandbox (macOS only): a
 # separate binary so it can be built and run on its own on the Mac.
 [[test]]
