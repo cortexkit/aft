@@ -1,8 +1,10 @@
-use super::{checked, credentials, path_arg, ACCEPTANCE_KEYCHAIN, GH_BINARY, REQUIRE_OSXKEYCHAIN};
+use super::{
+    checked, credentials, path_arg, quote, ACCEPTANCE_KEYCHAIN, GH_BINARY, REQUIRE_OSXKEYCHAIN,
+};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use std::fmt::Write;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 
 const PASSWORD: &str = "disposable-keychain-password";
 const ACCOUNT: &str = "aft-acceptance";
@@ -13,7 +15,45 @@ const GH_ACCOUNT: &str = "aft-sandbox-acceptance-gh-fixture";
 const GH_TOKEN: &str = "disposable-gh-keychain-token";
 const PREFIX: &str = "aft-sandbox-acceptance-";
 const SECURITY: &str = "/usr/bin/security";
-const GIT_ITEM_ATTRIBUTES: [&str; 6] = ["-a", GIT_ACCOUNT, "-r", "htps", "-t", "dflt"];
+
+fn fixture_host() -> String {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{PREFIX}{}-{stamp}.invalid", std::process::id())
+}
+
+fn account_home() -> PathBuf {
+    aft_base::worker_jail_canary::account_home()
+        .expect("resolve the Mac mini runner's account home from the password database")
+}
+
+fn verified_ci_keychain(account_home: &Path) -> PathBuf {
+    let keychain = std::env::var_os(ACCEPTANCE_KEYCHAIN).map(PathBuf::from);
+    let expected = Path::new("/Users/ghrunner/Library/Keychains/ci.keychain-db");
+    if keychain
+        .as_deref()
+        .is_some_and(|path| path == expected && path.is_file())
+    {
+        return keychain.unwrap();
+    }
+    let (stdout, stderr) = match Command::new(SECURITY)
+        .args(["default-keychain", "-d", "user"])
+        .env("HOME", account_home)
+        .output()
+    {
+        Ok(output) => (
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        ),
+        Err(error) => (String::new(), format!("cannot run security: {error}")),
+    };
+    panic!(
+        "keychain acceptance requires {expected:?}; {ACCEPTANCE_KEYCHAIN}={keychain:?}, \
+         security default-keychain -d user stdout={stdout:?} stderr={stderr:?}, HOME={account_home:?}"
+    );
+}
 
 pub(super) struct Keychain {
     path: PathBuf,
@@ -26,11 +66,7 @@ impl Keychain {
             path: root.join("project/acceptance.keychain-db"),
             git_item: None,
         };
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let host = format!("{PREFIX}{}-{stamp}.invalid", std::process::id());
+        let host = fixture_host();
         let security = |args: &[&str]| {
             checked(
                 Command::new("/usr/bin/security")
@@ -61,19 +97,22 @@ impl Keychain {
         );
         if std::env::var(REQUIRE_OSXKEYCHAIN).as_deref() == Ok("1") {
             // Keep the search list visible without changing the fixture daemon's HOME.
-            let account_home = aft_base::worker_jail_canary::account_home()
-                .expect("resolve the Mac mini runner's account home from the password database");
+            let account_home = account_home();
             let helper = credentials::git_helper("osxkeychain");
+            // Use separate items so the installed helper and its signed copy each authorize their own binary.
+            let copy_host = format!("{}-copy.invalid", host.strip_suffix(".invalid").unwrap());
             let copy = fixture.lookup(
                 "git_osxkeychain",
                 helper.as_path(),
                 format!(
-                    "printf '%s\\n' protocol=https host={host} username={GIT_ACCOUNT} '' | HOME={} @TOOL@ get",
+                    "tool=@TOOL@; if [ \"$tool\" = {} ]; then host={host}; else host={copy_host}; fi; \
+                     printf '%s\\n' protocol=https \"host=$host\" username={GIT_ACCOUNT} '' | HOME={} \"$tool\" get",
+                    path_arg(&helper),
                     path_arg(&account_home)
                 ),
                 format!("password={INTERNET}"),
             );
-            keychain.git_item = Some(GitItem::seed(&host, account_home, &helper, &copy));
+            keychain.git_item = Some(GitItem::seed(host, account_home, helper, copy_host, copy));
         } else {
             eprintln!("osxkeychain item not tested: only the Mac mini CI runner provisions a default keychain for this probe");
         }
@@ -89,26 +128,18 @@ impl Keychain {
         )
     }
 
-    pub(super) fn off_diagnostics(&self, gh: Option<&GhItem>) -> String {
+    pub(super) fn off_diagnostics(&self) -> String {
         let Some(item) = &self.git_item else {
             return String::new();
         };
         let home = path_arg(&item.account_home);
-        let keychain = path_arg(&item.keychain);
-        let host = &item.host;
-        let mut script = format!(
+        format!(
             "\nobserve ci_keychain_search_list /usr/bin/env HOME={home} {SECURITY} list-keychains -d user\n\
-             observe ci_keychain_implicit_search_list /usr/bin/env HOME={home} {SECURITY} list-keychains\n\
-             observe ci_git_item /usr/bin/env HOME={home} {SECURITY} find-internet-password -s {host} -a {GIT_ACCOUNT} -w {keychain}\n"
-        );
-        if let Some(gh) = gh {
-            let service = &gh.service;
-            writeln!(script, "observe ci_gh_item /usr/bin/env HOME={home} {SECURITY} find-generic-password -s {service} -a {GH_ACCOUNT} -w {keychain}").unwrap();
-        }
-        script
+             observe ci_keychain_implicit_search_list /usr/bin/env HOME={home} {SECURITY} list-keychains\n"
+        )
     }
 
-    pub(super) fn report_off(&self, label: &str, run: &str, gh: Option<&GhItem>) {
+    pub(super) fn report_off(&self, label: &str, run: &str) {
         if self.git_item.is_none() {
             return;
         }
@@ -118,8 +149,7 @@ impl Keychain {
             git_seed_found &=
                 report_fixture(label, run, &format!("git_osxkeychain_{kind}"), &git_seed);
         }
-        let gh_seed_found = gh.is_none_or(|_| report_fixture(label, run, "gh_keyring", GH_TOKEN));
-        if !git_seed_found || !gh_seed_found {
+        if !git_seed_found {
             for (name, args) in [
                 ("ci_keychain_search_list", " -d user"),
                 ("ci_keychain_implicit_search_list", ""),
@@ -127,58 +157,7 @@ impl Keychain {
                 let (status, output) = credentials::observed(run, name);
                 eprintln!("{label}: security list-keychains{args} (exit {status}):\n{output}");
             }
-            report_fixture(label, run, "ci_git_item", INTERNET);
-            if gh.is_some() {
-                report_fixture(label, run, "ci_gh_item", &gh_keychain_value());
-            }
         }
-    }
-
-    pub(super) fn gh_lookup(&self, root: &Path) -> Option<GhItem> {
-        let binary = std::env::var_os(GH_BINARY).filter(|path| !path.is_empty())?;
-        let fixture = self
-            .git_item
-            .as_ref()
-            .expect("the gh keyring probe needs the dedicated Mac mini test keychain");
-        let config = root.join("project/gh-keyring-probe");
-        std::fs::create_dir(&config).unwrap();
-        // Supply only the active username. The token must come from the keychain.
-        std::fs::write(
-            config.join("hosts.yml"),
-            format!(
-                "{}:\n  user: {GH_ACCOUNT}\n  users:\n    {GH_ACCOUNT}: {{}}\n",
-                fixture.host
-            ),
-        )
-        .unwrap();
-        std::fs::write(config.join("config.yml"), "version: 1\n").unwrap();
-        let service = format!("gh:{}", fixture.host);
-        let value = gh_keychain_value();
-        checked(
-            Command::new(SECURITY)
-                .args([
-                    "add-generic-password",
-                    "-s",
-                    &service,
-                    "-a",
-                    GH_ACCOUNT,
-                    "-w",
-                    &value,
-                    "-T",
-                    SECURITY,
-                    "-T",
-                ])
-                .arg(&binary)
-                .arg(&fixture.keychain),
-        );
-        Some(GhItem {
-            keychain: fixture.keychain.clone(),
-            host: fixture.host.clone(),
-            service,
-            binary: binary.into(),
-            config,
-            account_home: fixture.account_home.clone(),
-        })
     }
 }
 
@@ -192,36 +171,33 @@ impl Drop for Keychain {
 }
 
 struct GitItem {
-    keychain: PathBuf,
-    host: String,
     account_home: PathBuf,
+    entries: Vec<(PathBuf, String)>,
 }
 
 impl GitItem {
-    fn seed(host: &str, account_home: PathBuf, helper: &Path, copy: &Path) -> Self {
-        let keychain = std::env::var_os(ACCEPTANCE_KEYCHAIN).map(PathBuf::from);
-        let expected = Path::new("/Users/ghrunner/Library/Keychains/ci.keychain-db");
-        if keychain
-            .as_deref()
-            .is_none_or(|path| path != expected || !path.is_file())
-        {
-            let (stdout, stderr) = match Command::new("/usr/bin/security")
-                .args(["default-keychain", "-d", "user"])
-                .output()
-            {
-                Ok(output) => (
-                    String::from_utf8_lossy(&output.stdout).into_owned(),
-                    String::from_utf8_lossy(&output.stderr).into_owned(),
-                ),
-                Err(error) => (String::new(), format!("cannot run security: {error}")),
-            };
-            panic!(
-                "osxkeychain acceptance requires {expected:?}; {ACCEPTANCE_KEYCHAIN}={keychain:?}, \
-                 security default-keychain -d user stdout={stdout:?} stderr={stderr:?}, HOME={:?}",
-                std::env::var_os("HOME")
-            );
-        }
-        let keychain = keychain.unwrap();
+    fn seed(
+        host: String,
+        account_home: PathBuf,
+        helper: PathBuf,
+        copy_host: String,
+        copy: PathBuf,
+    ) -> Self {
+        let keychain = verified_ci_keychain(&account_home);
+        // The credential helper writes to the user's default keychain. Check it
+        // with the same HOME used for store and erase before touching any item.
+        let default = Command::new(SECURITY)
+            .arg("default-keychain")
+            .env("HOME", &account_home)
+            .output()
+            .expect("query the Mac mini runner's default keychain");
+        let stdout = String::from_utf8_lossy(&default.stdout);
+        let stderr = String::from_utf8_lossy(&default.stderr);
+        assert!(
+            default.status.success() && Path::new(stdout.trim().trim_matches('"')) == keychain,
+            "refusing to seed outside {keychain:?}; security default-keychain stdout={stdout:?} \
+             stderr={stderr:?}, HOME={account_home:?}"
+        );
 
         // Check the reserved account even if an earlier run seeded different
         // protocol attributes. Remove only a server with the fixture prefix.
@@ -254,21 +230,48 @@ impl GitItem {
             checked(&mut Self::delete_command(&keychain, stale));
         }
 
-        checked(
-            Command::new(SECURITY)
-                .args(["add-internet-password", "-s", host, "-w", INTERNET])
-                .args(GIT_ITEM_ATTRIBUTES)
-                .arg("-T")
-                .arg(helper)
-                .arg("-T")
-                .arg(copy)
-                .arg(&keychain),
-        );
-        Self {
-            keychain,
-            host: host.into(),
+        let mut item = Self {
             account_home,
+            entries: Vec::new(),
+        };
+        for (helper, host) in [(helper, host), (copy, copy_host)] {
+            let output = item
+                .credential(&helper, &host, "store", Some(INTERNET))
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "could not seed {helper:?} at {host}: {output:?}"
+            );
+            item.entries.push((helper, host));
         }
+        item
+    }
+
+    fn credential(
+        &self,
+        helper: &Path,
+        host: &str,
+        action: &str,
+        password: Option<&str>,
+    ) -> io::Result<Output> {
+        let mut child = Command::new(helper)
+            .arg(action)
+            .env("HOME", &self.account_home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut input = child.stdin.take().unwrap();
+        write!(
+            input,
+            "protocol=https\nhost={host}\nusername={GIT_ACCOUNT}\n"
+        )?;
+        if let Some(password) = password {
+            writeln!(input, "password={password}")?;
+        }
+        writeln!(input)?;
+        drop(input);
+        child.wait_with_output()
     }
 
     fn delete_command(keychain: &Path, host: &str) -> Command {
@@ -282,17 +285,18 @@ impl GitItem {
 
 impl Drop for GitItem {
     fn drop(&mut self) {
-        let output = Self::delete_command(&self.keychain, &self.host).output();
-        if !matches!(&output, Ok(output) if output.status.success()) {
-            eprintln!(
-                "failed to delete the disposable osxkeychain fixture {}: {output:?}",
-                self.host
-            );
-            assert!(
-                std::thread::panicking(),
-                "osxkeychain fixture cleanup failed"
-            );
+        let mut cleaned = true;
+        for (helper, host) in &self.entries {
+            let output = self.credential(helper, host, "erase", None);
+            if !matches!(&output, Ok(output) if output.status.success()) {
+                eprintln!("failed to erase the disposable osxkeychain fixture {host}: {output:?}");
+                cleaned = false;
+            }
         }
+        assert!(
+            cleaned || std::thread::panicking(),
+            "osxkeychain fixture cleanup failed"
+        );
     }
 }
 
@@ -306,7 +310,68 @@ pub(super) struct GhItem {
 }
 
 impl GhItem {
-    pub(super) fn command(&self) -> String {
+    pub(super) fn seed(root: &Path) -> Option<Self> {
+        let Some(binary) = std::env::var_os(GH_BINARY).filter(|path| !path.is_empty()) else {
+            assert_ne!(
+                std::env::var(REQUIRE_OSXKEYCHAIN).as_deref(),
+                Ok("1"),
+                "Mac mini acceptance requires {GH_BINARY}"
+            );
+            eprintln!(
+                "raw gh keyring not tested: the Mac mini CI runner provisions gh for this probe"
+            );
+            return None;
+        };
+        let account_home = account_home();
+        let keychain = verified_ci_keychain(&account_home);
+        let host = fixture_host();
+        let config = root.join("project/gh-keyring-probe");
+        std::fs::create_dir(&config).unwrap();
+        // Configure an active user without putting the token in the file.
+        std::fs::write(
+            config.join("hosts.yml"),
+            format!("{host}:\n  user: {GH_ACCOUNT}\n  users:\n    {GH_ACCOUNT}: {{}}\n  git_protocol: https\n"),
+        )
+        .unwrap();
+        std::fs::write(config.join("config.yml"), "version: 1\n").unwrap();
+        let service = format!("gh:{host}");
+        let value = gh_keychain_value();
+        checked(
+            Command::new(SECURITY)
+                .args([
+                    "add-generic-password",
+                    "-s",
+                    &service,
+                    "-a",
+                    GH_ACCOUNT,
+                    "-w",
+                    &value,
+                    "-T",
+                    SECURITY,
+                    "-T",
+                ])
+                .arg(&binary)
+                .arg(&keychain),
+        );
+        Some(Self {
+            keychain,
+            host,
+            service,
+            binary: binary.into(),
+            config,
+            account_home,
+        })
+    }
+
+    pub(super) fn script(&self, root: &Path) -> String {
+        let mut script = credentials::observe_script(&root.join("project/gh-probe-stderr"));
+        let raw = self.command();
+        script.push_str(&format!("observe gh_keyring /bin/sh -c {}\n", quote(&raw)));
+        script.push_str(&self.security_probe());
+        script
+    }
+
+    fn command(&self) -> String {
         // Isolate the file config and environment so the raw CLI cannot find
         // an operator token. Do not refresh the fixture token over the network.
         format!(
@@ -320,7 +385,15 @@ impl GhItem {
         )
     }
 
+    fn security_probe(&self) -> String {
+        format!(
+            "\nobserve ci_gh_item /usr/bin/env HOME={} {SECURITY} find-generic-password -s {} -a {GH_ACCOUNT} -w {}\n",
+            path_arg(&self.account_home), self.service, path_arg(&self.keychain)
+        )
+    }
+
     pub(super) fn report(&self, label: &str, transcript: &str) {
+        report_fixture(label, transcript, "ci_gh_item", &gh_keychain_value());
         report_fixture(label, transcript, "gh_keyring", GH_TOKEN);
     }
 }

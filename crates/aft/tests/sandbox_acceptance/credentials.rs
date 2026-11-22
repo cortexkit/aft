@@ -163,29 +163,8 @@ impl Fixture {
         copy
     }
 
-    pub(super) fn script(&self, measure_setuid: bool, gh_probe: Option<&str>) -> String {
-        let stderr_path = path_arg(&self.copies.join("probe-stderr"));
-        let mut script =
-            format!("probe_stderr={stderr_path}\ntrap '/bin/rm -f \"$probe_stderr\"' EXIT\n");
-        script.push_str(
-            r#"observe() {
-    name=$1; shift
-    stdout=$("$@" 2>"$probe_stderr"); code=$?
-    stderr=$(/bin/cat "$probe_stderr")
-    # Read just the first line without printing any credential stdout.
-    stderr_first=
-    IFS= read -r stderr_first <"$probe_stderr" || true
-    [ -n "$stdout" ] && stdout_empty=no || stdout_empty=yes
-    printf 'PROBE %s: command=%s; exit=%s; stdout_empty=%s; stderr=%s\n' \
-        "$name" "$*" "$code" "$stdout_empty" "${stderr_first:-<none>}"
-    result=$stdout
-    if [ -n "$stderr" ]; then
-        if [ -n "$result" ]; then result=$(printf '%s\n%s' "$result" "$stderr"); else result=$stderr; fi
-    fi
-    printf 'BEGIN %s\n%s\nEND %s %s\n' "$name" "$result" "$name" "$code"
-}
-"#,
-        );
+    pub(super) fn script(&self, measure_setuid: bool) -> String {
+        let mut script = observe_script(&self.copies.join("probe-stderr"));
         if measure_setuid {
             script.push_str("observe sudo /usr/bin/sudo -n /usr/bin/true\n");
             if cfg!(target_os = "macos") {
@@ -193,9 +172,6 @@ impl Fixture {
             } else {
                 script.push_str("observe setuid_passwd /usr/bin/passwd -S\n");
             }
-        }
-        if let Some(command) = gh_probe {
-            writeln!(script, "observe gh_keyring /bin/sh -c {}", quote(command)).unwrap();
         }
         writeln!(
             script,
@@ -309,6 +285,32 @@ impl Fixture {
 fn identity(path: &Path) -> (u64, u64) {
     let metadata = fs::metadata(path).unwrap();
     (metadata.dev(), metadata.ino())
+}
+
+pub(super) fn observe_script(stderr_path: &Path) -> String {
+    let stderr_path = path_arg(stderr_path);
+    let mut script =
+        format!("probe_stderr={stderr_path}\ntrap '/bin/rm -f \"$probe_stderr\"' EXIT\n");
+    script.push_str(
+        r#"observe() {
+    name=$1; shift
+    stdout=$("$@" 2>"$probe_stderr"); code=$?
+    stderr=$(/bin/cat "$probe_stderr")
+    # Read just the first line without printing any credential stdout.
+    stderr_first=
+    IFS= read -r stderr_first <"$probe_stderr" || true
+    [ -n "$stdout" ] && stdout_empty=no || stdout_empty=yes
+    printf 'PROBE %s: command=%s; exit=%s; stdout_empty=%s; stderr=%s\n' \
+        "$name" "$*" "$code" "$stdout_empty" "${stderr_first:-<none>}"
+    result=$stdout
+    if [ -n "$stderr" ]; then
+        if [ -n "$result" ]; then result=$(printf '%s\n%s' "$result" "$stderr"); else result=$stderr; fi
+    fi
+    printf 'BEGIN %s\n%s\nEND %s %s\n' "$name" "$result" "$name" "$code"
+}
+"#,
+    );
+    script
 }
 
 pub(super) fn observed<'a>(transcript: &'a str, name: &str) -> (i32, &'a str) {

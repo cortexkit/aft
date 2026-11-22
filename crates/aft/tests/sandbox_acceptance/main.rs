@@ -41,6 +41,23 @@ fn role_matrix_credentials_worker() {
     });
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "run in the Mac mini sandbox acceptance CI lane"]
+fn role_matrix_gh_keychain_head() {
+    isolated("role_matrix_gh_keychain_head", false, |root| {
+        let Some(fixture) = macos::GhItem::seed(root) else {
+            return;
+        };
+        let shell = launch::Shell::new(root, false);
+        let script = fixture.script(root);
+        for mode in [SandboxMode::Off, SandboxMode::Credentials] {
+            let run = shell.run(mode, &script, false);
+            fixture.report(&format!("head {mode}"), &run);
+        }
+    });
+}
+
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes with outbound HTTPS"]
 fn role_matrix_https_head() {
@@ -158,35 +175,23 @@ fn credentials(root: &Path, worker: bool) {
     let shell = launch::Shell::new(root, worker);
     #[cfg(target_os = "macos")]
     let keychain = macos::Keychain::add_lookups(root, &mut fixture);
-    #[cfg(target_os = "macos")]
-    let gh = (!worker).then(|| keychain.gh_lookup(root)).flatten();
     for mode in LEVELS {
         let enabled = mode != SandboxMode::Off;
         let label = format!("{} {mode}", if worker { "worker" } else { "head" });
         let measure_setuid = !worker && matches!(mode, SandboxMode::Off | SandboxMode::Credentials);
-        #[cfg(target_os = "macos")]
-        let gh_probe = gh.as_ref().filter(|_| measure_setuid);
-        #[cfg(target_os = "macos")]
-        let gh_command = gh_probe.map(macos::GhItem::command);
-        #[cfg(target_os = "linux")]
-        let gh_command: Option<String> = None;
-        let script = fixture.script(measure_setuid, gh_command.as_deref());
+        let script = fixture.script(measure_setuid);
         #[cfg(target_os = "macos")]
         let script = {
             let mut script = script + &keychain.readable_file_check();
             if !enabled {
-                script.push_str(&keychain.off_diagnostics(gh_probe));
+                script.push_str(&keychain.off_diagnostics());
             }
             script
         };
         let run = shell.run(mode, &script, enabled);
         #[cfg(target_os = "macos")]
-        {
-            if !enabled {
-                keychain.report_off(&label, &run, gh_probe);
-            } else if let Some(probe) = gh_probe {
-                probe.report(&label, &run);
-            }
+        if !enabled {
+            keychain.report_off(&label, &run);
         }
         fixture.assert_oracle(&label, &run, enabled);
         #[cfg(target_os = "macos")]
