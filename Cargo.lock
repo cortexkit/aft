@@ -554,8 +554,6 @@ dependencies = [
  "subc-transport",
  "tempfile",
  "tikv-jemalloc-ctl",
- "tikv-jemalloc-sys",
- "tikv-jemallocator",
  "tokenizers",
  "tokio",
  "toml",
