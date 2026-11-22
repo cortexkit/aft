@@ -730,6 +730,40 @@ fn codemode_head_with_only_scope_owner_route_refuses() {
     assert_eq!(refusal_reason(&f), "head_route_not_bound");
 }
 
+#[test]
+fn codemode_head_skips_prefrontal_opencode2_route_at_another_root() {
+    let (_entorhinal_dir, entorhinal) = test_root("entorhinal");
+    let (_basal_dir, basal) = test_root("basal");
+    let opencode2 = "opencode2".parse::<crate::harness::Harness>().unwrap();
+    let mut head = head_stamp("head-a", "agent-a");
+    head.workdir = Some(entorhinal.as_path().to_str().unwrap().to_owned());
+    let mut head_route = route(&entorhinal, "ses_other_head", head, CallMode::Classic);
+    let data = Arc::get_mut(&mut head_route.0).unwrap();
+    data.harness = opencode2.wire_label();
+    data.spawn_principal = AuthenticatedPrincipal::RouteBind {
+        trust: BindTrust::FirstParty.sandbox_trust(),
+        route_channel: 76,
+        route_epoch: 1,
+        project_root: entorhinal.as_path().to_path_buf(),
+        harness: "opencode2".into(),
+        session_id: "ses_other_head".into(),
+        principal_id: Some("reserved:prefrontal".into()),
+    };
+    // Match the parent link and agent so the route's bound principal is the
+    // only reason to skip this head route.
+    let run_route = route(
+        &basal,
+        "ses_basal",
+        run_stamp("agent-a", "head-a", Some("linked")),
+        CallMode::Codemode,
+    );
+    let routes = HashMap::from([(channel(76), head_route), (channel(3450), run_route)]);
+    let body = call("read", json!({"path": "notes.txt"}));
+    let error = refusal(admit(&routes, channel(3450), Some(&body)));
+    assert_eq!(error.code, RUN_OWNER_NOT_BOUND);
+    assert_eq!(error.detail.unwrap()["reason"], "head_route_not_bound");
+}
+
 fn assert_ambiguous_field(f: &Fixture, field: &str) {
     let body = call("read", json!({"path": "notes.txt"}));
     let error = refusal(admit(&f.routes, channel(9), Some(&body)));
