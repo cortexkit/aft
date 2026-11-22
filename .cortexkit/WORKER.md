@@ -9,9 +9,14 @@ A check that prints nothing and exits 0 is not a pass unless this guide says tha
 Integration suites require `--features test-hooks` explicitly. Lib-only tests do
 not need it; production and release builds must never enable it.
 
+Unit tests live in the crate that owns the code: `aft-engine`, `aft-tools`,
+`aft-subc`, or the top layer `agent-file-tools`. Run a filtered test with
+`-p <that crate>`: `-p agent-file-tools --lib` runs only the top layer's own tests.
+
 | Gate | Command | Proof it ran |
 |---|---|---|
 | Format | `cargo fmt --all -- --check` | Silent on success. Show `cargo fmt --version` and exit 0. |
+| File size | `python3 scripts/check-file-sizes.py` | `File size check passed`. Run it before every delivery. Never raise a pin: split the file by area. When a pinned file shrinks, lower its pin to the exact new count. |
 | Windows compile | `RUSTFLAGS="-D warnings -A deprecated" cargo check -p agent-file-tools --tests --target x86_64-pc-windows-gnu --features test-hooks` | `Finished` line. Compile-only: it cannot catch Windows runtime failures. |
 | Unit (lib) | `cargo test -p agent-file-tools --lib -- <filter>` | `test result: ok. N passed` with N > 0. A filter that matches nothing reports `0 passed`, which is not a pass. |
 | Binary tests | `cargo test -p agent-file-tools --bin aft -- <filter>` | Same as above. Shared infrastructure (locks, leases, capability gates, path identity) breaks fixtures here too. |
