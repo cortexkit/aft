@@ -38,7 +38,7 @@ const SOURCE_INVENTORY_PATH = "docs/v0.49-agent-surface-sources.json";
 const ALLOWLIST_PATH = "docs/v0.49-legacy-vocabulary-allowlist.json";
 const PREFIX_CAPTURE_PATH = "docs/v0.49-agent-prefix-capture.json";
 const MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
-const SUBC_SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
+const SUBC_SCHEMA_PATH = "crates/aft-subc/src/subc_tool_schemas.json";
 const LEGACY = ["filePath", "toFile"] as const;
 let snapshotDir: string | undefined;
 
