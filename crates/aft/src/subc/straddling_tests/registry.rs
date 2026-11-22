@@ -1,11 +1,11 @@
 mod tests {
-    use crate::bash_background::persistence::{task_paths, write_task, PersistedTask};
+    use crate::bash_background::persistence::{task_paths, PersistedTask};
     use crate::bash_background::watches::{PatternMatch, WatchPattern};
     use crate::bash_background::BgTaskStatus;
     use crate::protocol::BashPatternMatchFrame;
     use aft_engine::test_bridge::bash_remote::registry_support::registry_cases::*;
     use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
-    use std::{fs, path::PathBuf, time::Instant};
+    use std::time::Instant;
 
     #[test]
     fn recovered_terminal_reply_matches_live_status_text() {

@@ -1,5 +1,5 @@
+use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
-use crate::secret::SecretVault;
 use crate::secret::{FakeReply, FakeVault};
 use crate::tools_test_support::with_secret_fetch_test_hooks;
 use crate::url_fetch::UrlFetchOptions;

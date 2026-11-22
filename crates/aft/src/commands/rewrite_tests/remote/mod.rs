@@ -10,8 +10,7 @@ use remote::*;
 #[cfg(unix)]
 use {
     crate::bash_background::persistence::{
-        read_task, read_task_at, resolve_task_layout, session_tasks_dir, unix_millis, write_task,
-        write_task_at, PersistedTask, TaskPaths,
+        read_task, read_task_at, resolve_task_layout, session_tasks_dir, write_task, PersistedTask,
     },
     crate::bash_background::registry::{self as reg, remote},
     crate::bash_background::BgTaskStatus,

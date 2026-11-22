@@ -1,5 +1,4 @@
 use aft_engine::test_bridge::bash_remote::{bash_background::registry::remote::*, resolve_posix_shell, BgTaskRegistryTestExt as _, TaskSinkTestExt as _};
-use aft_engine::test_bridge::bash_remote::BgTaskStateTestExt as _;
 use aft_engine::test_bridge::bash_remote::KeyedSubmissionTestExt as _;
 fn read_only_result_case(
     locked: Option<bool>,
