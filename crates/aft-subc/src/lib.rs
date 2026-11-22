@@ -51,10 +51,11 @@ pub(crate) use aft_base::config_resolve;
 #[cfg(test)]
 pub(crate) use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
+#[cfg(unix)]
 pub(crate) use aft_base::effective_path;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::environment;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::executable_cache;
 #[cfg(test)]
 pub(crate) use aft_base::feature_config;
@@ -90,7 +91,7 @@ pub(crate) use aft_base::task_temp_reads;
 pub(crate) use aft_base::task_watch_lines;
 #[cfg(test)]
 pub(crate) use aft_base::task_watches;
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use aft_base::test_allocations;
 #[cfg(test)]
 pub(crate) use aft_base::test_gate;
@@ -101,9 +102,12 @@ pub(crate) use aft_base::tool_progress;
 pub(crate) use aft_base::view_storage_reserve;
 #[cfg(test)]
 pub(crate) use aft_base::walk_boundary;
-#[cfg(test)]
+#[cfg(all(test, windows))]
+pub(crate) use aft_base::windows_path;
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::worker_jail_canary;
 pub(crate) use aft_base::{slog_error, slog_info, slog_warn};
+#[cfg(unix)]
 pub(crate) use aft_db::sandbox_profile;
 pub(crate) use aft_engine::access_policy;
 pub(crate) use aft_engine::agent_data;
