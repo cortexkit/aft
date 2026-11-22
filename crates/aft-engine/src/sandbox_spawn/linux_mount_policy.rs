@@ -46,15 +46,19 @@ pub(super) fn permissive(
             ..Default::default()
         }
     } else {
+        // A recursive read-only bind also covers an allowed checkout below
+        // it. Defer these broad denies until the writable carveouts exist.
+        let writable = profile.write_allow_roots();
+        let (nested, deferred_read_only): (Vec<_>, _) = profile
+            .write_deny_nested
+            .iter()
+            .cloned()
+            .partition(|deny| !writable.iter().any(|root| root.starts_with(deny)));
         LinuxMountPolicy {
             credential_masks: configured_shell_read_denies(ctx, home)?,
             read_masks: profile.read_deny.clone(),
-            read_only: profile
-                .write_deny
-                .iter()
-                .chain(&profile.write_deny_nested)
-                .cloned()
-                .collect(),
+            read_only: profile.write_deny.iter().cloned().chain(nested).collect(),
+            deferred_read_only,
             ..Default::default()
         }
     };

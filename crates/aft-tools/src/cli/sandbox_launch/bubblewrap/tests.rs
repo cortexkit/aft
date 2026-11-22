@@ -448,3 +448,35 @@ for name in [early, late, sibling]:
     assert_eq!(fs::read_to_string(early).unwrap(), SEED);
     assert_eq!(fs::read_to_string(late).unwrap(), SEED);
 }
+
+#[test]
+fn bwrap_core_standard_reports_only_missing_layers_after_snapshot() {
+    let root = tempfile::tempdir().unwrap();
+    let mut profile = fixture(root.path(), SandboxMode::Standard);
+    let hooks = root.path().join("checkout/.git/hooks");
+    let elsewhere = root.path().join("private");
+    seed(&hooks.join("control"));
+    profile.data_policy.deny.push(elsewhere.clone());
+    profile.linux_mounts = Some(LinuxMountPolicy {
+        read_only: vec![hooks.clone()],
+        deferred_read_only: vec![root.path().to_path_buf()],
+        ..Default::default()
+    });
+    let snapshot = Snapshot::take(profile.linux_mounts.as_ref().unwrap()).unwrap();
+    assert_eq!(snapshot.mounts[&hooks], Mount::ReadOnly);
+    assert_eq!(snapshot.mounts[root.path()], Mount::Guard);
+    let inner = prepare_inner(profile, &snapshot);
+    assert_eq!(
+        inner.unenforced,
+        [
+            format!(
+                "nested_write_deny_unenforced_on_bwrap:{}",
+                root.path().display()
+            ),
+            format!(
+                "private_store_mask_unenforced_on_bwrap:{}",
+                elsewhere.display()
+            ),
+        ]
+    );
+}

@@ -181,10 +181,34 @@ pub struct LinuxMountPolicy {
     pub credential_masks: Vec<PathBuf>,
     pub read_masks: Vec<PathBuf>,
     pub read_only: Vec<PathBuf>,
+    /// Broad write denies that would also remove an allowed checkout write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred_read_only: Vec<PathBuf>,
     pub cargo_homes: Vec<PathBuf>,
     /// Strict credential writes enforced by mounts when active, and still
     /// mandatory Landlock denies on direct fallback.
     pub fallback_write_deny: Vec<PathBuf>,
+}
+
+impl LinuxMountPolicy {
+    fn canonicalize_credentials(
+        mut self,
+        resolved: &mut HashMap<PathBuf, PathBuf>,
+    ) -> Result<Self, SandboxProfileError> {
+        self.credential_masks = canonicalize_denies(
+            self.credential_masks,
+            "linux_mounts.credential_masks",
+            resolved,
+            true,
+        )?;
+        self.fallback_write_deny = canonicalize_denies(
+            self.fallback_write_deny,
+            "linux_mounts.fallback_write_deny",
+            resolved,
+            true,
+        )?;
+        Ok(self)
+    }
 }
 
 fn is_false(value: &bool) -> bool {
@@ -278,6 +302,10 @@ impl SandboxProfile {
         }
 
         let mut deny_paths = HashMap::new();
+        let linux_mounts = self
+            .linux_mounts
+            .map(|mounts| mounts.canonicalize_credentials(&mut deny_paths))
+            .transpose()?;
         let preserve_aliases = matches!(
             self.mode,
             crate::config::SandboxMode::Standard | crate::config::SandboxMode::Credentials
@@ -287,7 +315,7 @@ impl SandboxProfile {
             canonicalize_read_grants(self.read_allow, self.read_allow_listed, &writable_files)?;
         Ok(Self {
             secret_proxy: self.secret_proxy,
-            linux_mounts: self.linux_mounts,
+            linux_mounts,
             v: self.v,
             mode: self.mode,
             worker_jail: self.worker_jail,

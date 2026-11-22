@@ -126,7 +126,7 @@ fn prepare_inner(mut profile: SandboxProfile, snapshot: &Snapshot) -> InnerProfi
                 .is_some_and(|mount| *mount != Mount::Guard)
         })
     };
-    profile.linux_mounts = None;
+    let mounts = profile.linux_mounts.take().expect("local mount policy");
     profile.write_deny_nested.retain(|path| !protected(path));
     profile.socket_deny.retain(|path| !protected(path));
     // The mount report names the prefix rather than describing Landlock's
@@ -134,9 +134,24 @@ fn prepare_inner(mut profile: SandboxProfile, snapshot: &Snapshot) -> InnerProfi
     profile.deny_prefixes.clear();
     let mut unenforced = snapshot.unenforced.clone();
     if profile.mode == SandboxMode::Standard {
-        for path in &profile.data_policy.deny {
+        for path in profile
+            .data_policy
+            .deny
+            .iter()
+            .filter(|path| !protected(path))
+        {
             unenforced.push(format!(
                 "private_store_mask_unenforced_on_bwrap:{}",
+                path.display()
+            ));
+        }
+        for path in mounts
+            .deferred_read_only
+            .iter()
+            .filter(|path| !protected(path))
+        {
+            unenforced.push(format!(
+                "nested_write_deny_unenforced_on_bwrap:{}",
                 path.display()
             ));
         }

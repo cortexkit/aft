@@ -404,3 +404,31 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
         });
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_level_policy_linux_standard_defers_only_checkout_covering_broad_binds() {
+    let base = tempfile::tempdir().unwrap();
+    let home = base.path();
+    let work = home.join("Work");
+    std::fs::create_dir(&work).unwrap();
+    let (ctx, project, io, _fixture) = unix_fixture(&work);
+    let sibling = home.join("sibling-checkout");
+    let hooks = project.join(".git/hooks");
+    let mut profile = SandboxProfile::build(
+        vec![project.clone()],
+        vec![hooks.clone()],
+        vec![work.clone(), sibling.clone()],
+        vec![],
+        vec![],
+        vec![],
+        vec![],
+        io,
+    )
+    .unwrap();
+    profile.mode = SandboxMode::Standard;
+    linux_mount_policy::permissive(&mut profile, &ctx, home).unwrap();
+    let mounts = profile.linux_mounts.unwrap();
+    assert_eq!(mounts.deferred_read_only, [work]);
+    assert_eq!(mounts.read_only, [hooks, sibling]);
+}
