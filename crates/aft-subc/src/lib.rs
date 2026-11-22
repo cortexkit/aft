@@ -93,9 +93,8 @@ pub(crate) use aft_base::tool_gate;
 pub(crate) use aft_base::tool_progress;
 pub(crate) use aft_base::view_storage_reserve;
 pub(crate) use aft_base::walk_boundary;
-pub(crate) use aft_base::windows_path;
 pub(crate) use aft_base::worker_jail_canary;
-pub(crate) use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
+pub(crate) use aft_base::{slog_error, slog_info, slog_warn};
 pub(crate) use aft_db::sandbox_profile;
 pub(crate) use aft_engine::access_policy;
 pub(crate) use aft_engine::agent_data;
@@ -167,7 +166,8 @@ pub(crate) use aft_engine::url_fetch;
 pub(crate) use aft_engine::watcher_filter;
 pub(crate) use aft_engine::write_ledger;
 pub(crate) use aft_tools::{
-    commands, response_finalize, run_tool_call, subc_format, subc_translate, tool_output,
+    commands, data_layer, response_finalize, run_tool_call, subc_format, subc_translate,
+    tool_output,
 };
 
 #[cfg(test)]

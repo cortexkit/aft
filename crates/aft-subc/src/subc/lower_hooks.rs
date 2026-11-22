@@ -112,10 +112,11 @@ mod tests {
 
     #[test]
     fn every_process_entry_registers_floor_checks_before_storage() {
-        let main = include_str!("../main.rs")
-            .split_once("fn main() {")
-            .unwrap()
-            .1;
+        let source = std::fs::read_to_string(
+            std::path::Path::new(crate::test_support::manifest_dir()).join("../aft/src/main.rs"),
+        )
+        .expect("read facade main source");
+        let main = source.split_once("fn main() {").unwrap().1;
         let registration = main
             .find("aft::reader_floor::register_cache_hooks();")
             .unwrap();

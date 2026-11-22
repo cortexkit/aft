@@ -146,6 +146,7 @@ Daemon tests use `tools_test_support` for handler fixtures and observations. It 
 | `tools_test_support::install_deferred_inspect_body_gate_for_test` | fixture | Test support | Holds the next deferred inspect at its request body. |
 | `tools_test_support::install_deferred_inspect_body_gate_for_request_for_test` | fixture | Test support | Holds only the specified deferred inspect request. |
 | `tools_test_support::install_deferred_inspect_stat_gate_for_test` | fixture | Test support | Holds inspect at its stat path without running unrelated stages. |
+| `tools_test_support::inspect_with_clock` | fixture | Test support | Prepares a daemon inspect reply using the test's clock. |
 | `tools_test_support::deferred_navigation_test_lock` | fixture | Test support | Serializes tests sharing the deferred navigation gate. |
 | `tools_test_support::deferred_navigation_worker_count_for_test` | getter | Test support | Counts outstanding navigation workers for cancellation and drain tests. |
 | `tools_test_support::install_deferred_navigation_gate_for_test` | fixture | Test support | Pauses the next navigation worker before calling its handler. |
@@ -156,7 +157,10 @@ Daemon tests use `tools_test_support` for handler fixtures and observations. It 
 | `tools_test_support::with_secret_fetch_test_hooks` | fixture | Test support | Configures a fake fetch and lets daemon tests observe a private document before deletion. |
 | `tools_test_support::text_index_is_ready` | getter | Test support | Checks readiness without exposing the handler's text-index wrapper. |
 | `tools_test_support::watch_restart_registered` | getter | Test support | Checks whether daemon startup installed the tools' restart callback. |
+| `tools_test_support::watch_yield_requested` | getter | Test support | Reads whether the registered watch has been asked to yield. |
 | `tools_test_support::install_watch_wait_fixture` | fixture | Test support | Installs a waiting watch without exposing the restart state lock. |
+| `tools_test_support::kill_deadline_sentence` | fixture | Test support | Renders the same deadline text the shell handler uses for a session. |
+| `tools_test_support::search_cancellation_requested` | getter | Test support | Reads the cancellation signal visible to code search on the executor thread. |
 | `tools_test_support::ranked_oversized_first_response` | fixture | Test support | Renders a large first hit and small second hit without exposing ranked result fields. |
 
 ## Test identities

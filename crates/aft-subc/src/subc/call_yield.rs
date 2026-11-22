@@ -791,7 +791,7 @@ mod tests {
         let signal = yields.register(route, 7);
         assert!(!yields.request(route, 8), "no watch answers corr 8");
         assert!(yields.request(route, 7));
-        assert!(signal.requested());
+        assert!(crate::tools_test_support::watch_yield_requested(&signal));
         assert!(!yields.request(route, 7), "a watch is asked only once");
         drop(signal);
         let _other = yields.register(route, 9);
