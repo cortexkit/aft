@@ -153,43 +153,17 @@ struct InnerProfile {
 
 fn prepare_inner(mut profile: SandboxProfile, snapshot: &Snapshot) -> InnerProfile {
     let protected = |path: &Path| {
-        path.ancestors().any(|ancestor| {
-            snapshot
-                .mounts
-                .get(ancestor)
-                .is_some_and(|mount| *mount != Mount::Guard)
-        })
+        path.ancestors()
+            .find_map(|ancestor| snapshot.mounts.get(ancestor))
+            .is_some_and(|mount| !matches!(mount, Mount::Guard | Mount::WriteException))
     };
-    let mounts = profile.linux_mounts.take().expect("local mount policy");
+    profile.linux_mounts = None;
     profile.write_deny_nested.retain(|path| !protected(path));
     profile.socket_deny.retain(|path| !protected(path));
     // The mount report names the prefix rather than describing Landlock's
     // inability to enforce it. Landlock itself does not use prefix rules.
     profile.deny_prefixes.clear();
     let mut unenforced = snapshot.unenforced.clone();
-    if profile.mode == SandboxMode::Standard {
-        for path in profile
-            .data_policy
-            .deny
-            .iter()
-            .filter(|path| !protected(path))
-        {
-            unenforced.push(format!(
-                "private_store_mask_unenforced_on_bwrap:{}",
-                path.display()
-            ));
-        }
-        for path in mounts
-            .deferred_read_only
-            .iter()
-            .filter(|path| !protected(path))
-        {
-            unenforced.push(format!(
-                "nested_write_deny_unenforced_on_bwrap:{}",
-                path.display()
-            ));
-        }
-    }
     if profile.worker_gh_fence == Some(WorkerGhFence::Unenforced) {
         unenforced.push(format!(
             "operator gh fence: unenforced ({} profile)",
@@ -206,8 +180,7 @@ fn prepare_inner(mut profile: SandboxProfile, snapshot: &Snapshot) -> InnerProfi
 
 fn exec_bwrap(args: &LaunchArgs, profile: SandboxProfile) -> Result<(), SandboxLaunchError> {
     let unavailable = |error: io::Error| SandboxLaunchError::unavailable(error.to_string());
-    let snapshot = Snapshot::take(profile.linux_mounts.as_ref().expect("local mount policy"))
-        .map_err(SandboxLaunchError::unavailable)?;
+    let snapshot = Snapshot::take(&profile).map_err(SandboxLaunchError::unavailable)?;
     let inner = prepare_inner(profile, &snapshot);
     let executable = std::env::current_exe().map_err(unavailable)?;
     let handoff = handoff::Handoff::new().map_err(unavailable)?;
@@ -240,7 +213,7 @@ fn append_mounts(command: &mut Command, snapshot: Snapshot) -> io::Result<(File,
     // kernel keeps the sources alive across exec without putting them on disk.
     let mut files = Vec::new();
     let mut argv = Vec::new();
-    for (path, mount) in snapshot.mounts {
+    for (path, mount) in &snapshot.mounts {
         let path = path.as_os_str().as_bytes();
         let mut append = |args: &[&[u8]]| {
             for arg in args {
@@ -250,16 +223,33 @@ fn append_mounts(command: &mut Command, snapshot: Snapshot) -> io::Result<(File,
         };
         match mount {
             Mount::Guard => append(&[b"--dev-bind", path, path]),
-            Mount::ReadOnly => append(&[b"--ro-bind", path, path]),
+            Mount::WriteException => append(&[b"--bind", path, path]),
+            Mount::ReadOnly | Mount::DeferredReadOnly | Mount::ReadException => {
+                append(&[b"--ro-bind", path, path])
+            }
             Mount::EmptyDir => {
                 append(&[b"--perms", b"0555", b"--tmpfs", path, b"--remount-ro", path])
             }
+            Mount::NoSearchDir => {
+                append(&[b"--perms", b"0000", b"--tmpfs", path, b"--remount-ro", path])
+            }
+            // Bubblewrap sources binds in the host mount tree. On the destination
+            // side it needs to create only placeholders inside this private tmpfs.
+            Mount::PrivateDir => append(&[b"--perms", b"0755", b"--tmpfs", path]),
             Mount::EmptyFile => {
                 let file = memfd(c"aft-bwrap-mask")?;
                 let fd = file.as_raw_fd().to_string();
                 append(&[b"--perms", b"0444", b"--ro-bind-data", fd.as_bytes(), path]);
                 files.push(file);
             }
+        }
+    }
+    // Remount only the tmpfs, not its writable exception submounts.
+    for (path, mount) in &snapshot.mounts {
+        if *mount == Mount::PrivateDir {
+            argv.extend_from_slice(b"--remount-ro\0");
+            argv.extend_from_slice(path.as_os_str().as_bytes());
+            argv.push(0);
         }
     }
     // The inventory can outgrow execve's argument-vector limit on large homes.

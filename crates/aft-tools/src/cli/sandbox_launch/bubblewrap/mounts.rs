@@ -1,4 +1,5 @@
-use aft::sandbox_profile::LinuxMountPolicy;
+use aft::config::SandboxMode;
+use aft::sandbox_profile::{LinuxMountPolicy, SandboxProfile, WorkerGhFence};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -7,13 +8,22 @@ use std::path::{Path, PathBuf};
 pub(super) enum Mount {
     Guard,
     ReadOnly,
+    DeferredReadOnly,
+    ReadException,
+    WriteException,
     EmptyFile,
     EmptyDir,
+    PrivateDir,
+    NoSearchDir,
 }
 
 impl Mount {
     fn masks(self) -> bool {
-        matches!(self, Self::EmptyFile | Self::EmptyDir)
+        matches!(self, Self::EmptyFile | Self::EmptyDir | Self::NoSearchDir)
+    }
+
+    fn host_writable(self) -> bool {
+        matches!(self, Self::Guard | Self::WriteException)
     }
 }
 
@@ -24,7 +34,16 @@ pub(super) struct Snapshot {
 }
 
 impl Snapshot {
-    pub fn take(policy: &LinuxMountPolicy) -> Result<Self, String> {
+    pub fn take(profile: &SandboxProfile) -> Result<Self, String> {
+        let policy = profile.linux_mounts.as_ref().expect("local mount policy");
+        let mut snapshot = Self::from_policy(policy)?;
+        if profile.mode != SandboxMode::Credentials {
+            snapshot.add_role_mounts(profile, policy)?;
+        }
+        snapshot.finish()
+    }
+
+    fn from_policy(policy: &LinuxMountPolicy) -> Result<Self, String> {
         let mut snapshot = Self {
             mounts: BTreeMap::new(),
             unenforced: Vec::new(),
@@ -53,10 +72,155 @@ impl Snapshot {
             }
             snapshot.add(path, false, "standard_control_target_absent_on_bwrap")?;
         }
-        snapshot.guard_ancestors();
-        snapshot.unenforced.sort_unstable();
-        snapshot.unenforced.dedup();
         Ok(snapshot)
+    }
+
+    fn finish(mut self) -> Result<Self, String> {
+        self.guard_ancestors();
+        self.unenforced.sort_unstable();
+        self.unenforced.dedup();
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    pub fn take_policy(policy: &LinuxMountPolicy) -> Result<Self, String> {
+        Self::from_policy(policy)?.finish()
+    }
+
+    fn add_role_mounts(
+        &mut self,
+        profile: &SandboxProfile,
+        policy: &LinuxMountPolicy,
+    ) -> Result<(), String> {
+        let data = &profile.data_policy;
+        let mut stores = BTreeSet::new();
+        let mut deferred = BTreeSet::new();
+        for raw in &data.deny {
+            if let Some((path, metadata)) = role_target(raw)? {
+                stores.insert(path.clone());
+                let entry = self.mounts.entry(path).or_insert(Mount::Guard);
+                if !entry.masks() {
+                    *entry = if metadata.is_dir() {
+                        Mount::PrivateDir
+                    } else {
+                        Mount::EmptyFile
+                    };
+                }
+            }
+        }
+        for raw in &policy.deferred_read_only {
+            if let Some((path, _)) = role_target(raw)? {
+                let entry = self.mounts.entry(path.clone()).or_insert(Mount::Guard);
+                if *entry == Mount::Guard {
+                    *entry = Mount::DeferredReadOnly;
+                    deferred.insert(path);
+                }
+            } else {
+                self.unenforced.push(format!(
+                    "standard_control_target_absent_on_bwrap:{}",
+                    raw.display()
+                ));
+            }
+        }
+
+        let session_reads = data
+            .session_task_read_dir
+            .as_deref()
+            .map(super::landlock_backend::session_task_read_paths)
+            .transpose()?
+            .unwrap_or_default();
+        let writable = data
+            .write_allow
+            .iter()
+            .map(|path| (path, true, profile.writable_files.contains(path)));
+        let readonly = data
+            .read_allow
+            .iter()
+            .map(|path| (path, false, profile.writable_files.contains(path)))
+            .chain(
+                data.read_files
+                    .iter()
+                    .chain(&session_reads)
+                    .map(|path| (path, false, true)),
+            );
+        let mut grants = BTreeMap::new();
+        for (raw, write, exact_file) in writable.chain(readonly) {
+            let Some((path, metadata)) = role_target(raw)? else {
+                continue;
+            };
+            if exact_file && (path != *raw || !metadata.is_file()) {
+                continue;
+            }
+            if stores.contains(&path) || deferred.contains(&path) {
+                continue;
+            }
+            if path.ancestors().skip(1).any(|p| stores.contains(p))
+                || write && path.ancestors().skip(1).any(|p| deferred.contains(p))
+            {
+                grants
+                    .entry(path)
+                    .and_modify(|w| *w |= write)
+                    .or_insert(write);
+            }
+        }
+        // Decide against the original hard controls before inserting any
+        // exception. A private-store exception can never undo a credential
+        // mask or a specific read-only control, including on its ancestors.
+        let hard_controls = self.mounts.clone();
+        for (path, writable) in grants {
+            if path
+                .ancestors()
+                .any(|p| hard_controls.get(p).is_some_and(|m| m.masks()))
+            {
+                continue;
+            }
+            let writable = writable
+                && !path
+                    .ancestors()
+                    .any(|p| hard_controls.get(p) == Some(&Mount::ReadOnly));
+            let nearest = path.ancestors().skip(1).find_map(|p| self.mounts.get(p));
+            if !writable
+                && nearest == Some(&Mount::WriteException)
+                && hard_controls.get(&path) != Some(&Mount::ReadOnly)
+            {
+                // A same-task session read is already covered by its writable I/O.
+                continue;
+            }
+            self.mounts.insert(
+                path,
+                if writable {
+                    Mount::WriteException
+                } else {
+                    Mount::ReadException
+                },
+            );
+        }
+
+        if let Some(WorkerGhFence::Canary { paths }) = &profile.worker_gh_fence {
+            for marker in paths {
+                let (marker, _) = existing_target(marker).map_err(|error| {
+                    format!(
+                        "cannot inspect worker-jail canary {}: {error}",
+                        marker.display()
+                    )
+                })?;
+                let dir = marker.parent().expect("canary has a directory");
+                // A hard mask on an ancestor must also fail the canary probe
+                // with EACCES, not hide the entire marker with ENOENT.
+                let anchor = dir
+                    .ancestors()
+                    .filter(|p| {
+                        matches!(
+                            self.mounts.get(*p),
+                            Some(Mount::EmptyDir | Mount::NoSearchDir)
+                        )
+                    })
+                    .last();
+                self.mounts
+                    .insert(anchor.unwrap_or(dir).to_path_buf(), Mount::NoSearchDir);
+            }
+        }
+        Ok(())
     }
 
     fn add(&mut self, path: &Path, mask: bool, absent: &str) -> Result<(), String> {
@@ -108,37 +272,58 @@ impl Snapshot {
     }
 
     fn guard_ancestors(&mut self) {
-        let mut planned = BTreeMap::new();
-        // BTreeMap orders a path before its descendants. An empty directory
-        // mask already blocks its children; binding one back would expose it.
+        let mut planned: BTreeMap<PathBuf, Mount> = BTreeMap::new();
+        // Paths sort before their descendants. Guard existing host directories,
+        // not the synthetic directories used to reach exceptions in private stores.
         for (path, mount) in std::mem::take(&mut self.mounts) {
-            if path
-                .ancestors()
-                .skip(1)
-                .any(|ancestor| planned.get(ancestor) == Some(&Mount::EmptyDir))
-            {
-                continue;
-            }
-            let mut ancestors = path
+            let ancestors = path
                 .ancestors()
                 .skip(1)
                 .take_while(|path| *path != Path::new("/"));
-            let below_read_only = ancestors
-                .clone()
-                .any(|ancestor| planned.get(ancestor) == Some(&Mount::ReadOnly));
-            if below_read_only && mount == Mount::Guard {
+            let nearest = ancestors.clone().find_map(|p| planned.get(p).copied());
+            if nearest.is_some_and(Mount::masks) {
                 continue;
             }
-            if !below_read_only {
-                for ancestor in ancestors.by_ref() {
-                    planned
-                        .entry(ancestor.to_path_buf())
-                        .or_insert(Mount::Guard);
+            if nearest == Some(Mount::PrivateDir)
+                && !matches!(
+                    mount,
+                    Mount::PrivateDir
+                        | Mount::ReadException
+                        | Mount::WriteException
+                        | Mount::NoSearchDir
+                )
+            {
+                continue;
+            }
+            if nearest.is_none_or(Mount::host_writable) {
+                for ancestor in ancestors {
+                    if planned.contains_key(ancestor) {
+                        break;
+                    }
+                    planned.insert(ancestor.to_path_buf(), Mount::Guard);
                 }
+            } else if mount == Mount::Guard {
+                continue;
             }
             planned.insert(path, mount);
         }
         self.mounts = planned;
+    }
+}
+
+fn role_target(path: &Path) -> Result<Option<(PathBuf, std::fs::Metadata)>, String> {
+    require_absolute(path)?;
+    match existing_target(path) {
+        Ok((target, _)) if target == Path::new("/") => Err(format!(
+            "cannot make the bubblewrap root a role mount: {}",
+            path.display()
+        )),
+        Ok(target) => Ok(Some(target)),
+        Err(error) if missing(&error) => Ok(None),
+        Err(error) => Err(format!(
+            "cannot inspect role mount {}: {error}",
+            path.display()
+        )),
     }
 }
 

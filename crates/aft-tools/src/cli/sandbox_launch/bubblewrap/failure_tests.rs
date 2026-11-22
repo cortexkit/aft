@@ -317,14 +317,22 @@ fn bwrap_failures_relaxed_fallback_runs_once_with_broad_access_and_full_report()
                 "{}\n{}",
                 r#"
 from pathlib import Path
-import sys
-credential, broad = sys.argv[-2:]
+import errno, os, sys
+credential, broad, parent = sys.argv[-3:]
 assert Path(credential).read_text() == 's5-disposable-secret'
 Path(broad).write_text('broad write allowed')
-del sys.argv[-2:]
+try:
+    os.kill(int(parent), 0)
+except OSError as error:
+    assert error.errno == errno.EPERM, error
+    print('outside_signal=denied', flush=True)
+else:
+    print('outside_signal=allowed', flush=True)
+del sys.argv[-3:]
 "#,
                 CHECK_FD_AND_EXIT
             );
+            let parent = std::process::id().to_string();
             let payload = [
                 "/usr/bin/python3",
                 "-I",
@@ -336,6 +344,7 @@ del sys.argv[-2:]
                 "78",
                 credential.to_str().unwrap(),
                 read_only.to_str().unwrap(),
+                parent.as_str(),
             ];
             let mut cmd = child("fallback", &profile, &marker, &payload);
             install_marker(&mut cmd, &fd_contents, 4);
@@ -354,6 +363,14 @@ del sys.argv[-2:]
                 "{stderr}"
             );
             assert!(!stderr.contains(UNAVAILABLE), "{stderr}");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let signal = stdout
+                .lines()
+                .find(|line| line.starts_with("outside_signal="));
+            super::roles_tests::assert_signal_report(
+                &stderr,
+                signal.expect("targeted signal probe"),
+            );
             for block in expected {
                 assert!(stderr.contains(&block), "missing {block} in {stderr}");
             }

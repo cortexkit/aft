@@ -93,7 +93,7 @@ pub(crate) use requirement::resolve_command_sandbox_spawn;
 pub use requirement::SandboxRequirement;
 #[cfg(unix)]
 use settings_grants::absolute_env_path;
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 use worker_reads::grant_worker_pool_reads;
 #[cfg(unix)]
 use worker_reads::{worker_cargo_configs, worker_container_names, worker_target_roots};
@@ -2291,10 +2291,10 @@ fn build_relaxed_profile(
     .into_iter()
     .flatten()
     {
-        // macOS workers already have their canonical checkout roots above.
+        // Workers already have their canonical checkout roots above.
         // Other workers' checkouts stay private; ancestor metadata does not
         // grant directory listings or access to their descendants.
-        if !cfg!(target_os = "macos") || !worker_jail_active() {
+        if !worker_jail_active() {
             stores
                 .read_allow
                 .push(data.join("cortexkit/alfonso/worktrees"));
@@ -2307,7 +2307,7 @@ fn build_relaxed_profile(
     stores
         .write_allow
         .extend([temp.to_path_buf(), task_io.to_path_buf()]);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if worker_jail_active() {
         grant_worker_pool_reads(home, roots, &mut stores, &mut write_deny);
     }
@@ -2315,12 +2315,16 @@ fn build_relaxed_profile(
     // protecting their control files or carving out sibling checkout denies.
     policy.absolute_floor = read_deny.clone();
     policy.private_stores = stores.clone();
-    // The macOS read limit hides the worker pool outside the worker's own
+    // The read limit hides the worker pool outside the worker's own
     // checkout, and the build-slot launcher sits in that pool.
-    #[cfg(target_os = "macos")]
+    #[cfg(target_os = "linux")]
+    let mut slot_files = Vec::new();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if worker_jail_active() {
         let slots = build_slots::worker_build_slot_grants(home, roots, &policy);
         build_slots::add_build_slot_reads(&slots, &mut stores, &mut write_deny);
+        #[cfg(target_os = "linux")]
+        slot_files.extend(slots.files);
         policy.private_stores = stores.clone();
     }
     let write_grants = policy.shell_grants(crate::access_policy::AccessOperation::Write);
@@ -2334,13 +2338,15 @@ fn build_relaxed_profile(
         .collect::<Result<Vec<_>, _>>()?;
     let mut writable = roots.to_vec();
     writable.extend(linked_git_grants(git_policies));
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     if worker_jail_active() {
         let targets = worker_target_roots(home, roots, &policy, &worker_cargo_configs(home, roots));
         stores.read_allow.extend(targets.iter().cloned());
         writable.extend(targets);
     }
     let files = linked_git_file_grants(git_policies);
+    #[cfg(target_os = "linux")]
+    let files = files.into_iter().chain(slot_files).collect::<Vec<_>>();
     stores.write_allow.extend(writable.iter().cloned());
     stores.write_allow.extend(files.iter().cloned());
     let mut checkout_denies = vec![home.join("Work")];
@@ -2383,6 +2389,12 @@ fn build_relaxed_profile(
         }
         write_deny.push(binary);
     }
+    #[cfg(target_os = "linux")]
+    if let Some(pin) = crate::pinned_executable::linux_task_pin().map_err(|e| e.to_string())? {
+        // The inner launcher and the task's shim use this exact image. The
+        // private cache that contains the image stays masked.
+        stores.read_files.push(pin);
+    }
     stores
         .read_allow
         .retain(|path| profile_candidate_exists(path));
@@ -2391,14 +2403,11 @@ fn build_relaxed_profile(
     stores
         .read_allow
         .extend(policy.shell_grants(crate::access_policy::AccessOperation::Read));
-    // The worker jail's gh-shim fence, as in the strict builder. Relaxed Linux
-    // grants all of `/` and enforces no deny, so there the fence is reported
-    // as unenforced instead; macOS relaxed enforces explicit denies.
+    // The worker jail's gh-shim fence, as in the Strict builder. On Linux the
+    // launcher reports it as unenforced if bubblewrap is unavailable.
     let jailed = worker_jail_active();
     let mut worker_gh_fence = None;
-    if jailed && cfg!(target_os = "linux") {
-        worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
-    } else if jailed {
+    if jailed {
         let dirs = crate::worker_jail_canary::prepare_homes(home, true)?;
         read_deny.extend(dirs.iter().cloned());
         write_deny.extend(dirs.iter().cloned());
@@ -13087,5 +13096,95 @@ mod worker_broker_floor_tests {
             .iter()
             .filter(|path| path.starts_with(&root))
             .all(|path| path.starts_with(&profile.temp_dir)));
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod bwrap_composition_fixture {
+    use super::*;
+
+    const SEED: &str = "disposable-composition-credential";
+
+    pub(crate) struct Fixture {
+        pub root: PathBuf,
+        pub scratch: PathBuf,
+        launcher: PathBuf,
+        credential: PathBuf,
+    }
+
+    impl Fixture {
+        pub(crate) fn new(root: &Path) -> Option<Self> {
+            let Some(launcher) = std::env::var_os("AFT_TEST_BWRAP_AFT") else {
+                eprintln!("skipped active composition oracle: AFT_TEST_BWRAP_AFT does not name a built aft binary");
+                return None;
+            };
+            let launcher = PathBuf::from(launcher).canonicalize().unwrap();
+            let root = root.canonicalize().unwrap();
+            let credential = root.join("fixture-home/.netrc");
+            let scratch = root.join("fixture-private/scratch");
+            std::fs::create_dir_all(credential.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(&scratch).unwrap();
+            std::fs::write(&credential, SEED).unwrap();
+            let f = Self {
+                root,
+                scratch,
+                launcher,
+                credential,
+            };
+            let output = std::process::Command::new("/bin/bash")
+                .current_dir(&f.root)
+                .args(["-c", &format!("test \"{}\" = '{SEED}'", f.lookup())])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "Off control could not read the seeded credential: {output:?}"
+            );
+            Some(f)
+        }
+
+        fn lookup(&self) -> &'static str {
+            "$(/bin/cat fixture-home/.netrc 2>/dev/null)"
+        }
+
+        pub(crate) fn oracle(&self) -> String {
+            format!(
+                "test \"{}\" != '{SEED}' || exit 73; printf 'credential-blocked\\n';",
+                self.lookup()
+            )
+        }
+
+        pub(crate) fn plan(&self) -> SpawnPlan {
+            let mut profile = SandboxProfile::build(
+                vec![self.root.clone()],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                self.scratch.clone(),
+            )
+            .unwrap();
+            profile.mode = SandboxMode::Standard;
+            profile.read_deny.push(self.credential.clone());
+            profile
+                .data_policy
+                .deny
+                .push(self.scratch.parent().unwrap().to_path_buf());
+            profile.data_policy.read_allow.push(self.scratch.clone());
+            profile.data_policy.write_allow.push(self.scratch.clone());
+            profile.linux_mounts = Some(crate::sandbox_profile::LinuxMountPolicy {
+                credential_masks: vec![self.credential.clone()],
+                ..Default::default()
+            });
+            SpawnPlan::launcher_for_test(profile, self.launcher.clone())
+        }
+
+        pub(crate) fn assert_report(text: &str) {
+            for expected in ["credential-blocked", "profile=standard backend=bwrap"] {
+                assert!(text.contains(expected), "missing {expected}: {text}");
+            }
+        }
     }
 }

@@ -40,8 +40,7 @@ pub(super) fn worker_build_slot_grants(
 /// profile has no separate jail grant lists: the launcher's directory and
 /// locks become read exceptions to the denied data folder, the locks also
 /// write exceptions, and the launcher itself stays write-denied.
-#[cfg(any(target_os = "macos", test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn add_build_slot_reads(
     grants: &WorkerJailGrants,
     stores: &mut crate::sandbox_profile::SandboxDataPolicy,

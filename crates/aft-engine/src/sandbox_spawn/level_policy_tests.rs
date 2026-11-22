@@ -339,10 +339,10 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
                 SandboxMode::Strict,
             ] {
                 set_role_modes(&ctx, mode, worker);
-                let canary_reads = usize::from(
-                    mode == SandboxMode::Strict
-                        || mode == SandboxMode::Standard && (!worker || !cfg!(target_os = "linux")),
-                );
+                // Standard now prepares both homes for workers on Linux too:
+                // bubblewrap can enforce the worker's canary deny.
+                let canary_reads =
+                    usize::from(matches!(mode, SandboxMode::Standard | SandboxMode::Strict));
                 let plan = crate::worker_jail_canary::with_test_preparation_home(
                     &account,
                     canary_reads,

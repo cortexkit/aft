@@ -494,6 +494,61 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bwrap_composition_remote_refusal_keeps_local_sandbox() {
+    use crate::sandbox_spawn::bwrap_composition_fixture::Fixture;
+    let dir = tempfile::tempdir().unwrap();
+    let Some(fixture) = Fixture::new(dir.path()) else {
+        return;
+    };
+    ensure_git_fixture(&fixture.root);
+    let daemon = daemon(Script::KnownRefused, "exec-remote/v1").await;
+    let registry = registry();
+    let task = registry
+        .spawn_remote(
+            launch(daemon.connection.clone()),
+            fixture.plan(),
+            &format!("{} printf local-proof", fixture.oracle()),
+            resolve_posix_shell(),
+            "session".into(),
+            fixture.root.clone(),
+            HashMap::new(),
+            HardKill::After(Duration::from_secs(30)),
+            None,
+            fixture.root.clone(),
+            TaskSlot::Background { max: 10 },
+            true,
+            false,
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+    let done = terminal(&registry, &task).await;
+    assert_eq!(done.exit_code, Some(0), "{}", done.output_preview);
+    assert!(
+        done.output_preview.contains("ran locally on"),
+        "{}",
+        done.output_preview
+    );
+    assert!(
+        done.output_preview.contains("remote refused: unreachable"),
+        "{}",
+        done.output_preview
+    );
+    assert!(
+        done.output_preview.contains("local-proof"),
+        "{}",
+        done.output_preview
+    );
+    Fixture::assert_report(&done.output_preview);
+    assert!(daemon
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|(_, req)| req["method"] == "exec.run"));
+}
+
 #[tokio::test]
 async fn memory_limit_delayed_fallback_keeps_submitted_cap_after_reload() {
     assert_delayed_fallback_cap(None).await;

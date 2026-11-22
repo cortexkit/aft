@@ -5,6 +5,8 @@ use std::process::Output;
 
 #[path = "failure_tests.rs"]
 mod failure_tests;
+#[path = "roles_tests.rs"]
+mod roles_tests;
 
 const SEED: &str = "s5-disposable-secret";
 
@@ -67,7 +69,7 @@ fn bwrap_core_snapshot_orders_guards_and_nested_masks_and_names_missing_targets(
         ..Default::default()
     };
     seed(&late);
-    let snapshot = Snapshot::take(&policy).unwrap();
+    let snapshot = Snapshot::take_policy(&policy).unwrap();
     assert_eq!(snapshot.mounts[&home.join(".config")], Mount::Guard);
     assert_eq!(snapshot.mounts[&git], Mount::ReadOnly);
     assert_eq!(snapshot.mounts[&credential], Mount::EmptyFile);
@@ -106,7 +108,7 @@ fn bwrap_core_strict_fallback_restores_checkout_relative_kube_mandatory_deny() {
         fallback_write_deny: vec![kube.clone()],
         ..Default::default()
     });
-    let snapshot = Snapshot::take(profile.linux_mounts.as_ref().unwrap()).unwrap();
+    let snapshot = Snapshot::take(&profile).unwrap();
     let inner = prepare_inner(profile.clone(), &snapshot);
     assert_eq!(snapshot.mounts[&kube], Mount::EmptyFile);
     assert!(inner.profile.write_deny.is_empty());
@@ -453,33 +455,31 @@ for name in [early, late, sibling]:
 }
 
 #[test]
-fn bwrap_core_standard_reports_only_missing_layers_after_snapshot() {
+fn bwrap_core_standard_reports_missing_controls_but_not_enforced_store_masks() {
     let root = tempfile::tempdir().unwrap();
     let mut profile = fixture(root.path(), SandboxMode::Standard);
     let hooks = root.path().join("checkout/.git/hooks");
     let elsewhere = root.path().join("private");
+    fs::create_dir(&elsewhere).unwrap();
     seed(&hooks.join("control"));
     profile.data_policy.deny.push(elsewhere.clone());
+    profile.data_policy.write_allow = profile.writable_roots.clone();
+    let absent = root.path().join("absent");
     profile.linux_mounts = Some(LinuxMountPolicy {
         read_only: vec![hooks.clone()],
-        deferred_read_only: vec![root.path().to_path_buf()],
+        deferred_read_only: vec![root.path().to_path_buf(), absent.clone()],
         ..Default::default()
     });
-    let snapshot = Snapshot::take(profile.linux_mounts.as_ref().unwrap()).unwrap();
+    let snapshot = Snapshot::take(&profile).unwrap();
     assert_eq!(snapshot.mounts[&hooks], Mount::ReadOnly);
-    assert_eq!(snapshot.mounts[root.path()], Mount::Guard);
+    assert_eq!(snapshot.mounts[root.path()], Mount::DeferredReadOnly);
+    assert_eq!(snapshot.mounts[&elsewhere], Mount::PrivateDir);
     let inner = prepare_inner(profile, &snapshot);
     assert_eq!(
         inner.unenforced,
-        [
-            format!(
-                "nested_write_deny_unenforced_on_bwrap:{}",
-                root.path().display()
-            ),
-            format!(
-                "private_store_mask_unenforced_on_bwrap:{}",
-                elsewhere.display()
-            ),
-        ]
+        [format!(
+            "standard_control_target_absent_on_bwrap:{}",
+            absent.display()
+        )]
     );
 }

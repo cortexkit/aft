@@ -14,7 +14,7 @@ const WORKER_ANCESTOR_CARGO_CONFIG_FILES: &[&str] = &[".cargo/config.toml", ".ca
 pub(super) const WORKER_CONTAINER_FILES: &[&str] = &[".cargo/alfonso-test-threads"];
 pub(super) const WORKER_CONTAINER_DIRS: &[&str] = &[".rust-build-seeds"];
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(super) fn worker_pool_read_files(home: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
     // Missing Cargo probes keep exact-file intent rather than becoming a
     // recursive directory grant if they appear before launch.
@@ -26,7 +26,7 @@ pub(super) fn worker_pool_read_files(home: &Path, roots: &[PathBuf]) -> Vec<Path
     worker_pool_read_paths(home, roots, &names)
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 pub(super) fn worker_pool_read_dirs(home: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
     worker_pool_read_paths(home, roots, WORKER_CONTAINER_DIRS)
         .into_iter()
@@ -34,7 +34,7 @@ pub(super) fn worker_pool_read_dirs(home: &Path, roots: &[PathBuf]) -> Vec<PathB
         .collect()
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", target_os = "linux", test))]
 fn worker_pool_read_paths(home: &Path, roots: &[PathBuf], names: &[&str]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     for data in [
@@ -139,14 +139,13 @@ pub(super) fn worker_target_roots(
     roots
 }
 
-/// Adds a macOS worker's read-only exceptions above its own checkout to a data
+/// Adds a worker's read-only exceptions above its own checkout to a data
 /// policy: the exact Cargo and container files, and the `.rust-build-seeds`
 /// directories (prebuilt dependency outputs a new worktree's build copies from)
 /// read recursively. Each path is also denied for writing. The links beside
 /// the checkout get metadata reads only, so lookups can follow them (see
 /// [`worker_container_links`]).
-#[cfg(any(target_os = "macos", test))]
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) fn grant_worker_pool_reads(
     home: &Path,
     roots: &[PathBuf],
@@ -159,6 +158,7 @@ pub(super) fn grant_worker_pool_reads(
     let dirs = worker_pool_read_dirs(home, roots);
     stores.read_allow.extend(dirs.iter().cloned());
     write_deny.extend(dirs);
+    #[cfg(target_os = "macos")]
     stores
         .read_metadata_allow
         .extend(worker_container_links(home, roots));

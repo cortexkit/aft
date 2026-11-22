@@ -156,7 +156,7 @@ fn apply_with_write_policy(
 
 const MAX_SESSION_READ_TASKS: usize = 500;
 
-fn session_task_read_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
+pub(super) fn session_task_read_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
     use aft::bash_background::persistence::{
         readable_task_file_names, validate_task_id, TaskLayout,
     };

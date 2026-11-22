@@ -422,9 +422,20 @@ fn scope_spawn(
     limit: super::super::HardKill,
     cap: Option<u64>,
 ) -> String {
+    scope_spawn_with_plan(r, root, SpawnPlan::Unsandboxed, command, limit, cap)
+}
+
+fn scope_spawn_with_plan(
+    r: &BgTaskRegistry,
+    root: &Path,
+    plan: SpawnPlan,
+    command: &str,
+    limit: super::super::HardKill,
+    cap: Option<u64>,
+) -> String {
     r.configure_task_scope_runtime(true, Duration::from_secs(86400));
     r.spawn_with_shell_in_slot_typed(
-        SpawnPlan::Unsandboxed,
+        plan,
         command,
         super::super::BashShell::Bash,
         PathBuf::from("/bin/bash"),
@@ -511,6 +522,77 @@ fn task_scope_memory_uses_the_task_scope() {
     assert_eq!(max.trim(), "67108864");
     assert_eq!(swap.trim(), "0");
     assert_eq!(group.trim(), "1");
+}
+
+#[test]
+#[ignore = "requires active bubblewrap and a systemd user manager with the memory controller"]
+fn bwrap_composition_memory_uses_the_real_task_scope() {
+    use crate::sandbox_spawn::bwrap_composition_fixture::Fixture;
+    let root = tempfile::tempdir().unwrap();
+    let Some(fixture) = Fixture::new(root.path()) else {
+        return;
+    };
+    require_manager();
+    let r = BgTaskRegistry::default();
+    let id = scope_spawn_with_plan(
+        &r,
+        &fixture.root,
+        fixture.plan(),
+        &format!(
+            "{} printf '%s\\n' \"$$\" > payload-pid; exec sleep 60",
+            fixture.oracle()
+        ),
+        super::super::HardKill::Default,
+        Some(64),
+    );
+    let _stop = StopOnDrop::new(id.clone());
+    let task = r.task(&id).unwrap();
+    let pid_file = fixture.root.join("payload-pid");
+    until(|| std::fs::read_to_string(&pid_file).is_ok_and(|s| !s.is_empty()));
+    let pid = std::fs::read_to_string(&pid_file)
+        .unwrap()
+        .trim()
+        .parse::<u32>()
+        .unwrap();
+    let policy = task
+        .lock_state()
+        .unwrap()
+        .metadata
+        .memory_policy
+        .clone()
+        .unwrap();
+    let path = policy
+        .cgroup
+        .expect("expected kernel cap, not the userspace RSS fallback");
+    let member = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+    assert!(
+        super::super::task_scope::matches_membership(&id, &member),
+        "{member}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("memory.max"))
+            .unwrap()
+            .trim(),
+        "67108864"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("memory.swap.max"))
+            .unwrap()
+            .trim(),
+        "0"
+    );
+    assert_eq!(
+        std::fs::read_to_string(path.join("memory.oom.group"))
+            .unwrap()
+            .trim(),
+        "1"
+    );
+    r.kill(&id, "task-scope").unwrap();
+    Fixture::assert_report(
+        &r.status(&id, "task-scope", None, None, 0)
+            .unwrap()
+            .output_preview,
+    );
 }
 
 #[test]

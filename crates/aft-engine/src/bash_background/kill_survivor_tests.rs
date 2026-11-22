@@ -1309,3 +1309,129 @@ fn timeout_kill_reports_a_root_owned_survivor_through_sudo() {
         Some(summary.as_str())
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bwrap_composition_background_pty_kill_and_per_call_socket() {
+    use crate::sandbox_spawn::bwrap_composition_fixture::Fixture;
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+
+    let root = tempfile::tempdir().unwrap();
+    let Some(fixture) = Fixture::new(root.path()) else {
+        return;
+    };
+    let listener = UnixListener::bind(fixture.scratch.join("call.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let command = format!(
+        "{}\n{}",
+        fixture.oracle(),
+        r#"
+        printf 'terminal-size='; stty size || exit 81
+        touch pty-ready
+        IFS= read -r line || exit 82
+        printf 'payload-received:%s\n' "$line"
+        /usr/bin/python3 -I -B -c '
+import socket
+with socket.socket(socket.AF_UNIX) as call:
+    call.settimeout(5)
+    call.connect("fixture-private/scratch/call.sock")
+    call.sendall(b"call-request")
+    call.shutdown(socket.SHUT_WR)
+    assert call.recv(64) == b"call-response"
+' || exit 83
+        printf 'socket-transaction-completed\n'
+        trap '' TERM
+        sleep 60 &
+        printf '%s %s\n' "$$" "$!" > task-children.tmp
+        mv task-children.tmp task-children
+        wait
+    "#
+    );
+    let registry = registry();
+    let task = registry
+        .spawn_pty(
+            fixture.plan(),
+            &command,
+            SESSION.to_string(),
+            fixture.root.clone(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(30)),
+            None,
+            fixture.root.clone(),
+            10,
+            true,
+            false,
+            Some(fixture.root.clone()),
+            24,
+            80,
+        )
+        .unwrap();
+    let pgid = task_pgid(&registry, &task);
+    let _reap = ReapGroup(pgid);
+    wait_for_file(
+        &fixture.root.join("pty-ready"),
+        "sandboxed PTY did not reach the input gate",
+    );
+    let input = b"from-engine\n";
+    assert_eq!(
+        registry.write_pty(&task, SESSION, input).unwrap(),
+        input.len()
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut stream = loop {
+        match listener.accept() {
+            Ok((stream, _)) => break stream,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "sandboxed PTY did not connect to the per-call socket"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("per-call socket accept: {error}"),
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut request = Vec::new();
+    stream.read_to_end(&mut request).unwrap();
+    assert_eq!(request, b"call-request");
+    stream.write_all(b"call-response").unwrap();
+    drop(stream);
+    let children = fixture.root.join("task-children");
+    wait_for_file(&children, "sandboxed task did not start its child");
+    let contents = std::fs::read_to_string(children).unwrap();
+    let pids = contents
+        .split_whitespace()
+        .map(|s| s.parse::<i32>().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(pids.len(), 2);
+    let live = live_process_group_members(pgid).unwrap();
+    assert!(pids
+        .iter()
+        .all(|pid| live.members.iter().any(|member| member.pid == *pid as u32)));
+    registry.kill(&task, SESSION).unwrap();
+    for pid in pids {
+        wait_for_exit(pid, "task process or its child survived bash_kill");
+    }
+    let snapshot = registry.status(&task, SESSION, None, None, 0).unwrap();
+    assert_eq!(snapshot.info.mode, BgMode::Pty);
+    assert_eq!(snapshot.info.status, BgTaskStatus::Killed);
+    let transcript = std::fs::read_to_string(snapshot.output_path.unwrap()).unwrap();
+    Fixture::assert_report(&transcript);
+    for expected in [
+        "terminal-size=24 80",
+        "payload-received:from-engine",
+        "socket-transaction-completed",
+    ] {
+        assert!(
+            transcript.contains(expected),
+            "missing {expected}: {transcript}"
+        );
+    }
+}

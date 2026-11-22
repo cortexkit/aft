@@ -196,36 +196,31 @@ fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
         let policy = ctx.access_policy("").unwrap();
         let strict = policy.compile_shell(temp.clone(), vec![], vec![]).unwrap();
         let relaxed_profile = |jailed: bool| {
-            crate::worker_jail_canary::with_test_preparation_home(
-                &home,
-                usize::from(!jailed || cfg!(target_os = "macos")),
-                || {
-                    with_worker_jail(jailed, || {
-                        build_relaxed_profile(
-                            &ctx,
-                            &home,
-                            &[root.clone()],
-                            &[resolve_git_policy(&root).unwrap()],
-                            &store,
-                            &task_io,
-                            &temp,
-                        )
-                        .unwrap()
-                    })
-                },
-            )
+            crate::worker_jail_canary::with_test_preparation_home(&home, 1, || {
+                with_worker_jail(jailed, || {
+                    build_relaxed_profile(
+                        &ctx,
+                        &home,
+                        &[root.clone()],
+                        &[resolve_git_policy(&root).unwrap()],
+                        &store,
+                        &task_io,
+                        &temp,
+                    )
+                    .unwrap()
+                })
+            })
         };
         let relaxed = relaxed_profile(true);
         let head = relaxed_profile(false);
         assert!(head.data_policy.read_allow.contains(&worktrees));
-        assert_eq!(
-            relaxed.data_policy.read_allow.contains(&worktrees),
-            !cfg!(target_os = "macos"),
-            "only macOS worker profiles narrow the pool read exception"
+        assert!(
+            !relaxed.data_policy.read_allow.contains(&worktrees),
+            "workers get exact grants rather than the pool read exception"
         );
         assert!(!strict.data_policy.read_allow.contains(&worktrees));
         assert!(head.data_policy.read_files.is_empty());
-        if cfg!(target_os = "macos") {
+        if cfg!(any(target_os = "macos", target_os = "linux")) {
             assert!(relaxed.data_policy.read_files.contains(&cargo_config));
             assert!(relaxed.data_policy.read_allow.contains(&target));
             assert!(relaxed.data_policy.write_allow.contains(&target));
