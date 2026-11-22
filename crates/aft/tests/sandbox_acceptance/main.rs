@@ -24,7 +24,7 @@ const LEVELS: [SandboxMode; 4] = [
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes"]
 fn role_matrix_credentials_head() {
-    isolated("role_matrix_credentials_head", |root| {
+    isolated("role_matrix_credentials_head", true, |root| {
         credentials(root, false)
     });
 }
@@ -32,7 +32,7 @@ fn role_matrix_credentials_head() {
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes"]
 fn role_matrix_credentials_worker() {
-    isolated("role_matrix_credentials_worker", |root| {
+    isolated("role_matrix_credentials_worker", true, |root| {
         credentials(root, true)
     });
 }
@@ -40,20 +40,20 @@ fn role_matrix_credentials_worker() {
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes with outbound HTTPS"]
 fn role_matrix_https_head() {
-    isolated("role_matrix_https_head", |root| https(root, false));
+    isolated("role_matrix_https_head", false, |root| https(root, false));
 }
 
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes with outbound HTTPS"]
 fn role_matrix_https_worker() {
-    isolated("role_matrix_https_worker", |root| https(root, true));
+    isolated("role_matrix_https_worker", false, |root| https(root, true));
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "run only where the stock bubblewrap namespace probe fails"]
 fn stock_landlock_fallback() {
-    isolated("stock_landlock_fallback", |root| {
+    isolated("stock_landlock_fallback", false, |root| {
         let shell = launch::Shell::new(root, false);
         let checkout_file = root.join("project/checkout-write-control");
         let outside_file = root.join("outside-write-control");
@@ -88,7 +88,7 @@ fn production_per_call_git_proxy() {
     panic!("the production git proxy is not yet available");
 }
 
-fn isolated(test_name: &str, run: impl FnOnce(&Path)) {
+fn isolated(test_name: &str, credential_env: bool, run: impl FnOnce(&Path)) {
     // Role resolution reads the daemon's environment. Set it only in a fresh
     // process; neither Cargo's HOME nor another test's credentials are fixtures.
     let Some(root) = std::env::var_os(HOME_PROCESS).map(std::path::PathBuf::from) else {
@@ -96,7 +96,8 @@ fn isolated(test_name: &str, run: impl FnOnce(&Path)) {
         let base = root.path().canonicalize().unwrap();
         std::fs::create_dir(base.join("home")).unwrap();
         std::fs::create_dir(base.join("project")).unwrap();
-        let output = Command::new(std::env::current_exe().unwrap())
+        let mut process = Command::new(std::env::current_exe().unwrap());
+        process
             .args([test_name, "--exact", "--ignored", "--nocapture"])
             .current_dir(&base)
             .env_clear()
@@ -113,14 +114,21 @@ fn isolated(test_name: &str, run: impl FnOnce(&Path)) {
             .env("XDG_CACHE_HOME", base.join("xdg/cache"))
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("SSH_AUTH_SOCK", base.join("a"))
-            .env("AWS_SHARED_CREDENTIALS_FILE", base.join("operator/aws"))
-            .env(
-                "KUBECONFIG",
-                std::env::join_paths([base.join("operator/kube"), "kube-relative/config".into()])
+            .env("GIT_TERMINAL_PROMPT", "0");
+        if credential_env {
+            process
+                .env("SSH_AUTH_SOCK", base.join("a"))
+                .env("AWS_SHARED_CREDENTIALS_FILE", base.join("operator/aws"))
+                .env(
+                    "KUBECONFIG",
+                    std::env::join_paths([
+                        base.join("operator/kube"),
+                        "kube-relative/config".into(),
+                    ])
                     .unwrap(),
-            )
+                );
+        }
+        let output = process
             .output()
             .expect("re-execute acceptance test with a disposable daemon HOME");
         let stdout = String::from_utf8_lossy(&output.stdout);
