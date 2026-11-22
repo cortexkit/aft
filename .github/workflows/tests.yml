@@ -251,7 +251,8 @@ jobs:
           cargo --version
           inventory="$RUNNER_TEMP/task-scope-inventory.txt"
           output="$RUNNER_TEMP/task-scope-tests.txt"
-          cargo test --features test-hooks -p agent-file-tools -p aft-engine --lib -- task_scope --ignored --list > "$inventory"
+          args=(--features test-hooks -p agent-file-tools -p aft-engine -p aft-tools --lib -- task_scope --ignored)
+          cargo test "${args[@]}" --list > "$inventory"
           python3 - "$inventory" <<'PY'
           import pathlib, sys
           tests = [line for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.endswith(': test')]
@@ -261,7 +262,7 @@ jobs:
           PY
           # These tests assert manager availability; --ignored opts them in,
           # rather than treating an unavailable manager as a passing skip.
-          if cargo test --features test-hooks -p agent-file-tools -p aft-engine --lib -- task_scope --ignored --test-threads=1 --nocapture > "$output" 2>&1; then
+          if cargo test "${args[@]}" --test-threads=1 --nocapture > "$output" 2>&1; then
             cat "$output"
           else
             cat "$output"

@@ -141,22 +141,12 @@ use crate::semantic_index::{
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
 use checkout_gaps::CheckoutSemanticGaps;
+use extensions::try_read_with_budget;
 pub use first_text_wait::first_text_index_wait_needed;
 use first_text_wait::wait_for_first_text_index;
 
 const DEFAULT_TOP_K: usize = 10;
 
-/// [`crate::search_index::try_read_with_budget`], timed as a readiness wait:
-/// every artifact read the search makes through it retries a contended lock
-/// in 1 ms sleeps until its budget runs out.
-fn try_read_with_budget<T>(
-    lock: &std::sync::RwLock<T>,
-    budget: Duration,
-) -> Option<std::sync::RwLockReadGuard<'_, T>> {
-    waits::timed(waits::SearchWait::Readiness, || {
-        crate::search_index::try_read_with_budget(lock, budget)
-    })
-}
 /// Semantic candidate admission is ranking policy, not a public response-size limit.
 /// Keeping it fixed prevents page-cap changes from rewriting the fused list.
 pub const SEMANTIC_ENUMERATION_LIMIT: usize = 100;

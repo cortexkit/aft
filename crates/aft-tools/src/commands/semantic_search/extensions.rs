@@ -1,16 +1,29 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLockReadGuard};
+use std::time::Duration;
 
 use serde::Serialize;
 
 use super::plan_table::{SearchLaneKind, SearchShape};
-use super::{LaneExecution, LaneInput, SearchLane};
+use super::{waits, LaneExecution, LaneInput, SearchLane};
 use crate::data_layer::status::SemanticIndexStatus;
 use crate::parser::SymbolCache;
 use crate::query_shape::{classify, looks_like_regex, QueryKind};
 pub use crate::search_b2::contracts::{QueryFacts, RawQuery, Span, Token, TokenVariant};
 use crate::search_index::{IndexStatus, SearchIndexSnapshot};
 use crate::semantic_index::SemanticIndex;
+
+/// [`crate::search_index::try_read_with_budget`], timed as a readiness wait:
+/// every artifact read the search makes through it retries a contended lock
+/// in 1 ms sleeps until its budget runs out.
+pub(super) fn try_read_with_budget<T>(
+    lock: &std::sync::RwLock<T>,
+    budget: Duration,
+) -> Option<std::sync::RwLockReadGuard<'_, T>> {
+    waits::timed(waits::SearchWait::Readiness, || {
+        crate::search_index::try_read_with_budget(lock, budget)
+    })
+}
 
 /// Result of waiting for the first search index to become ready, with a time bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
