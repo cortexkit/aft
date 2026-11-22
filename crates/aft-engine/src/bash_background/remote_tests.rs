@@ -497,6 +497,7 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn bwrap_composition_remote_refusal_keeps_local_sandbox() {
+    use crate::bash_background::{HardKill, TaskSlot};
     use crate::sandbox_spawn::bwrap_composition_fixture::Fixture;
     let dir = tempfile::tempdir().unwrap();
     let Some(fixture) = Fixture::new(dir.path()) else {
