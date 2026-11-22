@@ -93,7 +93,7 @@ fn retained_aft_engines() {
             .paths()
             .iter()
             .filter(|entry| {
-                entry.path.starts_with(b"crates/aft/src/") && entry.path.ends_with(b".rs")
+                entry.path.starts_with(b"crates/aft-tools/src/") && entry.path.ends_with(b".rs")
             })
             .take(40)
             .map(|entry| entry.path.clone())
@@ -159,7 +159,7 @@ fn retained_aft_engines() {
                         // Exclude engine-keeper censuses done by refresh from rollup component CPU.
                         let steps = STEPS.with(|steps| steps.borrow_mut().take());
                         for checkout in checkouts.iter().take(EDITING) {
-                            let relative = b"crates/aft/src/lib.rs".to_vec();
+                            let relative = b"crates/aft-tools/src/lib.rs".to_vec();
                             let path = checkout
                                 .root()
                                 .join(std::str::from_utf8(&relative).unwrap());

@@ -190,7 +190,7 @@ async fn cases(cases: &[&str]) {
             .args([
                 "--exact",
                 concat!(module_path!(), "::cold_redemption_probe_child")
-                    .trim_start_matches("aft::"),
+                    .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::")),
                 "--nocapture",
             ])
             .env(

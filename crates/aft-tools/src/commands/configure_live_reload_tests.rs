@@ -100,7 +100,7 @@ fn macos_full_sync_tracks_configure_and_reload_not_context_construction() {
         module_path!(),
         "::macos_full_sync_tracks_configure_and_reload_not_context_construction"
     )
-    .trim_start_matches("aft::");
+    .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::"));
     const CHILD: &str = "AFT_TEST_MACOS_FULL_SYNC_CHILD";
     // Publications from unrelated tests must not race this process-wide policy.
     if std::env::var_os(CHILD).is_none() {
@@ -154,7 +154,7 @@ fn prepared_bind_watches_keep_the_captured_source() {
         module_path!(),
         "::prepared_bind_watches_keep_the_captured_source"
     )
-    .trim_start_matches("aft::");
+    .trim_start_matches(concat!(env!("CARGO_CRATE_NAME"), "::"));
     const CHILD: &str = "AFT_TEST_PREPARED_WATCH_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())

@@ -3325,7 +3325,7 @@ async fn agent_commands_runon_never_declares_a_local_root() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                name.strip_prefix("aft::").unwrap_or(name),
+                name.strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::")).unwrap_or(name),
                 "--nocapture",
             ])
             .env(CHILD, "1")

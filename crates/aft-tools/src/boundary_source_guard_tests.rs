@@ -184,7 +184,7 @@ impl Guard {
 
 #[test]
 fn tools_module_tree_does_not_reference_subc() {
-    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let src = crate::test_support::manifest_dir().join("src");
     let forbidden = Guard::scan(&src);
     assert!(
         forbidden.is_empty(),

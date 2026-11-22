@@ -205,7 +205,7 @@ pub fn collect_fence_rust_files(root: &Path) -> Vec<PathBuf> {
 
     // Audit the direct search-stage files and the shared search-state primitives.
     for relative_dir in [
-        "crates/aft/src/commands/semantic_search",
+        "crates/aft-tools/src/commands/semantic_search",
         "crates/aft-engine/src/search_state",
     ] {
         let directory = root.join(relative_dir);
