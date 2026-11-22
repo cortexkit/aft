@@ -313,6 +313,9 @@ pub(in crate::subc) fn initialize_task_cleanup(ctx: &AppContext, storage_dir: &P
 }
 
 pub(in crate::subc) fn legacy_catalog(control: &readiness::DaemonControl, path: Option<&Path>) {
+    // The ready flip publishes these filtered roles in the same update.
+    // Daemons without catalog.update ignore HELLO's not-ready flag and
+    // keep its unfiltered catalog; dispatch still checks disabled_tools.
     let disabled = crate::subc_config::catalog_disabled_tools(path);
     control.set_catalog(build_manifest_without(&disabled).provides);
 }
