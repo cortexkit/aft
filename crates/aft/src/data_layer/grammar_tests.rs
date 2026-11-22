@@ -37,6 +37,11 @@ fn write(root: &Path, path: &str, bytes: impl AsRef<[u8]>) -> PathBuf {
 /// test transport) through a staged sibling and a rename. `fs::write`
 /// truncates first, and a poll landing in that window reads an empty clock
 /// and panics the grammar refresh thread.
+#[cfg(all(
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
 fn replace_polled(root: &Path, path: &str, bytes: impl AsRef<[u8]>) {
     let path = root.join(path);
     let mut staged = path.clone().into_os_string();
