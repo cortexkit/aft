@@ -7663,30 +7663,29 @@ async fn consent_completed_and_failed_calls_close_scoped_routes() {
     );
     let transport = Arc::new(SubcConsentTransport::new(daemon.path.clone()));
     *transport.consumer.lock().await = Some(Arc::clone(&consumer));
-    let call = |method| ConsentCall {
+    let call = |method, timeout_ms| ConsentCall {
         scope: selector(&stamp("worker", "worker", Some("head"))),
         project_root: PathBuf::from("/project"),
         session: "consent-close".into(),
         method,
         params: json!({}),
-        timeout: Duration::from_millis(100),
+        timeout: Duration::from_millis(timeout_ms),
     };
+    // Only the timeout case uses a short deadline: on a busy CI machine,
+    // opening the route alone can take longer than 100 ms.
+    let send = |method, timeout_ms| transport.clone().send(call(method, timeout_ms));
     assert_eq!(
-        transport
-            .clone()
-            .send(call("consent.request"))
-            .await
-            .unwrap(),
+        send("consent.request", 30_000).await.unwrap(),
         json!({"ok":true})
     );
     daemon.wait_closed();
     assert!(matches!(
-        transport.clone().send(call("consent.test_error")).await,
+        send("consent.test_error", 30_000).await,
         Err(ConsentError::Refused { .. })
     ));
     daemon.wait_closed();
     assert!(matches!(
-        transport.clone().send(call("consent.test_timeout")).await,
+        send("consent.test_timeout", 100).await,
         Err(ConsentError::Unavailable(_))
     ));
     daemon.wait_closed();
