@@ -1,0 +1,17 @@
+name: MOTOR macOS hold
+description: Acquire or release exclusive access to the Mac mini for an AFT CI job
+inputs:
+  phase:
+    description: acquire or release
+    required: true
+  shard:
+    description: Matrix shard, when multiple jobs share a job ID
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        AFT_HOLD_PHASE: ${{ inputs.phase }}
+        AFT_HOLD_SHARD: ${{ inputs.shard }}
+      run: python3 -B "$GITHUB_WORKSPACE/scripts/ci/macos-hold.py" "$AFT_HOLD_PHASE" --shard "$AFT_HOLD_SHARD"

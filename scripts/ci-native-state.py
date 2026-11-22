@@ -14,6 +14,9 @@ import time
 from typing import Union
 
 
+DEFAULT_TARGET_MAX_GIB = 50
+
+
 def run_directory(root: Path, run_id: str, attempt: str) -> Path:
     if not re.fullmatch(r"[0-9]+", run_id) or not re.fullmatch(r"[0-9]+", attempt):
         raise ValueError("CI state requires a numeric workflow run ID and attempt")
@@ -192,11 +195,11 @@ def target_bytes(target: Path) -> int:
     return total
 
 
-def clean_oversized_target(target: Path) -> None:
+def clean_oversized_target(target: Path, target_max_gib: int) -> None:
     if os.environ.get("RUNNER_ENVIRONMENT") != "self-hosted":
         return
     size = target_bytes(target)
-    if size > 50 * 1024**3:
+    if size > target_max_gib * 1024**3:
         print(f"CI shared target size before cleaning: {size / 1024**3:.1f} GiB ({size} bytes)", flush=True)
         # Cargo owns the dependency graph and fingerprints. Removing the whole
         # target is safe; deleting apparently old deps individually is not.
@@ -252,11 +255,11 @@ def refresh_line_ending_drift(checkout: Path) -> None:
         print(f"  {path.decode('utf-8', 'replace')}")
 
 
-def setup(root: Path, run_dir: Path) -> None:
+def setup(root: Path, run_dir: Path, target_max_gib: int = DEFAULT_TARGET_MAX_GIB) -> None:
     refresh_line_ending_drift(Path.cwd())
     target = root / "target"
     target.mkdir(parents=True, exist_ok=True)
-    clean_oversized_target(target)
+    clean_oversized_target(target, target_max_gib)
     target.mkdir(parents=True, exist_ok=True)
     run_dir.mkdir(parents=True, exist_ok=True)
     attempt = os.environ.get("GITHUB_RUN_ATTEMPT", "1")
@@ -288,7 +291,10 @@ def main() -> None:
     run_dir = run_directory(root, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"])
     cleanup_processes(root)
     if phase == "setup":
-        setup(root, run_dir)
+        target_max_gib = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_TARGET_MAX_GIB
+        if target_max_gib <= 0:
+            raise ValueError("CI shared target cap must be a positive number of GiB")
+        setup(root, run_dir, target_max_gib)
     elif phase == "cleanup":
         job = os.environ.get("AFT_CI_JOB_DIR")
         if job and Path(job).parent == run_dir:
