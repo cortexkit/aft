@@ -56,6 +56,8 @@ pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
 pub use aft_engine::access_policy;
 #[cfg(test)]
 mod access_policy_tests;
+#[cfg(test)]
+mod boundary_source_guard_tests;
 pub(crate) use aft_base::agent_commands;
 pub use aft_base::alert_records;
 pub use aft_engine::agent_child_env;

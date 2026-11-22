@@ -212,6 +212,7 @@ mod call_policy;
 pub(crate) mod call_yield;
 mod carrier_read_only;
 pub(crate) mod lower_hooks;
+pub use lower_hooks::register_tool_callbacks;
 #[cfg(test)]
 mod tool_result_tests;
 // The grant tests run real shell commands, which need a POSIX shell.

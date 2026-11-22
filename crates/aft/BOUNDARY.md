@@ -56,6 +56,7 @@ The daemon may call the tools; the tools do not depend on the daemon. This inven
 | `commands::configure::handle_cache_recovery` | function | Public API | Configure and daemon standing recovery use one cache recovery procedure. |
 | `commands::configure::ignore_rules_load_pending` | function | Public API | The daemon and configure tests determine whether initial ignore rules are still unpublished. |
 | `commands::configure::load_ignore_rules_if_unpublished` | function | Public API | The daemon uses the same initial publication operation exercised by configure tests. |
+| `commands::edit_match::register_edit_no_match_reporter` | function | Hook | The edit handlers report failed matches without owning the daemon's display scope. |
 | `commands::delete_file::handle_delete_deferred_with_restriction` | function | Public API | The dispatcher and daemon both pass a transport-owned delete restriction. |
 | `commands::inspect::handle_inspect_deferred_with_reply_deadline` | function | Public API | Normal and daemon inspect calls use the same deferred handler with transport timing. |
 | `commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline` | function | Public API | Normal and daemon navigation share the deferred handler and can supply an earlier deadline. |
@@ -64,6 +65,8 @@ The daemon may call the tools; the tools do not depend on the daemon. This inven
 | `commands::memory_census::render_memory_census_with_roots` | function | Public API | Tools and daemon health render the same census while choosing their own row cache. |
 | `commands::semantic_search::first_text_index_wait_needed` | function | Public API | The search handler and daemon both use the same first-index readiness check. |
 | `commands::semantic_search::handle_first_index_search_deferred` | function | Public API | The daemon calls the same timed deferred path exercised by the search handler tests. |
+| `response_finalize::DRIFTING` | const | Public API | Repeat reminders and the daemon notice catalogue share the registered template ID. |
+| `response_finalize::IDENTICAL` | const | Public API | Repeat reminders and the daemon notice catalogue share the registered template ID. |
 | `response_finalize::finalize_redisplayed_bash_response` | function | Public API | Daemon redisplay uses the finalization order pinned by the tools' output-cap tests. |
 | `response_finalize::finalize_tool_response_with_visibility` | function | Public API | The regular finalizer and daemon can supply the applicable bash visibility. |
 | `response_finalize::MAX_RESULT_BYTES` | const | Public API | The read handler and daemon encoder enforce the same wire-size limit. |

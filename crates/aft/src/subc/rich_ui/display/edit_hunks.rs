@@ -5,6 +5,11 @@ use similar::{ChangeTag, DiffTag};
 use crate::patch::matcher::{self, NearestMissSearch};
 use std::path::Path;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static NO_MATCH_CAPTURES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 pub(crate) fn capture_no_match(path: &Path, source: &str, sought: &str, index: usize) {
     super::ACTIVE.with(|slot| {
         let active = slot.borrow();
@@ -27,6 +32,8 @@ pub(crate) fn capture_no_match(path: &Path, source: &str, sought: &str, index: u
             super::records::cut_detail(body, crate::edit::DIFF_RESPONSE_BUDGET)
         });
         capture.file_snapshot = Some((record, detail));
+        #[cfg(test)]
+        NO_MATCH_CAPTURES.with(|count| count.set(count.get() + 1));
     });
 }
 

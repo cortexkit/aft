@@ -1,6 +1,16 @@
 //! Install the optional daemon services declared by lower layers before serving routes.
 
+/// Install the tool callbacks shared by standalone and attached startup. The
+/// edit reporter only captures details while a daemon display scope is active.
+#[doc(hidden)]
+pub fn register_tool_callbacks() {
+    crate::commands::edit_match::register_edit_no_match_reporter(
+        super::rich_ui::display::edit_no_match,
+    );
+}
+
 pub(crate) fn register() {
+    register_tool_callbacks();
     crate::reader_floor::register_cache_hooks();
     crate::commands::configure::register_runtime_hooks();
     crate::bash_background::frames::register(crate::bash_background::frames::Hooks {

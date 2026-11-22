@@ -7,8 +7,14 @@ use std::path::Path;
 
 use serde_json::Value;
 
+use crate::bash_rewrite::notices::{self, Notice};
 use crate::context::AppContext;
 use crate::protocol::Response;
+
+/// Registered runner notice ID for repeated calls with identical output.
+pub const IDENTICAL: &str = "aft.repeat_call.identical";
+/// Registered runner notice ID for repeated calls whose output drifts.
+pub const DRIFTING: &str = "aft.repeat_call.drifting";
 
 fn cap_response_text(response: &mut Response, ctx: &AppContext, session: &str, tool: &str) {
     if response.data.get("text").is_some_and(Value::is_string) {
@@ -49,7 +55,7 @@ pub fn append_repeat_breaker_reminder(
         )
     };
     let reminder = format!("<system-reminder>\n{observation} {instruction}\n</system-reminder>");
-    crate::subc::runner_notices::notice_templates::append_text(text, &reminder);
+    notices::append_text(text, &reminder);
     log::info!(
         "repeat_breaker fired session={} tool={} count={} span_ms={}",
         session_id,
@@ -111,7 +117,7 @@ pub fn finalize_response_with_bg_completions(
     attach_command: &str,
     allow_bg_completions: bool,
 ) {
-    crate::subc::runner_notices::notice_templates::deliver(response, None);
+    notices::deliver(response, None);
     let (publish, counts) = finalize_prefix(
         response,
         ctx,
@@ -347,11 +353,8 @@ fn attach_alert_block(
     let Some(alert) = alerts.finalize(session_id, dispatch_root, command) else {
         return;
     };
-    response
-        .notices
-        .items
-        .push(crate::subc::runner_notices::notice_templates::Notice::diagnostic(alert.text));
-    crate::subc::runner_notices::notice_templates::deliver(response, None);
+    response.notices.items.push(Notice::diagnostic(alert.text));
+    notices::deliver(response, None);
 }
 
 pub enum DispatchOutcome {

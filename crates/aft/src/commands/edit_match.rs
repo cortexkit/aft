@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::access_policy::{AccessOperation, GrantKind};
 use crate::backup::CapturedRegularFile;
@@ -12,6 +13,21 @@ use crate::edit::{self, validate_edited_file_syntax};
 use crate::format;
 
 use crate::protocol::{RawRequest, Response};
+
+type EditNoMatchReporter = fn(&Path, &str, &str, usize);
+static EDIT_NO_MATCH_REPORTER: OnceLock<EditNoMatchReporter> = OnceLock::new();
+
+/// Install the optional reporter for unmatched edits, including the zero-based
+/// change index in a batch. The first installation is kept for the process.
+pub fn register_edit_no_match_reporter(report: fn(&Path, &str, &str, usize)) {
+    let _ = EDIT_NO_MATCH_REPORTER.set(report);
+}
+
+pub(super) fn report_edit_no_match(path: &Path, source: &str, sought: &str, index: usize) {
+    if let Some(report) = EDIT_NO_MATCH_REPORTER.get() {
+        report(path, source, sought, index);
+    }
+}
 
 /// Handle an `edit_match` request.
 ///
@@ -1976,7 +1992,7 @@ fn handle_single_file_edit_match(
     let fuzzy_matches = crate::fuzzy_match::find_all_fuzzy(&source, match_str);
 
     if fuzzy_matches.is_empty() {
-        crate::subc::rich_ui::display::edit_no_match(path.as_path(), &source, match_str, 0);
+        report_edit_no_match(path.as_path(), &source, match_str, 0);
         return Response::error(
             &req.id,
             "match_not_found",
