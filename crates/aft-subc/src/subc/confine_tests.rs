@@ -655,7 +655,7 @@ fn vector(f: &Fixture, name: &str, value: Value) {
     let value = stable(value, f.pin.parent().unwrap().to_str().unwrap());
     let bytes = format!("{}\n", serde_json::to_string_pretty(&value).unwrap());
     let path = Path::new(crate::test_support::manifest_dir())
-        .join("tests/fixtures/confine")
+        .join("../aft/tests/fixtures/confine")
         .join(format!("{name}.json"));
     if std::env::var_os("AFT_REGENERATE_CONFINE_VECTORS").is_some() {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();

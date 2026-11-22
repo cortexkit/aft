@@ -2139,8 +2139,8 @@ fn tool_result_real_reply_validation_report() {
     println!("| --- | --- | --- | ---: | --- | --- |");
 
     // Replay captured native responses at the dispatch boundary, not handwritten envelopes.
-    let fixture_root =
-        Path::new(crate::test_support::manifest_dir()).join("tests/fixtures/subc_parity/format");
+    let fixture_root = Path::new(crate::test_support::manifest_dir())
+        .join("../aft/tests/fixtures/subc_parity/format");
     let mut fixtures: Vec<_> = std::fs::read_dir(fixture_root)
         .unwrap()
         .map(|entry| entry.unwrap().path())

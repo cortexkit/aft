@@ -150,7 +150,8 @@ fn dispatch(request: RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn sample_dir() -> PathBuf {
-    Path::new(crate::test_support::manifest_dir()).join("tests/fixtures/rich_ui/carrier-samples")
+    Path::new(crate::test_support::manifest_dir())
+        .join("../aft/tests/fixtures/rich_ui/carrier-samples")
 }
 
 fn sample_path(case: &Case) -> PathBuf {

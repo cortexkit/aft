@@ -611,7 +611,7 @@ fn vector(name: &str) -> Value {
     serde_json::from_slice(
         &std::fs::read(
             crate::test_support::manifest_dir()
-                .join("tests/fixtures/user-commands-v1")
+                .join("../aft/tests/fixtures/user-commands-v1")
                 .join(name),
         )
         .unwrap(),
@@ -631,7 +631,8 @@ fn roundtrip<T: DeserializeOwned + serde::Serialize>(body: &Value) -> T {
 
 #[test]
 fn user_commands_pinned_vectors_roundtrip_through_real_body_serializer() {
-    let directory = crate::test_support::manifest_dir().join("tests/fixtures/user-commands-v1");
+    let directory =
+        crate::test_support::manifest_dir().join("../aft/tests/fixtures/user-commands-v1");
     let sums = std::fs::read_to_string(directory.join("SHA256SUMS")).unwrap();
     let mut files = 0;
     for line in sums.lines() {
@@ -707,7 +708,8 @@ fn user_commands_samples() {
         ("not-bound.json", not_bound),
         ("wrong-caller.json", encode(&refusal)),
     ];
-    let baseline = crate::test_support::manifest_dir().join("tests/fixtures/aft-user-commands-v1");
+    let baseline =
+        crate::test_support::manifest_dir().join("../aft/tests/fixtures/aft-user-commands-v1");
     for (name, body) in &samples {
         // These samples were captured with the pre-upgrade SDK and role crates.
         // Pin both the published sample and the compact body sent to apps.

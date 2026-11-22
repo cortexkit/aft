@@ -34,7 +34,7 @@ mod tests {
     fn fixture(root: &Path) -> Vec<String> {
         let crate_dir = crate::test_support::manifest_dir();
         let mut sources = Vec::new();
-        for entry in std::fs::read_dir(crate_dir.join("tests/fixtures/callgraph")).unwrap() {
+        for entry in std::fs::read_dir(crate_dir.join("../aft/tests/fixtures/callgraph")).unwrap() {
             let path = entry.unwrap().path();
             if path.extension().is_some_and(|extension| extension == "ts") {
                 let relative = format!("web/{}", path.file_name().unwrap().to_str().unwrap());
@@ -118,7 +118,7 @@ pub fn separator() -> char {
         for (from, to) in [
             ("../aft-store/src/stat.rs", "src/stat.rs"),
             ("../aft-engine/src/data_layer/runtime.rs", "src/runtime.rs"),
-            ("tests/fixtures/sample.go", "pkg/sample.go"),
+            ("../aft/tests/fixtures/sample.go", "pkg/sample.go"),
         ] {
             copy(root, &crate_dir.join(from), to);
             sources.push(to.to_string());

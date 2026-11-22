@@ -7731,7 +7731,7 @@ mod fresh_payload_tests {
                 "text": crate::subc_format::format_inspect_for_test(&response)})
         }).collect::<Vec<_>>();
         let path = Path::new(crate::test_support::manifest_dir())
-            .join("tests/fixtures/inspect/noise-renderer.json");
+            .join("../aft/tests/fixtures/inspect/noise-renderer.json");
         let actual = serde_json::to_string_pretty(&rendered).unwrap() + "\n";
         if std::env::var_os("UPDATE_INSPECT_NOISE_GOLDEN").is_some() {
             std::fs::write(&path, &actual).unwrap();
