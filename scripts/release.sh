@@ -353,12 +353,6 @@ echo "→ Syncing versions to $VERSION..."
 bun scripts/version-sync.mjs "$VERSION"
 echo ""
 
-# Regenerate the JSON Schema asset so editor `$schema` URLs always resolve
-# to a schema that matches the shipped config surface for this release.
-echo "→ Rebuilding aft.schema.json..."
-cargo run --locked --quiet -p agent-file-tools --example aft-settings-schema > assets/aft.schema.json
-echo ""
-
 # Refresh bun.lock so workspace package versions match the bumped
 # package.json files. Without this, CI's `bun install --frozen-lockfile`
 # fails because the lockfile still pins the old versions.
@@ -372,6 +366,14 @@ echo ""
 # dirty parent). --offline: the bump only renames workspace members.
 echo "→ Refreshing Cargo.lock..."
 cargo update -w --offline --quiet || { echo "Error: cargo update failed after version sync"; exit 1; }
+echo ""
+
+# Regenerate the JSON Schema asset so editor `$schema` URLs always resolve
+# to a schema that matches the shipped config surface for this release. It
+# runs after the Cargo.lock refresh because `--locked` refuses a lock file that
+# still names the previous workspace versions.
+echo "→ Rebuilding aft.schema.json..."
+cargo run --locked --quiet -p agent-file-tools --example aft-settings-schema > assets/aft.schema.json
 echo ""
 
 # Recapture the config parity goldens at the new version. Some config keys are

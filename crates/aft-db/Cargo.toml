@@ -1,6 +1,6 @@
 [package]
 name = "aft-db"
-version = "0.66.0"
+version = "0.67.0"
 edition = "2021"
 rust-version.workspace = true
 license = "MIT"
@@ -14,7 +14,7 @@ test-hooks = ["aft-base/test-hooks"]
 test-timing-hooks = ["aft-base/test-timing-hooks"]
 
 [dependencies]
-aft-base = { path = "../aft-base", version = "0.66.0" }
+aft-base = { path = "../aft-base", version = "0.67.0" }
 rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -32,5 +32,5 @@ tempfile = { version = "3", optional = true }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
-aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-base = { path = "../aft-base", version = "0.67.0", features = ["test-support"] }
 tempfile = "3"
