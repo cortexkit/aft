@@ -18,7 +18,7 @@ SPEC = importlib.util.spec_from_file_location("workflow_gates", Path(__file__).w
 assert SPEC is not None and SPEC.loader is not None
 parser = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(parser)
-PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "agent-file-tools"]
+PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "agent-file-tools"]
 
 
 class CratesPublicationTests(unittest.TestCase):
@@ -73,15 +73,22 @@ class CratesPublicationTests(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n" + source)
         path.chmod(0o755)
 
-    def run_publish(self, *, already=(), fail="", mismatch=False, tag="v1.2.3"):
+    def run_publish(self, *, already=(), fail="", mismatch=False, tag="v1.2.3", engine="present"):
         with self.fixture() as directory:
             root = Path(directory)
             (root / "crates/aft").mkdir(parents=True)
-            (root / "crates/aft/Cargo.toml").write_text('version = "0.0.0"\n')
+            upper = '[package]\nversion = "0.0.0"\n'
+            if engine != "pre-split":
+                upper += '[dependencies]\naft-engine = { path = "../aft-engine", version = "=0.0.0" }\n'
+            (root / "crates/aft/Cargo.toml").write_text(upper)
+            if engine == "present":
+                (root / "crates/aft-engine").mkdir()
+                (root / "crates/aft-engine/Cargo.toml").touch()
             self.stub(root, "node", '''import os, pathlib, sys
 assert sys.argv[1:] == ["scripts/version-sync.mjs", "--from-tag"]
 version = "9.9.9" if os.environ["MISMATCH"] else os.environ["GITHUB_REF_NAME"][1:]
-pathlib.Path("crates/aft/Cargo.toml").write_text(f'version = "{version}"\\n')
+manifest = pathlib.Path("crates/aft/Cargo.toml")
+manifest.write_text(manifest.read_text().replace('version = "0.0.0"', f'version = "{version}"', 1))
 ''')
             self.stub(root, "cargo", '''import json, os, pathlib, sys
 args = sys.argv[1:]
@@ -116,11 +123,7 @@ pathlib.Path("slept").touch()
             ["publish", "--package", "aft-tokenizer", "--dry-run"],
             ["publish", "--package", "aft-secret-rules"],
             ["publish", "--package", "aft-secret-rules", "--dry-run"],
-            ["publish", "--package", "aft-store"],
-            ["publish", "--package", "aft-base"],
-            ["publish", "--package", "aft-db"],
-            ["publish", "--package", "aft-parse"],
-            ["publish", "--package", "agent-file-tools"],
+            *[["publish", "--package", name] for name in PACKAGES[2:]],
         ])
         self.assertTrue(slept)
 
@@ -130,6 +133,18 @@ pathlib.Path("slept").touch()
         self.assertEqual(len(calls), 2 * len(PACKAGES))
         self.assertEqual(calls[-1], ["publish", "--package", "agent-file-tools", "--dry-run"])
         self.assertTrue(slept)
+
+    def test_pre_engine_tag_retries_without_engine(self):
+        result, calls, _ = self.run_publish(tag="v0.67.0", engine="pre-split")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(calls, [["publish", "--package", name] for name in PACKAGES if name != "aft-engine"])
+
+    def test_engine_tag_without_its_engine_manifest_cannot_publish(self):
+        result, calls, slept = self.run_publish(tag="v0.68.0", engine="missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires aft-engine but is missing crates/aft-engine/Cargo.toml", result.stderr)
+        self.assertEqual(calls, [])
+        self.assertFalse(slept)
 
     def test_real_crates_refusal_stays_red_and_stops_publication(self):
         result, calls, slept = self.run_publish(fail="aft-secret-rules")

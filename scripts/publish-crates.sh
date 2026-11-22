@@ -10,6 +10,14 @@ if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[[:alnum:].-]+)?(\+[[:alnum:].-]+)?$
   exit 1
 fi
 
+# The retry workflow can check out a tag from before the engine split. If
+# agent-file-tools declares aft-engine, the tag must also contain its manifest.
+engine_manifest=crates/aft-engine/Cargo.toml
+if [[ ! -f "$engine_manifest" ]] && grep -q '^aft-engine[[:space:]]*=' crates/aft/Cargo.toml; then
+  echo "::error::$TAG requires aft-engine but is missing $engine_manifest" >&2
+  exit 1
+fi
+
 # Cargo must publish the requested tag's version, not a stale manifest version.
 GITHUB_REF_NAME="$TAG" node scripts/version-sync.mjs --from-tag
 TAG_VERSION="${TAG#v}"
@@ -37,8 +45,13 @@ cargo publish --package aft-db \
 sleep 30
 cargo publish --package aft-parse \
   || { ec=$?; cargo publish --package aft-parse --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+if [[ -f "$engine_manifest" ]]; then
+  sleep 30
+  cargo publish --package aft-engine \
+    || { ec=$?; cargo publish --package aft-engine --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+fi
 
-# Allow the leaf versions to propagate to crates.io's sparse index before the
+# Allow the dependency versions to propagate to crates.io's sparse index before the
 # main crate's verification resolves them.
 sleep 30
 cargo publish --package agent-file-tools \

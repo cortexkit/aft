@@ -147,6 +147,17 @@ jobs:
         run: |
           python3 scripts/check-crate-source-paths.py --self-test
           python3 scripts/check-crate-source-paths.py
+      - name: Keep engine dependencies below the daemon edge
+        run: |
+          python3 crates/aft-engine/checks/dependency-direction.py
+          for fixture in direct-dev two-hop-dev-build; do
+            status=0
+            python3 crates/aft-engine/checks/dependency-direction.py --metadata "crates/aft-engine/checks/fixtures/$fixture.json" || status=$?
+            if [ "$status" -ne 1 ]; then
+              echo "::error::Dependency direction fixture $fixture must exit 1, got $status"
+              exit 1
+            fi
+          done
       - name: Install workspace deps
         run: bun install --frozen-lockfile
       - name: Bun lint
@@ -170,6 +181,7 @@ jobs:
           python3 -m unittest discover -s scripts/lib -p test_cache_write_policy.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_artifact.py -v
           python3 -m unittest discover -s scripts/lib -p test_native_release_workflow.py -v
+          python3 -m unittest discover -s scripts/lib -p test_crates_publication.py -v
           python3 -m unittest discover -s scripts/lib -p test_merge_queue_workflow.py -v
           python3 -m unittest discover -s scripts/lib -p test_pr_search_descriptor.py -v
           python3 -m unittest discover -s scripts/lib -p test_landing_policy.py -v
@@ -229,7 +241,7 @@ jobs:
           cargo --version
           inventory="$RUNNER_TEMP/task-scope-inventory.txt"
           output="$RUNNER_TEMP/task-scope-tests.txt"
-          cargo test --features test-hooks -p agent-file-tools --lib -- task_scope --ignored --list > "$inventory"
+          cargo test --features test-hooks -p agent-file-tools -p aft-engine --lib -- task_scope --ignored --list > "$inventory"
           python3 - "$inventory" <<'PY'
           import pathlib, sys
           tests = [line for line in pathlib.Path(sys.argv[1]).read_text().splitlines() if line.endswith(': test')]
@@ -239,7 +251,7 @@ jobs:
           PY
           # These tests assert manager availability; --ignored opts them in,
           # rather than treating an unavailable manager as a passing skip.
-          if cargo test --features test-hooks -p agent-file-tools --lib -- task_scope --ignored --test-threads=1 --nocapture > "$output" 2>&1; then
+          if cargo test --features test-hooks -p agent-file-tools -p aft-engine --lib -- task_scope --ignored --test-threads=1 --nocapture > "$output" 2>&1; then
             cat "$output"
           else
             cat "$output"
@@ -248,7 +260,8 @@ jobs:
           python3 - "$output" <<'PY'
           import pathlib, re, sys
           output = pathlib.Path(sys.argv[1]).read_text()
-          if not re.search(r'^test result: ok\. 21 passed; 0 failed; 0 ignored;', output, re.M):
+          passed = re.findall(r'^test result: ok\. ([1-9]\d*) passed; 0 failed; 0 ignored;', output, re.M)
+          if len(passed) != 2 or sum(map(int, passed)) != 21:
               raise SystemExit('systemd task-scope tests must run: expected 21 passed and zero skipped')
           print('Systemd task-scope gate passed: 21 tests ran, zero skipped')
           PY
