@@ -967,7 +967,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertEqual(len(build_steps), 4)
         for command in build_steps:
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
-        audit = next(step for step in job["steps"] if step.get("name") == "Audit native engine compiler inputs (macOS)")
+        audit = next(step for step in job["steps"] if step.get("name") == "Audit native compiler inputs (macOS)")
         self.assertIn(audit["run"], build_steps)
         self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
         self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
