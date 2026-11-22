@@ -50,7 +50,6 @@ impl Fixture {
         let copies = project.join("copied-bin");
         fs::create_dir_all(&copies).unwrap();
         fs::write(&public, "public-control").unwrap();
-        fs::copy("/bin/cat", copies.join("cat")).unwrap();
         let mut fixture = Self {
             copies,
             files: Vec::new(),
@@ -146,6 +145,14 @@ impl Fixture {
         let copy = self.copies.join(program.file_name().unwrap());
         if !copy.exists() {
             fs::copy(&program, &copy).unwrap_or_else(|error| panic!("copy {program:?}: {error}"));
+            #[cfg(target_os = "macos")]
+            // Apple system executables may be restricted to their original
+            // path. Sign the disposable copy for local execution.
+            checked(
+                Command::new("/usr/bin/codesign")
+                    .args(["--force", "--sign", "-", "--timestamp=none"])
+                    .arg(&copy),
+            );
         }
         self.lookups.push(Lookup {
             name,
