@@ -2655,7 +2655,16 @@ fn credential_floor_paths(
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>), String> {
     let mut denies = Vec::new();
     let mut cargo_homes = Vec::new();
-    for home in std::iter::once(home).chain(account) {
+    let mut homes = BTreeSet::new();
+    for (home, source) in [(Some(home), "HOME"), (account, "account home")] {
+        if let Some(home) = home {
+            homes.extend(
+                crate::sandbox_profile::resolve_env_deny_paths(home.to_path_buf(), source)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    for home in homes {
         denies.extend(
             [
                 ".ssh",
@@ -2674,7 +2683,7 @@ fn credential_floor_paths(
             ]
             .map(|path| home.join(path)),
         );
-        let (overrides, cargo) = relaxed_credential_paths(home, roots, &getenv)?;
+        let (overrides, cargo) = relaxed_credential_paths(&home, roots, &getenv)?;
         denies.extend(overrides);
         cargo_homes.extend(cargo);
     }
