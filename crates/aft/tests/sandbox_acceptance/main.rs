@@ -14,6 +14,8 @@ use std::process::{Command, Output};
 
 const HOME_PROCESS: &str = "AFT_SANDBOX_ACCEPTANCE_HOME_PROCESS";
 const REQUIRE_OSXKEYCHAIN: &str = "AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN";
+#[cfg(target_os = "macos")]
+const GH_BINARY: &str = "AFT_ACCEPTANCE_GH_BINARY";
 const LEVELS: [SandboxMode; 4] = [
     SandboxMode::Off,
     SandboxMode::Credentials,
@@ -115,6 +117,8 @@ fn isolated(test_name: &str, credential_env: bool, run: impl FnOnce(&Path)) {
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0");
+        #[cfg(target_os = "macos")]
+        process.env(GH_BINARY, std::env::var_os(GH_BINARY).unwrap_or_default());
         if credential_env {
             process
                 .env("SSH_AUTH_SOCK", base.join("a"))
@@ -150,14 +154,26 @@ fn credentials(root: &Path, worker: bool) {
     let shell = launch::Shell::new(root, worker);
     #[cfg(target_os = "macos")]
     let keychain = macos::Keychain::add_lookups(root, &mut fixture);
+    #[cfg(target_os = "macos")]
+    let gh = (!worker).then(|| keychain.gh_lookup(root)).flatten();
     for mode in LEVELS {
         let enabled = mode != SandboxMode::Off;
         let label = format!("{} {mode}", if worker { "worker" } else { "head" });
         let measure_setuid = !worker && matches!(mode, SandboxMode::Off | SandboxMode::Credentials);
-        let script = fixture.script(measure_setuid);
+        #[cfg(target_os = "macos")]
+        let gh_probe = gh.as_ref().filter(|_| measure_setuid);
+        #[cfg(target_os = "macos")]
+        let gh_command = gh_probe.map(macos::GhItem::command);
+        #[cfg(target_os = "linux")]
+        let gh_command: Option<String> = None;
+        let script = fixture.script(measure_setuid, gh_command.as_deref());
         #[cfg(target_os = "macos")]
         let script = script + &keychain.readable_file_check();
         let run = shell.run(mode, &script, enabled);
+        #[cfg(target_os = "macos")]
+        if let Some(probe) = gh_probe {
+            probe.report(&label, &run);
+        }
         fixture.assert_oracle(&label, &run, enabled);
         #[cfg(target_os = "macos")]
         assert!(

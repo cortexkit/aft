@@ -162,7 +162,7 @@ impl Fixture {
         });
     }
 
-    pub(super) fn script(&self, measure_setuid: bool) -> String {
+    pub(super) fn script(&self, measure_setuid: bool, gh_probe: Option<&str>) -> String {
         let stderr_path = path_arg(&self.copies.join("probe-stderr"));
         let mut script = format!("probe_stderr={stderr_path}\n");
         script.push_str(
@@ -191,6 +191,9 @@ impl Fixture {
             } else {
                 script.push_str("observe setuid_passwd /usr/bin/passwd -S\n");
             }
+        }
+        if let Some(command) = gh_probe {
+            writeln!(script, "observe gh_keyring /bin/sh -c {}", quote(command)).unwrap();
         }
         writeln!(
             script,
@@ -307,7 +310,7 @@ fn identity(path: &Path) -> (u64, u64) {
     (metadata.dev(), metadata.ino())
 }
 
-fn observed<'a>(transcript: &'a str, name: &str) -> (i32, &'a str) {
+pub(super) fn observed<'a>(transcript: &'a str, name: &str) -> (i32, &'a str) {
     let (_, record) = transcript
         .split_once(&format!("BEGIN {name}\n"))
         .unwrap_or_else(|| panic!("{name} did not run: {transcript}"));

@@ -126,6 +126,20 @@ jobs:
       - name: Run the role and credential acceptance matrix
         shell: bash
         run: |
+          set -euo pipefail
+          gh_version=2.105.0
+          gh_sha256=2a5d03103ae444927383b93d9ffd65579a26e2eb900ce1cf11f55258d5319ded
+          dist="gh_${gh_version}_macOS_arm64"
+          install_dir=$(mktemp -d "$RUNNER_TEMP/aft-sandbox-gh.XXXXXX")
+          trap 'rm -rf "$install_dir"' EXIT
+          archive="$install_dir/$dist.zip"
+          curl --fail --silent --show-error --location --retry 3 --max-time 120 \
+            --proto '=https' --proto-redir '=https' --output "$archive" \
+            "https://github.com/cli/cli/releases/download/v${gh_version}/${dist}.zip"
+          printf '%s  %s\n' "$gh_sha256" "$archive" | shasum -a 256 --check
+          unzip -q "$archive" -d "$install_dir"
+          export AFT_ACCEPTANCE_GH_BINARY="$install_dir/$dist/bin/gh"
+          "$AFT_ACCEPTANCE_GH_BINARY" --version
           bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
             cargo test --features test-hooks -p agent-file-tools --test sandbox_acceptance -- role_matrix --ignored --test-threads=1 --nocapture
       - name: Run the governed GitHub read through the native worker jail
