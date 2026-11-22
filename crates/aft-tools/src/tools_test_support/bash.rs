@@ -1,6 +1,24 @@
 use aft_engine::test_bridge::bash_remote::{registry_support as test_support, BgTask};
 use std::sync::Arc;
 
+/// Read whether the watch has been asked to yield.
+pub fn watch_yield_requested(signal: &crate::commands::bash_watch::YieldSignal) -> bool {
+    signal.requested()
+}
+
+/// Render the hard kill deadline for the requested kind of session.
+pub fn kill_deadline_sentence(
+    deadline: Option<crate::bash_background::registry::HardKillDeadline>,
+    started_at_ms: u64,
+    worker_session: bool,
+) -> String {
+    crate::commands::bash_orchestrate::kill_deadline_sentence(
+        deadline,
+        started_at_ms,
+        worker_session,
+    )
+}
+
 /// Build a shell wait fixture with the default worker time limit.
 pub fn wait_fixture(
     explicit_timeout: Option<u64>,

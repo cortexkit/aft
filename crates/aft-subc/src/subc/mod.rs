@@ -12768,7 +12768,7 @@ pub(crate) mod test_support {
             request_id.to_string(),
             Box::new(move |_| {
                 let DispatchOutcome::Deferred(pending) =
-                    crate::commands::inspect::handle_inspect_deferred_with_clock(
+                    crate::tools_test_support::inspect_with_clock(
                         &request,
                         inspect_ctx,
                         true,
@@ -12868,10 +12868,11 @@ pub(crate) mod test_support {
             request_id.to_string(),
             Box::new(move |_| {
                 let DispatchOutcome::Deferred(pending) = crate::commands::lsp_navigation::
-                    handle_lsp_navigation_deferred_with_restriction(
+                    handle_lsp_navigation_deferred_with_reply_deadline(
                         &request,
                         navigation_ctx,
                         true,
+                        None,
                     )
                 else {
                     panic!("cold navigation setup must defer")
@@ -13236,10 +13237,11 @@ pub(crate) mod test_support {
         let wake = crate::pending_response::DeferredResponseWake::default();
         let _scope = wake.install();
         let DispatchOutcome::Deferred(mut pending) =
-            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_restriction(
+            crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
                 &navigation_request("nav-wake", &source),
                 Arc::clone(&ctx),
                 true,
+                None,
             )
         else {
             panic!("cold navigation must defer")
@@ -13273,10 +13275,11 @@ pub(crate) mod test_support {
         let wake = crate::pending_response::DeferredResponseWake::default();
         let _scope = wake.install();
         let DispatchOutcome::Deferred(mut pending) =
-            crate::commands::inspect::handle_inspect_deferred_with_restriction(
+            crate::commands::inspect::handle_inspect_deferred_with_reply_deadline(
                 &inspect_request("inspect-wake"),
                 Arc::clone(&ctx),
                 true,
+                None,
             )
         else {
             panic!("inspect must defer")
@@ -14114,7 +14117,7 @@ pub(crate) mod test_support {
                     .send(())
                     .expect("signal untracked search");
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !crate::commands::semantic_search::search_cancellation_requested() {
+                while !crate::tools_test_support::search_cancellation_requested() {
                     if Instant::now() >= deadline {
                         return Response::error(
                             "untracked-search",
@@ -14125,7 +14128,7 @@ pub(crate) mod test_support {
                     if disabled_probe_rx
                         .recv_timeout(Duration::from_millis(10))
                         .is_ok()
-                        && !crate::commands::semantic_search::search_cancellation_requested()
+                        && !crate::tools_test_support::search_cancellation_requested()
                     {
                         disabled_progress_tx
                             .send(())
@@ -14182,7 +14185,7 @@ pub(crate) mod test_support {
             Box::new(move |_| {
                 tracked_started_tx.send(()).expect("signal tracked search");
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while !crate::commands::semantic_search::search_cancellation_requested() {
+                while !crate::tools_test_support::search_cancellation_requested() {
                     if Instant::now() >= deadline {
                         return Response::error(
                             "tracked-search",
@@ -14193,7 +14196,7 @@ pub(crate) mod test_support {
                     if tracked_probe_rx
                         .recv_timeout(Duration::from_millis(10))
                         .is_ok()
-                        && !crate::commands::semantic_search::search_cancellation_requested()
+                        && !crate::tools_test_support::search_cancellation_requested()
                     {
                         tracked_progress_tx
                             .send(())
@@ -16617,7 +16620,8 @@ mod tests {
 
     #[test]
     fn deleted_root_reap_drops_synapse_runtime_on_async_frame_loop() {
-        use crate::commands::semantic_search::rerank::{slot, synapse, SelectedBackend};
+        use aft_engine::search_state::rerank::{slot, SelectedBackend};
+        use aft_engine::test_bridge::search_misc::rerank::synapse;
 
         let (root_dir, root) = test_root("deleted-root-synapse-runtime");
         let connection = tempfile::NamedTempFile::new().expect("connection file");
@@ -22707,12 +22711,16 @@ mod admission_mechanism_tests {
 
     #[test]
     fn core_tool_membership_has_one_routing_source() {
+        let formatter = std::fs::read_to_string(
+            Path::new(crate::test_support::manifest_dir()).join("../aft-tools/src/subc_format.rs"),
+        )
+        .expect("read tool formatter source");
         for (source, signature) in [
             (
                 include_str!("manifest.rs"),
                 "pub(super) fn is_subc_agent_core_tool",
             ),
-            (include_str!("../subc_format.rs"), "fn is_core_agent_tool"),
+            (formatter.as_str(), "fn is_core_agent_tool"),
         ] {
             let body = source
                 .split(signature)

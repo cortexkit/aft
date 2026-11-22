@@ -6993,7 +6993,7 @@ mod tests {
                 role.has_bash_watch(),
                 "{role:?}: {status_text}"
             );
-            let deadline = orchestrate::kill_deadline_sentence(
+            let deadline = crate::tools_test_support::kill_deadline_sentence(
                 Some(crate::bash_background::registry::HardKillDeadline {
                     limit_ms: 1_800_000,
                     source: crate::bash_background::registry::HardKillSource::Default,

@@ -64,6 +64,7 @@ pub(crate) use aft_engine::access_policy;
 mod access_policy_tests;
 #[cfg(test)]
 mod boundary_source_guard_tests;
+#[cfg(test)]
 pub(crate) use aft_base::agent_commands;
 pub(crate) use aft_engine::agent_child_env;
 pub(crate) use aft_engine::alert_state;
@@ -82,8 +83,11 @@ pub(crate) use aft_engine::blocking_wait;
 pub(crate) use aft_parse::ast_grep_hints;
 pub(crate) mod bounded_io_command;
 pub(crate) use aft_base::clock;
+#[cfg(test)]
 pub(crate) use aft_base::cold_build_limiter;
+#[cfg(test)]
 pub(crate) use aft_engine::cache_freshness;
+#[cfg(test)]
 pub(crate) use aft_engine::cache_location;
 pub(crate) use aft_engine::callgraph;
 pub(crate) use aft_engine::callgraph_store;
@@ -135,8 +139,10 @@ pub(crate) use aft_engine::extract;
 pub(crate) use aft_engine::feature_status;
 pub(crate) use aft_engine::file_kind;
 pub(crate) use aft_engine::format;
+#[cfg(test)]
 pub(crate) use aft_engine::fs_lock;
 pub(crate) use aft_engine::gh_shim;
+#[cfg(test)]
 pub(crate) use aft_engine::gh_shim_relay;
 pub(crate) use aft_engine::gh_shim_speech;
 pub(crate) use aft_engine::gh_shim_ticket;
@@ -149,11 +155,13 @@ pub(crate) use aft_engine::imports;
 pub(crate) use aft_engine::indent;
 pub(crate) use aft_engine::inspect;
 pub(crate) use aft_engine::large_read;
+#[cfg(test)]
 pub(crate) use aft_engine::lifecycle_census;
 pub(crate) use aft_engine::logging;
 pub(crate) use aft_engine::lsp;
 pub(crate) use aft_engine::lsp_hints;
 pub(crate) use aft_engine::memory;
+#[cfg(test)]
 pub(crate) use aft_engine::memory_census;
 pub(crate) use aft_engine::native_route;
 pub(crate) use aft_parse::fuzzy_match;
@@ -166,6 +174,7 @@ pub(crate) use aft_base::pinned_dir;
 pub(crate) use aft_base::policy_path;
 pub(crate) use aft_base::privacy_spawn;
 pub(crate) use aft_base::private_storage;
+#[cfg(test)]
 pub(crate) use aft_base::process_identity;
 pub(crate) use aft_base::process_io;
 pub(crate) use aft_base::project_walk;
@@ -198,6 +207,7 @@ pub(crate) use aft_base::subc_config;
 pub(crate) use aft_db::sandbox_profile;
 pub(crate) use aft_engine::runtime_drain;
 pub(crate) use aft_engine::sandbox_spawn;
+#[cfg(test)]
 pub(crate) use aft_engine::scoped_key;
 pub(crate) use aft_engine::search_b2;
 pub(crate) use aft_engine::search_index;
@@ -237,6 +247,7 @@ pub(crate) use aft_engine::write_ledger;
 // uses portable APIs; only its callers are Windows-gated.
 #[allow(unused_imports)]
 pub(crate) use aft_base::windows_command;
+#[cfg(windows)]
 pub(crate) use aft_base::windows_path;
 pub(crate) use aft_base::worker_jail_canary;
 

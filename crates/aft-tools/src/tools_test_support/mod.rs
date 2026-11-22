@@ -7,7 +7,7 @@ mod remote;
 
 #[cfg(unix)]
 pub use bash::completed_spawn_for_test;
-pub use bash::wait_fixture;
+pub use bash::{kill_deadline_sentence, wait_fixture, watch_yield_requested};
 pub use external_search::external_search_fixture;
 #[cfg(unix)]
 pub use remote::{handle_with_policy, rendered_status};
@@ -35,6 +35,28 @@ pub use crate::commands::{
     glob::glob_root_files_for_test, outline::discover_outline_paths_for_test,
 };
 pub use crate::upper_test_context::{test_app, test_context};
+
+/// Prepare a deferred inspect using the caller's test clock.
+pub fn inspect_with_clock(
+    request: &crate::protocol::RawRequest,
+    context: std::sync::Arc<crate::context::AppContext>,
+    restricted: bool,
+    reply_deadline: Option<std::time::Instant>,
+    now: impl Fn() -> std::time::Instant + Send + 'static,
+) -> crate::response_finalize::DispatchOutcome {
+    crate::commands::inspect::handle_inspect_deferred_with_clock(
+        request,
+        context,
+        restricted,
+        reply_deadline,
+        now,
+    )
+}
+
+/// Read the cancellation signal visible to code-search handlers on this thread.
+pub fn search_cancellation_requested() -> bool {
+    crate::commands::semantic_search::search_cancellation_requested()
+}
 
 /// Whether the checkout's text index is ready to answer a tool call.
 pub fn text_index_is_ready(ctx: &crate::context::AppContext) -> bool {
