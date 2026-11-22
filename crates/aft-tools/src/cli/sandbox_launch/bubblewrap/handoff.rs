@@ -67,6 +67,15 @@ impl Handoff {
             SandboxLaunchError::unavailable(format!("cannot execute {BWRAP}: {error}"))
         })?;
         drop(writer);
+        // Like system(3): a terminal SIGINT or SIGQUIT goes to the whole
+        // foreground group, this supervisor included. Ignore both while
+        // waiting, so the payload alone decides and its real exit status is
+        // reported. The child was spawned first and keeps default handlers;
+        // exit_with_status restores the default before re-raising a signal.
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_IGN);
+            libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+        }
         let status = child.wait().map_err(|error| {
             SandboxLaunchError::unavailable(format!("cannot wait for bubblewrap: {error}"))
         })?;
