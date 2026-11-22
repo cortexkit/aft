@@ -40,7 +40,7 @@ Unit tests live in the crate that owns the code: `aft-engine`, `aft-tools`,
 Mandatory when you touch them:
 - A list-cutting site (`.take(`, `truncate(`, a cap): register it, then run `cargo test --features test-hooks -p agent-file-tools --test list_envelope`.
 - A new file under the search engine: register its owner, then run `cargo test --features test-hooks -p agent-file-tools --test engine`.
-- An agent tool argument: regenerate with `bun run --cwd packages/opencode-plugin build:tool-schemas`. The committed `crates/aft/src/subc_tool_schemas.json` must match byte for byte.
+- An agent tool argument: regenerate with `bun run --cwd packages/opencode-plugin build:tool-schemas`. The committed `crates/aft-subc/src/subc_tool_schemas.json` must match byte for byte.
 - Config keys or the resolver: run `bun scripts/capture-config-parity.ts` (zero diff), then `cargo test --features test-hooks -p agent-file-tools --test integration config_parity`.
 - Search ranking or routing files (the `RANKING_FENCE_PREFIXES` in `benchmarks/aft-search/search_quality_lib.py`): say so in your report. The train needs a search-quality descriptor, and ranking changes need benchmark evidence.
 

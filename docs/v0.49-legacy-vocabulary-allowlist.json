@@ -84,7 +84,7 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
-      "path": "crates/aft/src/commands/apply_patch.rs",
+      "path": "crates/aft-tools/src/commands/apply_patch.rs",
       "line": 119,
       "column": 45,
       "token": "filePath",
@@ -95,7 +95,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/apply_patch.rs",
+      "path": "crates/aft-tools/src/commands/apply_patch.rs",
       "line": 1077,
       "column": 18,
       "token": "filePath",
@@ -106,7 +106,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/apply_patch.rs",
+      "path": "crates/aft-tools/src/commands/apply_patch.rs",
       "line": 1237,
       "column": 43,
       "token": "filePath",
@@ -117,7 +117,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/apply_patch.rs",
+      "path": "crates/aft-tools/src/commands/apply_patch.rs",
       "line": 1367,
       "column": 34,
       "token": "filePath",
@@ -128,7 +128,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/apply_patch.rs",
+      "path": "crates/aft-tools/src/commands/apply_patch.rs",
       "line": 1401,
       "column": 25,
       "token": "filePath",
@@ -139,7 +139,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/delete_file.rs",
+      "path": "crates/aft-tools/src/commands/delete_file.rs",
       "line": 305,
       "column": 32,
       "token": "filePath",
@@ -150,7 +150,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/edit_match.rs",
+      "path": "crates/aft-tools/src/commands/edit_match.rs",
       "line": 116,
       "column": 37,
       "token": "filePath",
@@ -161,7 +161,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/trace_to_symbol.rs",
+      "path": "crates/aft-tools/src/commands/trace_to_symbol.rs",
       "line": 73,
       "column": 39,
       "token": "toFile",
@@ -172,7 +172,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/undo.rs",
+      "path": "crates/aft-tools/src/commands/undo.rs",
       "line": 20,
       "column": 72,
       "token": "filePath",
@@ -183,7 +183,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/undo.rs",
+      "path": "crates/aft-tools/src/commands/undo.rs",
       "line": 105,
       "column": 37,
       "token": "filePath",
@@ -194,7 +194,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/undo.rs",
+      "path": "crates/aft-tools/src/commands/undo.rs",
       "line": 205,
       "column": 21,
       "token": "filePath",
@@ -205,7 +205,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/undo.rs",
+      "path": "crates/aft-tools/src/commands/undo.rs",
       "line": 214,
       "column": 37,
       "token": "filePath",
@@ -491,7 +491,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/repeat_breaker.rs",
+      "path": "crates/aft-tools/src/repeat_breaker.rs",
       "line": 244,
       "column": 18,
       "token": "filePath",
@@ -502,7 +502,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/access_grants_tests.rs",
+      "path": "crates/aft-subc/src/subc/access_grants_tests.rs",
       "line": 398,
       "column": 27,
       "token": "filePath",
@@ -513,7 +513,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/confine_tests.rs",
+      "path": "crates/aft-subc/src/subc/confine_tests.rs",
       "line": 90,
       "column": 27,
       "token": "filePath",
@@ -524,7 +524,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_rust_sources_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_rust_sources_tests.rs",
       "line": 272,
       "column": 18,
       "token": "filePath",
@@ -535,7 +535,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 482,
       "column": 50,
       "token": "filePath",
@@ -546,7 +546,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 690,
       "column": 73,
       "token": "filePath",
@@ -557,7 +557,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 892,
       "column": 21,
       "token": "filePath",
@@ -568,7 +568,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 2336,
       "column": 28,
       "token": "filePath",
@@ -579,7 +579,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 3117,
       "column": 32,
       "token": "filePath",
@@ -590,7 +590,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 3633,
       "column": 21,
       "token": "filePath",
@@ -601,7 +601,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/manifest.rs",
+      "path": "crates/aft-subc/src/subc/manifest.rs",
       "line": 737,
       "column": 62,
       "token": "filePath",
@@ -612,7 +612,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/manifest.rs",
+      "path": "crates/aft-subc/src/subc/manifest.rs",
       "line": 741,
       "column": 13,
       "token": "filePath",
@@ -623,7 +623,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/manifest.rs",
+      "path": "crates/aft-subc/src/subc/manifest.rs",
       "line": 750,
       "column": 43,
       "token": "filePath",
@@ -634,7 +634,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/manifest.rs",
+      "path": "crates/aft-subc/src/subc/manifest.rs",
       "line": 751,
       "column": 62,
       "token": "filePath",
@@ -645,7 +645,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/manifest.rs",
+      "path": "crates/aft-subc/src/subc/manifest.rs",
       "line": 1132,
       "column": 23,
       "token": "filePath",
@@ -656,7 +656,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/mod.rs",
+      "path": "crates/aft-subc/src/subc/mod.rs",
       "line": 18829,
       "column": 26,
       "token": "filePath",
@@ -667,7 +667,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/mod.rs",
+      "path": "crates/aft-subc/src/subc/mod.rs",
       "line": 20078,
       "column": 50,
       "token": "filePath",
@@ -678,7 +678,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/mod.rs",
+      "path": "crates/aft-subc/src/subc/mod.rs",
       "line": 20087,
       "column": 78,
       "token": "filePath",
@@ -689,7 +689,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2623,
       "column": 67,
       "token": "filePath",
@@ -700,7 +700,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2625,
       "column": 57,
       "token": "filePath",
@@ -711,7 +711,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2629,
       "column": 34,
       "token": "filePath",
@@ -722,7 +722,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2636,
       "column": 76,
       "token": "filePath",
@@ -733,7 +733,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2642,
       "column": 31,
       "token": "filePath",
@@ -744,7 +744,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2644,
       "column": 39,
       "token": "filePath",
@@ -755,7 +755,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2650,
       "column": 38,
       "token": "filePath",
@@ -766,7 +766,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2658,
       "column": 17,
       "token": "filePath",
@@ -777,7 +777,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2660,
       "column": 14,
       "token": "filePath",
@@ -788,7 +788,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2669,
       "column": 43,
       "token": "filePath",
@@ -799,7 +799,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2681,
       "column": 42,
       "token": "filePath",
@@ -810,7 +810,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 2692,
       "column": 53,
       "token": "filePath",
@@ -821,7 +821,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3046,
       "column": 44,
       "token": "filePath",
@@ -832,7 +832,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3845,
       "column": 56,
       "token": "filePath",
@@ -843,7 +843,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3849,
       "column": 63,
       "token": "filePath",
@@ -854,7 +854,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3879,
       "column": 23,
       "token": "filePath",
@@ -865,7 +865,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3887,
       "column": 34,
       "token": "filePath",
@@ -876,7 +876,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3897,
       "column": 58,
       "token": "filePath",
@@ -887,7 +887,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3902,
       "column": 19,
       "token": "filePath",
@@ -898,7 +898,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3907,
       "column": 34,
       "token": "filePath",
@@ -909,7 +909,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3910,
       "column": 33,
       "token": "filePath",
@@ -920,7 +920,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3912,
       "column": 51,
       "token": "filePath",
@@ -931,7 +931,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 3919,
       "column": 53,
       "token": "filePath",
@@ -942,7 +942,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 4734,
       "column": 63,
       "token": "filePath",
@@ -953,7 +953,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 5194,
       "column": 21,
       "token": "filePath",
@@ -964,7 +964,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6024,
       "column": 133,
       "token": "filePath",
@@ -975,7 +975,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6054,
       "column": 60,
       "token": "filePath",
@@ -986,7 +986,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6245,
       "column": 56,
       "token": "filePath",
@@ -997,7 +997,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6296,
       "column": 33,
       "token": "filePath",
@@ -1008,7 +1008,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6313,
       "column": 53,
       "token": "filePath",
@@ -1019,7 +1019,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6341,
       "column": 64,
       "token": "filePath",
@@ -1030,7 +1030,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6354,
       "column": 58,
       "token": "filePath",
@@ -1041,7 +1041,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/tool_provider.rs",
+      "path": "crates/aft-subc/src/subc/tool_provider.rs",
       "line": 6447,
       "column": 136,
       "token": "filePath",
@@ -1052,7 +1052,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 99,
       "column": 80,
       "token": "filePath",
@@ -1063,7 +1063,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 101,
       "column": 76,
       "token": "filePath",
@@ -1074,7 +1074,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 104,
       "column": 80,
       "token": "filePath",
@@ -1085,7 +1085,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 199,
       "column": 30,
       "token": "filePath",
@@ -1096,7 +1096,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 468,
       "column": 35,
       "token": "filePath",
@@ -1107,7 +1107,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 757,
       "column": 29,
       "token": "filePath",
@@ -1118,7 +1118,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_format.rs",
+      "path": "crates/aft-tools/src/subc_format.rs",
       "line": 2778,
       "column": 40,
       "token": "filePath",
@@ -1129,7 +1129,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 137,
       "column": 36,
       "token": "filePath",
@@ -1140,7 +1140,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 158,
       "column": 28,
       "token": "filePath",
@@ -1151,7 +1151,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 258,
       "column": 58,
       "token": "filePath",
@@ -1162,7 +1162,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 263,
       "column": 58,
       "token": "filePath",
@@ -1173,7 +1173,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 264,
       "column": 60,
       "token": "toFile",
@@ -1184,7 +1184,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 266,
       "column": 66,
       "token": "filePath",
@@ -1195,7 +1195,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 307,
       "column": 24,
       "token": "filePath",
@@ -1206,7 +1206,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 400,
       "column": 41,
       "token": "filePath",
@@ -1217,7 +1217,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 401,
       "column": 21,
       "token": "filePath",
@@ -1228,7 +1228,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 404,
       "column": 43,
       "token": "filePath",
@@ -1239,7 +1239,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 406,
       "column": 65,
       "token": "filePath",
@@ -1250,7 +1250,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 407,
       "column": 66,
       "token": "filePath",
@@ -1261,7 +1261,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 1579,
       "column": 18,
       "token": "toFile",
@@ -1272,7 +1272,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 2194,
       "column": 77,
       "token": "filePath",
@@ -1283,7 +1283,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 2686,
       "column": 35,
       "token": "filePath",
@@ -1294,7 +1294,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 2901,
       "column": 59,
       "token": "filePath",
@@ -1305,7 +1305,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3074,
       "column": 42,
       "token": "filePath",
@@ -1316,7 +1316,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3081,
       "column": 64,
       "token": "filePath",
@@ -1327,7 +1327,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3085,
       "column": 41,
       "token": "filePath",
@@ -1338,7 +1338,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3091,
       "column": 62,
       "token": "filePath",
@@ -1349,7 +1349,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3096,
       "column": 14,
       "token": "filePath",
@@ -1360,7 +1360,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3239,
       "column": 34,
       "token": "filePath",
@@ -1371,7 +1371,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3269,
       "column": 44,
       "token": "filePath",
@@ -1382,7 +1382,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3297,
       "column": 30,
       "token": "filePath",
@@ -1393,7 +1393,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3315,
       "column": 98,
       "token": "filePath",
@@ -1404,7 +1404,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3328,
       "column": 30,
       "token": "filePath",
@@ -1415,7 +1415,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3363,
       "column": 98,
       "token": "filePath",
@@ -1426,7 +1426,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3659,
       "column": 46,
       "token": "filePath",
@@ -1437,7 +1437,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3759,
       "column": 14,
       "token": "filePath",
@@ -1448,7 +1448,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3824,
       "column": 22,
       "token": "filePath",
@@ -1459,7 +1459,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3836,
       "column": 22,
       "token": "filePath",
@@ -1470,7 +1470,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3846,
       "column": 22,
       "token": "filePath",
@@ -1481,7 +1481,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3856,
       "column": 22,
       "token": "filePath",
@@ -1492,7 +1492,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3866,
       "column": 22,
       "token": "filePath",
@@ -1503,7 +1503,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3876,
       "column": 22,
       "token": "filePath",
@@ -1514,7 +1514,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 3951,
       "column": 18,
       "token": "filePath",
@@ -1525,7 +1525,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 4908,
       "column": 14,
       "token": "filePath",
@@ -1536,7 +1536,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 5003,
       "column": 57,
       "token": "filePath",
@@ -1547,7 +1547,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/parent_query/mod.rs",
+      "path": "crates/aft-tools/src/commands/parent_query/mod.rs",
       "line": 237,
       "column": 52,
       "token": "toFile",
@@ -8537,7 +8537,7 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 996,
       "column": 28,
       "token": "filePath",
@@ -8548,7 +8548,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 1743,
       "column": 32,
       "token": "filePath",
@@ -8559,7 +8559,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/subc_translate.rs",
+      "path": "crates/aft-tools/src/subc_translate.rs",
       "line": 2909,
       "column": 59,
       "token": "filePath",
@@ -8603,7 +8603,7 @@
       "reason": "Rust command, translation, or protocol plumbing consumes the legacy wire spelling."
     },
     {
-      "path": "crates/aft/src/commands/apply_patch.rs",
+      "path": "crates/aft-tools/src/commands/apply_patch.rs",
       "line": 1072,
       "column": 25,
       "token": "filePath",
@@ -8625,7 +8625,7 @@
       "reason": "The read preflight validates both canonical and legacy path keys before dispatch; this spelling is internal confinement logic, not a new agent argument."
     },
     {
-      "path": "crates/aft/src/subc/confine_tests.rs",
+      "path": "crates/aft-subc/src/subc/confine_tests.rs",
       "line": 134,
       "column": 27,
       "token": "filePath",
@@ -8636,7 +8636,7 @@
       "reason": "The confinement test helper builds an existing legacy read call to exercise boundary enforcement; this spelling is test input, not a new agent argument."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 2055,
       "column": 22,
       "token": "filePath",
@@ -8647,7 +8647,7 @@
       "reason": "The approved retry exercises read's existing served V1 filePath wire, not a new agent-facing argument."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 2104,
       "column": 21,
       "token": "filePath",
@@ -8658,7 +8658,7 @@
       "reason": "The reverse-elicitation request exercises read's existing served V1 filePath wire, not a new agent-facing argument."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 2149,
       "column": 21,
       "token": "filePath",
@@ -8669,7 +8669,7 @@
       "reason": "The later call proves single-use approval using read's existing served V1 filePath wire."
     },
     {
-      "path": "crates/aft/src/subc/consent_tests.rs",
+      "path": "crates/aft-subc/src/subc/consent_tests.rs",
       "line": 2174,
       "column": 21,
       "token": "filePath",

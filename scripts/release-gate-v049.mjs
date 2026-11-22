@@ -24,7 +24,8 @@ const ROOT = resolve(import.meta.dirname, "..");
 const RELEASE_MANIFEST_PATH = "docs/v0.49-release-manifest.json";
 const SURFACE_MANIFEST_PATH = "docs/v0.49-agent-surface-manifest.json";
 const SOURCE_INVENTORY_PATH = "docs/v0.49-unified-tool-surface-inventory.json";
-const SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
+const SCHEMA_PATH = "crates/aft-subc/src/subc_tool_schemas.json";
+const PREVIOUS_SCHEMA_PATH = "crates/aft/src/subc_tool_schemas.json";
 const EVIDENCE_PATH = "docs/v0.49-release-evidence.json";
 let snapshotDir;
 
@@ -436,7 +437,7 @@ function snapshotForManifest(rows) {
 }
 
 function schemaSnapshot(commit, surface) {
-  const oldBytes = sourceBytes(commit, SCHEMA_PATH);
+  const oldBytes = sourceBytes(commit, PREVIOUS_SCHEMA_PATH);
   const expected = surface.artifacts.find((artifact) => artifact.path === SCHEMA_PATH);
   if (!expected) fail(`surface manifest omits ${SCHEMA_PATH}`);
   return {

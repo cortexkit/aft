@@ -412,7 +412,7 @@ async function validateSliceMatrices(
 export async function loadToolSchemas(
   repoRoot: string,
 ): Promise<Record<string, Record<string, unknown>>> {
-  const path = join(repoRoot, "crates", "aft", "src", "subc_tool_schemas.json");
+  const path = join(repoRoot, "crates", "aft-subc", "src", "subc_tool_schemas.json");
   const record = asRecord(await readJson(path));
   if (!record) fail("matrix_invalid", "tool schema artifact is invalid", { path }, true);
   return record as Record<string, Record<string, unknown>>;
