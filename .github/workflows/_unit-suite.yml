@@ -944,14 +944,6 @@ jobs:
         env:
           MACOS_LIBTEST_ARCHIVE: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-libtest-nextest.tar.zst
 
-      - name: Audit native engine compiler inputs (macOS)
-        run: |
-          # Keep the archive's codegen setting so Cargo can reuse its libtest build.
-          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
-          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
-        env:
-          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
-
       # Keep the build's timing report even when a later step fails; it is the
       # evidence for diagnosing slow archive builds.
       - name: Save libtest build timings
@@ -961,6 +953,14 @@ jobs:
           name: macos-libtest-timings
           path: target/cargo-timings/
           if-no-files-found: error
+
+      - name: Audit native engine compiler inputs (macOS)
+        run: |
+          # Keep the archive's codegen setting so Cargo can reuse its libtest build.
+          cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+        env:
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Run the serial backtrace probe with local debug objects
         run: cargo test --features wasm-grammars -p agent-file-tools -p aft-base -p aft-db --features test-hooks --lib panic_hook_preserves_default_backtrace_behavior_and_persists --config "$LIBTEST_CARGO_CONFIG"
