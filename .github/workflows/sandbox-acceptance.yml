@@ -1,10 +1,7 @@
 name: Sandbox acceptance
 
 on:
-  merge_group:
-    types: [checks_requested]
-  push:
-    branches: [main, 'train/**', 'release/**']
+  workflow_call:
   workflow_dispatch:
 
 permissions:
@@ -13,7 +10,7 @@ permissions:
 jobs:
   linux:
     name: Sandbox acceptance (Linux bubblewrap)
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v5
@@ -23,18 +20,43 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Require the real bubblewrap namespace backend
+      - name: Install the sandbox probe tools
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y -o Acquire::Retries=5 bubblewrap openssh-client python3
           test -x /usr/bin/python3
-          # Ubuntu 24.04 may block unprivileged user namespaces via AppArmor.
-          # This setting is changed only on the disposable GitHub-hosted VM.
-          if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Probe bubblewrap on the stock hosted image
+        id: stock-bwrap
+        shell: bash
+        run: |
+          echo "Hosted image: ${ImageOS:-unknown} ${ImageVersion:-unknown}"
+          /usr/bin/bwrap --version
+          sysctl kernel.apparmor_restrict_unprivileged_userns || true
+          if (cd / && LC_ALL=C /usr/bin/bwrap --unshare-user --disable-userns --dev-bind / / -- /usr/bin/true); then
+            echo 'Stock bubblewrap works; the enforcing matrix will use the stock settings.'
+            echo 'active=true' >> "$GITHUB_OUTPUT"
+          else
+            status=$?
+            echo "Stock bubblewrap failed with exit $status; the stock Landlock fallback must pass before changing AppArmor."
+            echo 'active=false' >> "$GITHUB_OUTPUT"
           fi
-          /usr/bin/bwrap --unshare-user --ro-bind / / -- /bin/true
+      - name: Verify AFT's Landlock fallback on the stock hosted image
+        if: steps.stock-bwrap.outputs.active == 'false'
+        shell: bash
+        run: |
+          bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
+            cargo test --features test-hooks -p agent-file-tools --test sandbox_acceptance -- \
+            stock_landlock_fallback --exact --ignored --nocapture
+      - name: Permit user namespaces for the enforcing matrix
+        if: steps.stock-bwrap.outputs.active == 'false'
+        shell: bash
+        run: |
+          # Change the restriction only on this disposable hosted VM, after
+          # proving the stock fallback and before requiring active bubblewrap.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          cd /
+          LC_ALL=C /usr/bin/bwrap --unshare-user --disable-userns --dev-bind / / -- /usr/bin/true
       - name: Run the role and credential acceptance matrix
         shell: bash
         run: |
@@ -71,13 +93,21 @@ jobs:
   macos:
     name: Sandbox acceptance (Mac mini Seatbelt)
     runs-on: [self-hosted, mac-mini]
-    timeout-minutes: 45
+    # MOTOR manages the build fleet that normally shares this host.
+    # Each job timeout includes 50 minutes for MOTOR to drain the fleet VMs.
+    timeout-minutes: 95
     env:
       AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN: '1'
     steps:
       - uses: actions/checkout@v5
+        id: checkout
         with:
           persist-credentials: false
+      - name: Acquire MOTOR macOS hold
+        id: macos-hold
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: acquire
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -104,3 +134,13 @@ jobs:
           bash crates/aft/tests/sandbox_acceptance/ci-test.sh \
             cargo test --features test-hooks -p agent-file-tools --test worker_jail -- \
             worker_gh_read_t8_first_bound_read_uses_broker_with_credentials_denied --exact --nocapture
+      - name: Clean native test processes
+        if: always() && steps.macos-hold.outcome == 'success'
+        uses: ./.github/actions/native-ci-state
+        with:
+          phase: cleanup
+      - name: Release MOTOR macOS hold
+        if: always() && steps.checkout.outcome == 'success'
+        uses: ./.github/actions/macos-hold
+        with:
+          phase: release

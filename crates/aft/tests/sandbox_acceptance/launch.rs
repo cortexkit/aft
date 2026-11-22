@@ -52,6 +52,43 @@ impl Shell {
     }
 
     pub(super) fn run(&self, mode: SandboxMode, script: &str, check_call_socket: bool) -> String {
+        let transcript = self.run_task(mode, script, check_call_socket);
+        #[cfg(target_os = "linux")]
+        if mode != SandboxMode::Off {
+            let backend = if mode == SandboxMode::Strict {
+                "bwrap+landlock"
+            } else {
+                "bwrap"
+            };
+            let prefix = format!("sandbox-launch: profile={mode} backend={backend} ");
+            assert!(
+                transcript.lines().any(|line| line.starts_with(&prefix)),
+                "worker={} {mode}: required active {backend} backend not reported: {:?}",
+                self.worker,
+                transcript
+                    .lines()
+                    .find(|line| line.starts_with("sandbox-launch: profile="))
+            );
+        }
+        transcript
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn run_stock_landlock(&self, script: &str) -> String {
+        let transcript = self.run_task(SandboxMode::Strict, script, false);
+        let report = transcript.lines().find(|line| {
+            line.starts_with("sandbox-launch: profile=strict unenforced=[")
+                && line.contains("bwrap_user_namespace_unavailable")
+                && line.ends_with("(bubblewrap unavailable; using direct Landlock)")
+        });
+        let report = report.unwrap_or_else(|| {
+            panic!("Strict did not report the stock user-namespace fallback: {transcript}")
+        });
+        eprintln!("{report}");
+        transcript
+    }
+
+    fn run_task(&self, mode: SandboxMode, script: &str, check_call_socket: bool) -> String {
         // A distinct level on the other role makes a wrong selection observable.
         let other = if mode == SandboxMode::Off {
             SandboxMode::Standard
@@ -165,24 +202,6 @@ impl Shell {
                 "worker={} {mode}: shell did not complete: {snapshot:?}\n{transcript}",
                 self.worker
             );
-            #[cfg(target_os = "linux")]
-            if mode != SandboxMode::Off {
-                let backend = if mode == SandboxMode::Strict {
-                    "bwrap+landlock"
-                } else {
-                    "bwrap"
-                };
-                let report = transcript
-                    .lines()
-                    .find(|line| line.starts_with("sandbox-launch: profile="));
-                assert!(
-                    report.is_some_and(|line| line.starts_with(&format!(
-                        "sandbox-launch: profile={mode} backend={backend} "
-                    ))),
-                    "worker={} {mode}: required active {backend} backend not reported: {report:?}",
-                    self.worker
-                );
-            }
             if let Some(call) = call {
                 call.finish();
             }

@@ -49,6 +49,39 @@ fn role_matrix_https_worker() {
     isolated("role_matrix_https_worker", |root| https(root, true));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "run only where the stock bubblewrap namespace probe fails"]
+fn stock_landlock_fallback() {
+    isolated("stock_landlock_fallback", |root| {
+        let shell = launch::Shell::new(root, false);
+        let checkout_file = root.join("project/checkout-write-control");
+        let outside_file = root.join("outside-write-control");
+        std::fs::write(&outside_file, "original").unwrap();
+        let script = format!(
+            "printf payload > {} || exit 7; \
+             if (printf changed > {}); then echo OUTSIDE_WRITABLE; else echo OUTSIDE_DENIED; fi",
+            path_arg(&checkout_file),
+            path_arg(&outside_file),
+        );
+
+        let off = shell.run(SandboxMode::Off, &script, false);
+        assert!(off.lines().any(|line| line == "OUTSIDE_WRITABLE"), "{off}");
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "changed");
+        std::fs::write(&outside_file, "original").unwrap();
+        std::fs::remove_file(&checkout_file).unwrap();
+
+        let strict = shell.run_stock_landlock(&script);
+        assert!(
+            strict.lines().any(|line| line == "OUTSIDE_DENIED"),
+            "{strict}"
+        );
+        assert_eq!(std::fs::read_to_string(&checkout_file).unwrap(), "payload");
+        assert_eq!(std::fs::read_to_string(&outside_file).unwrap(), "original");
+        eprintln!("Stock Strict payload wrote in the checkout but could not modify the outside control file");
+    });
+}
+
 #[test]
 #[ignore = "run once the local-secrets git proxy lands"]
 fn production_per_call_git_proxy() {

@@ -214,6 +214,11 @@ jobs:
     with:
       storm_profile_probe: ${{ github.event_name == 'workflow_dispatch' && inputs.storm_profile_probe }}
 
+  sandbox-acceptance:
+    name: Sandbox acceptance
+    if: ${{ github.event_name != 'pull_request' }}
+    uses: ./.github/workflows/sandbox-acceptance.yml
+
   unit-linux-task-scopes:
     name: Linux background task scopes (systemd user manager)
     if: ${{ github.event_name != 'pull_request' }}
