@@ -56,15 +56,22 @@ METRICS = ("mrr_at_10", "hit_at_1", "hit_at_5")
 RANKING_FENCE_PREFIXES = (
     "crates/aft/src/commands/semantic_search.rs",
     "crates/aft/src/commands/semantic_search/",
+    # Keep former owners fenced too: the merge queue can compare against a
+    # revision before the split, where deletions still appear at those paths.
     "crates/aft/src/search_index.rs",
     "crates/aft/src/search_index/exact_lane.rs",
     "crates/aft/src/search_state/",
+    "crates/aft-engine/src/search_index.rs",
+    "crates/aft-engine/src/search_index/exact_lane.rs",
+    "crates/aft-engine/src/search_state/",
     "crates/aft/src/query_shape.rs",
     "crates/aft-base/src/query_shape.rs",
     "crates/aft/src/semantic_index.rs",
+    "crates/aft-engine/src/semantic_index.rs",
     "crates/aft-base/src/ort_pin.rs",
     "crates/aft/src/embed/",
     "crates/aft/src/lib.rs",
+    "crates/aft-engine/src/lib.rs",
     "crates/aft-base/src/lib.rs",
     "crates/aft-db/src/lib.rs",
     "crates/aft-parse/src/lib.rs",
@@ -72,6 +79,7 @@ RANKING_FENCE_PREFIXES = (
     # query runs and which candidates they produce, so a change there moves
     # search results just as a scoring change does.
     "crates/aft/src/search_b2/",
+    "crates/aft-engine/src/search_b2/",
     # The semantic index chunks each file on the symbols parser.rs extracts:
     # its grammars, queries and extractors decide which symbols exist and
     # which lines each one spans, and those lines become the chunk text that
@@ -79,6 +87,7 @@ RANKING_FENCE_PREFIXES = (
     # symbols.rs stays out: it only defines the Symbol and Range types and
     # their serialization, and never decides where a range starts or ends.
     "crates/aft/src/parser.rs",
+    "crates/aft-engine/src/parser.rs",
     "crates/aft-parse/src/parser.rs",
     "crates/aft-parse/src/parser/file_language.rs",
     "crates/aft-base/src/lang_id.rs",
