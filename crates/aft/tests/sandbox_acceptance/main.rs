@@ -16,6 +16,8 @@ const HOME_PROCESS: &str = "AFT_SANDBOX_ACCEPTANCE_HOME_PROCESS";
 const REQUIRE_OSXKEYCHAIN: &str = "AFT_REQUIRE_ACCEPTANCE_OSXKEYCHAIN";
 #[cfg(target_os = "macos")]
 const GH_BINARY: &str = "AFT_ACCEPTANCE_GH_BINARY";
+#[cfg(target_os = "macos")]
+const ACCEPTANCE_KEYCHAIN: &str = "AFT_ACCEPTANCE_KEYCHAIN";
 const LEVELS: [SandboxMode; 4] = [
     SandboxMode::Off,
     SandboxMode::Credentials,
@@ -118,7 +120,9 @@ fn isolated(test_name: &str, credential_env: bool, run: impl FnOnce(&Path)) {
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_TERMINAL_PROMPT", "0");
         #[cfg(target_os = "macos")]
-        process.env(GH_BINARY, std::env::var_os(GH_BINARY).unwrap_or_default());
+        for name in [GH_BINARY, ACCEPTANCE_KEYCHAIN] {
+            process.env(name, std::env::var_os(name).unwrap_or_default());
+        }
         if credential_env {
             process
                 .env("SSH_AUTH_SOCK", base.join("a"))

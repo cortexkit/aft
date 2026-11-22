@@ -123,6 +123,7 @@ jobs:
             exit 1
           fi
           security unlock-keychain -p "" "$default"
+          printf 'AFT_ACCEPTANCE_KEYCHAIN=%s\n' "$default" >> "$GITHUB_ENV"
       - name: Run the role and credential acceptance matrix
         shell: bash
         run: |

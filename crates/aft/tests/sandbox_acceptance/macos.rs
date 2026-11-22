@@ -1,4 +1,4 @@
-use super::{checked, credentials, path_arg, GH_BINARY, REQUIRE_OSXKEYCHAIN};
+use super::{checked, credentials, path_arg, ACCEPTANCE_KEYCHAIN, GH_BINARY, REQUIRE_OSXKEYCHAIN};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -148,19 +148,29 @@ struct GitItem {
 
 impl GitItem {
     fn seed(host: &str) -> Self {
-        let output = Command::new("/usr/bin/security")
-            .args(["default-keychain", "-d", "user"])
-            .output()
-            .expect("check Mac mini CI default keychain");
-        let keychain = PathBuf::from(
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .trim_matches('"'),
-        );
-        assert!(output.status.success()
-                && keychain == Path::new("/Users/ghrunner/Library/Keychains/ci.keychain-db")
-                && keychain.is_file(),
-            "osxkeychain acceptance will only seed the Mac mini runner's dedicated default ci.keychain");
+        let keychain = std::env::var_os(ACCEPTANCE_KEYCHAIN).map(PathBuf::from);
+        let expected = Path::new("/Users/ghrunner/Library/Keychains/ci.keychain-db");
+        if keychain
+            .as_deref()
+            .is_none_or(|path| path != expected || !path.is_file())
+        {
+            let (stdout, stderr) = match Command::new("/usr/bin/security")
+                .args(["default-keychain", "-d", "user"])
+                .output()
+            {
+                Ok(output) => (
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                    String::from_utf8_lossy(&output.stderr).into_owned(),
+                ),
+                Err(error) => (String::new(), format!("cannot run security: {error}")),
+            };
+            panic!(
+                "osxkeychain acceptance requires {expected:?}; {ACCEPTANCE_KEYCHAIN}={keychain:?}, \
+                 security default-keychain -d user stdout={stdout:?} stderr={stderr:?}, HOME={:?}",
+                std::env::var_os("HOME")
+            );
+        }
+        let keychain = keychain.unwrap();
 
         // Check the reserved account even if an earlier run seeded different
         // protocol attributes. Remove only a server with the fixture prefix.
