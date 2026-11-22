@@ -68,13 +68,17 @@ impl Keychain {
             GENERIC.into(),
         );
         if std::env::var(REQUIRE_OSXKEYCHAIN).as_deref() == Ok("1") {
-            keychain.git_item = Some(GitItem::seed(&host));
+            let item = GitItem::seed(&host);
             fixture.lookup(
                 "git_osxkeychain",
                 credentials::git_helper("osxkeychain"),
-                format!("printf '%s\\n' protocol=https host={host}:443 path=acceptance username={GIT_ACCOUNT} '' | @TOOL@ get"),
+                format!(
+                    "printf '%s\\n' protocol=https host={host}:443 path=acceptance username={GIT_ACCOUNT} '' | HOME={} @TOOL@ get",
+                    path_arg(&item.account_home)
+                ),
                 format!("password={INTERNET}"),
             );
+            keychain.git_item = Some(item);
         } else {
             eprintln!("osxkeychain item not tested: only the Mac mini CI runner provisions a default keychain for this probe");
         }
@@ -88,6 +92,33 @@ impl Keychain {
             "\n/bin/cat {} >/dev/null && printf 'KEYCHAIN_BYTES_READABLE\\n'\n",
             path_arg(&self.path)
         )
+    }
+
+    pub(super) fn search_list_check(&self) -> String {
+        let Some(item) = &self.git_item else {
+            return String::new();
+        };
+        format!(
+            "\nprintf 'BEGIN ci_keychain_search_list\\n'\n\
+             HOME={} /usr/bin/security list-keychains -d user 2>&1\n\
+             printf '\\nEND ci_keychain_search_list %s\\n' \"$?\"\n",
+            path_arg(&item.account_home)
+        )
+    }
+
+    pub(super) fn report_failed_search_list(&self, label: &str, run: &str, gh_seed_found: bool) {
+        if self.git_item.is_none() {
+            return;
+        }
+        let git_seed = format!("password={INTERNET}");
+        let git_seed_found = ["direct", "child", "copied"].into_iter().all(|kind| {
+            let (status, output) = credentials::observed(run, &format!("git_osxkeychain_{kind}"));
+            status == 0 && output.contains(&git_seed)
+        });
+        if !git_seed_found || !gh_seed_found {
+            let (status, output) = credentials::observed(run, "ci_keychain_search_list");
+            eprintln!("{label}: security list-keychains -d user (exit {status}):\n{output}");
+        }
     }
 
     pub(super) fn gh_lookup(&self, root: &Path) -> Option<GhItem> {
@@ -128,6 +159,7 @@ impl Keychain {
             service,
             binary: binary.into(),
             config,
+            account_home: fixture.account_home.clone(),
         })
     }
 }
@@ -144,6 +176,7 @@ impl Drop for Keychain {
 struct GitItem {
     keychain: PathBuf,
     host: String,
+    account_home: PathBuf,
 }
 
 impl GitItem {
@@ -171,6 +204,9 @@ impl GitItem {
             );
         }
         let keychain = keychain.unwrap();
+        // Git's osxkeychain helper and gh need the runner's home to find the CI keychain.
+        let account_home = aft_base::worker_jail_canary::account_home()
+            .expect("resolve the Mac mini runner's account home from the password database");
 
         // Check the reserved account even if an earlier run seeded different
         // protocol attributes. Remove only a server with the fixture prefix.
@@ -212,6 +248,7 @@ impl GitItem {
         Self {
             keychain,
             host: host.into(),
+            account_home,
         }
     }
 
@@ -246,6 +283,7 @@ pub(super) struct GhItem {
     service: String,
     binary: PathBuf,
     config: PathBuf,
+    account_home: PathBuf,
 }
 
 impl GhItem {
@@ -253,21 +291,21 @@ impl GhItem {
         // Isolate the file config and environment so the raw CLI cannot find
         // an operator token. Do not refresh the fixture token over the network.
         format!(
-            "/usr/bin/env -i HOME=\"$HOME\" PATH=/usr/bin:/bin GH_CONFIG_DIR={} \
+            "/usr/bin/env -i HOME={} PATH=/usr/bin:/bin GH_CONFIG_DIR={} \
              GH_NO_UPDATE_NOTIFIER=1 GH_NO_EXTENSION_UPDATE_NOTIFIER=1 \
              {} auth token --hostname {} --no-refresh",
+            path_arg(&self.account_home),
             path_arg(&self.config),
             path_arg(&self.binary),
             self.host,
         )
     }
 
-    pub(super) fn report(&self, label: &str, transcript: &str) {
+    pub(super) fn report(&self, label: &str, transcript: &str) -> bool {
         let (_, output) = credentials::observed(transcript, "gh_keyring");
-        eprintln!(
-            "{label}: gh_keyring returned_seed={}",
-            output.lines().any(|line| line == GH_TOKEN)
-        );
+        let found = output.lines().any(|line| line == GH_TOKEN);
+        eprintln!("{label}: gh_keyring returned_seed={found}");
+        found
     }
 }
 

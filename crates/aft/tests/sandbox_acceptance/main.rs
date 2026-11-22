@@ -172,11 +172,20 @@ fn credentials(root: &Path, worker: bool) {
         let gh_command: Option<String> = None;
         let script = fixture.script(measure_setuid, gh_command.as_deref());
         #[cfg(target_os = "macos")]
-        let script = script + &keychain.readable_file_check();
+        let script = {
+            let mut script = script + &keychain.readable_file_check();
+            if !enabled {
+                script.push_str(&keychain.search_list_check());
+            }
+            script
+        };
         let run = shell.run(mode, &script, enabled);
         #[cfg(target_os = "macos")]
-        if let Some(probe) = gh_probe {
-            probe.report(&label, &run);
+        {
+            let gh_seed_found = gh_probe.is_none_or(|probe| probe.report(&label, &run));
+            if !enabled {
+                keychain.report_failed_search_list(&label, &run, gh_seed_found);
+            }
         }
         fixture.assert_oracle(&label, &run, enabled);
         #[cfg(target_os = "macos")]
