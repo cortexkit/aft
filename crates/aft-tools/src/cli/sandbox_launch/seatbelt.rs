@@ -720,7 +720,7 @@ mod macos_native_tests {
         let task = aft::bash_background::persistence::create_task_layout(
             &storage,
             "seatbelt-probe",
-            "bash-0000000000000001",
+            &format!("bash-{:016x}", level as u8),
         )
         .unwrap();
         let _launcher =
