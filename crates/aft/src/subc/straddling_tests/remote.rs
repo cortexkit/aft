@@ -2,7 +2,7 @@ use crate::bash_background::persistence::{
     read_task, resolve_task_layout, session_tasks_dir, unix_millis, write_task, write_task_at,
     TaskPaths,
 };
-use crate::bash_background::BgTaskStatus;
+use crate::bash_background::{registry::remote::RemotePhase, BgTaskStatus};
 use crate::exec_remote::types::*;
 use crate::sandbox_spawn::SpawnPlan;
 use crate::tools_test_support::{handle_with_policy, rendered_status};

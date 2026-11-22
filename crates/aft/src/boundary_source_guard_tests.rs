@@ -204,7 +204,7 @@ fn tools_module_tree_does_not_reference_subc() {
 fn source_guard_detects_planted_paths_in_tools_modules_only() {
     let checkout = tempfile::tempdir().unwrap();
     let src = checkout.path().join("src");
-    let write = |path: &str, source| {
+    let write = |path: &str, source: &str| {
         let path = checkout.path().join(path);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, source).unwrap();

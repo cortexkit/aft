@@ -417,7 +417,7 @@ fn audit_arm_failure_cleans_transferred_scratch() {
 fn audit_killing_revokes_before_term_grace() {
     isolated("audit_killing_revokes_before_term_grace", || {
         let f = Fixture::new();
-        use aft_base::scope_watch::{revision, Source};
+        use crate::subc::scope_watch::{revision, Source};
         let before_arm = revision(Source::Shell);
         let command = format!(
             "trap ':' TERM; : > ready; {}; {}; : > term-request; while :; do sleep 0.05; done",

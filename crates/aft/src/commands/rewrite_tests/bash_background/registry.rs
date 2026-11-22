@@ -2,10 +2,8 @@ mod tests {
     use crate::bash_background::persistence::{write_task, BgMode, ExitMarker, PersistedTask};
     use crate::bash_background::BgTaskStatus;
     use aft_engine::test_bridge::bash_remote::BgBuffer;
+    use aft_engine::test_bridge::bash_remote::TaskRuntimeTestExt as _;
     use aft_engine::test_bridge::bash_remote::{registry_support::registry_cases::*, TaskRuntime};
-    use aft_engine::test_bridge::bash_remote::{
-        BgTaskRegistryTestExt as _, TaskRuntimeTestExt as _,
-    };
     use std::{fs, path::PathBuf};
 
     #[test]

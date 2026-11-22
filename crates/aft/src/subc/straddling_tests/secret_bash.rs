@@ -160,7 +160,7 @@ fn stamp(kind: &str) -> subc_protocol::scope::ScopeStamp {
 #[cfg(unix)]
 #[tokio::test]
 async fn scope_watch_secret_proxy_arm_and_stop_notify_without_strict_execution() {
-    use aft_base::scope_watch::{revision, Source};
+    use crate::subc::scope_watch::{revision, Source};
     use std::ffi::OsString;
     use std::os::unix::process::CommandExt;
     struct Session(std::process::Child);
