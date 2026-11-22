@@ -1,8 +1,9 @@
 //! Byte-bounded cache of projections reconstructed from one publication.
 
 use aft_store::heap::{HeapBytes, Seen};
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, OnceLock, RwLock};
 
 const CHURN_FLOOR: usize = 4096;
 
@@ -16,14 +17,19 @@ pub(in crate::data_layer) struct CacheChurn {
 #[derive(Default)]
 struct Pass {
     seen: HashSet<Arc<str>>,
+    warm_seen: AtomicUsize,
     path_bytes: usize,
     redecodes: usize,
     oversized_redecodes: usize,
     decodes: usize,
-    joined: usize,
+    joined: AtomicUsize,
 }
 
 impl Pass {
+    fn distinct(&self) -> usize {
+        self.seen.len() + self.warm_seen.load(Relaxed)
+    }
+
     fn note(&mut self, path: Arc<str>) -> bool {
         let bytes = path.len() + aft_store::heap::COUNTS;
         let first = self.seen.insert(path);
@@ -42,7 +48,7 @@ impl Pass {
                 self.oversized_redecodes += 1;
             }
         }
-        let distinct = self.seen.len();
+        let distinct = self.distinct();
         (self.redecodes >= CHURN_FLOOR && self.redecodes > distinct).then_some(CacheChurn {
             redecodes: self.redecodes,
             distinct,
@@ -61,34 +67,39 @@ enum Read<T> {
 struct Entry<T> {
     value: Arc<T>,
     size: usize,
-    used: u64,
-    seen_in_pass: bool,
+    slot: usize,
+    referenced: AtomicBool,
+    warm: bool,
+    warm_seen: AtomicBool,
 }
 
 struct State<T> {
     entries: HashMap<Arc<str>, Entry<T>>,
-    order: BTreeMap<u64, Arc<str>>,
+    /// Ring slots keep stable indices so removing an edited path is constant time.
+    clock: Vec<Option<Arc<str>>>,
+    free: Vec<usize>,
+    hand: usize,
     flights: HashMap<Arc<str>, Flight<T>>,
     pass: Option<Pass>,
     held: usize,
     peak: usize,
     peak_table: usize,
     evicted: usize,
-    clock: u64,
 }
 
 impl<T> Default for State<T> {
     fn default() -> Self {
         Self {
             entries: HashMap::new(),
-            order: BTreeMap::new(),
+            clock: Vec::new(),
+            free: Vec::new(),
+            hand: 0,
             flights: HashMap::new(),
             pass: None,
             held: 0,
             peak: 0,
             peak_table: 0,
             evicted: 0,
-            clock: 0,
         }
     }
 }
@@ -104,10 +115,8 @@ impl<T> State<T> {
             }
         }
         table::<(Arc<str>, Entry<T>)>(self.entries.capacity())
-            + aft_store::heap::btree_bytes(
-                self.order.len(),
-                size_of::<u64>() + size_of::<Arc<str>>(),
-            )
+            + self.clock.capacity() * size_of::<Option<Arc<str>>>()
+            + self.free.capacity() * size_of::<usize>()
             + self.entries.len() * aft_store::heap::COUNTS
             + table::<(Arc<str>, Flight<T>)>(self.flights.capacity())
             + self.flights.len() * (size_of::<OnceLock<Option<Arc<T>>>>() + aft_store::heap::COUNTS)
@@ -116,39 +125,69 @@ impl<T> State<T> {
             + self.pass.as_ref().map_or(0, |pass| table::<Arc<str>>(pass.seen.capacity()) + pass.path_bytes)
     }
 
-    fn touch(&mut self, path: &str) -> Option<Arc<T>> {
-        let entry = self.entries.get_mut(path)?;
-        let key = self
-            .order
-            .remove(&entry.used)
-            .expect("cache entry is ordered");
-        self.clock += 1;
-        entry.used = self.clock;
-        let mut first = false;
-        if let Some(pass) = &mut self.pass {
-            if !std::mem::replace(&mut entry.seen_in_pass, true) {
-                first = pass.note(Arc::clone(&key));
+    fn get(&self, path: &str) -> Option<Arc<T>> {
+        let entry = self.entries.get(path)?;
+        entry.referenced.store(true, Relaxed);
+        if entry.warm && !entry.warm_seen.load(Relaxed) {
+            if let Some(pass) = &self.pass {
+                if !entry.warm_seen.swap(true, Relaxed) {
+                    pass.warm_seen.fetch_add(1, Relaxed);
+                }
             }
         }
-        self.order.insert(entry.used, key);
-        let value = Arc::clone(&entry.value);
-        if first {
-            self.peak_table = self.peak_table.max(self.table_bytes());
+        Some(Arc::clone(&entry.value))
+    }
+
+    fn find(&self, path: &str) -> Option<Read<T>> {
+        if let Some(value) = self.get(path) {
+            return Some(Read::Cached(value));
         }
-        Some(value)
+        let (key, flight) = self.flights.get_key_value(path)?;
+        if let Some(pass) = &self.pass {
+            pass.joined.fetch_add(1, Relaxed);
+        }
+        Some(Read::InFlight(Arc::clone(key), Arc::clone(flight)))
     }
 
     fn remove(&mut self, path: &str) {
-        if let Some(entry) = self.entries.remove(path) {
-            self.order.remove(&entry.used);
+        if let Some((path, entry)) = self.entries.remove_entry(path) {
+            self.clock[entry.slot] = None;
+            self.free.push(entry.slot);
             self.held -= entry.size;
+            if entry.warm && entry.warm_seen.load(Relaxed) {
+                if let Some(pass) = &mut self.pass {
+                    // Move a warmed hit to the seen set before forgetting its entry.
+                    pass.warm_seen.fetch_sub(1, Relaxed);
+                    pass.note(path);
+                }
+            }
+        }
+    }
+
+    fn evict_one(&mut self) {
+        debug_assert!(!self.entries.is_empty());
+        loop {
+            let slot = self.hand;
+            self.hand = (slot + 1) % self.clock.len();
+            let Some(path) = &self.clock[slot] else {
+                continue;
+            };
+            let entry = &self.entries[path];
+            // Give each referenced entry one more trip around the ring.
+            if entry.referenced.swap(false, Relaxed) {
+                continue;
+            }
+            let path = Arc::clone(path);
+            self.remove(&path);
+            self.evicted += 1;
+            return;
         }
     }
 }
 
 pub(super) struct DecodedCache<T> {
     budget: usize,
-    state: Mutex<State<T>>,
+    state: RwLock<State<T>>,
     churn: OnceLock<CacheChurn>,
     #[cfg(test)]
     lookups: std::sync::atomic::AtomicUsize,
@@ -164,7 +203,7 @@ impl<T> DecodedCache<T> {
     pub(super) fn new(budget: usize) -> Self {
         Self {
             budget,
-            state: Mutex::default(),
+            state: RwLock::default(),
             churn: OnceLock::new(),
             #[cfg(test)]
             lookups: std::sync::atomic::AtomicUsize::new(0),
@@ -179,7 +218,8 @@ impl<T> DecodedCache<T> {
         state.peak = state.held;
         state.peak_table = state.table_bytes();
         for entry in state.entries.values_mut() {
-            entry.seen_in_pass = false;
+            entry.warm = track_churn;
+            *entry.warm_seen.get_mut() = false;
         }
     }
 
@@ -191,7 +231,7 @@ impl<T> DecodedCache<T> {
                 log::info!(
                     "refresh declarer cache: held={} peak={} evicted={} table={} peak_table={} decodes={} distinct={} redecodes={} oversized_redecodes={} joined={} budget={}",
                     state.held, state.peak, state.evicted, state.table_bytes(), state.peak_table,
-                    pass.decodes, pass.seen.len(), pass.redecodes, pass.oversized_redecodes, pass.joined, self.budget
+                    pass.decodes, pass.distinct(), pass.redecodes, pass.oversized_redecodes, pass.joined.load(Relaxed), self.budget
                 );
             }
         }
@@ -203,22 +243,19 @@ impl<T> DecodedCache<T> {
     }
 
     pub(super) fn get(&self, path: &str) -> Option<Arc<T>> {
-        self.state.lock().expect("decoded cache lock").touch(path)
+        self.state.read().expect("decoded cache lock").get(path)
     }
 
     fn lookup(&self, path: &str) -> Read<T> {
         #[cfg(test)]
         self.lookups
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut state = self.state.lock().expect("decoded cache lock");
-        if let Some(value) = state.touch(path) {
-            return Read::Cached(value);
+        if let Some(read) = self.state.read().expect("decoded cache lock").find(path) {
+            return read;
         }
-        if let Some((key, flight)) = state.flights.get_key_value(path) {
-            let read = Read::InFlight(Arc::clone(key), Arc::clone(flight));
-            if let Some(pass) = &mut state.pass {
-                pass.joined += 1;
-            }
+        let mut state = self.state.write().expect("decoded cache lock");
+        // A miss can become a hit or join a flight while taking the write lock.
+        if let Some(read) = state.find(path) {
             return read;
         }
         let path = state
@@ -240,7 +277,7 @@ impl<T> DecodedCache<T> {
     #[cfg(test)]
     pub(super) fn peek(&self, path: &str) -> Option<Arc<T>> {
         self.state
-            .lock()
+            .read()
             .expect("decoded cache lock")
             .entries
             .get(path)
@@ -256,7 +293,7 @@ impl<T> DecodedCache<T> {
 
     #[cfg(test)]
     pub(super) fn counts(&self) -> (usize, usize, usize, usize, usize) {
-        let state = self.state.lock().expect("decoded cache lock");
+        let state = self.state.read().expect("decoded cache lock");
         (
             state.held,
             state.peak,
@@ -289,7 +326,7 @@ impl<T: HeapBytes> DecodedCache<T> {
                 let size = value
                     .as_ref()
                     .map(|value| value.heap_bytes(&mut Seen::new()) + path.len());
-                let mut state = self.state.lock().expect("decoded cache lock");
+                let mut state = self.state.write().expect("decoded cache lock");
                 if let Some((value, size)) = value.as_ref().zip(size) {
                     let admissible = size <= self.budget;
                     if let Some(pass) = &mut state.pass {
@@ -312,20 +349,22 @@ impl<T: HeapBytes> DecodedCache<T> {
 
     fn install(state: &mut State<T>, path: Arc<str>, value: &Arc<T>, size: usize, budget: usize) {
         while state.held > budget - size {
-            let (_, path) = state.order.pop_first().expect("cache is over budget");
-            state.remove(&path);
-            state.evicted += 1;
+            state.evict_one();
         }
-        state.clock += 1;
-        let used = state.clock;
-        state.order.insert(used, Arc::clone(&path));
+        let slot = state.free.pop().unwrap_or_else(|| {
+            state.clock.push(None);
+            state.clock.len() - 1
+        });
+        state.clock[slot] = Some(Arc::clone(&path));
         state.entries.insert(
             path,
             Entry {
                 value: Arc::clone(value),
                 size,
-                used,
-                seen_in_pass: state.pass.is_some(),
+                slot,
+                referenced: AtomicBool::new(false),
+                warm: false,
+                warm_seen: AtomicBool::new(false),
             },
         );
         state.held += size;
@@ -335,7 +374,7 @@ impl<T: HeapBytes> DecodedCache<T> {
 
 impl<T: HeapBytes> HeapBytes for DecodedCache<T> {
     fn heap_bytes(&self, seen: &mut Seen) -> usize {
-        let state = self.state.lock().expect("decoded cache lock");
+        let state = self.state.read().expect("decoded cache lock");
         state
             .entries
             .iter()
@@ -350,6 +389,44 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
     use std::sync::Barrier;
+
+    #[test]
+    fn referenced_entry_gets_one_more_sweep() {
+        let value = || Arc::new("a".repeat(64));
+        let bytes = value().heap_bytes(&mut Seen::new()) + 1;
+        let cache = DecodedCache::new(bytes * 2);
+        let project = |path| cache.get_or_project(path, || Some(value())).unwrap();
+        let a = project("a");
+        let _ = project("b");
+        assert!(Arc::ptr_eq(&cache.get("a").unwrap(), &a));
+        let _ = project("c");
+        assert!(
+            cache.peek("b").is_none(),
+            "the hand skips a referenced entry"
+        );
+        assert!(cache.peek("a").is_some());
+        let _ = project("d");
+        assert!(cache.peek("a").is_none(), "a reference buys only one sweep");
+        assert_eq!(cache.counts().0, bytes * 2);
+    }
+
+    #[test]
+    fn warm_hit_stays_distinct_after_eviction_and_reread() {
+        let value = || Arc::new("a".repeat(64));
+        let bytes = value().heap_bytes(&mut Seen::new()) + 1;
+        let mut cache = DecodedCache::new(bytes);
+        let _ = cache.get_or_project("a", || Some(value())).unwrap();
+        cache.begin_pass(true);
+        assert!(cache.get("a").is_some());
+        assert!(cache.get("a").is_some());
+        let _ = cache.get_or_project("b", || Some(value())).unwrap();
+        assert!(cache.peek("a").is_none());
+        let _ = cache.get_or_project("a", || Some(value())).unwrap();
+        let state = cache.state.read().unwrap();
+        let pass = state.pass.as_ref().unwrap();
+        assert_eq!(pass.distinct(), 2);
+        assert_eq!(pass.redecodes, 1);
+    }
 
     #[test]
     fn concurrent_misses_share_one_projection_even_without_admission() {
@@ -376,7 +453,7 @@ mod tests {
             assert_eq!(projected.load(Relaxed), 1);
             assert!(Arc::ptr_eq(&first, &second));
             assert_eq!(cache.peek("p").is_some(), budget > 1);
-            assert!(cache.state.lock().unwrap().flights.is_empty());
+            assert!(cache.state.read().unwrap().flights.is_empty());
         }
     }
 
