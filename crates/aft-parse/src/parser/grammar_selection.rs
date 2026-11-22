@@ -45,6 +45,7 @@ pub fn grammar_for(lang: LangId) -> Result<Language, AftError> {
         LangId::Groovy => dekobon_tree_sitter_groovy::LANGUAGE.into(),
         LangId::ObjC => tree_sitter_objc::LANGUAGE.into(),
         LangId::Toml => tree_sitter_toml::LANGUAGE.into(),
+        LangId::Nix => tree_sitter_nix::LANGUAGE.into(),
         _ => unreachable!("downloaded languages use the extractor table"),
     })
 }

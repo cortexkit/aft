@@ -103,6 +103,7 @@ const FormatterEnum = z.enum([
   "rustfmt",
   "goimports",
   "gofmt",
+  "nixfmt",
   "none",
 ]);
 

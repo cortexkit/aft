@@ -962,6 +962,21 @@
     ]
   },
   {
+    "name": "smoke-nix",
+    "language": "nix",
+    "shapes": [
+      "existing scoped-node identity smoke"
+    ],
+    "files": [
+      {
+        "target": "a.nix",
+        "new_for": "Missing stored values: nix absent from the scoped-node smoke table (position_identity_tests.rs predates Nix support)",
+        "text": "{ f = { g = 1; }; }\n",
+        "sha256": "035fd5a00d2069b27da4f2ddfaa4bdb58a57458ba1d31a055598e247bc0b0266"
+      }
+    ]
+  },
+  {
     "name": "smoke-objc",
     "language": "objc",
     "shapes": [

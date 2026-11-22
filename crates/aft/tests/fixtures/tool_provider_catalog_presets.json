@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
-      "catalog_digest": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
+      "generation": "5eb36fe06356a75f368bc26c05510f8d52e89a653c194ecb6fcba9d922adb876",
+      "catalog_digest": "5eb36fe06356a75f368bc26c05510f8d52e89a653c194ecb6fcba9d922adb876",
       "tools": [
         {
           "name": "status",
@@ -707,7 +707,7 @@
         {
           "read_only": true,
           "name": "ast_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -717,7 +717,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -740,7 +740,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -772,7 +773,7 @@
         },
         {
           "name": "ast_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -809,7 +810,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -1288,8 +1290,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
-      "catalog_digest": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
+      "generation": "4f099a09a632c56778caddd4d8a2413787bfd4900517cbf056dbc07a112f1f0d",
+      "catalog_digest": "4f099a09a632c56778caddd4d8a2413787bfd4900517cbf056dbc07a112f1f0d",
       "tools": [
         {
           "name": "status",
@@ -2059,7 +2061,7 @@
         {
           "read_only": true,
           "name": "ast_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2069,7 +2071,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -2092,7 +2094,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -2124,7 +2127,7 @@
         },
         {
           "name": "ast_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -2161,7 +2164,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -3562,8 +3566,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
-      "catalog_digest": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
+      "generation": "2013a50a1da5629a2f0dc42c04de867dbabb26bad5a130ab72a5d6b75f45d7e3",
+      "catalog_digest": "2013a50a1da5629a2f0dc42c04de867dbabb26bad5a130ab72a5d6b75f45d7e3",
       "tools": [
         {
           "name": "status",
@@ -4271,7 +4275,7 @@
         {
           "read_only": true,
           "name": "ast_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -4281,7 +4285,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -4304,7 +4308,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -4336,7 +4341,7 @@
         },
         {
           "name": "ast_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -4373,7 +4378,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -4853,8 +4859,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
-      "catalog_digest": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
+      "generation": "cdc56c25eefd092406a0daf33a1a835c6c9901dd4ce82d76f9bb901deb50f5b5",
+      "catalog_digest": "cdc56c25eefd092406a0daf33a1a835c6c9901dd4ce82d76f9bb901deb50f5b5",
       "tools": [
         {
           "name": "status",
@@ -5636,7 +5642,7 @@
         {
           "read_only": true,
           "name": "ast_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5646,7 +5652,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -5669,7 +5675,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -5701,7 +5708,7 @@
         },
         {
           "name": "ast_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -5738,7 +5745,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -6218,8 +6226,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
-      "catalog_digest": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
+      "generation": "afdf1ff3c10a6d36f471eebaa6a12a3b64f9d61ce5eac9e15e8920149fada7d8",
+      "catalog_digest": "afdf1ff3c10a6d36f471eebaa6a12a3b64f9d61ce5eac9e15e8920149fada7d8",
       "tools": [
         {
           "name": "status",
@@ -6915,7 +6923,7 @@
         {
           "read_only": true,
           "name": "ast_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -6925,7 +6933,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -6948,7 +6956,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -6980,7 +6989,7 @@
         },
         {
           "name": "ast_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -7017,7 +7026,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -7430,8 +7440,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
-      "catalog_digest": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
+      "generation": "feec6466cf78e57923ef5dd96f02bc9c1831f7d959f865740e1eccc725dfc8d3",
+      "catalog_digest": "feec6466cf78e57923ef5dd96f02bc9c1831f7d959f865740e1eccc725dfc8d3",
       "tools": [
         {
           "name": "status",
@@ -8201,7 +8211,7 @@
         {
           "read_only": true,
           "name": "ast_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -8211,7 +8221,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -8234,7 +8244,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -8266,7 +8277,7 @@
         },
         {
           "name": "ast_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -8303,7 +8314,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -8723,8 +8735,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
-      "catalog_digest": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
+      "generation": "016df98f3645c531920c95610c467ce04e905b91ea68b687a02e595ecad7f404",
+      "catalog_digest": "016df98f3645c531920c95610c467ce04e905b91ea68b687a02e595ecad7f404",
       "tools": [
         {
           "name": "bash",
@@ -9288,7 +9300,7 @@
         {
           "read_only": true,
           "name": "ast_grep_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -9298,7 +9310,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -9321,7 +9333,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -9353,7 +9366,7 @@
         },
         {
           "name": "ast_grep_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -9390,7 +9403,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -9859,8 +9873,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
-      "catalog_digest": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
+      "generation": "f16c2f4ea62d2bd95af6881cc3fcb1519dca3322ddbfc1b23eb296308d907440",
+      "catalog_digest": "f16c2f4ea62d2bd95af6881cc3fcb1519dca3322ddbfc1b23eb296308d907440",
       "tools": [
         {
           "name": "bash",
@@ -10512,7 +10526,7 @@
         {
           "read_only": true,
           "name": "ast_grep_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -10522,7 +10536,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -10545,7 +10559,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -10577,7 +10592,7 @@
         },
         {
           "name": "ast_grep_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -10614,7 +10629,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -11087,8 +11103,8 @@
       "hashline": true
     },
     "reply": {
-      "generation": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
-      "catalog_digest": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
+      "generation": "7d8da5b952b0c73d7a7cf5972de6af2f8209621848e0fc22e33dc8aa4505d10e",
+      "catalog_digest": "7d8da5b952b0c73d7a7cf5972de6af2f8209621848e0fc22e33dc8aa4505d10e",
       "tools": [
         {
           "name": "bash",
@@ -11686,7 +11702,7 @@
         {
           "read_only": true,
           "name": "ast_grep_search",
-          "schema_digest": "96463c1682f4d87f5216797bb29cc474cd88690a8c9469f1824d9d4b9faa0b35",
+          "schema_digest": "9baa9cf880ce69d7eb41c25fd7c43d358b325be852d79298a8b0196e11a99c4c",
           "semantics": 1,
           "modes": [
             "classic",
@@ -11696,7 +11712,7 @@
           "capabilities": [
             "aft:code.ast_grep/v1"
           ],
-          "description": "Search code patterns across filesystem using AST-aware matching. Supports 11 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc'",
+          "description": "Search code patterns across filesystem using AST-aware matching. Supports 12 languages.\n\nUse meta-variables: $VAR matches a single AST node, $$$ matches multiple nodes (variadic).\nIMPORTANT: Patterns must be complete AST nodes (valid code fragments).\nFor functions, include params and body: 'export async function $NAME($$$) { $$$ }' not just 'export async function $NAME'.\n\nExamples: pattern='console.log($MSG)' lang='typescript', pattern='async function $NAME($$$) { $$$ }' lang='javascript', pattern='def $FUNC($$$): $$$' lang='python', pattern='Writeln($MSG);' lang='pascal', pattern='$X <- $Y' lang='r', pattern='[obj foo:$ARG]' lang='objc', pattern='$NAME = true;' lang='nix'",
           "input_schema": {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "type": "object",
@@ -11719,7 +11735,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {
@@ -11751,7 +11768,7 @@
         },
         {
           "name": "ast_grep_replace",
-          "schema_digest": "86703537e883e53529c1045ee962ec1b062401108112606deffb16ff847892c9",
+          "schema_digest": "524ddc3bc03d6558c238293b068fc42fe26892a7b51f29e15256809e88db514a",
           "semantics": 1,
           "modes": [
             "classic",
@@ -11788,7 +11805,8 @@
                   "metal",
                   "pascal",
                   "r",
-                  "objc"
+                  "objc",
+                  "nix"
                 ]
               },
               "paths": {

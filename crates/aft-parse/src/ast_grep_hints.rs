@@ -139,6 +139,21 @@ pub fn detect_language_specific_mistake(pattern: &str, lang: &AstGrepLang) -> Op
                 );
             }
         }
+        AstGrepLang::Nix => {
+            // An attrset body (`a = 1; b = 2;` / `a = 1; inherit b;`) is several
+            // sibling expressions with no single AST node to bind, so the
+            // contextual fallback refuses it. Scope the pattern to one member.
+            if nix_pattern_has_multiple_bindings(src) {
+                return Some(
+                    "Hint: A nix pattern must contain one binding or one inherit clause \
+                     (e.g. \"$NAME = $VALUE;\" or \"inherit $NAME;\"). An attrset body is \
+                     several expressions with no single AST node to match, so it will not \
+                     parse — search for one binding at a time, or match the enclosing \
+                     attrset expression."
+                        .to_string(),
+                );
+            }
+        }
         _ => {}
     }
 
@@ -160,6 +175,599 @@ fn has_regex_escape(src: &str) -> bool {
             if matches!(next, b'w' | b'W' | b'd' | b'D' | b's' | b'S' | b'b' | b'B') {
                 return true;
             }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Advance past a Nix `/* … */` block comment, called with `bytes[*i] == b'/'`
+/// and `bytes[*i + 1] == b'*'`. Comments do not nest; an unterminated comment
+/// runs to the end. Shared by the hint scanner and the pattern comment strip
+/// so the two terminators cannot drift.
+pub(crate) fn nix_skip_block_comment(bytes: &[u8], i: &mut usize) {
+    *i += 2;
+    while *i + 1 < bytes.len() && !(bytes[*i] == b'*' && bytes.get(*i + 1) == Some(&b'/')) {
+        *i += 1;
+    }
+    *i = if *i + 1 < bytes.len() {
+        *i + 2
+    } else {
+        bytes.len()
+    };
+}
+
+/// True when an apostrophe pair at `i` continues a Nix identifier token.
+///
+/// The vendored grammar lexes identifiers as `/[a-zA-Z_][a-zA-Z0-9_'\-]*/`,
+/// so a quote pair is identifier content whenever an identifier token is
+/// live at `i`: started before (`foo''`, `foo-''`), or restarted by the
+/// lexer at a numeric boundary or after an operator/select (`9x''`,
+/// `-b''`, `a.foo''`, `a+foo''`, `1.5e2-b''`). The pair opens a string
+/// instead when the token behind it is not an identifier: a path (only a
+/// real `/` proves one — scanner.c needs a separator, path chars exclude
+/// `'`), or a float token (`1.5e2''`, `.5e2''`: float_expression
+/// grammar.js:55-56 swallows its own exponent and admits neither letter
+/// nor `'`; its select lookalike `0.e2''` is NOT a float — branch 1 needs
+/// a leading 1-9, branch 2 needs a digit after the dot — so there the
+/// identifier restarts). A `*/` flush behind the run counts as a
+/// comment terminator (extras boundary, fresh token) only when the lex-state
+/// table shows it really closes a block comment (`nix_lex_code_states`):
+/// a bare `X*/Y` is times-then-path, which opens.
+/// Residual: `uri_expression` tails (grammar.js:83) admit `'`, so a
+/// spaceless `http://x''` opens a string here while the grammar continues
+/// the URI; spaceless URI juxtaposition is degenerate in patterns.
+/// Positions inside `${ … }` bodies classify as code (bodies are full
+/// expressions, grammar.js:386), except bytes covered by body comments
+/// or nested strings.
+pub(crate) fn nix_apostrophe_continues_identifier(bytes: &[u8], i: usize, states: &[bool]) -> bool {
+    fn is_ident_cont(c: u8) -> bool {
+        matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'\'' | b'-')
+    }
+    fn is_ident_start(c: u8) -> bool {
+        matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'_')
+    }
+    // Identifier restart after an operator inside a run: digits are then a
+    // number token, an identifier start continues, a second dash restarts
+    // again; anything else opens (a `+` here would be unary plus, which
+    // the grammar does not admit, so no valid pattern reaches it).
+    fn restarts_after_dash(bytes: &[u8], from: usize, i: usize) -> bool {
+        let mut p = from;
+        loop {
+            while p < i && bytes[p].is_ascii_digit() {
+                p += 1;
+            }
+            if p >= i {
+                return false;
+            }
+            if is_ident_start(bytes[p]) {
+                return true;
+            }
+            if bytes[p] != b'-' {
+                return false;
+            }
+            p += 1;
+        }
+    }
+    let mut j = i;
+    while j > 0 && is_ident_cont(bytes[j - 1]) {
+        j -= 1;
+    }
+    if j == i {
+        return false; // previous byte cannot be part of an identifier
+    }
+    // Extend back over path/operator chars. `/` proves a path token
+    // unless it truly terminates a block comment (extras boundary: the
+    // identifier behind it is a fresh token, stop scanning there).
+    let mut k = j;
+    while k > 0 {
+        let c = bytes[k - 1];
+        if c == b'/' {
+            // Lex-state lookup: a code-level slash is a path fragment or a
+            // division operand and a path cannot contain `'`, so the pair
+            // opens. Anything else at that byte (comment text — including
+            // a `*/` terminator — or string material) hides the slash from
+            // the lexer; the run is judged on its own from here.
+            if states.get(k - 1) == Some(&true) {
+                return false;
+            }
+            break;
+        }
+        if c == b'.' && k == j {
+            // Float mantissa immediately behind the run (grammar.js:56):
+            // branch 1 `[1-9][0-9]*.` (digit after dot optional) or
+            // branch 2 `0?\.[0-9]+` (digit after dot required).
+            let mut d0 = k - 1;
+            while d0 > 0 && bytes[d0 - 1].is_ascii_digit() {
+                d0 -= 1;
+            }
+            let digit_before = d0 < k - 1;
+            let digit_after = k < bytes.len() && bytes[k].is_ascii_digit();
+            let float = if digit_before {
+                bytes[d0] != b'0' || digit_after
+            } else {
+                digit_after
+            };
+            if float {
+                // A complete float tail (`digits`, optional `e[+-]?digits`,
+                // possibly followed by `-` and a fresh token) is a number;
+                // its letters belong to the number unless an identifier
+                // restarts after a dash.
+                let mut t = j;
+                while t < i && bytes[t].is_ascii_digit() {
+                    t += 1;
+                }
+                if t == i {
+                    return false;
+                }
+                if matches!(bytes[t], b'e' | b'E') {
+                    let mut u = t + 1;
+                    if u < i && matches!(bytes[u], b'+' | b'-') {
+                        u += 1;
+                    }
+                    let exponent_digits = u;
+                    while u < i && bytes[u].is_ascii_digit() {
+                        u += 1;
+                    }
+                    if exponent_digits < u {
+                        if u == i {
+                            return false;
+                        }
+                        if bytes[u] == b'-' {
+                            return restarts_after_dash(bytes, u + 1, i);
+                        }
+                    }
+                }
+            }
+            // Not a float: fall through, the dot is a select boundary.
+        }
+        if matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'+' | b'.') {
+            k -= 1;
+            continue;
+        }
+        break;
+    }
+    // An identifier may restart inside the run (after a `-` or digits);
+    // without any start char (letter/underscore) there is nothing to
+    // continue and the pair opens a string.
+    bytes[j..i].iter().any(|&c| is_ident_start(c))
+}
+
+/// Per-byte lex states for a Nix pattern: `true` marks a byte the lexer
+/// reads as code (ordinary source, including the full expressions inside
+/// `${ … }` interpolation bodies), `false` marks comment text, string
+/// content, and escape spans. One forward pass with the shared frame model:
+/// comments are lexer extras (grammar.js:25) and strings are regions that
+/// can hide anything, so the apostrophe guard asks this table instead of
+/// rescanning — a table lookup cannot recurse, which is what keeps guard
+/// checks linear on patterns with many `*/x''` elements.
+pub(crate) fn nix_lex_code_states(bytes: &[u8]) -> Vec<bool> {
+    let mut st = vec![true; bytes.len()];
+    let mut stack: Vec<NixStrFrame> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if stack.is_empty() {
+            if b == b'#' {
+                st[i] = false;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    st[i] = false;
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    st[i] = false;
+                    i += 1;
+                }
+                for pad in [i, i + 1] {
+                    if pad < bytes.len() {
+                        st[pad] = false;
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                st[i] = false;
+                stack.push(NixStrFrame {
+                    indented: false,
+                    braces: 0,
+                });
+                i += 1;
+                continue;
+            }
+            if b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                if nix_apostrophe_continues_identifier(bytes, i, &st) {
+                    // Identifier material (`9x''z`, `foo''`): not an opener.
+                    i += 1;
+                    continue;
+                }
+                st[i] = false;
+                st[i + 1] = false;
+                stack.push(NixStrFrame {
+                    indented: true,
+                    braces: 0,
+                });
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        let top = *stack.last().expect("checked non-empty");
+        if top.braces > 0 {
+            // Interpolation body: a full expression (grammar.js:386), so
+            // these bytes are code; comments and nested strings inside the
+            // body still hide their own material.
+            if b == b'#' {
+                st[i] = false;
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    st[i] = false;
+                    i += 1;
+                }
+                continue;
+            }
+            if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                while i < bytes.len() && !(bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/')) {
+                    st[i] = false;
+                    i += 1;
+                }
+                for pad in [i, i + 1] {
+                    if pad < bytes.len() {
+                        st[pad] = false;
+                    }
+                }
+                i += 2;
+                continue;
+            }
+            if b == b'$' && bytes.get(i + 1) == Some(&b'{') {
+                stack.last_mut().unwrap().braces += 1;
+                i += 2;
+                continue;
+            }
+            if b == b'{' {
+                stack.last_mut().unwrap().braces += 1;
+                i += 1;
+                continue;
+            }
+            if b == b'}' {
+                stack.last_mut().unwrap().braces = (stack.last_mut().unwrap().braces - 1).max(0);
+                i += 1;
+                continue;
+            }
+            if b == b'"' {
+                st[i] = false;
+                stack.push(NixStrFrame {
+                    indented: false,
+                    braces: 0,
+                });
+                i += 1;
+                continue;
+            }
+            if b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                if nix_apostrophe_continues_identifier(bytes, i, &st) {
+                    i += 1; // identifier content inside the body
+                    continue;
+                }
+                st[i] = false;
+                st[i + 1] = false;
+                stack.push(NixStrFrame {
+                    indented: true,
+                    braces: 0,
+                });
+                i += 2;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // String content: not code until the frame closes or an interpolation
+        // body opens.
+        st[i] = false;
+        if top.indented {
+            if b == b'\'' && bytes.get(i + 1) == Some(&b'\'') {
+                match bytes.get(i + 2) {
+                    // scanner.c escape set, aligned with nix_string_step:
+                    // `''\x` (incl. `''\$`) is a four-byte escape.
+                    Some(b'\\') => {
+                        let span = if i + 3 < bytes.len() { 4 } else { 3 };
+                        for pad in i..(i + span).min(bytes.len()) {
+                            st[pad] = false;
+                        }
+                        i += span;
+                    }
+                    Some(b'\'') | Some(b'$') => {
+                        for pad in i..(i + 3).min(bytes.len()) {
+                            st[pad] = false;
+                        }
+                        i += 3;
+                    }
+                    _ => {
+                        stack.pop();
+                        st[i + 1] = false; // second byte of the closing ''
+                        i += 2;
+                    }
+                }
+                continue;
+            }
+            if b == b'$' {
+                // Mirror nix_string_step / scanner.c: `$` swallows the next
+                // char unless it stops there, so only an ODD dollar-run
+                // before `{` interpolates (`''$${x}''` is literal).
+                match bytes.get(i + 1) {
+                    Some(b'{') => {
+                        stack.last_mut().unwrap().braces += 1;
+                        st[i + 1] = false; // the opener brace is string syntax
+                        i += 2;
+                    }
+                    Some(b'\'') => i += 1, // a quote pair must stop the fragment
+                    Some(_) => {
+                        st[i + 1] = false;
+                        i += 2;
+                    }
+                    None => i += 1,
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        if b == b'\\' {
+            if i + 1 < bytes.len() {
+                st[i + 1] = false;
+            }
+            i += 2;
+            continue;
+        }
+        if b == b'$' {
+            // scanner.c: `$` stops before `{` (interpolation), `"` and `\`
+            // (delimiter/escape), and otherwise swallows one more char, so
+            // `$${` does not interpolate while `$$${` does.
+            match bytes.get(i + 1) {
+                Some(b'{') => {
+                    stack.last_mut().unwrap().braces += 1;
+                    st[i + 1] = false; // the opener brace is string syntax
+                    i += 2;
+                }
+                Some(b'"') | Some(b'\\') => i += 1,
+                Some(_) => {
+                    st[i + 1] = false;
+                    i += 2;
+                }
+                None => i += 1,
+            }
+            continue;
+        }
+        if b == b'"' {
+            stack.pop();
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    st
+}
+
+/// One open Nix string: whether it is an indented `'' … ''` and the current
+/// interpolation/brace depth inside it. An interpolation body is a full
+/// expression (`interpolation: seq("${", _expression, "}")` in the vendored
+/// grammar), so strings legitimately nest inside `${ … }`.
+#[derive(Clone, Copy)]
+pub(crate) struct NixStrFrame {
+    pub indented: bool,
+    pub braces: i32,
+}
+
+/// Advance one atomic span starting at `bytes[i]` inside a (possibly nested)
+/// Nix string; the caller advances by the returned length and repeats until
+/// its stack is empty. Pushes a frame when a nested string opens, pops when
+/// the current string closes. Precondition: `stack` is non-empty and
+/// `bytes[i]` lies inside the top string. `states` is the pattern's lex-state
+/// table (`nix_lex_code_states`), consulted for apostrophe pairs in
+/// interpolation bodies. A span may end mid-glyph (escapes), so callers that
+/// slice must copy per REGION, not per span.
+pub(crate) fn nix_string_step(
+    bytes: &[u8],
+    i: usize,
+    stack: &mut Vec<NixStrFrame>,
+    states: &[bool],
+) -> usize {
+    let Some(top) = stack.last_mut() else {
+        return 1;
+    };
+    let b = bytes[i];
+    if top.braces > 0 {
+        // Interpolation body: a full expression, so comments are legal
+        // anywhere. Skip them before reading quotes or braces so comment
+        // text cannot forge a string-open or brace-close event.
+        if b == b'#' {
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j] != b'\n' {
+                j += 1;
+            }
+            return j - i;
+        }
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            let mut j = i;
+            nix_skip_block_comment(bytes, &mut j);
+            return j - i;
+        }
+        match b {
+            b'"' => {
+                stack.push(NixStrFrame {
+                    indented: false,
+                    braces: 0,
+                });
+                return 1;
+            }
+            b'\'' if bytes.get(i + 1) == Some(&b'\'') => {
+                if nix_apostrophe_continues_identifier(bytes, i, states) {
+                    return 1; // identifier content (`x''y`), not an open
+                }
+                stack.push(NixStrFrame {
+                    indented: true,
+                    braces: 0,
+                });
+                return 2;
+            }
+            b'{' => top.braces += 1,
+            b'}' => top.braces = (top.braces - 1).max(0),
+            _ => {}
+        }
+        return 1;
+    }
+    if top.indented {
+        if b == b'\'' {
+            if bytes.get(i + 1) == Some(&b'\'') {
+                // Two quotes always stop indented content: either the close
+                // delimiter or one of the `'''` / `''$` / `''\x` escapes
+                // (scanner.c scan_indented_string_fragment).
+                return match bytes.get(i + 2) {
+                    Some(&b'\'') => 3,                        // `'''` literal apostrophe
+                    Some(&b'$') => 3, // `''$` literal dollar, so `''${` is literal `${`
+                    Some(&b'\\') if i + 3 < bytes.len() => 4, // `''\$` and `''\x`
+                    Some(&b'\\') => 3, // `''\` at end of input
+                    _ => {
+                        stack.pop();
+                        2 // closing `''`
+                    }
+                };
+            }
+            return 1; // lone `'` inside indented content
+        }
+        if b == b'$' {
+            // Bare `${` interpolates inside an indented string; `$` plus
+            // any other char (except a following quote pair, which stops
+            // as a delimiter/escape) is content.
+            return match bytes.get(i + 1) {
+                Some(&b'{') => {
+                    top.braces += 1;
+                    2
+                }
+                Some(&b'\'') => 1,
+                Some(_) => 2,
+                None => 1,
+            };
+        }
+        return 1;
+    }
+    if b == b'\\' {
+        return if i + 1 < bytes.len() { 2 } else { 1 };
+    }
+    if b == b'$' {
+        // scanner.c: `$` stops before `{` (interpolation), `"` and `\`
+        // (delimiter/escape), and otherwise swallows one more char, so
+        // `$${` does not interpolate while `$$${` does.
+        return match bytes.get(i + 1) {
+            Some(&b'{') => {
+                top.braces += 1;
+                2
+            }
+            Some(&b'"') | Some(&b'\\') => 1,
+            Some(_) => 2,
+            None => 1,
+        };
+    }
+    if b == b'"' {
+        stack.pop();
+    }
+    1
+}
+
+/// A Nix attrset body carries several sibling members (`a = 1; b = 2;` or
+/// `a = 1; inherit b;`), so the contextual fallback has no single node to bind
+/// and refuses the pattern. The shape reads as a top-level `;` with a further
+/// binding-shaped member after it. String contents (including `${ … }`
+/// interpolation bodies, where strings nest) and comments are skipped so a `;`
+/// inside `"x;y"`, `"${ f "x;y" }"`, `# …; …`, or `/* …; … */` is not mistaken
+/// for a binding terminator.
+fn nix_pattern_has_multiple_bindings(src: &str) -> bool {
+    let bytes = src.as_bytes();
+    let states = nix_lex_code_states(bytes);
+    let mut depth: i32 = 0;
+    let mut strings: Vec<NixStrFrame> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !strings.is_empty() {
+            i += nix_string_step(bytes, i, &mut strings, &states);
+            continue;
+        }
+        // Top level: comments hide their contents; a `;` inside one must not
+        // look like a member terminator.
+        if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            nix_skip_block_comment(bytes, &mut i);
+            continue;
+        }
+        if b == b'#' {
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        match b {
+            // Consume both opening quotes; escape and interpolation handling
+            // then lives in the shared frame stepper. An apostrophe pair
+            // right after an identifier char continues the identifier.
+            b'\'' if bytes.get(i + 1) == Some(&b'\'') => {
+                if nix_apostrophe_continues_identifier(bytes, i, &states) {
+                    i += 1;
+                    continue;
+                }
+                strings.push(NixStrFrame {
+                    indented: true,
+                    braces: 0,
+                });
+                i += 2;
+                continue;
+            }
+            b'"' => strings.push(NixStrFrame {
+                indented: false,
+                braces: 0,
+            }),
+            b'{' | b'[' | b'(' => depth += 1,
+            b'}' | b']' | b')' => depth = (depth - 1).max(0),
+            b';' if depth == 0 => {
+                // The next member can hide behind whitespace, `#` line
+                // comments, `/* … */` block comments, or open as a quoted
+                // attribute name (`"a" = 1;`).
+                let mut j = i + 1;
+                while j < bytes.len() {
+                    let c = bytes[j];
+                    if c.is_ascii_whitespace() {
+                        j += 1;
+                    } else if c == b'#' {
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            j += 1;
+                        }
+                    } else if c == b'/' && bytes.get(j + 1) == Some(&b'*') {
+                        nix_skip_block_comment(bytes, &mut j);
+                    } else {
+                        break;
+                    }
+                }
+                if let Some(&c) = bytes.get(j) {
+                    // A top-level `let …; in …` expression is one member: the
+                    // `in` that terminates the let is not a sibling binding.
+                    if c == b'i'
+                        && bytes.get(j + 1) == Some(&b'n')
+                        && !matches!(bytes.get(j + 2),
+                            Some(w) if w.is_ascii_alphanumeric() || *w == b'_')
+                    {
+                        i = j + 2;
+                        continue;
+                    }
+                    if c.is_ascii_alphabetic() || c == b'_' || c == b'$' || c == b'"' || c == b'\''
+                    {
+                        return true;
+                    }
+                }
+            }
+            _ => {}
         }
         i += 1;
     }

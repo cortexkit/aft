@@ -859,7 +859,8 @@ pub fn is_entry_point(name: &str, kind: &SymbolKind, exported: bool, lang: LangI
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => false,
+        | LangId::Luau
+        | LangId::Nix => false,
     }
 }
 

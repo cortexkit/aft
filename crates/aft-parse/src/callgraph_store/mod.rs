@@ -5039,6 +5039,7 @@ pub fn lang_label(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }
 
@@ -5077,6 +5078,7 @@ pub fn lang_from_label(label: &str) -> Option<LangId> {
         "groovy" => Some(LangId::Groovy),
         "objc" => Some(LangId::ObjC),
         "toml" => Some(LangId::Toml),
+        "nix" => Some(LangId::Nix),
         _ => None,
     }
 }

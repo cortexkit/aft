@@ -1277,6 +1277,18 @@ fn language_label(language: u8) -> &'static str {
         30 => "Groovy",
         31 => "Objective-C",
         32 => "TOML",
+        33 => "Luau",
+        34 => "Nix",
         other => panic!("unknown cached language code {other}"),
     }
+}
+
+#[test]
+// NOTE: this file is `#![cfg(feature = "semantic-chunk-census")]` with
+// `autotests = false` and no registered `[[test]]` target, so no current
+// command compiles or runs this — it documents and guards the decode arm
+// for whenever the census target is registered (openspec design D5: the
+// arm itself is verified by grep + compile-when-enabled).
+fn language_label_covers_nix() {
+    assert_eq!(language_label(language_code(LangId::Nix)), "Nix");
 }

@@ -41,7 +41,8 @@ impl IndentStyle {
             | LangId::Lua
             | LangId::Scss
             | LangId::Yaml
-            | LangId::Toml => IndentStyle::Spaces(2),
+            | LangId::Toml
+            | LangId::Nix => IndentStyle::Spaces(2),
             LangId::Rust => IndentStyle::Spaces(4),
             LangId::Go => IndentStyle::Tabs,
             LangId::C
@@ -181,5 +182,18 @@ pub fn source_line_ending(source: &str) -> &'static str {
         "\r\n"
     } else {
         "\n"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nix_defaults_to_two_spaces() {
+        assert_eq!(
+            IndentStyle::default_for(LangId::Nix),
+            IndentStyle::Spaces(2)
+        );
     }
 }

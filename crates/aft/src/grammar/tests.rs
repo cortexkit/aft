@@ -290,6 +290,7 @@ fn grammar_detection_golden_builtins_and_opt_in() {
         ("groovy gvy gy gsh gradle", Groovy),
         ("m mm", ObjC),
         ("toml", Toml),
+        ("nix", Nix),
     ];
     for (extensions, language) in mappings {
         for extension in extensions.split_whitespace() {

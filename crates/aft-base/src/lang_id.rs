@@ -41,6 +41,7 @@ pub enum LangId {
     ObjC,
     Toml,
     Luau,
+    Nix,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -50,7 +51,7 @@ pub const TEST_EXTENSIONS: &[&str] = &[
     "htm", "md", "markdown", "mdx", "qmd", "Qmd", "rmd", "Rmd", "sol", "scss", "vue", "json",
     "jsonc", "scala", "sc", "java", "rb", "kt", "kts", "swift", "inc", "php", "lua", "pl", "pm",
     "t", "yaml", "yml", "pas", "pp", "dpr", "dpk", "lpr", "R", "r", "groovy", "gvy", "gy", "gsh",
-    "gradle", "m", "mm", "toml", "luau", "H", "unknown", "",
+    "gradle", "m", "mm", "toml", "luau", "nix", "H", "unknown", "",
 ];
 
 /// Classify by name without reading the file. A `.h` result is provisional C;
@@ -98,6 +99,7 @@ pub fn native_language_by_extension(ext: &str) -> Option<LangId> {
         "groovy" | "gvy" | "gy" | "gsh" | "gradle" => Some(LangId::Groovy),
         "m" | "mm" => Some(LangId::ObjC),
         "toml" => Some(LangId::Toml),
+        "nix" => Some(LangId::Nix),
         _ => None,
     }
 }

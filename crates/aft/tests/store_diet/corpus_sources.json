@@ -868,6 +868,20 @@
           "contains": "macro_rules! runtime_methods"
         }
       ]
+    },
+    {
+      "name": "smoke-nix",
+      "language": "nix",
+      "shapes": [
+        "existing scoped-node identity smoke"
+      ],
+      "files": [
+        {
+          "target": "a.nix",
+          "new_for": "Missing stored values: nix absent from the scoped-node smoke table (position_identity_tests.rs predates Nix support)",
+          "text": "{ f = { g = 1; }; }\n"
+        }
+      ]
     }
   ]
 }

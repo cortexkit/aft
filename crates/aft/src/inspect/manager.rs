@@ -5478,6 +5478,7 @@ fn duplicates_supports_language(language: crate::parser::LangId) -> bool {
             | crate::parser::LangId::Groovy
             | crate::parser::LangId::ObjC
             | crate::parser::LangId::Toml
+            | crate::parser::LangId::Nix
     )
 }
 
@@ -5526,6 +5527,7 @@ fn language_name(language: crate::parser::LangId) -> &'static str {
         crate::parser::LangId::Groovy => "groovy",
         crate::parser::LangId::ObjC => "objc",
         crate::parser::LangId::Toml => "toml",
+        crate::parser::LangId::Nix => "nix",
     }
 }
 

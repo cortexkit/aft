@@ -11,8 +11,10 @@ the selectors and narrowly justified new inputs. No fixture program is executed.
 
 The corpus contains the existing 33-language scoped-node table from
 `callgraph_store/position_identity_tests.rs`, the eight-language receiver table
-from `callgraph_store/dispatch/tests.rs`, and the explicitly named richer projects
-in the manifest. Projects are isolated from one another so similarly named types
+from `callgraph_store/dispatch/tests.rs`, the explicitly named richer projects
+in the manifest, and the `smoke-nix` `new_for` text case registered in
+`corpus_sources.json` (Nix postdates the scoped-node table, so the generator
+materializes it from its stored text). Projects are isolated from one another so similarly named types
 from unrelated fixture projects cannot change resolution.
 
 | Family | Existing richer inputs sampled |
@@ -42,8 +44,8 @@ f/g call shape; stale marking uses the production `mark_files_stale` API.
 
 - Typed receiver inference is implemented for TS/TSX/JS, Python, Rust, Go, Java,
   C# and Kotlin. No typed-dispatch claim is made for the other language samples.
-- Bash, SCSS, Vue, HTML, Markdown, JSON, YAML, Pascal, R, Groovy, ObjC and TOML
-  have no call-expression node kinds in `calls.rs`. Their structural symbols,
+- Bash, SCSS, Vue, HTML, Markdown, JSON, YAML, Pascal, R, Groovy, ObjC, TOML
+  and Nix have no call-expression node kinds in `calls.rs`. Their structural symbols,
   file-language values and empty/incomplete answers are still part of parity.
 - Markdown is excluded by the views graph plane, not silently parsed as TS.
 - No established PHP constructor/closure-call or Swift/Lua/Perl closure-call

@@ -772,6 +772,7 @@ fn lang_key(lang: LangId) -> &'static str {
         LangId::Groovy => "groovy",
         LangId::ObjC => "objc",
         LangId::Toml => "toml",
+        LangId::Nix => "nix",
     }
 }
 
@@ -784,6 +785,7 @@ fn has_formatter_support(lang: LangId) -> bool {
             | LangId::Python
             | LangId::Rust
             | LangId::Go
+            | LangId::Nix
     )
 }
 
@@ -1011,7 +1013,8 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::Nix => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1135,7 +1138,8 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
         | LangId::Groovy
         | LangId::ObjC
         | LangId::Toml
-        | LangId::Luau => Vec::new(),
+        | LangId::Luau
+        | LangId::Nix => Vec::new(),
         LangId::Html => Vec::new(),
         LangId::Markdown => Vec::new(),
         LangId::Yaml => Vec::new(),
@@ -1189,6 +1193,12 @@ fn explicit_formatter_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate
             tool: name.to_string(),
             source: "formatter config".to_string(),
             args: vec!["-w".to_string(), file_str.to_string()],
+            required: true,
+        }],
+        "nixfmt" => vec![ToolCandidate {
+            tool: name.to_string(),
+            source: "formatter config".to_string(),
+            args: vec![file_str.to_string()],
             required: true,
         }],
         _ => Vec::new(),
@@ -1386,6 +1396,7 @@ fn placeholder_file_for_language(project_root: &Path, lang: LangId) -> PathBuf {
         LangId::Groovy => "aft-tool-detection.groovy",
         LangId::ObjC => "aft-tool-detection.m",
         LangId::Toml => "aft-tool-detection.toml",
+        LangId::Nix => "aft-tool-detection.nix",
     };
     project_root.join(filename)
 }
@@ -2809,6 +2820,32 @@ pub fn validate_full(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn nixfmt_is_a_configured_formatter_candidate() {
+        assert!(super::has_formatter_support(crate::parser::LangId::Nix));
+        assert!(!super::has_checker_support(crate::parser::LangId::Nix));
+
+        let path = std::path::Path::new("flake.nix");
+        assert!(
+            super::formatter_candidates(
+                crate::parser::LangId::Nix,
+                &crate::config::Config::default(),
+                path
+            )
+            .is_empty(),
+            "Nix has no auto-detected formatter"
+        );
+
+        let mut config = crate::config::Config::default();
+        config
+            .formatter
+            .insert("nix".to_string(), "nixfmt".to_string());
+        let candidates = super::formatter_candidates(crate::parser::LangId::Nix, &config, path);
+        assert_eq!(candidates.len(), 1, "{candidates:?}");
+        assert_eq!(candidates[0].tool, "nixfmt");
+        assert_eq!(candidates[0].args, vec!["flake.nix".to_string()]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn cached_ruff_version_still_checks_policy_without_running() {
