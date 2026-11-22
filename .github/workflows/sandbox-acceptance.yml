@@ -3,6 +3,8 @@ name: Sandbox acceptance
 on:
   workflow_call:
   workflow_dispatch:
+  push:
+    branches: ['probe/sandbox-acceptance']
 
 permissions:
   contents: read
