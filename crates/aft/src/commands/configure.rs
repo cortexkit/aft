@@ -4277,6 +4277,7 @@ fn wait_on_configure_replay_gate_for_test(_root: &Path, _label: &str) {}
 #[derive(Clone, Debug)]
 pub struct ConfigureUnitRecord {
     pub(crate) root: PathBuf,
+    #[cfg(test)]
     pub(crate) generation: u64,
     pub(crate) stage: &'static str,
     pub(crate) finished_at: std::time::Instant,
@@ -4309,6 +4310,7 @@ fn record_configure_unit_for_test(job: &ConfigureMaintenanceJob, stage: Configur
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .push(ConfigureUnitRecord {
             root: job.canonical_cache_root.clone(),
+            #[cfg(test)]
             generation: job.generation,
             stage: stage.label(),
             finished_at: std::time::Instant::now(),

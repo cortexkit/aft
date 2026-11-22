@@ -839,6 +839,11 @@ fn native_launcher_candidates_respect_explicit_binary_even_if_missing() {
 #[cfg(unix)]
 #[test]
 fn secret_bash_real_plan_precedence_and_untrusted_request_scope() {
+    with_safe_ptrace(real_plan_precedence_and_untrusted_request_scope);
+}
+
+#[cfg(unix)]
+fn real_plan_precedence_and_untrusted_request_scope() {
     let root = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     let _launcher = native_launcher(root.path());
@@ -906,7 +911,7 @@ fn secret_bash_real_pipeline_background_pty_environment_and_key_scan() {
         );
         return;
     }
-    native_pipeline();
+    with_safe_ptrace(native_pipeline);
 }
 
 #[cfg(unix)]

@@ -1,4 +1,5 @@
 # old-package	old-target	old-test	new-package	new-target	new-test	linux	macos	windows
+agent-file-tools	doc:aft	crates/aft/src/response_finalize.rs - response_finalize::PendingResponse (line 372)	agent-file-tools	doc:aft	crates/aft/src/response_finalize.rs - response_finalize::PendingResponse (line 378)	1	1	1
 agent-file-tools	lib:aft	commands::outline_fetch_tests::secret_audit_regressions::failed_audit_does_not_create_an_ordinary_key_bearing_url	agent-file-tools	lib:aft	subc::straddling_tests::secret_audit_regressions::failed_audit_does_not_create_an_ordinary_key_bearing_url	1	1	1
 agent-file-tools	lib:aft	commands::rewrite_tests::bash_background::a02_tests::bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes	agent-file-tools	lib:aft	subc::straddling_tests::a02_tests::bash_tail_masks_secrets_and_tickets_before_and_after_removing_escapes	1	1	1
 agent-file-tools	lib:aft	commands::rewrite_tests::bash_background::a02_tests::display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot	agent-file-tools	lib:aft	subc::straddling_tests::a02_tests::display_terminal_claim_uses_current_reply_state_not_a_stale_snapshot	1	1	1
