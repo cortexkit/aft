@@ -699,7 +699,7 @@ test("zoom refuses empty batch and conflicting locations before dispatch", async
 
 test("committed zoom schema pins the batch-only surface without root unions", async () => {
   const schemas = await Bun.file(
-    new URL("../../../../crates/aft/src/subc_tool_schemas.json", import.meta.url),
+    new URL("../../../../crates/aft-subc/src/subc_tool_schemas.json", import.meta.url),
   ).json();
   const schema = schemas.zoom;
   expect(Object.keys(schema.properties).sort()).toEqual(["batch", "callgraph", "contextLines"]);

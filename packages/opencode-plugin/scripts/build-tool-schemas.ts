@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 /**
- * Generates subc_tool_schemas.json for the agent-file-tools crate.
+ * Generates the daemon tool schema and preset artifacts for the aft-subc crate.
  *
  * Run: bun run build:tool-schemas
- * Output: crates/aft/src/subc_tool_schemas.json and crates/aft/src/subc_tool_presets.json
+ * Output: crates/aft-subc/src/subc_tool_*.json
  */
 
 import * as path from "node:path";
@@ -17,7 +17,8 @@ import {
 async function main() {
   const pluginRoot = path.resolve(import.meta.dir, "..");
   const repoRoot = path.resolve(pluginRoot, "..", "..");
-  const outputPath = path.join(repoRoot, "crates", "aft", "src", "subc_tool_schemas.json");
+  const subcAssetDir = path.join(repoRoot, "crates", "aft-subc", "src");
+  const outputPath = path.join(subcAssetDir, "subc_tool_schemas.json");
   const hashlineOutputPath = path.join(
     repoRoot,
     "crates",
@@ -40,7 +41,7 @@ async function main() {
     await Bun.write(outputPath, json);
   }
 
-  const presetsPath = path.join(repoRoot, "crates", "aft", "src", "subc_tool_presets.json");
+  const presetsPath = path.join(subcAssetDir, "subc_tool_presets.json");
   const presetsJson = buildSubcToolPresetsJson();
   if (checkOnly) {
     const existing = await Bun.file(presetsPath).text();
@@ -53,7 +54,7 @@ async function main() {
     await Bun.write(presetsPath, presetsJson);
   }
 
-  const remotePath = path.join(repoRoot, "crates", "aft", "src", "subc_tool_remote_schemas.json");
+  const remotePath = path.join(subcAssetDir, "subc_tool_remote_schemas.json");
   const remoteJson = buildSubcRemoteToolSchemasJson();
   if (checkOnly) {
     if ((await Bun.file(remotePath).text()) !== remoteJson) {
@@ -63,13 +64,7 @@ async function main() {
     await Bun.write(remotePath, remoteJson);
   }
 
-  const revisionPath = path.join(
-    repoRoot,
-    "crates",
-    "aft",
-    "src",
-    "subc_tool_revision_schemas.json",
-  );
+  const revisionPath = path.join(subcAssetDir, "subc_tool_revision_schemas.json");
   const revisionJson = buildSubcRevisionToolSchemasJson();
   if (checkOnly) {
     if ((await Bun.file(revisionPath).text()) !== revisionJson) {
