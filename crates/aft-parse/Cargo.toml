@@ -1,6 +1,6 @@
 [package]
 name = "aft-parse"
-version = "0.66.0"
+version = "0.67.0"
 edition = "2021"
 rust-version.workspace = true
 license = "MIT"
@@ -16,8 +16,8 @@ callgraph-shape-census = ["aft-base/callgraph-shape-census"]
 wasm-grammars = ["tree-sitter/wasm", "dep:wasmtime", "dep:wasmtime-c-api-impl", "dep:reqwest", "dep:getrandom"]
 
 [dependencies]
-aft-base = { path = "../aft-base", version = "0.66.0" }
-aft-store = { path = "../aft-store", version = "0.66.0" }
+aft-base = { path = "../aft-base", version = "0.67.0" }
+aft-store = { path = "../aft-store", version = "0.67.0" }
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
@@ -76,6 +76,6 @@ wasmtime = { version = "=36.0.20", optional = true, default-features = false, fe
 wasmtime-c-api-impl = { version = "=36.0.20", optional = true, default-features = false }
 
 [dev-dependencies]
-aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-base = { path = "../aft-base", version = "0.67.0", features = ["test-support"] }
 tempfile = "3"
 rayon = "1"
