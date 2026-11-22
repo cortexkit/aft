@@ -257,6 +257,7 @@ fn real_probe_uses_same_launcher_and_no_user_flags() {
         loopback_tcp_connect_deny: Vec::new(),
         cache_roots: vec![],
         temp_dir: dir.path().to_path_buf(),
+        linux_mounts: None,
         worker_gh_fence: None,
     };
     let plan = SpawnPlan::launcher_for_test(profile, launcher);

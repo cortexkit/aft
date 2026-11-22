@@ -72,6 +72,10 @@ use credential_floor::{
     add_relaxed_cargo_credential_denies, credential_floor_paths, relaxed_credential_paths,
 };
 mod launcher_image;
+#[cfg(unix)]
+mod linux_mount_policy;
+#[cfg(unix)]
+use linux_mount_policy::configured_shell_read_denies;
 pub mod remote;
 #[doc(hidden)]
 pub mod remote_shell_guard;
@@ -1857,6 +1861,8 @@ fn build_native_profile(
     let temp_dir = create_task_temp_dir(&task_io_dir)?;
     let result = (|| {
         let finalize = |mut profile: SandboxProfile| -> Result<SandboxProfile, String> {
+            #[cfg(target_os = "linux")]
+            linux_mount_policy::permissive(&mut profile, ctx, &home)?;
             add_credential_floor(&mut profile, &env_home, &project_roots)?;
             #[cfg(target_os = "macos")]
             deny_macos_operator_ssh_agent(&mut profile);
@@ -2069,6 +2075,15 @@ fn build_native_profile(
         profile.write_deny.extend(shell_write_deny);
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
+        #[cfg(target_os = "linux")]
+        linux_mount_policy::strict(
+            &mut profile,
+            ctx,
+            &home,
+            &env_home,
+            &project_roots,
+            &control_roots,
+        )?;
         add_credential_floor(&mut profile, &env_home, &project_roots)?;
         #[cfg(target_os = "macos")]
         {
@@ -2221,19 +2236,6 @@ fn build_credentials_profile(
 }
 
 #[cfg(unix)]
-fn configured_shell_read_denies(ctx: &AppContext, home: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut denies = Vec::new();
-    for path in &ctx.config().sandbox.read_deny {
-        let path = crate::access_policy::expand_home(path, home);
-        denies.extend(
-            crate::sandbox_profile::resolve_env_deny_paths(path, "sandbox.read_deny")
-                .map_err(|error| error.to_string())?,
-        );
-    }
-    Ok(denies)
-}
-
-#[cfg(unix)]
 fn operator_ssh_agent() -> Option<PathBuf> {
     std::env::var_os("SSH_AUTH_SOCK")
         .filter(|value| !value.is_empty())
@@ -2264,18 +2266,7 @@ fn build_relaxed_profile(
         .map_err(|error| error.data.to_string())?;
     let mut read_deny = policy.absolute_floor.clone();
     let mut write_deny = read_deny.clone();
-    write_deny.extend(
-        [
-            ".zshrc",
-            ".zprofile",
-            ".bashrc",
-            ".profile",
-            ".gitconfig",
-            ".config/git",
-            "Library/LaunchAgents",
-        ]
-        .map(|path| home.join(path)),
-    );
+    write_deny.extend(linux_mount_policy::standard_home_write_denies(home));
     let mut stores = policy.private_stores.clone();
     stores.deny.push(session_store.to_path_buf());
     stores.session_task_read_dir = Some(session_store.to_path_buf());
@@ -2441,6 +2432,7 @@ fn build_relaxed_profile(
         loopback_tcp_connect_deny: Vec::new(),
         cache_roots: Vec::new(),
         temp_dir: temp.to_path_buf(),
+        linux_mounts: None,
         worker_gh_fence,
     };
     protect_worker_credential_services(&mut profile, home)?;
@@ -12207,6 +12199,7 @@ mod read_allow_tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: vec!["/home/alice/.npm".into()],
             temp_dir: temp.into(),
+            linux_mounts: None,
             worker_gh_fence: None,
         };
         let inventory = FakeLister::default()
@@ -12817,6 +12810,7 @@ mod worker_gh_fence_tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: PathBuf::from("/home/alice/work/tmp"),
+            linux_mounts: None,
             worker_gh_fence: Some(WorkerGhFence::Canary {
                 paths: vec![canary_dir.join(crate::worker_jail_canary::CANARY_FILE)],
             }),

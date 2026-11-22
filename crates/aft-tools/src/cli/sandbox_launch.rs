@@ -18,6 +18,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[cfg(target_os = "linux")]
+mod bubblewrap;
+#[cfg(target_os = "linux")]
 mod landlock_backend;
 #[cfg(any(target_os = "macos", test))]
 mod seatbelt;
@@ -94,6 +96,16 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
         if args.command.is_empty() {
             return Err(SandboxLaunchError::usage("missing target command after --"));
         }
+        #[cfg(target_os = "linux")]
+        if args.bwrap_inner {
+            if args.remote_strict || args.profile_file.is_some() || args.profile_json.is_some() {
+                return Err(SandboxLaunchError::usage(
+                    "--bwrap-inner accepts only a local descriptor-backed profile",
+                ));
+            }
+            report_failure(&args, bubblewrap::apply_inner(&args))?;
+            return exec_target(&args.command);
+        }
 
         let source_count = usize::from(args.profile_fd.is_some())
             + usize::from(args.profile_file.is_some())
@@ -127,6 +139,10 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             .canonicalize_for_launch()
             .map_err(|error| SandboxLaunchError::unavailable(error.to_string()));
         let applied = profile.and_then(|profile| {
+            #[cfg(target_os = "linux")]
+            if !args.remote_strict && profile.linux_mounts.is_some() {
+                return bubblewrap::launch(&args, profile);
+            }
             // Seal while still privileged: confinement must not be able to
             // block descriptor flag changes. CLOEXEC keeps this launcher’s
             // error write available but closes the channel in the target.
@@ -143,17 +159,7 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
             }
             apply_sandbox(&profile)
         });
-        if let Err(error) = applied {
-            if error.exit_code == SANDBOX_UNAVAILABLE_EXIT_CODE {
-                if let Some(path) = args.failure_marker.as_deref() {
-                    let _ = write_failure_marker(path);
-                }
-                if let Some(fd) = args.failure_fd {
-                    let _ = write_failure_fd(fd);
-                }
-            }
-            return Err(error);
-        }
+        report_failure(&args, applied)?;
         exec_target(&args.command)
     }
 }
@@ -161,6 +167,8 @@ pub fn run(args: Vec<OsString>) -> Result<(), SandboxLaunchError> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[derive(Debug, Default)]
 struct LaunchArgs {
+    #[cfg(target_os = "linux")]
+    bwrap_inner: bool,
     #[cfg(feature = "test-timing-hooks")]
     start_gate: Option<PathBuf>,
     profile_fd: Option<i32>,
@@ -184,6 +192,11 @@ impl LaunchArgs {
         let mut parsed = Self::default();
         let mut args = args.into_iter();
         while let Some(arg) = args.next() {
+            #[cfg(target_os = "linux")]
+            if arg == "--bwrap-inner" {
+                parsed.bwrap_inner = true;
+                continue;
+            }
             #[cfg(feature = "test-timing-hooks")]
             if arg == "--test-start-gate" {
                 parsed.start_gate = Some(PathBuf::from(args.next().ok_or_else(|| {
@@ -300,7 +313,7 @@ fn read_profile_json(value: &str) -> Result<SandboxProfile, SandboxLaunchError> 
 }
 
 #[cfg(unix)]
-fn read_profile(fd: RawFd) -> Result<SandboxProfile, SandboxLaunchError> {
+fn read_profile<T: serde::de::DeserializeOwned>(fd: RawFd) -> Result<T, SandboxLaunchError> {
     // Validate first because constructing `File` ownership from a closed raw
     // descriptor triggers Rust's IO-safety abort instead of a recoverable error.
     if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
@@ -343,6 +356,25 @@ fn read_profile_file(path: &Path) -> Result<SandboxProfile, SandboxLaunchError> 
     serde_json::from_slice(&bytes).map_err(|error| {
         SandboxLaunchError::usage(format!("invalid sandbox profile JSON: {error}"))
     })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn report_failure(
+    args: &LaunchArgs,
+    setup: Result<(), SandboxLaunchError>,
+) -> Result<(), SandboxLaunchError> {
+    if setup
+        .as_ref()
+        .is_err_and(|error| error.exit_code == SANDBOX_UNAVAILABLE_EXIT_CODE)
+    {
+        if let Some(path) = args.failure_marker.as_deref() {
+            let _ = write_failure_marker(path);
+        }
+        if let Some(fd) = args.failure_fd {
+            let _ = write_failure_fd(fd);
+        }
+    }
+    setup
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

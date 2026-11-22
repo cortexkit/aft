@@ -37,9 +37,35 @@ pub(super) fn add_credential_floor_with_account_home(
 ) -> Result<(), String> {
     let (denies, cargo_homes) =
         credential_floor_paths(home, Some(account), roots, |key| std::env::var_os(key))?;
+    let before_floor = profile.write_deny.len();
     profile.read_deny.extend(denies.iter().cloned());
     profile.write_deny.extend(denies);
-    add_relaxed_cargo_credential_denies(profile, cargo_homes)
+    add_relaxed_cargo_credential_denies(profile, cargo_homes.clone())?;
+    if let Some(mounts) = &mut profile.linux_mounts {
+        mounts.cargo_homes = cargo_homes;
+        mounts
+            .credential_masks
+            .extend_from_slice(&profile.write_deny[before_floor..]);
+        if profile.mode == crate::config::SandboxMode::Strict {
+            // Retain earlier mandatory denies even if the mount layer also
+            // masks them. Only the appended floor can move to fallback.
+            mounts.fallback_write_deny = profile.write_deny.split_off(before_floor);
+        }
+        if let Some(socket) = super::operator_ssh_agent() {
+            let paths = if socket.is_absolute() {
+                vec![socket]
+            } else {
+                roots.iter().map(|root| root.join(&socket)).collect()
+            };
+            for path in paths {
+                mounts.credential_masks.extend(
+                    crate::sandbox_profile::resolve_env_deny_paths(path, "SSH_AUTH_SOCK")
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

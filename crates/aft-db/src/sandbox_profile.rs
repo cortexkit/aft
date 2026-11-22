@@ -170,6 +170,21 @@ pub struct SandboxProfile {
     /// from falling back to the operator's gh. See `crate::worker_jail_canary`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker_gh_fence: Option<WorkerGhFence>,
+    /// Mount policy for the local Linux launcher. Remote Strict profiles omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linux_mounts: Option<LinuxMountPolicy>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LinuxMountPolicy {
+    pub credential_masks: Vec<PathBuf>,
+    pub read_masks: Vec<PathBuf>,
+    pub read_only: Vec<PathBuf>,
+    pub cargo_homes: Vec<PathBuf>,
+    /// Strict credential writes enforced by mounts when active, and still
+    /// mandatory Landlock denies on direct fallback.
+    pub fallback_write_deny: Vec<PathBuf>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -182,6 +197,7 @@ fn secret_bash_ordinary_profile_retains_legacy_bytes() {
     let legacy = r#"{"v":7,"mode":"strict","worker_jail":false,"deny_prefixes":[],"data_policy":{"deny":[],"read_allow":[],"write_allow":[]},"writable_roots":[],"write_deny":[],"write_deny_nested":[],"read_allow":[],"read_allow_listed":[],"read_deny":[],"socket_deny":[],"cache_roots":[],"temp_dir":"/policy"}"#;
     let profile: SandboxProfile = serde_json::from_str(legacy).unwrap();
     assert!(!profile.secret_proxy);
+    assert!(profile.linux_mounts.is_none());
     assert_eq!(serde_json::to_string(&profile).unwrap(), legacy);
 }
 
@@ -243,6 +259,7 @@ impl SandboxProfile {
             cache_roots: canonicalize_required_dirs(cache_roots, "cache_roots")?,
             temp_dir: canonicalize_required_dir(temp_dir, "temp_dir")?,
             worker_gh_fence: None,
+            linux_mounts: None,
         })
     }
 
@@ -270,6 +287,7 @@ impl SandboxProfile {
             canonicalize_read_grants(self.read_allow, self.read_allow_listed, &writable_files)?;
         Ok(Self {
             secret_proxy: self.secret_proxy,
+            linux_mounts: self.linux_mounts,
             v: self.v,
             mode: self.mode,
             worker_jail: self.worker_jail,
@@ -1480,6 +1498,7 @@ mod tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: root.clone(),
+            linux_mounts: None,
             worker_gh_fence: None,
         }
         .canonicalize_for_launch()

@@ -1605,6 +1605,7 @@ mod tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: task_temp,
+            linux_mounts: None,
             worker_gh_fence: None,
         };
         let source = render_profile(&profile).expect("render profile");
@@ -1648,6 +1649,7 @@ mod tests {
             loopback_tcp_connect_deny: Vec::new(),
             cache_roots: Vec::new(),
             temp_dir: Path::new("/task").to_path_buf(),
+            linux_mounts: None,
             worker_gh_fence: Some(aft::sandbox_profile::WorkerGhFence::Canary {
                 paths: paths.to_vec(),
             }),
