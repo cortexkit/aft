@@ -1381,6 +1381,7 @@ jobs:
         shell: bash
         env:
           AFT_GATE_LOG: ${{ runner.temp }}/macos-libtest-shard-${{ matrix.shard }}.log
+          AFT_SEATBELT_HTTPS_URL: https://example.com/
           AFT_TEST_DIAG: "1"
           AFT_UNIT_TEST_RUNNER: nextest
           AFT_GATE_PHASES: ${{ matrix.shard == 1 && 'lib,lib-shard' || 'lib-shard' }}

@@ -1848,6 +1848,8 @@ fn build_native_profile(
     let result = (|| {
         let finalize = |mut profile: SandboxProfile| -> Result<SandboxProfile, String> {
             add_credential_floor(&mut profile, &env_home, &project_roots)?;
+            #[cfg(target_os = "macos")]
+            deny_macos_operator_ssh_agent(&mut profile);
             let profile = profile
                 .canonicalize_for_launch()
                 .map_err(|error| error.to_string())?;
@@ -2044,12 +2046,12 @@ fn build_native_profile(
             cache_roots.dedup();
         }
 
-        let mut socket_deny = vec![PathBuf::from("/var/run/docker.sock")];
-        if let Some(agent_socket) =
-            std::env::var_os("SSH_AUTH_SOCK").filter(|value| !value.is_empty())
-        {
-            socket_deny.push(PathBuf::from(agent_socket));
-        }
+        let socket_deny = vec![PathBuf::from("/var/run/docker.sock")];
+        #[cfg(not(target_os = "macos"))]
+        let socket_deny = socket_deny
+            .into_iter()
+            .chain(operator_ssh_agent())
+            .collect();
 
         let mut profile = policy
             .compile_shell(temp_dir.clone(), cache_roots, socket_deny)
@@ -2058,6 +2060,15 @@ fn build_native_profile(
         profile.write_deny_nested = write_deny_nested;
         profile.read_deny.extend(shell_read_deny);
         add_credential_floor(&mut profile, &env_home, &project_roots)?;
+        #[cfg(target_os = "macos")]
+        {
+            deny_macos_operator_ssh_agent(&mut profile);
+            // Seatbelt can deny writes to configured read-deny paths inside
+            // a writable subtree. Landlock cannot subtract paths that way.
+            let denies = configured_shell_read_denies(ctx, &env_home)?;
+            profile.read_deny.extend(denies.iter().cloned());
+            profile.write_deny.extend(denies);
+        }
         if jailed {
             profile.read_deny.extend(canary_dirs.iter().cloned());
             profile.write_deny.extend(canary_dirs.iter().cloned());
@@ -2193,14 +2204,37 @@ fn build_credentials_profile(
     if profile.worker_jail {
         profile.worker_gh_fence = Some(crate::sandbox_profile::WorkerGhFence::Unenforced);
     }
+    let denies = configured_shell_read_denies(ctx, home)?;
+    profile.read_deny.extend(denies.iter().cloned());
+    profile.write_deny.extend(denies);
+    Ok(profile)
+}
+
+#[cfg(unix)]
+fn configured_shell_read_denies(ctx: &AppContext, home: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut denies = Vec::new();
     for path in &ctx.config().sandbox.read_deny {
         let path = crate::access_policy::expand_home(path, home);
-        let denies = crate::sandbox_profile::resolve_env_deny_paths(path, "sandbox.read_deny")
-            .map_err(|error| error.to_string())?;
-        profile.read_deny.extend(denies.iter().cloned());
-        profile.write_deny.extend(denies);
+        denies.extend(
+            crate::sandbox_profile::resolve_env_deny_paths(path, "sandbox.read_deny")
+                .map_err(|error| error.to_string())?,
+        );
     }
-    Ok(profile)
+    Ok(denies)
+}
+
+#[cfg(unix)]
+fn operator_ssh_agent() -> Option<PathBuf> {
+    std::env::var_os("SSH_AUTH_SOCK")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(target_os = "macos")]
+fn deny_macos_operator_ssh_agent(profile: &mut SandboxProfile) {
+    // Take only the daemon's inherited socket, not sockets set up for a call.
+    // Add it before the final canonicalization, which retains both spellings.
+    profile.socket_deny.extend(operator_ssh_agent());
 }
 
 /// Build Standard's protected-path list without predicting the caches, sockets

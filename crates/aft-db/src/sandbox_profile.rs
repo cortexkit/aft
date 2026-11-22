@@ -158,6 +158,7 @@ pub struct SandboxProfile {
     #[serde(default)]
     pub read_allow_listed: Vec<PathBuf>,
     pub read_deny: Vec<PathBuf>,
+    /// Exact Unix socket destinations denied by the backend, not their parent trees.
     pub socket_deny: Vec<PathBuf>,
     /// Shared compile servers can write outside the client's jail. Seatbelt
     /// denies only these loopback TCP destinations, not ordinary test servers.
@@ -309,10 +310,11 @@ impl SandboxProfile {
                 &mut deny_paths,
                 self.mode != crate::config::SandboxMode::Off,
             )?,
-            socket_deny: canonicalize_optional_paths(
+            socket_deny: canonicalize_denies(
                 self.socket_deny,
                 "socket_deny",
                 &mut deny_paths,
+                cfg!(target_os = "macos") && self.mode != crate::config::SandboxMode::Off,
             )?,
             cache_roots: canonicalize_required_dirs(self.cache_roots, "cache_roots")?,
             loopback_tcp_connect_deny: self.loopback_tcp_connect_deny,

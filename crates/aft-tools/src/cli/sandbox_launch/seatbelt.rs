@@ -49,12 +49,10 @@ pub(super) fn apply(profile: &SandboxProfile) -> Result<(), String> {
 }
 
 fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
-    // Seatbelt currently renders the Standard policy for Credentials, too.
-    if matches!(
-        profile.mode,
-        aft::config::SandboxMode::Standard | aft::config::SandboxMode::Credentials
-    ) {
-        return render_relaxed_profile(profile);
+    match profile.mode {
+        aft::config::SandboxMode::Credentials => return render_credentials_profile(profile),
+        aft::config::SandboxMode::Standard => return render_relaxed_profile(profile),
+        _ => {}
     }
     let mut source = String::from(
         "(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write* (literal \"/dev/null\"))\n",
@@ -142,12 +140,9 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
             escape_path(path)?
         ));
     }
-    for path in &profile.socket_deny {
-        source.push_str(&format!(
-            "(deny network-outbound (path \"{}\"))\n",
-            escape_path(path)?
-        ));
-    }
+    render_prefix_denies(&mut source, profile)?;
+    render_ancestor_unlink_denies(&mut source, all_file_denies(profile))?;
+    render_socket_denies(&mut source, profile)?;
 
     for port in &profile.loopback_tcp_connect_deny {
         source.push_str(&format!(
@@ -156,7 +151,26 @@ fn render_profile(profile: &SandboxProfile) -> Result<String, String> {
     }
     render_worker_canary_metadata(&mut source, profile)?;
 
-    render_worker_keychain_denies(&mut source, profile)?;
+    render_keychain_denies(&mut source, profile)?;
+    Ok(source)
+}
+
+fn render_credentials_profile(profile: &SandboxProfile) -> Result<String, String> {
+    let mut source = String::from("(version 1)\n(allow default)\n");
+    render_signal_scope(&mut source, profile);
+    for path in &profile.read_deny {
+        source.push_str(&format!(
+            "(deny file-read* file-write* {})\n",
+            relaxed_filter(path, false)?
+        ));
+    }
+    render_prefix_denies(&mut source, profile)?;
+    render_ancestor_unlink_denies(
+        &mut source,
+        profile.read_deny.iter().chain(&profile.deny_prefixes),
+    )?;
+    render_socket_denies(&mut source, profile)?;
+    render_keychain_item_denies(&mut source);
     Ok(source)
 }
 
@@ -170,36 +184,14 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
             relaxed_filter(path, false)?
         ));
     }
-    // Path-based denies must survive renaming any enclosing directory, including
-    // parents of private files outside the usual credential and store locations.
-    let ancestors = profile
-        .write_deny
-        .iter()
-        .chain(&profile.write_deny_nested)
-        .chain(&profile.deny_prefixes)
-        .chain(&profile.read_deny)
-        .chain(&profile.data_policy.deny)
-        .chain(&profile.keychain_deny)
-        .flat_map(|path| path.ancestors().skip(1))
-        .collect::<std::collections::BTreeSet<_>>();
-    for ancestor in ancestors {
-        source.push_str(&format!(
-            "(deny file-write-unlink (literal \"{}\"))\n",
-            escape_path(ancestor)?
-        ));
-    }
+    render_ancestor_unlink_denies(&mut source, all_file_denies(profile))?;
     for path in &profile.read_deny {
         source.push_str(&format!(
             "(deny file-read* {})\n",
             relaxed_filter(path, false)?
         ));
     }
-    for path in &profile.deny_prefixes {
-        source.push_str(&format!(
-            "(deny file-read* file-write* {})\n",
-            relaxed_filter(path, true)?
-        ));
-    }
+    render_prefix_denies(&mut source, profile)?;
     let writes = profile
         .write_allow_roots()
         .into_iter()
@@ -270,8 +262,58 @@ fn render_relaxed_profile(profile: &SandboxProfile) -> Result<String, String> {
         }
     }
     render_worker_canary_metadata(&mut source, profile)?;
-    render_worker_keychain_denies(&mut source, profile)?;
+    render_socket_denies(&mut source, profile)?;
+    render_keychain_denies(&mut source, profile)?;
     Ok(source)
+}
+
+fn all_file_denies(profile: &SandboxProfile) -> impl Iterator<Item = &std::path::PathBuf> {
+    profile
+        .write_deny
+        .iter()
+        .chain(&profile.write_deny_nested)
+        .chain(&profile.deny_prefixes)
+        .chain(&profile.read_deny)
+        .chain(&profile.data_policy.deny)
+        .chain(&profile.keychain_deny)
+}
+
+fn render_ancestor_unlink_denies<'a>(
+    source: &mut String,
+    denies: impl Iterator<Item = &'a std::path::PathBuf>,
+) -> Result<(), String> {
+    // Path-based denies must survive renaming any enclosing directory, including
+    // parents of private files outside the usual credential and store locations.
+    let ancestors = denies
+        .flat_map(|path| path.ancestors().skip(1))
+        .collect::<std::collections::BTreeSet<_>>();
+    for ancestor in ancestors {
+        source.push_str(&format!(
+            "(deny file-write-unlink (literal \"{}\"))\n",
+            escape_path(ancestor)?
+        ));
+    }
+    Ok(())
+}
+
+fn render_prefix_denies(source: &mut String, profile: &SandboxProfile) -> Result<(), String> {
+    for path in &profile.deny_prefixes {
+        source.push_str(&format!(
+            "(deny file-read* file-write* {})\n",
+            relaxed_filter(path, true)?
+        ));
+    }
+    Ok(())
+}
+
+fn render_socket_denies(source: &mut String, profile: &SandboxProfile) -> Result<(), String> {
+    for path in &profile.socket_deny {
+        source.push_str(&format!(
+            "(deny network-outbound (path \"{}\"))\n",
+            escape_path(path)?
+        ));
+    }
+    Ok(())
 }
 
 fn render_secret_memory_boundary(source: &mut String, profile: &SandboxProfile) {
@@ -323,25 +365,31 @@ fn render_signal_scope(source: &mut String, profile: &SandboxProfile) {
     source.push_str("(allow signal (signal-number 0))\n");
 }
 
-fn render_worker_keychain_denies(
-    source: &mut String,
-    profile: &SandboxProfile,
-) -> Result<(), String> {
+const KEYCHAIN_ITEM_SERVICES: &[&str] = &[
+    "com.apple.SecurityServer",           // File-based keychains (securityd).
+    "com.apple.securityd.xpc",            // Data-protection keychain (secd).
+    "com.apple.securityd.systemkeychain", // System-keychain service in recovery.
+];
+
+fn render_keychain_item_denies(source: &mut String) {
+    // Deny item lookups without denying trust evaluation or code signing.
+    for service in KEYCHAIN_ITEM_SERVICES {
+        source.push_str(&format!("(deny mach-lookup (global-name \"{service}\"))\n"));
+    }
+}
+
+fn render_keychain_denies(source: &mut String, profile: &SandboxProfile) -> Result<(), String> {
+    render_keychain_item_denies(source);
     render_worker_broker_denies(source, profile)?;
     if !profile.worker_jail {
         return Ok(());
     }
-    // These are Security.framework's keychain and authorization endpoints, not
-    // a com.apple.security.* wildcard. Trust evaluation and code-signing services
-    // remain governed by the profile's default allow policy.
+    // Workers at Standard and Strict also retain their authorization-service denies.
     for service in [
-        "com.apple.SecurityServer", // Legacy file-keychain API (securityd).
-        "com.apple.securityd.xpc",  // SecItem API (secd).
-        "com.apple.securityd.systemkeychain", // System-keychain API in recovery.
-        "com.apple.authd",          // Authorization Services rights and interaction.
-        "com.apple.security.agent", // Keychain unlock / ACL prompts.
+        "com.apple.authd",                // Authorization Services rights and interaction.
+        "com.apple.security.agent",       // Keychain unlock / ACL prompts.
         "com.apple.security.agent.login", // Privileged login-session agent.
-        "com.apple.security.authhost", // Authorization mechanism host.
+        "com.apple.security.authhost",    // Authorization mechanism host.
         "com.apple.security.authtrampoline", // Authorization execution trampoline.
     ] {
         source.push_str(&format!("(deny mach-lookup (global-name \"{service}\"))\n"));
@@ -588,6 +636,616 @@ fn escape_path(path: &Path) -> Result<String, String> {
     Ok(escaped)
 }
 
+#[cfg(all(test, target_os = "macos"))]
+mod macos_native_tests {
+    use super::*;
+    use aft::config::{Config, SandboxMode};
+    use std::fs;
+    use std::os::unix::fs::{symlink, MetadataExt};
+    use std::os::unix::net::UnixListener;
+    use std::path::PathBuf;
+    use std::process::{Command, Output};
+
+    const LEVELS: [SandboxMode; 3] = [
+        SandboxMode::Credentials,
+        SandboxMode::Standard,
+        SandboxMode::Strict,
+    ];
+    const SEED: &[u8] = b"disposable sandbox value";
+
+    fn command(profile: Option<&Path>, executable: &str) -> Command {
+        if let Some(path) = profile {
+            let mut command = Command::new("/usr/bin/sandbox-exec");
+            command.arg("-f").arg(path).arg(executable);
+            command
+        } else {
+            Command::new(executable)
+        }
+    }
+
+    fn assert_success(output: Output) -> Vec<u8> {
+        assert!(output.status.success(), "{output:?}");
+        output.stdout
+    }
+
+    fn file_oracle(profile: &Path, path: &Path) {
+        let read = |profile| command(profile, "/bin/cat").arg(path).output().unwrap();
+        let append = |profile| {
+            command(profile, "/bin/sh")
+                .args(["-c", "printf tamper >> \"$1\"", "append"])
+                .arg(path)
+                .output()
+                .unwrap()
+        };
+        assert_eq!(assert_success(read(None)), SEED);
+        assert_success(append(None));
+        assert_eq!(fs::read(path).unwrap(), [SEED, b"tamper"].concat());
+        fs::write(path, SEED).unwrap();
+
+        let output = read(Some(profile));
+        assert!(
+            !output.status.success() && output.stdout.is_empty(),
+            "{output:?}"
+        );
+        let output = append(Some(profile));
+        assert!(!output.status.success(), "{output:?}");
+        assert_eq!(fs::read(path).unwrap(), SEED);
+    }
+
+    fn head_profile(root: &Path, level: SandboxMode) -> PathBuf {
+        use aft::sandbox_spawn::{
+            resolve_sandbox_spawn, AuthenticatedPrincipal, RequestedSandboxTier, SandboxTaskKind,
+            SpawnPlan,
+        };
+        use aft_engine::test_bridge::bash_remote::cleanup_task_temp_dir;
+        use aft_engine::test_bridge::bash_remote::sandbox_spawn::install_sandbox_launcher_for_test;
+
+        let checkout = root.join("checkout");
+        let storage = root.join("home/.local/share/cortexkit/aft");
+        let ctx = aft::context::AppContext::new(
+            Box::new(aft::parser::TreeSitterProvider::new()),
+            Config {
+                project_root: Some(checkout.clone()),
+                storage_dir: Some(storage.clone()),
+                ..Default::default()
+            },
+        );
+        ctx.update_config(|config| {
+            config.sandbox.profile.head = level;
+            config.sandbox.profile.worker = SandboxMode::Off;
+            config.sandbox.read_deny = vec![checkout.join("notes/private")];
+            config.github.shim = false;
+            config.git.co_author = "off".into();
+        });
+        let task = aft::bash_background::persistence::create_task_layout(
+            &storage,
+            "seatbelt-probe",
+            "bash-0000000000000001",
+        )
+        .unwrap();
+        let _launcher =
+            install_sandbox_launcher_for_test(&checkout, std::env::current_exe().unwrap());
+        let plan = resolve_sandbox_spawn(
+            &ctx,
+            &AuthenticatedPrincipal::FirstParty,
+            RequestedSandboxTier::Native,
+            SandboxTaskKind::BashForeground,
+            &task.paths.io_dir,
+            None,
+        );
+        let SpawnPlan::Launcher { profile, .. } = plan else {
+            panic!("{level}: {plan:?}")
+        };
+        let temp = profile.temp_dir.clone();
+        let result = profile
+            .canonicalize_for_launch()
+            .map_err(|error| error.to_string())
+            .and_then(|profile| render_profile(&profile));
+        cleanup_task_temp_dir(&temp).unwrap();
+        let rendered = root.join(format!("{level}.sb"));
+        fs::write(&rendered, result.unwrap()).unwrap();
+        rendered
+    }
+
+    #[test]
+    fn files_and_agent_socket_follow_the_real_head_profile() {
+        const FIXTURE: &str = "AFT_SEATBELT_NATIVE_FIXTURE";
+        let Some(base) = std::env::var_os(FIXTURE).map(PathBuf::from) else {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let test = concat!(
+                module_path!(),
+                "::files_and_agent_socket_follow_the_real_head_profile"
+            );
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", test.split_once("::").unwrap().1, "--nocapture"])
+                .env(FIXTURE, &root)
+                .env("HOME", root.join("home"))
+                .env("CARGO_HOME", root.join("checkout/cargo"))
+                .env("AWS_SHARED_CREDENTIALS_FILE", root.join("aws-override"))
+                .env("SSH_AUTH_SOCK", root.join("agent-alias"))
+                .env(
+                    "KUBECONFIG",
+                    std::env::join_paths([
+                        root.join("kube-absolute"),
+                        PathBuf::from("kube-relative"),
+                    ])
+                    .unwrap(),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{output:?}"
+            );
+            return;
+        };
+
+        for dir in [
+            "home/.kube",
+            "checkout/cargo",
+            "checkout/notes",
+            "checkout/.git/hooks",
+            "home/.local/share/cortexkit/aft",
+        ] {
+            fs::create_dir_all(base.join(dir)).unwrap();
+        }
+        // Make .git look like a real repository to the engine's Git policy resolver.
+        assert_success(
+            Command::new("/usr/bin/git")
+                .args(["init", "-q"])
+                .arg(base.join("checkout"))
+                .output()
+                .unwrap(),
+        );
+        let denied = [
+            "home/.netrc",
+            "home/.kube/config",
+            "kube-absolute",
+            "checkout/kube-relative",
+            "aws-override",
+            "checkout/notes/private",
+        ];
+        for name in denied {
+            fs::write(base.join(name), SEED).unwrap();
+        }
+        let hooks = base.join("checkout/.git/hooks/probe");
+        fs::write(&hooks, SEED).unwrap();
+        let cortexkit = base.join("home/.local/share/cortexkit/fixture");
+        fs::write(&cortexkit, SEED).unwrap();
+
+        let agent = base.join("agent");
+        let alias = base.join("agent-alias");
+        let per_call = base.join("per-call-agent");
+        let _listeners = [
+            UnixListener::bind(&agent).unwrap(),
+            UnixListener::bind(&per_call).unwrap(),
+        ];
+        symlink(&agent, &alias).unwrap();
+        let connect = |profile, socket: &Path| {
+            command(profile, "/usr/bin/nc")
+                .args(["-z", "-U", "-w", "2"])
+                .arg(socket)
+                .output()
+                .unwrap()
+        };
+        for socket in [&agent, &alias, &per_call] {
+            assert_success(connect(None, socket));
+        }
+
+        let mut strict = None;
+        for level in LEVELS {
+            let profile = head_profile(&base, level);
+            for name in denied {
+                file_oracle(&profile, &base.join(name));
+            }
+            for socket in [&agent, &alias] {
+                let output = connect(Some(&profile), socket);
+                assert!(!output.status.success(), "{level} {socket:?}: {output:?}");
+            }
+            assert_success(connect(Some(&profile), &per_call));
+
+            if level == SandboxMode::Credentials {
+                assert_eq!(
+                    assert_success(
+                        command(Some(&profile), "/bin/cat")
+                            .arg(&cortexkit)
+                            .output()
+                            .unwrap()
+                    ),
+                    SEED
+                );
+                let outside = base.join("outside-checkout");
+                assert_success(
+                    command(Some(&profile), "/bin/sh")
+                        .args(["-c", "printf open > \"$1\"", "write"])
+                        .arg(&outside)
+                        .output()
+                        .unwrap(),
+                );
+                assert_eq!(fs::read(outside).unwrap(), b"open");
+            } else {
+                let output = command(Some(&profile), "/bin/sh")
+                    .args(["-c", "printf tamper >> \"$1\"", "append"])
+                    .arg(&hooks)
+                    .output()
+                    .unwrap();
+                assert!(!output.status.success(), "{level}: {output:?}");
+                assert_eq!(fs::read(&hooks).unwrap(), SEED);
+            }
+            if level == SandboxMode::Strict {
+                strict = Some(profile);
+            }
+        }
+        strict_rename_and_future_prefix(&base, &strict.unwrap());
+    }
+
+    fn strict_rename_and_future_prefix(base: &Path, profile: &Path) {
+        use std::io::Write;
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let notes = base.join("checkout/notes");
+        let moved = notes.with_file_name("moved-notes");
+        let private = notes.join("private");
+        let before = fs::metadata(&private).unwrap();
+        assert_success(
+            command(None, "/bin/mv")
+                .args([&notes, &moved])
+                .output()
+                .unwrap(),
+        );
+        assert_eq!(
+            fs::metadata(moved.join("private")).unwrap().ino(),
+            before.ino()
+        );
+        fs::rename(&moved, &notes).unwrap();
+        let output = command(Some(profile), "/bin/mv")
+            .args([&notes, &moved])
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{output:?}");
+        assert!(!moved.exists());
+        let after = fs::metadata(&private).unwrap();
+        assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
+        assert_eq!(fs::read(&private).unwrap(), SEED);
+
+        let cargo = base.join("checkout/cargo");
+        let future = cargo.join("credentials-after-start");
+        let renamed = cargo.join("renamed");
+        let sibling = cargo.join("config.toml");
+        let ready = cargo.join("ready");
+        assert!(!future.exists());
+        let mut child = command(Some(profile), "/bin/sh")
+            .args([
+                "-c",
+                r#"
+                : > "$4" || exit 90
+                read -r go || exit 91
+                if /bin/cat "$1"; then exit 92; fi
+                if (printf tamper >> "$1"); then exit 93; fi
+                if /bin/mv "$1" "$2"; then exit 94; fi
+                printf sibling > "$3"
+            "#,
+                "future-cargo-probe",
+            ])
+            .args([&future, &renamed, &sibling, &ready])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            if child.try_wait().unwrap().is_some() {
+                let output = child.wait_with_output().unwrap();
+                panic!(
+                    "Strict payload never started: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "Strict payload did not signal readiness"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!future.exists());
+        fs::write(&future, SEED).unwrap();
+        child.stdin.take().unwrap().write_all(b"ready\n").unwrap();
+        let stdout = assert_success(child.wait_with_output().unwrap());
+        assert!(stdout.is_empty(), "{stdout:?}");
+        assert_eq!(fs::read(&future).unwrap(), SEED);
+        assert!(!renamed.exists());
+        assert_eq!(fs::read(&sibling).unwrap(), b"sibling");
+    }
+
+    fn isolated_profile(root: &Path, level: SandboxMode) -> PathBuf {
+        let mut profile = SandboxProfile::build(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            root.to_owned(),
+        )
+        .unwrap();
+        profile.mode = level;
+        let path = root.join(format!("{level}.sb"));
+        fs::write(&path, render_profile(&profile).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn file_keychain_query_fails_while_its_file_stays_readable() {
+        struct Keychain(PathBuf);
+        impl Drop for Keychain {
+            fn drop(&mut self) {
+                let _ = Command::new("/usr/bin/security")
+                    .arg("delete-keychain")
+                    .arg(&self.0)
+                    .output();
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let chain = Keychain(root.join("disposable.keychain-db"));
+        let security = |args: &[&str]| {
+            assert_success(
+                command(None, "/usr/bin/security")
+                    .args(args)
+                    .arg(&chain.0)
+                    .output()
+                    .unwrap(),
+            )
+        };
+        security(&["create-keychain", "-p", "disposable-fixture"]);
+        security(&["unlock-keychain", "-p", "disposable-fixture"]);
+        const ITEM: &str = "aft-file-keychain-disposable-value";
+        security(&[
+            "add-generic-password",
+            "-A",
+            "-s",
+            "aft-test-service",
+            "-a",
+            "fixture",
+            "-w",
+            ITEM,
+        ]);
+        let query = |profile| {
+            command(profile, "/usr/bin/security")
+                .args([
+                    "find-generic-password",
+                    "-s",
+                    "aft-test-service",
+                    "-a",
+                    "fixture",
+                    "-w",
+                ])
+                .arg(&chain.0)
+                .output()
+                .unwrap()
+        };
+        assert_eq!(
+            assert_success(query(None)),
+            format!("{ITEM}\n").into_bytes()
+        );
+        for level in LEVELS {
+            let profile = isolated_profile(&root, level);
+            assert!(!assert_success(
+                command(Some(&profile), "/bin/cat")
+                    .arg(&chain.0)
+                    .output()
+                    .unwrap()
+            )
+            .is_empty());
+            let output = query(Some(&profile));
+            assert!(!output.status.success(), "{level}: {output:?}");
+            assert!(
+                !String::from_utf8_lossy(&output.stdout).contains(ITEM),
+                "{level}: {output:?}"
+            );
+        }
+        assert_eq!(
+            assert_success(query(None)),
+            format!("{ITEM}\n").into_bytes()
+        );
+    }
+
+    #[test]
+    fn data_protection_query_fails_if_the_runner_can_seed_an_item() {
+        use std::io::Write;
+        use std::process::Stdio;
+
+        // A standalone process exercises the SecItem API before and after
+        // sandbox application, without reusing a cached service connection.
+        const PROBE: &str = r#"
+            #import <Foundation/Foundation.h>
+            #import <Security/Security.h>
+            int main(int argc, char **argv) { @autoreleasepool {
+                if (argc != 3) return 2;
+                NSMutableDictionary *query = [@{
+                    (__bridge id)kSecClass: (__bridge id)kSecClassGenericPassword,
+                    (__bridge id)kSecUseDataProtectionKeychain: @YES,
+                    (__bridge id)kSecAttrService: [NSString stringWithUTF8String:argv[2]],
+                    (__bridge id)kSecAttrAccount: @"disposable-fixture"
+                } mutableCopy];
+                OSStatus status;
+                if (!strcmp(argv[1], "add")) {
+                    query[(__bridge id)kSecValueData] = [@"aft-data-protection-probe" dataUsingEncoding:NSUTF8StringEncoding];
+                    status = SecItemAdd((__bridge CFDictionaryRef)query, NULL);
+                } else if (!strcmp(argv[1], "delete")) {
+                    status = SecItemDelete((__bridge CFDictionaryRef)query);
+                } else {
+                    CFTypeRef result = NULL;
+                    query[(__bridge id)kSecReturnData] = @YES;
+                    status = SecItemCopyMatching((__bridge CFDictionaryRef)query, &result);
+                    if (status == errSecSuccess) {
+                        NSData *data = CFBridgingRelease(result);
+                        fwrite(data.bytes, 1, data.length, stdout);
+                    }
+                }
+                fprintf(stderr, "SecItem OSStatus=%d\n", (int)status);
+                return status != errSecSuccess;
+            } }
+        "#;
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("secitem-probe");
+        let mut compiler = Command::new("/usr/bin/xcrun")
+            .args([
+                "clang",
+                "-x",
+                "objective-c",
+                "-fobjc-arc",
+                "-framework",
+                "Foundation",
+                "-framework",
+                "Security",
+                "-o",
+            ])
+            .arg(&exe)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        compiler
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(PROBE.as_bytes())
+            .unwrap();
+        assert_success(compiler.wait_with_output().unwrap());
+
+        struct Item {
+            exe: PathBuf,
+            service: String,
+        }
+        impl Drop for Item {
+            fn drop(&mut self) {
+                let _ = Command::new(&self.exe)
+                    .args(["delete", &self.service])
+                    .output();
+            }
+        }
+        let service = format!(
+            "aft-data-protection-{}-{}",
+            std::process::id(),
+            dir.path().file_name().unwrap().to_string_lossy()
+        );
+        let output = Command::new(&exe).args(["add", &service]).output().unwrap();
+        if !output.status.success() {
+            let error = String::from_utf8_lossy(&output.stderr);
+            // A VM may lack a logged-in keychain, or an ad-hoc probe may not
+            // have a keychain access group. Neither case can show whether the
+            // sandbox prevents retrieval of an item an unrestricted process can read.
+            if ["SecItem OSStatus=-25291\n", "SecItem OSStatus=-34018\n"].contains(&error.as_ref())
+            {
+                eprintln!(
+                    "skipping data-protection item oracle: Off could not seed the fixture ({})",
+                    error.trim()
+                );
+                return;
+            }
+            panic!("failed to seed the data-protection fixture: {output:?}");
+        }
+        let item = Item { exe, service };
+        let query = |profile| {
+            command(profile, item.exe.to_str().unwrap())
+                .args(["find", &item.service])
+                .output()
+                .unwrap()
+        };
+        let expected = b"aft-data-protection-probe";
+        assert_eq!(assert_success(query(None)), expected);
+        for level in LEVELS {
+            let profile = isolated_profile(dir.path(), level);
+            let output = query(Some(&profile));
+            assert!(
+                !output.status.success() && output.stdout.is_empty(),
+                "{level}: {output:?}"
+            );
+        }
+        assert_eq!(assert_success(query(None)), expected);
+    }
+
+    #[test]
+    fn system_trust_evaluator_verifies_a_system_root_offline() {
+        let dir = tempfile::tempdir().unwrap();
+        let certificate = dir.path().join("isrg-root-x1.pem");
+        fs::write(
+            &certificate,
+            assert_success(
+                command(None, "/usr/bin/security")
+                    .args([
+                        "find-certificate",
+                        "-c",
+                        "ISRG Root X1",
+                        "-p",
+                        "/System/Library/Keychains/SystemRootCertificates.keychain",
+                    ])
+                    .output()
+                    .unwrap(),
+            ),
+        )
+        .unwrap();
+        let verify = |profile| {
+            assert_success(
+                command(profile, "/usr/bin/security")
+            // -c supplies the certificate to verify, not a trusted anchor (-r).
+            .args(["verify-cert", "-p", "basic", "-c"]).arg(&certificate).output().unwrap(),
+            )
+        };
+        let off = verify(None);
+        for level in LEVELS {
+            let profile = isolated_profile(dir.path(), level);
+            assert_eq!(verify(Some(&profile)), off);
+        }
+    }
+
+    #[test]
+    fn https_with_system_trust() {
+        const URL_ENV: &str = "AFT_SEATBELT_HTTPS_URL";
+        let Ok(url) = std::env::var(URL_ENV) else {
+            eprintln!("skipping HTTPS system trust test: {URL_ENV} is not set (requires a network-enabled macOS runner)");
+            return;
+        };
+        assert!(url.starts_with("https://"));
+        let dir = tempfile::tempdir().unwrap();
+        let fetch = |profile| {
+            // nscurl uses NSURLSession with the platform's default certificate trust.
+            let output = command(profile, "/usr/bin/nscurl")
+                .args([
+                    "--max-time",
+                    "20",
+                    "--ignore-location",
+                    "-D",
+                    "-",
+                    "-o",
+                    "/dev/null",
+                    &url,
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+                        line.starts_with("HTTP/") && line.split_whitespace().nth(1) == Some("200")
+                    }),
+                "{output:?}"
+            );
+        };
+        fetch(None);
+        for level in LEVELS {
+            let profile = isolated_profile(dir.path(), level);
+            fetch(Some(&profile));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Seatbelt rendering is macOS-only in production, and this fixture builds
@@ -664,7 +1322,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signal_scope_is_limited_to_worker_profiles_in_both_modes() {
+    fn signal_scope_is_limited_to_worker_profiles_at_every_enforcing_level() {
         let dir = tempfile::tempdir().unwrap();
         let mut profile = SandboxProfile::build(
             vec![dir.path().to_path_buf()],
@@ -678,6 +1336,7 @@ mod tests {
         )
         .unwrap();
         for mode in [
+            aft::config::SandboxMode::Credentials,
             aft::config::SandboxMode::Strict,
             aft::config::SandboxMode::Standard,
         ] {
@@ -695,7 +1354,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_keychain_mach_denies_preserve_trust_services() {
+    fn keychain_mach_denies_cover_heads_and_workers_but_spare_trust() {
         let dir = tempfile::tempdir().unwrap();
         let mut profile = SandboxProfile::build(
             vec![dir.path().to_path_buf()],
@@ -709,37 +1368,35 @@ mod tests {
         )
         .unwrap();
         for mode in [
+            aft::config::SandboxMode::Credentials,
             aft::config::SandboxMode::Strict,
             aft::config::SandboxMode::Standard,
         ] {
             profile.mode = mode;
-            profile.worker_jail = false;
-            let head = render_profile(&profile).unwrap();
-            assert!(!head.contains("mach-lookup"));
-            profile.worker_jail = true;
-            let source = render_profile(&profile).unwrap();
-            for service in [
-                "com.apple.SecurityServer",
-                "com.apple.securityd.xpc",
-                "com.apple.securityd.systemkeychain",
-                "com.apple.security.agent",
-                "com.apple.security.agent.login",
-                "com.apple.authd",
-                "com.apple.security.authhost",
-                "com.apple.security.authtrampoline",
-            ] {
-                assert!(
-                    source.contains(&format!("(deny mach-lookup (global-name \"{service}\"))")),
-                    "missing {service}: {source}"
-                );
+            for worker in [false, true] {
+                profile.worker_jail = worker;
+                let source = render_profile(&profile).unwrap();
+                let denies = |service| {
+                    source.contains(&format!("(deny mach-lookup (global-name \"{service}\"))"))
+                };
+                assert!(denies("com.apple.SecurityServer"));
+                assert!(denies("com.apple.securityd.xpc"));
+                assert!(denies("com.apple.securityd.systemkeychain"));
+                for service in [
+                    "com.apple.security.agent",
+                    "com.apple.security.agent.login",
+                    "com.apple.authd",
+                    "com.apple.security.authhost",
+                    "com.apple.security.authtrampoline",
+                ] {
+                    assert_eq!(
+                        denies(service),
+                        worker && mode != aft::config::SandboxMode::Credentials
+                    );
+                }
+                assert!(!source.contains("com.apple.trustd"));
+                assert!(source.contains("(allow default)"));
             }
-            for service in ["com.apple.trustd", "com.apple.trustd.agent"] {
-                assert!(
-                    !source.contains(&format!("(global-name \"{service}\")")),
-                    "trust service must remain default-allowed"
-                );
-            }
-            assert!(source.contains("(allow default)"));
         }
     }
 
@@ -778,17 +1435,15 @@ mod tests {
                     "missing final keychain file deny: {source}"
                 );
                 assert!(source.find(&deny).unwrap() > source.rfind("(allow ").unwrap());
-                if mode == aft::config::SandboxMode::Standard {
-                    for ancestor in path.ancestors().skip(1) {
-                        let unlink_deny = format!(
-                            "(deny file-write-unlink (literal \"{}\"))",
-                            escape_path(ancestor).unwrap()
-                        );
-                        assert!(
-                            source.contains(&unlink_deny),
-                            "keychain ancestor can be renamed: {source}"
-                        );
-                    }
+                for ancestor in path.ancestors().skip(1) {
+                    let unlink_deny = format!(
+                        "(deny file-write-unlink (literal \"{}\"))",
+                        escape_path(ancestor).unwrap()
+                    );
+                    assert!(
+                        source.contains(&unlink_deny),
+                        "keychain ancestor can be renamed: {source}"
+                    );
                 }
             }
         }
