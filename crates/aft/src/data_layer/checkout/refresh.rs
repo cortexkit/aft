@@ -704,11 +704,12 @@ impl Checkout {
                         guard.file()?;
                         let _label = carry.enter();
                         let (Some(resolution), Some((key, parse))) =
-                            (resolved.get(file), parses.get(file))
+                            (resolved.read(file), parses.get(file))
                         else {
                             return Ok(None);
                         };
-                        let slice = FileSlice::build_checked(file, key, parse, resolution, guard)?;
+                        let slice = FileSlice::build_checked(file, key, parse, &resolution, guard)?;
+                        drop(resolution);
                         let Some(resolution) = resolved.encoded(file, key) else {
                             return Ok(None);
                         };
@@ -779,14 +780,10 @@ impl Checkout {
                 work.decoded_resolutions =
                     work.decoded_resolutions.max(live.resolved.decoded_count());
             });
-            // An update keeps every parse and resolution it decoded. A broad
-            // one reads thousands (every file declaring a method named `new`,
-            // say), and resolves a thousand again after a widely read change,
-            // so past a budget every one that can be decoded again goes: from
-            // the publication, or for a resolution an update made, from the
-            // encoding it got above. A later update decodes again what it
-            // reads. A changed file's parse stays, since only the changes
-            // hold it until the next publication.
+            // Other refresh work can still leave parses and resolutions decoded.
+            // Past a budget, release any that can be read again from the
+            // publication or from the encoding the update made. A changed file's
+            // parse stays, since only the changes hold it until publication.
             if engine.live.inputs.parses.decoded_count() > ENGINE_DECODED_FILES {
                 engine.live.inputs.parses.release_decoded();
             }

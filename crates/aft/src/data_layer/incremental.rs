@@ -81,6 +81,8 @@ pub struct UpdateStats {
     pub dispatch_recomputed: usize,
     pub facts_changed: usize,
     pub sites_resolved: usize,
+    #[cfg(test)]
+    pub(super) site_merge_decoded_high_water: usize,
     pub bind_ms: f64,
     pub resolve_ms: f64,
     pub dispatch_ms: f64,
@@ -1507,18 +1509,17 @@ impl LiveCheckout {
         sites.retain(|path| inputs.parses.contains_key(path));
         admit(&mut budget, Stage::Sites, &sites)?;
         let paths = sites.iter().collect::<Vec<_>>();
-        for (path, kept, dependencies) in
-            self.calls
-                .resolve_sites_checked(inputs, &self.resolved, &paths, guard)?
-        {
-            guard.file()?;
-            let file = self.resolved.get_mut(&path).ok_or_else(|| {
-                ManifestJoinError::Parse(format!("stored resolution of {path} could not be read"))
-            })?;
-            file.sites = kept;
-            file.site_dependencies = dependencies;
-            self.reverse.note_sites(&path, &file.site_dependencies);
-        }
+        let results = self
+            .calls
+            .resolve_sites_checked(inputs, &self.resolved, &paths, guard)?;
+        self.resolved.merge_sites_checked(
+            &inputs.parses,
+            results,
+            |path, keys| self.reverse.note_sites(path, keys),
+            guard,
+            #[cfg(test)]
+            &mut stats.site_merge_decoded_high_water,
+        )?;
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;
         #[cfg(feature = "test-hooks")]

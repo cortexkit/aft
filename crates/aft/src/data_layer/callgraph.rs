@@ -593,11 +593,12 @@ impl ResolutionLookup for BTreeMap<String, FileResolution> {
 /// failure.
 ///
 /// An entry an update resolves again or changes ([`Self::insert`],
-/// [`Self::get_mut`]) is held decoded while the update runs.
-/// [`Self::encode_changed`] then encodes it, in the fragment encoding a
-/// publication writes, so that, like an entry read from the publication, it
-/// can be let go ([`Self::release_decoded`]) and decoded again when next
-/// read. Decoded, a resolution takes many times its encoded size, since
+/// [`Self::get_mut`]) is held decoded until either the new method-call sites
+/// are merged in and encoded, or [`Self::encode_changed`] encodes the
+/// remaining changes at the end of the update. Both use the publication's
+/// fragment encoding, so the decoded value can be let go
+/// ([`Self::release_decoded`]) and decoded again when next read. Decoded, a
+/// resolution takes many times its encoded size, since
 /// every reference row owns its strings; one broad edit re-resolves over a
 /// thousand files.
 ///
@@ -642,6 +643,15 @@ impl ResolutionSlot {
             ResolutionSource::Stored(stored) => stored.resolution_of(path).map(Arc::new),
             ResolutionSource::Encoded(encoded) => Some(Arc::new(encoded.decode(path))),
         }
+    }
+
+    fn into_decoded(self, path: &str) -> Option<FileResolution> {
+        let value = if self.value.get().is_some() {
+            self.value.into_inner().flatten()
+        } else {
+            self.decode(path)
+        }?;
+        Some(Arc::unwrap_or_clone(value))
     }
 
     /// Whether the value can be let go and decoded again.
@@ -779,8 +789,8 @@ impl Resolutions {
         if let ResolutionSource::Encoded(encoded) = &slot.source {
             return Some(Arc::clone(encoded));
         }
-        let resolution = slot.read(path)?;
-        Some(Arc::new(EncodedResolution::encode(record_key, resolution)))
+        let resolution = self.read(path)?;
+        Some(Arc::new(EncodedResolution::encode(record_key, &resolution)))
     }
 
     pub(crate) fn get_mut(&mut self, path: &str) -> Option<&mut FileResolution> {
@@ -794,6 +804,76 @@ impl Resolutions {
             changed.insert(path.to_string());
         }
         slot.value.get_mut()?.as_mut().map(Arc::make_mut)
+    }
+
+    /// Merges site-resolution results in bounded batches on the current rayon pool.
+    /// Each worker drops the decoded file before returning; only the encoding
+    /// and keys for the reverse index can wait for ordered installation.
+    /// If the merge stops, the caller must discard the partly updated engine.
+    pub(super) fn merge_sites_checked(
+        &mut self,
+        parses: &Parses,
+        mut results: Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>,
+        mut note_sites: impl FnMut(&str, &BTreeSet<String>),
+        guard: Option<&RefreshMemory>,
+        #[cfg(test)] decoded_high_water: &mut usize,
+    ) -> Result<(), UpdateError> {
+        #[cfg(test)]
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+        #[cfg(test)]
+        let (decoded_now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let carry = crate::alloc_trace::carry();
+        for batch in results.chunks_mut(READER_MERGE_WINDOW) {
+            let mut work = Vec::with_capacity(batch.len());
+            for result in batch {
+                let (path, sites, keys) = std::mem::take(result);
+                let slot = self
+                    .map
+                    .remove(&path)
+                    .ok_or_else(|| missing_resolution(&path))?;
+                work.push((path, slot, sites, keys));
+            }
+            let encoded = work
+                .into_par_iter()
+                .map(|(path, slot, sites, keys)| {
+                    guard.file()?;
+                    let _label = carry.enter();
+                    let key = parses.key(&path).ok_or_else(|| {
+                        ManifestJoinError::Parse(format!("missing parse for {path}"))
+                    })?;
+                    #[cfg(test)]
+                    peak.fetch_max(decoded_now.fetch_add(1, Relaxed) + 1, Relaxed);
+                    let mut file = slot
+                        .into_decoded(&path)
+                        .ok_or_else(|| missing_resolution(&path))?;
+                    file.sites = sites;
+                    file.site_dependencies = keys;
+                    let encoded = EncodedResolution::encode_checked(&key, &file, guard);
+                    let keys = std::mem::take(&mut file.site_dependencies);
+                    drop(file);
+                    #[cfg(test)]
+                    decoded_now.fetch_sub(1, Relaxed);
+                    Ok((path, encoded?, keys))
+                })
+                .collect::<Result<Vec<_>, UpdateError>>()?;
+            for (path, encoded, keys) in encoded {
+                guard.file()?;
+                self.changed.remove(&path);
+                self.map.insert(
+                    path.clone(),
+                    ResolutionSlot {
+                        value: std::sync::OnceLock::new(),
+                        source: ResolutionSource::Encoded(Arc::new(encoded)),
+                    },
+                );
+                note_sites(&path, &keys);
+            }
+        }
+        #[cfg(test)]
+        {
+            *decoded_high_water = peak.load(Relaxed);
+        }
+        Ok(())
     }
 
     /// Encodes every entry inserted or changed since the last call, reading
@@ -906,10 +986,7 @@ impl Resolutions {
 
     pub(crate) fn remove(&mut self, path: &str) -> Option<FileResolution> {
         self.changed.remove(path);
-        let slot = self.map.remove(path)?;
-        slot.read(path);
-        let resolution = slot.value.into_inner().flatten()?;
-        Some(Arc::try_unwrap(resolution).unwrap_or_else(|shared| (*shared).clone()))
+        self.map.remove(path)?.into_decoded(path)
     }
 
     pub(crate) fn contains_key(&self, path: &str) -> bool {
@@ -935,6 +1012,14 @@ impl Resolutions {
             .map(|(path, resolution)| (path.clone(), resolution.clone()))
             .collect()
     }
+}
+
+/// A fixed bound on how many reader resolutions one merge batch may decode,
+/// independent of the size of the edit or the thread pool.
+pub(super) const READER_MERGE_WINDOW: usize = 32;
+
+fn missing_resolution(path: &str) -> ManifestJoinError {
+    ManifestJoinError::Parse(format!("stored resolution of {path} could not be read"))
 }
 
 impl ResolutionLookup for Resolutions {

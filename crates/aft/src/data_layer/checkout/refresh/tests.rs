@@ -22,6 +22,63 @@ fn published_graph_sections(checkout: &Checkout) -> BTreeMap<(u16, u16), Vec<u8>
 }
 
 #[test]
+fn refresh_reader_merge_releases_decoded_files_and_publishes_cold_bytes() {
+    use crate::data_layer::callgraph::READER_MERGE_WINDOW;
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let layer = || Arc::new(DataLayer::new(8 << 20, 2));
+    let family = FamilyId::from_digest(Digest128::of(b"refresh reader merge"));
+    std::fs::write(root.join("go.mod"), "module example.com/p\n").unwrap();
+    std::fs::write(root.join("p.go"), "package p\ntype T struct{}\n").unwrap();
+    let readers = 2 * READER_MERGE_WINDOW + 3;
+    for i in 0..readers {
+        std::fs::write(
+            root.join(format!("reader{i}.go")),
+            format!("package p\nfunc Use{i}(t T) {{ t.Run() }}\n"),
+        )
+        .unwrap();
+    }
+
+    let checkout = Checkout::bind(layer(), &dir.path().join("live"), family, &root).unwrap();
+    checkout.build().unwrap();
+    let reader = |checkout: &Checkout| {
+        checkout
+            .inspect_engine(|live| live.resolved.read("reader0.go").unwrap())
+            .unwrap()
+            .unwrap()
+    };
+    let before = reader(&checkout);
+    assert!(!before.sites.is_empty());
+
+    std::fs::write(root.join("run.go"), "package p\nfunc (T) Run() {}\n").unwrap();
+    checkout.record_paths(&[b"run.go".to_vec()]).unwrap();
+    let stats = checkout.refresh_callgraph().unwrap().unwrap();
+    assert!(
+        !stats.cold_build,
+        "the fixture needs a real incremental merge"
+    );
+    assert_eq!(stats.sites_resolved, readers + 1);
+    assert!(
+        (1..=READER_MERGE_WINDOW).contains(&stats.site_merge_decoded_high_water),
+        "{stats:?}"
+    );
+    // Check immediately after assembly, before the engine's general cache trim.
+    assert_eq!(
+        super::super::source_work_for_test(&root).decoded_resolutions,
+        0
+    );
+    assert_ne!(before.sites, reader(&checkout).sites);
+    assert!(checkout.publish_changes().unwrap().is_some());
+    assert!(matches!(checkout.fold().unwrap(), Folded::Done(_)));
+
+    let cold = Checkout::bind(layer(), &dir.path().join("cold"), family, &root).unwrap();
+    cold.build().unwrap();
+    assert!(published_graph_sections(&checkout) == published_graph_sections(&cold));
+}
+
+#[test]
 fn refresh_memory_guard_publishes_the_cold_graph_byte_for_byte() {
     let root = tempfile::tempdir().unwrap();
     let store = tempfile::tempdir().unwrap();
