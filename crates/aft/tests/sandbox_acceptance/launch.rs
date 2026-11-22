@@ -104,7 +104,10 @@ impl Shell {
             }
             let mut script = script.to_owned();
             let call = check_call_socket.then(|| {
-                let call = socket::Call::bind(plan.temp_dir().expect("native task scratch"));
+                let SpawnPlan::Launcher { profile, .. } = &plan else {
+                    panic!("native task scratch required for the per-call socket");
+                };
+                let call = socket::Call::bind(&profile.temp_dir);
                 script.push_str(&call.command());
                 call
             });
