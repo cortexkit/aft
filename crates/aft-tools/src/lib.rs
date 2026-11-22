@@ -247,7 +247,7 @@ pub(crate) use aft_engine::write_ledger;
 // uses portable APIs; only its callers are Windows-gated.
 #[allow(unused_imports)]
 pub(crate) use aft_base::windows_command;
-#[cfg(windows)]
+#[cfg(any(test, windows))]
 pub(crate) use aft_base::windows_path;
 pub(crate) use aft_base::worker_jail_canary;
 
