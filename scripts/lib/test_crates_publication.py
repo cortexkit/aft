@@ -18,7 +18,8 @@ SPEC = importlib.util.spec_from_file_location("workflow_gates", Path(__file__).w
 assert SPEC is not None and SPEC.loader is not None
 parser = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(parser)
-PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "agent-file-tools"]
+SPLIT_CRATES = ("aft-engine", "aft-tools", "aft-subc")
+PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", *SPLIT_CRATES, "agent-file-tools"]
 
 
 class CratesPublicationTests(unittest.TestCase):
@@ -73,26 +74,34 @@ class CratesPublicationTests(unittest.TestCase):
         path.write_text(f"#!{sys.executable}\n" + source)
         path.chmod(0o755)
 
-    def run_publish(self, *, already=(), fail="", mismatch=False, tag="v1.2.3", engine="present"):
+    def run_publish(self, *, already=(), fail="", mismatch=False, tag="v1.2.3",
+                    split_crates=SPLIT_CRATES, missing=(), extra_manifests=()):
         with self.fixture() as directory:
             root = Path(directory)
-            (root / "crates/aft").mkdir(parents=True)
-            upper = '[package]\nversion = "0.0.0"\n'
-            if engine != "pre-split":
-                upper += '[dependencies]\naft-engine = { path = "../aft-engine", version = "=0.0.0" }\n'
-            (root / "crates/aft/Cargo.toml").write_text(upper)
-            if engine == "present":
-                (root / "crates/aft-engine").mkdir()
-                (root / "crates/aft-engine/Cargo.toml").touch()
+            manifests = dict(extra_manifests)
+            upper = '[package]\nname = "agent-file-tools"\nversion = "0.0.0"\n[dependencies]\n'
+            for crate in split_crates:
+                upper += f'{crate} = {{ path = "../{crate}", version = "=0.0.0" }}\n'
+                if crate not in missing:
+                    manifests[f"crates/{crate}/Cargo.toml"] = f'[package]\nname = "{crate}"\nversion = "0.0.0"\n'
+            manifests["crates/aft/Cargo.toml"] = upper
+            for name, contents in manifests.items():
+                manifest = root / name
+                manifest.parent.mkdir(parents=True, exist_ok=True)
+                manifest.write_text(contents)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "add", "--", *manifests], cwd=root, check=True)
             self.stub(root, "node", '''import os, pathlib, sys
 assert sys.argv[1:] == ["scripts/version-sync.mjs", "--from-tag"]
+with pathlib.Path("events").open("a") as log:
+    log.write('["version-sync"]\\n')
 version = "9.9.9" if os.environ["MISMATCH"] else os.environ["GITHUB_REF_NAME"][1:]
 manifest = pathlib.Path("crates/aft/Cargo.toml")
 manifest.write_text(manifest.read_text().replace('version = "0.0.0"', f'version = "{version}"', 1))
 ''')
             self.stub(root, "cargo", '''import json, os, pathlib, sys
 args = sys.argv[1:]
-with pathlib.Path("calls").open("a") as log:
+with pathlib.Path("events").open("a") as log:
     log.write(json.dumps(args) + "\\n")
 package = args[args.index("--package") + 1]
 if package in json.loads(os.environ["ALREADY"]):
@@ -104,7 +113,8 @@ if package == os.environ["FAIL"]:
 ''')
             self.stub(root, "sleep", '''import pathlib, sys
 assert sys.argv[1:] == ["30"]
-pathlib.Path("slept").touch()
+with pathlib.Path("events").open("a") as log:
+    log.write('["sleep", "30"]\\n')
 ''')
             result = subprocess.run(
                 ["bash", str(ROOT / "scripts/publish-crates.sh"), tag], cwd=root,
@@ -112,54 +122,83 @@ pathlib.Path("slept").touch()
                      "ALREADY": json.dumps(already), "FAIL": fail, "MISMATCH": "1" if mismatch else ""},
                 capture_output=True, text=True,
             )
-            calls = [json.loads(line) for line in (root / "calls").read_text().splitlines()] if (root / "calls").exists() else []
-            return result, calls, (root / "slept").exists()
+            events = root / "events"
+            return result, [json.loads(line) for line in events.read_text().splitlines()] if events.exists() else []
+
+    def publish_trace(self, packages, already=()):
+        events = [["version-sync"]]
+        for name in packages:
+            if name not in ("aft-tokenizer", "aft-secret-rules", "aft-store"):
+                events.append(["sleep", "30"])
+            events.append(["publish", "--package", name])
+            if name in already:
+                events.append(["publish", "--package", name, "--dry-run"])
+        return events
 
     def test_partial_publish_skips_existing_crates_and_continues_in_order(self):
-        result, calls, slept = self.run_publish(already=PACKAGES[:2])
+        already = (*PACKAGES[:2], "aft-engine", "aft-tools")
+        result, events = self.run_publish(already=already)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, [
-            ["publish", "--package", "aft-tokenizer"],
-            ["publish", "--package", "aft-tokenizer", "--dry-run"],
-            ["publish", "--package", "aft-secret-rules"],
-            ["publish", "--package", "aft-secret-rules", "--dry-run"],
-            *[["publish", "--package", name] for name in PACKAGES[2:]],
-        ])
-        self.assertTrue(slept)
+        self.assertEqual(events, self.publish_trace(PACKAGES, already=already))
 
     def test_all_existing_crates_are_a_successful_retry(self):
-        result, calls, slept = self.run_publish(already=PACKAGES)
+        result, events = self.run_publish(already=PACKAGES)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(calls), 2 * len(PACKAGES))
-        self.assertEqual(calls[-1], ["publish", "--package", "agent-file-tools", "--dry-run"])
-        self.assertTrue(slept)
+        self.assertEqual(events, self.publish_trace(PACKAGES, already=PACKAGES))
 
     def test_pre_engine_tag_retries_without_engine(self):
-        result, calls, _ = self.run_publish(tag="v0.67.0", engine="pre-split")
+        result, events = self.run_publish(tag="v0.67.0", split_crates=())
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(calls, [["publish", "--package", name] for name in PACKAGES if name != "aft-engine"])
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in SPLIT_CRATES]))
+
+    def test_engine_only_tag_retries_without_tools_or_daemon(self):
+        result, events = self.run_publish(tag="v0.68.0", split_crates=("aft-engine",))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-tools", "aft-subc")]))
 
     def test_engine_tag_without_its_engine_manifest_cannot_publish(self):
-        result, calls, slept = self.run_publish(tag="v0.68.0", engine="missing")
+        result, events = self.run_publish(tag="v0.68.0", split_crates=("aft-engine",), missing=("aft-engine",))
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("requires aft-engine but is missing crates/aft-engine/Cargo.toml", result.stderr)
-        self.assertEqual(calls, [])
-        self.assertFalse(slept)
+        self.assertEqual(events, [])
+
+    def test_split_tag_missing_either_new_manifest_cannot_publish(self):
+        for crate in ("aft-tools", "aft-subc"):
+            with self.subTest(crate=crate):
+                result, events = self.run_publish(missing=(crate,))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"requires {crate} but is missing crates/{crate}/Cargo.toml", result.stderr)
+                self.assertEqual(events, [])
+
+    def test_missing_crate_declared_outside_facade_cannot_publish(self):
+        declarations = (
+            ("aft-tools", "Cargo.toml", '[workspace]\nmembers = ["crates/aft-tools"]\n'),
+            ("aft-subc", "crates/aft-engine/Cargo.toml", '''
+[target.'cfg(unix)'.dev-dependencies.daemon]
+package = "aft-subc"
+version = "1.2.3"
+'''),
+        )
+        for crate, filename, contents in declarations:
+            with self.subTest(crate=crate, filename=filename):
+                result, events = self.run_publish(split_crates=(), extra_manifests=((filename, contents),))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"requires {crate} but is missing crates/{crate}/Cargo.toml", result.stderr)
+                self.assertIn(f"declared in {filename}", result.stderr)
+                self.assertEqual(events, [])
 
     def test_real_crates_refusal_stays_red_and_stops_publication(self):
-        result, calls, slept = self.run_publish(fail="aft-secret-rules")
+        result, events = self.run_publish(fail="aft-secret-rules")
         self.assertEqual(result.returncode, 23)
         self.assertIn("crates.io refused", result.stderr)
-        self.assertEqual(calls[-1], ["publish", "--package", "aft-secret-rules", "--dry-run"])
-        self.assertFalse(slept)
+        self.assertEqual(events, self.publish_trace(PACKAGES[:2], already=("aft-secret-rules",)))
 
     def test_version_mismatch_or_non_tag_input_cannot_publish(self):
         for mismatch, tag in ((True, "v1.2.3"), (False, "main")):
             with self.subTest(mismatch=mismatch, tag=tag):
-                result, calls, slept = self.run_publish(mismatch=mismatch, tag=tag)
+                result, events = self.run_publish(mismatch=mismatch, tag=tag)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(calls, [])
-                self.assertFalse(slept)
+                self.assertEqual(events, [["version-sync"]] if mismatch else [])
 
     def test_retry_refuses_absent_draft_or_invalid_release_before_publishing(self):
         job = self.workflow("crates-retry.yml")["jobs"]["publish-crates"]

@@ -30,7 +30,7 @@ COVERED = {
 }
 PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")
 TAG_PUBLISH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
-RELEASE_CRATES = ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "agent-file-tools")
+RELEASE_CRATES = ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools")
 REHEARSAL_VERSION = "0.63.5-rehearsal.1.1"
 
 
@@ -382,7 +382,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 manifest = fixture / "packages" / package / "package.json"
                 manifest.parent.mkdir(parents=True)
                 manifest.write_text(json.dumps({"version": "0.65.0"}))
-            crates = ("aft", "aft-base", "aft-db", "aft-engine", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules")
+            crates = ("aft", "aft-base", "aft-db", "aft-engine", "aft-parse", "aft-store", "aft-subc", "aft-tokenizer", "aft-tools", "secret-rules")
             for crate in crates:
                 manifest = fixture / "crates" / crate / "Cargo.toml"
                 manifest.parent.mkdir(parents=True)
@@ -396,9 +396,15 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             for change in (
                 f"crates/aft-engine/Cargo.toml:\n  version: {current} → {version}",
                 f"crates/aft-engine/Cargo.toml:\n  aft-base dep version: {current} → {version}",
+                f"crates/aft-tools/Cargo.toml:\n  version: {current} → {version}",
+                f"crates/aft-tools/Cargo.toml:\n  aft-engine dep version: ={current} → ={version}",
+                f"crates/aft-subc/Cargo.toml:\n  version: {current} → {version}",
+                f"crates/aft-subc/Cargo.toml:\n  aft-tools dep version: ={current} → ={version}",
                 f"crates/aft/Cargo.toml:\n  aft-engine dep version: ={current} → ={version}",
+                f"crates/aft/Cargo.toml:\n  aft-subc dep version: ={current} → ={version}",
             ):
                 self.assertIn(change, dry_run)
+            self.assertNotIn("WARNING:", dry_run)
             self.assertEqual([path.read_bytes() for path in manifests], before)
             subprocess.run(sync, check=True, capture_output=True, text=True)
             for crate in crates:
@@ -407,7 +413,8 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 for table in ("dependencies", "dev-dependencies", "build-dependencies"):
                     for name, spec in manifest.get(table, {}).items():
                         if isinstance(spec, dict) and "path" in spec:
-                            expected = f"={version}" if (crate, name) == ("aft", "aft-engine") else version
+                            exact = name in {"aft-engine", "aft-tools", "aft-subc"}
+                            expected = f"={version}" if exact else version
                             self.assertEqual(spec["version"], expected, f"{crate}: {table}.{name}")
 
 
@@ -578,7 +585,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "must require aft-engine =" + re.escape(REHEARSAL_VERSION)):
                     exec(script, {})
                 write_rehearsal_crate(upper)
-                for name in ("agent-file-tools", "aft-parse", "aft-engine"):
+                for name in ("agent-file-tools", "aft-parse", "aft-engine", "aft-tools", "aft-subc"):
                     archive = next(file for file in files if file.name.startswith(name + "-"))
                     for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
                         with self.subTest(package=name, size=size):
@@ -590,7 +597,6 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                     with self.assertRaisesRegex(AssertionError, name):
                         exec(script, {})
                     write_rehearsal_crate(archive)
-                    archive.write_bytes(b"crate")
 
     def test_crate_size_check_finds_multi_package_archives_and_checks_every_copy(self):
         script = inline_python(self.rehearsal, "Check packaged crate sizes")

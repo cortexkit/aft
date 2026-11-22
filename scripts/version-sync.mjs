@@ -11,8 +11,8 @@
  *   node scripts/version-sync.mjs 0.2.0 --dry-run  # preview changes without writing
  *
  * Updates the platform package manifests, bridge, OpenCode plugin, Pi plugin,
- * CLI, and both Cargo manifests. Plugin optional dependencies and bridge
- * dependency versions are synchronized along with each package's version.
+ * CLI, and the publishable Cargo manifests. Plugin optional dependencies and
+ * bridge dependency versions are synchronized along with each package's version.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -160,10 +160,13 @@ function updateCargoPathDep(filePath, depName, version, dryRun) {
   const content = readFileSync(filePath, "utf-8");
   // depName can contain hyphens — escape for safe regex insertion.
   const depEscaped = depName.replace(/[-/\\^$*+?.()|[\]{}]/g, "\\$&");
-  // Match a line starting with `<dep> = { ... version = "<old>" ... }`.
+  // Match every inline path dependency, including its dev-dependency entry.
   // Capture the prefix up to (and including) `version = "` so we can rewrite
   // just the version literal without touching path or other fields.
-  const re = new RegExp(`^(${depEscaped}\\s*=\\s*\\{[^\\n]*version\\s*=\\s*)"([^"]+)"`, "gm");
+  const re = new RegExp(
+    `^(${depEscaped}\\s*=\\s*\\{(?=[^}\\n]*\\bpath\\s*=)[^}\\n]*\\bversion\\s*=\\s*)"([^"]+)"`,
+    "gm",
+  );
   const matches = [...content.matchAll(re)];
   const match = matches[0];
 
@@ -243,12 +246,10 @@ const tokenizerPath = join(root, "crates", "aft-tokenizer", "Cargo.toml");
 results.push(updateCargoToml(tokenizerPath, version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-tokenizer", version, dryRun));
 
-// 12: Cargo.toml — aft-secret-rules (leaf crate, published before the main
-// crate for the same reason as aft-tokenizer). Its dependency key in
-// `crates/aft/Cargo.toml` is `secret-rules` (renamed via `package =`).
+// 12: Cargo.toml — aft-secret-rules. The workspace refers to this published
+// package as `secret-rules` via `package =`.
 const secretRulesPath = join(root, "crates", "secret-rules", "Cargo.toml");
 results.push(updateCargoToml(secretRulesPath, version, dryRun));
-results.push(updateCargoPathDep(cargoPath, "secret-rules", version, dryRun));
 
 // 13: Cargo.toml — aft-store (leaf crate holding the on-disk index formats,
 // published before the main crate for the same reason as aft-tokenizer).
@@ -261,10 +262,14 @@ const basePath = join(root, "crates", "aft-base", "Cargo.toml");
 const dbPath = join(root, "crates", "aft-db", "Cargo.toml");
 const parsePath = join(root, "crates", "aft-parse", "Cargo.toml");
 const enginePath = join(root, "crates", "aft-engine", "Cargo.toml");
+const toolsPath = join(root, "crates", "aft-tools", "Cargo.toml");
+const subcPath = join(root, "crates", "aft-subc", "Cargo.toml");
 results.push(updateCargoToml(basePath, version, dryRun));
 results.push(updateCargoToml(dbPath, version, dryRun));
 results.push(updateCargoToml(parsePath, version, dryRun));
 results.push(updateCargoToml(enginePath, version, dryRun));
+results.push(updateCargoToml(toolsPath, version, dryRun));
+results.push(updateCargoToml(subcPath, version, dryRun));
 results.push(updateCargoPathDep(basePath, "aft-store", version, dryRun));
 results.push(updateCargoPathDep(basePath, "secret-rules", version, dryRun));
 results.push(updateCargoPathDep(dbPath, "aft-base", version, dryRun));
@@ -273,11 +278,25 @@ results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
 for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules"]) {
   results.push(updateCargoPathDep(enginePath, dep, version, dryRun));
 }
+for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "secret-rules"]) {
+  results.push(updateCargoPathDep(toolsPath, dep, version, dryRun));
+}
+for (const dep of ["aft-base", "aft-db", "aft-store", "aft-tokenizer", "secret-rules"]) {
+  results.push(updateCargoPathDep(subcPath, dep, version, dryRun));
+}
 results.push(updateCargoPathDep(cargoPath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-db", version, dryRun));
 results.push(updateCargoPathDep(cargoPath, "aft-parse", version, dryRun));
-// Status uses the engine's package version, which must match the CLI's version.
-results.push(updateCargoPathDep(cargoPath, "aft-engine", `=${version}`, dryRun));
+// Keep the engine, tools, daemon, and facade in lockstep on their internal edges.
+for (const [manifest, deps] of [
+  [toolsPath, ["aft-engine"]],
+  [subcPath, ["aft-engine", "aft-tools"]],
+  [cargoPath, ["aft-engine", "aft-tools", "aft-subc"]],
+]) {
+  for (const dep of deps) {
+    results.push(updateCargoPathDep(manifest, dep, `=${version}`, dryRun));
+  }
+}
 
 // Report
 let updateCount = 0;
