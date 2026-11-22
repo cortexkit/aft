@@ -205,7 +205,7 @@ pub mod run_tool_call;
 pub(crate) use aft_base::shell_format;
 pub(crate) use aft_base::storage_path;
 pub(crate) use aft_base::subc_config;
-#[cfg(unix)]
+#[cfg(any(test, unix))]
 pub(crate) use aft_db::sandbox_profile;
 pub(crate) use aft_engine::runtime_drain;
 pub(crate) use aft_engine::sandbox_spawn;
@@ -251,7 +251,7 @@ pub(crate) use aft_engine::write_ledger;
 pub(crate) use aft_base::windows_command;
 #[cfg(any(test, windows))]
 pub(crate) use aft_base::windows_path;
-#[cfg(unix)]
+#[cfg(any(test, unix))]
 pub(crate) use aft_base::worker_jail_canary;
 
 #[cfg(all(test, target_os = "linux"))]
