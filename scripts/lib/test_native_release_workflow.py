@@ -493,8 +493,14 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
             "cargo publish --dry-run --locked --allow-dirty " + " ".join(f"-p {name}" for name in RELEASE_CRATES),
         )
         self.assertNotIn("--no-verify", publish)
+        materialize = next(step["run"] for step in steps if step.get("name") == "Materialize crate archives for inspection")
+        self.assertEqual(
+            materialize,
+            "cargo package --locked --allow-dirty --no-verify " + " ".join(f"-p {name}" for name in RELEASE_CRATES),
+        )
         names = [step.get("name") for step in steps]
-        self.assertLess(names.index("Rehearse crates.io publishing"), names.index("Check packaged crate sizes"))
+        self.assertLess(names.index("Rehearse crates.io publishing"), names.index("Materialize crate archives for inspection"))
+        self.assertLess(names.index("Materialize crate archives for inspection"), names.index("Check packaged crate sizes"))
 
     def test_npm_rehearsal_prepares_the_same_ten_packages_and_tested_binaries(self):
         published = self.jobs["publish-npm"]

@@ -553,7 +553,7 @@ describe("hashline edit schema selection", () => {
 
     const governed = JSON.parse(
       readFileSync(
-        new URL("../../../../crates/aft/src/hashline_edit_schemas.json", import.meta.url),
+        new URL("../../../../crates/aft-engine/src/hashline_edit_schemas.json", import.meta.url),
         "utf8",
       ),
     ) as { arms: { hashline: { schema: JsonObject } } };

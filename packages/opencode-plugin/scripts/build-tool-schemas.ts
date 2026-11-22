@@ -21,7 +21,7 @@ async function main() {
   const hashlineOutputPath = path.join(
     repoRoot,
     "crates",
-    "aft",
+    "aft-engine",
     "src",
     "hashline_edit_schemas.json",
   );
