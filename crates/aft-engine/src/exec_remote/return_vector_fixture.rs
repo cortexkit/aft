@@ -6,46 +6,134 @@
 use super::types::StreamRecord;
 use serde_json::Value;
 
-macro_rules! vectors {
-    ($($name:literal),* $(,)?) => {
-        /// Every case: name, `.jcs` bytes, `.sha256` text.
-        pub(crate) const RETURN_VECTORS: &[(&str, &[u8], &str)] = &[$(
-            (
-                $name,
-                include_bytes!(concat!("fixtures/return-chunked/", $name, ".jcs")),
-                include_str!(concat!("fixtures/return-chunked/", $name, ".sha256")),
-            ),
-        )*];
-    };
-}
-
-vectors!(
-    "two-files-one-empty",
-    "three-chunks-short-last",
-    "failed-missing",
-    "failed-not-regular",
-    "failed-escape",
-    "failed-over-cap",
-    "read-error-after-chunks",
-    "replay-retained",
-    "replay-expired",
-    "unknown-cause-discards-chunks",
-    "refuse-offset-gap",
-    "refuse-offset-overlap",
-    "refuse-interleaved-paths",
-    "refuse-chunk-too-large",
-    "refuse-empty-chunk",
-    "refuse-path-index-out-of-range",
-    "refuse-digest-mismatch",
-    "refuse-size-mismatch",
-    "refuse-path-not-echoed",
-    "refuse-chunks-before-over-cap",
-    "refuse-total-over-cap",
-    "read-error-after-chunks-counted",
-    "refuse-chunk-count-mismatch",
-    "replay-expired-counted",
-    "replay-retained-counted",
-);
+/// Every case: name, `.jcs` bytes, `.sha256` text.
+pub(crate) const RETURN_VECTORS: &[(&str, &[u8], &str)] = &[
+    (
+        "two-files-one-empty",
+        include_bytes!("fixtures/return-chunked/two-files-one-empty.jcs"),
+        include_str!("fixtures/return-chunked/two-files-one-empty.sha256"),
+    ),
+    (
+        "three-chunks-short-last",
+        include_bytes!("fixtures/return-chunked/three-chunks-short-last.jcs"),
+        include_str!("fixtures/return-chunked/three-chunks-short-last.sha256"),
+    ),
+    (
+        "failed-missing",
+        include_bytes!("fixtures/return-chunked/failed-missing.jcs"),
+        include_str!("fixtures/return-chunked/failed-missing.sha256"),
+    ),
+    (
+        "failed-not-regular",
+        include_bytes!("fixtures/return-chunked/failed-not-regular.jcs"),
+        include_str!("fixtures/return-chunked/failed-not-regular.sha256"),
+    ),
+    (
+        "failed-escape",
+        include_bytes!("fixtures/return-chunked/failed-escape.jcs"),
+        include_str!("fixtures/return-chunked/failed-escape.sha256"),
+    ),
+    (
+        "failed-over-cap",
+        include_bytes!("fixtures/return-chunked/failed-over-cap.jcs"),
+        include_str!("fixtures/return-chunked/failed-over-cap.sha256"),
+    ),
+    (
+        "read-error-after-chunks",
+        include_bytes!("fixtures/return-chunked/read-error-after-chunks.jcs"),
+        include_str!("fixtures/return-chunked/read-error-after-chunks.sha256"),
+    ),
+    (
+        "replay-retained",
+        include_bytes!("fixtures/return-chunked/replay-retained.jcs"),
+        include_str!("fixtures/return-chunked/replay-retained.sha256"),
+    ),
+    (
+        "replay-expired",
+        include_bytes!("fixtures/return-chunked/replay-expired.jcs"),
+        include_str!("fixtures/return-chunked/replay-expired.sha256"),
+    ),
+    (
+        "unknown-cause-discards-chunks",
+        include_bytes!("fixtures/return-chunked/unknown-cause-discards-chunks.jcs"),
+        include_str!("fixtures/return-chunked/unknown-cause-discards-chunks.sha256"),
+    ),
+    (
+        "refuse-offset-gap",
+        include_bytes!("fixtures/return-chunked/refuse-offset-gap.jcs"),
+        include_str!("fixtures/return-chunked/refuse-offset-gap.sha256"),
+    ),
+    (
+        "refuse-offset-overlap",
+        include_bytes!("fixtures/return-chunked/refuse-offset-overlap.jcs"),
+        include_str!("fixtures/return-chunked/refuse-offset-overlap.sha256"),
+    ),
+    (
+        "refuse-interleaved-paths",
+        include_bytes!("fixtures/return-chunked/refuse-interleaved-paths.jcs"),
+        include_str!("fixtures/return-chunked/refuse-interleaved-paths.sha256"),
+    ),
+    (
+        "refuse-chunk-too-large",
+        include_bytes!("fixtures/return-chunked/refuse-chunk-too-large.jcs"),
+        include_str!("fixtures/return-chunked/refuse-chunk-too-large.sha256"),
+    ),
+    (
+        "refuse-empty-chunk",
+        include_bytes!("fixtures/return-chunked/refuse-empty-chunk.jcs"),
+        include_str!("fixtures/return-chunked/refuse-empty-chunk.sha256"),
+    ),
+    (
+        "refuse-path-index-out-of-range",
+        include_bytes!("fixtures/return-chunked/refuse-path-index-out-of-range.jcs"),
+        include_str!("fixtures/return-chunked/refuse-path-index-out-of-range.sha256"),
+    ),
+    (
+        "refuse-digest-mismatch",
+        include_bytes!("fixtures/return-chunked/refuse-digest-mismatch.jcs"),
+        include_str!("fixtures/return-chunked/refuse-digest-mismatch.sha256"),
+    ),
+    (
+        "refuse-size-mismatch",
+        include_bytes!("fixtures/return-chunked/refuse-size-mismatch.jcs"),
+        include_str!("fixtures/return-chunked/refuse-size-mismatch.sha256"),
+    ),
+    (
+        "refuse-path-not-echoed",
+        include_bytes!("fixtures/return-chunked/refuse-path-not-echoed.jcs"),
+        include_str!("fixtures/return-chunked/refuse-path-not-echoed.sha256"),
+    ),
+    (
+        "refuse-chunks-before-over-cap",
+        include_bytes!("fixtures/return-chunked/refuse-chunks-before-over-cap.jcs"),
+        include_str!("fixtures/return-chunked/refuse-chunks-before-over-cap.sha256"),
+    ),
+    (
+        "refuse-total-over-cap",
+        include_bytes!("fixtures/return-chunked/refuse-total-over-cap.jcs"),
+        include_str!("fixtures/return-chunked/refuse-total-over-cap.sha256"),
+    ),
+    (
+        "read-error-after-chunks-counted",
+        include_bytes!("fixtures/return-chunked/read-error-after-chunks-counted.jcs"),
+        include_str!("fixtures/return-chunked/read-error-after-chunks-counted.sha256"),
+    ),
+    (
+        "refuse-chunk-count-mismatch",
+        include_bytes!("fixtures/return-chunked/refuse-chunk-count-mismatch.jcs"),
+        include_str!("fixtures/return-chunked/refuse-chunk-count-mismatch.sha256"),
+    ),
+    (
+        "replay-expired-counted",
+        include_bytes!("fixtures/return-chunked/replay-expired-counted.jcs"),
+        include_str!("fixtures/return-chunked/replay-expired-counted.sha256"),
+    ),
+    (
+        "replay-retained-counted",
+        include_bytes!("fixtures/return-chunked/replay-retained-counted.jcs"),
+        include_str!("fixtures/return-chunked/replay-retained-counted.sha256"),
+    ),
+];
 
 /// One case, after checking its bytes against the published digest.
 pub(crate) fn return_vector(name: &str) -> Value {

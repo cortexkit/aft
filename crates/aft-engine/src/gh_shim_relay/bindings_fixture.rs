@@ -16,40 +16,84 @@ pub const CASES: [&str; 9] = [
     "secret-extra-field",
 ];
 
-macro_rules! fixture {
-    ($name:literal) => {
-        (
-            $name,
-            include_bytes!(concat!(
-                "../gh_shim_speech/fixtures/plexus-bindings-contract/",
-                $name
-            ))
-            .as_slice(),
-        )
-    };
-}
-
 pub(super) fn files() -> [(&'static str, &'static [u8]); 19] {
     [
-        fixture!("agent.request.json"),
-        fixture!("agent.reply.json"),
-        fixture!("connection.request.json"),
-        fixture!("connection.reply.json"),
-        fixture!("extra-field.request.json"),
-        fixture!("extra-field.reply.json"),
-        fixture!("missing-agent-id.request.json"),
-        fixture!("missing-agent-id.reply.json"),
-        fixture!("no-grant.request.json"),
-        fixture!("no-grant.reply.json"),
-        fixture!("non-string-agent-id.request.json"),
-        fixture!("non-string-agent-id.reply.json"),
-        fixture!("none.request.json"),
-        fixture!("none.reply.json"),
-        fixture!("other-agent.request.json"),
-        fixture!("other-agent.reply.json"),
-        fixture!("secret-extra-field.request.json"),
-        fixture!("secret-extra-field.reply.json"),
-        fixture!("UPSTREAM_README.md"),
+        (
+            "agent.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/agent.request.json"),
+        ),
+        (
+            "agent.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/agent.reply.json"),
+        ),
+        (
+            "connection.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/connection.request.json"),
+        ),
+        (
+            "connection.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/connection.reply.json"),
+        ),
+        (
+            "extra-field.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/extra-field.request.json"),
+        ),
+        (
+            "extra-field.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/extra-field.reply.json"),
+        ),
+        (
+            "missing-agent-id.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/missing-agent-id.request.json"),
+        ),
+        (
+            "missing-agent-id.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/missing-agent-id.reply.json"),
+        ),
+        (
+            "no-grant.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/no-grant.request.json"),
+        ),
+        (
+            "no-grant.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/no-grant.reply.json"),
+        ),
+        (
+            "non-string-agent-id.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/non-string-agent-id.request.json"),
+        ),
+        (
+            "non-string-agent-id.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/non-string-agent-id.reply.json"),
+        ),
+        (
+            "none.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/none.request.json"),
+        ),
+        (
+            "none.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/none.reply.json"),
+        ),
+        (
+            "other-agent.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/other-agent.request.json"),
+        ),
+        (
+            "other-agent.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/other-agent.reply.json"),
+        ),
+        (
+            "secret-extra-field.request.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/secret-extra-field.request.json"),
+        ),
+        (
+            "secret-extra-field.reply.json",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/secret-extra-field.reply.json"),
+        ),
+        (
+            "UPSTREAM_README.md",
+            include_bytes!("../gh_shim_speech/fixtures/plexus-bindings-contract/UPSTREAM_README.md"),
+        ),
     ]
 }
 
