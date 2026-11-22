@@ -140,7 +140,7 @@ impl Fixture {
         program: impl Into<PathBuf>,
         command: String,
         expected: String,
-    ) {
+    ) -> PathBuf {
         let program = program.into();
         let copy = self.copies.join(program.file_name().unwrap());
         if !copy.exists() {
@@ -160,11 +160,13 @@ impl Fixture {
             command,
             expected,
         });
+        copy
     }
 
     pub(super) fn script(&self, measure_setuid: bool, gh_probe: Option<&str>) -> String {
         let stderr_path = path_arg(&self.copies.join("probe-stderr"));
-        let mut script = format!("probe_stderr={stderr_path}\n");
+        let mut script =
+            format!("probe_stderr={stderr_path}\ntrap '/bin/rm -f \"$probe_stderr\"' EXIT\n");
         script.push_str(
             r#"observe() {
     name=$1; shift
@@ -237,7 +239,6 @@ impl Fixture {
             path_arg(&self.moved)
         )
         .unwrap();
-        script.push_str("/bin/rm -f \"$probe_stderr\"\n");
         script
     }
 

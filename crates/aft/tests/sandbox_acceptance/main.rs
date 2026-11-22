@@ -175,16 +175,17 @@ fn credentials(root: &Path, worker: bool) {
         let script = {
             let mut script = script + &keychain.readable_file_check();
             if !enabled {
-                script.push_str(&keychain.search_list_check());
+                script.push_str(&keychain.off_diagnostics(gh_probe));
             }
             script
         };
         let run = shell.run(mode, &script, enabled);
         #[cfg(target_os = "macos")]
         {
-            let gh_seed_found = gh_probe.is_none_or(|probe| probe.report(&label, &run));
             if !enabled {
-                keychain.report_failed_search_list(&label, &run, gh_seed_found);
+                keychain.report_off(&label, &run, gh_probe);
+            } else if let Some(probe) = gh_probe {
+                probe.report(&label, &run);
             }
         }
         fixture.assert_oracle(&label, &run, enabled);
