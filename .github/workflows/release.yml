@@ -963,6 +963,11 @@ jobs:
       - name: Rehearse crates.io publishing
         run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-engine -p agent-file-tools
 
+      # Cargo can discard the dry-run staging archives after verification.
+      # Keep a package copy for inspection without compiling the crates again.
+      - name: Materialize crate archives for inspection
+        run: cargo package --locked --allow-dirty --no-verify -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-engine -p agent-file-tools
+
       # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
       # sizes). A publish dry run does not enforce the registry's upload limit.
       - name: Check packaged crate sizes
@@ -978,8 +983,7 @@ jobs:
               "cargo", "metadata", "--format-version", "1", "--no-deps",
           ], text=True))
           crate_dir = Path(metadata["target_directory"]) / "package"
-          # Multi-package publish stages archives in tmp-crate and tmp-registry;
-          # single-package packaging leaves them directly in the package folder.
+          # Check both top-level archives and any copies in Cargo's staging folders.
           crates = sorted(crate_dir.rglob("*.crate"))
           expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "agent-file-tools"}
           filenames = {crate.name for crate in crates}
