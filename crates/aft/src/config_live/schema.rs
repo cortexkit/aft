@@ -22,9 +22,40 @@ pub fn settings_declaration() -> Value {
         idle.remove("not");
         idle.insert("type".into(), json!("integer"));
     }
+    annotate_cache_dir(&mut schema["properties"]["storage"]["properties"]["cache_dir"]);
     declare(&mut schema, "", Some(&defaults::values()), "", false);
     setup_sections(&mut schema["properties"]);
     schema
+}
+
+fn annotate_cache_dir(cache_dir: &mut Value) {
+    // The settings editor edits a tagged choice as one JSON value.
+    cache_dir["x-ck-kind"] = json!("json");
+    for branch in cache_dir["oneOf"]
+        .as_array_mut()
+        .expect("cache directory choices")
+    {
+        let (description, kind_description) = match branch["properties"]["kind"]["const"].as_str() {
+            Some("default") => (
+                "Use the same cache behavior as omitting this setting.",
+                "Select the default cache behavior.",
+            ),
+            Some("main_disk") => (
+                "Put disk caches back under the storage root.",
+                "Select the storage root for disk caches.",
+            ),
+            Some("dir") => (
+                "Use a cache parent on a separate device.",
+                "Select an explicit cache parent directory.",
+            ),
+            other => panic!("unknown cache directory choice: {other:?}"),
+        };
+        branch["description"] = json!(description);
+        branch["properties"]["kind"]["description"] = json!(kind_description);
+        if let Some(path) = branch["properties"].get_mut("path") {
+            path["description"] = json!("Existing absolute path to the cache parent; ~ expands.");
+        }
+    }
 }
 
 fn setup_sections(fields: &mut Value) {
@@ -90,6 +121,11 @@ fn declare(
         }
     } else if !path.is_empty() {
         node.insert("x-ck-required".into(), json!(false));
+    }
+    if node.get("x-ck-kind").and_then(Value::as_str) == Some("json") {
+        // The JSON validator checks these children as assertions on one value,
+        // not as settings. Keep additionalProperties to reject unknown fields.
+        return;
     }
     let structural = node.get("type") == Some(&json!("object"));
     if structural {

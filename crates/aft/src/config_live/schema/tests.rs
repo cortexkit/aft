@@ -21,6 +21,24 @@ fn config_settings_editor_output_is_unchanged() {
     assert!(bytes == include_bytes!("../../../../../assets/aft.schema.json"));
 }
 
+#[test]
+fn config_settings_cache_dir_is_json_with_one_full_description() {
+    const CACHE_DIR: &str = "/properties/storage/properties/cache_dir";
+    let editor = editor_schema();
+    let editor_cache_dir = editor.pointer(CACHE_DIR).unwrap();
+    let declaration = settings_declaration();
+    let cache_dir = declaration.pointer(CACHE_DIR).unwrap();
+    assert_eq!(cache_dir["x-ck-kind"], "json");
+    assert_eq!(cache_dir["description"], editor_cache_dir["description"]);
+    let description = serde_json::to_string(&editor_cache_dir["description"]).unwrap();
+    let serialized = serde_json::to_string(cache_dir).unwrap();
+    assert_eq!(serialized.matches(description.as_str()).count(), 1);
+    for branch in cache_dir["oneOf"].as_array().unwrap() {
+        assert_eq!(branch["additionalProperties"], false);
+    }
+    Schema::new(declaration).expect("valid Subconscious vocabulary");
+}
+
 fn annotations(node: &Value, path: &str, found: &mut BTreeSet<(String, String)>) {
     for keyword in ["description", "markdownDescription"] {
         if let Some(text) = node.get(keyword).and_then(Value::as_str) {

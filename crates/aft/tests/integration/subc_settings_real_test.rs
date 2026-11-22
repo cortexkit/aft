@@ -211,6 +211,11 @@ async fn subc_settings_real_daemon_declares_then_filters_ready_catalog_and_appli
         .iter()
         .any(|module| module.module_id == "aft" && module.schema_digest.is_some()));
     let schema = client.config_schema("aft").await.unwrap().schema;
+    assert_eq!(
+        schema.pointer("/properties/storage/properties/cache_dir/x-ck-kind"),
+        Some(&json!("json")),
+        "the daemon must accept and serve the cache directory JSON marker"
+    );
     for (section, mark) in [
         (
             "github",
