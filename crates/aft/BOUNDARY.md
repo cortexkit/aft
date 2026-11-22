@@ -116,3 +116,51 @@ The daemon may call the tools; the tools do not depend on the daemon. This inven
 | `aft_engine::data_layer::outline` | module | Public API (lower export) | The daemon binds outline data via the existing engine API rather than the private tools alias. |
 | `aft_engine::data_layer::runtime` | module | Public API (lower export) | Daemon and tools share engine checkout lifecycle types and operations. |
 | `aft_engine::output_store::OutputScope` | struct | Public API (lower export) | Daemon response retention uses the same engine scope without a private output-cap alias. |
+
+## Test-only tools fixtures
+
+Daemon tests use `tools_test_support` for handler fixtures and observations. It compiles in this crate's unit tests and in library builds that explicitly enable `test-support`; normal builds do not enable it. No daemon state is imported by the tools fixture module.
+
+| Item path | Kind | Classification | Reason |
+| --- | --- | --- | --- |
+| `tools_test_support` | module | Test support | Names the tools fixtures that daemon tests may use. |
+| `tools_test_support::test_app` | fixture | Test support | Builds an app with isolated storage. |
+| `tools_test_support::test_context` | fixture | Test support | Builds an isolated handler context with shell handlers installed. |
+| `tools_test_support::wait_fixture` | fixture | Test support | Creates a shell wait with the expected worker time limit. |
+| `tools_test_support::completed_spawn_for_test` | fixture | Test support | Produces a real spawn reply after observing task completion. |
+| `tools_test_support::handle_with_policy` | fixture | Test support | Calls the shell handler with an explicit remote policy. |
+| `tools_test_support::rendered_status` | getter | Test support | Reads one task status in the format received by an agent. |
+| `tools_test_support::external_search_fixture` | fixture | Test support | Creates an external checkout and publishes its text index. |
+| `tools_test_support::direct_external_search_for_test` | fixture | Test support | Gives the daemon hook test a direct handler reply to compare against. |
+| `tools_test_support::configure_unit_records_for_root` | getter | Test support | Copies configure-tail measurements for one fixture root. |
+| `tools_test_support::ConfigureUnitRecord` | struct | Test support | Holds one stage observation without exposing its fields across the boundary. |
+| `tools_test_support::ConfigureUnitRecord::stage` | getter | Test support | Reads the completed configure stage's label. |
+| `tools_test_support::ConfigureUnitRecord::finished_at` | getter | Test support | Reads the recorded completion time for that stage. |
+| `tools_test_support::gate_configure_commit_for_test` | fixture | Test support | Holds one configure call between configuration publication and artifact updates. |
+| `tools_test_support::gate_configure_tail_stage_for_test` | fixture | Test support | Holds a selected configure-tail stage for one root. |
+| `tools_test_support::ConfigureTailStageGateGuard` | struct | Test support | Removes the stage gate on drop. |
+| `tools_test_support::ConfigureTailStageGateGuard::join_storage_sweep_worker` | fixture | Test support | Reaps a fixture worker before its temporary directories are removed. |
+| `tools_test_support::install_delete_gate_for_test` | fixture | Test support | Holds a recursive delete after backup planning. |
+| `tools_test_support::deferred_inspect_test_lock` | fixture | Test support | Serializes tests sharing the deferred inspect gate. |
+| `tools_test_support::deferred_inspect_root_count_for_test` | getter | Test support | Checks whether inspect still holds a permit for the fixture root. |
+| `tools_test_support::install_deferred_inspect_body_gate_for_test` | fixture | Test support | Holds the next deferred inspect at its request body. |
+| `tools_test_support::install_deferred_inspect_body_gate_for_request_for_test` | fixture | Test support | Holds only the specified deferred inspect request. |
+| `tools_test_support::install_deferred_inspect_stat_gate_for_test` | fixture | Test support | Holds inspect at its stat path without running unrelated stages. |
+| `tools_test_support::deferred_navigation_test_lock` | fixture | Test support | Serializes tests sharing the deferred navigation gate. |
+| `tools_test_support::deferred_navigation_worker_count_for_test` | getter | Test support | Counts outstanding navigation workers for cancellation and drain tests. |
+| `tools_test_support::install_deferred_navigation_gate_for_test` | fixture | Test support | Pauses the next navigation worker before calling its handler. |
+| `tools_test_support::take_deferred_navigation_seen_restrict_for_test` | getter | Test support | Reads and clears the worker's recorded restriction flag. |
+| `tools_test_support::glob_root_files_for_test` | fixture | Test support | Observes scoped glob discovery and its visited-entry count. |
+| `tools_test_support::discover_outline_paths_for_test` | fixture | Test support | Observes scoped outline discovery without the request's earlier path checks. |
+| `tools_test_support::with_secret_fetch_for_test` | fixture | Test support | Installs a fake vault and fetch options while the handler runs. |
+| `tools_test_support::with_secret_fetch_test_hooks` | fixture | Test support | Configures a fake fetch and lets daemon tests observe a private document before deletion. |
+| `tools_test_support::text_index_is_ready` | getter | Test support | Checks readiness without exposing the handler's text-index wrapper. |
+| `tools_test_support::watch_restart_registered` | getter | Test support | Checks whether daemon startup installed the tools' restart callback. |
+| `tools_test_support::install_watch_wait_fixture` | fixture | Test support | Installs a waiting watch without exposing the restart state lock. |
+| `tools_test_support::ranked_oversized_first_response` | fixture | Test support | Renders a large first hit and small second hit without exposing ranked result fields. |
+
+## Test identities
+
+[`test-ledger/moves.tsv`](test-ledger/moves.tsv) lists changed identities relative to `4dc94a5f6ad9cd0c8bf4159b15bb6dc85ab3bc52`, before the daemon boundary was prepared. Unlisted identities map to themselves with unchanged multiplicity. [`test-ledger/additions.tsv`](test-ledger/additions.tsv) lists new tests separately. An identity consists of the package, `kind:name` of the Cargo target, and the full test path. The last three columns are the expected occurrences on Linux, macOS and Windows, in that order; zero means the test is not compiled on that platform. The platform counts come from native listings, not from reading source-level platform attributes.
+
+Pass the base and current native tuple ledgers captured using `cargo test --workspace --features wasm-grammars,test-hooks -- --list` and workspace metadata to `python3 crates/aft/test-ledger/compare.py <platform> <base-tuples.tsv.gz> <current-tuples.tsv.gz>`. The comparator checks the old counts before applying the mapping, then compares both directions against the current listing.
