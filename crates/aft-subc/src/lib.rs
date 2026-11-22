@@ -45,20 +45,26 @@ pub(crate) use aft_base::clock;
 pub(crate) use aft_base::cold_build_limiter;
 pub(crate) use aft_base::compress;
 pub(crate) use aft_base::config;
+#[cfg(test)]
 pub(crate) use aft_base::config_fix;
 pub(crate) use aft_base::config_resolve;
+#[cfg(test)]
 pub(crate) use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
 pub(crate) use aft_base::effective_path;
+#[cfg(test)]
 pub(crate) use aft_base::environment;
 #[cfg(test)]
 pub(crate) use aft_base::executable_cache;
+#[cfg(test)]
 pub(crate) use aft_base::feature_config;
 pub(crate) use aft_base::fleet_status;
 pub(crate) use aft_base::harness;
 pub(crate) use aft_base::host_tool_names;
+#[cfg(test)]
 pub(crate) use aft_base::inspect_category;
 pub(crate) use aft_base::jsonc;
+#[cfg(test)]
 pub(crate) use aft_base::language;
 pub(crate) use aft_base::launch_nonce;
 pub(crate) use aft_base::lock_diagnostics;
@@ -82,6 +88,7 @@ pub(crate) use aft_base::subc_config;
 pub(crate) use aft_base::system_temp;
 pub(crate) use aft_base::task_temp_reads;
 pub(crate) use aft_base::task_watch_lines;
+#[cfg(test)]
 pub(crate) use aft_base::task_watches;
 #[cfg(test)]
 pub(crate) use aft_base::test_allocations;
@@ -92,7 +99,9 @@ pub(crate) use aft_base::test_support;
 pub(crate) use aft_base::tool_gate;
 pub(crate) use aft_base::tool_progress;
 pub(crate) use aft_base::view_storage_reserve;
+#[cfg(test)]
 pub(crate) use aft_base::walk_boundary;
+#[cfg(test)]
 pub(crate) use aft_base::worker_jail_canary;
 pub(crate) use aft_base::{slog_error, slog_info, slog_warn};
 pub(crate) use aft_db::sandbox_profile;
@@ -106,7 +115,9 @@ pub(crate) use aft_engine::bash_db_hints;
 pub(crate) use aft_engine::bash_permissions;
 pub(crate) use aft_engine::bash_rewrite;
 pub(crate) use aft_engine::blocking_wait;
+#[cfg(test)]
 pub(crate) use aft_engine::build_breaker;
+#[cfg(test)]
 pub(crate) use aft_engine::cache_location;
 pub(crate) use aft_engine::config_live;
 pub(crate) use aft_engine::context;
@@ -117,6 +128,7 @@ pub(crate) use aft_engine::engram_catalog;
 pub(crate) use aft_engine::exec_remote;
 pub(crate) use aft_engine::executor;
 pub(crate) use aft_engine::file_read_exact;
+#[cfg(test)]
 pub(crate) use aft_engine::fs_lock;
 pub(crate) use aft_engine::gh_shim;
 pub(crate) use aft_engine::gh_shim_relay;
@@ -124,6 +136,7 @@ pub(crate) use aft_engine::gh_shim_speech;
 pub(crate) use aft_engine::gh_shim_worker_broker;
 pub(crate) use aft_engine::git_root_resolution;
 pub(crate) use aft_engine::hashline;
+#[cfg(test)]
 pub(crate) use aft_engine::inspect;
 pub(crate) use aft_engine::io_accounting;
 pub(crate) use aft_engine::large_read;
@@ -136,6 +149,7 @@ pub(crate) use aft_engine::memory_census;
 pub(crate) use aft_engine::output_store;
 pub(crate) use aft_engine::page_collect;
 pub(crate) use aft_engine::parent_search;
+#[cfg(test)]
 pub(crate) use aft_engine::parser;
 pub(crate) use aft_engine::patch;
 pub(crate) use aft_engine::path_identity;
@@ -150,8 +164,10 @@ pub(crate) use aft_engine::root_identity;
 pub(crate) use aft_engine::runtime_drain;
 pub(crate) use aft_engine::sandbox_spawn;
 pub(crate) use aft_engine::scoped_key;
+#[cfg(test)]
 pub(crate) use aft_engine::search_index;
 pub(crate) use aft_engine::secret;
+#[cfg(test)]
 pub(crate) use aft_engine::secret_proxy;
 pub(crate) use aft_engine::semantic_admission;
 pub(crate) use aft_engine::semantic_index;
@@ -162,7 +178,9 @@ pub(crate) use aft_engine::synapse_embed;
 pub(crate) use aft_engine::test_bridge::test_env;
 #[cfg(test)]
 pub(crate) use aft_engine::test_bridge::test_storage;
+#[cfg(test)]
 pub(crate) use aft_engine::url_fetch;
+#[cfg(test)]
 pub(crate) use aft_engine::watcher_filter;
 pub(crate) use aft_engine::write_ledger;
 pub(crate) use aft_tools::{
