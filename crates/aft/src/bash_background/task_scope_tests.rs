@@ -704,6 +704,77 @@ fn task_scope_kill_follows_group_signal_order() {
 }
 
 #[test]
+fn task_scope_kill_reports_killed_when_scope_is_collected_during_open() {
+    use super::super::task_scope::{handle_for_test, with_scope_kill_open_error_for_test};
+
+    let root = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    registry.inner.shutdown.store(true, Ordering::SeqCst);
+    let session = "collected-scope";
+    let id = registry
+        .spawn(
+            SpawnPlan::Unsandboxed,
+            "echo ready; sleep 60",
+            session.into(),
+            root.path().into(),
+            HashMap::new(),
+            super::super::HardKill::Default,
+            None,
+            root.path().into(),
+            8,
+            false,
+            false,
+            None,
+        )
+        .unwrap();
+    let task = registry.task(&id).unwrap();
+    until(|| {
+        std::fs::read_to_string(&task.paths.stdout)
+            .unwrap_or_default()
+            .contains("ready")
+    });
+    let pid = {
+        let state = task.lock_state().unwrap();
+        let TaskRuntime::Piped(Some(child)) = &state.runtime else {
+            panic!("registry must still own the running child");
+        };
+        child.id() as libc::pid_t
+    };
+    let cgroup = root.path().join("fake-cgroup");
+    std::fs::create_dir(&cgroup).unwrap();
+    std::fs::write(cgroup.join("cgroup.kill"), "0").unwrap();
+    registry
+        .inner
+        .task_scopes
+        .register(handle_for_test(&id, cgroup.clone()));
+
+    let snapshot = with_scope_kill_open_error_for_test(
+        move |path| {
+            assert_eq!(path, cgroup.join("cgroup.kill"));
+            // Linux can find cgroup.kill by path and then return ENODEV from
+            // open if systemd removes the empty scope in between.
+            std::fs::remove_dir_all(&cgroup).unwrap();
+            std::io::Error::from_raw_os_error(libc::ENODEV)
+        },
+        || registry.kill(&id, session).unwrap(),
+    );
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    assert_eq!(
+        snapshot.info.status,
+        BgTaskStatus::Killed,
+        "{:?}",
+        snapshot.info.status_reason
+    );
+}
+
+#[test]
 fn task_scope_kill_reports_live_controller_permission_failure() {
     let root = tempfile::tempdir().unwrap();
     let id = random_slug();
