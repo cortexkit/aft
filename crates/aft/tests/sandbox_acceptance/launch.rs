@@ -172,8 +172,16 @@ impl Shell {
                 } else {
                     "bwrap"
                 };
-                assert!(transcript.lines().any(|line| line.starts_with(&format!("sandbox-launch: profile={mode} backend={backend} "))),
-                    "worker={} {mode}: required active {backend} backend not reported:\n{transcript}", self.worker);
+                let report = transcript
+                    .lines()
+                    .find(|line| line.starts_with("sandbox-launch: profile="));
+                assert!(
+                    report.is_some_and(|line| line.starts_with(&format!(
+                        "sandbox-launch: profile={mode} backend={backend} "
+                    ))),
+                    "worker={} {mode}: required active {backend} backend not reported: {report:?}",
+                    self.worker
+                );
             }
             if let Some(call) = call {
                 call.finish();

@@ -1,5 +1,5 @@
-//! Native acceptance tests are opt-in: they need an enforcing CI runner,
-//! working Git and OpenSSH, and outbound HTTPS.
+//! Native acceptance tests are opt-in: the credential matrix needs an enforcing
+//! runner with Git and OpenSSH, and the HTTPS matrix needs outbound networking.
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 
 mod credentials;
@@ -13,17 +13,39 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 const HOME_PROCESS: &str = "AFT_SANDBOX_ACCEPTANCE_HOME_PROCESS";
+const LEVELS: [SandboxMode; 4] = [
+    SandboxMode::Off,
+    SandboxMode::Credentials,
+    SandboxMode::Standard,
+    SandboxMode::Strict,
+];
 
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes"]
-fn role_matrix_head() {
-    matrix(false, "role_matrix_head");
+fn role_matrix_credentials_head() {
+    isolated("role_matrix_credentials_head", |root| {
+        credentials(root, false)
+    });
 }
 
 #[test]
 #[ignore = "run in the native sandbox acceptance CI lanes"]
-fn role_matrix_worker() {
-    matrix(true, "role_matrix_worker");
+fn role_matrix_credentials_worker() {
+    isolated("role_matrix_credentials_worker", |root| {
+        credentials(root, true)
+    });
+}
+
+#[test]
+#[ignore = "run in the native sandbox acceptance CI lanes with outbound HTTPS"]
+fn role_matrix_https_head() {
+    isolated("role_matrix_https_head", |root| https(root, false));
+}
+
+#[test]
+#[ignore = "run in the native sandbox acceptance CI lanes with outbound HTTPS"]
+fn role_matrix_https_worker() {
+    isolated("role_matrix_https_worker", |root| https(root, true));
 }
 
 #[test]
@@ -32,12 +54,14 @@ fn production_per_call_git_proxy() {
     panic!("the production git proxy is not yet available");
 }
 
-fn matrix(worker: bool, test_name: &str) {
+fn isolated(test_name: &str, run: impl FnOnce(&Path)) {
     // Role resolution reads the daemon's environment. Set it only in a fresh
     // process; neither Cargo's HOME nor another test's credentials are fixtures.
     let Some(root) = std::env::var_os(HOME_PROCESS).map(std::path::PathBuf::from) else {
         let root = tempfile::tempdir().unwrap();
         let base = root.path().canonicalize().unwrap();
+        std::fs::create_dir(base.join("home")).unwrap();
+        std::fs::create_dir(base.join("project")).unwrap();
         let output = Command::new(std::env::current_exe().unwrap())
             .args([test_name, "--exact", "--ignored", "--nocapture"])
             .current_dir(&base)
@@ -72,23 +96,21 @@ fn matrix(worker: bool, test_name: &str) {
         return;
     };
 
-    let mut fixture = credentials::Fixture::new(&root);
-    let shell = launch::Shell::new(&root, worker);
-    #[cfg(target_os = "macos")]
-    let keychain = macos::Keychain::add_lookups(&root, &mut fixture);
+    run(&root);
+}
 
-    for mode in [
-        SandboxMode::Off,
-        SandboxMode::Credentials,
-        SandboxMode::Standard,
-        SandboxMode::Strict,
-    ] {
+fn credentials(root: &Path, worker: bool) {
+    let mut fixture = credentials::Fixture::new(root);
+    let shell = launch::Shell::new(root, worker);
+    #[cfg(target_os = "macos")]
+    let keychain = macos::Keychain::add_lookups(root, &mut fixture);
+    let script = fixture.script();
+    #[cfg(target_os = "macos")]
+    let script = script + &keychain.readable_file_check();
+
+    for mode in LEVELS {
         let enabled = mode != SandboxMode::Off;
         let label = format!("{} {mode}", if worker { "worker" } else { "head" });
-        let mut script = fixture.script();
-        #[cfg(target_os = "macos")]
-        script.push_str(&keychain.readable_file_check());
-        script.push_str(&format!("\n{} && printf 'HTTPS_OK\\n'\n", https_command()));
         let run = shell.run(mode, &script, enabled);
         fixture.assert_oracle(&label, &run, enabled);
         #[cfg(target_os = "macos")]
@@ -96,19 +118,27 @@ fn matrix(worker: bool, test_name: &str) {
             run.lines().any(|line| line == "KEYCHAIN_BYTES_READABLE"),
             "{label}: keychain file was not readable: {run}"
         );
-        assert!(
-            run.lines().any(|line| line == "HTTPS_OK"),
-            "{label}: HTTPS failed: {run}"
-        );
         if enabled {
             assert!(
                 run.lines().any(|line| line == socket::SUCCESS),
                 "{label}: git credential did not use the per-call socket: {run}"
             );
         }
-        eprintln!(
-            "{label}: checked paired credential lookups and host file identity; HTTPS succeeded"
+        eprintln!("{label}: checked paired credential lookups and host file identity");
+    }
+}
+
+fn https(root: &Path, worker: bool) {
+    let shell = launch::Shell::new(root, worker);
+    let script = format!("{} && printf 'HTTPS_OK\\n'", https_command());
+    for mode in LEVELS {
+        let run = shell.run(mode, &script, false);
+        let label = format!("{} {mode}", if worker { "worker" } else { "head" });
+        assert!(
+            run.lines().any(|line| line == "HTTPS_OK"),
+            "{label}: HTTPS failed: {run}"
         );
+        eprintln!("{label}: HTTPS succeeded");
     }
 }
 
