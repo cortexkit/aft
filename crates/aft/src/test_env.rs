@@ -68,7 +68,8 @@ mod tests {
         }
 
         let test_env = without_whitespace(include_str!("../../aft-base/src/test_env.rs"));
-        let configure = without_whitespace(include_str!("commands/configure.rs"));
+        let configure =
+            without_whitespace(include_str!("../../aft-tools/src/commands/configure.rs"));
 
         assert!(test_env.contains("lock_test_mutex(process_env_mutex())"));
         let process_env_bare_unwrap = ["process_env_mutex()", ".lock()", ".unwrap()"].concat();

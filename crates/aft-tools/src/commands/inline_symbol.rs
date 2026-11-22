@@ -1801,8 +1801,7 @@ mod tests {
 
     fn fixture_path(name: &str) -> std::path::PathBuf {
         std::path::PathBuf::from(crate::test_support::manifest_dir())
-            .join("tests")
-            .join("fixtures")
+            .join("../aft/tests/fixtures")
             .join("inline_symbol")
             .join(name)
     }

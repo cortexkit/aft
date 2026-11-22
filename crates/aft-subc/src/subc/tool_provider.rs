@@ -5331,11 +5331,11 @@ mod tests {
     /// rewritten by the one helper and checked by the one golden test.
     const CATALOG_FIXTURES: &[(&str, &str)] = &[
         (
-            "tests/fixtures/tool_provider_catalog.json",
+            "../aft/tests/fixtures/tool_provider_catalog.json",
             include_str!("../../../aft/tests/fixtures/tool_provider_catalog.json"),
         ),
         (
-            "tests/fixtures/tool_provider_catalog_presets.json",
+            "../aft/tests/fixtures/tool_provider_catalog_presets.json",
             include_str!("../../../aft/tests/fixtures/tool_provider_catalog_presets.json"),
         ),
     ];
@@ -5386,7 +5386,7 @@ mod tests {
             fixtures.insert(name.into(), reply["system_text"]["text"].clone());
         }
         let path = Path::new(crate::test_support::manifest_dir())
-            .join("tests/fixtures/tool_provider_system_text.json");
+            .join("../aft/tests/fixtures/tool_provider_system_text.json");
         std::fs::write(
             path,
             format!("{}\n", serde_json::to_string_pretty(&fixtures).unwrap()),

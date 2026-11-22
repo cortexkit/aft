@@ -459,7 +459,7 @@ fn luau_s4_feature_matrix() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let manifest_dir = crate::test_support::manifest_dir().join("tests/fixtures/grammars");
+    let manifest_dir = crate::test_support::manifest_dir().join("../aft/tests/fixtures/grammars");
     for (phase, manifest) in [
         ("seed", "manifest-a.json"),
         ("gap", "manifest-a.json"),
@@ -520,7 +520,7 @@ fn scenario(phase: &str) {
     let manifest = crate::grammar::manifest("luau").unwrap();
     let wasm = std::fs::read(
         crate::test_support::manifest_dir()
-            .join("tests/fixtures/grammars")
+            .join("../aft/tests/fixtures/grammars")
             .join(format!("{}.wasm", manifest.sha256)),
     )
     .unwrap();

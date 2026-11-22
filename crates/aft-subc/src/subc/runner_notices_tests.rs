@@ -167,7 +167,7 @@ fn notice_templates_rewritten_bash_sends_once_without_footers() {
 fn shared_send_sample(name: &str) -> Vec<u8> {
     let body = std::fs::read(
         Path::new(crate::test_support::manifest_dir())
-            .join("tests/fixtures/llm-runner")
+            .join("../aft/tests/fixtures/llm-runner")
             .join(name),
     )
     .unwrap();
@@ -178,7 +178,8 @@ fn shared_send_sample(name: &str) -> Vec<u8> {
 #[test]
 fn runner_notices_shared_send_samples_have_pinned_bytes() {
     use sha2::{Digest, Sha256};
-    let root = Path::new(crate::test_support::manifest_dir()).join("tests/fixtures/llm-runner");
+    let root =
+        Path::new(crate::test_support::manifest_dir()).join("../aft/tests/fixtures/llm-runner");
     for (folder, digest, count) in [
         (
             "send-unknown-v2",

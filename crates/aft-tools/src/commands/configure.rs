@@ -3826,7 +3826,7 @@ pub(crate) fn open_database_runtime(
 ) -> crate::database_open::DatabaseOpenReport {
     use crate::database_open::{DatabaseOpenOutcome, DatabaseOpenReport};
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     ctx.note_database_open_attempt_for_test();
 
     wait_on_configure_tail_stage_gate_for_test(
@@ -10263,5 +10263,5 @@ mod tests {
 #[path = "configure_live_reload_tests.rs"]
 mod live_reload_tests;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use aft_engine::test_bridge::display_data::AppContextTestExt as _;

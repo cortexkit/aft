@@ -3,7 +3,7 @@
 
 use super::*;
 
-const FIXTURE: &str = "tests/fixtures/rich_ui/aft-rich-ui-manifest-v1.json";
+const FIXTURE: &str = "../aft/tests/fixtures/rich_ui/aft-rich-ui-manifest-v1.json";
 const TASK: &str = "bash-0000000000000081";
 const VIEWED_CALL: &str = "sample-viewed-call";
 

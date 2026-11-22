@@ -20,7 +20,8 @@ fn run(name: &str, test: fn()) {
         .env("AFT_S4_AUDIT_ROOT", dir.path())
         .env(
             "AFT_TEST_GRAMMAR_MANIFEST",
-            crate::test_support::manifest_dir().join("tests/fixtures/grammars/manifest-a.json"),
+            crate::test_support::manifest_dir()
+                .join("../aft/tests/fixtures/grammars/manifest-a.json"),
         )
         .env("AFT_TEST_GRAMMAR_CLOCK_FILE", dir.path().join("clock"))
         .env(
@@ -76,7 +77,7 @@ fn fixture(ready: bool) -> Fixture {
     let manifest = crate::grammar::manifest("luau").unwrap();
     let wasm = std::fs::read(
         crate::test_support::manifest_dir()
-            .join("tests/fixtures/grammars")
+            .join("../aft/tests/fixtures/grammars")
             .join(format!("{}.wasm", manifest.sha256)),
     )
     .unwrap();

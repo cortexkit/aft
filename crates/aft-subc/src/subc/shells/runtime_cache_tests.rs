@@ -314,7 +314,13 @@ fn shells_v1_production_task_store_writers_are_generation_tracked() {
         .unwrap();
     let writer = regex::Regex::new(r"(?i)\b(?:INSERT\s+(?:OR\s+\w+\s+)?INTO|REPLACE\s+INTO|UPDATE|DELETE\s+FROM)\s+bash_tasks\b").unwrap();
     let mut files = Vec::new();
-    for root in ["src", "../aft-base/src", "../aft-db/src"] {
+    for root in [
+        "src",
+        "../aft/src",
+        "../aft-tools/src",
+        "../aft-base/src",
+        "../aft-db/src",
+    ] {
         sources(&crate::test_support::manifest_dir().join(root), &mut files);
     }
     let mut count = 0;

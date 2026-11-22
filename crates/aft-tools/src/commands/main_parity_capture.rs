@@ -346,7 +346,7 @@ fn luau_s4_main_pinned_serialized_responses_match() {
         return;
     }
     let path = crate::test_support::manifest_dir()
-        .join("tests/fixtures/grammars/main-1c6563b4-responses.golden");
+        .join("../aft/tests/fixtures/grammars/main-1c6563b4-responses.golden");
     let expected = std::fs::read_to_string(path).unwrap();
     assert!(expected.starts_with(&format!("# main_commit={MAIN}\n")));
     if let Some(output) = std::env::var_os("AFT_MAIN_PARITY_ACTUAL") {

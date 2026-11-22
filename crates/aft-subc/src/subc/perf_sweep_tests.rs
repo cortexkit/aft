@@ -266,8 +266,8 @@ fn perf_sweep_reads_recent_entries_from_bounded_log_tail() {
 #[test]
 fn perf_sweep_parser_matches_script_python_on_shared_fixture() {
     let output = std::process::Command::new("python3")
-        .arg(crate::test_support::manifest_dir().join("tests/fixtures/perf_sweep_oracle.py"))
-        .arg(crate::test_support::manifest_dir().join("tests/fixtures/perf_sweep.txt"))
+        .arg(crate::test_support::manifest_dir().join("../aft/tests/fixtures/perf_sweep_oracle.py"))
+        .arg(crate::test_support::manifest_dir().join("../aft/tests/fixtures/perf_sweep.txt"))
         .arg(iso_seconds(SINCE))
         .output()
         .expect("python3 required for parser parity");
