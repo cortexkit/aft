@@ -1,5 +1,6 @@
 # package	target	test	linux	macos	windows
 aft-subc	lib:aft_subc	allocator_tests::lib_test_counts_known_allocation	1	1	1
+aft-subc	lib:aft_subc	secret_proxy::tests::client_child	1	1	0
 aft-subc	lib:aft_subc	subc::rich_ui::display::tests::edit_no_match_startup_then_daemon_registration_captures_once	1	1	1
 aft-subc	lib:aft_subc	subc::runner_notices::tests::handed_down_code_search_notice_preserves_equality_and_debug	1	1	1
 aft-tools	lib:aft_tools	allocator_tests::lib_test_counts_known_allocation	1	1	1

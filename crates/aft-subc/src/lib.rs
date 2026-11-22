@@ -168,6 +168,7 @@ pub(crate) use aft_engine::scoped_key;
 pub(crate) use aft_engine::search_index;
 pub(crate) use aft_engine::secret;
 #[cfg(test)]
+#[cfg(not(all(test, unix)))]
 pub(crate) use aft_engine::secret_proxy;
 pub(crate) use aft_engine::semantic_admission;
 pub(crate) use aft_engine::semantic_index;
@@ -196,6 +197,19 @@ use test_support as test_helpers;
 #[cfg(test)]
 #[path = "../../aft/tests/helpers/fake_lsp.rs"]
 pub(crate) mod fake_lsp_test_helper;
+
+#[cfg(all(test, unix))]
+mod secret_proxy {
+    pub(crate) use aft_engine::secret_proxy::*;
+
+    mod tests {
+        // The proxy client starts the current harness with this exact test name.
+        #[test]
+        fn client_child() {
+            aft_base::secret_proxy::tests::client_child();
+        }
+    }
+}
 
 #[cfg(test)]
 mod allocator_tests {

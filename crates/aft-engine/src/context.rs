@@ -11114,11 +11114,11 @@ impl AppContext {
         walked_any |= walked;
         oldest = oldest.min(measured_at);
         drop(walks);
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if walked_any {
             MEMORY_ESTIMATE_WALKS.with(|walks| walks.set(walks.get() + 1));
         }
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let _ = walked_any;
         let walked = WalkedMemory {
             measured_at: oldest,

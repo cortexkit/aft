@@ -64,7 +64,7 @@ pub(crate) use aft_engine::access_policy;
 mod access_policy_tests;
 #[cfg(test)]
 mod boundary_source_guard_tests;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::agent_commands;
 pub(crate) use aft_engine::agent_child_env;
 pub(crate) use aft_engine::alert_state;
@@ -126,6 +126,7 @@ pub(crate) use aft_base::jsonc_edit;
 pub(crate) use aft_base::language;
 #[cfg(test)]
 pub(crate) use aft_base::large_read_counts;
+#[cfg(unix)]
 pub(crate) use aft_base::launch_fds;
 pub(crate) use aft_base::list_envelope;
 pub(crate) use aft_base::list_surfaces;
@@ -142,7 +143,7 @@ pub(crate) use aft_engine::format;
 #[cfg(test)]
 pub(crate) use aft_engine::fs_lock;
 pub(crate) use aft_engine::gh_shim;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_engine::gh_shim_relay;
 pub(crate) use aft_engine::gh_shim_speech;
 pub(crate) use aft_engine::gh_shim_ticket;
@@ -174,7 +175,7 @@ pub(crate) use aft_base::pinned_dir;
 pub(crate) use aft_base::policy_path;
 pub(crate) use aft_base::privacy_spawn;
 pub(crate) use aft_base::private_storage;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::process_identity;
 pub(crate) use aft_base::process_io;
 pub(crate) use aft_base::project_walk;
@@ -204,6 +205,7 @@ pub mod run_tool_call;
 pub(crate) use aft_base::shell_format;
 pub(crate) use aft_base::storage_path;
 pub(crate) use aft_base::subc_config;
+#[cfg(unix)]
 pub(crate) use aft_db::sandbox_profile;
 pub(crate) use aft_engine::runtime_drain;
 pub(crate) use aft_engine::sandbox_spawn;
@@ -249,6 +251,7 @@ pub(crate) use aft_engine::write_ledger;
 pub(crate) use aft_base::windows_command;
 #[cfg(any(test, windows))]
 pub(crate) use aft_base::windows_path;
+#[cfg(unix)]
 pub(crate) use aft_base::worker_jail_canary;
 
 #[cfg(all(test, target_os = "linux"))]
@@ -257,7 +260,7 @@ mod daemon_heap_probe;
 pub(crate) mod search_hot_path_measurements;
 #[cfg(test)]
 pub(crate) use aft_base::test_allocations;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::test_gate;
 #[cfg(test)]
 pub(crate) use aft_base::test_support;

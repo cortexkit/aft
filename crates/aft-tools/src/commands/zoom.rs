@@ -3170,8 +3170,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_path(name: &str) -> PathBuf {
-        PathBuf::from(crate::test_support::manifest_dir())
-            .join("../aft/tests/fixtures")
+        crate::test_support::manifest_dir()
+            .parent()
+            .unwrap()
+            .join("aft/tests/fixtures")
             .join(name)
     }
 
