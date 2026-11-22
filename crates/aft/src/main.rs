@@ -552,22 +552,14 @@ fn main() {
         let app = App::default_shared();
         let ctx = Arc::new(AppContext::from_app(Arc::clone(&app), Config::default()));
         startup_phase("context_done");
-        // Tell the fleet backup service what this storage root holds; a
-        // failure is logged and never stops the module from attaching. A
-        // settings-gated start refreshes only once it has applied the view.
-        if !aft::subc::settings_gate_requested() {
-            aft::engram_catalog::refresh_catalog(&ctx.storage_dir());
-        }
         let executor = Arc::new(aft::context::Executor::new());
         install_subc_signal_handler(
             Arc::clone(&executor),
             Arc::clone(&ctx),
             app.lsp_child_registry(),
         );
-        // Resolve AFT's own CortexKit config home once at the boundary; it is
-        // threaded into the per-bind tier composition (W5). Under the gateway
-        // there is no plugin to relay on-disk config, so this is how a gateway
-        // user's aft.jsonc reaches AFT.
+        // Pass the user file path to Subconscious in the settings declaration.
+        // Only a daemon that does not advertise config.gate uses the legacy file read.
         let user_config_path = aft::subc_config::startup_cortexkit_user_config_path();
         // AFT_TEST_HOLD_ORT_SECTION holds an ORT section open during shutdown,
         // without loading ORT or relying on inference speed. Release builds

@@ -257,7 +257,6 @@ use crate::bash_background::registry::RouteDeliverySessions;
 use route_delivery::sync_all_callgraph_refresh_policies as sync_bg_live_delivery_sessions;
 mod secret_consent;
 mod settings;
-pub use settings::requested as settings_gate_requested;
 #[cfg(test)]
 mod views_idle_checkout_tests;
 #[cfg(all(test, unix))]
@@ -4356,10 +4355,7 @@ fn run_subc_mode_on_runtime_thread(
     // Before any database opens: this process admits keyed calls, so it is
     // the one that recovers the call ledger after a restart.
     crate::db::call_ledger::mark_provider_process();
-    let opt_in = settings::requested();
-    let _daemon_storage_lease = (!opt_in)
-        .then(|| crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir()))
-        .transpose()
+    let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
     let (runtime, dispatch_path_metrics, adopted) = match registration {
         Some(channel) => (channel.runtime, channel.metrics, Some(channel.stream)),
@@ -4377,9 +4373,6 @@ fn run_subc_mode_on_runtime_thread(
         let storage_dir = ctx.storage_dir();
         if registration::identity_ready() {
             crate::agent_commands::enable(&storage_dir);
-        }
-        if !opt_in {
-            settings::initialize_storage(shared_app.clone(), &storage_dir);
         }
         let using_registration = adopted.is_some();
         let stream: Box<dyn subc_client_rs::ModuleStream> = match adopted {
@@ -4970,16 +4963,16 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let spawn_role = readiness::SpawnRole::from_process_env();
-    let opt_in = startup_ctx.is_some() && settings::requested();
+    let manage_settings = startup_ctx.is_some();
     let hello = settings::negotiate(
         &mut read,
         &mut write,
         user_config_path.as_deref(),
-        opt_in,
+        manage_settings,
         using_registration,
     )
     .await?;
-    let gated = opt_in && hello.gated();
+    let gated = manage_settings && hello.gated();
     let rich_ui_proofs = hello.rich_ui;
     let hello_at = hello.at;
 
@@ -5082,11 +5075,9 @@ where
         .filter(|_| gated)
         .map(|ctx| ctx.config_unpinned());
     if let Some(ctx) = startup_ctx.as_ref() {
-        if opt_in {
-            settings::initialize_storage(shared_app.clone(), storage_dir);
-            crate::engram_catalog::refresh_catalog(storage_dir);
-        }
-        if opt_in && !gated {
+        settings::initialize_storage(shared_app.clone(), storage_dir);
+        crate::engram_catalog::refresh_catalog(storage_dir);
+        if !gated {
             settings::legacy_catalog(&control, user_config_path.as_deref());
         }
         settings::initialize_task_cleanup(ctx, storage_dir);

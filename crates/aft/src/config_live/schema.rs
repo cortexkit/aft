@@ -41,6 +41,8 @@ fn setup_sections(fields: &mut Value) {
             20,
             json!({"/remote_exec/enabled": true}),
         ),
+        // Offer backend selection without recommending a backend. Disabling
+        // meaning search is a separate setting under `indexes`.
         ("semantic", "Meaning search", 30, json!({})),
     ] {
         fields[feature]["title"] = json!(title);

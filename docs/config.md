@@ -16,6 +16,19 @@ and state folders (`~/.local/share/cortexkit`, `~/.local/state/cortexkit`, and t
 `XDG_DATA_HOME` and `XDG_STATE_HOME` equivalents), AFT's storage directory, and the
 daemon connection file remain blocked.
 
+When Subconscious advertises `config.gate`, AFT declares its settings schema
+so the desktop app can display and edit them. AFT uses the user settings that
+Subconscious returns, not a separate read of `aft.jsonc`. On an unstamped install,
+Subconscious reads that file and supplies the effective values at generation 0.
+It notifies AFT when those values change, even though the generation stays at 0.
+Settings that require a restart still need one.
+
+On a stamped install, AFT uses the last approved view while a new declaration
+awaits approval. If there is no approved view, AFT does not become ready and
+does not fall back to the file. A refusal from the daemon never permits file
+fallback. Standalone AFT and older daemons that do not advertise `config.gate`
+keep the existing file-based settings behavior.
+
 For the removal order and harness-specific registration steps, see [Uninstall](../README.md#uninstall).
 
 OMP uses this same CortexKit user file; register its Pi-compatible plugin with `npx @cortexkit/aft@latest setup --harness omp`.

@@ -41,7 +41,7 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     read: &mut R,
     write: &mut W,
     user_path: Option<&Path>,
-    opt_in: bool,
+    manage_settings: bool,
     using_registration: bool,
 ) -> Result<Hello, SubcError> {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
@@ -54,7 +54,7 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         })
         .await;
     }
-    let disabled = if opt_in {
+    let disabled = if manage_settings {
         Vec::new()
     } else {
         crate::subc_config::catalog_disabled_tools(user_path)
@@ -69,7 +69,7 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     let provides = manifest.provides.clone();
     let at = tokio::time::Instant::now();
     let mut ops = control_ops().unwrap_or_default();
-    if opt_in {
+    if manage_settings {
         ops.push(CONFIG_REVIEW_OP.to_string());
     }
     let hello = ModuleHelloBody {
@@ -106,7 +106,7 @@ pub(in crate::subc) async fn negotiate<R: AsyncRead + Unpin, W: AsyncWrite + Unp
         },
     };
     // A malformed acknowledgement cannot establish whether the daemon supports config.gate.
-    if opt_in && ack.is_none() {
+    if manage_settings && ack.is_none() {
         return Err(SubcError::UnexpectedFrame {
             ty: FrameType::HelloAck,
         });
