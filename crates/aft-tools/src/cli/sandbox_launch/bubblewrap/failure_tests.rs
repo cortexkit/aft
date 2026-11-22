@@ -481,7 +481,7 @@ fn bwrap_failures_inner_failure_and_payload_exit_78_have_distinct_markers() {
     let fd_contents = root.join("fd");
     let sentinel = root.join("started");
     let payload = fd_payload("4", &sentinel, "78");
-    let run = |profile| {
+    let run = |profile: &SandboxProfile| {
         let mut cmd = child("inner", profile, &marker, &payload);
         install_marker(&mut cmd, &fd_contents, 4);
         cmd.output().unwrap()
@@ -570,7 +570,7 @@ fn bwrap_failures_live_inner_refusal_and_payload_status_reach_outer_callers() {
     seed(&denied);
     profile.write_deny.push(denied);
     profile.linux_mounts = Some(LinuxMountPolicy::default());
-    let run = |profile, code, caller_marker| {
+    let run = |profile: &SandboxProfile, code, caller_marker| {
         let mut cmd = launch(&launcher, profile);
         cmd.arg("--failure-marker").arg(&marker);
         if caller_marker {
