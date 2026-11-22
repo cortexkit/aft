@@ -37,6 +37,10 @@ fn bwrap_core_snapshot_orders_guards_and_nested_masks_and_names_missing_targets(
     let git = home.join(".config/git");
     let credential = git.join("credentials");
     seed(&credential);
+    let aliases = home.join("aliases");
+    fs::create_dir(&aliases).unwrap();
+    let alias = aliases.join("git-credentials");
+    std::os::unix::fs::symlink(&credential, &alias).unwrap();
     let aws = home.join(".aws");
     let aws_child = aws.join("nested/secret");
     seed(&aws_child);
@@ -48,7 +52,13 @@ fn bwrap_core_snapshot_orders_guards_and_nested_masks_and_names_missing_targets(
     let control = home.join(".bashrc");
     let keychains = home.join("Library/Keychains");
     let policy = LinuxMountPolicy {
-        credential_masks: vec![credential.clone(), aws.clone(), absent.clone(), keychains],
+        credential_masks: vec![
+            credential.clone(),
+            alias,
+            aws.clone(),
+            absent.clone(),
+            keychains,
+        ],
         read_only: vec![git.clone(), aws_child.clone(), control.clone()],
         cargo_homes: vec![cargo.clone()],
         ..Default::default()
@@ -58,6 +68,7 @@ fn bwrap_core_snapshot_orders_guards_and_nested_masks_and_names_missing_targets(
     assert_eq!(snapshot.mounts[&home.join(".config")], Mount::Guard);
     assert_eq!(snapshot.mounts[&git], Mount::ReadOnly);
     assert_eq!(snapshot.mounts[&credential], Mount::EmptyFile);
+    assert_eq!(snapshot.mounts[&aliases], Mount::Guard);
     assert_eq!(snapshot.mounts[&aws], Mount::EmptyDir);
     assert_eq!(snapshot.mounts[&cargo], Mount::Guard);
     assert_eq!(snapshot.mounts[&late], Mount::EmptyFile);
@@ -163,6 +174,8 @@ fn bwrap_core_active_levels_keep_nested_masks_read_only_controls_and_ancestor_in
         let config = git.join("config");
         let enclosing = checkout.join("enclosing");
         let enclosed_credential = enclosing.join("token");
+        let masked_dir = checkout.join("masked-directory");
+        let masked_child = masked_dir.join("seed");
         let absent_credential = home.join(".netrc");
         let absent_control = checkout.join(".cortexkit/aft.jsonc");
         let hooks = checkout.join(".git/hooks");
@@ -174,6 +187,7 @@ fn bwrap_core_active_levels_keep_nested_masks_read_only_controls_and_ancestor_in
             &credential,
             &config,
             &enclosed_credential,
+            &masked_child,
             &hook,
             &kube,
             &read_mask,
@@ -186,6 +200,7 @@ fn bwrap_core_active_levels_keep_nested_masks_read_only_controls_and_ancestor_in
             credential_masks: vec![
                 credential.clone(),
                 enclosed_credential.clone(),
+                masked_dir,
                 absent_credential.clone(),
                 kube.clone(),
             ],
@@ -259,10 +274,25 @@ fn bwrap_core_active_levels_keep_nested_masks_read_only_controls_and_ancestor_in
             !stderr.contains(&format!("write:{}", hooks.display())),
             "{stderr}"
         );
+        if mode == SandboxMode::Strict {
+            let mut invalid = profile.clone();
+            invalid.write_deny.push(kube.clone());
+            let failure = run(&invalid);
+            assert_eq!(
+                failure.status.code(),
+                Some(super::super::SANDBOX_UNAVAILABLE_EXIT_CODE)
+            );
+            let stderr = String::from_utf8(failure.stderr).unwrap();
+            assert!(
+                stderr.contains("overlaps mandatory deny") && stderr.contains("kube/dev"),
+                "{stderr}"
+            );
+        }
         for path in [
             &credential,
             &config,
             &enclosed_credential,
+            &masked_child,
             &hook,
             &kube,
             &read_mask,
@@ -307,12 +337,14 @@ def cannot_write(path):
         return
     raise AssertionError(f'modified {path}')
 
-for path in [home / '.config/git/credentials', Path('enclosing/token'), Path(os.environ['KUBECONFIG'])]:
+for path in [home / '.config/git/credentials', Path('enclosing/token'), Path(os.environ['KUBECONFIG']), Path('masked-directory/seed')]:
     if mode == 'off':
         assert read(path) == seed, path
     else:
         assert read(path) != seed, path
         cannot_write(path)
+if mode != 'off':
+    cannot_write(Path('masked-directory/new'))
 assert read(home / '.config/git/config') == seed
 assert read(Path('.git/hooks/test-hook')) == seed
 if mode in ('standard', 'strict'):

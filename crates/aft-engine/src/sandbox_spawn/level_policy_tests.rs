@@ -177,6 +177,10 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
         let dir = tempfile::tempdir().unwrap();
         let base = dir.path().canonicalize().unwrap();
         let material = base.join("material");
+        let mut kube_paths = vec![material.join("kube-one"), "../material/kube-two".into()];
+        if cfg!(target_os = "linux") {
+            kube_paths.push("kube/inside".into());
+        }
         let test = concat!(
             module_path!(),
             "::sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor"
@@ -195,11 +199,8 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
             .env("DOCKER_CONFIG", material.join("docker"))
             .env("XDG_CONFIG_HOME", material.join("xdg"))
             .env("CARGO_HOME", material.join("cargo-alias"))
-            .env(
-                "KUBECONFIG",
-                std::env::join_paths([material.join("kube-one"), "../material/kube-two".into()])
-                    .unwrap(),
-            )
+            .env("KUBECONFIG", std::env::join_paths(kube_paths).unwrap())
+            .env("SSH_AUTH_SOCK", material.join("agent"))
             .output()
             .unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -233,7 +234,12 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
     symlink(&material, home.join(".kube/other")).unwrap();
     symlink(home.join(".kube/other/future"), home.join(".kube/config")).unwrap();
 
-    let (ctx, _project, io, _fixture) = unix_fixture(&base);
+    let (ctx, project, io, _fixture) = unix_fixture(&base);
+    let checkout_kube = project.join("kube/inside");
+    if cfg!(target_os = "linux") {
+        std::fs::create_dir(project.join("kube")).unwrap();
+        std::fs::write(&checkout_kube, "disposable kube fixture").unwrap();
+    }
     #[cfg(target_os = "linux")]
     let _inventory = fixed_read_inventory::install(&base);
     ACCOUNT_HOME_OVERRIDE.with(|value| value.replace(Some(Ok(account.clone()))));
@@ -282,6 +288,9 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
         ]
         .map(|path| material.join(path)),
     );
+    if cfg!(target_os = "linux") {
+        floor.insert(checkout_kube.clone());
+    }
     let prefixes = BTreeSet::from([
         home.join(".cargo/credentials"),
         home_alias.join(".cargo/credentials"),
@@ -322,6 +331,7 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
                 let write: BTreeSet<_> = profile.write_deny.iter().cloned().collect();
                 if mode == SandboxMode::Off {
                     assert!(read.is_empty() && write.is_empty());
+                    assert!(profile.linux_mounts.is_none());
                 } else {
                     assert_eq!(profile.worker_jail, worker);
                     assert_eq!(
@@ -332,9 +342,41 @@ fn sandbox_level_policy_selects_real_roles_and_shares_the_full_credential_floor(
                             .collect::<BTreeSet<_>>(),
                         prefixes
                     );
+                    let mut fallback_write = write.clone();
+                    if cfg!(target_os = "linux") {
+                        let mounts = profile
+                            .linux_mounts
+                            .as_ref()
+                            .expect("local Linux mount policy");
+                        let mut expected_masks = credential_denies.clone();
+                        expected_masks.insert(material.join("agent"));
+                        assert_eq!(
+                            mounts
+                                .credential_masks
+                                .iter()
+                                .cloned()
+                                .collect::<BTreeSet<_>>(),
+                            expected_masks
+                        );
+                        assert!(mounts.cargo_homes.contains(&material.join("cargo-alias")));
+                        if mode == SandboxMode::Strict {
+                            assert_eq!(
+                                mounts
+                                    .fallback_write_deny
+                                    .iter()
+                                    .cloned()
+                                    .collect::<BTreeSet<_>>(),
+                                floor
+                            );
+                            assert!(!write.contains(&checkout_kube));
+                            assert!(mounts.read_only.contains(&project.join(".git/hooks")));
+                            assert!(!mounts.read_only.contains(&project.join(".git")));
+                            fallback_write.extend(mounts.fallback_write_deny.iter().cloned());
+                        }
+                    }
                     for deny in &floor {
                         assert!(
-                            read.contains(deny) && write.contains(deny),
+                            read.contains(deny) && fallback_write.contains(deny),
                             "{mode} worker={worker} missing {}",
                             deny.display()
                         );

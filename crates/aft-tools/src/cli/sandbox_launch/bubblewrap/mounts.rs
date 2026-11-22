@@ -61,7 +61,7 @@ impl Snapshot {
 
     fn add(&mut self, path: &Path, mask: bool, absent: &str) -> Result<(), String> {
         require_absolute(path)?;
-        let (path, metadata) = match existing_target(path) {
+        let (target, metadata) = match existing_target(path) {
             Ok(target) => target,
             Err(error) if missing(&error) => {
                 if !(mask && path.ends_with("Library/Keychains")) {
@@ -76,7 +76,7 @@ impl Snapshot {
                 ))
             }
         };
-        if path == Path::new("/") {
+        if target == Path::new("/") {
             return Err("cannot mask or make the bubblewrap root read-only".into());
         }
         let mount = match (mask, metadata.is_dir()) {
@@ -85,9 +85,24 @@ impl Snapshot {
             (true, false) => Mount::EmptyFile,
             (false, _) => Mount::ReadOnly,
         };
-        let entry = self.mounts.entry(path).or_insert(mount);
-        if mount.masks() {
+        let entry = self.mounts.entry(target.clone()).or_insert(mount);
+        if mount.masks() || *entry == Mount::Guard {
             *entry = mount;
+        }
+        if target != path {
+            // The mount hides the resolved target. Guard the alias's parent
+            // directories too so renaming one cannot move the lookup path.
+            for parent in path.ancestors().skip(1) {
+                let resolved = parent.canonicalize().map_err(|error| {
+                    format!(
+                        "cannot resolve mount target ancestor {}: {error}",
+                        parent.display()
+                    )
+                })?;
+                if resolved != Path::new("/") {
+                    self.mounts.entry(resolved).or_insert(Mount::Guard);
+                }
+            }
         }
         Ok(())
     }
@@ -108,10 +123,13 @@ impl Snapshot {
                 .ancestors()
                 .skip(1)
                 .take_while(|path| *path != Path::new("/"));
-            if !ancestors
+            let below_read_only = ancestors
                 .clone()
-                .any(|ancestor| planned.get(ancestor) == Some(&Mount::ReadOnly))
-            {
+                .any(|ancestor| planned.get(ancestor) == Some(&Mount::ReadOnly));
+            if below_read_only && mount == Mount::Guard {
+                continue;
+            }
+            if !below_read_only {
                 for ancestor in ancestors.by_ref() {
                     planned
                         .entry(ancestor.to_path_buf())
