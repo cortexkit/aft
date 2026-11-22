@@ -64,6 +64,7 @@ fn handed_down_code_search_notice_preserves_equality_and_debug() {
         },
     ] {
         let changed = render(changed);
+        assert_ne!(baseline, changed);
         assert_ne!(
             baseline.bash_code_search_hint,
             changed.bash_code_search_hint
