@@ -10,9 +10,19 @@ use aft_store::spill::{self, WriteGuard};
 use std::io;
 
 use crate::data_layer::graph_store::SectionsError;
+use crate::data_layer::{
+    callgraph::CacheChurn, refresh_budget::RefreshLimit, refresh_memory::MemoryLimit,
+};
 
 #[cfg(test)]
 mod tests;
+
+pub(super) enum EngineUpdate {
+    Applied(Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>),
+    Cold(RefreshLimit),
+    Memory(MemoryLimit),
+    Churn(CacheChurn),
+}
 
 #[derive(Default)]
 pub(super) struct RefreshCounters {

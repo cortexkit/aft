@@ -39,8 +39,8 @@ use super::graph_store::{Held, SectionsWriter, StoredSlices};
 use super::incremental::{LiveCheckout, UpdateError, UpdateStats};
 use super::overlay::{CacheKey, OverlaySlices, PreparedSlice};
 use super::query::{SliceReader, SliceSource};
-use super::refresh_budget::{RefreshBudget, RefreshLimit, Stage};
-use super::refresh_memory::{ColdGrowth, MemoryLimit, RefreshChecks, RefreshMemory, RefreshStop};
+use super::refresh_budget::{RefreshBudget, Stage};
+use super::refresh_memory::{ColdGrowth, RefreshChecks, RefreshMemory, RefreshStop};
 use super::slice::FileSlice;
 use crate::callgraph_store::join::ParseBlob;
 use conversion::{extract_recorded, parse_record, staged_failure, warn_conversion_failure};
@@ -396,13 +396,6 @@ struct GraphEngine {
     /// substantial state. The publication must replace that size estimate;
     /// small publications otherwise keep the ordinary measurement cadence.
     measure_after_publication: bool,
-}
-
-enum EngineUpdate {
-    Applied(Option<(OverlaySlices<Arc<StoredSlices>>, Refreshed)>),
-    Cold(RefreshLimit),
-    Memory(MemoryLimit),
-    Churn(super::callgraph::CacheChurn),
 }
 
 /// A checkout's single queued or running build. Dropping a queued task also
