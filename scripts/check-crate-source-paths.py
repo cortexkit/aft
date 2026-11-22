@@ -14,7 +14,8 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-CRATES = ("aft-base", "aft-db", "aft-parse", "aft-engine")
+PACKAGED_CRATES = ("aft-engine", "aft-tools", "aft-subc")
+CRATES = ("aft-base", "aft-db", "aft-parse", *PACKAGED_CRATES)
 lexer = runpy.run_path(str(ROOT / "scripts/check-file-sizes.py"))
 tokens, group_end = lexer["tokens"], lexer["group_end"]
 CLOSING = {"(": ")", "[": "]", "{": "}"}
@@ -177,14 +178,14 @@ def violations(crate: Path, path: Path, source: str) -> list[str]:
 
 
 def check_crate(crate: Path) -> tuple[int, list[str]]:
-    if crate.name == "aft-engine":
-        # Excluded test modules can share workspace fixtures. The engine's
-        # compiler-input checks separately audit native tests and test-support.
+    if crate.name in PACKAGED_CRATES:
+        # Excluded test modules can share workspace fixtures. The compiler-input
+        # audit separately checks the native test and opt-in library inputs.
         names = subprocess.check_output([
-            "cargo", "package", "--locked", "-p", "aft-engine", "--list",
+            "cargo", "package", "--locked", "-p", crate.name, "--list",
         ], cwd=ROOT, text=True).splitlines()
         if "src/lib.rs" not in names:
-            raise ValueError("aft-engine package listing is missing src/lib.rs")
+            raise ValueError(f"{crate.name} package listing is missing src/lib.rs")
         sources = sorted(crate / name for name in names if name.endswith(".rs"))
     else:
         sources = sorted(path for path in crate.rglob("*.rs")
@@ -245,26 +246,28 @@ class SourcePathTests(unittest.TestCase):
         self.assertEqual(len(findings), 1)
         self.assertIn("expected one literal path inside the crate", findings[0])
 
-    def test_engine_checks_packaged_sources_but_not_excluded_test_fixtures(self):
+    def test_listed_crates_check_packaged_sources_but_not_excluded_test_fixtures(self):
         scratch = ROOT / "target/scratch"
         scratch.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=scratch) as temporary:
-            crate = Path(temporary) / "aft-engine"
-            source = crate / "src/lib.rs"
-            source.parent.mkdir(parents=True)
-            external = 'const FIXTURE: &str = include_str!("../../outside.txt");'
-            (source.parent / "fixture_tests.rs").write_text(external)
-            source.write_text("")
-            with mock.patch("subprocess.check_output", return_value="Cargo.toml\nsrc/lib.rs\n") as package:
-                self.assertEqual(check_crate(crate), (1, []))
-                package.assert_called_once_with([
-                    "cargo", "package", "--locked", "-p", "aft-engine", "--list",
-                ], cwd=ROOT, text=True)
-                source.write_text(external)
-                checked, findings = check_crate(crate)
-                self.assertEqual(checked, 1)
-                self.assertEqual(len(findings), 1)
-                self.assertIn("src/lib.rs:1: include_str!: path outside the crate", findings[0])
+        for name in ("aft-engine", "aft-tools", "aft-subc"):
+            with self.subTest(crate=name), tempfile.TemporaryDirectory(dir=scratch) as temporary:
+                self.assertIn(name, CRATES)
+                crate = Path(temporary) / name
+                source = crate / "src/lib.rs"
+                source.parent.mkdir(parents=True)
+                external = 'const FIXTURE: &str = include_str!("../../outside.txt");'
+                (source.parent / "fixture_tests.rs").write_text(external)
+                source.write_text("")
+                with mock.patch("subprocess.check_output", return_value="Cargo.toml\nsrc/lib.rs\n") as package:
+                    self.assertEqual(check_crate(crate), (1, []))
+                    package.assert_called_once_with([
+                        "cargo", "package", "--locked", "-p", name, "--list",
+                    ], cwd=ROOT, text=True)
+                    source.write_text(external)
+                    checked, findings = check_crate(crate)
+                    self.assertEqual(checked, 1)
+                    self.assertEqual(len(findings), 1)
+                    self.assertIn("src/lib.rs:1: include_str!: path outside the crate", findings[0])
 
 
 def main():

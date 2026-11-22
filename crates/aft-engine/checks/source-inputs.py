@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Check the aft-engine compiler inputs from a native Cargo JSON build."""
+"""Check the engine, tools and daemon compiler inputs from a Cargo JSON build."""
 
 import argparse
+from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
@@ -9,9 +10,32 @@ import subprocess
 import sys
 
 
-ENGINE = Path(__file__).resolve().parents[1]
-WORKSPACE = ENGINE.parents[1]
-UPPER_SOURCES = WORKSPACE / "crates/aft/src"
+CRATES = Path(__file__).resolve().parents[2]
+WORKSPACE = CRATES.parent
+
+
+@dataclass(frozen=True)
+class Audit:
+    name: str
+    upper_crates: tuple[str, ...]
+    native_features: tuple[str, ...]
+    packaged_features: tuple[str, ...]
+
+    @property
+    def root(self):
+        return CRATES / self.name
+
+
+# Match the feature selections in .github/workflows/_unit-suite.yml. The daemon
+# library does not declare wasm-grammars or test-support.
+AUDITS = (
+    Audit("aft-engine", ("aft", "aft-tools", "aft-subc"),
+          ("test-hooks", "wasm-grammars"), ("test-hooks", "test-support")),
+    Audit("aft-tools", ("aft", "aft-subc"),
+          ("test-hooks", "wasm-grammars"), ("test-hooks", "test-support")),
+    Audit("aft-subc", ("aft",),
+          ("test-hooks",), ("test-hooks", "test-runner-notice-fixtures")),
+)
 
 
 def make_paths(text):
@@ -37,24 +61,31 @@ def make_paths(text):
         yield "".join(word)
 
 
-def dep_file(artifact):
+def dep_file(artifact, audit):
     candidates = set()
+    prefix = artifact["target"]["name"] + "-"
     for filename in artifact["filenames"]:
         output = Path(filename)
         stem = output.stem.removeprefix("lib")
         # Cargo also copies a stable, unhashed library name into target/debug.
-        if stem.startswith("aft_engine-"):
+        if stem.startswith(prefix):
             candidates.add(output.with_name(stem + ".d"))
     if len(candidates) != 1:
-        raise ValueError(f"expected one hashed aft-engine unit, got {sorted(candidates)}")
+        raise ValueError(f"expected one hashed {audit.name} unit, got {sorted(candidates)}")
     path, = candidates
     if not path.is_file():
-        raise ValueError(f"missing aft-engine dep-info: {path}")
+        raise ValueError(f"missing {audit.name} dep-info: {path}")
     return path
 
 
-def engine_units(messages, required_features):
-    units = {False: set(), True: set()}
+def cargo_units(messages, packaged):
+    manifests = {audit.root / "Cargo.toml": audit for audit in AUDITS}
+    required = {
+        audit: set(audit.packaged_features if packaged else audit.native_features)
+        for audit in AUDITS
+    }
+    profiles = (False,) if packaged else (False, True)
+    units = {(audit, test): set() for audit in AUDITS for test in profiles}
     success = False
     for line in messages:
         message = json.loads(line)
@@ -62,18 +93,26 @@ def engine_units(messages, required_features):
             success = message["success"]
         if message["reason"] != "compiler-artifact":
             continue
-        if Path(message["manifest_path"]).resolve() != ENGINE / "Cargo.toml":
+        audit = manifests.get(Path(message["manifest_path"]).resolve())
+        if audit is None:
             continue
-        if message["target"]["kind"] == ["lib"] and message["target"]["name"] == "aft_engine":
-            if not required_features.issubset(message["features"]):
-                continue
-            units[message["profile"]["test"]].add(dep_file(message))
+        target = message["target"]
+        test = message["profile"]["test"]
+        if (test in profiles and target["kind"] == ["lib"]
+                and target["name"] == audit.name.replace("-", "_")
+                and required[audit].issubset(message["features"])):
+            units[audit, test].add(dep_file(message, audit))
     if not success:
         raise ValueError("Cargo JSON does not contain a successful build-finished record")
+    for (audit, test), dep_files in units.items():
+        if not dep_files:
+            kind = "lib-test" if test else "lib"
+            raise ValueError(f"missing {audit.name} {kind} with {', '.join(sorted(required[audit]))}")
     return units
 
 
-def audit_sources(dep_files, packaged=None):
+def audit_sources(audit, dep_files, packaged=None):
+    upper_roots = [CRATES / name / "src" for name in audit.upper_crates]
     violations = []
     for dep in sorted(dep_files):
         inputs = set(make_paths(dep.read_text(encoding="utf-8")))
@@ -81,10 +120,10 @@ def audit_sources(dep_files, packaged=None):
             raise ValueError(f"empty input list in {dep}")
         for spelling in sorted(inputs):
             path = (WORKSPACE / spelling).resolve()
-            if path.is_relative_to(UPPER_SOURCES):
+            if any(path.is_relative_to(root) for root in upper_roots):
                 violations.append(f"{dep.name}: upper source {path}")
-            if packaged is not None and path.is_relative_to(ENGINE):
-                relative = path.relative_to(ENGINE).as_posix()
+            if packaged is not None and path.is_relative_to(audit.root):
+                relative = path.relative_to(audit.root).as_posix()
                 if relative not in packaged:
                     violations.append(f"{dep.name}: not packaged: {relative}")
         print(f"{dep.name}: audited {len(inputs)} source inputs")
@@ -96,22 +135,24 @@ def main():
     parser.add_argument("messages", type=Path, help="stdout from Cargo --message-format=json")
     parser.add_argument(
         "--packaged", action="store_true",
-        help="check the library built with test-support,test-hooks against its package file list",
+        help="check each library built with its opt-in test features against its package file list",
     )
     args = parser.parse_args()
-    required = {"test-hooks", "test-support" if args.packaged else "wasm-grammars"}
+    violations = []
     try:
         with args.messages.open(encoding="utf-8") as stream:
-            units = engine_units(stream, required)
-        if not units[False] or (not args.packaged and not units[True]):
-            raise ValueError(f"missing aft-engine lib or lib-test with {', '.join(sorted(required))}")
-        if args.packaged:
-            packaged = set(subprocess.check_output([
-                "cargo", "package", "--locked", "-p", "aft-engine", "--list",
-            ], cwd=WORKSPACE, text=True).splitlines())
-            violations = audit_sources(units[False], packaged)
-        else:
-            violations = audit_sources(units[False] | units[True])
+            units = cargo_units(stream, args.packaged)
+        for audit in AUDITS:
+            dep_files = units[audit, False]
+            packaged = None
+            if args.packaged:
+                packaged = set(subprocess.check_output([
+                    "cargo", "package", "--locked", "-p", audit.name, "--list",
+                    "--features", ",".join(audit.packaged_features),
+                ], cwd=WORKSPACE, text=True).splitlines())
+            else:
+                dep_files = dep_files | units[audit, True]
+            violations.extend(audit_sources(audit, dep_files, packaged))
     except (OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"source-input check: {error}", file=sys.stderr)
         return 1
