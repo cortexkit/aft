@@ -121,14 +121,12 @@ fn inner_argv(fd: RawFd, marker: &Path, payload: Vec<OsString>) -> Vec<OsString>
 }
 
 fn child(stage: &str, profile: &SandboxProfile, marker: &Path, payload: &[&str]) -> Command {
+    let (_, test_path) = concat!(module_path!(), "::bwrap_failures_child")
+        .split_once("::")
+        .unwrap();
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
-        .args([
-            "--exact",
-            concat!(module_path!(), "::bwrap_failures_child"),
-            "--ignored",
-            "--nocapture",
-        ])
+        .args(["--exact", test_path, "--ignored", "--nocapture"])
         .env(CHILD, stage)
         .env("PROFILE", serde_json::to_string(profile).unwrap())
         .env("PAYLOAD", serde_json::to_string(payload).unwrap())
