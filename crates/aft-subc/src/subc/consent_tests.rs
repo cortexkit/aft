@@ -84,7 +84,7 @@ mod program_approvals {
         }
     }
 
-    fn program(f: &Fixture, worker: bool, name: &str) -> RouteIdentity {
+    pub(super) fn program(f: &Fixture, worker: bool, name: &str) -> RouteIdentity {
         f.ctx.bash_background().set_db_pool(f.ctx.db().unwrap());
         let base = if worker { &f.worker } else { &f.head };
         let mut stamp = serde_json::to_value(base.scope.as_ref().unwrap()).unwrap();

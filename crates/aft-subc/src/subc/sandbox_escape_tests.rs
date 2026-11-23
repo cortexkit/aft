@@ -129,7 +129,10 @@ async fn flow(options: FlowOptions<'_>) -> (Option<Response>, Arc<FakeCingulate>
     let command = format!("printf x >> {}", marker.display());
     let (first, arguments) = request_plan("escape-outcome", &command, &cwd);
     let identity = if options.end_program {
-        program(&f, false, "run:escape")
+        let identity = program_approvals::program(&f, false, "run:escape");
+        f.executor
+            .register_actor(identity.root.clone(), f.ctx.clone());
+        identity
     } else {
         head(&f)
     };
@@ -185,7 +188,6 @@ async fn flow(options: FlowOptions<'_>) -> (Option<Response>, Arc<FakeCingulate>
     let response = tokio::time::timeout(Duration::from_secs(5), &mut running)
         .await
         .expect("settled sandbox escape call")
-        .unwrap()
         .unwrap()
         .map(|result| result.0);
     let should_run = matches!(behavior, Behavior::Run)
