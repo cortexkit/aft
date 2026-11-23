@@ -1,6 +1,6 @@
 [package]
 name = "aft-store"
-version = "0.67.0"
+version = "0.67.1"
 edition = "2024"
 description = "On-disk index formats for Agent Foundational Toolkit"
 license = "MIT"
