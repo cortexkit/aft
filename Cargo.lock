@@ -90,6 +90,7 @@ name = "aft-db"
 version = "0.66.0"
 dependencies = [
  "aft-base",
+ "aft-store",
  "blake3",
  "cortexkit-role-tool-provider",
  "filetime",

@@ -39,5 +39,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [dev-dependencies]
 aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-store = { path = "../aft-store", version = "0.66.0" }
 tempfile = "3"
 filetime = "0.2"
