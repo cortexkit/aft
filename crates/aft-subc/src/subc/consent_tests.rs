@@ -541,6 +541,7 @@ struct FakeState {
     withdrawn: std::collections::HashSet<String>,
     /// Pending card params by sandbox elicitation id.
     sandbox_requests: HashMap<String, Value>,
+    report_refusal: Option<String>,
     macos: bool,
     cards: HashMap<(String, String), String>,
     next_id: usize,
@@ -831,6 +832,9 @@ impl FakeCingulate {
                 ))
             }
             "consent.report_execution" => {
+                if let Some(code) = state.report_refusal.clone() {
+                    return Err(fake_refusal(&code, "execution report refused"));
+                }
                 let id = params["elicitation_id"].as_str().unwrap();
                 let mut record = state
                     .answers

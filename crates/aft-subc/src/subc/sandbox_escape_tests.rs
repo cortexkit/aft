@@ -85,35 +85,89 @@ fn answer(request: &Value, state: &str, choice: Option<&str>) -> Value {
     answer
 }
 
-async fn outcome_case(
-    state: &str,
-    choice: Option<&str>,
-) -> (Response, Arc<FakeCingulate>, Fixture) {
+#[derive(Clone, Copy)]
+enum Behavior {
+    Run,
+    Refuse,
+    Unknown,
+}
+
+struct FlowOptions<'a> {
+    state: &'a str,
+    choice: Option<&'a str>,
+    behavior: Behavior,
+    missing_cwd: bool,
+    end_program: bool,
+    refuse_report: bool,
+}
+
+impl Default for FlowOptions<'_> {
+    fn default() -> Self {
+        Self {
+            state: "answered",
+            choice: Some("run_once"),
+            behavior: Behavior::Run,
+            missing_cwd: false,
+            end_program: false,
+            refuse_report: false,
+        }
+    }
+}
+
+async fn flow(options: FlowOptions<'_>) -> (Option<Response>, Arc<FakeCingulate>, Fixture) {
     let f = fixture(FakeCingulate::up());
+    if options.refuse_report {
+        f.fake.state.lock().unwrap().report_refusal = Some("elicitation_not_owner".into());
+    }
     let root = f.ctx.config().project_root.clone().unwrap();
-    let marker = f.dir.path().join(format!("marker-{state}"));
+    let cwd = if options.missing_cwd {
+        f.dir.path().join("gone")
+    } else {
+        root.clone()
+    };
+    let marker = f.dir.path().join(format!("marker-{}", options.state));
     let command = format!("printf x >> {}", marker.display());
-    let (first, arguments) = request_plan("escape-outcome", &command, &root);
-    let call = held_call(&f, &head(&f), arguments);
+    let (first, arguments) = request_plan("escape-outcome", &command, &cwd);
+    let identity = if options.end_program {
+        program(&f, false, "run:escape")
+    } else {
+        head(&f)
+    };
+    let call = held_call(&f, &identity, arguments);
     let request_id = call.request_id.clone();
     let fake = f.fake.clone();
+    let behavior = options.behavior;
     let mut running = tokio::spawn(async move {
         run_with_consent(call, (first, String::new()), move |_route, grants| {
             assert_eq!(grants, ["esc_test"]);
-            let output = std::process::Command::new("/bin/sh")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&root)
-                .status()
-                .unwrap();
-            assert!(output.success());
-            let response_id = request_id.clone();
-            async move {
-                Some((
-                    Response::success(&response_id, json!({"status":"completed", "exit_code":0})),
+            let result = match behavior {
+                Behavior::Run => {
+                    let output = std::process::Command::new("/bin/sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .current_dir(&root)
+                        .status()
+                        .unwrap();
+                    assert!(output.success());
+                    Some((
+                        Response::success(
+                            &request_id,
+                            json!({"status":"completed", "exit_code":0}),
+                        ),
+                        String::new(),
+                    ))
+                }
+                Behavior::Refuse => Some((
+                    Response::error(
+                        &request_id,
+                        aft_engine::sandbox_escape::REFUSED_CODE,
+                        aft_engine::sandbox_escape::UNAVAILABLE,
+                    ),
                     String::new(),
-                ))
-            }
+                )),
+                Behavior::Unknown => None,
+            };
+            async move { result }
         })
         .await
     });
@@ -121,27 +175,44 @@ async fn outcome_case(
         request = wait_for_request(&fake) => request,
         done = &mut running => panic!("sandbox escape ended before filing: {done:?}"),
     };
+    if options.end_program {
+        identity.run_scope.get().unwrap().end_for_test();
+    }
     fake.answer(
         request["sandbox_escape"]["call_key"].as_str().unwrap(),
-        answer(&request, state, choice),
+        answer(&request, options.state, options.choice),
     );
     let response = tokio::time::timeout(Duration::from_secs(5), &mut running)
         .await
         .expect("settled sandbox escape call")
         .unwrap()
         .unwrap()
-        .0;
-    assert_eq!(
-        marker.exists(),
-        state == "answered" && choice == Some("run_once")
-    );
+        .map(|result| result.0);
+    let should_run = matches!(behavior, Behavior::Run)
+        && options.state == "answered"
+        && options.choice == Some("run_once")
+        && !options.end_program;
+    assert_eq!(marker.exists(), should_run);
     (response, fake, f)
+}
+
+async fn outcome_case(
+    state: &str,
+    choice: Option<&str>,
+) -> (Option<Response>, Arc<FakeCingulate>, Fixture) {
+    flow(FlowOptions {
+        state,
+        choice,
+        ..Default::default()
+    })
+    .await
 }
 
 #[tokio::test]
 async fn sandbox_escape_run_once_executes_once_and_reports_without_output() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let (response, fake, f) = outcome_case("answered", Some("run_once")).await;
+    let response = response.unwrap();
     assert!(response.success, "{response:?}");
     assert_eq!(
         std::fs::read_to_string(f.dir.path().join("marker-answered")).unwrap(),
@@ -176,6 +247,97 @@ async fn sandbox_escape_run_once_executes_once_and_reports_without_output() {
 }
 
 #[tokio::test]
+async fn sandbox_escape_approved_dispatch_outcomes_use_execution_report_contract() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    for (missing_cwd, reason) in [(false, "refused_at_dispatch"), (true, "target_gone")] {
+        let (response, fake, _f) = flow(FlowOptions {
+            behavior: Behavior::Refuse,
+            missing_cwd,
+            ..Default::default()
+        })
+        .await;
+        assert!(!response.unwrap().success);
+        assert_eq!(
+            fake.calls("consent.report_execution"),
+            [
+                json!({"elicitation_id":"el_1", "execution":"approved_not_executed", "reason":reason})
+            ]
+        );
+    }
+
+    let (response, fake, _f) = flow(FlowOptions {
+        behavior: Behavior::Unknown,
+        ..Default::default()
+    })
+    .await;
+    assert!(response.is_none());
+    assert_eq!(
+        fake.calls("consent.report_execution"),
+        [json!({"elicitation_id":"el_1", "execution":"outcome_unknown"})]
+    );
+
+    let (response, fake, _f) = flow(FlowOptions {
+        behavior: Behavior::Refuse,
+        end_program: true,
+        ..Default::default()
+    })
+    .await;
+    assert!(!response.unwrap().success);
+    assert_eq!(
+        fake.calls("consent.report_execution"),
+        [
+            json!({"elicitation_id":"el_1", "execution":"approved_not_executed", "reason":"session_ended"})
+        ]
+    );
+}
+
+#[tokio::test]
+async fn sandbox_escape_pruned_execution_report_is_not_retried() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let (response, fake, _f) = flow(FlowOptions {
+        refuse_report: true,
+        ..Default::default()
+    })
+    .await;
+    assert!(response.unwrap().success);
+    assert_eq!(fake.calls("consent.report_execution").len(), 1);
+}
+
+#[tokio::test]
+async fn sandbox_escape_without_a_channel_runs_nothing() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    install_test_transport(None);
+    let root = f.ctx.config().project_root.clone().unwrap();
+    let (first, arguments) = request_plan("escape-no-channel", "printf never", &root);
+    let call = held_call(&f, &head(&f), arguments);
+    let response = run_with_consent(call, (first, String::new()), |_route, _grants| async {
+        None
+    })
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        response.data["code"],
+        aft_engine::sandbox_escape::UNAVAILABLE_CODE
+    );
+    assert_eq!(
+        response.data["message"],
+        aft_engine::sandbox_escape::UNAVAILABLE
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
+    assert!(f.fake.calls("consent.report_execution").is_empty());
+    let db = f.ctx.db().unwrap();
+    let conn = db.lock().unwrap();
+    let decision: String = conn
+        .query_row("SELECT decision FROM sandbox_escape_records", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(decision, "unavailable");
+}
+
+#[tokio::test]
 async fn sandbox_escape_decline_and_expiry_run_nothing_and_send_no_report() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     for (state, choice, code, message) in [
@@ -191,8 +353,15 @@ async fn sandbox_escape_decline_and_expiry_run_nothing_and_send_no_report() {
             aft_engine::sandbox_escape::EXPIRED_CODE,
             aft_engine::sandbox_escape::EXPIRED,
         ),
+        (
+            "withdrawn",
+            None,
+            aft_engine::sandbox_escape::WITHDRAWN_CODE,
+            aft_engine::sandbox_escape::WITHDRAWN,
+        ),
     ] {
         let (response, fake, _f) = outcome_case(state, choice).await;
+        let response = response.unwrap();
         assert!(!response.success);
         assert_eq!(response.data["code"], code);
         assert_eq!(response.data["message"], message);
