@@ -288,6 +288,18 @@ describe("OpenCode bash adapter", () => {
     }
   });
 
+  test("forwards the one-time escape reason to AFT", async () => {
+    const { calls, tool: bash } = createHarness(() => ({ success: true, output: "done" }));
+    await bash.execute(
+      { command: "pwd", escape_sandbox: "Use the saved login once" },
+      createMockSdkContext(),
+    );
+    expect(calls[0]?.params).toMatchObject({
+      command: "pwd",
+      escape_sandbox: "Use the saved login once",
+    });
+  });
+
   test("bash runon schema and guidance are absent without available remote execution", () => {
     for (const config of [
       {},
