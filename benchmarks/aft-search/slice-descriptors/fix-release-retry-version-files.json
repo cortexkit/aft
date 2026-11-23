@@ -1,0 +1,13 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "scripts/lib/release_retry.py",
+    "scripts/lib/test_pr_landing.py"
+  ],
+  "slices": [
+    "fix-release-retry-version-files"
+  ],
+  "note": "Release tooling only: the patch-retry check accepts a version bump in any crate or package manifest and lockfile, instead of a fixed path list that predates the crates added in 0.67. No product code changes."
+}
