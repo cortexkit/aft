@@ -8,7 +8,7 @@
 use super::*;
 use crate::db::access_asks::{self as asks, Permission};
 use crate::db::sandbox_escape_records::{self as records, NewRecord};
-use crate::sandbox_escape::{EscapePlan, REFUSED_CODE};
+use aft_engine::sandbox_escape::{EscapePlan, REFUSED_CODE};
 use std::collections::HashMap;
 use subc_protocol::scope::{ScopeKind, ScopeStamp};
 
@@ -47,7 +47,7 @@ impl CardFields {
         if self.call_key.trim().is_empty() {
             return Err("call_key must be nonblank");
         }
-        crate::sandbox_escape::validate_fields(&self.command, &self.reason)
+        aft_engine::sandbox_escape::validate_fields(&self.command, &self.reason)
             .map_or(Ok(()), |refusal| Err(refusal.message))?;
         if !self.cwd.starts_with('/') || self.cwd.contains('\0') {
             return Err("cwd must be an absolute path without NUL");
@@ -55,10 +55,10 @@ impl CardFields {
         if !self.shell.starts_with('/') || self.shell.contains('\0') {
             return Err("shell must be an absolute path without NUL");
         }
-        if crate::sandbox_escape::escaped_level_name(self.escapes_level).is_none() {
+        if aft_engine::sandbox_escape::escaped_level_name(self.escapes_level).is_none() {
             return Err("escapes_level must name a confined level");
         }
-        if !(1..=crate::sandbox_escape::EXPIRES_IN_MS).contains(&self.expires_in_ms) {
+        if !(1..=aft_engine::sandbox_escape::EXPIRES_IN_MS).contains(&self.expires_in_ms) {
             return Err("expires_in_ms is out of range");
         }
         Ok(())
@@ -76,6 +76,24 @@ pub struct RequesterRecord {
     pub sandbox_escape: CardFields,
     #[serde(flatten)]
     pub metadata: serde_json::Map<String, Value>,
+}
+
+/// Phone reads use camelCase chrome but preserve the nested request's
+/// snake_case fields. AFT's contract tests decode those served answers too.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PhoneRecord {
+    pub kind: CardKind,
+    #[serde(rename = "sandboxEscape")]
+    pub sandbox_escape: CardFields,
+    #[serde(flatten)]
+    pub metadata: serde_json::Map<String, Value>,
+}
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum AnswerRecord {
+    Requester(RequesterRecord),
+    Phone(PhoneRecord),
 }
 
 pub fn argument(arguments: &Value) -> Option<&Value> {
@@ -122,22 +140,22 @@ pub fn preflight_response(
     let reason = argument(arguments)?;
     let refuse = |message| Some(Response::error(request_id, REFUSED_CODE, message));
     if consent_identity(identity).is_none() {
-        return refuse(crate::sandbox_escape::HEAD_ONLY);
+        return refuse(aft_engine::sandbox_escape::HEAD_ONLY);
     }
     if remote_requested(arguments) {
-        return refuse(crate::sandbox_escape::LOCAL_ONLY);
+        return refuse(aft_engine::sandbox_escape::LOCAL_ONLY);
     }
     if cfg!(windows) {
-        return refuse(crate::sandbox_escape::WINDOWS_REFUSED);
+        return refuse(aft_engine::sandbox_escape::WINDOWS_REFUSED);
     }
     let Some(reason) = reason.as_str() else {
-        return refuse(crate::sandbox_escape::REASON_INVALID);
+        return refuse(aft_engine::sandbox_escape::REASON_INVALID);
     };
     let command = args(arguments)
         .get("command")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    crate::sandbox_escape::validate_fields(command, reason)
+    aft_engine::sandbox_escape::validate_fields(command, reason)
         .map(|refusal| Response::error(request_id, refusal.code, refusal.message))
 }
 
@@ -146,7 +164,7 @@ pub fn preflight_response(
 /// ordinary Shell row by an older binary, which ignores unknown object fields.
 pub fn requested_permission(response: &Response) -> Option<Permission> {
     if response.success
-        || response.data.get("code")?.as_str()? != crate::sandbox_escape::REQUIRED_CODE
+        || response.data.get("code")?.as_str()? != aft_engine::sandbox_escape::REQUIRED_CODE
     {
         return None;
     }
@@ -167,8 +185,27 @@ pub fn is_escape(permission: &Permission) -> bool {
     matches!(permission, Permission::SandboxEscape { .. })
 }
 
+/// Real sandbox_escape filing stays disabled until Cingulate's approving-device
+/// fix ships. Tests must install the fake explicitly; there is no fallback to
+/// the process's real transport even in a test build.
+pub fn card_transport() -> Option<Arc<dyn ConsentTransport>> {
+    #[cfg(test)]
+    {
+        super::TEST_TRANSPORT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
 pub fn hold_budget(permission: &Permission) -> Option<Duration> {
-    is_escape(permission).then_some(Duration::from_millis(crate::sandbox_escape::EXPIRES_IN_MS))
+    is_escape(permission).then_some(Duration::from_millis(
+        aft_engine::sandbox_escape::EXPIRES_IN_MS,
+    ))
 }
 
 fn fields(call_key: &str, permission: &Permission) -> CardFields {
@@ -192,7 +229,7 @@ fn fields(call_key: &str, permission: &Permission) -> CardFields {
         escapes_level: serde_json::from_value(json!(escapes_level)).expect("valid sandbox level"),
         background: *background,
         reason: reason.clone(),
-        expires_in_ms: crate::sandbox_escape::EXPIRES_IN_MS,
+        expires_in_ms: aft_engine::sandbox_escape::EXPIRES_IN_MS,
     }
 }
 
@@ -230,15 +267,15 @@ pub fn decode_record(record: &Value) -> Result<Settlement, ConsentError> {
                 by_user: true,
             }),
             Some(DECLINE) => Ok(Settlement::Refused(
-                crate::sandbox_escape::DECLINED_CODE.into(),
+                aft_engine::sandbox_escape::DECLINED_CODE.into(),
             )),
             _ => Err(super::malformed("the sandbox escape answer is unknown")),
         },
         "expired" => Ok(Settlement::Refused(
-            crate::sandbox_escape::EXPIRED_CODE.into(),
+            aft_engine::sandbox_escape::EXPIRED_CODE.into(),
         )),
         "withdrawn" => Ok(Settlement::Refused(
-            crate::sandbox_escape::WITHDRAWN_CODE.into(),
+            aft_engine::sandbox_escape::WITHDRAWN_CODE.into(),
         )),
         _ => Err(super::malformed("the sandbox escape state is unknown")),
     }
@@ -383,8 +420,8 @@ pub async fn note_settlement(
     let decision = match settled {
         Settlement::Allow { .. } => RUN_ONCE,
         Settlement::Deny { .. } => DECLINE,
-        Settlement::Refused(code) if code == crate::sandbox_escape::DECLINED_CODE => DECLINE,
-        Settlement::Refused(code) if code == crate::sandbox_escape::EXPIRED_CODE => "expired",
+        Settlement::Refused(code) if code == aft_engine::sandbox_escape::DECLINED_CODE => DECLINE,
+        Settlement::Refused(code) if code == aft_engine::sandbox_escape::EXPIRED_CODE => "expired",
         Settlement::Refused(_) => "withdrawn",
         Settlement::Pending => return,
     };
@@ -400,21 +437,21 @@ pub async fn note_settlement(
 
 fn refusal_for_code(code: &str) -> (&'static str, &'static str) {
     match code {
-        crate::sandbox_escape::DECLINED_CODE | "access_declined" => (
-            crate::sandbox_escape::DECLINED_CODE,
-            crate::sandbox_escape::DECLINED,
+        aft_engine::sandbox_escape::DECLINED_CODE | "access_declined" => (
+            aft_engine::sandbox_escape::DECLINED_CODE,
+            aft_engine::sandbox_escape::DECLINED,
         ),
-        crate::sandbox_escape::EXPIRED_CODE | ACCESS_TIMEOUT => (
-            crate::sandbox_escape::EXPIRED_CODE,
-            crate::sandbox_escape::EXPIRED,
+        aft_engine::sandbox_escape::EXPIRED_CODE | ACCESS_TIMEOUT => (
+            aft_engine::sandbox_escape::EXPIRED_CODE,
+            aft_engine::sandbox_escape::EXPIRED,
         ),
-        crate::sandbox_escape::WITHDRAWN_CODE | "access_withdrawn" => (
-            crate::sandbox_escape::WITHDRAWN_CODE,
-            crate::sandbox_escape::WITHDRAWN,
+        aft_engine::sandbox_escape::WITHDRAWN_CODE | "access_withdrawn" => (
+            aft_engine::sandbox_escape::WITHDRAWN_CODE,
+            aft_engine::sandbox_escape::WITHDRAWN,
         ),
         _ => (
-            crate::sandbox_escape::UNAVAILABLE_CODE,
-            crate::sandbox_escape::UNAVAILABLE,
+            aft_engine::sandbox_escape::UNAVAILABLE_CODE,
+            aft_engine::sandbox_escape::UNAVAILABLE,
         ),
     }
 }
@@ -427,13 +464,13 @@ pub fn refused_answer(call: &HeldCall, code: &str) -> Response {
 pub fn unavailable_answer(call: &HeldCall) -> Response {
     Response::error(
         &call.request_id,
-        crate::sandbox_escape::UNAVAILABLE_CODE,
-        crate::sandbox_escape::UNAVAILABLE,
+        aft_engine::sandbox_escape::UNAVAILABLE_CODE,
+        aft_engine::sandbox_escape::UNAVAILABLE,
     )
 }
 
 pub fn expired_answer(call: &HeldCall) -> Response {
-    refused_answer(call, crate::sandbox_escape::EXPIRED_CODE)
+    refused_answer(call, aft_engine::sandbox_escape::EXPIRED_CODE)
 }
 
 #[derive(Debug)]
@@ -470,9 +507,9 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
             RUN_ONCE
         } else {
             match response_code {
-                Some(crate::sandbox_escape::DECLINED_CODE) => DECLINE,
-                Some(crate::sandbox_escape::EXPIRED_CODE) => "expired",
-                Some(crate::sandbox_escape::WITHDRAWN_CODE) => "withdrawn",
+                Some(aft_engine::sandbox_escape::DECLINED_CODE) => DECLINE,
+                Some(aft_engine::sandbox_escape::EXPIRED_CODE) => "expired",
+                Some(aft_engine::sandbox_escape::WITHDRAWN_CODE) => "withdrawn",
                 Some(_) => "unavailable",
                 None => "withdrawn",
             }
@@ -549,7 +586,7 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
     else {
         return;
     };
-    let Some(transport) = transport() else {
+    let Some(transport) = card_transport() else {
         log::warn!("sandbox escape execution report has no consent transport");
         return;
     };

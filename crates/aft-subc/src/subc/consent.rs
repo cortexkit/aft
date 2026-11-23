@@ -2613,7 +2613,12 @@ async fn hold(
         waiting.remember(call, &prep);
     }
     sandbox_escape::track(call, &prep);
-    let Some(transport) = transport() else {
+    let transport = if sandbox_escape::is_escape(&prep.grant) {
+        sandbox_escape::card_transport()
+    } else {
+        transport()
+    };
+    let Some(transport) = transport else {
         return Hold::Answer(unavailable_answer(
             call,
             &prep.grant,

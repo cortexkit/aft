@@ -2242,7 +2242,7 @@ pub(super) fn submit_deferred_bash(
                 first.0.data["code"].as_str(),
                 Some(
                     crate::protocol::ERROR_PERMISSION_REQUIRED
-                        | crate::sandbox_escape::REQUIRED_CODE
+                        | aft_engine::sandbox_escape::REQUIRED_CODE
                 )
             ) && call_key.is_some()
             {

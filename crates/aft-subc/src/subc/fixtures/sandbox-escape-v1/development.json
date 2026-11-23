@@ -1,0 +1,130 @@
+{
+  "desktop-get": {
+    "method": "consent.get",
+    "params": {
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "result": {
+        "createdAtMs": 1800000000000,
+        "default": "decline",
+        "elicitationId": "el_1",
+        "expiresAtMs": 1800000600000,
+        "facts": [],
+        "kind": "sandbox_escape",
+        "lateExecution": "notify_only",
+        "materialDamage": false,
+        "onExpiry": "deny",
+        "options": [
+          {
+            "effect": "grant",
+            "id": "run_once",
+            "label": "Run once"
+          },
+          {
+            "effect": "decline",
+            "id": "decline",
+            "label": "Don't run"
+          }
+        ],
+        "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+        "requesterLabel": "reserved:aft",
+        "requesterName": "AFT",
+        "sandboxEscape": {
+          "background": true,
+          "call_key": "sample-desktop",
+          "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+          "cwd": "/example/orchard",
+          "escapes_level": "standard",
+          "expires_in_ms": 600000,
+          "reason": "Show the inventory report in the example folder.",
+          "shell": "/example/bin/sh"
+        },
+        "scope": {},
+        "state": "pending",
+        "subject": {
+          "agentId": "agent-lark",
+          "headAgentId": "agent-lark",
+          "label": "Lark"
+        },
+        "target": {
+          "kind": "sandbox_escape",
+          "label": "Shell command"
+        },
+        "title": "Run one command outside the sandbox?",
+        "urgency": "normal"
+      }
+    }
+  },
+  "desktop-run-once": {
+    "method": "consent.answer",
+    "params": {
+      "choiceId": "run_once",
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "result": {
+        "alreadyAnswered": false,
+        "elicitation": {
+          "answeredAtMs": 1800000000000,
+          "answeredChoiceId": "run_once",
+          "answeredDevice": "00000000000000000000000000000000",
+          "createdAtMs": 1800000000000,
+          "default": "decline",
+          "elicitationId": "el_1",
+          "expiresAtMs": 1800000600000,
+          "facts": [],
+          "kind": "sandbox_escape",
+          "lateExecution": "notify_only",
+          "materialDamage": false,
+          "onExpiry": "deny",
+          "options": [
+            {
+              "effect": "grant",
+              "id": "run_once",
+              "label": "Run once"
+            },
+            {
+              "effect": "decline",
+              "id": "decline",
+              "label": "Don't run"
+            }
+          ],
+          "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+          "requesterLabel": "reserved:aft",
+          "requesterName": "AFT",
+          "sandboxEscape": {
+            "background": true,
+            "call_key": "sample-desktop",
+            "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+            "cwd": "/example/orchard",
+            "escapes_level": "standard",
+            "expires_in_ms": 600000,
+            "reason": "Show the inventory report in the example folder.",
+            "shell": "/example/bin/sh"
+          },
+          "scope": {},
+          "state": "answered",
+          "subject": {
+            "agentId": "agent-lark",
+            "headAgentId": "agent-lark",
+            "label": "Lark"
+          },
+          "target": {
+            "kind": "sandbox_escape",
+            "label": "Shell command"
+          },
+          "title": "Run one command outside the sandbox?",
+          "urgency": "normal"
+        },
+        "ok": true
+      }
+    }
+  }
+}

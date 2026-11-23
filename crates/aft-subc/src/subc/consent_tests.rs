@@ -499,6 +499,9 @@ mod program_approvals {
     }
 }
 
+#[path = "sandbox_escape_tests.rs"]
+mod sandbox_escape_tests;
+
 // Consent workflow/vector cases use the consent service's '/'-rooted path
 // contract on Unix, pinned to Cingulate 6bb5f4d. Windows drive and UNC paths
 // have no agreed representation; fail-closed tests below check zero traffic.
@@ -536,15 +539,30 @@ struct FakeState {
     /// for the same id reports `access_withdrawn`, like Cingulate, so a
     /// sibling covered by a folder grant resumes without a second answer.
     withdrawn: std::collections::HashSet<String>,
+    /// Pending card params by sandbox elicitation id.
+    sandbox_requests: HashMap<String, Value>,
     macos: bool,
     cards: HashMap<(String, String), String>,
     next_id: usize,
 }
 
 impl FakeState {
-    fn new_id(&mut self) -> String {
+    fn new_escape_id(&mut self) -> String {
         self.next_id += 1;
-        format!("acc_{}", self.next_id)
+        format!("el_{}", self.next_id)
+    }
+
+    fn sandbox_record(&self, id: &str, state: &str, choice: Option<&str>) -> Value {
+        let request = &self.sandbox_requests[id]["sandbox_escape"];
+        let mut record = json!({
+            "kind": "sandbox_escape",
+            "state": state,
+            "sandbox_escape": request,
+        });
+        if let Some(choice) = choice {
+            record["answered_choice_id"] = json!(choice);
+        }
+        record
     }
 }
 
@@ -555,6 +573,9 @@ impl FakeState {
 #[derive(serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum FakeAccessRequest {
+    SandboxEscape {
+        sandbox_escape: super::sandbox_escape::CardFields,
+    },
     ToolPermission {
         call_key: String,
         tool: String,
@@ -590,6 +611,11 @@ impl FakeAccessRequest {
             .map_err(|error| fake_refusal("elicitation_invalid_request", &error.to_string()))?;
         let invalid = |message| fake_refusal("elicitation_invalid_request", message);
         match &request {
+            Self::SandboxEscape { sandbox_escape } => {
+                sandbox_escape
+                    .validate()
+                    .map_err(|message| invalid(message))?;
+            }
             Self::MacosPermission {
                 folder,
                 program,
@@ -712,6 +738,19 @@ impl FakeCingulate {
         match method {
             "consent.request" => {
                 let key = match FakeAccessRequest::decode(params)? {
+                    FakeAccessRequest::SandboxEscape { sandbox_escape } => {
+                        let key = sandbox_escape.call_key;
+                        let id = match state.asks.get(&key) {
+                            Some(id) => id.clone(),
+                            None => {
+                                let id = state.new_escape_id();
+                                state.asks.insert(key, id.clone());
+                                id
+                            }
+                        };
+                        state.sandbox_requests.insert(id.clone(), params.clone());
+                        return Ok(Some(json!({"elicitation_id":id})));
+                    }
                     FakeAccessRequest::ToolPermission { call_key, .. } => call_key,
                     FakeAccessRequest::MacosPermission {
                         folder, program, ..
@@ -757,6 +796,9 @@ impl FakeCingulate {
                     return Ok(Some(answer.clone()));
                 }
                 if state.withdrawn.contains(id) {
+                    if id.starts_with("el_") {
+                        return Ok(Some(state.sandbox_record(id, "withdrawn", None)));
+                    }
                     return Ok(Some(
                         json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
                     ));
@@ -772,11 +814,26 @@ impl FakeCingulate {
                     if let Some(answer) = state.answers.get(id).cloned() {
                         return Ok(Some(answer));
                     }
+                    if id.starts_with("el_") {
+                        let record = state.sandbox_record(id, "withdrawn", None);
+                        state.withdrawn.insert(id.to_string());
+                        return Ok(Some(record));
+                    }
                     state.withdrawn.insert(id.to_string());
                 }
                 Ok(Some(
                     json!({"state":"refused:access_withdrawn","outcome":"access_withdrawn","code":"access_withdrawn"}),
                 ))
+            }
+            "consent.report_execution" => {
+                let id = params["elicitation_id"].as_str().unwrap();
+                let mut record = state
+                    .answers
+                    .get(id)
+                    .cloned()
+                    .unwrap_or_else(|| state.sandbox_record(id, "answered", Some("run_once")));
+                record["execution"] = params["execution"].clone();
+                Ok(Some(record))
             }
             _ => Ok(Some(
                 json!({"state": "refused:access_withdrawn", "outcome": "access_withdrawn", "code": "access_withdrawn"}),
@@ -820,6 +877,14 @@ impl ConsentTransport for SharedFake {
                 // An open ask long-polls until it settles or the wait ends.
                 fake.state.lock().unwrap().calls.pop();
                 if Instant::now() >= end {
+                    let id = params["elicitation_id"].as_str().unwrap_or_default();
+                    if id.starts_with("el_") {
+                        break fake
+                            .state
+                            .lock()
+                            .unwrap()
+                            .sandbox_record(id, "pending", None);
+                    }
                     break json!({"state": "pending:head"});
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

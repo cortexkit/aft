@@ -1,0 +1,717 @@
+{
+  "answer-at-expiry": {
+    "method": "consent.answer",
+    "params": {
+      "choiceId": "run_once",
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_4"
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_expired",
+        "message": "elicitation_expired: sandbox_escape deadline has passed"
+      }
+    }
+  },
+  "control-character": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "invalid-example",
+        "command": "printf example\u001b",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_invalid_request",
+        "message": "invalid sandbox_escape command control character"
+      }
+    }
+  },
+  "decline": {
+    "method": "consent.answer",
+    "params": {
+      "choiceId": "decline",
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_2"
+    },
+    "reply": {
+      "result": {
+        "alreadyAnswered": false,
+        "elicitation": {
+          "answeredAtMs": 1800000000000,
+          "answeredChoiceId": "decline",
+          "answeredDevice": "48ec112eb467c1045fbd00e05cc64f67",
+          "createdAtMs": 1800000000000,
+          "default": "decline",
+          "elicitationId": "el_2",
+          "expiresAtMs": 1800000600000,
+          "facts": [],
+          "kind": "sandbox_escape",
+          "lateExecution": "notify_only",
+          "materialDamage": false,
+          "onExpiry": "deny",
+          "options": [
+            {
+              "effect": "grant",
+              "id": "run_once",
+              "label": "Run once"
+            },
+            {
+              "effect": "decline",
+              "id": "decline",
+              "label": "Don't run"
+            }
+          ],
+          "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+          "requesterLabel": "reserved:aft",
+          "requesterName": "AFT",
+          "sandboxEscape": {
+            "background": true,
+            "call_key": "sample-decline",
+            "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+            "cwd": "/example/orchard",
+            "escapes_level": "standard",
+            "expires_in_ms": 600000,
+            "reason": "Show the inventory report in the example folder.",
+            "shell": "/example/bin/sh"
+          },
+          "scope": {},
+          "state": "answered",
+          "subject": {
+            "agentId": "agent-lark",
+            "headAgentId": "agent-lark",
+            "label": "Lark"
+          },
+          "target": {
+            "kind": "sandbox_escape",
+            "label": "Shell command"
+          },
+          "title": "Run one command outside the sandbox?",
+          "urgency": "normal"
+        },
+        "ok": true
+      }
+    }
+  },
+  "desktop-answer-refused": {
+    "method": "consent.answer",
+    "params": {
+      "choiceId": "run_once",
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_sandbox_escape_approval_required",
+        "message": "sandbox escape requires an approving device with clientFeatures sandbox-escape-approval"
+      }
+    }
+  },
+  "desktop-get": {
+    "method": "consent.get",
+    "params": {
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "result": {
+        "createdAtMs": 1800000000000,
+        "default": "decline",
+        "elicitationId": "el_1",
+        "expiresAtMs": 1800000600000,
+        "facts": [],
+        "kind": "sandbox_escape",
+        "lateExecution": "notify_only",
+        "materialDamage": false,
+        "onExpiry": "deny",
+        "options": [
+          {
+            "effect": "grant",
+            "id": "run_once",
+            "label": "Run once"
+          },
+          {
+            "effect": "decline",
+            "id": "decline",
+            "label": "Don't run"
+          }
+        ],
+        "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+        "requesterLabel": "reserved:aft",
+        "requesterName": "AFT",
+        "sandboxEscape": {
+          "background": true,
+          "call_key": "sample-worker",
+          "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+          "cwd": "/example/orchard",
+          "escapes_level": "standard",
+          "expires_in_ms": 600000,
+          "reason": "Show the inventory report in the example folder.",
+          "shell": "/example/bin/sh"
+        },
+        "scope": {},
+        "state": "pending",
+        "subject": {
+          "agentId": "agent-lark",
+          "headAgentId": "agent-lark",
+          "label": "Lark",
+          "viaWorker": true
+        },
+        "target": {
+          "kind": "sandbox_escape",
+          "label": "Shell command"
+        },
+        "title": "Run one command outside the sandbox?",
+        "urgency": "normal"
+      }
+    }
+  },
+  "file-worker": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "sample-worker",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "result": {
+        "elicitation_id": "el_1"
+      }
+    }
+  },
+  "head-answer-refused": {
+    "method": "consent.answer",
+    "params": {
+      "choiceId": "run_once",
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_operator_required",
+        "message": "operator surface required"
+      }
+    }
+  },
+  "long-command": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "invalid-example",
+        "command": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_invalid_request",
+        "message": "invalid sandbox_escape command length"
+      }
+    }
+  },
+  "long-expiry": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "invalid-example",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600001,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_invalid_request",
+        "message": "invalid sandbox_escape expires_in_ms"
+      }
+    }
+  },
+  "missing-agent-stamp": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "no-stamp",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_requester_refused",
+        "message": "requester reserved:aft is refused"
+      }
+    }
+  },
+  "phone-get": {
+    "method": "consent.get",
+    "params": {
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "result": {
+        "createdAtMs": 1800000000000,
+        "default": "decline",
+        "elicitationId": "el_1",
+        "expiresAtMs": 1800000600000,
+        "facts": [],
+        "kind": "sandbox_escape",
+        "lateExecution": "notify_only",
+        "materialDamage": false,
+        "onExpiry": "deny",
+        "options": [
+          {
+            "effect": "grant",
+            "id": "run_once",
+            "label": "Run once"
+          },
+          {
+            "effect": "decline",
+            "id": "decline",
+            "label": "Don't run"
+          }
+        ],
+        "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+        "requesterLabel": "reserved:aft",
+        "requesterName": "AFT",
+        "sandboxEscape": {
+          "background": true,
+          "call_key": "sample-worker",
+          "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+          "cwd": "/example/orchard",
+          "escapes_level": "standard",
+          "expires_in_ms": 600000,
+          "reason": "Show the inventory report in the example folder.",
+          "shell": "/example/bin/sh"
+        },
+        "scope": {},
+        "state": "pending",
+        "subject": {
+          "agentId": "agent-lark",
+          "headAgentId": "agent-lark",
+          "label": "Lark",
+          "viaWorker": true
+        },
+        "target": {
+          "kind": "sandbox_escape",
+          "label": "Shell command"
+        },
+        "title": "Run one command outside the sandbox?",
+        "urgency": "normal"
+      }
+    }
+  },
+  "relative-cwd": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "invalid-example",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_invalid_request",
+        "message": "invalid sandbox_escape cwd"
+      }
+    }
+  },
+  "replay": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "sample-worker",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "result": {
+        "elicitation_id": "el_1"
+      }
+    }
+  },
+  "report-execution": {
+    "method": "consent.report_execution",
+    "params": {
+      "elicitation_id": "el_1",
+      "execution": "executed"
+    },
+    "reply": {
+      "result": {
+        "answered_at_ms": 1800000000000,
+        "answered_choice_id": "run_once",
+        "answered_device": "48ec112eb467c1045fbd00e05cc64f67",
+        "created_at_ms": 1800000000000,
+        "default": "decline",
+        "elicitation_id": "el_1",
+        "execution": "executed",
+        "expires_at_ms": 1800000600000,
+        "facts": [],
+        "kind": "sandbox_escape",
+        "late_execution": "notify_only",
+        "material_damage": false,
+        "on_expiry": "deny",
+        "options": [
+          {
+            "effect": "grant",
+            "id": "run_once",
+            "label": "Run once"
+          },
+          {
+            "effect": "decline",
+            "id": "decline",
+            "label": "Don't run"
+          }
+        ],
+        "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+        "requester_label": "reserved:aft",
+        "sandbox_escape": {
+          "background": true,
+          "call_key": "sample-worker",
+          "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+          "cwd": "/example/orchard",
+          "escapes_level": "standard",
+          "expires_in_ms": 600000,
+          "reason": "Show the inventory report in the example folder.",
+          "shell": "/example/bin/sh"
+        },
+        "scope": {},
+        "state": "answered",
+        "subject": {
+          "agent_id": "agent-lark",
+          "head_agent_id": "agent-lark",
+          "label": "Lark",
+          "via_worker": true
+        },
+        "target": {
+          "kind": "sandbox_escape",
+          "label": "Shell command"
+        },
+        "title": "Run one command outside the sandbox?",
+        "urgency": "normal"
+      }
+    }
+  },
+  "requester-expired": {
+    "method": "consent.await",
+    "params": {
+      "elicitation_id": "el_4",
+      "timeout_ms": 0
+    },
+    "reply": {
+      "result": {
+        "answered_at_ms": 1800000600000,
+        "created_at_ms": 1800000000000,
+        "default": "decline",
+        "elicitation_id": "el_4",
+        "expires_at_ms": 1800000600000,
+        "facts": [],
+        "kind": "sandbox_escape",
+        "late_execution": "notify_only",
+        "material_damage": false,
+        "on_expiry": "deny",
+        "options": [
+          {
+            "effect": "grant",
+            "id": "run_once",
+            "label": "Run once"
+          },
+          {
+            "effect": "decline",
+            "id": "decline",
+            "label": "Don't run"
+          }
+        ],
+        "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+        "requester_label": "reserved:aft",
+        "sandbox_escape": {
+          "background": true,
+          "call_key": "sample-expire",
+          "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+          "cwd": "/example/orchard",
+          "escapes_level": "standard",
+          "expires_in_ms": 600000,
+          "reason": "Show the inventory report in the example folder.",
+          "shell": "/example/bin/sh"
+        },
+        "scope": {},
+        "state": "expired",
+        "subject": {
+          "agent_id": "agent-lark",
+          "head_agent_id": "agent-lark",
+          "label": "Lark"
+        },
+        "target": {
+          "kind": "sandbox_escape",
+          "label": "Shell command"
+        },
+        "title": "Run one command outside the sandbox?",
+        "urgency": "normal"
+      }
+    }
+  },
+  "run-once": {
+    "method": "consent.answer",
+    "params": {
+      "choiceId": "run_once",
+      "clientFeatures": [
+        "sandbox-escape-approval"
+      ],
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "result": {
+        "alreadyAnswered": false,
+        "elicitation": {
+          "answeredAtMs": 1800000000000,
+          "answeredChoiceId": "run_once",
+          "answeredDevice": "48ec112eb467c1045fbd00e05cc64f67",
+          "createdAtMs": 1800000000000,
+          "default": "decline",
+          "elicitationId": "el_1",
+          "expiresAtMs": 1800000600000,
+          "facts": [],
+          "kind": "sandbox_escape",
+          "lateExecution": "notify_only",
+          "materialDamage": false,
+          "onExpiry": "deny",
+          "options": [
+            {
+              "effect": "grant",
+              "id": "run_once",
+              "label": "Run once"
+            },
+            {
+              "effect": "decline",
+              "id": "decline",
+              "label": "Don't run"
+            }
+          ],
+          "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+          "requesterLabel": "reserved:aft",
+          "requesterName": "AFT",
+          "sandboxEscape": {
+            "background": true,
+            "call_key": "sample-worker",
+            "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+            "cwd": "/example/orchard",
+            "escapes_level": "standard",
+            "expires_in_ms": 600000,
+            "reason": "Show the inventory report in the example folder.",
+            "shell": "/example/bin/sh"
+          },
+          "scope": {},
+          "state": "answered",
+          "subject": {
+            "agentId": "agent-lark",
+            "headAgentId": "agent-lark",
+            "label": "Lark",
+            "viaWorker": true
+          },
+          "target": {
+            "kind": "sandbox_escape",
+            "label": "Shell command"
+          },
+          "title": "Run one command outside the sandbox?",
+          "urgency": "normal"
+        },
+        "ok": true
+      }
+    }
+  },
+  "text-direction": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "invalid-example",
+        "command": "printf example‮",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_invalid_request",
+        "message": "invalid sandbox_escape command text direction"
+      }
+    }
+  },
+  "unknown-key": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "agent_id": "untrusted-agent",
+        "background": true,
+        "call_key": "invalid-example",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_invalid_request",
+        "message": "invalid sandbox_escape fields"
+      }
+    }
+  },
+  "unsupported-get": {
+    "method": "consent.get",
+    "params": {
+      "elicitationId": "el_1"
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_not_found",
+        "message": "elicitation not found"
+      }
+    }
+  },
+  "withdraw": {
+    "method": "consent.withdraw",
+    "params": {
+      "elicitation_id": "el_3"
+    },
+    "reply": {
+      "result": {
+        "answered_at_ms": 1800000000000,
+        "created_at_ms": 1800000000000,
+        "default": "decline",
+        "elicitation_id": "el_3",
+        "expires_at_ms": 1800000600000,
+        "facts": [],
+        "kind": "sandbox_escape",
+        "late_execution": "notify_only",
+        "material_damage": false,
+        "on_expiry": "deny",
+        "options": [
+          {
+            "effect": "grant",
+            "id": "run_once",
+            "label": "Run once"
+          },
+          {
+            "effect": "decline",
+            "id": "decline",
+            "label": "Don't run"
+          }
+        ],
+        "prompt": "Runs outside the Standard sandbox, with full access to your logins and files.",
+        "requester_label": "reserved:aft",
+        "sandbox_escape": {
+          "background": true,
+          "call_key": "sample-withdraw",
+          "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+          "cwd": "/example/orchard",
+          "escapes_level": "standard",
+          "expires_in_ms": 600000,
+          "reason": "Show the inventory report in the example folder.",
+          "shell": "/example/bin/sh"
+        },
+        "scope": {},
+        "state": "withdrawn",
+        "subject": {
+          "agent_id": "agent-lark",
+          "head_agent_id": "agent-lark",
+          "label": "Lark"
+        },
+        "target": {
+          "kind": "sandbox_escape",
+          "label": "Shell command"
+        },
+        "title": "Run one command outside the sandbox?",
+        "urgency": "normal"
+      }
+    }
+  },
+  "wrong-filer": {
+    "method": "consent.request",
+    "params": {
+      "kind": "sandbox_escape",
+      "sandbox_escape": {
+        "background": true,
+        "call_key": "wrong-filer",
+        "command": "  printf '%s\\n' 'Garden inventory'\n\tprintf '%s\\n' 'End of example'  ",
+        "cwd": "/example/orchard",
+        "escapes_level": "standard",
+        "expires_in_ms": 600000,
+        "reason": "Show the inventory report in the example folder.",
+        "shell": "/example/bin/sh"
+      }
+    },
+    "reply": {
+      "error": {
+        "code": "elicitation_requester_refused",
+        "message": "requester reserved:broca is refused"
+      }
+    }
+  }
+}
