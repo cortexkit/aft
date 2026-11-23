@@ -10,7 +10,7 @@ fn sandbox_escape_grant_outlives_the_ordinary_host_prompt_window() {
     let mut config = crate::config::Config::default();
     config.project_root = Some(root.clone());
     config.storage_dir = Some(storage.clone());
-    let ctx = crate::test_context(Box::new(crate::parser::TreeSitterProvider::new()), config);
+    let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     let principal = AuthenticatedPrincipal::FirstParty;
     let environment = approved_payload_environment(&HashMap::new(), &fixture.path().join("tmp"));
     let id = mint_host_escalation_grant(
