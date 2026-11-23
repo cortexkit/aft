@@ -13,6 +13,7 @@ fi
 # Usage:
 #   ./scripts/release.sh 0.2.0        # release v0.2.0
 #   ./scripts/release.sh 0.2.0 --dry  # preview without committing/pushing
+#   ./scripts/release.sh 0.2.0 --tag-commit <sha>  # resume: tag a later test-only fix
 #   ./scripts/release.sh --retry-from v0.2.0 0.2.1 --fix <commit> [--fix <commit> ...] [--notes-file <path>]
 #
 # What it does:
@@ -22,17 +23,22 @@ fi
 #   4. Commits the version bump
 #   5. Opens the release PR and waits for queue integration
 #   6. Checks the merge-queue or main push run for the exact final merge commit, then tags it
+#      (--tag-commit: a later main commit that changes only tests, checked the same way)
 #   7. CI takes over: gate on that green tests.yml run → build → publish npm +
 #      GitHub release (release.yml does not rerun the tests)
 
 VERSION="${1:-}"
 DRY=""
 LEGACY_ARGS=()
+TAG_ARGS=()
 if [[ $# -gt 0 ]]; then shift; fi
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry) DRY=--dry ;;
     --legacy-merge) LEGACY_ARGS+=(--legacy-merge) ;;
+    --tag-commit)
+      if [[ $# -lt 2 ]]; then echo "--tag-commit needs a commit" >&2; exit 2; fi
+      TAG_ARGS+=(--tag-commit "$2"); shift ;;
     *) echo "Unknown release option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -51,16 +57,25 @@ fi
 
 TAG="v$VERSION"
 RESUME_RELEASE=0
+# The helper comes from the checkout running the release, not from the
+# worktree: resuming checks out the release branch there, and that branch's
+# copy of the release tooling can predate a tooling change the resume needs.
+RELEASE_QUEUE="$(cd "$(dirname "$0")" && pwd)/lib/release_queue.py"
 
 RELEASE_STATE="$(git rev-parse --git-common-dir)/aft-release/$TAG.json"
 if [[ -f "$RELEASE_STATE" ]]; then
-  PHASE=$(python3 scripts/lib/release_queue.py phase "$VERSION")
+  PHASE=$(python3 "$RELEASE_QUEUE" phase "$VERSION")
   if [[ "$PHASE" == prepared ]]; then RESUME_RELEASE=1; fi
 else
   if git show-ref --verify --quiet "refs/tags/$TAG" || git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
     echo "Error: tag '$TAG' exists without this release's PR checkpoint; refusing to reuse it" >&2
     exit 1
   fi
+fi
+
+if [[ ${#TAG_ARGS[@]} -gt 0 && "$RESUME_RELEASE" != 1 ]]; then
+  echo "Error: --tag-commit only resumes a release whose PR already landed" >&2
+  exit 1
 fi
 
 # Check for clean working tree
@@ -72,7 +87,7 @@ fi
 
 # Resume only the saved dedicated branch; never manufacture a second bump/PR.
 if [[ -f "$RELEASE_STATE" && "$DRY" != --dry ]]; then
-  python3 scripts/lib/release_queue.py resume "$VERSION"
+  python3 "$RELEASE_QUEUE" resume "$VERSION"
 fi
 BRANCH=$(git branch --show-current)
 if [[ ! -f "$RELEASE_STATE" && "$BRANCH" != main && -n "$BRANCH" ]]; then
@@ -88,7 +103,8 @@ echo ""
 push_release() {
   echo "→ Landing the release PR, checking exact-SHA queue or main push CI, then tagging..."
   # macOS ships bash 3.2, where "${arr[@]}" of an empty array fails under set -u.
-  python3 scripts/lib/release_queue.py publish "$VERSION" ${LEGACY_ARGS[@]+"${LEGACY_ARGS[@]}"}
+  python3 "$RELEASE_QUEUE" publish "$VERSION" ${LEGACY_ARGS[@]+"${LEGACY_ARGS[@]}"} \
+    ${TAG_ARGS[@]+"${TAG_ARGS[@]}"}
   echo "  ✓ Released $TAG"
   echo "  → GitHub Actions will now: enforce exact-SHA release gate → build → publish"
 }
@@ -199,7 +215,7 @@ if [[ "$DRY" == "--dry" ]]; then
 fi
 
 if [[ ! -f "$RELEASE_STATE" ]]; then
-  python3 scripts/lib/release_queue.py start "$VERSION"
+  python3 "$RELEASE_QUEUE" start "$VERSION"
 fi
 
 # Attribution is explicit because operators may prepare a release without the
@@ -420,7 +436,7 @@ if [[ -f "$gate_script" ]]; then
   ) || { echo "Error: committed release candidate failed publication gates"; exit 1; }
 fi
 
-python3 scripts/lib/release_queue.py checkpoint "$VERSION"
+python3 "$RELEASE_QUEUE" checkpoint "$VERSION"
 
 # Build the prepared bump locally; create no tag before final main CI succeeds.
 echo "→ Rebuilding local binary with new version..."
