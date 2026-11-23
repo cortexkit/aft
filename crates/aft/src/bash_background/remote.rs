@@ -930,6 +930,8 @@ pub(crate) struct RemoteTask {
     pub stderr_len: u64,
     #[serde(default)]
     pub unknown_len: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub output_limit_dropped_bytes: u64,
     pub cancel_requested: bool,
     /// A cancellation the runner still has to be sent (or to answer): set,
     /// with `cancel_requested`, before an owner pause marks the task
@@ -999,6 +1001,10 @@ pub(crate) struct RemoteTask {
     /// could not fill them: lost output or differently sized chunks.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub expired_gap_unverified: Vec<(u64, u64)>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1356,6 +1362,7 @@ struct OutputProgress {
     stdout_len: u64,
     stderr_len: u64,
     unknown_len: u64,
+    output_limit_dropped_bytes: u64,
 }
 
 #[cfg(unix)]
@@ -1366,6 +1373,7 @@ impl OutputProgress {
             stdout_len: remote.stdout_len,
             stderr_len: remote.stderr_len,
             unknown_len: remote.unknown_len,
+            output_limit_dropped_bytes: remote.output_limit_dropped_bytes,
         }
     }
 
@@ -1374,6 +1382,7 @@ impl OutputProgress {
         remote.stdout_len = self.stdout_len;
         remote.stderr_len = self.stderr_len;
         remote.unknown_len = self.unknown_len;
+        remote.output_limit_dropped_bytes = self.output_limit_dropped_bytes;
     }
 }
 
@@ -1818,6 +1827,7 @@ pub(super) fn terminal_metadata_from_proof(metadata: &mut PersistedTask) -> Opti
     let reason = remote_oom_kill(metadata)
         .map(|oom| oom.message())
         .or(reason);
+    let reason = source_cancel::output_limit_reason(metadata, &status).or(reason);
     metadata.mark_terminal(status, code, reason);
     Some(())
 }
@@ -2095,6 +2105,9 @@ impl OutputSink for TaskSink {
         } else {
             self.output_progress.stderr_len
         };
+        if self.drop_output_over_limit(seq, Some(stream), offset, bytes.len() as u64)? {
+            return Ok(());
+        }
         let file = if stdout {
             &mut self.stdout
         } else {
@@ -2132,6 +2145,9 @@ impl OutputSink for TaskSink {
     }
     fn unknown_output(&mut self, seq: u64, bytes: &[u8]) -> io::Result<()> {
         let offset = self.output_progress.unknown_len;
+        if self.drop_output_over_limit(seq, None, offset, bytes.len() as u64)? {
+            return Ok(());
+        }
         if !bytes.is_empty() {
             if self.unknown.is_none() {
                 let layout = resolve_task_layout(&self.task.paths.session_dir, &self.task.task_id)?;
@@ -2859,6 +2875,7 @@ impl BgTaskRegistry {
             stdout_len: 0,
             stderr_len: 0,
             unknown_len: 0,
+            output_limit_dropped_bytes: 0,
             cancel_requested: false,
             cancel_pending: false,
             owner_pause_cancel: None,
@@ -4744,6 +4761,7 @@ impl BgTaskRegistry {
             {
                 reason = state.metadata.status_reason.clone();
             }
+            reason = source_cancel::output_limit_reason(&state.metadata, &status).or(reason);
             let status_label = format!("{status:?}");
             state.metadata.mark_terminal(status, code, reason.clone());
             // Remote execution has no local shell wrapper to write markers.
@@ -4782,111 +4800,6 @@ impl BgTaskRegistry {
         let _ = self.inner.wake_tx.try_send(());
     }
 
-    fn record_remote_cancel(&self, task: &Arc<BgTask>) -> Result<bool, String> {
-        self.record_remote_cancel_owed(task, false)
-    }
-
-    /// Record the cancellation intent on a remote task that is not finished
-    /// yet, and wake its worker. With `owed`, also record that the runner
-    /// is still owed the cancel (`RemoteTask::cancel_pending`), in the same
-    /// write: a caller about to mark the task finished before the worker has
-    /// sent it must leave that debt in the saved record. Nothing is owed for
-    /// a job the runner already reported a terminal for. Returns false when
-    /// the task runs locally.
-    pub(super) fn record_remote_cancel_owed(
-        &self,
-        task: &Arc<BgTask>,
-        owed: bool,
-    ) -> Result<bool, String> {
-        {
-            let mut db = DeferredDbWrites::new(self, task);
-            let mut state = task.state.lock().map_err(|_| "task lock poisoned")?;
-            if !state.metadata.is_terminal() {
-                let Some(remote) = state.metadata.remote.as_mut() else {
-                    return Ok(false);
-                };
-                remote.cancel_requested = true;
-                if owed && remote.terminal.is_none() {
-                    // Indexed before the record says so (see
-                    // `write_owed_cancel_marker`).
-                    write_owed_cancel_marker(&task.paths);
-                    remote.cancel_pending = true;
-                }
-                self.persist_task_locked(task, &state.metadata, &mut db)
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-        task.remote_cancel_notify.notify_one();
-        Ok(true)
-    }
-
-    pub(super) fn kill_remote_task(&self, task: &Arc<BgTask>) -> Result<BgTaskSnapshot, String> {
-        let metadata = task
-            .lock_state()
-            .map_err(|_| "task lock poisoned")?
-            .metadata
-            .clone();
-        if let Some(job_id) = unknown_remote_cancel_job(&metadata) {
-            // The original follower has stopped. Probe cancellation separately,
-            // without replacing its saved unknown outcome with an acknowledgement.
-            let bound = remote_kill_settle_bound().min(ReattachBudget::until_job_end(&metadata).0);
-            let result = std::thread::scope(|scope| {
-                scope
-                    .spawn(|| {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_all()
-                            .build()
-                            .map_err(|error| error.to_string())?;
-                        runtime.block_on(async {
-                            tokio::time::timeout(bound, cancel_unknown_remote(&metadata, job_id))
-                                .await
-                                .map_err(|_| "runner confirmation timed out".to_string())?
-                        })
-                    })
-                    .join()
-            })
-            .unwrap_or_else(|_| Err("runner cancellation probe stopped".into()));
-            let mut snapshot = self.snapshot_with_terminal_cache(task, 8 * 1024);
-            snapshot.remote_cancel = Some(result.unwrap_or_else(|error| {
-                format!("remote cancellation unconfirmed; outcome is still unknown: {error}")
-            }));
-            return Ok(snapshot);
-        }
-        if !self.record_remote_cancel(task)? {
-            return self.kill(&task.task_id, &task.session_id);
-        }
-        let bound = remote_kill_settle_bound();
-        let state = task.state.lock().map_err(|_| "task lock poisoned")?;
-        let (state, _) = task
-            .kill_settled
-            .wait_timeout_while(state, bound, |s| !s.metadata.is_terminal())
-            .map_err(|_| "task lock poisoned")?;
-        if !state.metadata.is_terminal() {
-            if state
-                .metadata
-                .remote
-                .as_ref()
-                .is_some_and(|remote| remote.job_id.is_none())
-            {
-                return Err(format!(
-                    "remote cancellation pending for task {}; no job id was received, so the job may still run; AFT will cancel it when its job id arrives; inspect bash_status (never rerun)",
-                    task.task_id,
-                ));
-            }
-            let job_id = state
-                .metadata
-                .remote
-                .as_ref()
-                .and_then(|remote| remote.job_id)
-                .unwrap();
-            return Err(format!(
-                "remote cancellation pending for job {job_id}; the job may still run until the build server confirms it stopped; inspect bash_status (never rerun)"
-            ));
-        }
-        drop(state);
-        Ok(self.snapshot_with_terminal_cache(task, 8 * 1024))
-    }
-
     /// Record an owner's pause on a remote task before `bash.kill_scope`
     /// stops anything: the pause reason, the cancellation intent and the
     /// cancel the runner is owed, in one write. From then on its worker
@@ -4914,10 +4827,14 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    pub(super) fn record_owner_pause_remote(&self, task: &Arc<BgTask>) -> Result<(), String> {
+    pub(super) fn record_owner_pause_remote(
+        &self,
+        task: &Arc<BgTask>,
+        saves: &mut KillStateSave,
+    ) -> Result<(), String> {
         // The task is marked finished below, before its worker can have sent
         // the cancellation; the saved record keeps it owed until then.
-        self.record_remote_cancel_owed(task, true)?;
+        self.record_remote_cancel_with_saves(task, true, saves)?;
         self.remote_terminal(task, Verdict::Cancelled, None);
         Ok(())
     }
@@ -6142,3 +6059,7 @@ pub(crate) use tests::{
     captured_task_after_losing_replay_for_test, uncaptured_terminal_before_render_for_test,
     uncaptured_unknown_before_render_for_test,
 };
+
+#[cfg(unix)]
+#[path = "remote/source_cancel.rs"]
+mod source_cancel;

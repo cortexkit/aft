@@ -258,6 +258,47 @@ fn bash_kill_names_a_survivor_the_group_kill_could_not_reach() {
     );
 }
 
+#[test]
+fn bash_kill_stops_the_group_when_saving_killing_fails() {
+    use super::super::persistence::{with_task_io_fault, TaskIoFault};
+
+    let registry = registry();
+    let dir = tempfile::tempdir().unwrap();
+    let task_id = spawn_for_kill(
+        &registry,
+        dir.path(),
+        "sleep 30 & echo $! > child.tmp && mv child.tmp child.pid; wait",
+    );
+    let pgid = task_pgid(&registry, &task_id);
+    let _reap = ReapGroup(pgid);
+    let pid_file = dir.path().join("child.pid");
+    wait_for_file(&pid_file, "the descendant did not start");
+    let child_pid = fs::read_to_string(pid_file)
+        .unwrap()
+        .trim()
+        .parse::<i32>()
+        .unwrap();
+    assert_eq!(unsafe { libc::getpgid(child_pid) }, pgid);
+
+    let result = with_task_io_fault(TaskIoFault::KillingEnospc, || {
+        registry.kill(&task_id, SESSION)
+    });
+    assert!(
+        live_process_group_members(pgid).is_ok_and(|group| group.is_clean()),
+        "the process group is still running: {result:?}"
+    );
+    let stopped = result.unwrap();
+    assert_eq!(stopped.info.status, BgTaskStatus::Killed);
+    let warning = stopped.kill_state_warning.unwrap();
+    assert_eq!(
+        warning,
+        "The command was stopped, but AFT could not save its state: No space left on device."
+    );
+    let second = registry.kill(&task_id, SESSION).unwrap();
+    assert!(!second.kill_signaled);
+    assert!(second.kill_state_warning.is_none());
+}
+
 /// A command that finished on its own but left a TERM-ignoring process in
 /// its group: `bash_kill` signals that survivor, and if it is still running
 /// afterwards the task says it survived the kill.

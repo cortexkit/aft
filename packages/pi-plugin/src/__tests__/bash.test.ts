@@ -2234,7 +2234,8 @@ describe("bash tool adapter", () => {
     }
   });
 
-  test("bash_kill preserves its outcome and appends the durable-revocation warning", async () => {
+  test("bash_kill preserves its outcome and appends each warning", async () => {
+    const stateWarning = "The command was stopped, but AFT could not save its state: disk full.";
     const warning =
       "bot_write_revocation_not_durable: the block on this command's bot writes was not saved and lasts only until AFT restarts; check the command's state.";
     const tools = new Map<string, MockToolDef>();
@@ -2242,6 +2243,7 @@ describe("bash tool adapter", () => {
       send: async () => ({
         success: true,
         status: "killed",
+        kill_state_warning: stateWarning,
         bot_write_revocation_warning: warning,
       }),
     } as unknown as BinaryBridge;
@@ -2250,7 +2252,7 @@ describe("bash tool adapter", () => {
       .get("bash_kill")!
       .execute("call", { task_id: "bash-warning" }, undefined, undefined, { cwd: projectRoot });
     expect((result.content[0] as { text: string }).text).toBe(
-      `Task bash-warning: killed\n${warning}`,
+      `Task bash-warning: killed\n${stateWarning}\n${warning}`,
     );
   });
 

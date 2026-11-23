@@ -2176,6 +2176,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -4237,26 +4238,8 @@ async fn exec_remote_bash_kill_inside_tool_call_budget_returns_prompt_terminal()
     assert!(done.info.status_reason.unwrap().contains("cancel"));
 }
 
-#[tokio::test]
-async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
-    let daemon = daemon(Script::Continuous, "exec-remote/v1").await;
-    let dir = tempfile::tempdir().unwrap();
-    let registry = registry();
-    let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let task = registry.task(&task_id).unwrap();
-    // Cancel during active output without waiting for a coalesced durable checkpoint.
-    wait_for(
-        "continuous output must be consumed before cancelling",
-        || (fs::metadata(&task.paths.stdout).unwrap().len() >= 11).then_some(()),
-    )
-    .await;
-    assert!(registry.record_remote_cancel(&task).unwrap());
-    daemon.wait_for_requests("exec.cancel", 1).await;
-    assert_eq!(
-        terminal(&registry, &task_id).await.info.status,
-        BgTaskStatus::Killed
-    );
-}
+#[path = "remote_tests/output_limit.rs"]
+mod output_limit;
 
 #[tokio::test]
 async fn exec_remote_launch_is_fenced_by_a_refused_startup_receipt() {
@@ -4803,6 +4786,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -9216,6 +9200,7 @@ fn remote_phase_comes_from_runner_evidence() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -9547,6 +9532,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -10020,6 +10006,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -17016,6 +17003,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,

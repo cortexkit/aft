@@ -82,6 +82,7 @@ pub(super) fn persist_accepted_with_snapshot_scope(
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,

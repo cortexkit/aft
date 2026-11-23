@@ -1405,7 +1405,7 @@ fn format_bash_status(
 // consumers show the model the same text.
 fn format_bash_kill(data: &Value) -> String {
     let task_id = bash_task_id(data);
-    let outcome = if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
+    let mut outcome = if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
         let reached = data
             .get("kill_reached")
             .and_then(Value::as_u64)
@@ -1422,13 +1422,13 @@ fn format_bash_kill(data: &Value) -> String {
             format!("Task {task_id}: {status}")
         }
     };
-    match data
-        .get("bot_write_revocation_warning")
-        .and_then(Value::as_str)
-    {
-        Some(warning) => format!("{outcome}\n{warning}"),
-        None => outcome,
+    for key in ["kill_state_warning", "bot_write_revocation_warning"] {
+        if let Some(warning) = data.get(key).and_then(Value::as_str) {
+            outcome.push('\n');
+            outcome.push_str(warning);
+        }
     }
+    outcome
 }
 
 // Formats a PTY write result exactly as the OpenCode tool does
@@ -6127,13 +6127,14 @@ mod bot_kill_warning_tests {
     use super::*;
     #[test]
     fn kill_warning_keeps_the_reported_kill_outcome_first() {
+        let state_warning = "The command was stopped, but AFT could not save its state: disk full.";
         let text = format_bash_kill(
-            &serde_json::json!({"task_id":"bash-warning","status":"killed","bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
+            &serde_json::json!({"task_id":"bash-warning","status":"killed","kill_state_warning":state_warning,"bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
         );
         assert_eq!(
             text,
             format!(
-                "Task bash-warning: killed\n{}",
+                "Task bash-warning: killed\n{state_warning}\n{}",
                 crate::gh_shim_speech::REVOCATION_NOT_DURABLE
             )
         );

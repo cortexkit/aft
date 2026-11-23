@@ -1,10 +1,10 @@
 {
   "crates/aft/src/bash_background/registry.rs": {
-    "lines": 18612,
+    "lines": 18595,
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote_tests.rs": {
-    "lines": 17941,
+    "lines": 17929,
     "reason": "Split remote execution tests by scenario pending; AFT crate split lane."
   },
   "crates/aft/tests/integration/subc_bridge_test.rs": {
@@ -64,7 +64,7 @@
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote.rs": {
-    "lines": 6144,
+    "lines": 6065,
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
   "crates/aft/src/inspect/manager.rs": {
