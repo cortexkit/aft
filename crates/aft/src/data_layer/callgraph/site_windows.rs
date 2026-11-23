@@ -36,6 +36,10 @@ fn window_len<T>(remaining: &[T], budget: usize, estimate: impl Fn(&T) -> usize)
     len
 }
 
+fn window_chunk_len(global_chunk: usize, readers: usize, threads: usize) -> usize {
+    global_chunk.min(readers.div_ceil(threads)).max(1)
+}
+
 fn estimate(inputs: &CheckoutInputs, path: &str) -> usize {
     // Source length is a cheap proxy for the number of sites: estimating must
     // not decode every reader. Charge 16 KiB per 128 source bytes to allow for
@@ -65,22 +69,32 @@ impl MethodCallInputs {
             return Ok(Vec::new());
         }
         let budget = crate::memory::profile::current().bind_batch_bytes;
-        self.resolve_site_pass(inputs, resolved, paths, guard, |source, projects, chunk| {
-            let mut encoded = Vec::with_capacity(paths.len());
-            while !paths.is_empty() {
-                let len = window_len(paths, budget, |path| estimate(inputs, path));
-                let (window, rest) = paths.split_at(len);
-                paths = rest;
-                let results = source.resolve_window(window, projects, chunk, guard)?;
-                #[cfg(test)]
-                {
-                    // Each reader's results stay decoded until encoding starts.
-                    *decoded_high_water = (*decoded_high_water).max(results.len());
+        let threads = rayon::current_num_threads();
+        self.resolve_site_pass(
+            inputs,
+            resolved,
+            paths,
+            guard,
+            |source, projects, global_chunk| {
+                let mut encoded = Vec::with_capacity(paths.len());
+                while !paths.is_empty() {
+                    let len = window_len(paths, budget, |path| estimate(inputs, path));
+                    let (window, rest) = paths.split_at(len);
+                    paths = rest;
+                    // The full pass can be much larger than a window. Cap its
+                    // chunk size so a small window can still use the pool.
+                    let chunk = global_chunk.map(|chunk| window_chunk_len(chunk, len, threads));
+                    let results = source.resolve_window(window, projects, chunk, guard)?;
+                    #[cfg(test)]
+                    {
+                        // Each reader's results stay decoded until encoding starts.
+                        *decoded_high_water = (*decoded_high_water).max(results.len());
+                    }
+                    encode_window(inputs, resolved, results, &mut encoded, guard)?;
                 }
-                encode_window(inputs, resolved, results, &mut encoded, guard)?;
-            }
-            Ok(encoded)
-        })
+                Ok(encoded)
+            },
+        )
     }
 }
 
@@ -110,15 +124,29 @@ fn encode_window(
                         "stored resolution of {path} could not be read"
                     ))
                 })?;
-                let mut file =
-                    Arc::try_unwrap(previous).unwrap_or_else(|previous| FileResolution {
-                        rows: previous.rows.clone(),
-                        binding: previous.binding.clone(),
-                        dispatch: previous.dispatch.clone(),
-                        ..FileResolution::default()
-                    });
-                file.sites = sites;
-                file.site_dependencies = keys;
+                let file = match Arc::try_unwrap(previous) {
+                    Ok(mut file) => {
+                        file.sites = sites;
+                        file.site_dependencies = keys;
+                        file
+                    }
+                    Err(previous) => {
+                        let FileResolution {
+                            rows,
+                            binding,
+                            dispatch,
+                            sites: _,
+                            site_dependencies: _,
+                        } = &*previous;
+                        FileResolution {
+                            rows: rows.clone(),
+                            binding: binding.clone(),
+                            dispatch: dispatch.clone(),
+                            sites,
+                            site_dependencies: keys,
+                        }
+                    }
+                };
                 let encoded = EncodedResolution::encode_checked(&key, &file, guard)?;
                 Ok((path, encoded, file.site_dependencies))
             })
@@ -170,5 +198,21 @@ mod tests {
             window_len(&many, usize::MAX, |size| *size),
             READER_RESOLVE_WINDOW
         );
+    }
+
+    #[test]
+    fn reader_window_caps_chunk_size_to_use_the_pool() {
+        let threads = 8;
+        let global_chunk = |total: usize| total.div_ceil(threads * 4);
+        assert_eq!(window_chunk_len(global_chunk(179), 179, threads), 6);
+
+        let full = READER_RESOLVE_WINDOW;
+        let chunk = window_chunk_len(global_chunk(13_500), full, threads);
+        assert!(full.div_ceil(chunk) >= threads);
+
+        let byte_cut = window_len(&[100; 64], 2_400, |size| *size);
+        assert_eq!(byte_cut, 24);
+        assert_eq!(window_chunk_len(global_chunk(13_500), byte_cut, threads), 3);
+        assert_eq!(window_chunk_len(global_chunk(13_500), 1, threads), 1);
     }
 }
