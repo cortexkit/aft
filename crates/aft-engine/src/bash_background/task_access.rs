@@ -223,7 +223,7 @@ pub(super) struct WorkCounters {
     task_folder_reads: AtomicUsize,
 }
 
-use crate::task_temp_reads::{is_task_environment, task_directory};
+use crate::task_temp_reads::task_directory;
 pub use aft_base::task_entry::safe_task_entry;
 
 /// A second hard link exposes the same task output through another path.

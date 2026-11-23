@@ -147,6 +147,7 @@ pub mod gh_shim_worker_broker;
 pub mod gh_shim_worker_endpoints;
 pub use aft_base::git_head;
 pub mod git_index_reader;
+#[cfg(test)]
 pub(crate) use aft_base::git_probe;
 pub(crate) use aft_base::git_revision;
 #[doc(hidden)]

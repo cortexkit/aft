@@ -18,7 +18,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub(crate) use aft_db::path_filters::relative_to_root;
 use aft_db::path_filters::to_glob_path;
 pub use aft_db::path_filters::{build_path_filters, PathFilters};
 use ignore::WalkBuilder;

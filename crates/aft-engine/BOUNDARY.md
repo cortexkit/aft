@@ -34,7 +34,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `root_cache::ArtifactPublishEpoch` and `standing_roots` | compatibility re-exports | `aft-engine` | Preserve old epoch and standing-root paths. |
 | `read_fence::{Fence, capture, inherit, with_remote_mutation, remote_mutation, ReadGate, set_floor_filter, …}` | module moved down | `aft-db` | Share request-local read policy and remote mutation state without the index or composition. |
 | `path_filters::{PathFilters, build_path_filters, build_globset, relative_to_root, to_glob_path}` | items moved down | `aft-db` | Confinement fence floor filter. |
-| `data_layer::read_fence`, `context::confinement` and `search_index::{PathFilters, build_path_filters, relative_to_root}` | compatibility re-exports | `aft-engine` | Preserve the request-scope API, including the typed floor filter. |
+| `data_layer::read_fence`, `context::confinement` and `search_index::{PathFilters, build_path_filters}` | compatibility re-exports | `aft-engine` | Preserve the request-scope API, including the typed floor filter. |
 | `context::confinement::with_root` | compatibility adapter | `aft-engine` | Derive a read gate from the actual `AppContext` before calling the lower confinement scope. |
 | `semantic_status::{SemanticIndexStatus, SemanticRefreshAccounting, SEMANTIC_MASS_REFRESH_MIN_FILES}` | items moved down | `aft-base` | Refresh accounting is plain per-root state and does not need an index worker. |
 | `data_layer::status` and the corresponding `context` status names | compatibility re-exports | `aft-engine` | Keep old semantic-status paths. |
@@ -129,5 +129,5 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `process::test_hooks` | test-support visibility widened | `aft-base` | Engine unit tests inject failures into the lower implementation. |
 | `process::start_new_session` | visibility widened | `aft-base` | Shell child setup and lower process fixtures share one session-start primitive. |
 | `memory::profile::admitted` | visibility widened | `aft-base` | Engine builds pin the lower admission profile. |
-| `path_filters::{relative_to_root, to_glob_path}` | visibility widened | `aft-db` | The engine search code retains the identical path operations. |
+| `path_filters::to_glob_path` | visibility widened | `aft-db` | The engine search code retains the identical path operation. |
 | `root_identity::key::git_command_for_test` | test-support visibility widened | `aft-db` | The engine and lower identity tests share hermetic Git setup. |

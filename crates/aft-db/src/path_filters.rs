@@ -13,8 +13,7 @@ pub fn build_path_filters(include: &[String], exclude: &[String]) -> Result<Path
     })
 }
 
-#[doc(hidden)]
-pub fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
+pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root)
         .map(PathBuf::from)
         .unwrap_or_else(|_| path.to_path_buf())

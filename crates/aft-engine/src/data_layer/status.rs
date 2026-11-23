@@ -1,5 +1,4 @@
 pub use aft_base::semantic_status::*;
-use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Serialize;
