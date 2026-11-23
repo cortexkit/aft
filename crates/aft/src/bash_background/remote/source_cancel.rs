@@ -5,7 +5,7 @@ impl TaskSink {
     pub(super) fn drop_output_over_limit(
         &mut self,
         seq: u64,
-        stream: Option<OutputStream>,
+        stream: Option<&OutputStream>,
         offset: u64,
         bytes: u64,
     ) -> io::Result<bool> {
@@ -48,7 +48,7 @@ impl TaskSink {
                 );
             }
             let _ = self.registry.inner.wake_tx.try_send(());
-        } else if let Err(error) = self.progress(seq, stream, offset) {
+        } else if let Err(error) = self.progress(seq, stream.cloned(), offset) {
             self.output_progress = progress;
             return Err(error);
         }

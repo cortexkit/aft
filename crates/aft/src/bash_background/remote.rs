@@ -2105,7 +2105,7 @@ impl OutputSink for TaskSink {
         } else {
             self.output_progress.stderr_len
         };
-        if self.drop_output_over_limit(seq, Some(stream), offset, bytes.len() as u64)? {
+        if self.drop_output_over_limit(seq, Some(&stream), offset, bytes.len() as u64)? {
             return Ok(());
         }
         let file = if stdout {
