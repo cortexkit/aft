@@ -559,7 +559,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     grant_id,
                     command: params.command.clone(),
                     cwd,
-                    shell_path,
+                    shell: shell_path,
                     escapes_level: crate::sandbox_spawn::effective_sandbox_mode(ctx, &principal),
                     background: params.background || params.pty,
                     reason,
