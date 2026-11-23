@@ -19,14 +19,11 @@ from land_pr import gh, log, operator_gh, save
 from landing_policy import ROOT, git
 
 VERSION = re.compile(r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
-VERSION_FILES = {
-    "bun.lock", "Cargo.lock", "crates/aft/Cargo.toml",
-    "crates/aft-tokenizer/Cargo.toml", "crates/secret-rules/Cargo.toml",
-    *(f"packages/{name}/package.json" for name in
-      ("aft-bridge", "aft-cli", "opencode-plugin", "pi-plugin")),
-    *(f"packages/npm/{name}/package.json" for name in
-      ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")),
-}
+# version-sync rewrites the version in every published crate and package
+# manifest and in both lockfiles. Matching by file name instead of listing paths
+# keeps a newly added crate or package from failing every retry; verify_lineage
+# still proves that each such file changed only its version string.
+VERSION_FILE_NAMES = {"Cargo.toml", "package.json", "Cargo.lock", "bun.lock"}
 
 
 @contextmanager
@@ -129,7 +126,8 @@ def verify_lineage(oid: str, line: str, seen: set[str] | None = None) -> None:
             raise ValueError(f"retry head has not bumped {package} to {version}")
     notes_path = f".alfonso/release-notes/v{version}.md"
     changed = set(git("diff-tree", "--no-commit-id", "--name-only", "-r", oid).splitlines())
-    if not changed <= VERSION_FILES | {notes_path} or notes_path not in changed:
+    if notes_path not in changed or any(
+            path != notes_path and Path(path).name not in VERSION_FILE_NAMES for path in changed):
         raise ValueError("retry bump changes files other than versions and notes")
     for path in changed - {notes_path}:
         before = git("show", f"{oid}^:{path}")

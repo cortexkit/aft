@@ -382,6 +382,11 @@ if '--snapshot-dir' not in args:
         for path in pathlib.Path('packages').glob('*/package.json'):
             value = json.loads(path.read_text()); value['version'] = args[1]
             path.write_text(json.dumps(value))
+        import re
+        for path in pathlib.Path('crates').glob('*/Cargo.toml'):
+            path.write_text(re.sub(r'(?m)^version = "[^"]*"', f'version = "{args[1]}"', path.read_text()))
+        if os.environ.get('PR_TEST_SYNC_EXTRA'):
+            pathlib.Path('fix-one').write_text('changed by the version bump\n')
     sys.exit(0)
 state = pathlib.Path(os.environ['PR_TEST_STATE'])
 head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
@@ -1157,11 +1162,15 @@ class ReleaseQueueTests(PRFixture):
 
 
 class ReleaseRetryTests(PRFixture):
-    def prepare_retry(self) -> list[str]:
+    def prepare_retry(self, extra_files: dict[str, str] | None = None) -> list[str]:
         self.git("checkout", "-q", "main")
         notes = self.repo / ".alfonso/release-notes/v1.0.0.md"
         notes.parent.mkdir(parents=True)
         notes.write_text("# v1.0.0\n\nOriginal approved notes for 1.0.0.\n")
+        for name, text in (extra_files or {}).items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
         workflows = self.repo / ".github/workflows"
         workflows.mkdir()
         (workflows / "tests.yml").write_text('on:\n  push:\n    branches:\n      - main\n      - "release/**"\n')
@@ -1234,6 +1243,23 @@ class ReleaseRetryTests(PRFixture):
         bump = self.git("show", "-s", "--format=%B", "v1.0.1^{commit}")
         self.assertIn("Release-retry-from: v1.0.0", bump)
         self.assertIn("Co-authored-by: alfonso-aft <bot@example.invalid>", bump)
+
+    def test_retry_accepts_a_version_bump_in_a_newly_added_crate(self) -> None:
+        # The bump rewrites the version in every crate manifest, including
+        # crates added after the retry check was written.
+        fixes = self.prepare_retry(
+            {"crates/aft-newcrate/Cargo.toml": '[package]\nname = "aft-newcrate"\nversion = "1.0.0"\n'})
+        result = self.retry(fixes)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('version = "1.0.1"', self.git("show", "v1.0.1:crates/aft-newcrate/Cargo.toml"))
+
+    def test_retry_refuses_a_bump_that_changes_a_non_version_file(self) -> None:
+        fixes = self.prepare_retry()
+        self.env["PR_TEST_SYNC_EXTRA"] = "1"
+        result = self.retry(fixes)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("retry bump changes files other than versions and notes", result.stderr)
+        self.assertEqual(self.git("tag", "--list", "v1.0.1"), "")
 
     def test_retry_refuses_fix_not_on_main(self) -> None:
         self.prepare_retry()
