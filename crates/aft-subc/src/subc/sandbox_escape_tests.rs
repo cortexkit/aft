@@ -126,7 +126,6 @@ async fn outcome_case(
         .expect("settled sandbox escape call")
         .unwrap()
         .unwrap()
-        .expect("terminal response")
         .0;
     assert_eq!(
         marker.exists(),
