@@ -320,6 +320,19 @@ class CIHoldTests(unittest.TestCase):
             self.assertEqual(ci.main(), 0)
             self.assertEqual(mac.read_hold_record(self.hold_path), foreign)
 
+    def test_release_fails_loudly_when_the_hold_cannot_be_read(self):
+        # A hold nobody can parse keeps blocking the Mac until it expires, so the
+        # release step must fail rather than report success.
+        malformed = self.initial_record | {"granted_at": self.initial_record["expires_at"]}
+        self.hold_path.write_text(json.dumps(malformed))
+        with (
+            patch.object(ci.protocol, "HOLD_DIR", self.holds),
+            patch.dict(os.environ, self.env),
+            patch.object(sys, "argv", ["macos-hold.py", "release", "--shard", "3"]),
+        ):
+            self.assertEqual(ci.main(), 1)
+        self.assertTrue(self.hold_path.exists())
+
 
 class ContaminationTests(unittest.TestCase):
     def test_vm_names_include_motor_backend_not_merely_the_harness(self):

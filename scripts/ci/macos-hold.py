@@ -63,6 +63,26 @@ def refresh(owner, holds, grants, *, deadline=None):
     require_grant(hold, min(cutoff, deadline) if deadline is not None else cutoff)
 
 
+def release(owner, holds):
+    """Remove this job's hold and say what happened, so a hold left behind is visible."""
+    path = holds / "hold.json"
+    record = protocol.read_hold_record(path)
+    if record is None:
+        if path.exists() or path.is_symlink():
+            # The fleet stays blocked until the hold expires, so do not pass quietly.
+            raise RuntimeError(f"MOTOR hold at {path} is unreadable or malformed; it was left in place")
+        print(f"No MOTOR hold to release for {owner}", flush=True)
+        return
+    if record["owner"] != owner:
+        print(f"::warning::MOTOR hold at {path} belongs to {record['owner']}, not {owner}; left in place", flush=True)
+        return
+    protocol.remove_owned_hold(holds, owner)
+    remaining = protocol.read_hold_record(path)
+    if remaining is not None and remaining["owner"] == owner:
+        raise RuntimeError(f"MOTOR hold at {path} for {owner} is still present after release")
+    print(f"Released MOTOR hold for {owner}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("acquire", "refresh", "release"))
@@ -71,7 +91,7 @@ def main():
     try:
         owner = job_owner(os.environ, args.shard)
         if args.phase == "release":
-            protocol.remove_owned_hold(protocol.HOLD_DIR, owner)
+            release(owner, protocol.HOLD_DIR)
         else:
             action = acquire if args.phase == "acquire" else refresh
             action(owner, protocol.HOLD_DIR, protocol.GRANT_DIR)
