@@ -315,6 +315,7 @@ function bashParamsForConfig(
     background: boolean;
     compress: boolean;
     sandbox: boolean;
+    escape: boolean;
     subagentBackground: boolean;
     runon?: boolean;
   },
@@ -324,6 +325,7 @@ function bashParamsForConfig(
     ...BashBaseParams,
     // Replaces the base `timeout` in place (the key keeps its position).
     ...(features.background ? BashBackgroundTimeoutParam : {}),
+    ...(features.escape ? BashEscapeParam : {}),
     ...(features.background ? BashWaitParam : {}),
     ...(features.sandbox ? BashSandboxParam : {}),
     ...(features.background
@@ -818,6 +820,7 @@ export function registerBashTool(
           background: bashCfg.background,
           compress: bashCfg.compress,
           sandbox: nativeSandboxEnabled(ctx.config),
+          escape: !isPowerShell,
           subagentBackground: bashCfg.subagent_background,
           runon: remoteRuns(),
         },

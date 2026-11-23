@@ -255,9 +255,11 @@ export function buildSubcToolSchemas(
   // The powershell entry is always generated; whether it is advertised is
   // decided per host when the Rust manifest is served (only where pwsh runs).
   // It never carries `runon`: the remote runner runs bash, not PowerShell.
+  const powershellProperties = { ...bashProperties };
+  delete powershellProperties.escape_sandbox;
   const powershellSchema = {
     ...bashSchema,
-    properties: { ...bashProperties },
+    properties: powershellProperties,
     description:
       "Execute PowerShell commands through AFT's bash task family with UTF-8 output and conservative per-command approval.",
   };

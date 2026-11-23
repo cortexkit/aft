@@ -200,8 +200,9 @@ async fn sandbox_escape_decline_and_expiry_run_nothing_and_send_no_report() {
     }
 }
 
-#[test]
-fn sandbox_escape_inapplicable_calls_are_refused_before_filing() {
+#[tokio::test]
+async fn sandbox_escape_inapplicable_calls_are_refused_before_filing() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
     let f = fixture(FakeCingulate::up());
     let head = head(&f);
     let long = "x".repeat(2_001);

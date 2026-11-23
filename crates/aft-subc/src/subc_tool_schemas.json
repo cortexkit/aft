@@ -27,6 +27,10 @@
         "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
         "type": "string"
       },
+      "escape_sandbox": {
+        "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
+        "type": "string"
+      },
       "wait": {
         "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); Any new message detaches this wait. Set `bash.detach_on_user_message: false` to keep it blocking; even then, a message containing the literal `&detach` forces detachment, and the token is stripped before delivery and the rest of the message is preserved; a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else.",
         "type": "boolean"

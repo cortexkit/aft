@@ -10,8 +10,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
-      "catalog_digest": "1a1f91d9ef9329a9483514e44440e6e4cb9b4a1abb61850ff545943559505a18",
+      "generation": "381f6361c17b82be5929f46385d0d18cf580db788a4e2df273d9f32f7c8e7b64",
+      "catalog_digest": "381f6361c17b82be5929f46385d0d18cf580db788a4e2df273d9f32f7c8e7b64",
       "tools": [
         {
           "name": "status",
@@ -32,7 +32,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -71,6 +71,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -1288,8 +1292,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
-      "catalog_digest": "cbfdfca755c28bf6dcc408e28007094df90a819c311dca32845dc304cc67f42f",
+      "generation": "7bd8f13de4eefa615a047d4bfc0c88cf23e49556a79fa422d66cc6683955603f",
+      "catalog_digest": "7bd8f13de4eefa615a047d4bfc0c88cf23e49556a79fa422d66cc6683955603f",
       "tools": [
         {
           "name": "status",
@@ -1310,7 +1314,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -1349,6 +1353,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -3562,8 +3570,8 @@
     "powershell_available": false,
     "remote_runs": true,
     "reply": {
-      "generation": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
-      "catalog_digest": "adaf1a2f05f47e2af785618ba9a30340f7ba89479bf83160cd7cad774f1da1d4",
+      "generation": "d011ab79416e1adbc5fe4f44be338691d8fa6e66fdf4c714334e1cb850e26d47",
+      "catalog_digest": "d011ab79416e1adbc5fe4f44be338691d8fa6e66fdf4c714334e1cb850e26d47",
       "tools": [
         {
           "name": "status",
@@ -3584,7 +3592,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+          "schema_digest": "0128dc3b4009836ff8cd1256cd6ccecaa8330703bfab0d9c9b8816e2b1b2106e",
           "semantics": 3,
           "modes": [
             "classic",
@@ -3623,6 +3631,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -4853,8 +4865,8 @@
     "powershell_available": true,
     "remote_runs": true,
     "reply": {
-      "generation": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
-      "catalog_digest": "486a1f6fd39dd7439a3c13af4a17df40bcfe206cc615efde4effa37a71a03588",
+      "generation": "e9494ffeaeffdf426208c32a218e48f4ee8d352dc8a40e7b9cc2a129b99dc1ca",
+      "catalog_digest": "e9494ffeaeffdf426208c32a218e48f4ee8d352dc8a40e7b9cc2a129b99dc1ca",
       "tools": [
         {
           "name": "status",
@@ -4875,7 +4887,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "019128a28f9f2724d2c086f93a1c74222b294ad95fee8b255fa799b257397a4f",
+          "schema_digest": "0128dc3b4009836ff8cd1256cd6ccecaa8330703bfab0d9c9b8816e2b1b2106e",
           "semantics": 3,
           "modes": [
             "classic",
@@ -4914,6 +4926,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -6218,8 +6234,8 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
-      "catalog_digest": "1f4117191dce93e591a3f464ba18b852cd040b6fa014c483f04ec133f69ed5b9",
+      "generation": "6ffef202ceac01cdc117d8d9ec6520d8ef7584eb153528c9f385338695a9c853",
+      "catalog_digest": "6ffef202ceac01cdc117d8d9ec6520d8ef7584eb153528c9f385338695a9c853",
       "tools": [
         {
           "name": "status",
@@ -6240,7 +6256,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -6279,6 +6295,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -7430,8 +7450,8 @@
     "disabled_tools": [],
     "powershell_available": true,
     "reply": {
-      "generation": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
-      "catalog_digest": "a91ae13cba6cc7c57c313a4b0ee9b7b739e2b1edc0d9a4c499e140a07d1a756b",
+      "generation": "79446eeafde2d36d31c285393b4531cfd8958efdf5822a8c90eba9281112f055",
+      "catalog_digest": "79446eeafde2d36d31c285393b4531cfd8958efdf5822a8c90eba9281112f055",
       "tools": [
         {
           "name": "status",
@@ -7452,7 +7472,7 @@
         },
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -7491,6 +7511,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -8723,12 +8747,12 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
-      "catalog_digest": "7b55ca9f7252399ab1ffe6d7da9529939af5c936e22f904edd531d35a723f237",
+      "generation": "2e7882585563636e19695f2e757e646c9e84d0077d0b86bf82be568cc28acde6",
+      "catalog_digest": "2e7882585563636e19695f2e757e646c9e84d0077d0b86bf82be568cc28acde6",
       "tools": [
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -8767,6 +8791,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -9859,12 +9887,12 @@
     "disabled_tools": [],
     "powershell_available": false,
     "reply": {
-      "generation": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
-      "catalog_digest": "f2b3dd280a517810d1429863899eeb7ec4f5ae2ded764c1458c9587766f677b5",
+      "generation": "e8b23a208006940bd13554c65a0be1d232b06ba4c7deafbf9547d2f45e3ebdaa",
+      "catalog_digest": "e8b23a208006940bd13554c65a0be1d232b06ba4c7deafbf9547d2f45e3ebdaa",
       "tools": [
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -9903,6 +9931,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
@@ -11087,12 +11119,12 @@
       "hashline": true
     },
     "reply": {
-      "generation": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
-      "catalog_digest": "91a936147272e86f6186e11aac74d955b5b939cf4659daaa4e4ccf0ef3fd6af4",
+      "generation": "da99d9f7a2d376ec0bc2cbd5d95096c698c3eb927494cf14a330488c54afeb32",
+      "catalog_digest": "da99d9f7a2d376ec0bc2cbd5d95096c698c3eb927494cf14a330488c54afeb32",
       "tools": [
         {
           "name": "bash",
-          "schema_digest": "da852fe71bf96fc7597ea7236d99a23f311dbd1d32f6ef026259c7140a70fc0a",
+          "schema_digest": "1a97115ff8a24d8844477437789fc9dac9f783c1ce9bb1ecc92988747f98d3ff",
           "semantics": 3,
           "modes": [
             "classic",
@@ -11131,6 +11163,10 @@
               },
               "description": {
                 "description": "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
+                "type": "string"
+              },
+              "escape_sandbox": {
+                "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells.",
                 "type": "string"
               },
               "wait": {
