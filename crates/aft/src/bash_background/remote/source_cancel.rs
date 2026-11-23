@@ -130,8 +130,10 @@ impl BgTaskRegistry {
             .metadata
             .clone();
         if let Some(job_id) = unknown_remote_cancel_job(&metadata) {
-            // The original follower has stopped. Probe cancellation separately,
-            // without replacing its saved unknown outcome with an acknowledgement.
+            // AFT already marked this task's fate unknown and no longer follows
+            // the build-server job, but the job may still be running. Probe
+            // cancellation separately, without replacing the saved unknown
+            // outcome with an acknowledgement.
             let bound = remote_kill_settle_bound().min(ReattachBudget::until_job_end(&metadata).0);
             let result = std::thread::scope(|scope| {
                 scope
