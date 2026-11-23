@@ -71,7 +71,7 @@ impl CardFields {
 pub struct RequesterRecord {
     pub kind: CardKind,
     pub state: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answered_choice_id: Option<String>,
     pub sandbox_escape: CardFields,
     #[serde(flatten)]
