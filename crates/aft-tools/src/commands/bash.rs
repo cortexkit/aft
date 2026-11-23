@@ -551,6 +551,15 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                     return Response::error(&req.id, "sandbox_escalation_denied", error);
                 }
             };
+            if params.escape_sandbox.is_some()
+                && crate::sandbox_spawn::retain_host_escalation_for_escape(ctx, &grant_id).is_err()
+            {
+                return Response::error(
+                    &req.id,
+                    aft_engine::sandbox_escape::UNAVAILABLE_CODE,
+                    aft_engine::sandbox_escape::UNAVAILABLE,
+                );
+            }
             if let Some(snapshot) = snapshot {
                 crate::sandbox_spawn::save_provider_approval(ctx, &grant_id, snapshot);
             }
