@@ -159,7 +159,9 @@ fn encode_window(
 impl Resolutions {
     /// Install only after every reader has resolved against the original map.
     /// If the guard stops installation, the caller must discard the live
-    /// checkout engine: only some readers' slots and reverse keys were replaced.
+    /// checkout engine: only some readers' slots would have been replaced, and
+    /// only some of their dependency keys recorded through `note_sites` (the
+    /// index that finds which readers a later edit affects).
     pub(in crate::data_layer) fn install_sites_checked(
         &mut self,
         encoded: EncodedSites,

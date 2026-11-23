@@ -229,8 +229,9 @@ fn refresh_reader_windows_bound_decoded_results() {
     ]);
     let before = checkout(&files, &[]);
     files.push(("run.go", "package p\nfunc (T) Run() {}\n"));
-    // Exercise pass 4 directly: refresh admission would reject this fixture
-    // because almost all its files read the edited declaration.
+    // Run the incremental update directly, without the refresh's admission
+    // check: a real refresh would rebuild cold instead, because almost all
+    // its files read the edited declaration.
     let (stats, _) = update_checked(before, checkout(&files, &[]), &["run.go"]);
     assert_eq!(stats.sites_resolved, readers.len() + 1);
     assert_eq!(
