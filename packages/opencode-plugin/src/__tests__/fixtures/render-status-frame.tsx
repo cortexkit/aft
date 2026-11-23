@@ -13,11 +13,20 @@ const palette = {
   background: "#000000",
   border: "#444444",
 };
+const paused = {
+  status: "unavailable",
+  reason: "disk_reserve",
+  error:
+    "Index storage is paused: 3.7 GiB is free on this disk and AFT keeps 4.0 GiB free. Unused index data is being cleaned up; retry later.",
+};
 const status = coerceAftStatus({
   cache_role: "main",
   checkpoints_total: null,
   session: { checkpoints: null },
   disk: { data_store_bytes: 4096, trigram_disk_bytes: 1024, semantic_disk_bytes: 2048 },
+  ...(process.env.AFT_STATUS_DISK_FLOOR
+    ? { search_index: paused, semantic_index: paused, callgraph_store: paused }
+    : {}),
 });
 const setup = await testRender(
   () => (
