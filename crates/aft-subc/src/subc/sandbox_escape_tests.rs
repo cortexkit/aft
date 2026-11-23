@@ -97,7 +97,7 @@ async fn outcome_case(
     let call = held_call(&f, &head(&f), arguments);
     let request_id = call.request_id.clone();
     let fake = f.fake.clone();
-    let running = tokio::spawn(async move {
+    let mut running = tokio::spawn(async move {
         run_with_consent(call, (first, String::new()), move |_route, grants| {
             assert_eq!(grants, ["esc_test"]);
             let output = std::process::Command::new("/bin/sh")
@@ -117,12 +117,15 @@ async fn outcome_case(
         })
         .await
     });
-    let request = wait_for_request(&fake).await;
+    let request = tokio::select! {
+        request = wait_for_request(&fake) => request,
+        done = &mut running => panic!("sandbox escape ended before filing: {done:?}"),
+    };
     fake.answer(
         request["sandbox_escape"]["call_key"].as_str().unwrap(),
         answer(&request, state, choice),
     );
-    let response = tokio::time::timeout(Duration::from_secs(5), running)
+    let response = tokio::time::timeout(Duration::from_secs(5), &mut running)
         .await
         .expect("settled sandbox escape call")
         .unwrap()
@@ -235,6 +238,20 @@ fn sandbox_escape_inapplicable_calls_are_refused_before_filing() {
     assert!(f.fake.calls("consent.request").is_empty());
 }
 
+fn canonical(value: &Value) -> Value {
+    match value {
+        Value::Object(object) => {
+            let sorted = object
+                .iter()
+                .map(|(key, value)| (key.clone(), canonical(value)))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Value::Object(sorted.into_iter().collect())
+        }
+        Value::Array(items) => Value::Array(items.iter().map(canonical).collect()),
+        other => other.clone(),
+    }
+}
+
 fn assert_roundtrip<T>(value: &Value)
 where
     T: serde::de::DeserializeOwned + serde::Serialize,
@@ -243,8 +260,8 @@ where
     let encoded = serde_json::to_value(decoded).unwrap();
     assert_eq!(&encoded, value);
     assert_eq!(
-        serde_json::to_vec(&encoded).unwrap(),
-        serde_json::to_vec(value).unwrap()
+        serde_json::to_vec(&canonical(&encoded)).unwrap(),
+        serde_json::to_vec(&canonical(value)).unwrap()
     );
 }
 
