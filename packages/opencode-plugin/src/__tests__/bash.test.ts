@@ -253,6 +253,8 @@ describe("OpenCode bash adapter", () => {
     expect(safeParse(bash.args.wait, true).success).toBe(true);
     expect(safeParse(bash.args.sandbox, "host").success).toBe(true);
     expect(safeParse(bash.args.sandbox, "native").success).toBe(false);
+    expect(safeParse(bash.args.escape_sandbox, "Use the saved login once").success).toBe(true);
+    expect(safeParse(bash.args.escape_sandbox, 42).success).toBe(false);
     expect(safeParse(bash.args.background, true).success).toBe(true);
     expect(safeParse(bash.args.compressed, false).success).toBe(true);
     expect(safeParse(bash.args.ptyRows, 50).success).toBe(true);

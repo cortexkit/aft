@@ -33,6 +33,10 @@
           "type": "string",
           "description": "Human-readable description shown in UI logs. Helps users understand what the command does without reading shell syntax."
         },
+        "escape_sandbox": {
+          "type": "string",
+          "description": "Ask the person to run this exact command once outside the sandbox. Give a one-line reason (160 characters maximum); available only to local head shells."
+        },
         "wait": {
           "type": "boolean",
           "description": "When true, run in the foreground without auto-promoting and wait until the command finishes or reaches its timeout (at most bash.worker_wait_max_ms, 30 minutes by default; the command then keeps running in the background and the reply says how to keep waiting); any new message detaches by default, while `bash.detach_on_user_message: false` keeps it blocking unless the message contains the literal `&detach`. The token is stripped before delivery; the rest of the message is preserved, and a token-only message becomes `(requested background detach)`. Use only when you know the result is required before doing anything else."

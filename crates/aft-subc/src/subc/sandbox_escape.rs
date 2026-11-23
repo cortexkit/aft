@@ -473,6 +473,14 @@ pub fn expired_answer(call: &HeldCall) -> Response {
     refused_answer(call, aft_engine::sandbox_escape::EXPIRED_CODE)
 }
 
+struct ObservedResponse {
+    success: bool,
+    code: Option<String>,
+    status: Option<String>,
+    exit_code: Option<i64>,
+    task_id: Option<String>,
+}
+
 #[derive(Debug)]
 struct Completion {
     decision: String,
@@ -488,7 +496,28 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
     let Some(call_key) = take_call_key(call) else {
         return;
     };
-    let response = result.map(|result| &result.0);
+    let response = result.map(|result| ObservedResponse {
+        success: result.0.success,
+        code: result
+            .0
+            .data
+            .get("code")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        status: result
+            .0
+            .data
+            .get("status")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        exit_code: result.0.data.get("exit_code").and_then(Value::as_i64),
+        task_id: result
+            .0
+            .data
+            .get("task_id")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    });
     let scope_ended = call
         .identity
         .run_scope
@@ -499,10 +528,11 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
             return Ok(None);
         };
         let approved = row.decision == RUN_ONCE;
-        let response_code = response
-            .filter(|response| !response.success)
-            .and_then(|response| response.data.get("code"))
-            .and_then(Value::as_str);
+        let response_code = response.as_ref().and_then(|response| {
+            (!response.success)
+                .then_some(response.code.as_deref())
+                .flatten()
+        });
         let decision = if approved {
             RUN_ONCE
         } else {
@@ -514,40 +544,33 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
                 None => "withdrawn",
             }
         };
-        let terminal_status = response.and_then(|response| {
-            response
-                .data
-                .get("status")
-                .and_then(Value::as_str)
-                .filter(|status| {
-                    matches!(
-                        *status,
-                        "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
-                    )
-                })
+        let terminal_status = response.as_ref().and_then(|response| {
+            response.status.as_deref().filter(|status| {
+                matches!(
+                    *status,
+                    "completed" | "failed" | "killed" | "timed_out" | "fate_unknown"
+                )
+            })
         });
         let exit_status = approved.then(|| {
-            response.map_or("outcome_unknown", |response| {
+            response.as_ref().map_or("outcome_unknown", |response| {
                 response
-                    .data
-                    .get("status")
-                    .and_then(Value::as_str)
+                    .status
+                    .as_deref()
                     .or(response_code)
                     .unwrap_or("completed")
             })
         });
-        let exit_code = response
-            .and_then(|response| response.data.get("exit_code"))
-            .and_then(Value::as_i64);
+        let exit_code = response.as_ref().and_then(|response| response.exit_code);
         let task_id = response
-            .and_then(|response| response.data.get("task_id"))
-            .and_then(Value::as_str);
+            .as_ref()
+            .and_then(|response| response.task_id.as_deref());
         records::finish(conn, &call_key, decision, exit_status, exit_code, task_id)?;
         let execution = approved.then(|| {
             if response.is_none() {
                 "outcome_unknown"
-            } else if response.is_some_and(|response| {
-                response.success || terminal_status.is_some() || task_id.is_some()
+            } else if response.as_ref().is_some_and(|response| {
+                response.success || terminal_status.is_some() || response.task_id.is_some()
             }) {
                 "executed"
             } else {
