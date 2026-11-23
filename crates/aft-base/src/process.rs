@@ -755,6 +755,24 @@ pub fn terminate_process(child: &mut Child) {
     terminate_pgid(pgid, Some(child));
 }
 
+/// Start a non-PTY child in a new session before exec. The bridge can inherit a
+/// harness's controlling terminal even though the child uses pipe-backed stdio;
+/// an interactive shell could otherwise perform job control against that terminal.
+#[cfg(unix)]
+pub(crate) fn start_new_session(command: &mut std::process::Command) {
+    use std::os::unix::process::CommandExt;
+
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
+        });
+    }
+}
+
 #[cfg(unix)]
 pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
     terminate_pgid_with(pgid, || {

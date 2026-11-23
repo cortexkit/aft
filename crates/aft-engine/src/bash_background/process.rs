@@ -115,24 +115,6 @@ pub(crate) fn pipeline_shell_kind(shell: &Path) -> Option<&'static str> {
     }
 }
 
-/// Start a non-PTY child in a new session before exec. The bridge can inherit a
-/// harness's controlling terminal even though the child uses pipe-backed stdio;
-/// an interactive shell could otherwise perform job control against that terminal.
-#[cfg(unix)]
-pub(crate) fn start_new_session(command: &mut std::process::Command) {
-    use std::os::unix::process::CommandExt;
-
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() == -1 {
-                Err(std::io::Error::last_os_error())
-            } else {
-                Ok(())
-            }
-        });
-    }
-}
-
 #[cfg(target_os = "linux")]
 pub(crate) fn oom_priority_marker(scratch: Option<&Path>, io_dir: &Path) -> std::path::PathBuf {
     scratch.unwrap_or(io_dir).join("oom-priority-failure")
