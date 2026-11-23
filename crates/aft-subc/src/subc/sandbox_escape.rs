@@ -525,6 +525,7 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
         .run_scope
         .get()
         .is_some_and(|scope| scope.revoked());
+    let detached = call.connection_cancel.is_cancelled() || call.drain.is_active();
     let completed = match with_db(call, move |conn, _| {
         let Some(row) = records::get(conn, &call_key)? else {
             return Ok(None);
@@ -543,6 +544,7 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
                 Some(aft_engine::sandbox_escape::EXPIRED_CODE) => "expired",
                 Some(aft_engine::sandbox_escape::WITHDRAWN_CODE) => "withdrawn",
                 Some(_) => "unavailable",
+                None if detached => "requested",
                 None => "withdrawn",
             }
         };

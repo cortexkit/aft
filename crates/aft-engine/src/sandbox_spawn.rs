@@ -17,6 +17,10 @@
 //! Formatters, their version probes, and checkers do execute project code, so
 //! [`ToolLaunchPolicy`] carries the session shell's launch policy to those tools.
 
+#[cfg(all(test, unix))]
+#[path = "sandbox_escape_grant_tests.rs"]
+mod sandbox_escape_grant_tests;
+
 use std::cell::RefCell;
 #[cfg(any(test, target_os = "linux"))]
 use std::collections::BTreeSet;
@@ -935,6 +939,18 @@ pub fn mint_host_escalation_grant(
         session_id,
         Instant::now(),
     )
+}
+
+#[cfg(unix)]
+pub fn retain_host_escalation_for_escape(ctx: &AppContext, grant_id: &str) -> Result<(), String> {
+    let mut store = ctx.escalation_grants().lock();
+    let grant = store
+        .grants
+        .get_mut(grant_id)
+        .ok_or_else(|| "sandbox escape grant is unavailable".to_string())?;
+    grant.expires_at =
+        Instant::now() + Duration::from_millis(crate::sandbox_escape::EXPIRES_IN_MS + 10_000);
+    Ok(())
 }
 
 #[cfg(unix)]
