@@ -626,7 +626,10 @@ fn format_delete(data: &Value) -> String {
         text.push_str("\nwarning ");
         text.push_str(&warning);
     }
-    text
+    // A partial batch names every path it left and why, so the agent can
+    // retry exactly those (for example in smaller groups) instead of listing
+    // the folder again to find them.
+    append_ast_skipped_files(text, response.get("skipped_files"))
 }
 fn format_move(data: &Value, ctx: &FormatContext) -> String {
     let response = data.as_object();
@@ -4891,6 +4894,25 @@ fn compact_inspect_terminal_field(value: Option<&Value>, fallback: &str) -> Stri
             compact = compact.replace(internal, plain);
         }
         compact
+    }
+}
+
+#[cfg(test)]
+mod delete_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn partial_delete_names_each_skipped_path_and_reason() {
+        let rendered = format_delete(&json!({
+            "complete": false,
+            "deleted": [{"file": "/repo/a.txt"}, {"file": "/repo/b.txt"}],
+            "skipped_files": [{"file": "/repo/big", "reason": "backup would copy more than 100 MiB"}],
+        }));
+        assert_eq!(
+            rendered,
+            "Deleted 2/3 file(s)\n\nIncomplete: skipped 1 file(s)\n  /repo/big: backup would copy more than 100 MiB"
+        );
     }
 }
 
