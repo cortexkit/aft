@@ -82,7 +82,7 @@ pub struct UpdateStats {
     pub facts_changed: usize,
     pub sites_resolved: usize,
     #[cfg(test)]
-    pub(super) site_merge_decoded_high_water: usize,
+    pub(super) site_decoded_high_water: usize,
     pub bind_ms: f64,
     pub resolve_ms: f64,
     pub dispatch_ms: f64,
@@ -1520,16 +1520,18 @@ impl LiveCheckout {
         sites.retain(|path| inputs.parses.contains_key(path));
         admit(&mut budget, Stage::Sites, &sites)?;
         let paths = sites.iter().collect::<Vec<_>>();
-        let results = self
-            .calls
-            .resolve_sites_checked(inputs, &self.resolved, &paths, guard)?;
-        self.resolved.merge_sites_checked(
-            &inputs.parses,
-            results,
-            |path, keys| self.reverse.note_sites(path, keys),
+        let encoded = self.calls.resolve_sites_encoded(
+            inputs,
+            &self.resolved,
+            &paths,
             guard,
             #[cfg(test)]
-            &mut stats.site_merge_decoded_high_water,
+            &mut stats.site_decoded_high_water,
+        )?;
+        self.resolved.install_sites_checked(
+            encoded,
+            |path, keys| self.reverse.note_sites(path, keys),
+            guard,
         )?;
         stats.sites_resolved = paths.len();
         stats.sites_ms = started.elapsed().as_secs_f64() * 1000.0;

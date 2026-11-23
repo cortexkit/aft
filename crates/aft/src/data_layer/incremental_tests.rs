@@ -207,6 +207,39 @@ fn refresh_memory_guard_checks_inside_one_large_site_batch() {
     );
 }
 
+#[test]
+fn refresh_reader_windows_bound_decoded_results() {
+    use super::callgraph::READER_RESOLVE_WINDOW;
+
+    let readers = (0..READER_RESOLVE_WINDOW + 3)
+        .map(|i| {
+            (
+                format!("reader{i}.go"),
+                format!("package p\nfunc Use{i}(t T) {{ t.Run() }}\n"),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut files = readers
+        .iter()
+        .map(|(path, text)| (path.as_str(), text.as_str()))
+        .collect::<Vec<_>>();
+    files.extend([
+        ("go.mod", "module example.com/p\n"),
+        ("p.go", "package p\ntype T struct{}\n"),
+    ]);
+    let before = checkout(&files, &[]);
+    files.push(("run.go", "package p\nfunc (T) Run() {}\n"));
+    // Exercise pass 4 directly: refresh admission would reject this fixture
+    // because almost all its files read the edited declaration.
+    let (stats, _) = update_checked(before, checkout(&files, &[]), &["run.go"]);
+    assert_eq!(stats.sites_resolved, readers.len() + 1);
+    assert_eq!(
+        stats.site_decoded_high_water, READER_RESOLVE_WINDOW,
+        "kept {} decoded reader results for {} readers",
+        stats.site_decoded_high_water, stats.sites_resolved
+    );
+}
+
 /// A checkout of text `files` and symlinks `links` (path, target).
 pub(super) fn checkout(files: &[(&str, &str)], links: &[(&str, &str)]) -> CheckoutInputs {
     let mut records = Vec::new();

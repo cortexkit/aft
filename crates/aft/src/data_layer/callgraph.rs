@@ -30,8 +30,8 @@ use rayon::prelude::*;
 
 use crate::callgraph_store::facts::{BlobKey, DirEntry, EntryKind, ProjectFacts};
 use crate::callgraph_store::join::dispatch::{
-    associated_reference, dependency, DispatchFiles, DispatchParse, DispatchParseOwner,
-    MemoizedResolver, Resolution, Resolver, SiteHint,
+    associated_reference, dependency, CSharpProjects, DispatchFiles, DispatchParse,
+    DispatchParseOwner, MemoizedResolver, Resolution, Resolver, SiteHint,
 };
 use crate::callgraph_store::join::{
     bind_file, dispatch_type_targets_for, finish_binding, resolve_file, BlobRef, BlobRefKind,
@@ -48,7 +48,10 @@ mod decoded_cache;
 pub(super) use decoded_cache::CacheChurn;
 mod key_order;
 mod site_records;
+mod site_windows;
 mod spool;
+#[cfg(test)]
+pub(super) use site_windows::READER_RESOLVE_WINDOW;
 
 pub(crate) use key_order::Budget as KeyOrderBudget;
 
@@ -72,18 +75,16 @@ pub(crate) struct CheckoutInputs {
 }
 
 impl CheckoutInputs {
-    fn csharp_projects(&self) -> crate::callgraph_store::join::dispatch::CSharpProjects {
-        crate::callgraph_store::join::dispatch::CSharpProjects::new(
-            self.state.directory_records(b"").map(|record| {
-                (
-                    record.path.as_slice(),
-                    self.configs
-                        .get(&record.path)
-                        .filter(|_| record.language == super::content::CSHARP_PROJECT_CONFIG)
-                        .map(|markers| markers.as_ref()),
-                )
-            }),
-        )
+    fn csharp_projects(&self) -> CSharpProjects {
+        CSharpProjects::new(self.state.directory_records(b"").map(|record| {
+            (
+                record.path.as_slice(),
+                self.configs
+                    .get(&record.path)
+                    .filter(|_| record.language == super::content::CSHARP_PROJECT_CONFIG)
+                    .map(|markers| markers.as_ref()),
+            )
+        }))
     }
 }
 
@@ -808,76 +809,6 @@ impl Resolutions {
         slot.value.get_mut()?.as_mut().map(Arc::make_mut)
     }
 
-    /// Merges site-resolution results in bounded batches on the current rayon pool.
-    /// Each worker drops the decoded file before returning; only the encoding
-    /// and keys for the reverse index can wait for ordered installation.
-    /// If the merge stops, the caller must discard the partly updated engine.
-    pub(super) fn merge_sites_checked(
-        &mut self,
-        parses: &Parses,
-        mut results: Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>,
-        mut note_sites: impl FnMut(&str, &BTreeSet<String>),
-        guard: Option<&RefreshMemory>,
-        #[cfg(test)] decoded_high_water: &mut usize,
-    ) -> Result<(), UpdateError> {
-        #[cfg(test)]
-        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-        #[cfg(test)]
-        let (decoded_now, peak) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        let carry = crate::alloc_trace::carry();
-        for batch in results.chunks_mut(READER_MERGE_WINDOW) {
-            let mut work = Vec::with_capacity(batch.len());
-            for result in batch {
-                let (path, sites, keys) = std::mem::take(result);
-                let slot = self
-                    .map
-                    .remove(&path)
-                    .ok_or_else(|| missing_resolution(&path))?;
-                work.push((path, slot, sites, keys));
-            }
-            let encoded = work
-                .into_par_iter()
-                .map(|(path, slot, sites, keys)| {
-                    guard.file()?;
-                    let _label = carry.enter();
-                    let key = parses.key(&path).ok_or_else(|| {
-                        ManifestJoinError::Parse(format!("missing parse for {path}"))
-                    })?;
-                    #[cfg(test)]
-                    peak.fetch_max(decoded_now.fetch_add(1, Relaxed) + 1, Relaxed);
-                    let mut file = slot
-                        .into_decoded(&path)
-                        .ok_or_else(|| missing_resolution(&path))?;
-                    file.sites = sites;
-                    file.site_dependencies = keys;
-                    let encoded = EncodedResolution::encode_checked(&key, &file, guard);
-                    let keys = std::mem::take(&mut file.site_dependencies);
-                    drop(file);
-                    #[cfg(test)]
-                    decoded_now.fetch_sub(1, Relaxed);
-                    Ok((path, encoded?, keys))
-                })
-                .collect::<Result<Vec<_>, UpdateError>>()?;
-            for (path, encoded, keys) in encoded {
-                guard.file()?;
-                self.changed.remove(&path);
-                self.map.insert(
-                    path.clone(),
-                    ResolutionSlot {
-                        value: std::sync::OnceLock::new(),
-                        source: ResolutionSource::Encoded(Arc::new(encoded)),
-                    },
-                );
-                note_sites(&path, &keys);
-            }
-        }
-        #[cfg(test)]
-        {
-            *decoded_high_water = peak.load(Relaxed);
-        }
-        Ok(())
-    }
-
     /// Encodes every entry inserted or changed since the last call, reading
     /// each file's parse key from `record_key`, so that
     /// [`Self::release_decoded`] can let it go. Runs on the current rayon
@@ -1014,14 +945,6 @@ impl Resolutions {
             .map(|(path, resolution)| (path.clone(), resolution.clone()))
             .collect()
     }
-}
-
-/// A fixed bound on how many reader resolutions one merge batch may decode,
-/// independent of the size of the edit or the thread pool.
-pub(super) const READER_MERGE_WINDOW: usize = 32;
-
-fn missing_resolution(path: &str) -> ManifestJoinError {
-    ManifestJoinError::Parse(format!("stored resolution of {path} could not be read"))
 }
 
 impl ResolutionLookup for Resolutions {
@@ -2900,45 +2823,50 @@ impl MethodCallInputs {
         resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
     ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, ManifestJoinError> {
-        self.resolve_sites_checked(inputs, resolved, paths, None)
-            .map_err(UpdateError::unguarded)
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.resolve_site_pass(inputs, resolved, paths, None, |source, projects, chunk| {
+            source.resolve_window(paths, projects, chunk, None)
+        })
+        .map_err(UpdateError::unguarded)
     }
 
-    pub(super) fn resolve_sites_checked(
+    fn resolve_site_pass<T>(
         &mut self,
         inputs: &CheckoutInputs,
         resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
         guard: Option<&RefreshMemory>,
-    ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, UpdateError> {
-        if paths.is_empty() {
-            return Ok(Vec::new());
-        }
+        run: impl FnOnce(&SiteSource<'_>, &CSharpProjects, Option<usize>) -> Result<T, UpdateError>,
+    ) -> Result<T, UpdateError> {
         self.projections
             .begin_pass(guard.is_some() && self.stored.is_some());
-        let results = self.resolve_site_pass(inputs, resolved, paths, guard);
+        let results = (|| {
+            let source = SiteSource::new(inputs, resolved, self);
+            let projects = inputs.csharp_projects();
+            let chunk = if paths.len() <= SMALL_SITE_RUN {
+                source.load_declarers(paths, guard)?;
+                None
+            } else {
+                Some(paths.len().div_ceil(rayon::current_num_threads() * 4))
+            };
+            run(&source, &projects, chunk)
+        })();
         self.projections.end_pass();
         results
     }
+}
 
-    fn resolve_site_pass(
+impl SiteSource<'_> {
+    fn resolve_window(
         &self,
-        inputs: &CheckoutInputs,
-        resolved: &(dyn ResolutionLookup + Sync),
         paths: &[&String],
+        projects: &CSharpProjects,
+        chunk: Option<usize>,
         guard: Option<&RefreshMemory>,
     ) -> Result<Vec<(String, Vec<SiteResolution>, BTreeSet<String>)>, UpdateError> {
-        let source = SiteSource::new(inputs, resolved, self);
-        let projects = inputs.csharp_projects();
-        let results = if paths.len() <= SMALL_SITE_RUN {
-            source.load_declarers(paths, guard)?;
-            let resolver = Resolver::over(&source).with_csharp_projects(&projects);
-            resolve_chunk(inputs, &source, &resolver, paths, guard)
-        } else {
-            let chunk = paths
-                .len()
-                .div_ceil(rayon::current_num_threads() * 4)
-                .max(1);
+        let results = if let Some(chunk) = chunk {
             let carry = crate::alloc_trace::carry();
             paths
                 .par_chunks(chunk)
@@ -2946,13 +2874,16 @@ impl MethodCallInputs {
                     let _label = carry.enter();
                     // The resolver and its memo are single-threaded caches
                     // over the shared source: one per chunk of files.
-                    let resolver = Resolver::over(&source).with_csharp_projects(&projects);
-                    resolve_chunk(inputs, &source, &resolver, chunk, guard)
+                    let resolver = Resolver::over(self).with_csharp_projects(projects);
+                    resolve_chunk(self.inputs, self, &resolver, chunk, guard)
                 })
                 .collect::<Result<Vec<_>, _>>()
                 .map(|chunks| chunks.into_iter().flatten().collect())
+        } else {
+            let resolver = Resolver::over(self).with_csharp_projects(projects);
+            resolve_chunk(self.inputs, self, &resolver, paths, guard)
         }?;
-        if let Some(error) = source
+        if let Some(error) = self
             .error
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -2960,7 +2891,7 @@ impl MethodCallInputs {
         {
             return Err(ManifestJoinError::Parse(error).into());
         }
-        source.check_churn()?;
+        self.check_churn()?;
         Ok(results)
     }
 }
