@@ -84,7 +84,7 @@
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
-    "lines": 5568,
+    "lines": 5556,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   }
 }

@@ -20,7 +20,7 @@ impl HealthRollupCache {
         })
     }
 
-    pub(super) fn allocator_observation(&self) -> (crate::memory::AllocatorObservation, u64) {
+    pub(super) fn allocator_observation(&self) -> crate::memory::AllocatorObservation {
         let requested = self.allocator_requested.swap(false, Ordering::AcqRel);
         let mut cached = self
             .allocator
@@ -34,18 +34,15 @@ impl HealthRollupCache {
                 let mut reused = observation.clone();
                 // Unsupported platforms keep a null age, not a measured zero.
                 reused.age_ms = observation.age_ms.map(|_| age_ms);
-                return (reused, cached.reuse_ms);
+                return reused;
             }
         }
         if !requested {
             // HealthCheck is also a liveness probe. Its RSS/footprint comes
             // from the kernel; allocator fields stay unavailable until an
             // explicit memory.census asks for the expensive breakdown.
-            return (
-                crate::memory::AllocatorObservation::from_source(
-                    crate::memory::AllocatorSource::Cached,
-                ),
-                MIN_REUSE_MS,
+            return crate::memory::AllocatorObservation::from_source(
+                crate::memory::AllocatorSource::Cached,
             );
         }
         let walk_started = Instant::now();
@@ -64,7 +61,7 @@ impl HealthRollupCache {
             reuse_ms,
             observation: observation.clone(),
         });
-        (observation, reuse_ms)
+        observation
     }
 }
 
@@ -88,10 +85,10 @@ mod tests {
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(0, Ordering::Relaxed);
         cache.request_census();
-        let (first, _) = cache.allocator_observation();
+        let first = cache.allocator_observation();
         let before = crate::memory::allocator_snapshot_calls_for_test();
         cache.clock_ms.store(600_000, Ordering::Relaxed);
-        let (old, _) = cache.allocator_observation();
+        let old = cache.allocator_observation();
         assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), before);
         assert_eq!(old.snapshot, first.snapshot);
         assert_eq!(old.age_ms, first.age_ms.map(|age| age + 600_000));
