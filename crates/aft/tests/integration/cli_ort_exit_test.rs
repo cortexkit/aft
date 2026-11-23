@@ -39,7 +39,7 @@ fn warmup_exit_waits_for_a_fill_inside_model_creation() {
     .unwrap();
 
     // The fill holds inside the section until `release` exists, so warmup
-    // never sees the meaning plane complete and ends through its timeout.
+    // never sees the meaning-search fill complete and ends through its timeout.
     let mut child = Command::new(aft_binary::aft_binary())
         .arg("warmup")
         .arg("--root")
