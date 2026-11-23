@@ -1,0 +1,177 @@
+OpenCode 1 provider configuration probe for the T7 parity leg
+run_id: oc1-1.19.6-20261123T174921686Z-t7-parity
+source_sha: d1cddbd231e294d279d49e6cc16040fb2051abba
+binary: opencode-ai@1.19.6 (linux-x64)
+isolation: throwaway HOME, TMPDIR, XDG_CONFIG_HOME, XDG_DATA_HOME, XDG_STATE_HOME, XDG_CACHE_HOME, XDG_RUNTIME_DIR; OPENCODE_DB=opencode2.db; OPENCODE_DISABLE_DEFAULT_PLUGINS=true
+service: foreground opencode run; private XDG state and process cleanup prevent a managed background service from using user state
+provider mock: @copilotkit/aimock@1.24.0 on loopback; fake OpenAI key only
+
+1. V2 providers/package/settings shape
+config key: providers; model: openai/mock-model
+config:
+{
+  "providers": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "package": "@opencode/ai/providers/openai-compatible",
+      "settings": {
+        "baseURL": "http://127.0.0.1:<mock>/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  }
+}
+exit: 1; mock requests: 0; paths: []
+diagnostic: configuration compatibility diagnostic path=["providers"] kind=unsupported action="Omitted native setting that cannot be represented in V1"
+host error: ProviderModelNotFoundError: Model not found: openai/mock-model.
+host output:
+{"type":"error","timestamp":1795456175778,"sessionID":"ses_df678f3f1ffeP7ngQP4NffmWo3","error":{"name":"UnknownError","data":{"message":"Unexpected server error. Check server logs for details.","ref":"err_a6e0da07"}}}
+
+timestamp=2026-11-23T17:49:34.830Z level=INFO run=f9ceabe0 message="creating instance" directory=<capture-root>/probe-0/project
+timestamp=2026-11-23T17:49:34.831Z level=INFO run=f9ceabe0 message=fromDirectory directory=<capture-root>/probe-0/project
+timestamp=2026-11-23T17:49:34.837Z level=INFO run=f9ceabe0 message=bootstrapping directory=<capture-root>/probe-0/project
+timestamp=2026-11-23T17:49:34.847Z level=INFO run=f9ceabe0 message=loading path=<capture-root>/probe-0/xdg-config/opencode/config.json
+timestamp=2026-11-23T17:49:34.848Z level=INFO run=f9ceabe0 message=loading path=<capture-root>/probe-0/xdg-config/opencode/opencode.json
+timestamp=2026-11-23T17:49:34.850Z level=WARN run=f9ceabe0 message="configuration compatibility diagnostic" source=<capture-root>/probe-0/xdg-config/opencode/opencode.json path="[\"providers\"]" kind=unsupported action="Omitted native setting that cannot be represented in V1"
+timestamp=2026-11-23T17:49:34.851Z level=INFO run=f9ceabe0 message=loading path=<capture-root>/probe-0/xdg-config/opencode/opencode.jsonc
+timestamp=2026-11-23T17:49:34.997Z level=INFO run=f9ceabe0 message="all LSPs are disabled"
+timestamp=2026-11-23T17:49:34.998Z level=INFO run=f9ceabe0 message="all formatters are disabled"
+timestamp=2026-11-23T17:49:34.998Z level=INFO run=f9ceabe0 message=init
+timestamp=2026-11-23T17:49:35.119Z level=INFO run=f9ceabe0 message=created id=ses_df678f3f1ffeP7ngQP4NffmWo3 slug=quiet-canyon version=1.19.6 projectID=global directory=<capture-root>/probe-0/project path=tmp/aft-opencode1-contract-C4DOmV/probe-0/project workspaceID=undefined parentID=undefined title="New session - 2026-11-23T17:49:35.119Z" agent=undefined model=undefined metadata=undefined permission="[{\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"plan_enter\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"plan_exit\",\"pattern\":\"*\",\"action\":\"deny\"}]" cost=0 tokens.input=0 tokens.output=0 tokens.reasoning=0 tokens.cache.read=0 tokens.cache.write=0 time.created=1795456175119 time.updated=1795456175119
+timestamp=2026-11-23T17:49:35.128Z level=INFO run=f9ceabe0 message="event connected"
+timestamp=2026-11-23T17:49:35.154Z level=INFO run=f9ceabe0 message=loop session.id=ses_df678f3f1ffeP7ngQP4NffmWo3 step=0
+timestamp=2026-11-23T17:49:35.774Z level=ERROR run=f9ceabe0 message=failed ref=err_a6e0da07 error="ProviderModelNotFoundError: Model not found: openai/mock-model." cause="ProviderModelNotFoundError: Model not found: openai/mock-model.\n    at <anonymous> (/$bunfs/root/chunk-jmc1wxh6.js:2:64699)\n    at SessionPrompt.getModel (/$bunfs/root/chunk-nmjsn7jr.js:50:11031)\n    at SessionPrompt.getModel (definition) (/$bunfs/root/chunk-nmjsn7jr.js:50:831)\n    at SessionPrompt.run (/$bunfs/root/chunk-nmjsn7jr.js:50:14576)\n    at SessionPrompt.run (definition) (/$bunfs/root/chunk-nmjsn7jr.js:50:10099)\n    at SessionRunState.ensureRunning (/$bunfs/root/chunk-nmjsn7jr.js:50:14545)\n    at SessionRunState.ensureRunning (definition) (/$bunfs/root/chunk-nmjsn7jr.js:2:6839)\n    at SessionPrompt.loop (/$bunfs/root/chunk-nmjsn7jr.js:50:9849)\n    at SessionPrompt.loop (definition) (/$bunfs/root/chunk-nmjsn7jr.js:50:14481)\n    at SessionPrompt.prompt (/$bunfs/root/chunk-h7x9wajc.js:6:11717)\n    at SessionPrompt.prompt (definition) (/$bunfs/root/chunk-nmjsn7jr.js:50:9462)"
+timestamp=2026-11-23T17:49:35.775Z level=INFO run=f9ceabe0 message=stream providerID=openai modelID=gpt-5.4-nano-flex session.id=ses_df678f3f1ffeP7ngQP4NffmWo3 small=true agent=title mode=primary
+timestamp=2026-11-23T17:49:35.779Z level=INFO run=f9ceabe0 message="disposing instance" directory=<capture-root>/probe-0/project
+2. V1 provider key with OpenAI API alias
+config key: provider; model: openai/mock-model
+config:
+{
+  "provider": {
+    "openai": {
+      "name": "Deterministic aimock",
+      "api": "openai",
+      "options": {
+        "baseURL": "http://127.0.0.1:<mock>/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  }
+}
+exit: 0; mock requests: 2; paths: ["/v1/responses","/v1/responses"]
+diagnostic: none
+host error: none
+host output:
+{"type":"step_start","timestamp":1795456177795,"sessionID":"ses_df678edbfffe0taC7gdrV7JWYz","part":{"id":"prt_2098715f8001JMGwG81lqMDkNO","messageID":"msg_2098714d6001yU9cJmDRbCWYsp","sessionID":"ses_df678edbfffe0taC7gdrV7JWYz","type":"step-start"}}
+{"type":"text","timestamp":1795456177796,"sessionID":"ses_df678edbfffe0taC7gdrV7JWYz","part":{"id":"prt_2098715f9001kqaNAH9UD5DWvv","messageID":"msg_2098714d6001yU9cJmDRbCWYsp","sessionID":"ses_df678edbfffe0taC7gdrV7JWYz","type":"text","text":"Scenario complete","time":{"start":1795456177657,"end":1795456177659},"metadata":{"openai":{"itemId":"msg-oEIsi0YnihNNvFII"}}}}
+{"type":"step_finish","timestamp":1795456177796,"sessionID":"ses_df678edbfffe0taC7gdrV7JWYz","part":{"id":"prt_2098715fd001tIOp8H2QJHLMV0","reason":"stop","messageID":"msg_2098714d6001yU9cJmDRbCWYsp","sessionID":"ses_df678edbfffe0taC7gdrV7JWYz","type":"step-finish","tokens":{"total":0,"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}
+
+timestamp=2026-11-23T17:49:36.423Z level=INFO run=c85bd309 message="creating instance" directory=<capture-root>/probe-1/project
+timestamp=2026-11-23T17:49:36.424Z level=INFO run=c85bd309 message=fromDirectory directory=<capture-root>/probe-1/project
+timestamp=2026-11-23T17:49:36.434Z level=INFO run=c85bd309 message=bootstrapping directory=<capture-root>/probe-1/project
+timestamp=2026-11-23T17:49:36.438Z level=INFO run=c85bd309 message=loading path=<capture-root>/probe-1/xdg-config/opencode/config.json
+timestamp=2026-11-23T17:49:36.440Z level=INFO run=c85bd309 message=loading path=<capture-root>/probe-1/xdg-config/opencode/opencode.json
+timestamp=2026-11-23T17:49:36.443Z level=INFO run=c85bd309 message=loading path=<capture-root>/probe-1/xdg-config/opencode/opencode.jsonc
+timestamp=2026-11-23T17:49:36.583Z level=INFO run=c85bd309 message="all LSPs are disabled"
+timestamp=2026-11-23T17:49:36.584Z level=INFO run=c85bd309 message="all formatters are disabled"
+timestamp=2026-11-23T17:49:36.584Z level=INFO run=c85bd309 message=init
+timestamp=2026-11-23T17:49:36.704Z level=INFO run=c85bd309 message=created id=ses_df678edbfffe0taC7gdrV7JWYz slug=silent-wizard version=1.19.6 projectID=global directory=<capture-root>/probe-1/project path=tmp/aft-opencode1-contract-C4DOmV/probe-1/project workspaceID=undefined parentID=undefined title="New session - 2026-11-23T17:49:36.704Z" agent=undefined model=undefined metadata=undefined permission="[{\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"plan_enter\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"plan_exit\",\"pattern\":\"*\",\"action\":\"deny\"}]" cost=0 tokens.input=0 tokens.output=0 tokens.reasoning=0 tokens.cache.read=0 tokens.cache.write=0 time.created=1795456176704 time.updated=1795456176704
+timestamp=2026-11-23T17:49:36.713Z level=INFO run=c85bd309 message="event connected"
+timestamp=2026-11-23T17:49:36.744Z level=INFO run=c85bd309 message=loop session.id=ses_df678edbfffe0taC7gdrV7JWYz step=0
+timestamp=2026-11-23T17:49:37.372Z level=INFO run=c85bd309 message="shell tool using shell" shell=/bin/bash
+timestamp=2026-11-23T17:49:37.379Z level=INFO run=c85bd309 message=init count=1
+timestamp=2026-11-23T17:49:37.384Z level=INFO run=c85bd309 message=stream providerID=openai modelID=gpt-5.4-nano-flex session.id=ses_df678edbfffe0taC7gdrV7JWYz small=true agent=title mode=primary
+timestamp=2026-11-23T17:49:37.390Z level=INFO run=c85bd309 message="llm runtime selected" llm.runtime=ai-sdk llm.provider=openai llm.model=gpt-5.4-nano-flex
+timestamp=2026-11-23T17:49:37.467Z level=INFO run=c85bd309 message="watcher backend" directory=<capture-root>/probe-1/project platform=linux backend=inotify
+timestamp=2026-11-23T17:49:37.469Z level=INFO run=c85bd309 message="project copy refresh started" projectID=global
+timestamp=2026-11-23T17:49:37.470Z level=INFO run=c85bd309 message="project copy refresh done" projectID=global updated=[] removed=[]
+timestamp=2026-11-23T17:49:37.493Z level=INFO run=c85bd309 message="booting location services" directory=<capture-root>/probe-1/project workspaceID=undefined
+timestamp=2026-11-23T17:49:37.498Z level=INFO run=c85bd309 message=process session.id=ses_df678edbfffe0taC7gdrV7JWYz messageID=msg_2098714d6001yU9cJmDRbCWYsp
+timestamp=2026-11-23T17:49:37.499Z level=INFO run=c85bd309 message=stream providerID=openai modelID=mock-model session.id=ses_df678edbfffe0taC7gdrV7JWYz small=false agent=build mode=primary
+timestamp=2026-11-23T17:49:37.640Z level=INFO run=c85bd309 message="llm runtime selected" llm.runtime=ai-sdk llm.provider=openai llm.model=mock-model
+timestamp=2026-11-23T17:49:37.665Z level=INFO run=c85bd309 message=loop session.id=ses_df678edbfffe0taC7gdrV7JWYz step=1
+timestamp=2026-11-23T17:49:37.666Z level=INFO run=c85bd309 message="exiting loop" session.id=ses_df678edbfffe0taC7gdrV7JWYz
+timestamp=2026-11-23T17:49:37.796Z level=INFO run=c85bd309 message="disposing instance" directory=<capture-root>/probe-1/project
+3. V1 npm OpenAI-compatible provider
+config key: provider; model: mock/mock-model
+config:
+{
+  "provider": {
+    "mock": {
+      "name": "Deterministic aimock",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:<mock>/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  }
+}
+exit: 0; mock requests: 2; paths: ["/v1/chat/completions","/v1/chat/completions"]
+diagnostic: none
+host error: none
+host output:
+{"type":"step_start","timestamp":1795456179952,"sessionID":"ses_df678e5baffe6nOBiMOfdIHoTw","part":{"id":"prt_209871ee10018ZQ9G88I8foBMt","messageID":"msg_209871d11001UouVggUAOLIzxI","sessionID":"ses_df678e5baffe6nOBiMOfdIHoTw","type":"step-start"}}
+{"type":"text","timestamp":1795456179952,"sessionID":"ses_df678e5baffe6nOBiMOfdIHoTw","part":{"id":"prt_209871ee3001r1LdMxw66mScQ2","messageID":"msg_209871d11001UouVggUAOLIzxI","sessionID":"ses_df678e5baffe6nOBiMOfdIHoTw","type":"text","text":"Scenario complete","time":{"start":1795456179939,"end":1795456179941}}}
+{"type":"step_finish","timestamp":1795456179952,"sessionID":"ses_df678e5baffe6nOBiMOfdIHoTw","part":{"id":"prt_209871ee7001gN2PcLmv1vy2NI","reason":"stop","messageID":"msg_209871d11001UouVggUAOLIzxI","sessionID":"ses_df678e5baffe6nOBiMOfdIHoTw","type":"step-finish","tokens":{"input":0,"output":0,"reasoning":0,"cache":{"write":0,"read":0}},"cost":0}}
+
+timestamp=2026-11-23T17:49:38.458Z level=INFO run=393dda5c message="creating instance" directory=<capture-root>/probe-2/project
+timestamp=2026-11-23T17:49:38.459Z level=INFO run=393dda5c message=fromDirectory directory=<capture-root>/probe-2/project
+timestamp=2026-11-23T17:49:38.464Z level=INFO run=393dda5c message=bootstrapping directory=<capture-root>/probe-2/project
+timestamp=2026-11-23T17:49:38.469Z level=INFO run=393dda5c message=loading path=<capture-root>/probe-2/xdg-config/opencode/config.json
+timestamp=2026-11-23T17:49:38.471Z level=INFO run=393dda5c message=loading path=<capture-root>/probe-2/xdg-config/opencode/opencode.json
+timestamp=2026-11-23T17:49:38.479Z level=INFO run=393dda5c message=loading path=<capture-root>/probe-2/xdg-config/opencode/opencode.jsonc
+timestamp=2026-11-23T17:49:38.626Z level=INFO run=393dda5c message="all LSPs are disabled"
+timestamp=2026-11-23T17:49:38.626Z level=INFO run=393dda5c message="all formatters are disabled"
+timestamp=2026-11-23T17:49:38.626Z level=INFO run=393dda5c message=init
+timestamp=2026-11-23T17:49:38.757Z level=INFO run=393dda5c message=created id=ses_df678e5baffe6nOBiMOfdIHoTw slug=jolly-canyon version=1.19.6 projectID=global directory=<capture-root>/probe-2/project path=tmp/aft-opencode1-contract-C4DOmV/probe-2/project workspaceID=undefined parentID=undefined title="New session - 2026-11-23T17:49:38.757Z" agent=undefined model=undefined metadata=undefined permission="[{\"permission\":\"question\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"plan_enter\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"plan_exit\",\"pattern\":\"*\",\"action\":\"deny\"}]" cost=0 tokens.input=0 tokens.output=0 tokens.reasoning=0 tokens.cache.read=0 tokens.cache.write=0 time.created=1795456178757 time.updated=1795456178757
+timestamp=2026-11-23T17:49:38.766Z level=INFO run=393dda5c message="event connected"
+timestamp=2026-11-23T17:49:38.798Z level=INFO run=393dda5c message=loop session.id=ses_df678e5baffe6nOBiMOfdIHoTw step=0
+timestamp=2026-11-23T17:49:39.481Z level=INFO run=393dda5c message="shell tool using shell" shell=/bin/bash
+timestamp=2026-11-23T17:49:39.488Z level=INFO run=393dda5c message=init count=1
+timestamp=2026-11-23T17:49:39.494Z level=INFO run=393dda5c message=stream providerID=mock modelID=mock-model session.id=ses_df678e5baffe6nOBiMOfdIHoTw small=true agent=title mode=primary
+timestamp=2026-11-23T17:49:39.499Z level=INFO run=393dda5c message="llm runtime selected" llm.runtime=ai-sdk llm.provider=mock llm.model=mock-model
+timestamp=2026-11-23T17:49:39.572Z level=INFO run=393dda5c message="watcher backend" directory=<capture-root>/probe-2/project platform=linux backend=inotify
+timestamp=2026-11-23T17:49:39.581Z level=INFO run=393dda5c message="project copy refresh started" projectID=global
+timestamp=2026-11-23T17:49:39.582Z level=INFO run=393dda5c message="project copy refresh done" projectID=global updated=[] removed=[]
+timestamp=2026-11-23T17:49:39.600Z level=INFO run=393dda5c message="booting location services" directory=<capture-root>/probe-2/project workspaceID=undefined
+timestamp=2026-11-23T17:49:39.930Z level=INFO run=393dda5c message=process session.id=ses_df678e5baffe6nOBiMOfdIHoTw messageID=msg_209871d11001UouVggUAOLIzxI
+timestamp=2026-11-23T17:49:39.931Z level=INFO run=393dda5c message=stream providerID=mock modelID=mock-model session.id=ses_df678e5baffe6nOBiMOfdIHoTw small=false agent=build mode=primary
+timestamp=2026-11-23T17:49:39.932Z level=INFO run=393dda5c message="llm runtime selected" llm.runtime=ai-sdk llm.provider=mock llm.model=mock-model
+timestamp=2026-11-23T17:49:39.948Z level=INFO run=393dda5c message=loop session.id=ses_df678e5baffe6nOBiMOfdIHoTw step=1
+timestamp=2026-11-23T17:49:39.949Z level=INFO run=393dda5c message="exiting loop" session.id=ses_df678e5baffe6nOBiMOfdIHoTw
+timestamp=2026-11-23T17:49:39.952Z level=INFO run=393dda5c message="disposing instance" directory=<capture-root>/probe-2/project
+
+Accepted provider config: {
+  "provider": {
+    "mock": {
+      "name": "Deterministic aimock",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "baseURL": "http://127.0.0.1:<mock>/v1",
+        "apiKey": "{env:OPENAI_API_KEY}"
+      },
+      "models": {
+        "mock-model": {
+          "name": "Mock Model"
+        }
+      }
+    }
+  }
+}
+The contract uses {{AIMOCK_BASE_URL}} so each private harness scenario can materialize its own local endpoint.
