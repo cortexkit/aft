@@ -290,6 +290,14 @@ export const StatusDialog = (props: StatusDialogProps) => {
             value={formatCacheRoleLabel(status()!.cache_role)}
             tone={cacheRoleTone(status()!.cache_role)}
           />
+          {status()!.disk.data_store_bytes != null && (
+            <R
+              theme={t()}
+              label="Index store"
+              value={formatBytes(status()!.disk.data_store_bytes!)}
+              tone="muted"
+            />
+          )}
         </box>
       ) : null}
 
@@ -314,12 +322,6 @@ export const StatusDialog = (props: StatusDialogProps) => {
               theme={t()}
               label="Trigrams"
               value={formatCountShort(status()!.search_index.trigrams)}
-            />
-            <R
-              theme={t()}
-              label="Disk"
-              value={formatBytes(status()!.disk.trigram_disk_bytes)}
-              tone="muted"
             />
 
             <box marginTop={1}>
@@ -413,12 +415,6 @@ export const StatusDialog = (props: StatusDialogProps) => {
                 tone="muted"
               />
             ) : null}
-            <R
-              theme={t()}
-              label="Disk"
-              value={formatBytes(status()!.disk.semantic_disk_bytes)}
-              tone="muted"
-            />
 
             <box marginTop={1}>
               <text fg={t().text}>

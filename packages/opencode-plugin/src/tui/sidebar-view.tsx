@@ -15,6 +15,7 @@ import { createMemo, createSignal, onCleanup } from "solid-js";
 import {
   type AftStatusSnapshot,
   degradedHeaderMarker,
+  formatBytes,
   formatSemanticIndexLabel,
   formatSemanticRefreshing,
   NOT_STARTED_STATUS_TEXT,
@@ -107,14 +108,6 @@ export function badgeForeground(accent: SidebarColor, background: SidebarColor):
   if (!accentChannels || !backgroundChannels) return background;
   const picked = badgeTextColor(accentChannels, backgroundChannels);
   return picked === backgroundChannels ? background : picked;
-}
-
-function formatBytes(n: number): string {
-  if (!Number.isFinite(n) || n <= 0) return "—";
-  if (n >= 1_073_741_824) return `${(n / 1_073_741_824).toFixed(1)} GB`;
-  if (n >= 1_048_576) return `${(n / 1_048_576).toFixed(1)} MB`;
-  if (n >= 1_024) return `${Math.round(n / 1_024)} KB`;
-  return `${n} B`;
 }
 
 function formatCount(n: number | null | undefined): string {
@@ -413,8 +406,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
   };
   const semanticRefreshing = () =>
     formatSemanticRefreshing(s()?.semantic_index?.refreshing_count ?? 0);
-  const trigramBytes = () => s()?.disk?.trigram_disk_bytes ?? 0;
-  const semanticBytes = () => s()?.disk?.semantic_disk_bytes ?? 0;
+  const indexStoreBytes = () => s()?.disk?.data_store_bytes;
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
   const statusBar = () => s()?.status_bar ?? s()?.status_bar_values;
 
@@ -574,6 +566,15 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
             {/* Search index */}
             {!notInitialized() && !props.collapsed && (
               <>
+                {(props.prefs.sections.searchIndex || props.prefs.sections.semanticIndex) &&
+                  indexStoreBytes() != null && (
+                    <StatRow
+                      palette={props.palette}
+                      label="Index store"
+                      value={formatBytes(indexStoreBytes()!)}
+                      tone="muted"
+                    />
+                  )}
                 {props.prefs.sections.searchIndex && (
                   <>
                     <SectionHeader palette={props.palette} title="Search Index" />
@@ -591,12 +592,6 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
                         tone="muted"
                       />
                     )}
-                    <StatRow
-                      palette={props.palette}
-                      label="Disk"
-                      value={formatBytes(trigramBytes())}
-                      tone="muted"
-                    />
                   </>
                 )}
 
@@ -635,12 +630,6 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
                         tone="muted"
                       />
                     )}
-                    <StatRow
-                      palette={props.palette}
-                      label="Disk"
-                      value={formatBytes(semanticBytes())}
-                      tone="muted"
-                    />
                   </>
                 )}
 

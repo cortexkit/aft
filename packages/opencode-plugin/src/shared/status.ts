@@ -128,6 +128,7 @@ export interface AftStatusSnapshot {
   };
   disk: {
     storage_dir: string | null;
+    data_store_bytes?: number | null;
     trigram_disk_bytes: number;
     semantic_disk_bytes: number;
   };
@@ -389,6 +390,7 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     },
     disk: {
       storage_dir: readNullableString(disk.storage_dir),
+      data_store_bytes: readOptionalNumber(disk.data_store_bytes),
       trigram_disk_bytes: readNumber(disk.trigram_disk_bytes),
       semantic_disk_bytes: readNumber(disk.semantic_disk_bytes),
     },
@@ -465,11 +467,10 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     lines.push(`- dimension: ${formatCount(status.semantic_index.dimension)}`);
   }
 
+  if (status.disk.data_store_bytes != null) {
+    lines.push("", "Disk usage", `- Index store: ${formatBytes(status.disk.data_store_bytes)}`);
+  }
   lines.push(
-    "",
-    "Disk usage",
-    `- trigram index: ${formatBytes(status.disk.trigram_disk_bytes)}`,
-    `- semantic index: ${formatBytes(status.disk.semantic_disk_bytes)}`,
     "",
     "Runtime",
     `- LSP servers: ${formatCount(status.lsp_servers)}`,

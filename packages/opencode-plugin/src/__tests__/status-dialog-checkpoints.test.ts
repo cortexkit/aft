@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
 
-test("TUI renders unknown current and project checkpoint counts", async () => {
+async function renderStatusFrame(): Promise<string> {
   const child = Bun.spawn(
     [
       process.execPath,
@@ -17,6 +17,17 @@ test("TUI renders unknown current and project checkpoint counts", async () => {
     child.exited,
   ]);
   expect({ exitCode, stderr }).toEqual({ exitCode: 0, stderr: "" });
+  return frame;
+}
+
+test("TUI renders unknown current and project checkpoint counts", async () => {
+  const frame = await renderStatusFrame();
   expect(frame).toMatch(/Checkpoints\s+—/);
   expect(frame).toMatch(/All-session checkpoints\s+—/);
+}, 30_000);
+
+test("TUI status dialog shows a single shared Index store size", async () => {
+  const frame = await renderStatusFrame();
+  expect(frame.match(/Index store\s+4\.0 KB/g)).toHaveLength(1);
+  expect(frame).not.toMatch(/\bDisk\b/);
 }, 30_000);

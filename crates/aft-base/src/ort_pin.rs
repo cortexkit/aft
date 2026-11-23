@@ -359,13 +359,12 @@ impl AuthorizedOrtLibrary {
         };
         let path = &held.path;
         let changed = |detail: String| {
-            // Worded like the hash-mismatch refusal so it does not match
-            // `semantic_index::is_onnx_runtime_unavailable`: a missing runtime
-            // is answered with `doctor --fix`, which cannot help here.
+            // Keep the integrity error distinct from a missing runtime so status
+            // reports why the library was rejected.
             format!(
                 "onnx runtime library changed while it was being checked at {}: {detail}. \
-                 It is not used, so semantic search is unavailable. Remove the file and \
-                 reinstall with `npx @cortexkit/aft doctor --clear`.",
+                 It is not used, so semantic search is unavailable. Reinstall with \
+                 `npx @cortexkit/aft doctor --fix`.",
                 path.display()
             )
         };
@@ -512,14 +511,12 @@ pub(crate) fn open_authorized_with(
         });
     }
 
-    // Worded so `semantic_index::is_onnx_runtime_unavailable` does not match it
-    // (that check looks for "dlopen", "not found" and similar): a match would
-    // report a missing runtime and suggest `doctor --fix`, which cannot help
-    // while a tampered file still sits in the folder.
+    // Keep the integrity error distinct from a missing runtime so status
+    // reports why the library was rejected.
     Err(format!(
         "onnx runtime library hash mismatch at {}: sha256 {sha256} is not a pinned ONNX \
-         Runtime build, so semantic search is unavailable. Remove the file and reinstall \
-         with `npx @cortexkit/aft doctor --clear`, or name a runtime you trust with \
+         Runtime build, so semantic search is unavailable. Reinstall with \
+         `npx @cortexkit/aft doctor --fix`, or name a runtime you trust with \
          ORT_DYLIB_PATH in the environment AFT is started with.",
         path.display()
     ))
@@ -1053,30 +1050,31 @@ pub mod tests {
 
     #[test]
     fn installer_pins_the_same_library_hashes() {
-        // The bridge installer (onnx-runtime.ts, `librarySha256`) checks a
-        // download against its own copy of PINNED_ORT_LIBRARIES before
-        // publishing it. If the two lists drift apart, the installer publishes
-        // builds AFT then refuses, or refuses builds AFT would load.
+        // Doctor uses the installer's pins and the legacy macOS pin to check a
+        // managed cache. Its accepted digests must match the loader's list.
         let installer = Path::new(crate::test_support::manifest_dir())
             .join("../../packages/aft-bridge/src/onnx-runtime.ts");
         let Ok(source) = std::fs::read_to_string(&installer) else {
             eprintln!("skipping: {} not present", installer.display());
             return;
         };
-        let installer_pins: Vec<&str> = source
+        let mut installer_pins: Vec<&str> = source
             .lines()
             .filter_map(|line| line.trim().strip_prefix("librarySha256: \""))
             .filter_map(|rest| rest.split('"').next())
             .collect();
+        let legacy_pin = source
+            .split_once("const LEGACY_MACOS_LIBRARY_SHA256")
+            .and_then(|(_, source)| source.split('"').nth(1))
+            .expect("doctor must accept the legacy macOS library hash");
+        installer_pins.push(legacy_pin);
         let mut rust_pins: Vec<&str> = PINNED_ORT_LIBRARIES
             .iter()
-            .filter(|library| library.asset.ends_with(".nupkg"))
             .map(|library| library.sha256)
             .collect();
-        let mut installer_sorted = installer_pins.clone();
         rust_pins.sort_unstable();
-        installer_sorted.sort_unstable();
-        assert_eq!(installer_sorted, rust_pins);
+        installer_pins.sort_unstable();
+        assert_eq!(installer_pins, rust_pins);
     }
 
     #[test]

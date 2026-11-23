@@ -17,6 +17,7 @@ const status = coerceAftStatus({
   cache_role: "main",
   checkpoints_total: null,
   session: { checkpoints: null },
+  disk: { data_store_bytes: 4096, trigram_disk_bytes: 1024, semantic_disk_bytes: 2048 },
 });
 const setup = await testRender(
   () => (

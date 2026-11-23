@@ -25,9 +25,13 @@
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, renameSync, rmSync } from "node:fs";
 import { isAbsolute, join, relative } from "node:path";
-import { ensureOnnxRuntime } from "@cortexkit/aft-bridge";
+import { ensureManagedOnnxRuntime } from "@cortexkit/aft-bridge";
 import type { HarnessAdapter } from "../adapters/types.js";
-import type { DiagnosticReport, HarnessDiagnostic } from "./diagnostics.js";
+import {
+  type DiagnosticReport,
+  type HarnessDiagnostic,
+  ONNX_CACHE_PIN_WARNING,
+} from "./diagnostics.js";
 import { formatFsError } from "./fs-errors.js";
 import { dirSize, formatBytes } from "./fs-util.js";
 import { confirm, log, note } from "./prompts.js";
@@ -57,14 +61,16 @@ export function findOnnxFixCandidates(report: DiagnosticReport): OnnxFixCandidat
     // the replacement in managed storage.
     const systemTooOld =
       harness.onnxRuntime.systemPath !== null && harness.onnxRuntime.systemCompatible === false;
-    const cachedTooOld =
+    const cachedIncompatible =
       harness.onnxRuntime.cachedPath !== null && harness.onnxRuntime.cachedCompatible === false;
     const hasCompatibleCached = harness.onnxRuntime.cachedCompatible === true;
 
-    if (cachedTooOld) {
+    if (cachedIncompatible) {
       candidates.push({
         harness,
-        reason: `cached ONNX Runtime at ${harness.onnxRuntime.cachedPath} is v${harness.onnxRuntime.cachedVersion}, but AFT requires ${harness.onnxRuntime.requirement}. AFT will stage and verify a managed replacement before removing it.`,
+        reason: harness.onnxRuntime.cachedPinMismatch
+          ? ONNX_CACHE_PIN_WARNING
+          : `cached ONNX Runtime at ${harness.onnxRuntime.cachedPath} is v${harness.onnxRuntime.cachedVersion}, but AFT requires ${harness.onnxRuntime.requirement}. AFT will stage and verify a managed replacement before removing it.`,
         storageOnnxDir,
         storageOnnxBytes: existsSync(storageOnnxDir) ? dirSize(storageOnnxDir) : 0,
       });
@@ -234,7 +240,7 @@ export async function runOnnxFix(
 
   const result: OnnxFixResult = { cleared: 0, installed: 0, bytesReclaimed: 0, errors: [] };
   const rmFn = options.rmFn ?? rmSync;
-  const ensureFn = options.ensureFn ?? ensureOnnxRuntime;
+  const ensureFn = options.ensureFn ?? ensureManagedOnnxRuntime;
 
   for (const candidate of candidates) {
     try {

@@ -78,6 +78,14 @@ describe("coerceAftStatus", () => {
     expect(dialog).toContain("- project checkpoints (all sessions): —");
   });
 
+  test("text status dialog shows a single shared Index store size", () => {
+    const dialog = formatStatusDialogMessage(
+      coerceAftStatus({ ...baseResponse, disk: { ...baseResponse.disk, data_store_bytes: 4096 } }),
+    );
+    expect(dialog.match(/^- Index store: 4\.0 KB$/gm)).toHaveLength(1);
+    expect(dialog).not.toMatch(/^- (trigram|semantic) index:/m);
+  });
+
   test("off inspect categories survive status parsing and never show stale counts", () => {
     const status = coerceAftStatus({
       ...baseResponse,

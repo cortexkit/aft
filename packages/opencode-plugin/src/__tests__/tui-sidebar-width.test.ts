@@ -32,7 +32,7 @@ function snapshot(overrides: Record<string, unknown> = {}) {
       refreshing_count: 0,
       error: "ONNX Runtime not found. Install it.",
     },
-    disk: { trigram_disk_bytes: 1000, semantic_disk_bytes: 0 },
+    disk: { data_store_bytes: 4096 },
     ...overrides,
   };
 }
@@ -120,6 +120,20 @@ async function renderFrame(
 }
 
 describe("the sidebar at its real width", () => {
+  test(
+    "sidebar shows a single shared Index store size",
+    async () => {
+      const frame = await renderFrame(
+        snapshot({
+          disk: { data_store_bytes: 4096, trigram_disk_bytes: 1024, semantic_disk_bytes: 2048 },
+        }),
+      );
+      expect(frame.filter((line) => /^ Index store\s+4\.0 KB$/.test(line))).toHaveLength(1);
+      expect(frame.some((line) => /^ Disk\b/.test(line))).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
   test(
     "a long status value wraps under the value column and never overwrites its label",
     async () => {

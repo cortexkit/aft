@@ -1926,16 +1926,11 @@ impl SearchLaneStatus {
                     _ => lane.effective.as_str().to_string(),
                 };
                 let state = if name == "semantic" {
-                    // With the data layer's meaning plane serving the lane,
-                    // its own status words the label.
-                    let status = match crate::commands::data_search::DataSemantic::probe(ctx) {
-                        Some(data) => Some(data.status()),
-                        None => ctx
-                            .semantic_index_status()
-                            .try_read()
-                            .ok()
-                            .map(|status| status.clone()),
-                    };
+                    // Prefer the current semantic index status over the stored snapshot.
+                    let snapshot = ctx.semantic_index_status();
+                    let status = crate::commands::data_search::DataSemantic::probe(ctx)
+                        .map(|data| data.status())
+                        .or_else(|| snapshot.try_read().ok().map(|status| status.clone()));
                     match status.as_ref() {
                         Some(SemanticIndexStatus::Ready { refreshing, .. })
                             if !refreshing.is_empty() && lane.is_ready() =>
@@ -1943,17 +1938,21 @@ impl SearchLaneStatus {
                             "refreshing (previous generation serving)".to_string()
                         }
                         Some(SemanticIndexStatus::Building {
-                            entries_done: Some(done),
-                            entries_total: Some(total),
+                            stage,
+                            entries_done,
+                            entries_total,
                             ..
-                        }) if *total > 0 && lane.effective == IndexEffective::Building => {
-                            format!("building {}%", done.saturating_mul(100) / total)
-                        }
-                        Some(SemanticIndexStatus::Building { stage, .. })
-                            if stage == "loading_artifacts"
-                                && lane.effective == IndexEffective::Building =>
-                        {
-                            "loading".to_string()
+                        }) if lane.effective == IndexEffective::Building => {
+                            match (stage.as_str(), entries_done, entries_total) {
+                                ("waiting_for_onnx_runtime_download", _, _) => {
+                                    "waiting for ONNX Runtime download".to_string()
+                                }
+                                (_, Some(done), Some(total)) if *total > 0 => {
+                                    format!("building {}%", done.saturating_mul(100) / total)
+                                }
+                                ("loading_artifacts", _, _) => "loading".to_string(),
+                                _ => state,
+                            }
                         }
                         _ => state,
                     }

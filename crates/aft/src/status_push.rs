@@ -605,6 +605,7 @@ mod tests {
         assert_eq!(frame.snapshot["callgraph_store"], full["callgraph_store"]);
         assert_eq!(frame.snapshot["data_store"], full["data_store"]);
         assert_eq!(frame.snapshot["search_index"], full["search_index"]);
+        assert_eq!(frame.snapshot["disk"]["data_store_bytes"], 2048);
 
         let compact = summary(&full, 256);
         assert_eq!(compact["callgraph_store"], full["callgraph_store"]);

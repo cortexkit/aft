@@ -370,10 +370,12 @@ export { type OnnxRuntimeLoadProbe, probeOnnxRuntimeLoadable } from "./onnx-prob
 export {
   __test__ as __onnxTest__,
   cleanupOnnxRuntime,
+  ensureManagedOnnxRuntime,
   ensureOnnxRuntime,
   getManualInstallHint,
   getOnnxRuntimeInstallFailure,
   isOrtAutoDownloadSupported,
+  isPinnedOnnxRuntimeLibrary,
 } from "./onnx-runtime.js";
 export {
   InvalidRequestError,
