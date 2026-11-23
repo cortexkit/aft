@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { coerceAftStatus } from "../shared/status.js";
 import baseline from "./fixtures/sidebar-appearance-baseline.json";
 
 /**
@@ -130,13 +131,17 @@ describe("the sidebar at its real width", () => {
           "Index storage is paused: 3.7 GiB is free on this disk and AFT keeps 4.0 GiB free. Unused index data is being cleaned up; retry later.",
       };
       const frame = await renderFrame(
-        snapshot({ search_index: paused, semantic_index: paused, callgraph_store: paused }),
+        coerceAftStatus(
+          snapshot({ search_index: paused, semantic_index: paused, callgraph_store: paused }),
+        ),
       );
       const blocked = frame.join(" ").replace(/\s+/g, " ");
       expect(blocked.match(/paused \(low disk space\)/g)).toHaveLength(2);
       const graphOnly = (
         await renderFrame(
-          snapshot({ semantic_index: { status: "ready" }, callgraph_store: paused }),
+          coerceAftStatus(
+            snapshot({ semantic_index: { status: "ready" }, callgraph_store: paused }),
+          ),
         )
       )
         .join(" ")
