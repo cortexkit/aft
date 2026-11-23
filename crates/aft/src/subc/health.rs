@@ -3531,17 +3531,134 @@ impl HealthRollupCache {
 mod findings_snapshot_tests {
     use super::*;
 
+    fn snapshot_findings(cache: &HealthRollupCache) -> Vec<Value> {
+        serde_json::to_value(cache.findings(1_000_000, 60_000))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["check"] == "health_snapshot")
+            .cloned()
+            .collect()
+    }
+
     #[test]
-    fn diagnostics_findings_contended_cache_returns_unknown_without_fallback_probes() {
+    fn diagnostics_findings_keep_last_snapshot_through_idle_interval_and_assembly() {
         let cache = HealthRollupCache::new();
-        let _held = cache.snapshot.write().unwrap();
-        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
-        assert_eq!(findings.as_array().unwrap().len(), 1);
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *cache.census_wake.lock().unwrap() = Some(wake_tx);
+
+        let published_at = 1_000;
+        cache.clock_ms.store(published_at, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let next_start = published_at + duration_millis_u64(demand::BACKGROUND_INTERVAL);
+        cache.clock_ms.store(next_start, Ordering::Relaxed);
+        let building = build_health_diagnostic_rollup_from_actors(&cache, &executor, &app, vec![]);
+
+        // The worker waits a full interval before building the next rollup.
+        // Until it swaps in that rollup, readers still get the last publication.
+        let latest_healthy = next_start + 5_000;
+        cache.clock_ms.store(latest_healthy, Ordering::Relaxed);
+        let findings = snapshot_findings(&cache);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(cache.refresh_count_for_test(), 1);
+
+        // If assembly outlasts the idle interval plus five seconds, the old
+        // publication is no longer fresh evidence.
+        cache.clock_ms.store(latest_healthy + 1, Ordering::Relaxed);
+        let findings = snapshot_findings(&cache);
+        assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], "error");
         assert_eq!(
             findings[0]["samples"][0]["reason"],
-            "cache_contended_or_poisoned"
+            "snapshot_older_than_30s_or_unmeasured"
         );
+        assert_eq!(
+            wake_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        assert!(!cache.health_requested.load(Ordering::Acquire));
+
+        cache.publish(Some(building));
+        assert!(snapshot_findings(&cache).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_findings_use_fresh_evidence_after_a_contended_refresh() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+
+        let interval_ms = duration_millis_u64(demand::BACKGROUND_INTERVAL);
+        cache.clock_ms.store(interval_ms, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        let (published, age) = cache.snapshot();
+        assert!(cache.census_contended(&published));
+        assert_eq!(age, Some(interval_ms));
+        let findings = snapshot_findings(&cache);
+        assert!(findings.is_empty(), "{findings:?}");
+
+        // Further missed refreshes must not update the last success's age.
+        cache.clock_ms.store(interval_ms + 5_001, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        let findings = snapshot_findings(&cache);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["severity"], "error");
+        assert_eq!(
+            findings[0]["samples"][0]["reason"],
+            "snapshot_older_than_30s_or_unmeasured"
+        );
+    }
+
+    #[test]
+    fn diagnostics_findings_can_read_last_publication_after_lock_poisoning() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.refresh_for_test(&Executor::new(), &App::default_shared());
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _held = cache.snapshot.write().unwrap();
+                    panic!("simulate a publication interrupted while holding the pointer lock");
+                })
+                .join()
+                .is_err());
+        });
+        let findings = snapshot_findings(&cache);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostics_findings_ignore_expired_allocator_in_fresh_idle_rollups() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
+        cache.request_census();
+        cache.refresh_for_test(&executor, &app);
+        let walks = crate::memory::allocator_snapshot_calls_for_test();
+
+        let interval_ms = duration_millis_u64(demand::BACKGROUND_INTERVAL);
+        let first_past_reuse = (300_000 / interval_ms + 1) * interval_ms;
+        for now in [first_past_reuse, first_past_reuse + interval_ms] {
+            cache.clock_ms.store(now, Ordering::Relaxed);
+            cache.refresh_for_test(&executor, &app);
+            let (rollup, age) = cache.snapshot();
+            assert_eq!(age, Some(0));
+            assert!(rollup.metrics["memory"]["allocator_observation_age_ms"]
+                .as_u64()
+                .is_some_and(|age| age >= now));
+            assert!(cache.allocator_breakdown_due());
+            let findings = snapshot_findings(&cache);
+            assert!(findings.is_empty(), "{findings:?}");
+        }
+        assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), walks);
     }
 }
 
