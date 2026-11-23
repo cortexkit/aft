@@ -148,12 +148,44 @@ fn exit_after_log_flush(code: i32) -> i32 {
 /// Code 0 returns so the caller can return from `main` as before; any other
 /// code exits here.
 fn run_ort_capable_command(command: impl FnOnce() -> i32) {
+    #[cfg(feature = "test-hooks")]
+    hold_ort_section_at_exit_for_test();
     let code = command();
     if code == 0 {
         aft::ort_lifecycle::quiesce_before_return(0);
         return;
     }
     aft::ort_lifecycle::exit_process(code)
+}
+
+/// Opens an ONNX Runtime section on a background thread before the command
+/// runs and holds it, so an exit test can see whether the command's end waits
+/// for it on either exit path, without loading ONNX Runtime or depending on
+/// when a fill runs. Set `AFT_TEST_HOLD_ORT_SECTION_AT_EXIT` to a folder: the
+/// thread writes `entered` there once the section is open, waits until
+/// `release` exists, and writes `left` just before it leaves the section. A
+/// process that ends without waiting never writes `left`.
+#[cfg(feature = "test-hooks")]
+fn hold_ort_section_at_exit_for_test() {
+    let Some(dir) =
+        std::env::var_os("AFT_TEST_HOLD_ORT_SECTION_AT_EXIT").map(std::path::PathBuf::from)
+    else {
+        return;
+    };
+    let (opened_tx, opened_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let Some(_section) = aft::ort_lifecycle::enter() else {
+            return;
+        };
+        let _ = std::fs::write(dir.join("entered"), b"");
+        let _ = opened_tx.send(());
+        while !dir.join("release").exists() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::write(dir.join("left"), b"");
+    });
+    // The section must be open before the command can finish.
+    let _ = opened_rx.recv();
 }
 
 fn hold_process_storage_lease() -> Arc<aft::root_cache::ProcessStorageLease> {
