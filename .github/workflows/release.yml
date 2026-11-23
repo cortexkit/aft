@@ -506,7 +506,7 @@ jobs:
 
       - name: Build
         # MSVC keeps debug info in a PDB, not in the shipped executable.
-        run: python scripts/ci-stage-aft.py --pdb cargo build --release --bin aft --target aarch64-pc-windows-msvc -p agent-file-tools --config 'profile.release.strip=false' --features wasm-grammars
+        run: python scripts/ci-stage-aft.py --pdb --legacy-msvc-profile-dir aarch64-pc-windows-msvc/release cargo rustc --release --bin aft --target aarch64-pc-windows-msvc -p agent-file-tools --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
@@ -613,7 +613,7 @@ jobs:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Build
-        run: python scripts/ci-stage-aft.py --pdb cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
+        run: python scripts/ci-stage-aft.py --pdb --legacy-msvc-profile-dir x86_64-pc-windows-msvc/release cargo rustc --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target

@@ -1698,7 +1698,7 @@ jobs:
         run: bun run typecheck
 
       - name: Cargo build (debug — needed by plugin tests)
-        run: python3 scripts/ci-stage-aft.py cargo build --features wasm-grammars -p agent-file-tools --bin aft
+        run: python3 scripts/ci-stage-aft.py cargo rustc --features wasm-grammars -p agent-file-tools --bin aft
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
           CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
@@ -2371,7 +2371,7 @@ jobs:
         shell: pwsh
 
       - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
-        run: python scripts/ci-stage-aft.py cargo build --features wasm-grammars -p agent-file-tools --bin aft
+        run: python scripts/ci-stage-aft.py --legacy-msvc-profile-dir debug cargo rustc --features wasm-grammars -p agent-file-tools --bin aft
         shell: pwsh
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target

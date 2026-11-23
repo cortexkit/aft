@@ -159,7 +159,9 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                                              "with": {"phase": "cleanup"}})
                 if job_id.startswith("build-"):
                     build = next(i for i, step in enumerate(steps) if step.get("name") == "Build")
-                    self.assertIn(f"ci-stage-aft.py --pdb cargo build --release --bin aft --target {target}", steps[build]["run"])
+                    self.assertIn(f"--legacy-msvc-profile-dir {target}/release", steps[build]["run"])
+                    self.assertIn(f"cargo rustc --release --bin aft --target {target}", steps[build]["run"])
+                    self.assertIn("ci-stage-aft.py --pdb", steps[build]["run"])
                     self.assertEqual(steps[build]["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_JOB_DIR }}/cargo-target")
                     self.assertEqual(steps[build]["env"]["CARGO_BUILD_BUILD_DIR"],
                                      "${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}")
@@ -218,7 +220,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
         job = self.workflow("_e2e-suite.yml")["jobs"]["e2e-macos"]
         self.assertEqual(job["env"]["CARGO_PROFILE"], "${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}")
         self.assertEqual(job["env"]["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only")
-        self.assertIn('cargo build --profile "$CARGO_PROFILE"', commands(job))
+        self.assertIn('cargo rustc --profile "$CARGO_PROFILE"', commands(job))
         for command in ('codesign -f -s - "$AFT_CI_JOB_DIR/aft"',
                         'codesign --verify --strict "$AFT_CI_JOB_DIR/aft"',
                         '"$AFT_CI_JOB_DIR/aft" --version'):

@@ -71,7 +71,7 @@ class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
         for arch, target in (("x64", "x86_64"), ("arm64", "aarch64")):
             with self.subTest(arch=arch):
                 steps = self.jobs[f"build-win32-{arch}"]["steps"]
-                builds = [step for step in steps if "cargo build --release" in step.get("run", "")]
+                builds = [step for step in steps if re.search(r"cargo (build|rustc) --release", step.get("run", ""))]
                 self.assertTrue(builds)
                 self.assertTrue(all("profile.release.strip=false" in step["run"] for step in builds))
                 verify_index = next(i for i, step in enumerate(steps) if step.get("name") == "Verify and package Windows PDB")
@@ -1330,7 +1330,7 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertNotIn("needs:", dependencies)
         self.assertNotIn("actions/download-artifact", conformance)
         self.assertIn("python3 scripts/check-path-deps.py", conformance)
-        self.assertIn("cargo build --features wasm-grammars -p agent-file-tools", conformance)
+        self.assertIn("cargo rustc --features wasm-grammars -p agent-file-tools", conformance)
         self.assertIn("AFT_BINARY_PATH: ${{ env.AFT_CI_JOB_DIR }}/aft", conformance)
 
 
@@ -1385,6 +1385,20 @@ class StageAftTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "unexpected aft executable"):
                 self.stage["stage_artifact"]({"executable": str(executable)}, job / "cargo-target", job, False)
             self.assertFalse((job / "aft").exists())
+
+    def test_legacy_msvc_invalidation_removes_only_the_profile_binary_and_pdb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp).resolve()
+            profile = Path("x86_64-pc-windows-msvc/stage")
+            removed = [profile / "deps" / file for file in ("aft.exe", "aft.pdb")]
+            kept = [profile / "aft.exe", profile / "deps/libaft.rlib",
+                    Path("aarch64-pc-windows-msvc/stage/deps/aft.exe")]
+            for path in removed + kept:
+                (build / path).parent.mkdir(parents=True, exist_ok=True)
+                (build / path).touch()
+            self.stage["invalidate_legacy_msvc_binary"](build, profile)
+            self.assertTrue(all(not (build / path).exists() for path in removed))
+            self.assertTrue(all((build / path).is_file() for path in kept))
 
 
 class NativeSelfHostedWorkflowTests(unittest.TestCase):
@@ -1628,7 +1642,7 @@ while [[ "$1" != --output ]]; do shift; done
                                          "${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}", name)
                     else:
                         self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
-                    self.assertRegex(run, r"cargo (build|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
+                    self.assertRegex(run, r"cargo (build|rustc|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
                 if any(command in run for command in (
                     "rust-test-gate.sh", "ci-windows-probes.py", "bun run test:unit", "bun test ",
                     "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1", "cargo test",
