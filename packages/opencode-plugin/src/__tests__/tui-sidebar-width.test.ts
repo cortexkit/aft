@@ -135,7 +135,9 @@ describe("the sidebar at its real width", () => {
       const blocked = frame.join(" ").replace(/\s+/g, " ");
       expect(blocked.match(/paused \(low disk space\)/g)).toHaveLength(2);
       const graphOnly = (
-        await renderFrame(snapshot({ semantic_index: { status: "ready" }, callgraph_store: paused }))
+        await renderFrame(
+          snapshot({ semantic_index: { status: "ready" }, callgraph_store: paused }),
+        )
       )
         .join(" ")
         .replace(/\s+/g, " ");

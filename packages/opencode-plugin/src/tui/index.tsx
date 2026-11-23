@@ -9,8 +9,10 @@ import { AftRpcClient } from "../shared/rpc-client";
 import {
   type AftStatusSnapshot,
   coerceAftStatus,
+  diskPausedIndexLabel,
   formatBytes,
   formatCacheRoleLabel,
+  formatSearchIndexLabel,
   formatSemanticIndexLabel,
   formatSemanticRefreshing,
   NOT_STARTED_STATUS_TEXT,
@@ -298,6 +300,9 @@ export const StatusDialog = (props: StatusDialogProps) => {
               tone="muted"
             />
           )}
+          {status()!.index_store_pause && (
+            <text fg={t().warning}>⚠ {status()!.index_store_pause}</text>
+          )}
         </box>
       ) : null}
 
@@ -314,7 +319,7 @@ export const StatusDialog = (props: StatusDialogProps) => {
             <R
               theme={t()}
               label="Status"
-              value={status()!.search_index.status}
+              value={formatSearchIndexLabel(status()!.search_index)}
               tone={statusTone(status()!.search_index.status)}
             />
             <R theme={t()} label="Files" value={formatCountShort(status()!.search_index.files)} />
@@ -463,7 +468,8 @@ export const StatusDialog = (props: StatusDialogProps) => {
       ) : null}
 
       {/* Semantic error — full-width, themed error color */}
-      {status()?.semantic_index.error ? (
+      {status()?.semantic_index.error &&
+      !diskPausedIndexLabel(status()!.semantic_index.status, status()!.semantic_index.reason) ? (
         <box marginTop={1} width="100%">
           <text fg={t().error}>⚠ {status()!.semantic_index.error}</text>
         </box>

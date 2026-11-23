@@ -15,6 +15,7 @@ import { createMemo, createSignal, onCleanup } from "solid-js";
 import {
   type AftStatusSnapshot,
   degradedHeaderMarker,
+  diskPausedIndexLabel,
   formatBytes,
   formatSemanticIndexLabel,
   formatSemanticRefreshing,
@@ -385,7 +386,12 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
 
   // Pre-compute display values so the JSX stays readable. createMemo for
   // each derived field would be overkill — these are cheap derivations.
-  const searchStatus = () => statusDisplay(s()?.search_index?.status ?? "disabled");
+  const searchStatus = () => {
+    const index = s()?.search_index;
+    const display = statusDisplay(index?.status ?? "disabled");
+    const label = index && diskPausedIndexLabel(index.status, index.reason);
+    return label ? { ...display, label } : display;
+  };
   const semanticStatus = () => {
     const rawStatus = s()?.semantic_index?.status ?? "disabled";
     const display = statusDisplay(rawStatus);
@@ -407,6 +413,8 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
   const semanticRefreshing = () =>
     formatSemanticRefreshing(s()?.semantic_index?.refreshing_count ?? 0);
   const indexStoreBytes = () => s()?.disk?.data_store_bytes;
+  const indexStorePause = () =>
+    s()?.index_store_pause && <text fg={props.palette.warning}>⚠ {s()!.index_store_pause}</text>;
   const compressionRows = () => formatCompressionSidebarRows(s()?.compression);
   const statusBar = () => s()?.status_bar ?? s()?.status_bar_values;
 
@@ -519,6 +527,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
           order of the expanded grid. */}
             {!notInitialized() && props.collapsed && (
               <box width="100%" flexDirection="column">
+                {indexStorePause()}
                 {props.prefs.sections.searchIndex && (
                   <CollapsedRow palette={props.palette} label="Search Index">
                     <text fg={toneColor(props.palette, searchStatus().tone)}>●</text>
@@ -575,6 +584,7 @@ export const AftSidebarPanel = (props: AftSidebarPanelProps) => {
                       tone="muted"
                     />
                   )}
+                {indexStorePause()}
                 {props.prefs.sections.searchIndex && (
                   <>
                     <SectionHeader palette={props.palette} title="Search Index" />

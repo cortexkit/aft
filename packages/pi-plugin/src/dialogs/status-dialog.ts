@@ -22,14 +22,17 @@ import {
   type TUI,
   truncateToWidth,
   visibleWidth,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
 import packageJson from "../../package.json";
 import {
   type AftStatusSnapshot,
   coerceAftStatus,
+  diskPausedIndexLabel,
   formatBytes,
   formatCacheRoleLabel,
+  formatSearchIndexLabel,
   formatSemanticIndexLabel,
   formatSemanticRefreshing,
   type StatusCompression,
@@ -211,7 +214,13 @@ function renderInner(
 
   // Left: search index
   left.push(theme.fg("muted", "Search index"));
-  left.push(kv("status", colorStatus(s.search_index.status, theme), theme));
+  left.push(
+    kv(
+      "status",
+      colorStatus(s.search_index.status, theme, formatSearchIndexLabel(s.search_index)),
+      theme,
+    ),
+  );
   left.push(kv("files", formatCountShort(s.search_index.files), theme));
   left.push(kv("trigrams", formatCountShort(s.search_index.trigrams), theme));
   left.push(kv("disk", formatBytes(s.disk.trigram_disk_bytes), theme));
@@ -236,6 +245,11 @@ function renderInner(
   right.push(kv("disk", formatBytes(s.disk.semantic_disk_bytes), theme));
 
   for (const line of renderColumns(left, right, colWidth)) lines.push(line);
+  if (s.index_store_pause) {
+    for (const line of wrapTextWithAnsi(`⚠ ${s.index_store_pause}`, innerWidth)) {
+      lines.push(theme.fg("warning", line));
+    }
+  }
   lines.push("");
 
   // Runtime + current session row
@@ -295,7 +309,10 @@ function renderInner(
   }
 
   // Errors — full width, error color
-  if (s.semantic_index.error) {
+  if (
+    s.semantic_index.error &&
+    !diskPausedIndexLabel(s.semantic_index.status, s.semantic_index.reason)
+  ) {
     lines.push("");
     lines.push(theme.fg("error", `⚠ ${s.semantic_index.error}`));
   }

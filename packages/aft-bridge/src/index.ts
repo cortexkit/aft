@@ -444,7 +444,13 @@ export {
 export { RevivableTransportPool } from "./revivable-transport.js";
 // --- semantic-index status vocabulary (shared by both plugin hosts) ---
 export type { SemanticBackendDetail, SemanticIndexStatusKind } from "./semantic-status.js";
-export { formatSemanticIndexStatus, semanticIndexStatusKind } from "./semantic-status.js";
+export {
+  diskPausedIndexLabel,
+  formatSearchIndexLabel,
+  formatSemanticIndexStatus,
+  indexDiskPauseMessage,
+  semanticIndexStatusKind,
+} from "./semantic-status.js";
 export {
   isTestEnvironment,
   resolveAftLogPath,

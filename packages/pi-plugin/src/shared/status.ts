@@ -1,5 +1,8 @@
 import {
+  diskPausedIndexLabel,
+  formatSearchIndexLabel,
   formatSemanticIndexStatus,
+  indexDiskPauseMessage,
   type SemanticIndexStatusKind,
   semanticIndexStatusKind,
 } from "@cortexkit/aft-bridge";
@@ -11,7 +14,13 @@ import {
  * dead index as a rebuild long after the other host was fixed. Re-exported here
  * so this module stays the one status import for the rest of the plugin.
  */
-export { formatSemanticIndexStatus, type SemanticIndexStatusKind, semanticIndexStatusKind };
+export {
+  diskPausedIndexLabel,
+  formatSearchIndexLabel,
+  formatSemanticIndexStatus,
+  type SemanticIndexStatusKind,
+  semanticIndexStatusKind,
+};
 
 /**
  * The status label for a snapshot's semantic index, including the backend URL
@@ -25,6 +34,8 @@ export function formatSemanticIndexLabel(
     "status" | "stage" | "error" | "reason" | "backend_url" | "pending_reason"
   >,
 ): string {
+  const diskPause = diskPausedIndexLabel(semantic.status, semantic.reason);
+  if (diskPause) return diskPause;
   const label = formatSemanticIndexStatus(semantic.status, semantic.stage, semantic.error, {
     reason: semantic.reason,
     backendUrl: semantic.backend_url,
@@ -73,9 +84,11 @@ export interface AftStatusSnapshot {
   };
   search_index: {
     status: string;
+    reason?: string | null;
     files: number | null;
     trigrams: number | null;
   };
+  index_store_pause?: string;
   semantic_index: {
     status: string;
     backend?: string | null;
@@ -278,9 +291,11 @@ export function coerceAftStatus(response: Record<string, unknown>): AftStatusSna
     },
     search_index: {
       status: readString(searchIndex.status, "unknown"),
+      ...(typeof searchIndex.reason === "string" ? { reason: searchIndex.reason } : {}),
       files: readOptionalNumber(searchIndex.files),
       trigrams: readOptionalNumber(searchIndex.trigrams),
     },
+    index_store_pause: indexDiskPauseMessage(response),
     semantic_index: {
       status: readString(semanticIndex.status, "unknown"),
       backend: readNullableString(semanticIndex.backend ?? semanticConfig.backend),
@@ -357,7 +372,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     `- callgraph_store: ${formatFlag(status.features.callgraph_store)}`,
     "",
     "Search index",
-    `- status: ${status.search_index.status}`,
+    `- status: ${formatSearchIndexLabel(status.search_index)}`,
     `- files: ${formatCount(status.search_index.files)}`,
     `- trigrams: ${formatCount(status.search_index.trigrams)}`,
     "",
@@ -385,6 +400,7 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
     "Disk usage",
     `- trigram index: ${formatBytes(status.disk.trigram_disk_bytes)}`,
     `- semantic index: ${formatBytes(status.disk.semantic_disk_bytes)}`,
+    ...(status.index_store_pause ? [`⚠ ${status.index_store_pause}`] : []),
     "",
     "Runtime",
     `- LSP servers: ${formatCount(status.lsp_servers)}`,
@@ -421,7 +437,10 @@ export function formatStatusDialogMessage(status: AftStatusSnapshot): string {
       `- semantic progress: ${formatCount(status.semantic_index.entries_done ?? null)} / ${formatCount(status.semantic_index.entries_total ?? null)}`,
     );
   }
-  if (status.semantic_index.error) {
+  if (
+    status.semantic_index.error &&
+    !diskPausedIndexLabel(status.semantic_index.status, status.semantic_index.reason)
+  ) {
     lines.push("", "Semantic error", status.semantic_index.error);
   }
 
@@ -481,7 +500,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     `- \`callgraph_store\`: ${formatFlag(status.features.callgraph_store)}`,
     "",
     "### Search index",
-    `- **Status:** \`${status.search_index.status}\``,
+    `- **Status:** \`${formatSearchIndexLabel(status.search_index)}\``,
     `- **Files:** ${formatCount(status.search_index.files)}`,
     `- **Trigrams:** ${formatCount(status.search_index.trigrams)}`,
     "",
@@ -515,7 +534,10 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     );
   }
 
-  if (status.semantic_index.error) {
+  if (
+    status.semantic_index.error &&
+    !diskPausedIndexLabel(status.semantic_index.status, status.semantic_index.reason)
+  ) {
     lines.push(`- **Error:** ${status.semantic_index.error}`);
   }
 
@@ -524,6 +546,7 @@ export function formatStatusMarkdown(status: AftStatusSnapshot): string {
     "### Disk usage",
     `- **Trigram index:** ${formatBytes(status.disk.trigram_disk_bytes)}`,
     `- **Semantic index:** ${formatBytes(status.disk.semantic_disk_bytes)}`,
+    ...(status.index_store_pause ? [`⚠ ${status.index_store_pause}`] : []),
     "",
     "### Runtime",
     `- **LSP servers:** ${formatCount(status.lsp_servers)}`,
