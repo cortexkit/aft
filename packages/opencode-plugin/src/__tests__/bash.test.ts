@@ -474,6 +474,7 @@ describe("OpenCode bash adapter", () => {
       "timeout",
       "workdir",
       "description",
+      "escape_sandbox",
       "compressed",
     ]);
     expect(bash.args.wait).toBeUndefined();

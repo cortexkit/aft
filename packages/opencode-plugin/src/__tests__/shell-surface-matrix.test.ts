@@ -54,7 +54,7 @@ function configFor(combo: Combo): Record<string, unknown> {
 }
 
 function expectedBashKeys(combo: Combo): string[] {
-  const keys = ["command", "timeout", "workdir", "description"];
+  const keys = ["command", "timeout", "workdir", "description", "escape_sandbox"];
   if (combo.background) keys.push("wait", "background", "pty", "ptyRows", "ptyCols");
   if (combo.compress) keys.push("compressed");
   if (combo.sandbox) keys.push("sandbox");
@@ -77,7 +77,8 @@ function forbiddenPatterns(combo: Combo): Array<{ what: string; pattern: RegExp 
       { what: "wait detachment", pattern: /detach/i },
     );
   }
-  if (!combo.sandbox) forbidden.push({ what: "sandbox", pattern: /\bsandbox/i });
+  // The escape reason is always present, including at Off, where it is a no-op.
+  // Schema keys above still pin the conditional `sandbox` switch itself.
   return forbidden;
 }
 
