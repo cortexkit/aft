@@ -1260,7 +1260,16 @@ class ReleaseTagCommitTests(PRFixture):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(self.git("rev-list", "-n", "1", "v1.0.1"), fix)
 
-    def test_tag_commit_refuses_a_release_that_has_not_landed(self) -> None:
+    def test_tag_commit_refuses_a_prepared_release_that_has_not_landed(self) -> None:
+        self.prepare()
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", self.base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("needs a release whose PR already landed", result.stderr)
+        self.assertFalse(self.state_path.with_suffix(".calls").exists()
+                         and any(call["args"][:2] == ["pr", "create"] for call in self.calls()))
+        self.assertFalse(self.tagged())
+
+    def test_tag_commit_refuses_a_release_that_has_not_started(self) -> None:
         self.git("checkout", "-q", "main")
         result = self.run_script("release.sh", "1.0.1", "--tag-commit", self.base)
         self.assertNotEqual(result.returncode, 0)

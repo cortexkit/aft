@@ -139,6 +139,10 @@ def resume(version: str) -> None:
 def publish(version: str, legacy: bool, tag_commit: str | None = None) -> str:
     path = state_path(version)
     state = json.loads(path.read_text())
+    if tag_commit and not state.get("merge_oid"):
+        # A follow-up can only stand in for a merge that already landed; never
+        # land the release PR on the way to tagging something else.
+        raise ValueError("--tag-commit needs a release whose PR already landed")
     resume(version)
     # This helper may come from a newer checkout than the release branch, but
     # the landing, CI and publication gates run from the release's own tree:
