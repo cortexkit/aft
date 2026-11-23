@@ -1324,7 +1324,7 @@ mod tests {
             let result = roots.publish_if_current(
                 &entry.literal_path,
                 build.publication,
-                &RejectedLease(fails_with_error),
+                &Arc::new(RejectedLease(fails_with_error)),
                 || true,
                 || true,
                 || panic!("an unverified lease must not publish"),

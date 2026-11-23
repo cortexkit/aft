@@ -29,7 +29,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `build_breaker` | compatibility re-export | `aft-engine` | Keep breaker paths unchanged. |
 | `standing_roots` | module moved down | `aft-db` | Standing-root reconciliation owns database state. |
 | `artifact_publish_epoch::ArtifactPublishEpoch` | item moved down | `aft-db` | Standing-root publication lease and epoch. |
-| `standing_publication_lease::StandingPublicationLease` | port | `aft-db` | Standing publication verifies the engine's writer lease under the publish epoch. |
+| `standing_publication_lease::StandingPublicationLease` | port | `aft-db` | Standing publication verifies the engine's writer lease under the publish epoch; `Arc` forwards verification for existing callers. |
 | `impl StandingPublicationLease for root_cache::WriterLease` | compatibility adapter | `aft-engine` | Use the real lease without moving acquisition or its registries down. |
 | `root_cache::ArtifactPublishEpoch` and `standing_roots` | compatibility re-exports | `aft-engine` | Preserve old epoch and standing-root paths. |
 | `read_fence::{Fence, capture, inherit, with_remote_mutation, remote_mutation, ReadGate, set_floor_filter, …}` | module moved down | `aft-db` | Share request-local read policy and remote mutation state without the index or composition. |

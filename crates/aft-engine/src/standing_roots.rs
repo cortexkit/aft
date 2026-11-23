@@ -56,7 +56,7 @@ mod tests {
             .publish_if_current(
                 &entry.literal_path,
                 build.publication,
-                lease.as_ref(),
+                &lease,
                 || true,
                 || true,
                 || published.store(true, Ordering::SeqCst),
@@ -101,7 +101,7 @@ mod tests {
                 .publish_if_current(
                     &publish_literal,
                     admission.publication,
-                    lease.as_ref(),
+                    &lease,
                     || true,
                     || true,
                     || {
@@ -169,7 +169,7 @@ mod tests {
             .publish_if_current(
                 &entry.literal_path,
                 build.publication,
-                lease.as_ref(),
+                &lease,
                 || true,
                 || true,
                 || (),
