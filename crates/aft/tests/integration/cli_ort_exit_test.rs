@@ -11,11 +11,14 @@ use std::time::{Duration, Instant};
 
 use crate::test_helpers::aft_binary;
 
-fn wait_for_file(path: &Path, child: &mut Child, what: &str) {
+fn wait_for_file(path: &Path, child: &mut Child, lines: &mpsc::Receiver<String>, what: &str) {
     let deadline = Instant::now() + Duration::from_secs(60);
     while !path.exists() {
         if let Some(status) = child.try_wait().unwrap() {
-            panic!("aft exited with {status} before {what}");
+            // Give the reader a moment to pass on the last lines aft wrote.
+            std::thread::sleep(Duration::from_millis(200));
+            let stderr: Vec<String> = lines.try_iter().collect();
+            panic!("aft exited with {status} before {what}; stderr: {stderr:#?}");
         }
         assert!(Instant::now() < deadline, "timed out waiting for {what}");
         std::thread::sleep(Duration::from_millis(10));
@@ -46,6 +49,12 @@ fn warmup_exit_waits_for_a_fill_inside_model_creation() {
         .arg(&root)
         .args(["--only", "semantic", "--timeout", "2000"])
         .env_clear()
+        // Keep the search path, and on Windows the system folder: AFT needs
+        // git to decide whether the root is a repository, and on Windows it
+        // cannot find git, or run it, without them. The meaning-search fill
+        // then never starts and the test never reaches the exit it checks.
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .envs(std::env::var_os("SystemRoot").map(|value| ("SystemRoot", value)))
         .env("HOME", &home)
         .env("USERPROFILE", &home)
         .env("APPDATA", &home)
@@ -73,6 +82,7 @@ fn warmup_exit_waits_for_a_fill_inside_model_creation() {
     wait_for_file(
         &hold.join("entered"),
         &mut child,
+        &lines_rx,
         "the fill entered model creation",
     );
 

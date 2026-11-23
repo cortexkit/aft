@@ -1,0 +1,12 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/cli_ort_exit_test.rs"
+  ],
+  "slices": [
+    "fix-ort-exit-test-windows-path"
+  ],
+  "note": "Test-only: the CLI exit test keeps PATH (and SystemRoot on Windows) in the child's cleared environment so AFT can find git on Windows, and an early exit now prints aft's stderr. No product code changes."
+}
