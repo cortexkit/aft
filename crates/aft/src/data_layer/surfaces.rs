@@ -909,10 +909,11 @@ fn meaning_report(
 ) -> Option<MeaningReport> {
     use crate::commands::data_search::DataSemantic;
     use crate::data_layer::status::SemanticIndexStatus;
-    let semantic =
-        DataSemantic::from_state(checkout.meaning_status_for_view(view, cached_only), || {
-            failure.cloned()
-        })?;
+    let semantic = if cached_only {
+        DataSemantic::from_state(checkout.cached_meaning_status(view), || failure.cloned())?
+    } else {
+        DataSemantic::of_checkout(checkout)?
+    };
     let filling = checkout.filling();
     let plane = match semantic {
         DataSemantic::Serving(meaning) => MeaningPlane::Serving {

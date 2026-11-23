@@ -2280,18 +2280,10 @@ impl DataCheckout {
         self.work.meaning.state(self.view().as_ref())
     }
 
-    pub(crate) fn meaning_status_for_view(
-        &self,
-        view: Option<&CheckoutView>,
-        cached_only: bool,
-    ) -> MeaningState {
-        if cached_only {
-            self.work
-                .meaning
-                .cached_state(view, |plane| self.work.rebuild_meaning_coverage(plane))
-        } else {
-            self.work.meaning.state(view)
-        }
+    pub(crate) fn cached_meaning_status(&self, view: Option<&CheckoutView>) -> MeaningState {
+        self.work
+            .meaning
+            .cached_state(view, |plane| self.work.rebuild_meaning_coverage(plane))
     }
 
     #[cfg(test)]
