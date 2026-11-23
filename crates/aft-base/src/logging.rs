@@ -302,6 +302,9 @@ pub fn capture_active() -> bool {
 fn canonical_slog_target(target: &str) -> std::borrow::Cow<'_, str> {
     match target.split_once("::") {
         Some(("aft_base" | "aft_db" | "aft_parse", module)) => format!("aft::{module}").into(),
+        Some(("aft_edit" | "aft_index" | "aft_inspect" | "aft_github" | "aft_shell", module)) => {
+            format!("aft_engine::{module}").into()
+        }
         _ => target.into(),
     }
 }
@@ -3545,6 +3548,33 @@ pub mod tests {
         assert!(matches(
             canonical_slog_target("aft_db::db::write_ledger").as_ref()
         ));
+    }
+
+    #[test]
+    fn split_engine_area_log_targets_preserve_engine_filters() {
+        for (new, old) in [
+            ("aft_edit::edit::apply", "aft_engine::edit::apply"),
+            ("aft_index::search_index", "aft_engine::search_index"),
+            ("aft_inspect::lsp::transport", "aft_engine::lsp::transport"),
+            ("aft_github::github_read", "aft_engine::github_read"),
+            ("aft_shell::bash_background", "aft_engine::bash_background"),
+        ] {
+            let canonical = canonical_slog_target(new);
+            assert_eq!(canonical, old);
+            let filter = env_logger::Builder::new()
+                .parse_filters(&format!("info,{old}=debug"))
+                .build();
+            for (level, enabled) in [(log::Level::Debug, true), (log::Level::Trace, false)] {
+                let matches = |target| {
+                    log::Log::enabled(
+                        &filter,
+                        &log::Metadata::builder().target(target).level(level).build(),
+                    )
+                };
+                assert_eq!(matches(old), enabled, "{old} at {level}");
+                assert_eq!(matches(&canonical), matches(old), "{new} at {level}");
+            }
+        }
     }
 
     fn slow_phases() -> ToolCallPhaseDurations {

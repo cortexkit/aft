@@ -152,19 +152,25 @@ jobs:
           python3 crates/aft-engine/checks/dependency-direction.py
           for fixture in crates/aft-engine/checks/fixtures/*.json; do
             case "${fixture##*/}" in
-              direct-dev.json|two-hop-dev-build.json) pair="aft-engine -> agent-file-tools" ;;
-              engine-to-tools-*.json) pair="aft-engine -> aft-tools" ;;
-              engine-to-subc.json) pair="aft-engine -> aft-subc" ;;
-              tools-to-subc-*.json) pair="aft-tools -> aft-subc" ;;
-              tools-to-facade.json) pair="aft-tools -> agent-file-tools" ;;
-              subc-to-facade.json) pair="aft-subc -> agent-file-tools" ;;
-              *) echo "::error::Dependency direction fixture $fixture has no expected pair"; exit 1 ;;
+              base-to-engine-dev.json) path="aft-base -> aft-engine" ;;
+              direct-dev.json) path="aft-engine -> agent-file-tools" ;;
+              two-hop-dev-build.json) path="aft-engine -> helper -> agent-file-tools" ;;
+              engine-to-tools-direct-dev.json) path="aft-engine -> aft-tools" ;;
+              engine-to-tools-two-hop.json) path="aft-engine -> helper -> aft-tools" ;;
+              engine-to-subc.json) path="aft-engine -> aft-subc" ;;
+              tools-to-subc-direct-dev.json) path="aft-tools -> aft-subc" ;;
+              tools-to-subc-two-hop.json) path="aft-tools -> helper -> aft-subc" ;;
+              tools-to-facade.json) path="aft-tools -> agent-file-tools" ;;
+              subc-to-facade.json) path="aft-subc -> agent-file-tools" ;;
+              *) echo "::error::Dependency direction fixture $fixture has no expected path"; exit 1 ;;
             esac
+            pair="${path%% -> *} -> ${path##* -> }"
+            expected="forbidden dependency: $pair (path: $path)"
             status=0
             stderr=$(python3 crates/aft-engine/checks/dependency-direction.py --metadata "$fixture" 2>&1 >/dev/null) || status=$?
             printf '%s\n' "$stderr" >&2
-            if [[ "$status" -ne 1 || "$stderr" != *"forbidden dependency: $pair (path: "* ]]; then
-              echo "::error::Dependency direction fixture $fixture must exit 1 and report $pair in stderr; got exit $status"
+            if [[ "$status" -ne 1 || "$stderr" != "$expected" ]]; then
+              echo "::error::Dependency direction fixture $fixture must exit 1 and report '$expected' in stderr; got exit $status"
               exit 1
             fi
           done

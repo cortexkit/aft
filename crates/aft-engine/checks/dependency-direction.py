@@ -9,7 +9,20 @@ import subprocess
 import sys
 
 
+LOWER_FORBIDDEN_TARGETS = {"aft-engine", "aft-tools", "aft-subc", "agent-file-tools"}
+LEAF_FORBIDDEN_TARGETS = LOWER_FORBIDDEN_TARGETS | {
+    "aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer",
+    "aft-secret-rules", "aft-test-fake-lsp-server",
+}
+
 FORBIDDEN_TARGETS = {
+    "aft-base": LOWER_FORBIDDEN_TARGETS,
+    "aft-db": LOWER_FORBIDDEN_TARGETS,
+    "aft-parse": LOWER_FORBIDDEN_TARGETS,
+    "aft-store": LEAF_FORBIDDEN_TARGETS - {"aft-store"},
+    "aft-tokenizer": LEAF_FORBIDDEN_TARGETS - {"aft-tokenizer"},
+    "aft-secret-rules": LEAF_FORBIDDEN_TARGETS - {"aft-secret-rules"},
+    "aft-test-fake-lsp-server": LEAF_FORBIDDEN_TARGETS - {"aft-test-fake-lsp-server"},
     "aft-engine": {"aft-tools", "aft-subc", "agent-file-tools"},
     "aft-tools": {"aft-subc", "agent-file-tools"},
     "aft-subc": {"agent-file-tools"},
