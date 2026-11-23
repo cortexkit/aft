@@ -1,4 +1,8 @@
-"""Persist release preparation and tag only the exact green landed merge OID."""
+"""Persist release preparation and tag only an exact green landed commit.
+
+That is the release's merge, or with --tag-commit a later main commit that
+changes only tests (when the merge's own run failed in a test).
+"""
 
 from __future__ import annotations
 
@@ -29,6 +33,58 @@ def versions_at(oid: str, version: str) -> None:
     for package in ("aft-bridge", "opencode-plugin", "pi-plugin"):
         if json.loads(git("show", f"{oid}:packages/{package}/package.json"))["version"] != version:
             raise ValueError(f"{oid}: {package} version does not match release {version}")
+
+
+# Paths a later commit may change and still carry an earlier release's tag:
+# tests, test fixtures and CI-only records that no shipped binary or package
+# reads. Anything else needs a new version.
+TEST_ONLY_PATHS = re.compile(
+    r"(?:^|/)(?:tests|__tests__)/"
+    r"|(?:^|/)tests\.rs$|_tests?\.rs$"
+    r"|\.test\.(?:ts|tsx|js|mjs)$"
+    r"|^scripts/lib/test_[^/]+\.py$"
+    r"|^benchmarks/aft-search/slice-descriptors/[^/]+\.json$"
+)
+SIZE_PINS = "scripts/file-size-pins.json"
+
+
+def non_test_changes(base: str, commit: str) -> list[str]:
+    """Paths changed from `base` to `commit` that a test-only follow-up may not touch."""
+    changed = git("diff", "--name-only", "--no-renames", base, commit).splitlines()
+    refused = [path for path in changed if path != SIZE_PINS and not TEST_ONLY_PATHS.search(path)]
+    if SIZE_PINS in changed and not pins_only_lowered(base, commit):
+        refused.append(SIZE_PINS)
+    return refused
+
+
+def pins_only_lowered(base: str, commit: str) -> bool:
+    """File-size pins may only shrink or disappear; they gate CI, not the build."""
+    def pins(oid: str) -> dict:
+        shown = subprocess.run(["git", "show", f"{oid}:{SIZE_PINS}"],
+                               capture_output=True, text=True, check=False)
+        return json.loads(shown.stdout) if shown.returncode == 0 else {}
+    before, after = pins(base), pins(commit)
+    return all(path in before and entry.get("lines", 0) <= before[path].get("lines", 0)
+               for path, entry in after.items())
+
+
+def test_only_follow_up(merge_oid: str, commit: str, version: str) -> str:
+    """The exact later main commit to tag instead of the release's merge.
+
+    For a release whose merge commit's main run failed in a test, and whose
+    fix landed after it: the follow-up must be on main, descend from the
+    merge, keep the release version, and change only tests from it, so the
+    published artifacts match the reviewed release.
+    """
+    oid = git("rev-parse", "--verify", f"{commit}^{{commit}}")
+    git("merge-base", "--is-ancestor", oid, "origin/main")
+    if subprocess.run(["git", "merge-base", "--is-ancestor", merge_oid, oid], check=False).returncode:
+        raise ValueError(f"{oid} does not descend from the release merge {merge_oid}")
+    versions_at(oid, version)
+    refused = non_test_changes(merge_oid, oid)
+    if refused:
+        raise ValueError(f"{oid} changes more than tests since the release merge: {', '.join(refused)}")
+    return oid
 
 
 def start(version: str) -> None:
@@ -80,11 +136,15 @@ def resume(version: str) -> None:
     git("checkout", branch)
 
 
-def publish(version: str, legacy: bool) -> str:
+def publish(version: str, legacy: bool, tag_commit: str | None = None) -> str:
     path = state_path(version)
     state = json.loads(path.read_text())
     resume(version)
-    command = [str(ROOT / "scripts/land-pr.sh"), f"release-{version}", "--title", f"release: v{version}"]
+    # This helper may come from a newer checkout than the release branch, but
+    # the landing, CI and publication gates run from the release's own tree:
+    # the publication gate validates the tree it is stored in.
+    tree = Path(git("rev-parse", "--show-toplevel"))
+    command = [str(tree / "scripts/land-pr.sh"), f"release-{version}", "--title", f"release: v{version}"]
     if legacy:
         command.append("--legacy-merge")
     oid = subprocess.check_output(command, text=True).strip()
@@ -98,17 +158,22 @@ def publish(version: str, legacy: bool) -> str:
     git("merge-base", "--is-ancestor", oid, "origin/main")
     git("merge-base", "--is-ancestor", state["release_head"], oid)
     versions_at(oid, version)
+    if tag_commit:
+        # Every gate below then checks the follow-up's own exact SHA.
+        oid = test_only_follow_up(oid, tag_commit, version)
+        state["tag_oid"] = oid
+        save(path, state)
     repo = gh("repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner")
     env = {**os.environ, "REPO": repo, "GITHUB_REPOSITORY": repo,
            "WATCH_CI_WORKFLOW": "tests.yml", "WATCH_CI_EVENT": "push", "WATCH_CI_BRANCH": "main"}
-    gate_command = [str(ROOT / "scripts/release-ci-gate.sh"), oid]
+    gate_command = [str(tree / "scripts/release-ci-gate.sh"), oid]
     # Queue evidence is useful only for the exact merged SHA and the full
     # required set. An incomplete or red queue run keeps the main-push wait.
     queue = subprocess.run([*gate_command, "--queue-only"], env=env, stdout=sys.stderr)
     if queue.returncode:
-        subprocess.run([str(ROOT / "scripts/watch-ci.sh"), oid], env=env, stdout=sys.stderr, check=True)
+        subprocess.run([str(tree / "scripts/watch-ci.sh"), oid], env=env, stdout=sys.stderr, check=True)
         subprocess.run(gate_command, env=env, stdout=sys.stderr, check=True)
-    gate = ROOT / "scripts/release-gate-v049.mjs"
+    gate = tree / "scripts/release-gate-v049.mjs"
     if gate.exists():
         # The merge may include earlier queued PRs. Freeze publication records
         # from that exact final tree, not just the original version-bump head.
@@ -126,7 +191,7 @@ def publish(version: str, legacy: bool) -> str:
     tag_release(version, oid)
     state["tagged"] = True
     save(path, state)
-    log(f"released v{version} at final merge {oid}")
+    log(f"released v{version} at {oid}")
     return oid
 
 
@@ -153,12 +218,14 @@ def run_isolated(arguments: list[str]) -> int:
     if arguments and arguments[0] == "--retry-from":
         return retry.run(arguments)
     if not arguments or arguments[0] in ("--help", "-h"):
-        print("Usage: scripts/release.sh VERSION [--dry] [--legacy-merge]\n"
+        print("Usage: scripts/release.sh VERSION [--dry] [--legacy-merge] [--tag-commit COMMIT]\n"
               "       scripts/release.sh --retry-from vX.Y.Z X.Y.(Z+1) --fix COMMIT [--fix COMMIT ...] [--notes-file PATH]\n"
               "Retry fixes must already be on origin/main. Work happens in a disposable worktree;\n"
               "release/X.Y is pushed directly, checked by Tests, and tagged only when green.\n"
               "Notes reuse the failed tag's approved notes, renamed to the new version, plus each fix's subject;\n"
-              "a patch of a published release passes --notes-file with notes for the fixes only.")
+              "a patch of a published release passes --notes-file with notes for the fixes only.\n"
+              "--tag-commit resumes a landed release whose merge run failed in a test: it tags that later\n"
+              "green main commit instead, if it changes only tests since the merge.")
         return 0 if arguments else 2
     version = arguments[0]
     if not state_path(version).exists() and git("branch", "--show-current") != "main":
@@ -197,6 +264,7 @@ def main() -> int:
     parser.add_argument("operation", choices=("start", "checkpoint", "resume", "publish", "phase"))
     parser.add_argument("version")
     parser.add_argument("--legacy-merge", action="store_true")
+    parser.add_argument("--tag-commit", help="tag this later test-only main commit instead of the merge")
     args = parser.parse_args()
     try:
         if args.operation == "start":
@@ -208,7 +276,7 @@ def main() -> int:
         elif args.operation == "resume":
             resume(args.version)
         else:
-            print(publish(args.version, args.legacy_merge))
+            print(publish(args.version, args.legacy_merge, args.tag_commit))
         return 0
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
         log(f"release REFUSED: {error}")

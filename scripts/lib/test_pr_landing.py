@@ -109,7 +109,7 @@ if a[:2] == ['pr', 'merge']:
         s['merged'] = True; s['merge_oid'] = oid
     persist(); sys.exit(0)
 if a[:2] == ['run', 'list']:
-    oid = g('rev-parse', 'HEAD') if s.get('retry_branch') else s.get('merge_oid', '0'*40)
+    oid = g('rev-parse', 'HEAD') if s.get('retry_branch') else s.get('push_run_oid', s.get('merge_oid', '0'*40))
     runs = [{'databaseId': 99, 'headSha': oid, 'headBranch': s.get('retry_branch', 'main'), 'event': 'push',
               'status': s.get('push_status', 'completed'), 'conclusion': s.get('push_conclusion', 'success'), 'attempt': 1,
               'url': 'https://github.com/example/repo/actions/runs/99'}]
@@ -1154,6 +1154,117 @@ class ReleaseQueueTests(PRFixture):
 
     def test_red_queue_context_waits_for_main_push(self) -> None:
         self.assert_queue_falls_back("queue_red")
+
+
+class ReleaseTagCommitTests(PRFixture):
+    """A landed release whose merge run failed in a test can tag a later fix."""
+
+    prepare = ReleaseQueueTests.prepare
+
+    def land_red_release(self, pins: dict | None = None) -> str:
+        if pins is not None:
+            # The pin file must already exist at the release merge.
+            self.git("checkout", "-q", "main")
+            (self.repo / "scripts/file-size-pins.json").write_text(json.dumps(pins))
+            self.git("add", "scripts/file-size-pins.json")
+            self.git("commit", "-qm", "pins\n\n" + COAUTHOR)
+            self.git("push", "-q", "origin", "main")
+        self.prepare()
+        self.write_state(push_conclusion="failure")
+        result = self.run_script("release.sh", "1.0.1")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse(self.tagged())
+        self.update_state(push_conclusion="success")
+        return self.git("rev-parse", "origin/main")
+
+    def update_state(self, **values: object) -> None:
+        # Keep what the fake GitHub recorded, such as the merged release PR.
+        self.state = json.loads(self.state_path.read_text())
+        self.write_state(**values)
+
+    def follow_up(self, files: dict[str, str]) -> str:
+        self.git("fetch", "-q", "origin")
+        self.git("checkout", "-q", "-B", "follow-up", "origin/main")
+        for name, text in files.items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+            self.git("add", name)
+        self.git("commit", "-qm", "follow-up\n\n" + COAUTHOR)
+        self.git("push", "-q", "origin", "HEAD:main")
+        sha = self.git("rev-parse", "HEAD")
+        self.git("checkout", "-q", "main")
+        return sha
+
+    def tagged(self) -> bool:
+        exists = subprocess.run(["git", "show-ref", "--verify", "--quiet", "refs/tags/v1.0.1"], cwd=self.repo)
+        return exists.returncode == 0
+
+    def test_tags_later_test_only_commit_and_checks_its_own_sha(self) -> None:
+        merge = self.land_red_release()
+        fix = self.follow_up({"crates/aft/src/subc/consent_tests.rs": "// fixed\n",
+                              "crates/aft/tests/integration/search_test.rs": "// fixed\n",
+                              "benchmarks/aft-search/slice-descriptors/fix.json": "{}\n"})
+        self.update_state(push_run_oid=fix)
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", fix)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("rev-list", "-n", "1", "v1.0.1"), fix)
+        self.assertNotEqual(fix, merge)
+        self.assertEqual((self.state_path.parent / "watched-oid").read_text().strip(), fix)
+        publication = [call for call in self.calls() if call["args"][0] == "node"]
+        self.assertTrue(publication and all(call["source_oid"] == fix for call in publication))
+
+    def test_refuses_follow_up_that_changes_shipped_code(self) -> None:
+        self.land_red_release()
+        fix = self.follow_up({"crates/aft/src/subc/consent_tests.rs": "// fixed\n",
+                              "crates/aft/src/subc/consent.rs": "// changed\n"})
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", fix)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("crates/aft/src/subc/consent.rs", result.stderr)
+        self.assertNotIn("consent_tests.rs", result.stderr)
+        self.assertFalse(self.tagged())
+
+    def test_size_pins_may_only_shrink(self) -> None:
+        self.land_red_release(pins={"a.rs": {"lines": 5100}})
+        lowered = self.follow_up({"scripts/file-size-pins.json": json.dumps({"a.rs": {"lines": 5050}})})
+        raised = self.follow_up({"scripts/file-size-pins.json": json.dumps({"a.rs": {"lines": 5200}})})
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", raised)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("scripts/file-size-pins.json", result.stderr)
+        self.assertFalse(self.tagged())
+        self.update_state(push_run_oid=lowered)
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", lowered)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("rev-list", "-n", "1", "v1.0.1"), lowered)
+
+    def test_resume_runs_the_helper_of_the_checkout_running_the_release(self) -> None:
+        # The release branch carries an older helper than the checkout that
+        # resumes it, as when a release-tooling fix lands after the release PR.
+        self.prepare()
+        self.git("checkout", "-q", "land/release-1.0.1")
+        (self.repo / "scripts/lib/release_queue.py").write_text("import sys\nsys.exit('release branch helper ran')\n")
+        self.git("add", "scripts/lib/release_queue.py")
+        self.git("commit", "-qm", "older helper\n\n" + COAUTHOR)
+        checkpoint = self.repo / ".git/aft-release/v1.0.1.json"
+        saved = json.loads(checkpoint.read_text())
+        saved["release_head"] = self.git("rev-parse", "HEAD")
+        checkpoint.write_text(json.dumps(saved))
+        self.git("checkout", "-q", "main")
+        self.write_state(push_conclusion="failure")
+        red = self.run_script("release.sh", "1.0.1")
+        self.assertNotIn("release branch helper ran", red.stdout + red.stderr)
+        self.assertIn("release-ci-gate: REFUSED", red.stderr)
+        fix = self.follow_up({"crates/aft/tests/fix_test.rs": "// fixed\n"})
+        self.update_state(push_conclusion="success", push_run_oid=fix)
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", fix)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.git("rev-list", "-n", "1", "v1.0.1"), fix)
+
+    def test_tag_commit_refuses_a_release_that_has_not_landed(self) -> None:
+        self.git("checkout", "-q", "main")
+        result = self.run_script("release.sh", "1.0.1", "--tag-commit", self.base)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("only resumes a release whose PR already landed", result.stdout + result.stderr)
 
 
 class ReleaseRetryTests(PRFixture):
