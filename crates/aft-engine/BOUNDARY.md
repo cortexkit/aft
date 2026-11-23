@@ -11,7 +11,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `task_entry::safe_task_entry` | item moved down | `aft-base` | Recursive readers share one task entry policy. |
 | `bash_background::registry::safe_task_entry` | compatibility re-export | `aft-engine` | Preserve the task registry path. |
 | `process::{GroupListing, ProcessIdentity, LiveDescendant, LiveDescendantsUnavailable}` | items moved down or re-exported | `aft-base` | LSP and shell share one process-group inspection vocabulary. |
-| `process::{live_process_group_members, terminate_process, terminate_pgid, terminate_pid, is_process_alive, is_recorded_process_alive}` | items moved down or re-exported | `aft-base` | LSP and shell share process termination and liveness policy. |
+| `process::{live_process_group_members, terminate_process, terminate_pgid, terminate_pid, is_process_alive, is_recorded_process_alive, start_new_session}` | items moved down or re-exported | `aft-base` | LSP and shell share process termination, liveness and child session setup. |
 | `process::{TERMINATE_GRACE, LIVE_DESCENDANT_CAP, LIVE_DESCENDANT_NAME_CAP, OMITTED_ARGUMENTS_MARKER, GROUP_IDENTITY_CAP}` | items moved down | `aft-base` | Keep constants beside the process helpers that enforce them. |
 | `bash_background::process` | compatibility re-export | `aft-engine` | Preserve the old helper paths; shell payload handling stays in the engine. |
 | `memory` | existing lower owner | `aft-base` | The accounting implementation was already lower-owned. |
@@ -127,6 +127,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `root_identity::key::canonicalize_or_normalize` | visibility widened | `aft-db` | Engine key lookups and test drivers share the actual identity state. |
 | `standing_roots::reconciliation_work_for_test` | test-support visibility widened | `aft-db` | Engine test drivers read lower reconciliation counters. |
 | `process::test_hooks` | test-support visibility widened | `aft-base` | Engine unit tests inject failures into the lower implementation. |
+| `process::start_new_session` | visibility widened | `aft-base` | Shell child setup and lower process fixtures share one session-start primitive. |
 | `memory::profile::admitted` | visibility widened | `aft-base` | Engine builds pin the lower admission profile. |
 | `path_filters::{relative_to_root, to_glob_path}` | visibility widened | `aft-db` | The engine search code retains the identical path operations. |
 | `root_identity::key::git_command_for_test` | test-support visibility widened | `aft-db` | The engine and lower identity tests share hermetic Git setup. |

@@ -759,7 +759,8 @@ pub fn terminate_process(child: &mut Child) {
 /// harness's controlling terminal even though the child uses pipe-backed stdio;
 /// an interactive shell could otherwise perform job control against that terminal.
 #[cfg(unix)]
-pub(crate) fn start_new_session(command: &mut std::process::Command) {
+#[doc(hidden)]
+pub fn start_new_session(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
 
     unsafe {
