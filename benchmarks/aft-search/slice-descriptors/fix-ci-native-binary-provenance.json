@@ -1,0 +1,18 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    ".github/workflows/_e2e-suite.yml",
+    ".github/workflows/_unit-suite.yml",
+    ".github/workflows/release.yml",
+    "scripts/ci-native-state.py",
+    "scripts/ci-stage-aft.py",
+    "scripts/lib/test_native_release_workflow.py",
+    "scripts/lib/test_workflow_gates.py"
+  ],
+  "slices": [
+    "fix-ci-native-binary-provenance"
+  ],
+  "note": "Native CI keeps Cargo intermediates warm but stages each job's reported executable and release PDB from private outputs. No product or ranking code changes."
+}
