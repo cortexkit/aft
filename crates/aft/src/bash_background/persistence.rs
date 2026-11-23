@@ -1714,6 +1714,12 @@ fn write_task_in_dir(
         return Err(task_storage_full_for_test());
     }
     #[cfg(test)]
+    if task.is_terminal()
+        && TASK_IO_FAULT.with(|slot| matches!(slot.get(), Some(TaskIoFault::TerminalEnospc)))
+    {
+        return Err(task_storage_full_for_test());
+    }
+    #[cfg(test)]
     if task.status == BgTaskStatus::Starting {
         starting_write_delay_for_test();
     }
@@ -1823,6 +1829,7 @@ pub(crate) enum TaskIoFault {
     RunningEnospc,
     #[cfg(unix)]
     KillingEnospc,
+    TerminalEnospc,
     #[cfg(unix)]
     RunningDelay(std::time::Duration),
     RunningHook(fn() -> io::Result<()>),

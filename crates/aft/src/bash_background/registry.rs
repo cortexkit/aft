@@ -19519,17 +19519,19 @@ mod tests {
 
     #[test]
     fn lifecycle_failed_kill_persist_leaves_terminal_state_retryable() {
+        use super::super::persistence::{with_task_io_fault, TaskIoFault};
+
         let registry = BgTaskRegistry::default();
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let task = lifecycle_running_fixture(&registry, &dir);
-        fs::remove_file(&task.paths.json).unwrap();
-        fs::create_dir(&task.paths.json).unwrap();
-        let stopped = registry.kill(&task.task_id, "session").unwrap();
+        let stopped = with_task_io_fault(TaskIoFault::TerminalEnospc, || {
+            registry.kill(&task.task_id, "session").unwrap()
+        });
         assert_eq!(stopped.info.status, BgTaskStatus::Killed);
         assert!(stopped.kill_state_warning.is_some());
         assert!(!task.kill_in_flight());
         assert!(task.terminal_persist_dirty.load(Ordering::SeqCst));
-        fs::remove_dir(&task.paths.json).unwrap();
         registry.retry_terminal_persist(&task).unwrap();
         assert_eq!(
             read_task(&task.paths.json).unwrap().status,
@@ -20058,6 +20060,7 @@ mod tests {
         assert!(registry.take_wait_mode_detach("session"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_abort_attempts_every_task_and_retains_failures() {
         let registry = BgTaskRegistry::default();
@@ -20077,15 +20080,22 @@ mod tests {
         } else {
             first
         };
-        // Make the first task's state lock unavailable. The abort must
-        // retain that failure and still stop the other task.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _state = failing.state.lock().unwrap();
-            panic!("inject a poisoned task state lock");
-        }));
-        let result = registry.abort_inflight("session");
-        failing.state.clear_poison();
-        assert!(result.unwrap_err().contains("lock poisoned"));
+        // The wrapper exited, but the task's cgroup still needs stopping.
+        // Make the cgroup kill fail without preventing either state save.
+        fs::write(&failing.paths.exit, b"0").unwrap();
+        let cgroup = dir.path().join("fake-cgroup");
+        fs::create_dir_all(cgroup.join("cgroup.kill")).unwrap();
+        registry
+            .inner
+            .task_scopes
+            .register(super::super::task_scope::handle_for_test(
+                &failing_id,
+                cgroup,
+            ));
+        assert!(registry
+            .abort_inflight("session")
+            .unwrap_err()
+            .contains("scope could not be killed"));
         assert!(other.state.lock().unwrap().metadata.is_terminal());
         assert!(
             registry.inner.wait_registered_tasks.lock().unwrap()["session"].contains(&failing_id)
