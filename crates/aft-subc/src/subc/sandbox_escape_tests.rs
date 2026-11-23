@@ -107,9 +107,10 @@ async fn outcome_case(
                 .status()
                 .unwrap();
             assert!(output.success());
+            let response_id = request_id.clone();
             async move {
                 Some((
-                    Response::success(&request_id, json!({"status":"completed", "exit_code":0})),
+                    Response::success(&response_id, json!({"status":"completed", "exit_code":0})),
                     String::new(),
                 ))
             }
