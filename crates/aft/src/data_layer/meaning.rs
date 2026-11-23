@@ -595,6 +595,8 @@ impl Meaning {
             if let Some(dimensions) = constant_dimensions {
                 return self.fill_constant_vectors_for_test(checkout, config, dimensions);
             }
+            #[cfg(feature = "test-hooks")]
+            hold_model_creation_for_exit_test();
             match SemanticEmbeddingModel::from_config(config) {
                 Ok(loaded) => *model = Some((config.clone(), loaded)),
                 Err(error) => return Round::Failed(self.failure(checkout.root(), error, true)),
@@ -813,6 +815,31 @@ pub(crate) fn hold_model_loads_for_test(root: &Path) -> impl Drop {
     }
     lock(model_holds_for_test()).insert(root.to_path_buf());
     Release(root.to_path_buf())
+}
+
+/// Holds a fill inside an ONNX Runtime section where it would create its
+/// embedding session, so an exit test can see whether a CLI command that is
+/// ending waits for that session creation. Set
+/// `AFT_TEST_HOLD_FILL_MODEL_CREATION` to a folder: the fill writes `entered`
+/// there once it is inside the section, waits until `release` exists, and
+/// writes `left` just before it leaves the section. A process that ends
+/// without waiting for the section never writes `left`. The hold does not
+/// load ONNX Runtime, so the test needs no runtime installed; the model load
+/// that follows it then runs as usual.
+#[cfg(feature = "test-hooks")]
+fn hold_model_creation_for_exit_test() {
+    let Some(dir) = std::env::var_os("AFT_TEST_HOLD_FILL_MODEL_CREATION").map(PathBuf::from) else {
+        return;
+    };
+    // Once the process is exiting no new section opens, as for a real load.
+    let Some(_section) = crate::ort_lifecycle::enter() else {
+        return;
+    };
+    let _ = std::fs::write(dir.join("entered"), b"");
+    while !dir.join("release").exists() {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let _ = std::fs::write(dir.join("left"), b"");
 }
 
 #[cfg(test)]
