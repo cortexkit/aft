@@ -80,6 +80,7 @@ pub struct RequesterRecord {
 
 /// Phone reads use camelCase chrome but preserve the nested request's
 /// snake_case fields. AFT's contract tests decode those served answers too.
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PhoneRecord {
     pub kind: CardKind,
@@ -89,6 +90,7 @@ pub struct PhoneRecord {
     pub metadata: serde_json::Map<String, Value>,
 }
 
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum AnswerRecord {
@@ -283,7 +285,7 @@ pub fn decode_record(record: &Value) -> Result<Settlement, ConsentError> {
 
 /// Prepare a sandbox card in the same access_asks row machinery as a shell
 /// permission. The row's added variant remains readable as Shell by old builds.
-pub fn prepare(
+pub(super) fn prepare(
     conn: &rusqlite::Connection,
     identity: &RouteIdentity,
     tool: &str,
@@ -376,7 +378,7 @@ pub fn prepare(
 static ACTIVE: std::sync::LazyLock<StdMutex<HashMap<(RouteChannel, u64), String>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
 
-pub fn track(call: &HeldCall, prep: &Prepared) {
+pub(super) fn track(call: &HeldCall, prep: &Prepared) {
     if !is_escape(&prep.grant) {
         return;
     }
@@ -393,7 +395,7 @@ fn take_call_key(call: &HeldCall) -> Option<String> {
         .remove(&(call.route, call.corr))
 }
 
-pub async fn note_filed(call: &HeldCall, prep: &Prepared, elicitation: &str) {
+pub(super) async fn note_filed(call: &HeldCall, prep: &Prepared, elicitation: &str) {
     if !is_escape(&prep.grant) {
         return;
     }
@@ -408,7 +410,7 @@ pub async fn note_filed(call: &HeldCall, prep: &Prepared, elicitation: &str) {
     }
 }
 
-pub async fn note_settlement(
+pub(super) async fn note_settlement(
     call: &HeldCall,
     prep: &Prepared,
     settled: &Settlement,
