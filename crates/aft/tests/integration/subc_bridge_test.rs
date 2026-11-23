@@ -11747,22 +11747,29 @@ fn hold_bash_until_release_command(
     release: &std::path::Path,
     terminal_text: &str,
 ) -> String {
+    // The loop must never outlive its test on a shared runner: it ends when the
+    // release file appears, when the test's temp folder is gone (the test ended
+    // before the loop saw its release file), or after 300 s of wall time. A
+    // count of `sleep` polls overshoots, because each poll also spawns a process.
+    let folder = release.parent().expect("release file has a parent folder");
     if cfg!(windows) {
         // The Windows runner uses PowerShell, not a POSIX shell. Keep the
         // command alive until the test releases it, even if frame handling is
         // slower than the shell's startup.
         format!(
-            "Set-Content -NoNewline -Path \"{}\" -Value started; $polls = 0; while ((-not (Test-Path \"{}\")) -and ($polls -lt 6000)) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (Test-Path \"{}\") {{ Write-Output '{}' }} else {{ Write-Output 'gate-timeout' }}",
+            "Set-Content -NoNewline -Path \"{}\" -Value started; $deadline = (Get-Date).AddSeconds(300); while ((-not (Test-Path \"{}\")) -and (Test-Path \"{}\") -and ((Get-Date) -lt $deadline)) {{ Start-Sleep -Milliseconds 50 }}; if (Test-Path \"{}\") {{ Write-Output '{}' }} else {{ Write-Output 'gate-timeout' }}",
             shell_path(marker),
             shell_path(release),
+            shell_path(folder),
             shell_path(release),
             terminal_text,
         )
     } else {
         format!(
-            "printf started > \"{}\"; polls=0; until [ -e \"{}\" ] || [ \"$polls\" -ge 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -e \"{}\" ]; then printf '{}\\n'; else printf 'gate-timeout\\n'; fi",
+            "printf started > \"{}\"; end=$(( $(date +%s) + 300 )); until [ -e \"{}\" ] || [ ! -d \"{}\" ] || [ \"$(date +%s)\" -ge \"$end\" ]; do sleep 0.05; done; if [ -e \"{}\" ]; then printf '{}\\n'; else printf 'gate-timeout\\n'; fi",
             shell_path(marker),
             shell_path(release),
+            shell_path(folder),
             shell_path(release),
             terminal_text,
         )
