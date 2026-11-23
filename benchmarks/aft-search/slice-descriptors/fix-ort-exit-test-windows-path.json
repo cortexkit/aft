@@ -3,7 +3,7 @@
   "targeted_mechanism": "none",
   "kind": "harness",
   "fixtures": [
-    "crates/aft/tests/integration/cli_ort_exit_test.rs"
+    "harness-goldens"
   ],
   "slices": [
     "fix-ort-exit-test-windows-path"
