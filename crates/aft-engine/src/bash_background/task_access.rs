@@ -224,7 +224,7 @@ pub(super) struct WorkCounters {
 }
 
 use crate::task_temp_reads::{is_task_environment, task_directory};
-
+pub use aft_base::task_entry::safe_task_entry;
 
 /// A second hard link exposes the same task output through another path.
 pub(super) fn has_multiple_hard_links(metadata: &fs::Metadata) -> bool {

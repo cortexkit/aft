@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 /// Serializes artifact supersession with the final disk publication step.
 /// Advancing an epoch either happens before a stale worker checks and prevents
 /// its publish, or after that worker has fully published the still-current

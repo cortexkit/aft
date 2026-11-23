@@ -1344,9 +1344,9 @@ fn detect_checker_for_path(path: &Path, lang: LangId, config: &Config) -> ToolDe
 }
 
 fn languages_in_project(project_root: &Path) -> HashSet<LangId> {
-    crate::callgraph::walk_project_files(
+    aft_parse::callgraph::walk_project_files(
         project_root,
-        if crate::data_layer::read_fence::active() {
+        if aft_db::read_fence::active() {
             crate::project_walk::IgnoreFileAccess::Fenced
         } else {
             crate::project_walk::IgnoreFileAccess::Allowed

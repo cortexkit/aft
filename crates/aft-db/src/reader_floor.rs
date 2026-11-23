@@ -481,7 +481,8 @@ fn read_snapshot(path: &Path) -> io::Result<(Option<FloorStamp>, Option<Vec<u8>>
 
 /// Recheck a refused root on a persistence retry. The caller must apply its
 /// retry backoff before calling; readable roots incur no filesystem work.
-pub(crate) fn refresh_refused(storage_root: &Path) -> Result<(), FloorError> {
+#[doc(hidden)]
+pub fn refresh_refused(storage_root: &Path) -> Result<(), FloorError> {
     let path = floor_path(storage_root);
     if !persisted_format::refusals_under(storage_root)
         .iter()
@@ -557,9 +558,10 @@ pub fn register_cache_hooks() {
 /// A floor lives in durable storage, and its refusals also cover artifacts on
 /// a separate `storage.cache_dir` volume: refusal routing spells paths inside
 /// a prepared cache root under the durable root that owns it (see
-/// [`crate::root_cache::durable_route`]), so nothing is recorded for the
+/// [`aft_base::cache_location::durable_route`]), so nothing is recorded for the
 /// cache root itself, which never becomes a storage owner of its own.
-pub(crate) fn prepare_artifact_root(storage: &Path, _artifacts: &Path) {
+#[doc(hidden)]
+pub fn prepare_artifact_root(storage: &Path, _artifacts: &Path) {
     prepare(storage);
 }
 
@@ -1374,7 +1376,8 @@ pub(crate) mod tests {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn prepare_cache_root_for_test(
+#[doc(hidden)]
+pub fn prepare_cache_root_for_test(
     config: &mut crate::config::Config,
 ) -> Option<crate::config_resolve::ConfigWarning> {
     crate::reader_floor::register_cache_hooks();
@@ -1388,7 +1391,8 @@ pub(crate) fn prepare_cache_root_for_test(
 
 /// Register storage-format reader-version checks before testing obsolete-cache deletion.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn clean_old_for_test(
+#[doc(hidden)]
+pub fn clean_old_for_test(
     tiers: &[crate::config_resolve::ConfigTier],
     storage: &std::path::Path,
     confirm: impl FnMut(&[crate::cache_location::CleanupCandidate]) -> bool,

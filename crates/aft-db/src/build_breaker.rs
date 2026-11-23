@@ -396,12 +396,14 @@ impl BuildDeathBreaker {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn reset_open_calls_for_test() {
+    #[doc(hidden)]
+    pub fn reset_open_calls_for_test() {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.set(0));
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn open_calls_for_test() -> u64 {
+    #[doc(hidden)]
+    pub fn open_calls_for_test() -> u64 {
         OPEN_CALLS_FOR_TEST.with(|calls| calls.get())
     }
 

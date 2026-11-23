@@ -1,0 +1,18 @@
+{
+  "commit": {
+    "name": "AFT upgrade fixture",
+    "email": "fixture@example.invalid",
+    "date": "2000-01-01T00:00:00+0000",
+    "message": "artifact key upgrade fixture"
+  },
+  "files": {
+    "src/lib.rs": "pub fn fixture_value() -> usize { 17 }\n",
+    "README.md": "Artifact identity upgrade fixture.\n"
+  },
+  "cases": [
+    { "name": "repository_top_level", "layout": "repository", "legacy_memo": false },
+    { "name": "linked_worktree", "layout": "linked_worktree", "legacy_memo": false },
+    { "name": "plain_folder", "layout": "plain", "legacy_memo": false },
+    { "name": "legacy_git_memo", "layout": "repository", "legacy_memo": true }
+  ]
+}

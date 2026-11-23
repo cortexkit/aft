@@ -20,7 +20,7 @@ thread_local! {
             floor_filter_root: None,
         })
     };
-    #[cfg(any(test, all(unix, feature = "test-support")))]
+    #[cfg(any(test, feature = "test-support"))]
     static ASK_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -40,7 +40,7 @@ pub struct Fence {
 #[derive(Default)]
 struct FloorOmissions {
     paths: BTreeSet<PathBuf>,
-    filter: Option<(PathBuf, crate::search_index::PathFilters)>,
+    filter: Option<(PathBuf, crate::path_filters::PathFilters)>,
 }
 
 impl PartialEq for Fence {
@@ -73,12 +73,14 @@ impl std::fmt::Debug for Fence {
 impl Fence {
     /// Optional background work may outlive its reply. Keep its read authority,
     /// but do not let it append omissions to a response that is already sent.
-    pub(crate) fn without_floor_disclosure(mut self) -> Self {
+    #[doc(hidden)]
+    pub fn without_floor_disclosure(mut self) -> Self {
         self.floor_omissions = None;
         self
     }
 
-    pub(crate) fn for_floor_filter_root(mut self, root: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn for_floor_filter_root(mut self, root: &Path) -> Self {
         self.floor_filter_root = Some(root.to_path_buf());
         self
     }
@@ -91,7 +93,8 @@ impl Fence {
         }
     }
 
-    pub(crate) fn record_floor(&self, path: &Path) {
+    #[doc(hidden)]
+    pub fn record_floor(&self, path: &Path) {
         if let Some(omissions) = &self.floor_omissions {
             let is_dir = path.is_dir();
             let mut omissions = omissions.lock();
@@ -105,7 +108,8 @@ impl Fence {
         }
     }
 
-    pub(crate) fn record_source_exclusion(&self, path: &Path) {
+    #[doc(hidden)]
+    pub fn record_source_exclusion(&self, path: &Path) {
         if self.floor_omissions.is_some()
             && (crate::project_content::storage_root_for_path(
                 path,
@@ -118,7 +122,8 @@ impl Fence {
         }
     }
 
-    pub(crate) fn record_matched_source_exclusion(&self, path: &Path) {
+    #[doc(hidden)]
+    pub fn record_matched_source_exclusion(&self, path: &Path) {
         if self.floor_omissions.is_some()
             && (crate::project_content::storage_root_for_path(
                 path,
@@ -140,7 +145,8 @@ impl Fence {
     /// path: inside the confined root and not denied by a floor such as
     /// `sandbox.read_deny`. A denied path is remembered so the reply can say
     /// how many paths were left out. Unconfined walks admit everything.
-    pub(crate) fn admits_walk_entry(&self, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn admits_walk_entry(&self, path: &Path) -> bool {
         if !self.active() {
             return true;
         }
@@ -207,7 +213,7 @@ pub fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response {
 }
 
 #[doc(hidden)]
-pub fn set_floor_filter(root: &Path, filter: &crate::search_index::PathFilters) {
+pub fn set_floor_filter(root: &Path, filter: &crate::path_filters::PathFilters) {
     FENCE.with(|fence| {
         if let Some(omissions) = &fence.borrow().floor_omissions {
             omissions.lock().filter = Some((root.to_path_buf(), filter.clone()));
@@ -217,7 +223,8 @@ pub fn set_floor_filter(root: &Path, filter: &crate::search_index::PathFilters) 
 
 /// The read policy one confined call checks walked paths against, snapshotted
 /// once per call so a walk does not rebuild it for every entry.
-pub(crate) struct ReadGate {
+#[doc(hidden)]
+pub struct ReadGate {
     root: PathBuf,
     decision: Arc<dyn Fn(&Path) -> bool + Send + Sync>,
     /// Paths the walks of this call left out because the policy denies them.
@@ -226,7 +233,8 @@ pub(crate) struct ReadGate {
 }
 
 impl ReadGate {
-    pub(crate) fn new(root: PathBuf, decision: Arc<dyn Fn(&Path) -> bool + Send + Sync>) -> Self {
+    #[doc(hidden)]
+    pub fn new(root: PathBuf, decision: Arc<dyn Fn(&Path) -> bool + Send + Sync>) -> Self {
         Self {
             root,
             decision,
@@ -239,7 +247,8 @@ impl ReadGate {
     }
 }
 
-pub(crate) fn with_gate<R>(gate: ReadGate, run: impl FnOnce() -> R) -> R {
+#[doc(hidden)]
+pub fn with_gate<R>(gate: ReadGate, run: impl FnOnce() -> R) -> R {
     // Gate assignment deliberately outlives this call, until the enclosing fence is restored.
     let mut fence = capture();
     fence.gate = Some(Arc::new(gate));
@@ -247,13 +256,15 @@ pub(crate) fn with_gate<R>(gate: ReadGate, run: impl FnOnce() -> R) -> R {
     run()
 }
 
-#[cfg(any(test, all(unix, feature = "test-support")))]
-pub(crate) fn note_ask() {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn note_ask() {
     ASK_CALLS.with(|calls| calls.set(calls.get() + 1));
 }
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn ask_calls() -> usize {
+#[doc(hidden)]
+pub fn ask_calls() -> usize {
     ASK_CALLS.with(|calls| calls.get())
 }
 
@@ -266,7 +277,8 @@ pub fn remote_mutation() -> bool {
     FENCE.with(|fence| fence.borrow().remote_mutation)
 }
 
-pub(crate) fn admits_path_metadata(identity: &Path) -> bool {
+#[doc(hidden)]
+pub fn admits_path_metadata(identity: &Path) -> bool {
     match crate::bounded_io::metadata(identity) {
         Ok(_) => true,
         // Remote edit tools can create files after the root and access checks.
@@ -286,7 +298,8 @@ pub fn with_remote_mutation<T>(mutation: bool, run: impl FnOnce() -> T) -> T {
     }
 }
 
-pub(crate) fn for_request(id: &str) -> bool {
+#[doc(hidden)]
+pub fn for_request(id: &str) -> bool {
     FENCE.with(|fence| fence.borrow().requests.iter().any(|request| request == id))
 }
 
@@ -338,14 +351,16 @@ impl Drop for FenceScope {
     }
 }
 
-pub(crate) fn inherit<R>(fence: Fence, run: impl FnOnce() -> R) -> R {
+#[doc(hidden)]
+pub fn inherit<R>(fence: Fence, run: impl FnOnce() -> R) -> R {
     let _scope = FenceScope::enter(fence);
     run()
 }
 
 /// How many paths this thread's confined call has left out of its walks
 /// because the read policy denies them.
-pub(crate) fn denied_count() -> usize {
+#[doc(hidden)]
+pub fn denied_count() -> usize {
     FENCE.with(|fence| {
         fence
             .borrow()
@@ -430,10 +445,8 @@ pub fn refusal(id: &str, input: &Path) -> Response {
 /// outside the root, and directory walks on this thread (and on helper
 /// threads that inherit the fence) check each entry against the call's read
 /// policy, built here once.
-pub(crate) fn with_root<R>(
-    id: &str,
-    run: impl FnOnce() -> Result<R, Response>,
-) -> Result<R, Response> {
+#[doc(hidden)]
+pub fn with_root<R>(id: &str, run: impl FnOnce() -> Result<R, Response>) -> Result<R, Response> {
     let mut fence = capture();
     fence.requests.push(id.to_owned());
     let _scope = FenceScope::enter(fence);
@@ -546,7 +559,8 @@ impl ConfinedIgnoreRules {
 
     /// Ignore files above a folder explicitly named in a glob do not apply,
     /// but all file reads still use the original confinement gate.
-    pub(crate) fn is_ignored_below(&self, path: &Path, is_dir: bool, root: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn is_ignored_below(&self, path: &Path, is_dir: bool, root: &Path) -> bool {
         self.is_ignored_with_root(path, is_dir, Some(root))
     }
 

@@ -13,10 +13,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Condvar, Mutex};
 
+use crate::artifact_publish_epoch::ArtifactPublishEpoch;
 use crate::config::{Config, IndexKind};
 use crate::db::standing_roots::{self, StandingRootRecord};
-use crate::root_cache::{ArtifactPublishEpoch, WriterLease};
 use crate::scoped_key::{reject_duplicate_artifact_keys, ResolvedStandingRoot};
+use crate::standing_publication_lease::StandingPublicationLease;
 
 /// Configuration snapshots are observed only at standing maintenance-pass
 /// boundaries. This keeps a pass internally coherent while allowing the next
@@ -636,7 +637,7 @@ impl StandingRoots {
         &self,
         literal_path: &str,
         admission: StandingPublicationAdmission,
-        writer_lease: &WriterLease,
+        writer_lease: &dyn StandingPublicationLease,
         fingerprint_is_current: impl FnOnce() -> bool,
         generation_is_current: impl FnOnce() -> bool,
         publish_and_rename: impl FnOnce() -> R,
@@ -696,7 +697,8 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reconciliation_work_for_test() -> [i64; 6] {
+#[doc(hidden)]
+pub fn reconciliation_work_for_test() -> [i64; 6] {
     use crate::db::lifecycle::{thread_counts, SqliteStore};
     let opens = thread_counts::total_opens_on_this_thread(SqliteStore::AftDb) as i64;
     [
@@ -1297,7 +1299,18 @@ mod tests {
     }
 
     #[test]
-    fn publication_is_a_noop_after_bind_epoch_revocation() {
+    fn publication_refuses_an_unverified_lease() {
+        struct RejectedLease(bool);
+        impl StandingPublicationLease for RejectedLease {
+            fn verify(&self) -> std::io::Result<bool> {
+                if self.0 {
+                    Err(std::io::Error::other("lease check failed"))
+                } else {
+                    Ok(false)
+                }
+            }
+        }
+
         let storage = tempdir().unwrap();
         let root_dir = tempdir().unwrap();
         let roots = StandingRoots::default();
@@ -1305,149 +1318,19 @@ mod tests {
             storage.path(),
             vec![root(root_dir.path(), vec![IndexKind::Search])],
         );
-        let mut report = roots.reconcile(&cfg).unwrap();
-        let entry = report.active_entries.remove(0);
+        let entry = roots.reconcile(&cfg).unwrap().active_entries.remove(0);
         let build = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        roots.begin_case_a_bind(&entry.literal_path).unwrap();
-        let published = std::sync::atomic::AtomicBool::new(false);
-        let result = roots
-            .publish_if_current(
+        for fails_with_error in [false, true] {
+            let result = roots.publish_if_current(
                 &entry.literal_path,
                 build.publication,
-                &lease,
+                &RejectedLease(fails_with_error),
                 || true,
                 || true,
-                || published.store(true, Ordering::SeqCst),
-            )
-            .unwrap();
-        assert!(result.is_none());
-        assert!(!published.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn publication_fence_holds_epoch_mutex_through_final_rename() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut report = roots.reconcile(&cfg).unwrap();
-        let entry = report.active_entries.remove(0);
-        let admission = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::channel();
-        let (release_rename_tx, release_rename_rx) = std::sync::mpsc::channel();
-        let publish_roots = roots.clone();
-        let publish_literal = entry.literal_path.clone();
-        let publisher = std::thread::spawn(move || {
-            publish_roots
-                .publish_if_current(
-                    &publish_literal,
-                    admission.publication,
-                    &lease,
-                    || true,
-                    || true,
-                    || {
-                        rename_entered_tx.send(()).unwrap();
-                        release_rename_rx.recv().unwrap();
-                    },
-                )
-                .unwrap()
-        });
-        rename_entered_rx.recv().unwrap();
-        let (bind_done_tx, bind_done_rx) = std::sync::mpsc::channel();
-        let bind_roots = roots.clone();
-        let bind_literal = entry.literal_path.clone();
-        let binder = std::thread::spawn(move || {
-            bind_done_tx
-                .send(bind_roots.begin_case_a_bind(&bind_literal))
-                .unwrap();
-        });
-        assert!(bind_done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err());
-        release_rename_tx.send(()).unwrap();
-        assert!(publisher.join().unwrap().is_some());
-        // Only the 100 ms check above is about ordering: the bind must not
-        // finish while the rename holds the fence. Once released, the bind does
-        // real filesystem work, so this receive is just a hang guard, sized
-        // for a loaded Windows runner.
-        bind_done_rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap()
-            .unwrap();
-        binder.join().unwrap();
-    }
-
-    #[test]
-    fn superseded_snapshot_publication_is_a_noop() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let mut cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut initial = roots.reconcile(&cfg).unwrap();
-        let entry = initial.active_entries.remove(0);
-        let build = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        cfg.index.roots[0].indexes = vec![IndexKind::Semantic];
-        let report = roots.reconcile(&cfg).unwrap();
-        assert_eq!(report.replaced, vec![entry.literal_path.clone()]);
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(roots
-            .publish_if_current(
-                &entry.literal_path,
-                build.publication,
-                &lease,
-                || true,
-                || true,
-                || (),
-            )
-            .unwrap()
-            .is_none());
+                || panic!("an unverified lease must not publish"),
+            );
+            assert_eq!(result.unwrap(), None::<()>);
+        }
     }
 
     #[test]

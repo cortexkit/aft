@@ -6310,7 +6310,7 @@ impl LspManager {
             outcome.forced += pids.len();
             for pid in &pids {
                 if let Some(key) = keys_by_pid.get(pid) {
-                    if crate::bash_background::process::is_process_alive(*pid) {
+                    if aft_base::process_identity::is_process_alive(*pid) {
                         slog_error!(
                             "error shutting down language server {:?} at {}: timed out waiting for shutdown",
                             key.kind,
@@ -13305,7 +13305,7 @@ mod idle_reap_shutdown_log_tests {
             "logs: {lines:?}"
         );
         assert_eq!(outcome.unreaped, 0);
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!aft_base::process_identity::is_process_alive(pid));
         assert!(!registry.pids().contains(&pid));
     }
 
@@ -13365,7 +13365,7 @@ mod idle_reap_shutdown_log_tests {
                 "logs: {lines:?}"
             );
             assert_eq!(outcome.unreaped, 0);
-            assert!(!crate::bash_background::process::is_process_alive(pid));
+            assert!(!aft_base::process_identity::is_process_alive(pid));
             assert!(!registry.pids().contains(&pid));
         }
     }

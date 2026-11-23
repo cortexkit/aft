@@ -4,7 +4,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-pub use aft_base::memory_profile::{MemoryMode, MemoryProfile};
+pub use crate::memory_profile::{MemoryMode, MemoryProfile};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveMemory {
@@ -28,6 +28,7 @@ pub fn effective(configured: Option<MemoryMode>) -> EffectiveMemory {
 }
 
 static CONFIGURED: AtomicU8 = AtomicU8::new(0);
+static PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn current_effective() -> EffectiveMemory {
     effective(match CONFIGURED.load(Ordering::Acquire) {
@@ -38,8 +39,8 @@ pub fn current_effective() -> EffectiveMemory {
 }
 
 /// Publish only from startup and configuration publication, never constructors.
-pub fn publish(configured: Option<MemoryMode>) {
-    static PUBLICATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[doc(hidden)]
+pub fn publish_with_notification(configured: Option<MemoryMode>, notify: &dyn Fn()) {
     let _publication = PUBLICATION.lock().unwrap_or_else(|e| e.into_inner());
     apply_allocator_decay(effective(configured).value);
     CONFIGURED.store(
@@ -50,7 +51,7 @@ pub fn publish(configured: Option<MemoryMode>) {
         },
         Ordering::Release,
     );
-    crate::data_layer::runtime::memory_profile_changed();
+    notify();
 }
 
 thread_local! {
@@ -58,7 +59,8 @@ thread_local! {
 }
 
 /// Running work keeps the profile captured when it was admitted.
-pub(crate) fn admitted<T>(profile: MemoryProfile, work: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn admitted<T>(profile: MemoryProfile, work: impl FnOnce() -> T) -> T {
     struct Restore(Option<MemoryProfile>);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -203,6 +205,7 @@ mod tests {
     #[test]
     fn memory_linux_decay_updates_existing_and_future_arenas_and_restores_defaults() {
         use tikv_jemalloc_ctl::raw;
+        let _publication = PUBLICATION.lock().unwrap_or_else(|e| e.into_inner());
         let arena = unsafe { raw::read::<u32>(b"thread.arena\0") }.unwrap();
         apply_allocator_decay(MemoryMode::Lean);
         for name in ["dirty_decay_ms", "muzzy_decay_ms"] {
@@ -230,5 +233,19 @@ mod tests {
                 default
             );
         }
+    }
+
+    #[test]
+    fn publication_notifier_observes_the_new_profile_once_inside_the_guard() {
+        let observed = std::cell::RefCell::new(Vec::new());
+        publish_with_notification(Some(MemoryMode::Lean), &|| {
+            assert!(matches!(
+                PUBLICATION.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ));
+            observed.borrow_mut().push(current_effective().value);
+        });
+        publish_with_notification(None, &|| {});
+        assert_eq!(*observed.borrow(), [MemoryMode::Lean]);
     }
 }

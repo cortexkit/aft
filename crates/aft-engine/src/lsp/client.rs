@@ -3039,12 +3039,12 @@ pub(crate) fn kill_lsp_child_group(child: &mut std::process::Child) {
     {
         let pgid = child.id() as i32;
         // LSP cleanup holds the manager lock, so retain the short leader-only wait.
-        crate::bash_background::process::terminate_pgid_leader_grace(pgid, child);
+        aft_base::process::terminate_pgid_leader_grace(pgid, child);
         let _ = child.wait();
     }
     #[cfg(not(unix))]
     {
-        crate::bash_background::process::terminate_process(child);
+        aft_base::process::terminate_process(child);
         let _ = child.wait();
     }
 }
@@ -3299,7 +3299,7 @@ mod tests {
         let error = LspError::Io(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         assert!(client.abort_live_child_after_shutdown_error(error).is_ok());
         assert!(!registry.pids().contains(&pid));
-        assert!(!crate::bash_background::process::is_process_alive(pid));
+        assert!(!aft_base::process_identity::is_process_alive(pid));
     }
 
     #[test]

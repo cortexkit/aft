@@ -48,6 +48,26 @@ macro_rules! test_support_visibility {
 use aft_base::*;
 
 pub mod access_policy;
+#[doc(hidden)]
+pub mod artifact_publish_epoch;
+#[doc(hidden)]
+pub mod build_breaker;
 pub mod db;
+#[doc(hidden)]
+pub mod path_filters;
+#[doc(hidden)]
+pub mod persisted_format;
+#[doc(hidden)]
+pub mod read_fence;
+#[doc(hidden)]
+pub mod reader_floor;
+#[doc(hidden)]
+pub mod root_identity;
 pub mod sandbox_profile;
+#[doc(hidden)]
+pub mod scoped_key;
+#[doc(hidden)]
+pub mod standing_publication_lease;
+#[doc(hidden)]
+pub mod standing_roots;
 pub mod write_ledger;

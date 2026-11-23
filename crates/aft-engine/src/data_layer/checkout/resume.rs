@@ -576,7 +576,7 @@ fn executable_fingerprint() -> Option<String> {
     static FINGERPRINT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     FINGERPRINT
         .get_or_init(|| {
-            let metadata = crate::pinned_executable::startup_image_metadata()?;
+            let metadata = aft_base::pinned_executable::startup_image_metadata()?;
             let modified = metadata
                 .modified()
                 .ok()?

@@ -77,10 +77,10 @@ pub mod bash_permissions;
 pub mod bash_rewrite;
 #[doc(hidden)]
 pub mod blocking_wait;
-pub(crate) use aft_base::bounded_io;
-pub mod build_breaker;
 pub use aft_base::atomic_replace;
+pub(crate) use aft_base::bounded_io;
 pub use aft_base::build_state;
+pub use aft_db::build_breaker;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
@@ -238,17 +238,17 @@ pub mod provisional_identity_retry;
 pub use aft_base::pty_render;
 pub use aft_base::query_shape;
 pub use aft_base::read_policy;
-pub mod reader_floor;
+pub use aft_db::reader_floor;
 pub mod repeat_state;
 #[doc(hidden)]
 pub mod revision_read;
 pub mod root_cache;
-pub mod root_identity;
+pub use aft_db::root_identity;
 pub mod runtime_drain;
 pub mod runtime_registry;
 pub use aft_db::sandbox_profile;
 pub mod sandbox_spawn;
-pub mod scoped_key;
+pub use aft_db::scoped_key;
 pub mod search_b2;
 pub mod search_index;
 pub mod search_state;
@@ -282,9 +282,9 @@ pub use aft_base::task_watch_lines;
 pub use aft_base::task_watches;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_storage;
-pub use aft_base::tool_gate;
 #[doc(hidden)]
-pub mod tool_call_result;
+pub use aft_base::tool_call_result;
+pub use aft_base::tool_gate;
 pub use aft_base::tool_path;
 pub(crate) use aft_base::tool_progress;
 pub mod url_fetch;

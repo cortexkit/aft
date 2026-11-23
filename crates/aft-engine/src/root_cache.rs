@@ -27,6 +27,7 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::fs_lock;
+pub use aft_db::artifact_publish_epoch::ArtifactPublishEpoch;
 
 #[cfg(test)]
 #[path = "root_cache_paths_tests.rs"]
@@ -80,13 +81,18 @@ impl RootCacheDomain {
     }
 }
 
-
 pub struct WriterLease {
     domain: RootCacheDomain,
     key: String,
     path: PathBuf,
     epoch: String,
     guard: Mutex<fs_lock::LockGuard>,
+}
+
+impl aft_db::standing_publication_lease::StandingPublicationLease for WriterLease {
+    fn verify(&self) -> io::Result<bool> {
+        WriterLease::verify(self)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

@@ -135,11 +135,15 @@ pub mod prefrontal;
 pub mod privacy_spawn;
 #[doc(hidden)]
 pub mod private_storage;
+#[doc(hidden)]
+pub mod process;
 pub mod process_group;
 pub mod process_identity;
 pub mod process_io;
 pub mod process_spawn;
 pub mod production_storage;
+#[doc(hidden)]
+pub mod progress_sender;
 pub mod project_content;
 pub mod project_walk;
 pub mod protocol;
@@ -150,6 +154,8 @@ pub mod runner_status_state;
 pub mod scope_watch_events;
 pub mod secret;
 pub mod secret_proxy;
+#[doc(hidden)]
+pub mod semantic_status;
 pub mod shared_timer;
 pub mod shell_format;
 pub mod stage_timer;
@@ -159,6 +165,8 @@ pub mod subc_config;
 pub mod subc_fake;
 pub mod symbols;
 pub mod system_temp;
+#[doc(hidden)]
+pub mod task_entry;
 pub mod task_temp_reads;
 pub mod task_watch_lines;
 pub mod task_watches;
@@ -174,6 +182,8 @@ pub mod test_read_denial;
 pub mod test_storage;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+#[doc(hidden)]
+pub mod tool_call_result;
 pub mod tool_gate;
 pub mod tool_path;
 pub mod tool_progress;

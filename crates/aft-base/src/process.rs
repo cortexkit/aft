@@ -88,7 +88,7 @@ impl GroupListing {
 /// means the group was checked and has no live member; an incomplete one keeps
 /// the members it found; an error says why the group could not be checked.
 pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendantsUnavailable> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::listing_fails(pgid) {
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
@@ -110,9 +110,10 @@ pub fn live_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescend
 
 /// Fault injection for tests, keyed by process group so parallel tests do not
 /// collide.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[cfg_attr(not(unix), allow(dead_code))]
-pub(crate) mod test_hooks {
+#[doc(hidden)]
+pub mod test_hooks {
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
 
@@ -125,7 +126,8 @@ pub(crate) mod test_hooks {
     thread_local! { static SIGNAL_EVENTS: std::cell::RefCell<Option<(i32, std::sync::Arc<Mutex<Vec<&'static str>>>)>> = const { std::cell::RefCell::new(None) }; }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn with_signal_events<T>(
+    #[doc(hidden)]
+    pub fn with_signal_events<T>(
         pgid: i32,
         events: std::sync::Arc<Mutex<Vec<&'static str>>>,
         run: impl FnOnce() -> T,
@@ -167,7 +169,8 @@ pub(crate) mod test_hooks {
     /// Leave this group's members out of the process listing while they stay
     /// alive, as `/proc` mounted with `hidepid=2` does for another user's
     /// processes.
-    pub(crate) fn hide_members(pgid: i32) {
+    #[doc(hidden)]
+    pub fn hide_members(pgid: i32) {
         insert(&MEMBERS_INVISIBLE, pgid);
     }
 
@@ -177,7 +180,8 @@ pub(crate) mod test_hooks {
 
     /// Make this group's members' `/proc/<pid>/stat` unreadable, as `/proc`
     /// mounted with `hidepid=1` does for another user's processes.
-    pub(crate) fn make_members_unreadable(pgid: i32) {
+    #[doc(hidden)]
+    pub fn make_members_unreadable(pgid: i32) {
         insert(&MEMBERS_UNREADABLE, pgid);
     }
 
@@ -190,7 +194,8 @@ pub(crate) mod test_hooks {
     /// `/proc` mounted with `hidepid=1` does for other users' processes. The
     /// group's own members stay readable.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub(crate) fn make_outsiders_unreadable(pgid: i32) {
+    #[doc(hidden)]
+    pub fn make_outsiders_unreadable(pgid: i32) {
         insert(&OUTSIDERS_UNREADABLE, pgid);
     }
 
@@ -200,7 +205,8 @@ pub(crate) mod test_hooks {
     }
 
     /// Make every listing of this group fail, as an unreadable `/proc` would.
-    pub(crate) fn fail_listing(pgid: i32) {
+    #[doc(hidden)]
+    pub fn fail_listing(pgid: i32) {
         LISTING_FAILS
             .get_or_init(Default::default)
             .lock()
@@ -217,7 +223,8 @@ pub(crate) mod test_hooks {
     /// Make the group SIGKILL reach no member of this group, as it does for
     /// members owned by another user (the kernel answers EPERM for them).
     /// Members that ignore SIGTERM then survive the kill.
-    pub(crate) fn deny_sigkill(pgid: i32) {
+    #[doc(hidden)]
+    pub fn deny_sigkill(pgid: i32) {
         SIGKILL_DENIED
             .get_or_init(Default::default)
             .lock()
@@ -479,17 +486,17 @@ fn linux_proc_entry(pid: u32, expected_pgid: i32) -> ProcEntry {
         return ProcEntry::Unreadable;
     };
     if pgrp != expected_pgid {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if test_hooks::outsiders_unreadable(expected_pgid) {
             return ProcEntry::Unreadable;
         }
         return ProcEntry::Elsewhere;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::members_invisible(pgrp) {
         return ProcEntry::Elsewhere;
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::members_unreadable(pgrp) {
         return ProcEntry::Unreadable;
     }
@@ -502,8 +509,9 @@ fn linux_proc_entry(pid: u32, expected_pgid: i32) -> ProcEntry {
 
 /// Whether `pid` has exited while its parent has not reaped it: the kernel
 /// reports it as a zombie, and `kill(pid, 0)` still succeeds for it.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) fn child_is_zombie_for_test(pid: u32) -> bool {
+#[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
+#[doc(hidden)]
+pub fn child_is_zombie_for_test(pid: u32) -> bool {
     let zombie = macos_kinfo(pid).is_some_and(|info| info.state == SZOMB);
     zombie && unsafe { libc::kill(pid as i32, 0) } == 0
 }
@@ -513,8 +521,9 @@ pub(crate) fn child_is_zombie_for_test(pid: u32) -> bool {
 /// `wait` on it before that check, and drop it afterwards to reap it. A
 /// short-lived `/usr/bin/true` is used because a shell can stay visible as
 /// running for a moment after its exit.
-#[cfg(all(test, target_os = "macos"))]
-pub(crate) fn spawn_unreaped_zombie_for_test() -> Child {
+#[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
+#[doc(hidden)]
+pub fn spawn_unreaped_zombie_for_test() -> Child {
     let child = std::process::Command::new("/usr/bin/true")
         .spawn()
         .expect("spawn zombie stand-in");
@@ -603,7 +612,7 @@ fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
         return Err(LiveDescendantsUnavailable::ListingFailed);
     }
     pids.truncate(count as usize);
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::members_invisible(pgid) {
         pids.clear();
     }
@@ -667,7 +676,7 @@ fn macos_process_group_members(pgid: i32) -> Result<GroupListing, LiveDescendant
 
 #[cfg(target_os = "macos")]
 use crate::fs_lock::macos_kinfo;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(all(any(test, feature = "test-support"), target_os = "macos"))]
 use crate::fs_lock::{MacosKinfo, P_WEXIT, SZOMB};
 
 #[cfg(target_os = "macos")]
@@ -756,7 +765,8 @@ pub fn terminate_pgid(pgid: i32, mut child: Option<&mut Child>) {
 }
 
 #[cfg(unix)]
-pub(crate) fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bool) {
+#[doc(hidden)]
+pub fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bool) {
     terminate_pgid_until(pgid, || {
         // Reap our wrapper before probing: signal 0 still sees zombies. Its
         // exit alone says nothing about the command's descendants, which need
@@ -767,13 +777,14 @@ pub(crate) fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bo
 }
 
 #[cfg(unix)]
-pub(crate) fn terminate_pgid_leader_grace(pgid: i32, child: &mut Child) {
+#[doc(hidden)]
+pub fn terminate_pgid_leader_grace(pgid: i32, child: &mut Child) {
     terminate_pgid_until(pgid, || matches!(child.try_wait(), Ok(Some(_))));
 }
 
 #[cfg(unix)]
 fn terminate_pgid_until(pgid: i32, mut exited: impl FnMut() -> bool) {
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
     test_hooks::signal_event(pgid, "group-term");
     unsafe {
         libc::killpg(pgid, libc::SIGTERM);
@@ -785,11 +796,11 @@ fn terminate_pgid_until(pgid: i32, mut exited: impl FnMut() -> bool) {
         }
         thread::sleep(Duration::from_millis(50));
     }
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if test_hooks::sigkill_denied(pgid) {
         return;
     }
-    #[cfg(all(test, target_os = "linux"))]
+    #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
     test_hooks::signal_event(pgid, "group-kill");
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);
@@ -838,7 +849,8 @@ pub fn is_recorded_process_alive(pid: u32, task_started_at_ms: u64) -> bool {
     recorded_process_probe(pid, task_started_at_ms).1
 }
 
-pub(crate) fn recorded_process_liveness(pid: u32, task_started_at_ms: u64) -> ProcessLiveness {
+#[doc(hidden)]
+pub fn recorded_process_liveness(pid: u32, task_started_at_ms: u64) -> ProcessLiveness {
     recorded_process_probe(pid, task_started_at_ms).0
 }
 
@@ -1118,6 +1130,8 @@ fn capped_identities_keeps_every_member_up_to_the_cap() {
     assert!(truncated);
 }
 
+#[cfg(test)]
+mod tests {
     #[test]
     fn documented_termination_grace_matches_policy() {
         let comment = include_str!("process.rs")
@@ -1134,3 +1148,4 @@ fn capped_identities_keeps_every_member_up_to_the_cap() {
     fn is_process_alive_returns_true_for_self() {
         assert!(super::is_process_alive(std::process::id()));
     }
+}

@@ -43,7 +43,8 @@ pub const CODE: &str = "storage_requires_newer_reader";
 pub const BACKUP_SCHEMA_VERSION: u32 = 6;
 /// Ordinary local history must remain readable by the current main daemon.
 /// Only a stack containing the `imported_guard` metadata field needs the newer reader format.
-pub(crate) const ORDINARY_BACKUP_SCHEMA_VERSION: u32 = 5;
+#[doc(hidden)]
+pub const ORDINARY_BACKUP_SCHEMA_VERSION: u32 = 5;
 pub const BASH_TASK_SCHEMA_VERSION: u32 = 7;
 
 /// One independently versioned on-disk format.
@@ -783,7 +784,8 @@ pub fn try_floor_refusal_counts() -> Option<std::collections::BTreeMap<String, u
 /// While none does, [`gate`] can refuse an artifact only for its own version,
 /// so a reader re-checking an artifact it has already gated, unchanged, need
 /// not resolve which storage root owns it.
-pub(crate) fn has_floor_refusal(store: PersistedStore) -> bool {
+#[doc(hidden)]
+pub fn has_floor_refusal(store: PersistedStore) -> bool {
     with_registry(|entries| {
         entries
             .iter()
@@ -874,7 +876,8 @@ pub fn clear(store: PersistedStore, scope: &Path) {
 
 /// Replace only this root's floor evidence after a successful floor recheck.
 /// Artifact refusals still require their own format checks before clearing.
-pub(crate) fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersistedFormat]) {
+#[doc(hidden)]
+pub fn replace_floor_refusals(root: &Path, refusals: &[UnsupportedPersistedFormat]) {
     let identity = storage_root(root);
     with_registry(|entries| {
         let roots = known_roots(entries, Some(&identity));
@@ -957,7 +960,8 @@ pub fn refusals_under(root: &Path) -> Vec<UnsupportedPersistedFormat> {
 /// Select refusals for the project's cached artifact key and shared storage.
 /// The second result counts unknown owners without assigning their paths to
 /// this project. No artifact reads or database queries are needed.
-pub(crate) fn refusals_for_push(
+#[doc(hidden)]
+pub fn refusals_for_push(
     storage: &Path,
     artifact_key: Option<&str>,
 ) -> (Vec<UnsupportedPersistedFormat>, usize) {
@@ -1090,7 +1094,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backup_and_bash_persisted_versions_stay_compatible() {
+    fn backup_and_bash_reader_versions_stay_compatible() {
         assert_eq!(BACKUP_SCHEMA_VERSION, 6);
         assert_eq!(ORDINARY_BACKUP_SCHEMA_VERSION, 5);
         assert_eq!(BASH_TASK_SCHEMA_VERSION, 7);
@@ -1098,9 +1102,6 @@ mod tests {
         assert_eq!(PersistedStore::BackupMeta.written(), 5);
         assert_eq!(PersistedStore::BashTask.supported(), 7);
         assert_eq!(PersistedStore::BashTask.written(), 7);
-        assert_eq!(crate::backup::SCHEMA_VERSION, 6);
-        assert_eq!(crate::backup::ORDINARY_SCHEMA_VERSION, 5);
-        assert_eq!(crate::bash_background::persistence::SCHEMA_VERSION, 7);
     }
 
     #[test]

@@ -8,6 +8,9 @@ repository = "https://github.com/cortexkit/aft"
 description = "SQLite stores and access policy for Agent Foundational Toolkit"
 autotests = false
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
+
 [features]
 test-support = ["aft-base/test-support", "dep:tempfile"]
 test-hooks = ["aft-base/test-hooks"]
@@ -24,6 +27,9 @@ getrandom = "0.3"
 tokio = { version = "1", features = ["sync"] }
 blake3 = "1"
 parking_lot = "0.12"
+globset = "0.4"
+ignore = "0.4"
+sha2 = { version = "0.10", features = ["compress"] }
 subc-protocol = "=0.37.4"
 cortexkit-role-tool-provider = "=0.15.12"
 tempfile = { version = "3", optional = true }
@@ -34,3 +40,4 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 [dev-dependencies]
 aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
 tempfile = "3"
+filetime = "0.2"

@@ -1,6 +1,14 @@
 #[cfg(unix)]
 use std::path::Path;
 
+pub use aft_base::process::*;
+
+#[cfg(all(test, unix))]
+use std::{
+    process::Child,
+    thread,
+    time::{Duration, Instant},
+};
 
 /// The Unix payload wrapper runs the user's command in the same shell that
 /// owns the pipeline. Bash exposes per-segment statuses as `PIPESTATUS`, while
@@ -162,7 +170,6 @@ pub(crate) fn observe_oom_priority_failure(marker: &Path) {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
@@ -292,7 +299,6 @@ mod tests {
 
     #[cfg(unix)]
     use super::*;
-
 
     #[cfg(unix)]
     #[test]

@@ -18,7 +18,7 @@ pub fn safe_task_entry(path: &Path) -> bool {
         return false;
     }
     if metadata.is_file() {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::project_content::record_open(path);
         return path
             .parent()
@@ -30,3 +30,6 @@ pub fn safe_task_entry(path: &Path) -> bool {
     }
     true
 }
+use crate::pinned_dir::PinnedDir;
+use crate::task_temp_reads::{is_task_environment, task_directory};
+use std::{fs, path::Path};

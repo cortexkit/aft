@@ -566,14 +566,14 @@ fn prefrontal_relay_and_secret_scope_admission_refuses_other_owners() {
         let admitted = module == "prefrontal";
         assert_eq!(head_scope(&stamp), admitted);
         assert_eq!(
-            crate::secret::eligibility::alfonso_of_kind(&stamp, &[ScopeKind::Head]),
+            aft_base::secret::eligibility::alfonso_of_kind(&stamp, &[ScopeKind::Head]),
             admitted
         );
         stamp.kind = ScopeKind::Worker;
         assert_eq!(worker_scope(&stamp), admitted);
         stamp.owner_authorized = false;
         assert!(!worker_scope(&stamp));
-        assert!(!crate::secret::eligibility::alfonso_of_kind(
+        assert!(!aft_base::secret::eligibility::alfonso_of_kind(
             &stamp,
             &[ScopeKind::Worker]
         ));

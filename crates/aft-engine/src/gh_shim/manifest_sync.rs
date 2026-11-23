@@ -3,7 +3,7 @@
 use super::manifest_wire::{self as wire, Recorded, Reply, ResultBody};
 use super::manifest_wire::{Latest, Notice, Report};
 use super::*;
-use crate::secret::transport::ManagementSession;
+use aft_base::secret::transport::ManagementSession;
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 

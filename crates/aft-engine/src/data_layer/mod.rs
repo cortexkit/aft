@@ -39,7 +39,7 @@ mod publication_tests;
 #[doc(hidden)]
 pub mod query;
 #[doc(hidden)]
-pub mod read_fence;
+pub use aft_db::read_fence;
 mod refresh_budget;
 mod refresh_memory;
 #[cfg(feature = "test-hooks")]

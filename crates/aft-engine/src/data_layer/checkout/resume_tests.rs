@@ -193,7 +193,7 @@ fn resume_child_build() {
         return;
     }
     // As a daemon does at startup, before anything can replace the binary.
-    crate::pinned_executable::capture_at_startup();
+    aft_base::pinned_executable::capture_at_startup();
     if std::env::var_os("AFT_TEST_REPLACE_EXE").is_some() {
         let exe = std::env::current_exe().unwrap();
         let mut bytes = std::fs::read(&exe).unwrap();

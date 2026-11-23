@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
 // `SemanticIndexStatus::Ready` exposes a unique `refreshing` path list. Keep
 // per-path queue accounting separately so repeated edits to the same file do not
 // let an older refresh completion remove the path while newer work is pending.

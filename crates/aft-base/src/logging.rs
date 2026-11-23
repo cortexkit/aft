@@ -301,6 +301,14 @@ pub fn capture_active() -> bool {
 // Keep the session-log filters people set against AFT working across crate boundaries.
 fn canonical_slog_target(target: &str) -> std::borrow::Cow<'_, str> {
     match target.split_once("::") {
+        Some(("aft_db", module))
+            if matches!(
+                module.split("::").next(),
+                Some("persisted_format" | "reader_floor" | "root_identity")
+            ) =>
+        {
+            format!("aft_engine::{module}").into()
+        }
         Some(("aft_base" | "aft_db" | "aft_parse", module)) => format!("aft::{module}").into(),
         Some(("aft_edit" | "aft_index" | "aft_inspect" | "aft_github" | "aft_shell", module)) => {
             format!("aft_engine::{module}").into()
@@ -3558,6 +3566,12 @@ pub mod tests {
             ("aft_inspect::lsp::transport", "aft_engine::lsp::transport"),
             ("aft_github::github_read", "aft_engine::github_read"),
             ("aft_shell::bash_background", "aft_engine::bash_background"),
+            ("aft_db::persisted_format", "aft_engine::persisted_format"),
+            ("aft_db::reader_floor", "aft_engine::reader_floor"),
+            (
+                "aft_db::root_identity::key::tests",
+                "aft_engine::root_identity::key::tests",
+            ),
         ] {
             let canonical = canonical_slog_target(new);
             assert_eq!(canonical, old);

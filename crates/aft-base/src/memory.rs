@@ -4,6 +4,9 @@ use std::path::Path;
 use serde::Serialize;
 use serde_json::Value;
 
+#[doc(hidden)]
+pub mod profile;
+
 /// A cold-path estimate of memory AFT can attribute without allocator hooks.
 ///
 /// `estimated_bytes` is `None` when a subsystem is busy or its resident bytes

@@ -131,7 +131,8 @@ pub fn artifact_cache_key(project_root: &Path) -> String {
 /// Reuse the artifact key registered during configure when one exists; otherwise
 /// derive a key from Git at `project_root`. This fallback is for standalone build
 /// APIs whose callers have not configured a project or supplied a storage path.
-pub(crate) fn artifact_cache_key_for_build(project_root: &Path) -> String {
+#[doc(hidden)]
+pub fn artifact_cache_key_for_build(project_root: &Path) -> String {
     super::configured_artifact_key(project_root).unwrap_or_else(|| artifact_cache_key(project_root))
 }
 
@@ -153,7 +154,8 @@ pub fn artifact_cache_key_with_memo(
 /// Resolve a reader's key from the same identity records as a session bind,
 /// without creating or refreshing identity metadata. A busy legacy database
 /// leaves the identity unresolved rather than publishing a provisional key.
-pub(crate) fn artifact_cache_key_read_only(
+#[doc(hidden)]
+pub fn artifact_cache_key_read_only(
     project_root: &Path,
     storage_root: &Path,
 ) -> Result<String, ArtifactCacheKeyProbeError> {
@@ -178,7 +180,8 @@ pub struct ArtifactCacheKeyTimings {
     /// Git processes actually started, including unborn-branch verification.
     pub git_spawns: usize,
     /// Full history traversals, excluding cheap HEAD verification on reuse.
-    pub(crate) root_walks: usize,
+    #[doc(hidden)]
+    pub root_walks: usize,
     pub retry_wait: Duration,
     pub memo_wait: Duration,
     pub memo_hold: Duration,
@@ -220,7 +223,8 @@ pub(crate) fn artifact_cache_key_with_memo_profiled(
 /// The artifact key a session bind uses, or `None` while the root's identity
 /// is provisional (see [`resolve_root_identity_for_bind`]). A provisional key
 /// is not recorded anywhere, so the next bind derives the key again.
-pub(crate) fn artifact_cache_key_for_bind_profiled(
+#[doc(hidden)]
+pub fn artifact_cache_key_for_bind_profiled(
     probe_root: &Path,
     memo_root: &Path,
     storage_root: &Path,
@@ -673,15 +677,15 @@ pub(crate) fn resolve_root_identity_with_recheck(
 
 /// Why a root has no settled artifact identity yet. Shown as the root's
 /// degraded reason and as the detail of a refused identity lookup. A bound
-/// root retries the identity in the background while this reason stands; see
-/// [`crate::provisional_identity_retry`].
+/// root retries identity resolution in the background while this reason remains.
 #[doc(hidden)]
 pub const PROVISIONAL_IDENTITY_REASON: &str =
     "identity provisional: aft.db was busy at bind; indexes start once the database is free";
 /// Replaces [`PROVISIONAL_IDENTITY_REASON`] once the background retry gives up.
-pub(crate) const PROVISIONAL_IDENTITY_EXHAUSTED_REASON: &str = "identity provisional: aft.db stayed busy or unreadable for 5 minutes after bind, so this folder has no search, semantic or call-graph index. Close whatever holds aft.db open (usually another AFT process in a long write), then reopen this folder's session to bind it again";
-pub(crate) const GIT_IDENTITY_UNAVAILABLE_REASON: &str =
-    "identity provisional: git_identity_unavailable";
+#[doc(hidden)]
+pub const PROVISIONAL_IDENTITY_EXHAUSTED_REASON: &str = "identity provisional: aft.db stayed busy or unreadable for 5 minutes after bind, so this folder has no search, semantic or call-graph index. Close whatever holds aft.db open (usually another AFT process in a long write), then reopen this folder's session to bind it again";
+#[doc(hidden)]
+pub const GIT_IDENTITY_UNAVAILABLE_REASON: &str = "identity provisional: git_identity_unavailable";
 
 /// Like [`resolve_root_identity_with_recheck`], but a busy aft.db yields a
 /// provisional identity instead of an error. The caller must not store any
@@ -874,7 +878,8 @@ pub fn artifact_cache_key_memoized_only(project_root: &Path) -> Option<String> {
 }
 
 /// Keep Git-top-level artifact derivation shared with standing roots byte-for-byte.
-pub(crate) fn artifact_key_from_git_identity(root_commit: &str) -> String {
+#[doc(hidden)]
+pub fn artifact_key_from_git_identity(root_commit: &str) -> String {
     artifact_hash16(root_commit.as_bytes())
 }
 
@@ -952,13 +957,15 @@ pub(crate) fn checkout_position(project_root: &Path) -> CheckoutPosition {
 
 /// Existing non-Git path-scope artifact derivation, exposed for the standing
 /// identity classifier so it does not mint a parallel path-key family.
-pub(crate) fn artifact_path_identity_key(project_root: &Path) -> String {
+#[doc(hidden)]
+pub fn artifact_path_identity_key(project_root: &Path) -> String {
     let canonical_root = canonicalize_or_normalize(project_root);
     artifact_hash16(canonical_root.to_string_lossy().as_bytes())
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn artifact_path_identity_key_for_test(project_root: &Path) -> String {
+#[doc(hidden)]
+pub fn artifact_path_identity_key_for_test(project_root: &Path) -> String {
     artifact_path_identity_key(project_root)
 }
 
@@ -1257,7 +1264,8 @@ fn root_git_marker_state(project_root: &Path, git_common_dir: Option<&Path>) -> 
 ///
 /// Scoped roots consume this exact result as an opaque byte sequence; they must
 /// not independently rebuild the sorted, deduplicated root set.
-pub(crate) fn canonical_git_root_commit_identity(
+#[doc(hidden)]
+pub fn canonical_git_root_commit_identity(
     project_root: &Path,
 ) -> Result<String, ArtifactCacheKeyProbeError> {
     match repo_root_commit_with_retry(project_root) {
@@ -1285,9 +1293,8 @@ pub(crate) fn canonical_git_root_commit_identity(
 /// folder is not a repository (or has no commit yet), and an error when Git
 /// could not tell, so the caller can wait rather than key the folder by its
 /// path and later find it belongs to a repository.
-pub(crate) fn root_commit_identity_or_folder(
-    project_root: &Path,
-) -> Result<Option<String>, String> {
+#[doc(hidden)]
+pub fn root_commit_identity_or_folder(project_root: &Path) -> Result<Option<String>, String> {
     match repo_root_commit_with_retry(project_root) {
         RootCommitResolution::Commit(identity) => Ok(Some(identity)),
         RootCommitResolution::NotARepo => Ok(None),
@@ -1748,7 +1755,8 @@ thread_local! {
 }
 
 #[cfg(test)]
-pub(crate) fn root_commit_git_runs_for_test(project_root: &Path) -> usize {
+#[doc(hidden)]
+pub fn root_commit_git_runs_for_test(project_root: &Path) -> usize {
     ROOT_COMMIT_GIT_RUNS.with(|runs| runs.borrow().get(project_root).copied().unwrap_or(0))
 }
 
@@ -1945,7 +1953,8 @@ fn git_root_commit_once_real(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct GitRootCommitProbeOverrideGuard {
+#[doc(hidden)]
+pub struct GitRootCommitProbeOverrideGuard {
     previous: Option<RootCommitProbeOverride>,
 }
 
@@ -1957,7 +1966,8 @@ impl Drop for GitRootCommitProbeOverrideGuard {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn git_root_commit_probe_override_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
+#[doc(hidden)]
+pub fn git_root_commit_probe_override_lock_for_test() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
@@ -1965,7 +1975,8 @@ pub(crate) fn git_root_commit_probe_override_lock_for_test() -> std::sync::Mutex
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
+#[doc(hidden)]
+pub fn force_git_root_commit_probe_transient_for_paths_for_test(
     roots: Vec<PathBuf>,
     detail: impl Into<String>,
 ) -> GitRootCommitProbeOverrideGuard {
@@ -1989,7 +2000,8 @@ pub(crate) fn force_git_root_commit_probe_transient_for_paths_for_test(
 /// attempt count before and after the cancel is fixed by the order of events
 /// rather than by how fast the machine runs. Dropping the sender also releases
 /// the hold, so a test that panics never leaves the probing thread parked.
-pub(crate) fn force_git_root_commit_probe_held_transient_for_paths_for_test(
+#[doc(hidden)]
+pub fn force_git_root_commit_probe_held_transient_for_paths_for_test(
     roots: Vec<PathBuf>,
     attempts: Arc<AtomicUsize>,
     release: std::sync::mpsc::Receiver<()>,
@@ -2012,7 +2024,8 @@ pub(crate) fn force_git_root_commit_probe_held_transient_for_paths_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn force_git_root_commit_probe_commits_for_test(
+#[doc(hidden)]
+pub fn force_git_root_commit_probe_commits_for_test(
     commits_by_root: BTreeMap<PathBuf, String>,
 ) -> GitRootCommitProbeOverrideGuard {
     install_git_root_commit_probe_override_for_test(move |project_root| {
@@ -2042,8 +2055,17 @@ fn set_git_root_commit_probe_override_for_test(
     std::mem::replace(&mut *slot, override_probe)
 }
 
-pub(crate) fn canonicalize_or_normalize(path: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn canonicalize_or_normalize(path: &Path) -> PathBuf {
     crate::bounded_io::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn git_command_for_test(root: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new("git");
+    crate::test_env::apply_hermetic_git_env(command.arg("-C").arg(root));
+    command
 }
 
 #[cfg(test)]
@@ -2841,7 +2863,7 @@ pub(crate) mod tests {
             "upgrade fixtures require usable Git"
         );
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/root_identity_upgrade/cases.json"
+            "../../tests/fixtures/root_identity_upgrade/cases.json"
         ))
         .unwrap();
         let case = fixture["cases"]
@@ -3045,12 +3067,6 @@ pub(crate) mod tests {
             repo_root_commit_with_retry(dir.path()),
             RootCommitResolution::NotARepo
         ));
-    }
-
-    pub(crate) fn git_command_for_test(root: &Path) -> Command {
-        let mut command = Command::new("git");
-        crate::test_env::apply_hermetic_git_env(command.arg("-C").arg(root));
-        command
     }
 
     fn grafted_history_test_roots() -> [&'static str; 3] {
@@ -4031,7 +4047,7 @@ pub(crate) mod tests {
         let root = directory.path().join("checkout");
         let replacement = directory.path().join("replacement");
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/root_identity_upgrade/cases.json"
+            "../../tests/fixtures/root_identity_upgrade/cases.json"
         ))
         .unwrap();
         for (path, content) in [
@@ -4238,7 +4254,7 @@ pub(crate) mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repository");
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/root_identity_upgrade/cases.json"
+            "../../tests/fixtures/root_identity_upgrade/cases.json"
         ))
         .unwrap();
         certification_fixture_repository(&root, "initial history", &fixture["commit"]);
@@ -4312,7 +4328,7 @@ pub(crate) mod tests {
         let root = directory.path().join("checkout");
         let replacement = directory.path().join("replacement");
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/root_identity_upgrade/cases.json"
+            "../../tests/fixtures/root_identity_upgrade/cases.json"
         ))
         .unwrap();
         certification_fixture_repository(&root, "first checkout", &fixture["commit"]);
@@ -4364,7 +4380,7 @@ pub(crate) mod tests {
         let _probe_lock = git_root_commit_probe_override_lock_for_test();
         assert!(crate::developer_tools::git_usable());
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/root_identity_upgrade/cases.json"
+            "../../tests/fixtures/root_identity_upgrade/cases.json"
         ))
         .unwrap();
         for linked in [false, true] {

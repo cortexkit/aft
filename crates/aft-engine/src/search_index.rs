@@ -18,7 +18,9 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
+pub(crate) use aft_db::path_filters::relative_to_root;
+use aft_db::path_filters::to_glob_path;
+pub use aft_db::path_filters::{build_path_filters, PathFilters};
 use ignore::WalkBuilder;
 use rayon::prelude::*;
 use regex::bytes::Regex;
@@ -1098,7 +1100,6 @@ pub(crate) fn note_path_order_held_rows(search_root: &Path, rows: usize) {
 /// search root.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod path_order_held_rows_for_test;
-
 
 #[derive(Clone, Debug)]
 #[doc(hidden)]
@@ -3493,7 +3494,6 @@ pub fn resolve_cache_dir(project_root: &Path, storage_dir: Option<&Path>) -> Pat
     resolve_cache_dir_with_key(&artifact_cache_key_for_build(project_root), storage_dir)
 }
 
-
 pub fn walk_project_files_bounded_default(
     root: &Path,
     max_files: usize,
@@ -4036,7 +4036,6 @@ pub fn take_present_on_disk_with_admission<T, E>(
     ))
 }
 
-
 pub(crate) fn cache_relative_path(root: &Path, path: &Path) -> Option<PathBuf> {
     let normalized_root = normalize_path(root);
     let normalized_path = normalize_path(path);
@@ -4418,10 +4417,10 @@ pub fn is_binary_bytes(content: &[u8]) -> bool {
 }
 
 /// `storage_dir` is the root for rebuildable cache artifacts (see
-/// [`crate::bash_background::cache_artifact_root`]), not AFT's storage root
+/// [`aft_base::storage_path::cache_artifact_root`]), not AFT's storage root
 /// for data that must survive (aft.db, backups).
 pub fn resolve_cache_dir_with_key(project_key: &str, storage_dir: Option<&Path>) -> PathBuf {
-    crate::bash_background::cache_artifact_root(storage_dir)
+    aft_base::storage_path::cache_artifact_root(storage_dir)
         .join("index")
         .join(project_key)
 }
@@ -4635,7 +4634,6 @@ pub(crate) fn count_ignore_rule_discovery_dirs_legacy_stack(root: &Path) -> usiz
     }
     dirs
 }
-
 
 fn canonicalize_for_search_membership(path: &Path) -> PathBuf {
     // Indexed files and requested scope roots meet in containment checks. Bare
@@ -4874,7 +4872,6 @@ fn mask_for_position(position: usize) -> u8 {
     1u8 << (position % 8)
 }
 
-
 fn run_git(root: &Path, args: &[&str]) -> Option<String> {
     const GIT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -5027,7 +5024,6 @@ pub(crate) fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
     let prefix = &line[..line.len().min(PREFIX_BYTES)];
     bounded_grep_line_text(&String::from_utf8_lossy(prefix))
 }
-
 
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use crate::executor::audit::*;
@@ -5247,7 +5243,7 @@ mod tests {
     }
 
     use super::*;
-    use crate::root_identity::key::tests::git_command_for_test;
+    use crate::root_identity::key::git_command_for_test;
     use std::process::Command;
 
     /// Unmatched leading `..` components must survive comparison normalization:

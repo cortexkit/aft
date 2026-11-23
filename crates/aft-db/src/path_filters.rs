@@ -13,7 +13,8 @@ pub fn build_path_filters(include: &[String], exclude: &[String]) -> Result<Path
     })
 }
 
-pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
     path.strip_prefix(root)
         .map(PathBuf::from)
         .unwrap_or_else(|_| path.to_path_buf())
@@ -22,7 +23,7 @@ pub(crate) fn relative_to_root(root: &Path, path: &Path) -> PathBuf {
 impl PathFilters {
     #[doc(hidden)]
     pub fn matches(&self, root: &Path, path: &Path) -> bool {
-        if !crate::bash_background::registry::safe_task_entry(path) {
+        if !crate::task_entry::safe_task_entry(path) {
             return false;
         }
         if self.includes.is_none() && self.excludes.is_none() {
@@ -68,6 +69,13 @@ fn build_globset(patterns: &[String]) -> Result<Option<GlobSet>, String> {
     builder.build().map(Some).map_err(|error| error.to_string())
 }
 
-fn to_glob_path(path: &Path) -> String {
+#[doc(hidden)]
+pub fn to_glob_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
+use crate::path_identity::lexical_normalize as normalize_path;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::path::{Path, PathBuf};
+
+#[cfg(any(test, feature = "test-support"))]
+use crate::executor::audit::audit_record;

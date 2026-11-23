@@ -12,6 +12,7 @@ import sys
 
 CRATES = Path(__file__).resolve().parents[2]
 WORKSPACE = CRATES.parent
+ROOT_IDENTITY_FIXTURE = Path("tests/fixtures/root_identity_upgrade/cases.json")
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,10 @@ def main():
     args = parser.parse_args()
     violations = []
     try:
+        upper_fixture = CRATES / "aft" / ROOT_IDENTITY_FIXTURE
+        lower_fixture = CRATES / "aft-db" / ROOT_IDENTITY_FIXTURE
+        if upper_fixture.exists() and upper_fixture.read_bytes() != lower_fixture.read_bytes():
+            violations.append("aft and aft-db root-identity fixtures differ")
         with args.messages.open(encoding="utf-8") as stream:
             units = cargo_units(stream, args.packaged)
         for audit in AUDITS:

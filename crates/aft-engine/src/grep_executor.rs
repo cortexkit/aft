@@ -1638,7 +1638,7 @@ fn target_walk_builder(
             floor_disclosure.record_source_exclusion(entry.path());
             return false;
         }
-        if !crate::bash_background::registry::safe_task_entry(entry.path()) {
+        if !aft_base::task_entry::safe_task_entry(entry.path()) {
             return false;
         }
         let is_dir = file_type.as_ref().is_some_and(std::fs::FileType::is_dir);
@@ -1796,7 +1796,7 @@ fn is_disclosable_ignore_boundary(
     entry.file_name() != ".git"
         && !crate::project_content::is_excluded_with_file_type(&entry.path(), Some(kind))
         && !(kind.is_dir() && worktrees.is_nested_worktree_root(&entry.path()))
-        && crate::bash_background::registry::safe_task_entry(&entry.path())
+        && aft_base::task_entry::safe_task_entry(&entry.path())
 }
 
 /// Evidence is limited to the named folder's children, never ignored subtrees.

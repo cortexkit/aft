@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum Identity {
+#[doc(hidden)]
+pub enum Identity {
     Path,
     Git {
         root_commit: String,
@@ -59,12 +60,18 @@ pub(crate) fn canonical_root(root: &Path) -> PathBuf {
 }
 
 #[derive(Clone)]
-pub(crate) struct ConfiguredArtifactAccess {
-    pub(crate) project_root: PathBuf,
-    pub(crate) shared_key: String,
-    pub(crate) private_key: String,
-    pub(crate) borrow_only_shared: bool,
-    pub(crate) registered: bool,
+#[doc(hidden)]
+pub struct ConfiguredArtifactAccess {
+    #[doc(hidden)]
+    pub project_root: PathBuf,
+    #[doc(hidden)]
+    pub shared_key: String,
+    #[doc(hidden)]
+    pub private_key: String,
+    #[doc(hidden)]
+    pub borrow_only_shared: bool,
+    #[doc(hidden)]
+    pub registered: bool,
 }
 
 static CONFIGURED_ARTIFACT_ACCESS: OnceLock<Mutex<HashMap<PathBuf, ConfiguredArtifactAccess>>> =
@@ -74,7 +81,8 @@ fn configured_artifact_access() -> &'static Mutex<HashMap<PathBuf, ConfiguredArt
     CONFIGURED_ARTIFACT_ACCESS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub(crate) fn artifact_access(project_root: &Path) -> Option<ConfiguredArtifactAccess> {
+#[doc(hidden)]
+pub fn artifact_access(project_root: &Path) -> Option<ConfiguredArtifactAccess> {
     configured_artifact_access()
         .lock()
         .ok()?
@@ -84,7 +92,8 @@ pub(crate) fn artifact_access(project_root: &Path) -> Option<ConfiguredArtifactA
 
 /// Return the artifact key registered during configure without deriving a new
 /// key from Git or reading the older identity pin in aft.db.
-pub(crate) fn configured_artifact_key(project_root: &Path) -> Option<String> {
+#[doc(hidden)]
+pub fn configured_artifact_key(project_root: &Path) -> Option<String> {
     let project_root = canonical_root(project_root);
     configured_artifact_access()
         .lock()
@@ -125,7 +134,8 @@ fn record_path(root: &Path, storage: &Path) -> PathBuf {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct RecordStamp {
+#[doc(hidden)]
+pub struct RecordStamp {
     modified: std::time::SystemTime,
     len: u64,
     #[cfg(unix)]
@@ -143,10 +153,8 @@ pub(crate) struct RecordStamp {
 
 /// The caller supplies a canonical root so checking a memo requires just one
 /// stat of the record, not another filesystem traversal to resolve the root.
-pub(crate) fn record_stamp(
-    canonical_root: &Path,
-    storage: &Path,
-) -> io::Result<Option<RecordStamp>> {
+#[doc(hidden)]
+pub fn record_stamp(canonical_root: &Path, storage: &Path) -> io::Result<Option<RecordStamp>> {
     let path = record_path(canonical_root, storage);
     #[cfg(not(windows))]
     let metadata = match std::fs::metadata(&path) {
@@ -190,7 +198,8 @@ pub(crate) fn record_stamp(
     }))
 }
 
-pub(crate) fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> {
+#[doc(hidden)]
+pub fn read(root: &Path, storage: &Path) -> io::Result<Option<Identity>> {
     Ok(read_record(root, storage)?.map(|record| record.identity))
 }
 
@@ -454,7 +463,8 @@ fn legacy_pins(root: &Path, storage: &Path) -> LegacyPins {
 /// Whether the older standing pins for `root` can be read right now without
 /// waiting on aft.db. A bind left provisional by a busy database polls this
 /// before it tries the whole bind again.
-pub(crate) fn legacy_pins_readable(root: &Path, storage: &Path) -> bool {
+#[doc(hidden)]
+pub fn legacy_pins_readable(root: &Path, storage: &Path) -> bool {
     read_legacy_pins(&canonical_root(root), storage).is_ok()
 }
 
@@ -567,7 +577,8 @@ impl Identity {
 
 /// Inspect ancestors without invoking Git, including linked-worktree markers.
 /// An unreadable marker cannot prove that a folder has no repository identity.
-pub(crate) fn nearest_git_marker(root: &Path) -> io::Result<Option<PathBuf>> {
+#[doc(hidden)]
+pub fn nearest_git_marker(root: &Path) -> io::Result<Option<PathBuf>> {
     for directory in root.ancestors() {
         match std::fs::symlink_metadata(directory.join(".git")) {
             Ok(_) => return Ok(Some(directory.to_path_buf())),

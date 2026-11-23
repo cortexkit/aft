@@ -200,6 +200,7 @@ pub mod launch_grants;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
+pub use aft_base::progress_sender::{ProgressSender, SharedProgressSender};
 
 thread_local! {
     static REQUEST_PROGRESS_ORIGIN: std::cell::RefCell<Option<(String, crate::protocol::ProgressOrigin)>> = const { std::cell::RefCell::new(None) };
