@@ -42,6 +42,7 @@ mod callgraph_restart_reuse_test;
 mod callgraph_test;
 mod checkpoint_metadata_test;
 mod cli_help_test;
+mod cli_ort_exit_test;
 mod commands_test;
 mod compress_cli_commands_test;
 mod compress_filters_test;

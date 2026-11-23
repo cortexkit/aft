@@ -132,6 +132,30 @@ fn exit_after_log_flush(code: i32) -> i32 {
     code
 }
 
+/// Runs a one-shot subcommand that can start ONNX Runtime work (`warmup` and
+/// `index` fill the meaning-search plane) and ends the process with the code
+/// it returns. Every such subcommand must end through this function.
+///
+/// When the command's own work is done, a background thread can still be
+/// inside ONNX Runtime: a meaning-search fill creating its embedding session,
+/// for example. Returning from `main` or calling `process::exit` runs ONNX
+/// Runtime's C++ static destructors underneath that thread, and the process
+/// dies with SIGSEGV after its output is complete. So, as the standalone and
+/// supervised shutdowns do, this first refuses new ONNX Runtime work and waits
+/// for the work in flight, then ends without native teardown if that work
+/// does not finish in time.
+///
+/// Code 0 returns so the caller can return from `main` as before; any other
+/// code exits here.
+fn run_ort_capable_command(command: impl FnOnce() -> i32) {
+    let code = command();
+    if code == 0 {
+        aft::ort_lifecycle::quiesce_before_return(0);
+        return;
+    }
+    aft::ort_lifecycle::exit_process(code)
+}
+
 fn hold_process_storage_lease() -> Arc<aft::root_cache::ProcessStorageLease> {
     let storage = aft::bash_background::storage_dir(None);
     aft::root_cache::acquire_daemon_storage_lease(&storage).unwrap_or_else(|error| {
@@ -368,14 +392,13 @@ fn main() {
         // Offline semantic collection can use Rayon. This branch exits without
         // running the server's later process-environment mutations.
         initialize_global_rayon_pool();
-        match cli::index::run(args) {
-            Ok(cli::index::IndexExit::Success) => return,
-            Ok(exit) => std::process::exit(exit.code()),
+        return run_ort_capable_command(|| match cli::index::run(args) {
+            Ok(exit) => exit.code(),
             Err(error) => {
                 eprintln!("{error}");
-                std::process::exit(1);
+                1
             }
-        }
+        });
     }
 
     if std::env::args().nth(1).as_deref() == Some("grammar-smoke") {
@@ -494,13 +517,13 @@ fn main() {
 
     if std::env::args().nth(1).as_deref() == Some("warmup") {
         let args = std::env::args_os().skip(2).collect::<Vec<_>>();
-        match cli::warmup::run(args) {
-            Ok(()) => return,
+        return run_ort_capable_command(|| match cli::warmup::run(args) {
+            Ok(()) => 0,
             Err(error) => {
                 eprintln!("{error}");
-                std::process::exit(error.exit_code());
+                error.exit_code()
             }
-        }
+        });
     }
 
     // Writes the large allocations and bursts the global allocator records;
