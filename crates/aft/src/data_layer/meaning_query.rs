@@ -159,13 +159,24 @@ impl DataSemantic {
     /// How `checkout`'s meaning search stands, as its last configuration
     /// left it; starts nothing. `None` while semantic search is off for it.
     pub(crate) fn of_checkout(checkout: &crate::data_layer::runtime::DataCheckout) -> Option<Self> {
-        Self::from_state(checkout.meaning_status())
+        Self::from_state(checkout.meaning_status(), || checkout.last_failure())
     }
 
-    pub(crate) fn from_state(state: MeaningState) -> Option<Self> {
+    pub(crate) fn from_state(
+        state: MeaningState,
+        build_failure: impl FnOnce() -> Option<crate::data_layer::checkout::Failure>,
+    ) -> Option<Self> {
         Some(match state {
             MeaningState::Off => return None,
-            MeaningState::Unpublished => Self::NotServing(building(DATA_LAYER_BUILD_STAGE, None)),
+            MeaningState::Unpublished => Self::NotServing(match build_failure() {
+                Some(failure)
+                    if failure.stage == "build"
+                        && crate::view_storage_reserve::is_message(&failure.error) =>
+                {
+                    SemanticIndexStatus::Failed(failure.error)
+                }
+                _ => building(DATA_LAYER_BUILD_STAGE, None),
+            }),
             MeaningState::Starting => Self::NotServing(building(meaning::STARTING_STAGE, None)),
             MeaningState::Blocked(failure) => Self::NotServing(blocked(&failure, None)),
             MeaningState::Serving { snapshot, failure } => {

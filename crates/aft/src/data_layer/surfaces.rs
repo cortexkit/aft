@@ -640,7 +640,12 @@ fn report_of_inner(checkout: &DataCheckout, cached_only: bool) -> DataStoreRepor
         failure,
         Some(checkout.checkout().family_dir().to_path_buf()),
     );
-    report.meaning = meaning_report(checkout, cached_only, view.as_ref());
+    report.meaning = meaning_report(
+        checkout,
+        cached_only,
+        view.as_ref(),
+        report.failure.as_ref(),
+    );
     report.disk_measurement = Some(Arc::clone(checkout.disk_measurement()));
     report.skipped_folders =
         view.map_or(0, |view| view.current_state().skipped_directories().len());
@@ -784,6 +789,10 @@ impl MeaningReport {
                 "entries_done": entries_done,
                 "entries_total": entries_total,
             }),
+            MeaningPlane::Failed(error) if crate::view_storage_reserve::is_message(error) => {
+                PlaneReport::because(UNAVAILABLE, reason::DISK_RESERVE, Some(error.clone()))
+                    .to_json()
+            }
             MeaningPlane::Failed(error) => json!({ "status": "failed", "error": error }),
             MeaningPlane::Disabled => json!({ "status": "disabled" }),
             MeaningPlane::Ready => json!({ "status": READY }),
@@ -896,14 +905,14 @@ fn meaning_report(
     checkout: &DataCheckout,
     cached_only: bool,
     view: Option<&super::checkout::CheckoutView>,
+    failure: Option<&DataFailure>,
 ) -> Option<MeaningReport> {
     use crate::commands::data_search::DataSemantic;
     use crate::data_layer::status::SemanticIndexStatus;
-    let semantic = if cached_only {
-        DataSemantic::from_state(checkout.cached_meaning_status(view))?
-    } else {
-        DataSemantic::of_checkout(checkout)?
-    };
+    let semantic =
+        DataSemantic::from_state(checkout.meaning_status_for_view(view, cached_only), || {
+            failure.cloned()
+        })?;
     let filling = checkout.filling();
     let plane = match semantic {
         DataSemantic::Serving(meaning) => MeaningPlane::Serving {
@@ -950,17 +959,20 @@ fn report_from(
     let refresh_failure = failure
         .as_ref()
         .filter(|failure| failure.stage == "refresh");
-    // Bound and not published: the bind started a build, which is running,
-    // about to run, or failed.
+    // Keep the pause visible while the next build attempt is queued or running.
+    let disk_paused =
+        build_failure.filter(|failure| crate::view_storage_reserve::is_message(&failure.error));
     let unpublished = || match build_failure {
-        Some(failure) if !status.building => PlaneReport::failed(failure),
+        Some(failure) if !status.building || disk_paused.is_some() => PlaneReport::failed(failure),
         _ => PlaneReport::of(BUILDING),
     };
     let (text, indexed_files) = match (files, status.text) {
         // Switched off in the configuration: not built, and grep walks.
         _ if !status.planes.text => (PlaneReport::of(OFF), None),
         (Some(_), PlaneStatus::Ready) => (PlaneReport::of(READY), None),
-        (Some(_), PlaneStatus::Building { done, .. }) => (PlaneReport::of(BUILDING), Some(done)),
+        (Some(_), PlaneStatus::Building { done, .. }) if disk_paused.is_none() => {
+            (PlaneReport::of(BUILDING), Some(done))
+        }
         _ => (unpublished(), None),
     };
     // The call graph is refreshed lazily: a published graph with edits
@@ -969,7 +981,9 @@ fn report_from(
         PlaneReport::of(OFF)
     } else if !status.callgraph_published {
         unpublished()
-    } else if let Some(failure) = refresh_failure {
+    } else if let Some(failure) =
+        refresh_failure.filter(|failure| !crate::view_storage_reserve::is_message(&failure.error))
+    {
         PlaneReport::failed(failure)
     } else {
         PlaneReport::of(READY)
@@ -1517,7 +1531,7 @@ fn apply_to_status_inner(payload: &mut Value, report: &DataStoreReport, push: bo
             payload["semantic_index"]["status"].as_str(),
             Some("paused" | "backend_unavailable")
         );
-        let mut semantic = if backend_down {
+        let mut semantic = if backend_down && meaning["reason"] != reason::DISK_RESERVE {
             let mut semantic = payload["semantic_index"].clone();
             if let (Some(semantic), Some(meaning)) = (semantic.as_object_mut(), meaning.as_object())
             {
@@ -1958,7 +1972,8 @@ mod tests {
             for plane in ["semantic_index", "search_index", "callgraph_store"] {
                 assert_eq!(
                     snapshot[plane]["status"], "unavailable",
-                    "{plane}: {snapshot}"
+                    "{plane}: {}",
+                    snapshot[plane]
                 );
                 assert_eq!(snapshot[plane]["reason"], "disk_reserve", "{plane}");
                 assert_eq!(snapshot[plane]["error"], paused, "{plane}");

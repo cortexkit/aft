@@ -1122,7 +1122,9 @@ impl DataSemantic {
         // generation reload or a member-cache build.
         let checkout = waits::timed(SearchWait::CheckoutSlot, || ctx.data_checkout())?;
         let _wait = waits::time(SearchWait::MeaningView);
-        Self::from_state(checkout.meaning(|| ctx.data_meaning_config()))
+        Self::from_state(checkout.meaning(|| ctx.data_meaning_config()), || {
+            checkout.last_failure()
+        })
     }
 }
 

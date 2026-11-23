@@ -164,6 +164,31 @@ impl IndexObservation {
         self.effective == IndexEffective::Ready
     }
 
+    pub(crate) fn disk_paused(&self) -> bool {
+        self.unavailable_reason.as_deref()
+            == Some(crate::data_layer::surfaces::reason::DISK_RESERVE)
+    }
+
+    pub(crate) fn readiness_label(&self) -> String {
+        match self.effective {
+            IndexEffective::Unavailable if self.disk_paused() => "paused (low disk space)".into(),
+            IndexEffective::Unavailable
+                if self.unavailable_reason.as_deref() == Some(cause::SEMANTIC_NOT_OPENED) =>
+            {
+                crate::semantic_admission::NOT_OPENED_LABEL.into()
+            }
+            IndexEffective::Unavailable => format!(
+                "unavailable: {}",
+                self.unavailable_reason.as_deref().unwrap_or("unknown")
+            ),
+            IndexEffective::Off => self.unavailable_reason.as_deref().map_or_else(
+                || "unavailable: disabled".into(),
+                |reason| format!("off: {reason}"),
+            ),
+            _ => self.effective.as_str().into(),
+        }
+    }
+
     /// The `{status, reason}` object consumers embed in their responses. In
     /// consumer payloads `reason` carries the unavailable or safety-disabled
     /// cause; the setup plan's derivation reason is a
@@ -235,13 +260,7 @@ pub fn observed_index_status(
 }
 
 fn observe_callgraph(ctx: &dyn IndexHost) -> IndexObservation {
-    // A bound checkout's call-graph plane in the index store serves every
-    // call-graph reader; nothing else does. Same mapping as the text plane.
-    match crate::data_layer::surfaces::report(ctx).map(|report| report.callgraph.status) {
-        Some(crate::data_layer::surfaces::READY) => IndexObservation::ready(),
-        Some(crate::data_layer::surfaces::BUILDING) => IndexObservation::building(),
-        _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
-    }
+    observe_store_plane(crate::data_layer::surfaces::report(ctx).map(|report| report.callgraph))
 }
 
 /// The recorded refusal, if any, of this root's artifact for `plane`: its own
@@ -287,11 +306,22 @@ pub fn storage_refusal(
 // index is being replaced or updated, which reports as building.
 
 fn observe_trigram(ctx: &dyn IndexHost) -> IndexObservation {
-    // A bound checkout's text plane in the index store serves the lexical
-    // lanes; nothing else does.
-    match crate::data_layer::surfaces::report(ctx).map(|report| report.text.status) {
-        Some(crate::data_layer::surfaces::READY) => IndexObservation::ready(),
-        Some(crate::data_layer::surfaces::BUILDING) => IndexObservation::building(),
+    observe_store_plane(crate::data_layer::surfaces::report(ctx).map(|report| report.text))
+}
+
+fn observe_store_plane(
+    plane: Option<crate::data_layer::surfaces::PlaneReport>,
+) -> IndexObservation {
+    use crate::data_layer::surfaces::{reason::DISK_RESERVE, PlaneReport, BUILDING, READY};
+    match plane {
+        Some(PlaneReport { status: READY, .. }) => IndexObservation::ready(),
+        Some(PlaneReport {
+            status: BUILDING, ..
+        }) => IndexObservation::building(),
+        Some(PlaneReport {
+            reason: Some(DISK_RESERVE),
+            ..
+        }) => IndexObservation::unavailable(DISK_RESERVE),
         _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
 }
@@ -302,6 +332,11 @@ fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
     // stands, whatever today's index status reads.
     if let Some(data) = crate::data_layer::meaning_query::DataSemantic::probe(ctx) {
         return match data.status() {
+            SemanticIndexStatus::Failed(message)
+                if crate::view_storage_reserve::is_message(&message) =>
+            {
+                IndexObservation::unavailable(crate::data_layer::surfaces::reason::DISK_RESERVE)
+            }
             SemanticIndexStatus::Failed(message) => {
                 IndexObservation::unavailable(semantic_failure_cause(ctx, &message))
             }
@@ -347,6 +382,11 @@ fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
         }
         _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
+}
+
+pub(crate) fn disk_pause_detail(ctx: &dyn IndexHost) -> Option<String> {
+    let failure = crate::data_layer::surfaces::report(ctx)?.failure?;
+    crate::view_storage_reserve::is_message(&failure.error).then_some(failure.error)
 }
 
 /// Classify a failed semantic build into a named cause.

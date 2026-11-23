@@ -1900,7 +1900,11 @@ impl SearchLaneStatus {
         [("trigram", &self.trigram), ("semantic", &self.semantic)]
             .into_iter()
             .map(|(name, lane)| {
-                if name == "semantic" && !lane.is_ready() && lane.effective != IndexEffective::Off {
+                if name == "semantic"
+                    && !lane.is_ready()
+                    && lane.effective != IndexEffective::Off
+                    && !lane.disk_paused()
+                {
                     let backend = ctx.semantic_backend_health_snapshot();
                     if !backend.available && backend.paused_until_ms.is_some() {
                         // A scheduled pause is not an ordinary unavailable-index
@@ -1908,23 +1912,7 @@ impl SearchLaneStatus {
                         return paused_backend_detail(&backend);
                     }
                 }
-                let state = match lane.effective {
-                    IndexEffective::Unavailable
-                        if lane.unavailable_reason.as_deref()
-                            == Some(feature_cause::SEMANTIC_NOT_OPENED) =>
-                    {
-                        crate::semantic_admission::NOT_OPENED_LABEL.to_string()
-                    }
-                    IndexEffective::Unavailable => format!(
-                        "unavailable: {}",
-                        lane.unavailable_reason.as_deref().unwrap_or("unknown")
-                    ),
-                    IndexEffective::Off => lane.unavailable_reason.as_deref().map_or_else(
-                        || "unavailable: disabled".to_string(),
-                        |reason| format!("off: {reason}"),
-                    ),
-                    _ => lane.effective.as_str().to_string(),
-                };
+                let state = lane.readiness_label();
                 let state = if name == "semantic" {
                     // Prefer the current semantic index status over the stored snapshot.
                     let snapshot = ctx.semantic_index_status();
@@ -1961,6 +1949,11 @@ impl SearchLaneStatus {
                 };
                 format!("{name}: {state}")
             })
+            .chain(
+                (self.trigram.disk_paused() || self.semantic.disk_paused())
+                    .then(|| crate::feature_status::disk_pause_detail(ctx))
+                    .flatten(),
+            )
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -2001,7 +1994,7 @@ impl SearchLaneStatus {
             || self.semantic.effective == IndexEffective::Building
         {
             "\nRetry shortly or use grep."
-        } else if both_off {
+        } else if both_off || self.trigram.disk_paused() || self.semantic.disk_paused() {
             ""
         } else {
             "\nUse grep, or inspect the unavailable lane's configuration."
