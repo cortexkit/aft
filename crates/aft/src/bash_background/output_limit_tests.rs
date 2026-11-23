@@ -91,7 +91,12 @@ fn output_limit_stops_piped_command_and_caps_retained_output() {
     );
     assert_eq!(len(&task.paths.stdout), cap);
     assert!(len(&task.paths.stderr) <= cap);
-    assert!(snapshot.output_preview.contains("end"));
+    use std::io::{Read, Seek, SeekFrom};
+    let mut stdout = fs::File::open(&task.paths.stdout).unwrap();
+    stdout.seek(SeekFrom::End(-3)).unwrap();
+    let mut tail = [0; 3];
+    stdout.read_exact(&mut tail).unwrap();
+    assert_eq!(&tail, b"end");
 }
 
 #[test]

@@ -19518,17 +19518,23 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_failed_killing_persist_preserves_running_state() {
+    fn lifecycle_failed_kill_persist_leaves_terminal_state_retryable() {
         let registry = BgTaskRegistry::default();
         let dir = tempfile::tempdir().unwrap();
         let task = lifecycle_running_fixture(&registry, &dir);
         fs::remove_file(&task.paths.json).unwrap();
         fs::create_dir(&task.paths.json).unwrap();
-        assert!(registry.kill(&task.task_id, "session").is_err());
-        let state = task.lock_state().unwrap();
-        assert_eq!(state.metadata.status, BgTaskStatus::Running);
-        assert_eq!(state.metadata.status_reason, None);
-        assert!(!state.kill_in_flight);
+        let stopped = registry.kill(&task.task_id, "session").unwrap();
+        assert_eq!(stopped.info.status, BgTaskStatus::Killed);
+        assert!(stopped.kill_state_warning.is_some());
+        assert!(!task.kill_in_flight());
+        assert!(task.terminal_persist_dirty.load(Ordering::SeqCst));
+        fs::remove_dir(&task.paths.json).unwrap();
+        registry.retry_terminal_persist(&task).unwrap();
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Killed
+        );
     }
 
     #[test]
@@ -20071,9 +20077,15 @@ mod tests {
         } else {
             first
         };
-        fs::remove_file(&failing.paths.json).unwrap();
-        fs::create_dir(&failing.paths.json).unwrap();
-        assert!(registry.abort_inflight("session").is_err());
+        // Make the first task's state lock unavailable. The abort must
+        // retain that failure and still stop the other task.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _state = failing.state.lock().unwrap();
+            panic!("inject a poisoned task state lock");
+        }));
+        let result = registry.abort_inflight("session");
+        failing.state.clear_poison();
+        assert!(result.unwrap_err().contains("lock poisoned"));
         assert!(other.state.lock().unwrap().metadata.is_terminal());
         assert!(
             registry.inner.wait_registered_tasks.lock().unwrap()["session"].contains(&failing_id)
