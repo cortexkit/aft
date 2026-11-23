@@ -4,6 +4,7 @@ import {
   BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
+  ESCAPE_SANDBOX_DESCRIPTION,
   BashOutputPageDecoder,
   BashPermissionLoopError,
   type BridgeRequestOptions,
@@ -246,6 +247,10 @@ const BashSandboxParam = {
   ),
 };
 
+const BashEscapeParam = {
+  escape_sandbox: Type.Optional(Type.String({ description: ESCAPE_SANDBOX_DESCRIPTION })),
+};
+
 const BashBackgroundFlagParam = {
   background: Type.Optional(
     Type.Boolean({
@@ -285,6 +290,7 @@ const BashRunonParam = {
 /** The full argument set, used for the parameter types `execute` receives. */
 const BashParams = Type.Object({
   ...BashBaseParams,
+  ...BashEscapeParam,
   ...BashWaitParam,
   ...BashSandboxParam,
   ...BashBackgroundFlagParam,
@@ -935,6 +941,7 @@ export function registerBashTool(
                 block_to_completion: blockToCompletion,
                 wait: requestedWait,
                 sandbox: params.sandbox,
+                escape_sandbox: params.escape_sandbox,
                 ...(isPowerShell ? { shell: "powershell" } : {}),
                 ...(params.runon !== undefined ? { runon: params.runon } : {}),
                 // Forwarded like `runon`: the engine refuses it without `runon`.
@@ -969,6 +976,13 @@ export function registerBashTool(
         if (fallbackCause === undefined) throw error;
         if (params.command.includes("{{ck-secret:") || bridgeCommand.includes("{{ck-secret:")) {
           throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
+        if (params.escape_sandbox !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "escape_sandbox",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
         }
         if (isPowerShell) {
           throw refuseAftModuleOptionWithoutFallback(

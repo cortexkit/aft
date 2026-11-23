@@ -11311,6 +11311,13 @@ async fn handle_tool_call_with_capabilities(
         executor
             .actor_context(&identity.root)
             .and_then(|ctx| ctx.database_runtime_refusal(&request_id, &bare_name))
+    })
+    .or_else(|| {
+        matches!(bare_name.as_str(), "bash" | "powershell")
+            .then(|| {
+                consent::sandbox_escape::preflight_response(&identity, &request_id, &arguments)
+            })
+            .flatten()
     }) {
         let text = crate::subc_format::format_response_with_context(
             &bare_name,

@@ -128,6 +128,7 @@ pub use aft_engine::root_cache;
 pub use aft_engine::root_identity;
 pub use aft_engine::runtime_drain;
 pub use aft_engine::runtime_registry;
+pub use aft_engine::sandbox_escape;
 pub use aft_engine::sandbox_spawn;
 pub use aft_engine::scoped_key;
 pub use aft_engine::search_b2;

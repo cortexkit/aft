@@ -8,6 +8,7 @@
  */
 
 // --- logger contract ---
+export { ESCAPE_SANDBOX_DESCRIPTION } from "./sandbox-escape.js";
 export { setActiveLogger } from "./active-logger.js";
 // --- bash.env deny list (shared by both plugin hosts and the engine) ---
 export {

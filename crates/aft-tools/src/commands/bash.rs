@@ -52,6 +52,8 @@ struct BashParams {
     #[serde(default)]
     sandbox: Option<BashSandbox>,
     #[serde(default)]
+    escape_sandbox: Option<String>,
+    #[serde(default)]
     shell: crate::bash_background::BashShell,
     #[serde(default)]
     permissions_granted: Vec<String>,
@@ -127,6 +129,32 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .is_some();
     let _runon_timings =
         remote_requested.then(|| crate::bash_background::RunonTimingScope::start(launch_started));
+    if let Some(reason) = params.escape_sandbox.as_deref() {
+        if let Some(refusal) = crate::sandbox_escape::validate_fields(&params.command, reason) {
+            return Response::error(&req.id, refusal.code, refusal.message);
+        }
+        if remote_requested {
+            return Response::error(
+                &req.id,
+                crate::sandbox_escape::REFUSED_CODE,
+                crate::sandbox_escape::LOCAL_ONLY,
+            );
+        }
+        if cfg!(windows) {
+            return Response::error(
+                &req.id,
+                crate::sandbox_escape::REFUSED_CODE,
+                crate::sandbox_escape::WINDOWS_REFUSED,
+            );
+        }
+        if crate::sandbox_spawn::worker_jail_active() {
+            return Response::error(
+                &req.id,
+                crate::sandbox_escape::REFUSED_CODE,
+                crate::sandbox_escape::HEAD_ONLY,
+            );
+        }
+    }
     if has_secrets && remote_requested {
         return crate::bash_background::secrets::refusal(
             &req.id,
@@ -136,7 +164,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     if let Some(requirement) = sandbox_requirement {
-        let tier = if params.sandbox.is_some() {
+        let tier = if params.sandbox.is_some() || params.escape_sandbox.is_some() {
             crate::sandbox_spawn::RequestedSandboxTier::Host
         } else {
             crate::sandbox_spawn::RequestedSandboxTier::Native
@@ -388,7 +416,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         .unwrap_or_else(|| default_workdir(ctx));
     crate::bash_background::enter_runon_phase("permission_preflight");
     let principal = crate::sandbox_spawn::current_authenticated_principal();
-    let host_requested = matches!(params.sandbox, Some(BashSandbox::Host));
+    let host_requested =
+        matches!(params.sandbox, Some(BashSandbox::Host)) || params.escape_sandbox.is_some();
     if host_requested && !crate::sandbox_spawn::principal_is_first_party(&principal) {
         return Response::error(
             &req.id,
@@ -524,19 +553,37 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
             if let Some(snapshot) = snapshot {
                 crate::sandbox_spawn::save_provider_approval(ctx, &grant_id, snapshot);
             }
-            return Response::error_with_data(
-                &req.id,
-                ERROR_PERMISSION_REQUIRED,
-                "bash command requires host escalation approval",
-                json!({
-                    "asks": [{
-                        "kind": "escalation",
-                        "command": params.command,
-                        "cwd": cwd,
-                        "grant_id": grant_id,
-                    }]
-                }),
-            );
+            return if let Some(reason) = params.escape_sandbox.clone() {
+                let plan = crate::sandbox_escape::EscapePlan {
+                    grant_id,
+                    command: params.command.clone(),
+                    cwd,
+                    shell_path,
+                    escapes_level: crate::sandbox_spawn::effective_sandbox_mode(ctx, &principal),
+                    background: params.background || params.pty,
+                    reason,
+                };
+                Response::error_with_data(
+                    &req.id,
+                    crate::sandbox_escape::REQUIRED_CODE,
+                    crate::sandbox_escape::APPROVAL_REQUIRED,
+                    json!({"sandbox_escape": plan}),
+                )
+            } else {
+                Response::error_with_data(
+                    &req.id,
+                    ERROR_PERMISSION_REQUIRED,
+                    "bash command requires host escalation approval",
+                    json!({
+                        "asks": [{
+                            "kind": "escalation",
+                            "command": params.command,
+                            "cwd": cwd,
+                            "grant_id": grant_id,
+                        }]
+                    }),
+                )
+            };
         }
     }
     // Only first-party strict requests may defer approval until the resolved

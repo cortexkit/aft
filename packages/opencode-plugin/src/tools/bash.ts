@@ -3,6 +3,7 @@ import {
   BASH_RETURN_PATHS_DESCRIPTION,
   BASH_RUNON_DESCRIPTION,
   BASH_RUNON_GUIDANCE,
+  ESCAPE_SANDBOX_DESCRIPTION,
   type BashPermissionAsk,
   type BridgeRequestOptions,
   bashHostFallbackAskPattern,
@@ -501,6 +502,7 @@ export function createBashTool(
       .describe(
         "Short 5-10 word human-readable summary shown in OpenCode UI metadata instead of raw shell syntax.",
       ),
+    escape_sandbox: z.string().optional().describe(ESCAPE_SANDBOX_DESCRIPTION),
     ...waitArg,
     ...sandboxArg,
     ...backgroundFlagArg,
@@ -681,6 +683,7 @@ export function createBashTool(
             block_to_completion: blockToCompletion,
             wait: requestedWait,
             sandbox: args.sandbox,
+            escape_sandbox: args.escape_sandbox,
             ...(runon !== undefined ? { runon } : {}),
             ...(returnPaths !== undefined ? { return_paths: returnPaths } : {}),
           },
@@ -705,6 +708,13 @@ export function createBashTool(
         if (fallbackCause === undefined) throw error;
         if (command.includes("{{ck-secret:")) {
           throw new Error(BASH_SECRET_HOST_FALLBACK_REFUSAL);
+        }
+        if (args.escape_sandbox !== undefined) {
+          throw refuseAftModuleOptionWithoutFallback(
+            error,
+            "escape_sandbox",
+            BASH_HOST_FALLBACK_REFUSAL,
+          );
         }
         if (!backgroundDisabled && rawRequestedBackground) {
           throw refuseAftModuleOptionWithoutFallback(

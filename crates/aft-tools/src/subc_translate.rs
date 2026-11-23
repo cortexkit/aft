@@ -1466,6 +1466,12 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
         }
         out.insert("sandbox".to_string(), sandbox.clone());
     }
+    if let Some(reason) = map_in.get("escape_sandbox") {
+        if !reason.is_string() {
+            return Err(invalid_request(crate::sandbox_escape::REASON_INVALID));
+        }
+        out.insert("escape_sandbox".to_string(), reason.clone());
+    }
     // `runon` is forwarded as written; the bash handler names an unknown
     // demand and decides whether this session may run remotely at all.
     // Some models fill every optional parameter, sending `runon: ""` for a

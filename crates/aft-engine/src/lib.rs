@@ -247,6 +247,7 @@ pub mod root_identity;
 pub mod runtime_drain;
 pub mod runtime_registry;
 pub use aft_db::sandbox_profile;
+pub mod sandbox_escape;
 pub mod sandbox_spawn;
 pub mod scoped_key;
 pub mod search_b2;

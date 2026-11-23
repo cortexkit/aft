@@ -35,6 +35,7 @@ pub mod remote_grant_rows;
 pub mod removal;
 pub mod rich_ui;
 pub mod runner_harness_keys;
+pub mod sandbox_escape_records;
 pub mod standing_roots;
 pub mod state;
 
@@ -713,6 +714,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
         run_migrations(&mut conn)?;
         ensure_additive_indexes(&conn)?;
         display_records::install(&conn)?;
+        sandbox_escape_records::install(&conn)?;
         codemode_owners::install(&conn)?;
         clear_stored_compression_commands(&mut conn)?;
         access_grants::migrate_prefrontal_owner(&mut conn)?;
@@ -1272,6 +1274,7 @@ pub mod tests {
         "rich_ui_cursor_key",
         "rich_ui_session_presets",
         "display_records",
+        "sandbox_escape_records",
         "codemode_owners",
     ];
 
@@ -1300,6 +1303,8 @@ pub mod tests {
         "idx_write_ledger_minutes_window",
         "idx_write_ledger_unmeasurable_window",
         "idx_rich_ui_session_presets_recorded",
+        "idx_sandbox_escape_records_retention",
+        "idx_sandbox_escape_records_task",
     ];
 
     /// Opens `aft.db` twice: the first connection plays this process's shared

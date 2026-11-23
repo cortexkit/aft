@@ -50,6 +50,8 @@ use subc_protocol::scope::ScopeSelector;
 
 #[path = "consent_expiry.rs"]
 pub(super) mod expiry;
+#[path = "sandbox_escape.rs"]
+pub(super) mod sandbox_escape;
 
 pub(super) const CINGULATE_MODULE_ID: &str = "cingulate";
 
@@ -746,19 +748,22 @@ impl PermissionDisplay for Permission {
     fn path(&self) -> &Path {
         match self {
             Self::File(grant) => &grant.path,
-            Self::Shell { cwd, .. } => cwd,
+            Self::Shell { cwd, .. } | Self::SandboxEscape { cwd, .. } => cwd,
         }
     }
 
     fn operation(&self) -> &'static str {
         match self {
             Self::File(grant) => operation_name(grant.operation),
-            Self::Shell { .. } => "exec",
+            Self::Shell { .. } | Self::SandboxEscape { .. } => "exec",
         }
     }
 }
 
 fn requested_permission(call: &HeldCall, response: &Response) -> Option<Permission> {
+    if let Some(escape) = sandbox_escape::requested_permission(response) {
+        return Some(escape);
+    }
     if let Some(grant) = requested_ask(response) {
         return Some(Permission::File(grant));
     }
@@ -1540,6 +1545,7 @@ where
     let owner = SettlementOwner::new(&call);
     let result = run_held(&call, grant, rerun, &owner.0).await;
     owner.complete(&result);
+    sandbox_escape::complete(&call, result.as_ref()).await;
     result
 }
 
@@ -1557,7 +1563,9 @@ where
     if let Some(other) = flight.other_settled(false) {
         return other.result(call, &grant, &route_hold).await;
     }
-    let deadline = (Instant::now() + hold_budget(None)).min(
+    let deadline = (Instant::now()
+        + sandbox_escape::hold_budget(&grant).unwrap_or_else(|| hold_budget(None)))
+    .min(
         call.reply_deadline
             .checked_sub(RERUN_MARGIN)
             .unwrap_or_else(Instant::now),
@@ -1590,7 +1598,8 @@ where
                 let shell: Vec<String> = once
                     .iter()
                     .flat_map(|permission| match permission {
-                        Permission::Shell { permissions, .. } => permissions.clone(),
+                        Permission::Shell { permissions, .. }
+                        | Permission::SandboxEscape { permissions, .. } => permissions.clone(),
                         Permission::File(_) => Vec::new(),
                     })
                     .collect();
@@ -1604,7 +1613,7 @@ where
                     .into_iter()
                     .filter_map(|permission| match permission {
                         Permission::File(grant) => Some(grant),
-                        Permission::Shell { .. } => None,
+                        Permission::Shell { .. } | Permission::SandboxEscape { .. } => None,
                     })
                     .collect();
                 let running = rerun(
@@ -1956,6 +1965,9 @@ fn prepare_shell(
     permission: &Permission,
     own_holder: Option<&str>,
 ) -> rusqlite::Result<Prep> {
+    if sandbox_escape::is_escape(permission) {
+        return sandbox_escape::prepare(conn, identity, tool, arguments, permission, own_holder);
+    }
     let stamp = identity.scope.as_ref().expect("a program has a run stamp");
     let key = AskKey {
         scope: access_grants::scope_key(identity),
@@ -2174,7 +2186,7 @@ fn log_consent(session: &str, event: ConsentEvent<'_>, ask: &str, grant: &Permis
             kind: GrantKind::Subtree,
             ..
         }) => "subtree",
-        Permission::Shell { .. } => "shell",
+        Permission::Shell { .. } | Permission::SandboxEscape { .. } => "shell",
     };
     // Attribute only this emission; consent work may run on async or blocking
     // workers whose thread-local logging context belongs to an earlier call.
@@ -2277,6 +2289,9 @@ pub(super) fn decode_elicitation_id(result: &Value) -> Result<String, ConsentErr
 /// access. `refused:<code>` (withdrawn, head gone) grants nothing, and the held
 /// call ends with that `<code>` as its error code.
 pub(super) fn decode_record(record: &Value) -> Result<Settlement, ConsentError> {
+    if record.get("kind").and_then(Value::as_str) == Some("sandbox_escape") {
+        return sandbox_escape::decode_record(record);
+    }
     if record.get("kind").and_then(Value::as_str) == Some("macos_permission") {
         return Err(ConsentError::Refused {
             code: "access_informational".into(),
@@ -2347,6 +2362,9 @@ fn retry_answer(call: &HeldCall, grant: &Permission) -> Response {
 }
 
 fn unavailable_answer(call: &HeldCall, grant: &Permission, detail: &str) -> Response {
+    if sandbox_escape::is_escape(grant) {
+        return sandbox_escape::unavailable_answer(call);
+    }
     answer(
         call,
         "access_unavailable",
@@ -2360,6 +2378,9 @@ fn unavailable_answer(call: &HeldCall, grant: &Permission, detail: &str) -> Resp
 }
 
 fn refused_answer(call: &HeldCall, grant: &Permission, code: &str, note: Option<&str>) -> Response {
+    if sandbox_escape::is_escape(grant) {
+        return sandbox_escape::refused_answer(call, code);
+    }
     let target = format!("{} {}", grant.operation(), grant.path().display());
     let message = match code {
         "access_declined" => match note {
@@ -2559,7 +2580,7 @@ async fn hold(
             directory_scope.as_ref().expect("file scope was probed"),
             own_holder.as_deref(),
         ),
-        Permission::Shell { .. } => {
+        Permission::Shell { .. } | Permission::SandboxEscape { .. } => {
             let conn = db.lock().map_err(|error| error.to_string())?;
             prepare_shell(
                 &conn,
@@ -2591,6 +2612,7 @@ async fn hold(
     if let Some(waiting) = waiting.as_mut() {
         waiting.remember(call, &prep);
     }
+    sandbox_escape::track(call, &prep);
     let Some(transport) = transport() else {
         return Hold::Answer(unavailable_answer(
             call,
@@ -2610,7 +2632,9 @@ async fn hold(
             UNARY_TIMEOUT,
         ))
         .await;
-    let elicitation = match reply.and_then(|reply| decode_elicitation_id(&reply)) {
+    let elicitation = match reply
+        .and_then(|reply| sandbox_escape::decode_elicitation_id(&prep.request, &reply))
+    {
         Ok(elicitation) => elicitation,
         Err(error) => return failed(call, &prep, error).await,
     };
@@ -2635,6 +2659,7 @@ async fn hold(
     if let Some((covered, covering)) = live.record_elicitation(&elicitation) {
         withdraw_covered_ask(&covered, &covering).await;
     }
+    sandbox_escape::note_filed(call, &prep, &elicitation).await;
     // Await at least once, even with no budget left, so an ask that already
     // settled (a retry after the answer) is applied rather than parked.
     let mut first = true;
@@ -2645,6 +2670,10 @@ async fn hold(
             return Hold::Answer(refused_answer(call, &prep.grant, ACCESS_TIMEOUT, None));
         }
         if now >= deadline && !first {
+            if sandbox_escape::is_escape(&prep.grant) {
+                withdraw(call, &prep, &elicitation).await;
+                return Hold::Answer(sandbox_escape::expired_answer(call));
+            }
             park(call, &prep, &elicitation);
             if let Some(waiting) = waiting.take() {
                 waiting.finish().await;
@@ -2814,6 +2843,7 @@ async fn finish(
     retry_after_deadline: Arc<AtomicBool>,
     elicitation: &str,
 ) -> Hold {
+    sandbox_escape::note_settlement(call, prep, &settled, elicitation).await;
     if call.identity.run_owner.is_some() {
         if call
             .identity

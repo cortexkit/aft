@@ -2090,16 +2090,23 @@ pub(super) fn submit_deferred_bash(
     reply_budget: impl Into<crate::blocking_wait::ReplyBudget>,
 ) {
     let reply_budget = reply_budget.into();
-    let program = super::secret_consent::current_identity().filter(|identity| {
-        identity
-            .run_owner
-            .as_ref()
-            .is_some_and(|owner| matches!(owner.kind, super::codemode::RunKind::Agent { .. }))
-            && matches!(
-                super::access_grants::ask_route(identity),
-                crate::access_policy::AskRoute::Consent { .. }
-            )
-    });
+    let escape = super::consent::sandbox_escape::argument(&arguments).is_some();
+    let program =
+        super::secret_consent::current_identity().filter(|identity| {
+            (escape
+                && super::consent::sandbox_escape::preflight_response(
+                    identity,
+                    &request_id,
+                    &arguments,
+                )
+                .is_none())
+                || (identity.run_owner.as_ref().is_some_and(|owner| {
+                    matches!(owner.kind, super::codemode::RunKind::Agent { .. })
+                }) && matches!(
+                    super::access_grants::ask_route(identity),
+                    crate::access_policy::AskRoute::Consent { .. }
+                ))
+        });
     if let Some(identity) = program.filter(|_| permissions_granted.is_none()) {
         let executor = executor.clone();
         let completion_tx = completion_tx.clone();
@@ -2231,8 +2238,13 @@ pub(super) fn submit_deferred_bash(
             };
             let _claim = metrics.held_bash_calls.insert(route, corr);
             held.shell_claim = Some(_claim.clone());
-            if first.0.data["code"] == crate::protocol::ERROR_PERMISSION_REQUIRED
-                && call_key.is_some()
+            if matches!(
+                first.0.data["code"].as_str(),
+                Some(
+                    crate::protocol::ERROR_PERMISSION_REQUIRED
+                        | crate::sandbox_escape::REQUIRED_CODE
+                )
+            ) && call_key.is_some()
             {
                 if super::consent::persist_permission_hold(&held)
                     .await

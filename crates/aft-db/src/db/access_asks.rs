@@ -25,6 +25,17 @@ use rusqlite::{params, Connection, OptionalExtension};
 #[serde(untagged)]
 pub enum Permission {
     File(AccessGrant),
+    /// A sandbox card carries the Shell fields too, so an older binary can
+    /// decode the row as an ordinary shell approval and ignore the extras.
+    SandboxEscape {
+        command: String,
+        cwd: std::path::PathBuf,
+        permissions: Vec<String>,
+        shell: std::path::PathBuf,
+        escapes_level: String,
+        background: bool,
+        reason: String,
+    },
     Shell {
         command: String,
         cwd: std::path::PathBuf,
@@ -36,7 +47,7 @@ impl Permission {
     pub fn file(&self) -> Option<&AccessGrant> {
         match self {
             Self::File(grant) => Some(grant),
-            Self::Shell { .. } => None,
+            Self::Shell { .. } | Self::SandboxEscape { .. } => None,
         }
     }
 }

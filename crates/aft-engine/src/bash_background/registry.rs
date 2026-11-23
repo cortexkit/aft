@@ -3775,6 +3775,16 @@ impl BgTaskRegistry {
                 error
             );
         } else {
+            if Self::response_status_is_terminal(Some(&row.status)) {
+                if let Err(error) = crate::db::sandbox_escape_records::finish_task(
+                    &conn,
+                    &metadata.task_id,
+                    &row.status,
+                    row.exit_code,
+                ) {
+                    crate::slog_warn!("sandbox escape task outcome recording failed: {error}");
+                }
+            }
             if let Some(ticket) = ticket.take() {
                 ticket.resolved();
             }
