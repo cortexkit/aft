@@ -130,28 +130,29 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     let _runon_timings =
         remote_requested.then(|| crate::bash_background::RunonTimingScope::start(launch_started));
     if let Some(reason) = params.escape_sandbox.as_deref() {
-        if let Some(refusal) = crate::sandbox_escape::validate_fields(&params.command, reason) {
+        if let Some(refusal) = aft_engine::sandbox_escape::validate_fields(&params.command, reason)
+        {
             return Response::error(&req.id, refusal.code, refusal.message);
         }
         if remote_requested {
             return Response::error(
                 &req.id,
-                crate::sandbox_escape::REFUSED_CODE,
-                crate::sandbox_escape::LOCAL_ONLY,
+                aft_engine::sandbox_escape::REFUSED_CODE,
+                aft_engine::sandbox_escape::LOCAL_ONLY,
             );
         }
         if cfg!(windows) {
             return Response::error(
                 &req.id,
-                crate::sandbox_escape::REFUSED_CODE,
-                crate::sandbox_escape::WINDOWS_REFUSED,
+                aft_engine::sandbox_escape::REFUSED_CODE,
+                aft_engine::sandbox_escape::WINDOWS_REFUSED,
             );
         }
         if crate::sandbox_spawn::worker_jail_active() {
             return Response::error(
                 &req.id,
-                crate::sandbox_escape::REFUSED_CODE,
-                crate::sandbox_escape::HEAD_ONLY,
+                aft_engine::sandbox_escape::REFUSED_CODE,
+                aft_engine::sandbox_escape::HEAD_ONLY,
             );
         }
     }
@@ -554,7 +555,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 crate::sandbox_spawn::save_provider_approval(ctx, &grant_id, snapshot);
             }
             return if let Some(reason) = params.escape_sandbox.clone() {
-                let plan = crate::sandbox_escape::EscapePlan {
+                let plan = aft_engine::sandbox_escape::EscapePlan {
                     grant_id,
                     command: params.command.clone(),
                     cwd,
@@ -565,8 +566,8 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
                 };
                 Response::error_with_data(
                     &req.id,
-                    crate::sandbox_escape::REQUIRED_CODE,
-                    crate::sandbox_escape::APPROVAL_REQUIRED,
+                    aft_engine::sandbox_escape::REQUIRED_CODE,
+                    aft_engine::sandbox_escape::APPROVAL_REQUIRED,
                     json!({"sandbox_escape": plan}),
                 )
             } else {

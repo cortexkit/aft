@@ -1468,7 +1468,7 @@ fn translate_bash(args: Value, project_root: &Path) -> Result<Translated, Transl
     }
     if let Some(reason) = map_in.get("escape_sandbox") {
         if !reason.is_string() {
-            return Err(invalid_request(crate::sandbox_escape::REASON_INVALID));
+            return Err(invalid_request(aft_engine::sandbox_escape::REASON_INVALID));
         }
         out.insert("escape_sandbox".to_string(), reason.clone());
     }
