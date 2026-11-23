@@ -21,7 +21,7 @@ pub(super) const RUNNING_DISK_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
 pub(super) const OUTPUT_LIMIT_REASON: &str = "Command stopped: output exceeded the 1 GiB limit.";
 
 pub(super) fn running_disk_limit_bytes(_session_dir: &Path) -> u64 {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     if let Some(limit) = TEST_LIMITS.lock().unwrap().get(_session_dir) {
         return *limit;
     }
@@ -35,11 +35,11 @@ pub(super) fn running_disk_limit_bytes(_session_dir: &Path) -> u64 {
     RUNNING_DISK_LIMIT_BYTES
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static TEST_LIMITS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, u64>>> =
     std::sync::LazyLock::new(Mutex::default);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn limit_for_test(session_dir: PathBuf, bytes: u64) -> impl Drop {
     struct Restore(PathBuf);
     impl Drop for Restore {
