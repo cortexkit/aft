@@ -547,6 +547,11 @@ struct FakeState {
 }
 
 impl FakeState {
+    fn new_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("acc_{}", self.next_id)
+    }
+
     fn new_escape_id(&mut self) -> String {
         self.next_id += 1;
         format!("el_{}", self.next_id)

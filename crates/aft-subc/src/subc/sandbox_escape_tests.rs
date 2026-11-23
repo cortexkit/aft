@@ -63,7 +63,7 @@ fn held_call(f: &Fixture, identity: &RouteIdentity, arguments: Value) -> HeldCal
 async fn wait_for_request(fake: &FakeCingulate) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            if let Some(request) = fake.calls("consent.request").first() {
+            if let Some(request) = fake.calls("consent.request").into_iter().next() {
                 return request;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -122,8 +122,8 @@ async fn outcome_case(
         answer(&request, state, choice),
     );
     let response = tokio::time::timeout(Duration::from_secs(5), running)
-        .expect("settled sandbox escape call")
         .await
+        .expect("settled sandbox escape call")
         .unwrap()
         .unwrap()
         .expect("terminal response")
@@ -278,12 +278,11 @@ fn sandbox_escape_release_vectors_roundtrip_through_request_and_answer_types() {
                 decoded.sandbox_escape.validate().unwrap();
                 assert_roundtrip::<escape::CardRequest>(params);
             } else if invalid.contains(&name.as_str()) {
-                assert!(
-                    decoded
-                        .as_ref()
-                        .is_err_or(|request| request.sandbox_escape.validate().is_err()),
-                    "{name} must be invalid"
-                );
+                let invalid_request = match decoded {
+                    Err(_) => true,
+                    Ok(request) => request.sandbox_escape.validate().is_err(),
+                };
+                assert!(invalid_request, "{name} must be invalid");
             } else {
                 panic!("unreviewed sandbox escape request vector: {name}");
             }
