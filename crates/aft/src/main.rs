@@ -133,7 +133,7 @@ fn exit_after_log_flush(code: i32) -> i32 {
 }
 
 /// Runs a one-shot subcommand that can start ONNX Runtime work (`warmup` and
-/// `index` fill the meaning-search plane) and ends the process with the code
+/// `index` fill meaning-search data) and ends the process with the code
 /// it returns. Every such subcommand must end through this function.
 ///
 /// When the command's own work is done, a background thread can still be

@@ -1,0 +1,14 @@
+{
+  "slice_class": "non_ranking",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": [
+    "crates/aft/tests/integration/cli_ort_exit_test.rs",
+    "crates/aft/src/data_layer/meaning.rs",
+    "crates/aft/src/main.rs"
+  ],
+  "slices": [
+    "fix-ort-cli-exit-quiesce"
+  ],
+  "note": "The one-shot `aft warmup` and `aft index` commands now wait for in-flight ONNX Runtime work before the process ends, as the standalone and daemon shutdowns already do. The only change in data_layer/meaning.rs is a test-hooks-only hold before embedding model creation, which release builds do not compile. No change to search ranking, routing, indexing or the meaning-search fill itself."
+}
