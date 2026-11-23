@@ -581,8 +581,9 @@ impl Meaning {
             .as_ref()
             .is_none_or(|(made_for, _)| made_for != config)
         {
-            // A plane already made for this configuration knows which vectors
-            // it needs. Without one, the model supplies the producer fingerprint.
+            // A plane already made for this configuration knows which files
+            // still need vectors. Without one, the model must load first: the
+            // plane's stored vectors are keyed by the model that produced them.
             let existing = lock(&self.plane)
                 .as_ref()
                 .filter(|configured| &configured.config == config)
