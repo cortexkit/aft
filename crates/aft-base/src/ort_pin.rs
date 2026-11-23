@@ -716,6 +716,7 @@ pub mod tests {
                 error.starts_with("onnx runtime library changed while it was being checked"),
                 "{error}"
             );
+            assert!(error.contains("npx @cortexkit/aft doctor --fix"), "{error}");
         } else {
             // The held file cannot be replaced at all.
             assert_eq!(swapped.get(), Some(false), "the swap was refused");
@@ -946,6 +947,7 @@ pub mod tests {
                 error.starts_with("onnx runtime library hash mismatch at"),
                 "require_pinned={require_pinned}: {error}"
             );
+            assert!(error.contains("npx @cortexkit/aft doctor --fix"), "{error}");
         }
     }
 

@@ -13104,6 +13104,33 @@ mod tests {
     }
 
     #[test]
+    fn refusal_message_names_onnx_runtime_download_wait() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_context(project.path());
+        let lanes = SearchLaneStatus {
+            trigram: IndexObservation::building(),
+            semantic: IndexObservation::building(),
+            semantic_reload_started: false,
+        };
+        for (entries_done, entries_total) in [(None, None), (Some(3), Some(10))] {
+            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+                stage: "waiting_for_onnx_runtime_download".into(),
+                files: None,
+                entries_done,
+                entries_total,
+            };
+            let response = lanes.refusal("onnx-download-text", &ctx).unwrap();
+            let rendered = crate::subc_format::format_response("search", &response, false);
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line == "semantic: waiting for ONNX Runtime download"),
+                "{rendered}"
+            );
+        }
+    }
+
+    #[test]
     fn both_lanes_configured_off_refuse_with_no_search_lanes_enabled() {
         let project = tempfile::tempdir().expect("create project dir");
         let ctx = test_context(project.path());
