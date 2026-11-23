@@ -71,14 +71,14 @@ class ReleaseDebugArtifactWorkflowTests(unittest.TestCase):
         for arch, target in (("x64", "x86_64"), ("arm64", "aarch64")):
             with self.subTest(arch=arch):
                 steps = self.jobs[f"build-win32-{arch}"]["steps"]
-                builds = [step for step in steps if "cargo build --release" in step.get("run", "")]
+                builds = [step for step in steps if re.search(r"cargo (build|rustc) --release", step.get("run", ""))]
                 self.assertTrue(builds)
                 self.assertTrue(all("profile.release.strip=false" in step["run"] for step in builds))
                 verify_index = next(i for i, step in enumerate(steps) if step.get("name") == "Verify and package Windows PDB")
                 command = steps[verify_index]["run"]
                 self.assertIn("scripts/release-debug-symbols.py windows", command)
                 self.assertIn(f"{target}-pc-windows-msvc/release/aft.exe", command)
-                self.assertIn(f"$env:AFT_CI_TARGET_DIR/{target}-pc-windows-msvc/release/aft.pdb", command)
+                self.assertIn("$env:AFT_CI_JOB_DIR/aft.pdb", command)
                 self.assertIn(f"aft-windows-{arch}-pdb.zip", command)
                 uploads = [(i, step["with"]) for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4"]
                 self.assertTrue(all(i > verify_index for i, _ in uploads))
@@ -615,6 +615,7 @@ class LinuxUnitWorkflowTests(unittest.TestCase):
                 homes.append(paths[0])
             self.assertNotEqual(*homes)
 
+    @unittest.skipUnless(sys.platform == "linux", "daemon runner uses GNU stat")
     def test_real_daemon_gate_rejects_insecure_ancestors_before_running_tests(self) -> None:
         root = Path(__file__).resolve().parents[2]
         with tempfile.TemporaryDirectory() as directory:
@@ -1329,8 +1330,75 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
         self.assertNotIn("needs:", dependencies)
         self.assertNotIn("actions/download-artifact", conformance)
         self.assertIn("python3 scripts/check-path-deps.py", conformance)
-        self.assertIn("cargo build --features wasm-grammars -p agent-file-tools", conformance)
-        self.assertIn("AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft", conformance)
+        self.assertIn("cargo rustc --features wasm-grammars -p agent-file-tools", conformance)
+        self.assertIn("AFT_BINARY_PATH: ${{ env.AFT_CI_JOB_DIR }}/aft", conformance)
+
+
+class StageAftTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.stage = runpy.run_path(str(REPO_ROOT / "scripts/ci-stage-aft.py"))
+
+    def test_stages_the_executable_and_pdb_from_a_fresh_cargo_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp).resolve()
+            target = job / "cargo-target"
+            output = target / "unexpected profile directory"
+            output.mkdir(parents=True)
+            executable = output / "aft.exe"
+            executable.write_bytes(b"right executable")
+            pdb = output / "aft.pdb"
+            pdb.write_bytes(b"matching symbols")
+            (target / "aft.exe").write_bytes(b"wrong executable")
+            line = json.dumps({"reason": "compiler-artifact", "target": {"name": "aft", "kind": ["bin"]},
+                               "fresh": True, "executable": str(executable),
+                               "filenames": [str(executable), str(pdb)]})
+            artifact = self.stage["read_aft_artifact"]([line])
+            self.stage["stage_artifact"](artifact, target, job, True)
+            self.assertEqual((job / "aft.exe").read_bytes(), b"right executable")
+            self.assertEqual((job / "aft.pdb").read_bytes(), b"matching symbols")
+            (job / "aft.exe").write_bytes(b"signed copy")
+            self.assertEqual(executable.read_bytes(), b"right executable")
+
+    def test_refuses_to_stage_when_cargo_reports_no_aft_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            job = Path(tmp).resolve()
+            target = job / "cargo-target"
+            target.mkdir()
+            (target / "aft").write_bytes(b"stale executable")
+            stream = [json.dumps({"reason": "compiler-artifact", "target": {"name": "aft", "kind": ["bin"]},
+                                  "fresh": True, "executable": None, "filenames": []}),
+                      json.dumps({"reason": "build-finished", "success": True})]
+            artifact = self.stage["read_aft_artifact"](stream)
+            with self.assertRaisesRegex(ValueError, "Cargo did not report an executable for the aft binary"):
+                self.stage["stage_artifact"](artifact, target, job, False)
+            self.assertFalse((job / "aft").exists())
+
+    def test_refuses_an_executable_from_the_shared_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            shared = root / "shared-target"
+            shared.mkdir()
+            executable = shared / "aft"
+            executable.touch()
+            job = root / "job"
+            job.mkdir()
+            with self.assertRaisesRegex(ValueError, "unexpected aft executable"):
+                self.stage["stage_artifact"]({"executable": str(executable)}, job / "cargo-target", job, False)
+            self.assertFalse((job / "aft").exists())
+
+    def test_legacy_msvc_invalidation_removes_only_the_profile_binary_and_pdb(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            build = Path(tmp).resolve()
+            profile = Path("x86_64-pc-windows-msvc/stage")
+            removed = [profile / "deps" / file for file in ("aft.exe", "aft.pdb")]
+            kept = [profile / "aft.exe", profile / "deps/libaft.rlib",
+                    Path("aarch64-pc-windows-msvc/stage/deps/aft.exe")]
+            for path in removed + kept:
+                (build / path).parent.mkdir(parents=True, exist_ok=True)
+                (build / path).touch()
+            self.stage["invalidate_legacy_msvc_binary"](build, profile)
+            self.assertTrue(all(not (build / path).exists() for path in removed))
+            self.assertTrue(all((build / path).is_file() for path in kept))
 
 
 class NativeSelfHostedWorkflowTests(unittest.TestCase):
@@ -1397,6 +1465,14 @@ class NativeSelfHostedWorkflowTests(unittest.TestCase):
         required.update(f"Unit / Cargo integration shard {shard}/3 ({platform})"
                         for platform in ("macOS", "Windows") for shard in (1, 2, 3))
         self.assertEqual(required - names, set())
+
+    def test_native_e2e_uses_the_job_local_binary(self) -> None:
+        jobs = self.suites[1]["jobs"]
+        for job, binary in (("e2e-windows", "aft.exe"), ("e2e-macos", "aft")):
+            with self.subTest(job=job):
+                paths = [step["env"]["AFT_BINARY_PATH"] for step in jobs[job]["steps"]
+                         if "AFT_BINARY_PATH" in step.get("env", {})]
+                self.assertEqual(paths, [f"${{{{ env.AFT_CI_JOB_DIR }}}}/{binary}"])
 
     def test_every_native_job_prepares_persistent_state_and_always_cleans_processes(self) -> None:
         jobs = self.native_jobs()
@@ -1560,8 +1636,13 @@ while [[ "$1" != --output ]]; do shift; done
                 run = step.get("run", "")
                 env = step.get("env", {})
                 if "CARGO_TARGET_DIR" in env:
-                    self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
-                    self.assertRegex(run, r"cargo (build|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
+                    if "scripts/ci-stage-aft.py" in run:
+                        self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_JOB_DIR }}/cargo-target", name)
+                        self.assertEqual(env["CARGO_BUILD_BUILD_DIR"],
+                                         "${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}", name)
+                    else:
+                        self.assertEqual(env["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}", name)
+                    self.assertRegex(run, r"cargo (build|rustc|check|nextest (archive|list)|test)|ci-macos-integration-archive.py", name)
                 if any(command in run for command in (
                     "rust-test-gate.sh", "ci-windows-probes.py", "bun run test:unit", "bun test ",
                     "tests/macos-e2e/run.sh", "tests/windows-e2e/run.ps1", "cargo test",
@@ -1569,6 +1650,7 @@ while [[ "$1" != --output ]]; do shift; done
                     checked += 1
                     self.assertNotIn("CARGO_TARGET_DIR", env, name)
                     self.assertNotIn("CARGO_BUILD_TARGET_DIR", env, name)
+                    self.assertNotIn("CARGO_BUILD_BUILD_DIR", env, name)
                     shell = step.get("shell", "pwsh" if job["runs-on"] == ["self-hosted", "narli"] else "bash")
                     clear = ("Remove-Item Env:CARGO_TARGET_DIR, Env:CARGO_BUILD_TARGET_DIR"
                              if shell == "pwsh" else "unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR")
@@ -1641,6 +1723,46 @@ while [[ "$1" != --output ]]; do shift; done
             self.assertEqual(first, self.state.run_directory(root, "100", "2"))
             with self.assertRaises(ValueError):
                 self.state.run_directory(root, "../target", "1")
+
+    def test_native_cleanup_removes_private_outputs_without_clearing_shared_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            root = home / "aft-ci"
+            run = self.state.run_directory(root, "100", "1")
+            job = run / "attempt-1-job-fixture"
+            output = job / "cargo-target" / "debug"
+            output.mkdir(parents=True)
+            (output / "aft").touch()
+            (job / "aft").touch()
+            archive = run / "archive.tar"
+            archive.touch()
+            warm = root / "target"
+            warm.mkdir()
+            (warm / "dependency").touch()
+            with unittest.mock.patch.object(self.state.Path, "home", return_value=home), \
+                 unittest.mock.patch.object(self.state, "cleanup_processes"), \
+                 unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "cleanup"]), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "self-hosted",
+                                                       "GITHUB_RUN_ID": "100", "GITHUB_RUN_ATTEMPT": "1",
+                                                       "AFT_CI_JOB_DIR": str(job)}):
+                self.state.main()
+            self.assertFalse(job.exists())
+            self.assertTrue(archive.is_file())
+            self.assertTrue((warm / "dependency").is_file())
+
+    def test_hosted_setup_also_publishes_a_job_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runner_temp = Path(tmp).resolve()
+            env = runner_temp / "env"
+            with unittest.mock.patch.object(sys, "argv", ["ci-native-state.py", "setup"]), \
+                 unittest.mock.patch.dict(os.environ, {"RUNNER_ENVIRONMENT": "github-hosted",
+                                                       "RUNNER_TEMP": str(runner_temp), "GITHUB_ENV": str(env)}):
+                self.state.main()
+            values = dict(line.split("=", 1) for line in env.read_text().splitlines())
+            job = Path(values["AFT_CI_JOB_DIR"])
+            self.assertEqual(job.parent, runner_temp)
+            self.assertTrue(job.is_dir())
+            self.assertNotIn("AFT_CI_TARGET_DIR", values, "hosted builds use their workspace cache")
 
     def test_shared_target_is_cleaned_whole_only_above_the_runner_cap_on_self_hosted(self) -> None:
         for environment, cap, size, expected in (("github-hosted", 30, 78, False),

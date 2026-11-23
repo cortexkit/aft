@@ -158,11 +158,19 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 self.assertEqual(steps[-1], {"uses": "./.github/actions/native-ci-state", "if": "always()",
                                              "with": {"phase": "cleanup"}})
                 if job_id.startswith("build-"):
+                    build = next(i for i, step in enumerate(steps) if step.get("name") == "Build")
+                    self.assertIn(f"--legacy-msvc-profile-dir {target}/release", steps[build]["run"])
+                    self.assertIn(f"cargo rustc --release --bin aft --target {target}", steps[build]["run"])
+                    self.assertIn("ci-stage-aft.py --pdb", steps[build]["run"])
+                    self.assertEqual(steps[build]["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_JOB_DIR }}/cargo-target")
+                    self.assertEqual(steps[build]["env"]["CARGO_BUILD_BUILD_DIR"],
+                                     "${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}")
                     stage = next(i for i, step in enumerate(steps)
                                  if step.get("name") == "Stage the built binary for the existing artifact contract")
-                    self.assertIn(f'$env:AFT_CI_TARGET_DIR/{target}/release/aft.exe', steps[stage]["run"])
+                    self.assertIn('$source = "$env:AFT_CI_JOB_DIR/aft.exe"', steps[stage]["run"])
                     self.assertIn("Get-FileHash $source", steps[stage]["run"])
                     upload = next(i for i, step in enumerate(steps) if step.get("uses") == "actions/upload-artifact@v4")
+                    self.assertLess(build, stage)
                     self.assertLess(stage, upload)
         arm = commands(jobs["build-win32-arm64"])
         self.assertIn("Hostx64/arm64/cl.exe", arm)
@@ -211,13 +219,14 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
     def test_macos_landing_e2e_uses_debug_without_changing_publication(self):
         job = self.workflow("_e2e-suite.yml")["jobs"]["e2e-macos"]
         self.assertEqual(job["env"]["CARGO_PROFILE"], "${{ inputs.cargo_profile == 'stage' && 'dev' || 'release' }}")
-        self.assertEqual(job["env"]["CARGO_PROFILE_DIR"], "${{ inputs.cargo_profile == 'stage' && 'debug' || 'release' }}")
         self.assertEqual(job["env"]["CARGO_PROFILE_DEV_DEBUG"], "line-tables-only")
-        self.assertIn('cargo build --profile "$CARGO_PROFILE"', commands(job))
-        for command in ('codesign -f -s -', 'codesign --verify --strict', '"$AFT_CI_TARGET_DIR/$CARGO_PROFILE_DIR/aft" --version'):
+        self.assertIn('cargo rustc --profile "$CARGO_PROFILE"', commands(job))
+        for command in ('codesign -f -s - "$AFT_CI_JOB_DIR/aft"',
+                        'codesign --verify --strict "$AFT_CI_JOB_DIR/aft"',
+                        '"$AFT_CI_JOB_DIR/aft" --version'):
             self.assertIn(command, commands(job))
         run = next(step for step in job["steps"] if "bash tests/macos-e2e/run.sh" in step.get("run", "").splitlines())
-        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ env.AFT_CI_TARGET_DIR }}/${{ env.CARGO_PROFILE_DIR }}/aft")
+        self.assertEqual(run["env"]["AFT_BINARY_PATH"], "${{ env.AFT_CI_JOB_DIR }}/aft")
 
     def test_macos_e2e_reuses_coreutils_without_write_access_to_homebrew(self):
         source = (ROOT / "tests/macos-e2e/run.sh").read_text()

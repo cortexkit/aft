@@ -284,8 +284,11 @@ def main() -> None:
     phase = sys.argv[1]
     if os.environ.get("RUNNER_ENVIRONMENT") != "self-hosted":
         if phase == "setup":
+            runner_temp = Path(os.environ["RUNNER_TEMP"])
+            job_dir = Path(tempfile.mkdtemp(prefix="aft-ci-job-", dir=runner_temp))
             with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env:
                 print(f"AFT_CI_ARCHIVE_DIR={os.environ['RUNNER_TEMP']}", file=env)
+                print(f"AFT_CI_JOB_DIR={job_dir.as_posix()}", file=env)
         return
     root = Path.home() / "aft-ci"
     run_dir = run_directory(root, os.environ["GITHUB_RUN_ID"], os.environ["GITHUB_RUN_ATTEMPT"])

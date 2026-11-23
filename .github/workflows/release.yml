@@ -506,14 +506,16 @@ jobs:
 
       - name: Build
         # MSVC keeps debug info in a PDB, not in the shipped executable.
-        run: cargo build --release --target aarch64-pc-windows-msvc --config 'profile.release.strip=false' --features wasm-grammars
+        run: python scripts/ci-stage-aft.py --pdb --legacy-msvc-profile-dir aarch64-pc-windows-msvc/release cargo rustc --release --bin aft --target aarch64-pc-windows-msvc -p agent-file-tools --config 'profile.release.strip=false' --features wasm-grammars
+        shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
+          CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
 
       - name: Stage the built binary for the existing artifact contract
         shell: pwsh
         run: |
-          $source = "$env:AFT_CI_TARGET_DIR/aarch64-pc-windows-msvc/release/aft.exe"
+          $source = "$env:AFT_CI_JOB_DIR/aft.exe"
           $destination = Join-Path $env:GITHUB_WORKSPACE "target/aarch64-pc-windows-msvc/release/aft.exe"
           $null = New-Item -ItemType Directory -Force -Path (Split-Path $destination)
           Copy-Item -LiteralPath $source -Destination $destination -Force
@@ -523,7 +525,7 @@ jobs:
 
       - name: Verify and package Windows PDB
         shell: pwsh
-        run: python scripts/release-debug-symbols.py windows --binary target/aarch64-pc-windows-msvc/release/aft.exe --pdb "$env:AFT_CI_TARGET_DIR/aarch64-pc-windows-msvc/release/aft.pdb" --archive release-debug/aft-windows-arm64-pdb.zip
+        run: python scripts/release-debug-symbols.py windows --binary target/aarch64-pc-windows-msvc/release/aft.exe --pdb "$env:AFT_CI_JOB_DIR/aft.pdb" --archive release-debug/aft-windows-arm64-pdb.zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows-arm64-pdb
@@ -611,15 +613,16 @@ jobs:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
       - name: Build
-        run: cargo build --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
+        run: python scripts/ci-stage-aft.py --pdb --legacy-msvc-profile-dir x86_64-pc-windows-msvc/release cargo rustc --release --bin aft --target x86_64-pc-windows-msvc -p agent-file-tools --timings --config 'profile.release.strip=false' --features wasm-grammars
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
+          CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
 
       - name: Stage the built binary for the existing artifact contract
         shell: pwsh
         run: |
-          $source = "$env:AFT_CI_TARGET_DIR/x86_64-pc-windows-msvc/release/aft.exe"
+          $source = "$env:AFT_CI_JOB_DIR/aft.exe"
           $destination = Join-Path $env:GITHUB_WORKSPACE "target/x86_64-pc-windows-msvc/release/aft.exe"
           $null = New-Item -ItemType Directory -Force -Path (Split-Path $destination)
           Copy-Item -LiteralPath $source -Destination $destination -Force
@@ -629,7 +632,7 @@ jobs:
 
       - name: Verify and package Windows PDB
         shell: pwsh
-        run: python scripts/release-debug-symbols.py windows --binary target/x86_64-pc-windows-msvc/release/aft.exe --pdb "$env:AFT_CI_TARGET_DIR/x86_64-pc-windows-msvc/release/aft.pdb" --archive release-debug/aft-windows-x64-pdb.zip
+        run: python scripts/release-debug-symbols.py windows --binary target/x86_64-pc-windows-msvc/release/aft.exe --pdb "$env:AFT_CI_JOB_DIR/aft.pdb" --archive release-debug/aft-windows-x64-pdb.zip
       - uses: actions/upload-artifact@v4
         with:
           name: windows-x64-pdb

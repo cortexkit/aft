@@ -1698,9 +1698,10 @@ jobs:
         run: bun run typecheck
 
       - name: Cargo build (debug — needed by plugin tests)
-        run: cargo build --features wasm-grammars -p agent-file-tools
+        run: python3 scripts/ci-stage-aft.py cargo rustc --features wasm-grammars -p agent-file-tools --bin aft
         env:
-          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
+          CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
 
       - name: Rust conformance gate (macOS)
         run: |
@@ -1778,7 +1779,7 @@ jobs:
         env:
           AFT_TEST_NATIVE_FIXTURE_TIMING: "1"
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft
+          AFT_BINARY_PATH: ${{ env.AFT_CI_JOB_DIR }}/aft
           SUBC_CORE_BIN: ${{ steps.subc_core.outputs.path }}
           SUBC_CORE_WIRE_VERSION: ${{ steps.subc_core.outputs.wire_version }}
 
@@ -2370,10 +2371,11 @@ jobs:
         shell: pwsh
 
       - name: Cargo build (debug — bash.test.ts spawns the real aft binary)
-        run: cargo build --features wasm-grammars -p agent-file-tools
+        run: python scripts/ci-stage-aft.py --legacy-msvc-profile-dir debug cargo rustc --features wasm-grammars -p agent-file-tools --bin aft
         shell: pwsh
         env:
-          CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
+          CARGO_TARGET_DIR: ${{ env.AFT_CI_JOB_DIR }}/cargo-target
+          CARGO_BUILD_BUILD_DIR: ${{ env.AFT_CI_TARGET_DIR || format('{0}/target', github.workspace) }}
 
       - name: Bun test (bash permission flow — full bridge + plugin + Rust)
         run: |
@@ -2383,7 +2385,7 @@ jobs:
         shell: pwsh
         env:
           AFT_CACHE_DIR: ${{ runner.temp }}/aft-cache
-          AFT_BINARY_PATH: ${{ env.AFT_CI_TARGET_DIR }}/debug/aft.exe
+          AFT_BINARY_PATH: ${{ env.AFT_CI_JOB_DIR }}/aft.exe
 
       - name: Clean native test processes
         if: always()
