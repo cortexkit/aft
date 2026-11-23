@@ -200,8 +200,6 @@ pub mod launch_grants;
 #[cfg(test)]
 pub(crate) use gitignore_state::ignore_rules_fixture;
 
-pub type ProgressSender = Arc<Box<dyn Fn(PushFrame) + Send + Sync>>;
-pub type SharedProgressSender = Arc<Mutex<Option<ProgressSender>>>;
 
 thread_local! {
     static REQUEST_PROGRESS_ORIGIN: std::cell::RefCell<Option<(String, crate::protocol::ProgressOrigin)>> = const { std::cell::RefCell::new(None) };
