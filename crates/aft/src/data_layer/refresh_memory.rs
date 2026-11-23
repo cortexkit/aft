@@ -11,7 +11,29 @@ use std::time::Duration;
 use footprint::bytes;
 
 const GROWTH_FILE: &str = "callgraph-cold-growth-bytes";
+const GROWTH_SAMPLES_FILE: &str = "callgraph-cold-growth-samples";
+const COLD_SAMPLE_LIMIT: usize = 5;
 const CHECK_INTERVAL: usize = 256;
+
+fn read_cold_growth(family: &Path) -> Option<u64> {
+    std::fs::read_to_string(family.join(GROWTH_FILE))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn read_cold_samples(family: &Path) -> Option<Vec<u64>> {
+    let contents = std::fs::read_to_string(family.join(GROWTH_SAMPLES_FILE)).ok()?;
+    let mut samples = Vec::new();
+    for value in contents.split_whitespace() {
+        if samples.len() == COLD_SAMPLE_LIMIT {
+            return None;
+        }
+        samples.push(value.parse().ok()?);
+    }
+    (!samples.is_empty()).then_some(samples)
+}
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct MemoryLimit {
@@ -52,10 +74,7 @@ pub(super) struct RefreshMemory {
 
 impl RefreshMemory {
     pub(super) fn start(family: &Path) -> Self {
-        let cold = std::fs::read_to_string(family.join(GROWTH_FILE))
-            .ok()
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or_default();
+        let cold = read_cold_growth(family).unwrap_or_default();
         let floor = crate::memory::profile::current().refresh_floor_bytes;
         Self::new(bytes(), floor.max(cold))
     }
@@ -205,14 +224,35 @@ impl ColdGrowth {
     }
 
     pub(super) fn record(mut self, family: &Path) {
-        if let Some(growth) = self.finish() {
+        let Some(growth) = self.finish() else {
+            return;
+        };
+        let mut samples = read_cold_samples(family)
+            .unwrap_or_else(|| read_cold_growth(family).into_iter().collect());
+        if samples.len() == COLD_SAMPLE_LIMIT {
+            samples.remove(0);
+        }
+        samples.push(growth);
+        let ceiling = samples.iter().copied().max().unwrap_or(growth);
+        let history = samples
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Keep the maximum in the original one-number file so older versions
+        // can still read the ceiling. Both files are best-effort cache writes.
+        for (file, contents) in [
+            (GROWTH_SAMPLES_FILE, history),
+            (GROWTH_FILE, ceiling.to_string()),
+        ] {
             let result = crate::durability::atomic_write(
-                &family.join(GROWTH_FILE),
-                growth.to_string().as_bytes(),
+                &family.join(file),
+                contents.as_bytes(),
                 crate::durability::AtomicWriteDurability::None,
             );
             if let Err(error) = result {
-                log::debug!("could not record cold call-graph build memory growth: {error}");
+                log::debug!("could not write {file}: {error}");
             }
         }
     }
@@ -221,5 +261,65 @@ impl ColdGrowth {
 impl Drop for ColdGrowth {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(family: &Path, growth: u64) {
+        let (stop, _stopped) = mpsc::channel();
+        ColdGrowth {
+            stop,
+            sampler: Some(thread::spawn(move || growth)),
+        }
+        .record(family);
+    }
+
+    #[test]
+    fn refresh_ceiling_uses_the_largest_recent_cold_sample() {
+        let family = tempfile::tempdir().unwrap();
+        let peak = u64::MAX - 1;
+        record(family.path(), peak);
+        record(family.path(), peak - 1);
+
+        assert_eq!(
+            std::fs::read_to_string(family.path().join(GROWTH_FILE)).unwrap(),
+            peak.to_string()
+        );
+        assert_eq!(RefreshMemory::start(family.path()).ceiling, peak);
+    }
+
+    #[test]
+    fn cold_growth_history_keeps_only_the_newest_five() {
+        let family = tempfile::tempdir().unwrap();
+        for growth in [100, 6, 7, 5, 4, 3] {
+            record(family.path(), growth);
+        }
+
+        assert_eq!(read_cold_samples(family.path()).unwrap(), [6, 7, 5, 4, 3]);
+        assert_eq!(read_cold_growth(family.path()), Some(7));
+    }
+
+    #[test]
+    fn missing_history_starts_from_the_single_cold_growth_number() {
+        let family = tempfile::tempdir().unwrap();
+        std::fs::write(family.path().join(GROWTH_FILE), "50").unwrap();
+        record(family.path(), 40);
+
+        assert_eq!(read_cold_samples(family.path()).unwrap(), [50, 40]);
+        assert_eq!(read_cold_growth(family.path()), Some(50));
+    }
+
+    #[test]
+    fn corrupt_history_starts_from_the_single_cold_growth_number() {
+        let family = tempfile::tempdir().unwrap();
+        std::fs::write(family.path().join(GROWTH_FILE), "50").unwrap();
+        std::fs::write(family.path().join(GROWTH_SAMPLES_FILE), "100\nbad").unwrap();
+        record(family.path(), 40);
+
+        assert_eq!(read_cold_samples(family.path()).unwrap(), [50, 40]);
+        assert_eq!(read_cold_growth(family.path()), Some(50));
     }
 }
