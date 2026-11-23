@@ -1928,6 +1928,82 @@ mod tests {
         context_with(root, storage, |_| {})
     }
 
+    #[test]
+    fn disk_floor_status_surfaces_keep_the_pause_during_a_retry_and_clear_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ctx = context_with(&root, storage.path(), |config| {
+            config.indexes.trigram = true;
+            config.indexes.callgraph = true;
+            config.indexes.semantic = true;
+        });
+        let low = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
+        bind_for_test(&ctx);
+        let data = ctx.data_checkout().unwrap();
+        data.configure_meaning_without_fill_for_test(Some(&ctx.config().semantic));
+        let checkout = data.checkout();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while checkout.last_failure().is_none() {
+            assert!(Instant::now() < deadline, "the first build never failed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let status = || {
+            let req = serde_json::from_value(json!({"id":"pause", "command":"status"})).unwrap();
+            crate::commands::status::handle_status(&req, &ctx).data
+        };
+        let paused = "Index storage is paused: 1.0 GiB is free on this disk and AFT keeps 32.0 GiB free. Unused index data is being cleaned up; retry later.";
+        let assert_paused = |snapshot: Value| {
+            for plane in ["semantic_index", "search_index", "callgraph_store"] {
+                assert_eq!(
+                    snapshot[plane]["status"], "unavailable",
+                    "{plane}: {snapshot}"
+                );
+                assert_eq!(snapshot[plane]["reason"], "disk_reserve", "{plane}");
+                assert_eq!(snapshot[plane]["error"], paused, "{plane}");
+            }
+        };
+        assert_paused(status());
+
+        let retry = checkout.reserve_build().expect("reserve a retry");
+        assert_paused(status());
+        assert_paused(ctx.try_build_status_push_snapshot().unwrap());
+
+        let req = serde_json::from_value(
+            json!({"id":"search", "command":"semantic_search", "query":"callee"}),
+        )
+        .unwrap();
+        let response = crate::commands::semantic_search::handle_semantic_search(&req, &ctx);
+        let text = response.data["message"].as_str().unwrap();
+        for line in [
+            "trigram: paused (low disk space)",
+            "semantic: paused (low disk space)",
+            paused,
+        ] {
+            assert!(text.lines().any(|actual| actual == line), "{text}");
+        }
+        assert_eq!(
+            response.data["enrichment"]["index"]["reason"],
+            "disk_reserve"
+        );
+
+        drop(low);
+        let space = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 39, 1 << 40);
+        checkout.build_reserved(false, retry).unwrap();
+        let assert_serving = |snapshot: Value| {
+            for plane in ["search_index", "callgraph_store"] {
+                assert_eq!(snapshot[plane]["status"], "ready", "{plane}");
+            }
+            assert_ne!(snapshot["semantic_index"]["reason"], "disk_reserve");
+        };
+        assert_serving(status());
+        drop(space);
+        let _low = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
+        assert!(matches!(checkout.build(), Err(DataError::DiskFloor(_))));
+        assert_serving(status());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn unreadable_folders_publish_with_health_and_query_gaps_then_rescan_recovers() {
