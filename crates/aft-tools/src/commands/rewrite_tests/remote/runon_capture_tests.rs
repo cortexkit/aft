@@ -203,7 +203,7 @@ async fn runon_capture_does_not_wait_or_warn_after_fallback_spawn_failure() {
     refused.wait_for_requests("exec.run", 1).await;
     // Leave the checkout intact, but make the local spawn fail in its workdir.
     fs::remove_dir(workdir).unwrap();
-    refused.acceptance_gate.notify_one();
+    refused.acceptance_gate().notify_one();
     let failed = terminal(ctx.bash_background(), &local).await;
     assert_eq!(failed.child_pid, None, "{failed:?}");
     assert!(

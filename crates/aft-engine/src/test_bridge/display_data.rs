@@ -8,6 +8,11 @@ pub mod test_config_file {
 
 pub mod meaning_query {
     pub use crate::data_layer::meaning_query::test_support::{serve, Gate};
+    use crate::data_layer::{meaning_query::DataSemantic, runtime::DataCheckout};
+
+    pub fn observe_checkout(checkout: &DataCheckout) -> Option<DataSemantic> {
+        DataSemantic::of_checkout(checkout)
+    }
 }
 
 pub mod reader_floor {

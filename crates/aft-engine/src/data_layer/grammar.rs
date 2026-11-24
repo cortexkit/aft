@@ -50,7 +50,8 @@ pub fn is_grammar_error(error: &AftError) -> bool {
     )
 }
 
-pub(crate) fn downloaded_language(path: &std::path::Path) -> Option<&'static str> {
+#[doc(hidden)]
+pub fn downloaded_language(path: &std::path::Path) -> Option<&'static str> {
     if !cfg!(feature = "wasm-grammars") {
         return None;
     }

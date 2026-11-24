@@ -145,7 +145,7 @@ mod tests {
 
         gate.open();
         wait_for("the fill to finish", || {
-            DataSemantic::of_checkout(&checkout)
+            aft_engine::test_bridge::display_data::meaning_query::observe_checkout(&checkout)
                 .and_then(|data| data.serving().cloned())
                 .filter(|meaning| meaning.complete())
         });

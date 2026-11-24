@@ -44,7 +44,7 @@ mod tests {
             config.indexes.callgraph = true;
             config.indexes.semantic = true;
         });
-        let low = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
+        let low = aft_base::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
         bind_for_test(&ctx);
         let data = ctx.data_checkout().unwrap();
         configure_meaning_without_fill(&data, &ctx.config().semantic);
@@ -96,7 +96,7 @@ mod tests {
         );
 
         drop(low);
-        let space = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 39, 1 << 40);
+        let space = aft_base::disk_floor::set_free_space_for_test(storage.path(), 1 << 39, 1 << 40);
         retry().unwrap();
         let assert_serving = |snapshot: Value| {
             for plane in ["search_index", "callgraph_store"] {
@@ -106,7 +106,7 @@ mod tests {
         };
         assert_serving(status());
         drop(space);
-        let _low = crate::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
+        let _low = aft_base::disk_floor::set_free_space_for_test(storage.path(), 1 << 30, 1 << 40);
         assert!(matches!(checkout.build(), Err(DataError::DiskFloor(_))));
         assert_serving(status());
     }
