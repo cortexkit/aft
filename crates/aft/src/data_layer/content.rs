@@ -1517,14 +1517,17 @@ mod tests {
         // it still has to be reported.
         // A comment sits inside the innermost wrapper so the doc-comment
         // walk traverses the full depth with real comments in range. That
-        // core comment sits at byte ~10,011 of the header: nothing caps a
-        // nix outline signature on the record path (truncate_signature runs
-        // on the symbol-listing paths, not the stored outline), so a splice
-        // regression leaves it verbatim in the stored signature — the first
-        // assertion is the reviewer's literal ask and a real oracle. A
-        // second comment sits right after the outermost paren, so a splice
-        // failing near the header start is caught too, the way the attrset
-        // test above catches it with `# early`.
+        // core comment sits at byte ~10,011 of the header, past the 1024-byte
+        // signature truncation every outline symbol passes through before
+        // storage (extract_symbols_from_tree_with, cloned into the outline
+        // at callgraph.rs:1784-1787), so it cannot answer whether comments
+        // are stripped at depth; a second comment sits right after the
+        // outermost paren, inside the retained prefix, where its presence
+        // would prove the splice failed — the same placement rule the
+        // attrset test above uses with `# early`. The `# c` assertion stays
+        // as a latent guard should the window ever widen; the deep region
+        // itself is oracled where no cap has run yet, in
+        // nix_deep_formal_comment_strips_below_the_window_in_the_parser.
         let source = format!(
             "{{ f = {{ x ? ( # outer\n{} ): x; }}\n",
             nested("(", "# c\n1", ")")
@@ -1562,9 +1565,8 @@ mod tests {
         // complete on the 2 MiB stack. Three oracles, each able to fail:
         // the name proves entry descent completed (with the RED-transplant
         // evidence pinning the overflow this fixture used to cause); the
-        // `# early` comment sits inside the header byte range that is kept
-        // whole in the stored signature (the nix record path applies no
-        // length cap), so a comment-free root signature fails if
+        // `# early` comment sits inside the header window that survives
+        // signature truncation, so a comment-free root signature fails if
         // the splice walk skips header comments; the `# TODO deep` marker
         // harvested from the core proves the marker walk reached the
         // ten-thousand-deep level.
@@ -1573,8 +1575,7 @@ mod tests {
         for layer in 0..NESTING {
             if layer % 2 == 0 {
                 // The outermost attrset carries `# early` inside the header
-                // byte range: kept whole in the stored signature (no length
-                // cap on this path), so a splice
+                // byte range: retained by signature truncation, so a splice
                 // regression leaves `#` in the stored signature.
                 if layer == 0 {
                     nest.push_str("{ # early\n wrap = ");

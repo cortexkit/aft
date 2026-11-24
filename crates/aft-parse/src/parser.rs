@@ -6978,6 +6978,9 @@ const NIX_OUTLINE_DEPTH: usize = 1;
 /// exact portion. The cap bounds retained name bytes, not total record
 /// bytes: per-symbol overhead is uncharged and stays a linear factor of
 /// the file size — what is ruled out is the super-linear name copy.
+/// Stored signature bytes are bounded separately, by the
+/// `MAX_SIGNATURE_BYTES` truncation every outline symbol passes through
+/// in [`extract_symbols_from_tree_with`] before reaching a record.
 const NIX_OUTLINE_NAME_BUDGET: usize = 4 << 20;
 
 /// Read an `attrpath` node as the dotted name written in the source.
@@ -10490,6 +10493,51 @@ mod tests {
                 .iter()
                 .any(|symbol| matches!(symbol.name.as_str(), "a" | "b")),
             "identical names expand neither: {same_name:?}"
+        );
+    }
+
+    #[test]
+    fn nix_deep_formal_comment_strips_below_the_window_in_the_parser() {
+        // The record path truncates every outline signature to
+        // MAX_SIGNATURE_BYTES before storage, so a comment deeper than that
+        // window cannot be observed in a stored record. Call the extractor
+        // directly — splicing runs there, truncation has not run yet — and
+        // nest enough wrappers that the comment sits past 1024 bytes: the
+        // deep header region becomes a live oracle, and the retained
+        // signature must still come back comment-free at full length.
+        let depth = 1200usize;
+        let mut source = String::from("{ f = { x ? (");
+        for _ in 0..depth {
+            source.push_str(" (");
+        }
+        source.push_str(" # deep\n 1");
+        for _ in 0..depth {
+            source.push_str(" )");
+        }
+        source.push_str(" ) }: x; }\n");
+        let mut parser = Parser::new();
+        parser
+            .set_language(&grammar_for(LangId::Nix).unwrap())
+            .expect("nix grammar loads");
+        let tree = parser.parse(&source, None).expect("parse nix source");
+        assert!(!tree.root_node().has_error(), "fixture must parse clean");
+        let symbols = extract_nix_symbols(&source, &tree.root_node()).expect("extract nix");
+        let binding = symbols
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("f survives the nest");
+        let signature = binding
+            .signature
+            .as_deref()
+            .expect("f is a function binding");
+        assert!(
+            signature.len() > MAX_SIGNATURE_BYTES,
+            "the probe comment must sit past the stored window: {}",
+            signature.len()
+        );
+        assert!(
+            !signature.contains('#'),
+            "the deep comment must be spliced before any truncation: {signature}"
         );
     }
 
