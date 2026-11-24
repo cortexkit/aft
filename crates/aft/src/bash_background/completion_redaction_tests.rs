@@ -190,13 +190,17 @@ fn bash_background_ticket_budget_withholds_previews_and_keeps_pointers() {
     assert!(context.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
     let completion = registry.completion_snapshot_for_task(&task).unwrap();
     assert!(completion.output_truncated);
-    assert!(completion
-        .output_preview
-        .starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
-    assert!(completion
-        .output_preview
-        .contains(&task.paths.stdout.display().to_string()));
+    // A completion notice no longer carries a whole over-budget ordinary line:
+    // it keeps a cut fragment within the preview budget, which is small enough
+    // to mask. Either way the ticket must not appear.
+    assert!(
+        completion.output_preview.len() < 1024,
+        "{}",
+        completion.output_preview.len()
+    );
     assert!(!completion.output_preview.contains(TICKET));
+    assert!(!completion.output_preview.contains(&TICKET[..16]));
+    assert!(!completion.output_preview.contains(&TICKET[16..]));
     let mut assembled = output;
     registry.mask_completion_text(&id, &mut assembled);
     assert!(assembled.starts_with(completion_preview::TRUNCATED_PREVIEW_WITHHELD));
