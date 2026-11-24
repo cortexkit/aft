@@ -957,6 +957,29 @@ fn blob_ref_kind(kind: RefKind) -> BlobRefKind {
 mod tests {
     #[test]
     fn grammar_unavailable_survives_the_content_record_boundary() {
+        const CHILD: &str = "AFT_TEST_CONTENT_MISSING_GRAMMAR_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            // A compiled grammar survives changes to the registry's storage
+            // root. Start a fresh harness so another test cannot leave it ready.
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env_remove("AFT_TEST_GRAMMAR_STORAGE")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success()
+                    && String::from_utf8_lossy(&result.stdout).contains("1 passed"),
+                "isolated grammar test did not pass: {}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr),
+            );
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let config = crate::config::Config {
             storage_dir: Some(directory.path().into()),
