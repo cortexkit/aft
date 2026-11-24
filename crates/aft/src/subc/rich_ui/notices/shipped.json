@@ -1,0 +1,82 @@
+{
+  "data_schema": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "type": "string",
+        "enum": [
+          "finished",
+          "still_running",
+          "watch"
+        ]
+      },
+      "task_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      },
+      "exit_code": {
+        "type": "integer"
+      },
+      "command": {
+        "type": "string"
+      },
+      "description": {
+        "type": "string"
+      },
+      "duration_ms": {
+        "type": "integer"
+      },
+      "elapsed_ms": {
+        "type": "integer"
+      },
+      "output_preview": {
+        "type": "string"
+      },
+      "output_cut": {
+        "type": "boolean"
+      },
+      "watch_match": {
+        "type": "string"
+      },
+      "watch_reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "task_id",
+      "status",
+      "command",
+      "output_preview",
+      "output_cut"
+    ],
+    "additionalProperties": false
+  },
+  "template_revision": 1,
+  "template": {
+    "row": {
+      "schema": "occipital.template/1",
+      "profile": "tool_row",
+      "executionDialect": "1.0",
+      "catalog": {
+        "version": "1.1",
+        "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+      },
+      "reads": [],
+      "source": "export const title = input.description ?? input.command\nexport const elapsed = input.elapsed_ms ?? input.duration_ms\nexport const seconds = Floor((elapsed ?? 0) / 1000)\nexport const minutes = Floor(seconds / 60)\nexport const hours = Floor(minutes / 60)\nexport const remainder = minutes - hours * 60\nexport const duration = elapsed == null ? \"\" : \" · \" + (hours > 0 ? Text(hours) + \" h\" + (remainder > 0 ? \" \" + Text(remainder) + \" min\" : \"\") : minutes > 0 ? Text(minutes) + \" min\" : Text(seconds) + \" s\")\nexport const stopped = input.status == \"killed\"\nexport const timedOut = input.status == \"timed_out\"\nexport const finished = input.kind == \"finished\" || input.watch_reason == \"task_exit\"\nexport const failed = finished && (stopped || timedOut || input.status != \"completed\" || (input.exit_code ?? 0) != 0)\nexport const exit = input.exit_code == null ? \"\" : \" · exit \" + Text(input.exit_code)\nexport const stoppedText = stopped ? \"Stopped\" : \"Timed out\"\nexport const result = (stopped || timedOut ? stoppedText : failed ? \"Failed\" + exit : \"Finished\") + duration\nexport const printed = \"Printed “\" + (input.watch_match ?? \"\") + \"”\"\nexport const summary = finished ? result : input.kind == \"still_running\" ? \"Still running\" + duration : printed\n\n<ToolHeader icon=\"terminal\" title={title} failed={failed} />\n\n<ToolText text={summary} tone=\"muted\" maxLines={1} />\n"
+    },
+    "page": {
+      "schema": "occipital.template/1",
+      "profile": "tool_page",
+      "executionDialect": "1.0",
+      "catalog": {
+        "version": "1.1",
+        "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+      },
+      "reads": [],
+      "source": "export const title = input.description ?? input.command\nexport const elapsed = input.elapsed_ms ?? input.duration_ms\nexport const seconds = Floor((elapsed ?? 0) / 1000)\nexport const minutes = Floor(seconds / 60)\nexport const hours = Floor(minutes / 60)\nexport const remainder = minutes - hours * 60\nexport const duration = elapsed == null ? \"\" : \" · \" + (hours > 0 ? Text(hours) + \" h\" + (remainder > 0 ? \" \" + Text(remainder) + \" min\" : \"\") : minutes > 0 ? Text(minutes) + \" min\" : Text(seconds) + \" s\")\nexport const stopped = input.status == \"killed\"\nexport const timedOut = input.status == \"timed_out\"\nexport const finished = input.kind == \"finished\" || input.watch_reason == \"task_exit\"\nexport const failed = finished && (stopped || timedOut || input.status != \"completed\" || (input.exit_code ?? 0) != 0)\nexport const exit = input.exit_code == null ? \"\" : \" · exit \" + Text(input.exit_code)\nexport const stoppedText = stopped ? \"Stopped\" : \"Timed out\"\nexport const result = (stopped || timedOut ? stoppedText : failed ? \"Failed\" + exit : \"Finished\") + duration\nexport const printed = \"Printed “\" + (input.watch_match ?? \"\") + \"”\"\nexport const summary = finished ? result : input.kind == \"still_running\" ? \"Still running\" + duration : printed\n\n<CardHeader title={title} />\n\n<ToolText text=\"Command\" />\n\n<CodeBlock codeString={input.command} />\n\n<ToolText text={finished && !failed && input.exit_code != null ? \"Exit \" + Text(input.exit_code) + duration : summary} tone={failed ? \"danger\" : \"muted\"} />\n\n{input.output_preview == \"\" ? <ToolText text=\"No output was kept.\" tone=\"muted\" /> : <ToolText text={\"Output · \" + Text(Count(Lines(input.output_preview))) + (Count(Lines(input.output_preview)) == 1 ? \" line\" : \" lines\")} />}\n\n{input.output_preview == \"\" ? null : <CodeBlock codeString={input.output_preview} />}\n\n{input.output_cut ? <ToolText text=\"Earlier output isn't shown.\" tone=\"muted\" /> : null}\n\n<OpenItem id={\"shell:\" + input.task_id} label={\"Shell \" + input.task_id} />\n"
+    }
+  }
+}
