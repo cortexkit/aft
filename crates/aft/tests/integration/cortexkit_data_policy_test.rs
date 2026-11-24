@@ -35,7 +35,7 @@ impl Fixture {
             aft,
         };
         let response = fixture.send(json!({
-            "command":"configure", "project_root":project,
+            "command":"configure", "harness":"opencode", "project_root":project,
             "config": user_config(json!({"backup":{"enabled":backups}, "indexes":{"trigram":false}})),
         }));
         assert_eq!(response["success"], true, "{response}");
