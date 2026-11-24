@@ -53,9 +53,6 @@ pub fn recovered_bash_frame(
     frames::recovered_bash_frame(snapshot, key, root, scope)
 }
 
-pub fn record_service(root: &Path) -> std::sync::Arc<crate::gh_shim_speech::service::Service> {
-    crate::gh_shim_speech::service::record_service(root)
-}
 
 pub fn worker_scope(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
     crate::gh_shim_relay::worker_scope(stamp)
@@ -151,17 +148,12 @@ pub fn with_spawn_plan_for_test<T>(plan: sandbox_engine::SpawnPlan, run: impl Fn
     sandbox_engine::with_spawn_plan_for_test(plan, run)
 }
 
-mod sandbox;
 #[cfg(target_os = "linux")]
 pub mod task_scope;
-pub use sandbox::*;
 
 pub use crate::bash_background::buffer::buffer_types::BgBuffer;
 pub use crate::bash_background::persistence::test_faults::{with_task_io_fault, TaskIoFault};
 pub use crate::bash_background::registry::task_types::{BgTask, BgTaskState, TaskRuntime};
-pub mod registry_support {
-    pub use crate::shell_test_fixtures::registry::*;
-}
 pub use crate::bash_background::registry::return_files::return_types::{
     ReturnOutcome, ReturnedPath,
 };
@@ -272,10 +264,6 @@ pub fn snapshots_built(registry: &registry::BgTaskRegistry) -> u64 {
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
-#[cfg(unix)]
-pub mod remote_support {
-    pub use crate::shell_test_fixtures::remote::*;
-}
 
 #[cfg(target_os = "linux")]
 pub mod git_policy_bench_support {
@@ -291,8 +279,6 @@ pub mod secrets_support {
     pub use crate::bash_background::secrets::test_support::*;
 }
 
-mod speech;
-pub use speech::*;
 
 pub fn remote_running(job_id: String) -> background::scoped_tasks::scoped_tasks_types::Remote {
     background::scoped_tasks::remote_running(job_id)
@@ -337,6 +323,3 @@ mod scheduler_ext;
 pub use scheduler_ext::*;
 
 pub use registry::remote::remote_types::{DrainingRetryTestExt, KeyedSubmissionTestExt};
-
-mod fixture_paths;
-pub use fixture_paths::*;
