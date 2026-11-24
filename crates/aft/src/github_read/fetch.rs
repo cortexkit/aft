@@ -930,6 +930,7 @@ mod tests {
         assert!(!document.has_fetch_gap());
         let calls = fetcher.runner.calls.lock().unwrap();
         assert!(calls[2]
+            .1
             .iter()
             .any(|argument| argument == "cursor=cursor-1"));
     }
