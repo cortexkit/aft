@@ -155,6 +155,8 @@ pub fn provider_incarnation() -> &'static str {
     static INCARNATION: std::sync::LazyLock<String> = std::sync::LazyLock::new(new_event_id);
     INCARNATION.as_str()
 }
+// The `acked` column is kept for schema compatibility. A feed ack advances the
+// cursor and deletes rows rather than marking them in the ledger.
 pub(super) const MIGRATION: &str = r#"
 CREATE TABLE IF NOT EXISTS call_ledger (
     carrier TEXT NOT NULL,
@@ -846,7 +848,7 @@ pub fn reduce_expired(conn: &Connection, key: &Key, now: i64) -> rusqlite::Resul
 /// A SQL LIMIT bounds the work before collecting any rows.
 pub fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let mut stmt = tx.prepare("SELECT carrier,call_key,custodian FROM call_ledger WHERE state='Settled' AND (acked=1 OR (settled_at<=?1 AND (owner IS NULL OR json_extract(late_entry,'$.kind')!='expired'))) ORDER BY settled_at,carrier,call_key LIMIT ?2")?;
+    let mut stmt = tx.prepare("SELECT carrier,call_key,custodian FROM call_ledger WHERE state='Settled' AND settled_at<=?1 AND (owner IS NULL OR json_extract(late_entry,'$.kind')!='expired') ORDER BY settled_at,carrier,call_key LIMIT ?2")?;
     let keys = stmt
         .query_map(params![now - RETENTION_MS, SWEEP_BATCH], |r| {
             Ok((
@@ -859,9 +861,8 @@ pub fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
-    let mut delete = tx.prepare(
-        "DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND (acked=1 OR owner IS NULL)",
-    )?;
+    let mut delete =
+        tx.prepare("DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND owner IS NULL")?;
     let mut converted = HashSet::new();
     for (key, custodian) in &keys {
         if delete.execute(params![key.carrier, key.call_key])? == 0 {

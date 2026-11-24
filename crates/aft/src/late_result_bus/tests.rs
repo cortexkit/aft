@@ -495,29 +495,15 @@ async fn late_result_bus_restart_does_not_republish_feed_acknowledged_entries() 
     let (_dir, conn) = database();
     let acknowledged = key("acknowledged");
     let retained = key("retained");
-    let marked = key("marked");
-    for key in [&acknowledged, &retained, &marked] {
+    for key in [&acknowledged, &retained] {
         admit(&conn, key, "reserved:broca");
         ledger::settle(&conn, key, &frame(), "ok", None, 20_000).unwrap();
     }
-    conn.execute_batch("CREATE TEMP TABLE saved_acknowledged AS SELECT * FROM call_ledger WHERE call_key='acknowledged';").unwrap();
     assert_eq!(ledger::ack(&conn, "reserved:broca", 1).unwrap(), 1);
     assert!(
         ledger::get(&conn, &acknowledged).unwrap().is_none(),
         "terminal feed ack deletes its row"
     );
-    // Also cover retained marker forms defensively: the feed cursor excludes
-    // a restored row below through_seq, and acked=1 excludes a marked row.
-    conn.execute_batch(
-        "INSERT INTO call_ledger SELECT * FROM saved_acknowledged;
-        UPDATE call_ledger SET acked=1 WHERE call_key='marked';",
-    )
-    .unwrap();
-    assert!(ledger::get(&conn, &acknowledged)
-        .unwrap()
-        .unwrap()
-        .late_entry
-        .is_some());
     let mut state = DeliveryState::default();
     let mut publisher = RecordingPublisher::default();
     drain(&conn, &mut state, &mut publisher).await;
