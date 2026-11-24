@@ -821,26 +821,7 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
     use subc_protocol::BindIdentity;
     let writer = SENDER.get().expect("display writer started");
     let mut consumer = None;
-    loop {
-        tokio::select! {
-            wake = receiver.recv() => {
-                if wake.is_none() {
-                    count(WriterStopped);
-                    return;
-                }
-            },
-            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {},
-        }
-        let entry = match writer.outbox.lock() {
-            Ok(mut outbox) => outbox.pop_due(Instant::now()),
-            Err(_) => {
-                count(WriterOutboxLock);
-                continue;
-            }
-        };
-        let Some(entry) = entry else {
-            continue;
-        };
+    while let Some(entry) = next_display_entry(&writer.outbox, &mut receiver).await {
         if consumer.is_none() {
             let options = ConsumerOptions {
                 call_timeout: std::time::Duration::from_secs(5),
@@ -963,6 +944,39 @@ async fn send_loop(connection_file: PathBuf, mut receiver: tokio::sync::mpsc::Re
             outbox.reads.push_finished(&entry.record_id, Instant::now());
         } else {
             count(WriterOutboxLock);
+        }
+    }
+}
+
+async fn next_display_entry(
+    outbox: &Mutex<Outbox>,
+    receiver: &mut tokio::sync::mpsc::Receiver<()>,
+) -> Option<outbox::Entry> {
+    loop {
+        let next = match outbox.lock() {
+            Ok(mut outbox) => {
+                if let Some(entry) = outbox.pop_due(tokio::time::Instant::now().into_std()) {
+                    return Some(entry);
+                }
+                outbox.next_wake_at()
+            }
+            Err(_) => {
+                count(WriterOutboxLock);
+                return None;
+            }
+        };
+        // Adding entries to the outbox signals the channel even during the
+        // scan above. One wake is enough to drain all currently due entries.
+        let wake = match next {
+            Some(next) => tokio::select! {
+                wake = receiver.recv() => wake,
+                _ = tokio::time::sleep_until(next.into()) => continue,
+            },
+            None => receiver.recv().await,
+        };
+        if wake.is_none() {
+            count(WriterStopped);
+            return None;
         }
     }
 }
@@ -1305,6 +1319,9 @@ fn read_request(
     Ok(request)
 }
 
+#[cfg(test)]
+#[path = "display/scheduler_tests.rs"]
+mod scheduler_tests;
 #[cfg(test)]
 #[path = "display/tests.rs"]
 mod tests;

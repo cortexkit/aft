@@ -186,6 +186,13 @@ impl Outbox {
         Some(entry)
     }
 
+    pub(super) fn next_wake_at(&self) -> Option<Instant> {
+        self.entries
+            .iter()
+            .map(|entry| entry.next.min(entry.admitted + EXPIRY))
+            .min()
+    }
+
     pub(crate) fn retry(&mut self, mut entry: Entry, now: Instant) {
         entry.attempts += 1;
         if entry.attempts >= 8 || now.duration_since(entry.admitted) >= EXPIRY {
