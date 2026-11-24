@@ -275,6 +275,7 @@ results.push(updateCargoToml(subcPath, version, dryRun));
 results.push(updateCargoPathDep(basePath, "aft-store", version, dryRun));
 results.push(updateCargoPathDep(basePath, "secret-rules", version, dryRun));
 results.push(updateCargoPathDep(dbPath, "aft-base", version, dryRun));
+results.push(updateCargoPathDep(dbPath, "aft-store", version, dryRun));
 results.push(updateCargoPathDep(parsePath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
 for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store"]) {
