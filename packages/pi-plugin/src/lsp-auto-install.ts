@@ -448,7 +448,7 @@ async function ensureServerInstalled(
 
   // The lock MUST be held through install completion, not just through the
   // start decision. Two parallel sessions would otherwise both pass the
-  // "is install needed" check and run `bun add` into the same cache dir
+  // "is install needed" check and run `npm install` into the same cache dir
   // concurrently, corrupting node_modules.
   //
   // We hold the lock for the full install promise via withInstallLock(). The
@@ -557,7 +557,7 @@ async function ensureServerInstalled(
 /**
  * Lazy import to avoid a runtime `require` at module top.
  *
- * Returns the directory `<cache>/<encoded-pkg>/` where `bun add` should
+ * Returns the directory `<cache>/<encoded-pkg>/` where `npm install` should
  * place `node_modules/`.
  */
 function cachedPackageDir(npmPackage: string): string {
@@ -572,7 +572,7 @@ function cachedPackageDir(npmPackage: string): string {
  *
  * TOFU verification for npm-distributed LSP servers.
  * Streams the binary file directly because npm doesn't have a single
- * archive (bun extracts node_modules across many files).
+ * archive (npm extracts node_modules across many files).
  */
 function hashInstalledBinary(spec: NpmServerSpec): Promise<string> {
   const path = installedBinaryPath(spec);

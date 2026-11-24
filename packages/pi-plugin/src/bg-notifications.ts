@@ -116,16 +116,16 @@ type SessionBgState = {
    * Task IDs and exact watch-version keys whose delivery is IN FLIGHT (removed from pendingCompletions /
    * pattern queues, delivery not yet resolved). Ingest skips these so a subc
    * forced drain in the removal→delivery window can't re-accept and double-deliver
-   * an already-departing completion (audit C-#1). Mirrors the OpenCode twin.
+   * an already-departing completion. Mirrors the OpenCode twin.
    */
   deliveringTaskIds: Set<string>;
   /**
    * Acknowledgement target keys DELIVERED to the agent but whose `bash_ack_completions` has not yet
    * confirmed (Rust still holds them and, over subc, re-nudges). Ingest skips them
    * for fresh delivery AND a forced drain RE-ACKs them (the self-terminating close
-   * of the re-nudge loop, C-#3). Removed by DAEMON RECONCILIATION, not a timer:
+   * of the re-nudge loop). Removed by DAEMON RECONCILIATION, not a timer:
    * when a forced drain no longer returns a task as unacknowledged, it is safe to
-   * forget (R2-T3 — a time TTL could evict a still-held task and reopen the
+   * forget (a time TTL could evict a still-held task and reopen the
    * double-deliver). Insertion-ordered for the FIFO OOM backstop cap.
    */
   deliveredAwaitingAckTaskIds: Set<string>;
@@ -251,7 +251,7 @@ export async function markBgCompletionDelivered(
   drainContext: DrainContext,
   taskId: string,
 ): Promise<void> {
-  // C-#1 site 5: an inline bash_watch wait already delivered this task's result.
+  // An inline bash_watch wait already delivered this task's result.
   // Mark it awaiting-ack so a forced drain racing this ack re-acks rather than
   // re-delivering, then confirm/keep on the ack result. (Not via consumedTaskIds —
   // that set is also used pre-delivery by markTaskWaiting.)
@@ -429,7 +429,7 @@ export function ingestBgCompletions(
       queuePendingPatternMatch(state, completionToExitPattern(completion, true));
       continue;
     }
-    // C-#1: skip a task whose delivery is in flight / awaiting ack — a late push
+    // Skip a task whose delivery is in flight / awaiting ack — a late push
     // for an already-departing completion would otherwise re-queue a duplicate.
     if (isDeliveringOrAwaitingAck(state, completion.task_id)) {
       state.outstandingTaskIds.delete(completion.task_id);
@@ -522,9 +522,9 @@ export async function appendToolResultBgCompletions(
   state.retryDelayMs = null;
   state.wakeRetryAttempts = 0;
   state.wakeHardStopped = false;
-  // C-#1 site 4: tool-result piggyback delivery (the reminder is returned below
+  // Tool-result piggyback delivery (the reminder is returned below
   // and cannot fail here), so mark ack-target ids awaiting-ack, then confirm/keep
-  // on the ack result (keep → re-ack on a later forced drain, C-#3).
+  // on the ack result (keep → re-ack on a later forced drain).
   const inTurnAckIds = completionAcks.map(bashAckKey);
   markDeliveredAwaitingAck(state, inTurnAckIds);
   const inTurnAcked = await ackCompletions(drainContext, completionAcks);
@@ -973,7 +973,7 @@ async function drainCompletions(drainContext: DrainContext): Promise<void> {
       count: drainedTaskIds.length,
       task_ids: drainedTaskIds,
     });
-    // C-#3 / R2-T3: reconcile awaiting-ack against the drain snapshot (daemon
+    // Reconcile awaiting-ack against the drain snapshot (daemon
     // truth). A task the drain still returns is held unacked → re-ack (stops the
     // nudges, self-terminating); one it no longer returns was dropped daemon-side
     // → reconcile forgets it. Ingest skips awaiting-ack tasks, so re-ack never
@@ -1166,7 +1166,7 @@ function scheduleWake(
     state.pendingLongRunning = [];
     state.pendingPatternMatches = [];
     const completionAcks = completionAcksForDelivery(pending, pendingPatternMatches);
-    // C-#1 site 1: mark ALL ack-target ids (completions + ack-on-delivery pattern
+    // Mark ALL ack-target ids (completions + ack-on-delivery pattern
     // matches) as delivery-in-flight at the same sync tick they leave the queues,
     // before the sendWake await, so ingest skips them during delivery.
     const ackTargetIds = completionAcks.map(bashAckKey);
@@ -1200,7 +1200,7 @@ function scheduleWake(
           onSendFailure(err, true);
           return;
         }
-        // C-#1 site 3: delivery failed before departing (sendWake rejects only
+        // Delivery failed before departing (sendWake rejects only
         // before the awaiting-ack move). Clear in-flight so re-pended tasks are
         // redeliverable on retry.
         clearDelivering(state, ackTargetIds);
@@ -1289,9 +1289,9 @@ function ingestDrainedBgCompletions(
     // Suppress completions for tasks already consumed inline by a
     // bash_status wait (same dedupe as ingestBgCompletions push path).
     if (state.consumedTaskIds.has(completion.task_id)) continue;
-    // C-#1: a completion mid-delivery or delivered-but-not-yet-acked must NOT be
+    // A completion mid-delivery or delivered-but-not-yet-acked must NOT be
     // re-accepted as a fresh delivery. drainCompletions re-acks the awaiting-ack
-    // ones (C-#3) so the module's re-nudge loop terminates.
+    // ones so the module's re-nudge loop terminates.
     if (isDeliveringOrAwaitingAck(state, completion.task_id)) continue;
     if (
       !state.pendingCompletions.some((pending) => pending.task_id === completion.task_id) &&
@@ -1423,9 +1423,9 @@ function clearAwaitingAck(state: SessionBgState, taskIds: readonly string[]): vo
 }
 
 /**
- * Reconcile the awaiting-ack set against a forced drain's snapshot (R2-T3, daemon
- * is source of truth). A task the drain STILL returns is held unacked → RE-ACK
- * (C-#3 close); a task the drain does NOT return was already dropped daemon-side
+ * Reconcile the awaiting-ack set against a forced drain's snapshot (the daemon
+ * is source of truth). A task the drain STILL returns is held unacked → RE-ACK,
+ * which stops its re-nudges; a task the drain does NOT return was already dropped daemon-side
  * → forget. Returns ids to re-ack; the caller acks then confirms. Replaces a
  * timer eviction that could drop a still-held task and reopen the double-deliver.
  */
