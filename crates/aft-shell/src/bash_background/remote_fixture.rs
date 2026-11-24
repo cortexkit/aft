@@ -445,7 +445,6 @@ pub fn cancel_unknown_terminal() -> TerminalRecord {
     terminal
 }
 
-
 pub fn runon_restart_principal(project: &Path) -> crate::sandbox_spawn::AuthenticatedPrincipal {
     crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind {
         trust: crate::sandbox_spawn::PrincipalTrust::FirstParty,
@@ -474,7 +473,6 @@ pub(super) fn persist_accepted_with_snapshot_cap(
 ) -> (BgTaskRegistry, String, TaskPaths) {
     persist_accepted_with_snapshot_scope(dir, connection, command, memory_limit_mib, false, 86400)
 }
-
 
 pub fn exec_runs(daemon: &crate::exec_remote::wire_fixture::Daemon) -> Vec<serde_json::Value> {
     daemon
@@ -539,7 +537,6 @@ pub fn ensure_git_fixture(root: &Path) {
     }
 }
 
-
 #[cfg(unix)]
 pub fn add_git_worktree(repository: &Path, path: &Path, branch: &str) {
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -580,7 +577,6 @@ pub fn runner_cancels(daemon: &crate::exec_remote::wire_fixture::Daemon) -> usiz
 pub fn plugin_transport_deadline(timeout_ms: u64) -> Duration {
     Duration::from_millis(timeout_ms + 10_000)
 }
-
 
 pub fn shorten_draining_budget(root: &Path, ms: u64) {
     draining_budgets().lock().unwrap().insert(root.into(), ms);
@@ -1077,7 +1073,6 @@ pub(super) fn held<T>(lock: &Mutex<T>) -> bool {
     matches!(lock.try_lock(), Err(std::sync::TryLockError::WouldBlock))
 }
 
-
 /// Shorten the time a job submitted under `root` has for the runner to admit
 /// it, which bounds how long AFT keeps resubmitting after hinted refusals.
 pub fn shorten_hinted_retry_budget(root: &Path, ms: u64) {
@@ -1172,8 +1167,7 @@ pub fn seed_large_local_return_output(root: &Path) {
         .unwrap();
 }
 
-
-pub(super) fn finished_remote_for_cancel(
+pub fn finished_remote_for_cancel(
     dir: &Path,
     connection: PathBuf,
     record: TerminalRecord,
@@ -1203,7 +1197,6 @@ pub fn cancel_requests(
         .map(|(_, body)| body.clone())
         .collect()
 }
-
 
 pub(super) fn persist_accepted_with_snapshot_scope(
     dir: &Path,
@@ -1345,4 +1338,55 @@ impl UncapturedTerminalBeforeRenderForTest {
     pub fn task(&self) -> &Arc<BgTask> {
         &self.task
     }
+}
+
+pub async fn runon_restart_accept_fixture(
+    registry: &BgTaskRegistry,
+    project: PathBuf,
+    storage: PathBuf,
+    connection: PathBuf,
+) -> String {
+    let mut launch = launch(connection);
+    launch.explicit_runon = true;
+    launch.harness = "runner".into();
+    let task_id = super::super::with_scope_spawn(Some(owner_scope("restart-worker")), || {
+        registry
+            .spawn_remote(
+                launch,
+                SpawnPlan::Unsandboxed,
+                "printf remote-restart-proof",
+                resolve_posix_shell(),
+                "session".into(),
+                project.clone(),
+                HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
+                storage,
+                crate::bash_background::TaskSlot::Background { max: 10 },
+                true,
+                false,
+                Some(project.clone()),
+            )
+            .unwrap()
+    });
+    wait_for(
+        "the remote job must be accepted and started before drain",
+        || {
+            let task = registry.task(&task_id).unwrap();
+            let state = task.state.lock().unwrap();
+            state.metadata.remote.as_ref().and_then(|remote| {
+                (remote.accepted
+                    && remote.started.is_some()
+                    && remote.last_seq == Some(0)
+                    && remote.submission.is_some())
+                .then_some(())
+            })
+        },
+    )
+    .await;
+    // Module drain detaches, not cancels, accepted jobs. Exiting this child
+    // also removes its worker threads and in-memory task ownership, so the
+    // replacement must recover from disk rather than share the old task.
+    registry.detach();
+    task_id
 }

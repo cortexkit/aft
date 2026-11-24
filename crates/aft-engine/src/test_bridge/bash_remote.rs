@@ -160,7 +160,7 @@ pub use crate::bash_background::buffer::buffer_types::BgBuffer;
 pub use crate::bash_background::persistence::test_faults::{with_task_io_fault, TaskIoFault};
 pub use crate::bash_background::registry::task_types::{BgTask, BgTaskState, TaskRuntime};
 pub mod registry_support {
-    pub use crate::bash_background::registry::test_support::*;
+    pub use crate::shell_test_fixtures::registry::*;
 }
 pub use crate::bash_background::registry::return_files::return_types::{
     ReturnOutcome, ReturnedPath,
@@ -274,7 +274,7 @@ pub fn snapshots_built(registry: &registry::BgTaskRegistry) -> u64 {
 
 #[cfg(unix)]
 pub mod remote_support {
-    pub use crate::bash_background::registry::remote::{fixture::*, seams::*};
+    pub use crate::shell_test_fixtures::remote::*;
 }
 
 #[cfg(target_os = "linux")]

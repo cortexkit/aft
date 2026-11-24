@@ -92,7 +92,8 @@ pub(crate) fn seal_spawn(task: &PersistedTask) {
     ticket::seal_spawn(&spawn_metadata(task));
 }
 
-pub(crate) fn decode_cold_task(row: &str) -> Option<ColdTaskMetadata> {
+#[doc(hidden)]
+pub fn decode_cold_task(row: &str) -> Option<ColdTaskMetadata> {
     let task: PersistedTask = serde_json::from_str(row).ok()?;
     Some(ColdTaskMetadata {
         spawn: spawn_metadata(&task),

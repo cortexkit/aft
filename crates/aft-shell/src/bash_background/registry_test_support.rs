@@ -3,10 +3,19 @@ use crate::bash_background::persistence::{task_paths, write_task};
 use std::io::Write;
 
 #[cfg(unix)]
+pub mod remote {
+    pub use super::super::remote::{fixture::*, seams::*};
+}
+
+#[doc(hidden)]
+pub fn task_count(registry: &BgTaskRegistry) -> usize {
+    registry.inner.tasks.lock().unwrap().len()
+}
+
+#[cfg(unix)]
 pub(super) const LONG_RUNNING_COMMAND: &str = "sleep 5";
 #[cfg(windows)]
 pub(super) const LONG_RUNNING_COMMAND: &str = "ping -n 6 127.0.0.1";
-
 
 pub fn register_unpersisted_watch(
     registry: &BgTaskRegistry,
@@ -188,7 +197,7 @@ pub fn registry_with_db_and_frames(
 ) {
     let frames = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&frames);
-    let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+    let sender: aft_base::progress_sender::ProgressSender = Arc::new(Box::new(move |frame| {
         captured.lock().unwrap().push(frame);
     })
         as Box<dyn Fn(PushFrame) + Send + Sync>);
@@ -280,7 +289,6 @@ pub fn append_each_line_output(path: &Path, bytes: &[u8]) {
         .unwrap();
 }
 
-
 pub fn terminal_task(
     registry: &BgTaskRegistry,
     fixture: &tempfile::TempDir,
@@ -331,4 +339,76 @@ impl Drop for TaskStateLockBanForTest {
     fn drop(&mut self) {
         TASK_STATE_LOCKS_FORBIDDEN.with(|flag| flag.set(self.previous));
     }
+}
+
+#[doc(hidden)]
+pub fn create_wait_fixture(
+    root: &std::path::Path,
+    registry: &BgTaskRegistry,
+    explicit_timeout: Option<u64>,
+) -> Arc<BgTask> {
+    let task_id = "bash-0000000000000001";
+    let session_id = "head-session";
+    let paths = task_paths(root, session_id, task_id).unwrap();
+    std::fs::create_dir_all(&paths.dir).unwrap();
+    let mut metadata = PersistedTask::starting(
+        task_id.into(),
+        session_id.into(),
+        "fake running command".into(),
+        root.to_path_buf(),
+        Some(root.to_path_buf()),
+        Some(explicit_timeout.unwrap_or(1_800_000)),
+        false,
+        false,
+    );
+    metadata.default_hard_kill = explicit_timeout.is_none();
+    metadata.started_at = unix_millis().saturating_sub(1_900);
+    // Insert a terminal fixture so replay does not renew its hard-kill timeout,
+    // then make it running. Its backdated start exercises renewal without sleeping or
+    // spawning a process; no watchdog runs in this fixture.
+    metadata.mark_terminal(BgTaskStatus::Completed, Some(0), None);
+    write_task(&paths.json, &metadata).unwrap();
+    registry
+        .insert_rehydrated_task(metadata, paths, false)
+        .unwrap();
+    let task = registry.task_for_session(task_id, session_id).unwrap();
+    assert!(task.started.elapsed() >= Duration::from_millis(1_900));
+    assert_eq!(task.hard_kill_renewable, explicit_timeout.is_none());
+    {
+        let mut state = task.state.lock().unwrap();
+        state.metadata.status = BgTaskStatus::Running;
+        state.metadata.finished_at = None;
+        state.metadata.exit_code = None;
+        state.metadata.duration_ms = None;
+        write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+    task
+}
+
+#[doc(hidden)]
+pub fn mark_fixture_terminal(task: &BgTask) {
+    {
+        let mut state = task.state.lock().unwrap();
+        state
+            .metadata
+            .mark_terminal(BgTaskStatus::Completed, Some(0), None);
+        state.metadata.compressed = true;
+        state.terminal_output_cache = None;
+        write_task(&task.paths.json, &state.metadata).unwrap();
+    }
+    std::fs::write(&task.paths.stdout, "identical output\n").unwrap();
+    std::fs::write(&task.paths.stderr, "").unwrap();
+}
+
+#[cfg(test)]
+pub(super) fn terminal_fixture() -> (tempfile::TempDir, BgTaskRegistry, Arc<BgTask>) {
+    let dir = tempfile::tempdir().unwrap();
+    let registry = BgTaskRegistry::default();
+    let task = create_wait_fixture(dir.path(), &registry, None);
+    assert_eq!(
+        crate::config::Config::default().bash.worker_wait_max_ms,
+        1_800_000
+    );
+    mark_fixture_terminal(&task);
+    (dir, registry, task)
 }

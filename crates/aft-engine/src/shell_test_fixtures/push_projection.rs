@@ -1,9 +1,14 @@
 //! Shared populated context for push-projection regressions; no real LSP tools are required.
-use super::*;
-use crate::bash_background::persistence::{task_paths, write_task};
+use crate::bash_background::{
+    persistence::{task_paths, write_task, PersistedTask},
+    BgTaskStatus,
+};
 use crate::context::{App, AppContext};
 use aft_inspect::inspect::compatibility_test::InspectManagerTest as _;
-use std::sync::{MutexGuard, OnceLock};
+use std::{
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard, OnceLock},
+};
 
 pub struct BusyRoot {
     pub(crate) ctx: Arc<AppContext>,
@@ -104,7 +109,10 @@ fn build() -> BusyRoot {
         contexts.push(other);
     }
     app.publish_lifecycle_census(crate::lifecycle_census::collect(&app, &contexts));
-    assert_eq!(ctx.bash_background().inner.tasks.lock().unwrap().len(), 256);
+    assert_eq!(
+        aft_shell::bash_background::registry::test_support::task_count(ctx.bash_background()),
+        256
+    );
     assert_eq!(ctx.lsp_server_count(), 5);
     BusyRoot {
         ctx,

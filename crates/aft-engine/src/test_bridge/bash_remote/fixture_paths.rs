@@ -129,7 +129,7 @@ pub mod bash_background {
 
     #[cfg(unix)]
     pub mod push_projection_fixture {
-        pub use crate::bash_background::registry::push_projection_fixture::{busy_root, BusyRoot};
+        pub use crate::shell_test_fixtures::push_projection::{busy_root, BusyRoot};
     }
 
     pub mod frames {

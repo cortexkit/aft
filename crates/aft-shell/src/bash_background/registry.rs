@@ -18425,7 +18425,8 @@ mod task_scope_tests;
 mod completion_replay_ordering_tests;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "registry_test_support.rs"]
-pub(crate) mod test_support;
+#[doc(hidden)]
+pub mod test_support;
 
 #[cfg(all(test, unix))]
 #[path = "kill_survivor_tests.rs"]
@@ -31108,16 +31109,14 @@ mod a02_tests {
     use super::test_support::terminal_fixture;
     #[test]
     fn pty_display_counts_one_stream_and_uses_the_pty_detail_field() {
-        let (_dir, ctx, task) = terminal_fixture();
+        let (_dir, registry, task) = terminal_fixture();
         let mut metadata = task.state.lock().unwrap().metadata.clone();
         metadata.mode = BgMode::Pty;
         metadata.completion_has_env_secrets = Some(false);
         metadata.completion_has_non_ticket_env_secrets = Some(false);
         std::fs::write(&task.paths.pty, "ok\n").unwrap();
         let buffer = BgBuffer::registered(&task.paths, BgMode::Pty);
-        let bodies = ctx
-            .bash_background()
-            .display_bodies(&task, &metadata, &buffer);
+        let bodies = registry.display_bodies(&task, &metadata, &buffer);
         assert_eq!(bodies.facts["outputBytes"], 3);
         assert_eq!(bodies.detail["pty"], "ok\n");
         assert!(bodies.detail.get("stdout").is_none());
@@ -31126,7 +31125,7 @@ mod a02_tests {
 
     #[test]
     fn remote_refusal_display_uses_the_proven_code_without_inventing_an_exit() {
-        let (_dir, ctx, task) = terminal_fixture();
+        let (_dir, registry, task) = terminal_fixture();
         let mut metadata = task.state.lock().unwrap().metadata.clone();
         metadata.status = BgTaskStatus::Failed;
         metadata.exit_code = None;
@@ -31137,10 +31136,7 @@ mod a02_tests {
             "pre_start_refusal":{"code":"runon_cd_outside_checkout","message":"private external path","ran":"none"}
         })).unwrap());
         let buffer = task.state.lock().unwrap().buffer.clone();
-        let record = ctx
-            .bash_background()
-            .display_bodies(&task, &metadata, &buffer)
-            .facts;
+        let record = registry.display_bodies(&task, &metadata, &buffer).facts;
         assert_eq!(record["outcome"], "error");
         assert_eq!(record["reason"], "runon_cd_outside_checkout");
         assert!(record.get("exitCode").is_none());
@@ -31178,10 +31174,9 @@ mod a02_tests {
                 ("unknown | cat", Some(0), true, 2),
                 ("unknown", Some(1), false, 2),
             ] {
-                let (_dir, ctx, task) = terminal_fixture();
+                let (_dir, registry, task) = terminal_fixture();
                 std::fs::write(&task.paths.stdout, vec![b'x'; size]).unwrap();
-                let registry = ctx.bash_background();
-                install_hint(registry, &task, command, enabled);
+                install_hint(&registry, &task, command, enabled);
                 let (mut metadata, buffer) = {
                     let state = task.state.lock().unwrap();
                     (state.metadata.clone(), state.buffer.clone())
@@ -31215,10 +31210,9 @@ mod a02_tests {
     fn a02_render_shares_the_hint_input_bytes() {
         use crate::bash_background::persistence::work_counts;
         for size in [0, 1024 * 1024, 10 * 1024 * 1024] {
-            let (_dir, ctx, task) = terminal_fixture();
+            let (_dir, registry, task) = terminal_fixture();
             std::fs::write(&task.paths.stdout, vec![b'x'; size]).unwrap();
-            let registry = ctx.bash_background();
-            install_hint(registry, &task, "unknown", true);
+            install_hint(&registry, &task, "unknown", true);
             let (mut metadata, buffer) = {
                 let state = task.state.lock().unwrap();
                 (state.metadata.clone(), state.buffer.clone())
@@ -31243,8 +31237,8 @@ mod a02_tests {
 
     #[test]
     fn a02_terminal_cache_fill_is_single_flight() {
-        let (_dir, ctx, task) = terminal_fixture();
-        let registry = ctx.bash_background().clone();
+        let (_dir, registry, task) = terminal_fixture();
+        let registry = registry.clone();
         let renders = Arc::new(AtomicU64::new(0));
         let counter = renders.clone();
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
@@ -31324,8 +31318,8 @@ mod a02_tests {
 
     #[test]
     fn a02_failed_fill_retries_and_callback_can_reconfigure() {
-        let (_dir, ctx, task) = terminal_fixture();
-        let registry = ctx.bash_background().clone();
+        let (_dir, registry, task) = terminal_fixture();
+        let registry = registry.clone();
         registry.set_compressor(|_, _| panic!("injected render failure"));
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
             || registry.ensure_terminal_output_cache(&task)
@@ -31356,8 +31350,7 @@ mod a02_tests {
     #[test]
     fn a02_pty_repeat_and_absent_hint_jobs_do_no_artifact_work() {
         use crate::bash_background::persistence::work_counts;
-        let (_dir, ctx, task) = terminal_fixture();
-        let registry = ctx.bash_background();
+        let (_dir, registry, task) = terminal_fixture();
         let (mut metadata, buffer) = {
             let state = task.state.lock().unwrap();
             (state.metadata.clone(), state.buffer.clone())
@@ -31371,7 +31364,7 @@ mod a02_tests {
         metadata.exit_code = Some(1);
         fs::write(&task.paths.pty, "no such table: missing\n").unwrap();
         let pty = BgBuffer::registered(&task.paths, BgMode::Pty);
-        install_hint(registry, &task, "unknown", true);
+        install_hint(&registry, &task, "unknown", true);
         registry.finish_db_hint(&metadata, &pty);
         work_counts::reset();
         registry.finish_db_hint(&metadata, &pty);
@@ -31379,7 +31372,3 @@ mod a02_tests {
         assert_eq!(work_counts::get().artifact_bytes, 0);
     }
 }
-
-#[cfg(all(unix, any(test, feature = "test-support")))]
-#[path = "push_projection_fixture.rs"]
-pub(crate) mod push_projection_fixture;

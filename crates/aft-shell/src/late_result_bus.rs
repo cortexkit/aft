@@ -331,9 +331,10 @@ async fn drive(
         if scan_pending && capacity > 0 {
             let database = database.clone();
             let position = state.position.clone();
-            let batch =
-                tokio::task::spawn_blocking(move || scan(database.as_ref(), &position, capacity))
-                    .await;
+            let batch = tokio::task::spawn_blocking(move || {
+                scan_ledger(database.as_ref(), &position, capacity)
+            })
+            .await;
             match batch {
                 Ok(Ok(batch)) => {
                     scan_pending = state.deliver(&mut publisher, batch).await;
@@ -454,7 +455,7 @@ fn notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Notice>> {
     }))
 }
 
-fn scan(
+fn scan_ledger(
     database: &dyn LedgerDatabase,
     position: &Position,
     capacity: usize,
@@ -467,7 +468,7 @@ fn scan(
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub fn scan_from_start_for_test(database: &dyn LedgerDatabase) -> Result<usize, &'static str> {
-    scan(database, &Position::default(), SCAN_BATCH).map(|batch| batch.visited)
+    scan_ledger(database, &Position::default(), SCAN_BATCH).map(|batch| batch.visited)
 }
 
 fn read_batch(conn: &Connection, position: &Position, capacity: usize) -> rusqlite::Result<Batch> {

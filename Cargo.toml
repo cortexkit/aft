@@ -37,7 +37,7 @@ rust-version = "1.92"
 [workspace.metadata.motor]
 warm-commands = [
   "cargo nextest run --no-run --workspace --features wasm-grammars,test-hooks",
-  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-github -p aft-index -p aft-inspect -p aft-tools -p aft-subc --tests --features test-hooks",
+  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-github -p aft-index -p aft-inspect -p aft-shell -p aft-tools -p aft-subc --tests --features test-hooks",
 ]
 
 [profile.release]

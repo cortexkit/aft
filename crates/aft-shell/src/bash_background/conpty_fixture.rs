@@ -72,7 +72,7 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured_frames = frames.clone();
-        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+        let sender: aft_base::progress_sender::ProgressSender = Arc::new(Box::new(move |frame| {
             captured_frames
                 .lock()
                 .unwrap()

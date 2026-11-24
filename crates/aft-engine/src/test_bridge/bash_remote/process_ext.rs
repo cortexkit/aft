@@ -766,7 +766,7 @@ pub trait BusyRootTestExt {
 }
 
 #[cfg(unix)]
-impl BusyRootTestExt for crate::bash_background::registry::push_projection_fixture::BusyRoot {
+impl BusyRootTestExt for crate::shell_test_fixtures::push_projection::BusyRoot {
     fn ctx(&self) -> &Arc<crate::context::AppContext> {
         &self.ctx
     }

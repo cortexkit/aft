@@ -69,6 +69,9 @@ tokio-util = { version = "0.7", features = ["io"] }
 toml = { version = "0.8", default-features = false, features = ["parse"] }
 tree-sitter = "=0.26.7"
 tree-sitter-bash = "0.25"
+tree-sitter-javascript = "0.25"
+tree-sitter-python = "0.25"
+url = "2"
 which = "7"
 zeroize = "1"
 

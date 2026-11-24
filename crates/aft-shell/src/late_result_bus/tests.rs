@@ -128,7 +128,7 @@ async fn drain(
         if capacity == 0 {
             break;
         }
-        let batch = scan(conn, &state.position, capacity).unwrap();
+        let batch = scan_ledger(conn, &state.position, capacity).unwrap();
         visited += batch.visited;
         if !state.deliver(publisher, batch).await {
             break;
