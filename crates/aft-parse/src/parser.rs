@@ -20,6 +20,7 @@ use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 mod file_language;
 pub use file_language::dynamic_language_for_extension;
 mod grammar_selection;
+mod navigation_symbols;
 pub use grammar_selection::grammar_for;
 pub mod dead_code_facts;
 pub mod outline_facts;
@@ -2066,7 +2067,7 @@ impl FileParser {
             {
                 cached.symbols
             }
-            _ => Arc::new(extract_symbols_from_tree(
+            _ => Arc::new(navigation_symbols::extract(
                 &parsed.source,
                 &parsed.tree,
                 parsed.lang,
@@ -2406,13 +2407,7 @@ impl FileParser {
                 // same file a second time.
                 let (tree, lang) =
                     self.parse_with_source(path, &source, current_mtime, size, content_hash)?;
-                let mut symbols = extract_symbols_from_tree(&source, tree, lang)?;
-                if lang == LangId::Rust {
-                    complete_rust_trait_members(
-                        &mut symbols,
-                        crate::callgraph::rust_trait_members(&source, tree.root_node(), Direct),
-                    );
-                }
+                let symbols = navigation_symbols::extract(&source, tree, lang)?;
                 (
                     Arc::new(symbols),
                     (lang == LangId::Rust)

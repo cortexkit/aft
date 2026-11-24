@@ -51,6 +51,36 @@ use tree_sitter::{Language, Node, Query, QueryCursor, Tree};
 // helpers only they use read as dead in release-profile test builds.
 #[cfg_attr(not(debug_assertions), allow(dead_code))]
 mod tests {
+    #[test]
+    fn audit_resolution_snapshot_cache_keeps_trait_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        std::fs::write(
+            &path,
+            "trait Greeter { fn greet(&self); fn wave(&self) {} }",
+        )
+        .unwrap();
+        let mut outline = FileParser::new();
+        let parsed = outline.parse_snapshot(&path).unwrap();
+        let first = outline
+            .extract_symbols_from_snapshot(&path, &parsed)
+            .unwrap();
+        let mut navigation = FileParser::with_symbol_cache(outline.symbol_cache.clone());
+        let second = navigation.extract_symbols(&path).unwrap();
+        for symbols in [&*first, &second[..]] {
+            for name in ["greet", "wave"] {
+                assert!(
+                    symbols.iter().any(|symbol| {
+                        symbol.name == name
+                            && symbol.kind == SymbolKind::Method
+                            && symbol.parent.as_deref() == Some("Greeter")
+                    }),
+                    "missing Greeter::{name} from {symbols:?}"
+                );
+            }
+        }
+    }
+
     /// The reason a too deeply nested Markdown file is not parsed reaches
     /// the coding agents that call AFT's tools, in the error for that file.
     /// Its wording is a reviewed interface, so it is pinned here, and it
