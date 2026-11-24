@@ -2,6 +2,27 @@
 
 use super::*;
 
+/// Queue ignore-rule discovery for a rebind whose previous configure never
+/// published a matcher. The backend picks up the new matcher generation
+/// without waiting on a filesystem walk in the frame loop.
+pub(super) fn submit_ignore_rule_load(executor: &Executor, root_id: &ProjectRootId) {
+    let request_id = format!(
+        "subc-ignore-rule-load-{}",
+        root_id.as_path().to_string_lossy()
+    );
+    let response_id = request_id.clone();
+    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
+        let published = crate::commands::configure::load_ignore_rules_if_unpublished(ctx);
+        Response::success(response_id, json!({ "published": published }))
+    });
+    drop(executor.submit_maintenance_async(
+        root_id.clone(),
+        Lane::MaintenanceCommit,
+        request_id,
+        job,
+    ));
+}
+
 #[cfg(test)]
 mod tests;
 

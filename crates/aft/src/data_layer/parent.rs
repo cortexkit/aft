@@ -77,7 +77,7 @@ impl ChildCheckouts {
 
     /// The child checkouts bound so far. Waits for a bind in progress, as
     /// the root's own checkout does.
-    fn bound(&self) -> Vec<Arc<DataCheckout>> {
+    pub(crate) fn bound(&self) -> Vec<Arc<DataCheckout>> {
         let slots = self
             .inner
             .lock()

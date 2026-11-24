@@ -353,8 +353,7 @@ fn external_ignore_watch_paths(ctx: &AppContext, root_path: &Path) -> Vec<PathBu
 /// Nothing then ever builds the matcher, and the backend keeps the only plan
 /// it can make without one: `.git` alone.
 ///
-/// `ensure_project_watcher` runs on the subc frame loop, which must never walk
-/// a project tree, so it does not call this. Its callers queue this as a
+/// The subc bind loop must never walk a project tree. It queues this as a
 /// maintenance job on the root's actor instead (see
 /// `ignore_rules_load_pending`); publishing the matcher bumps the generation
 /// and the running backend re-derives from it.
@@ -383,9 +382,10 @@ pub(crate) fn load_ignore_rules_if_unpublished(ctx: &AppContext) -> bool {
 /// never loaded, so the caller must queue [`load_ignore_rules_if_unpublished`]
 /// off its own thread.
 pub(crate) fn ignore_rules_load_pending(ctx: &AppContext) -> bool {
-    ctx.watcher_runtime_active() && !ctx.gitignore_published()
+    (ctx.watcher_runtime_active() || ctx.watcher_gap_pending()) && !ctx.gitignore_published()
 }
 
+#[cfg(test)]
 fn start_project_watcher_with<W, E, F>(
     ctx: &AppContext,
     root_path: &Path,
@@ -403,6 +403,7 @@ fn start_project_watcher_with<W, E, F>(
     });
 }
 
+#[cfg(test)]
 fn start_project_watcher_with_spawn<W, E, F, S>(
     ctx: &AppContext,
     root_path: &Path,
@@ -413,6 +414,106 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
     F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
+        + Send
+        + 'static,
+    S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
+{
+    if let Some(prepared) =
+        prepare_project_watcher_runtime(ctx, root_path, extra_watch_paths, attach, spawn, false)
+    {
+        prepared.publish(ctx);
+    }
+}
+
+struct PreparedWatcher {
+    dispatch: crossbeam_channel::Receiver<watcher_filter::WatcherDispatchEvent>,
+    runtime: WatcherThreadHandle,
+    thread_id: thread::ThreadId,
+    sees_config: Option<bool>,
+}
+
+#[cfg(test)]
+#[test]
+fn watcher_preparation_does_not_hold_admission_or_publish_into_a_closed_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = AppContext::new(
+        Box::new(crate::parser::TreeSitterProvider::new()),
+        Config {
+            project_root: Some(root.path().to_path_buf()),
+            storage_dir: Some(root.path().join("state")),
+            ..Config::default()
+        },
+    );
+    ctx.set_canonical_cache_root(root.path().to_path_buf());
+    ctx.mark_subc_bound();
+    let generation = ctx.configure_generation();
+    std::thread::scope(|scope| {
+        let (entered, wait) = mpsc::channel();
+        let (ready, release) = mpsc::channel();
+        let ctx = &ctx;
+        let path = root.path();
+        let restore = scope.spawn(move || {
+            let prepared = prepare_project_watcher_runtime(
+                ctx,
+                path,
+                Vec::new(),
+                move |_, _, tx| {
+                    entered.send(()).unwrap();
+                    release.recv().unwrap();
+                    Ok::<_, &'static str>(tx)
+                },
+                |builder, job| builder.spawn(job),
+                true,
+            )
+            .unwrap();
+            prepared.publish_if_current(ctx, generation, 0, true)
+        });
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+        ctx.mark_subc_unbound();
+        ready.send(()).unwrap();
+        assert_eq!(restore.join().unwrap(), None);
+        assert!(!ctx.watcher_runtime_active());
+    });
+}
+
+impl PreparedWatcher {
+    fn publish(self, ctx: &AppContext) {
+        if let Some(sees_config) = self.sees_config {
+            ctx.config_live()
+                .set_project_watcher_sees_config(sees_config);
+        }
+        ctx.install_watcher_runtime_with_thread_id(self.dispatch, self.runtime, self.thread_id);
+    }
+
+    fn publish_if_current(
+        self,
+        ctx: &AppContext,
+        generation: u64,
+        gap_epoch: u64,
+        replace: bool,
+    ) -> Option<bool> {
+        ctx.run_if_subc_bound_generation(generation, || {
+            if ctx.watcher_gap_epoch() != gap_epoch || (!replace && ctx.watcher_runtime_active()) {
+                return false;
+            }
+            self.publish(ctx);
+            true
+        })
+    }
+}
+
+fn prepare_project_watcher_runtime<W, E, F, S>(
+    ctx: &AppContext,
+    root_path: &Path,
+    extra_watch_paths: Vec<PathBuf>,
+    attach: F,
+    spawn: S,
+    await_backend: bool,
+) -> Option<PreparedWatcher>
+where
+    W: Send + 'static,
+    E: std::fmt::Display + Send + 'static,
+    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
         + Send
         + 'static,
     S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
@@ -434,7 +535,7 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
     let shared_gitignore = ctx.shared_gitignore();
     let gitignore_generation = ctx.gitignore_generation();
     let session_id_for_bg = log_ctx::current_session();
-    let sync_start = file_watcher_sync_start_for_test();
+    let sync_start = await_backend || file_watcher_sync_start_for_test();
     let (start_tx, start_rx) = mpsc::channel::<Result<(), String>>();
     let start_tx = sync_start.then_some(start_tx);
 
@@ -475,26 +576,35 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
             slog_warn!(
                 "watcher filter thread could not start for generation {generation}: {error}"
             );
-            return;
+            return None;
         }
     };
 
-    let watcher_thread_id = join.thread().id();
-    ctx.install_watcher_runtime_with_thread_id(
-        dispatch_rx,
-        WatcherThreadHandle::new(shutdown, join),
-        watcher_thread_id,
-    );
-
+    let prepared = PreparedWatcher {
+        dispatch: dispatch_rx,
+        thread_id: join.thread().id(),
+        runtime: WatcherThreadHandle::new(shutdown, join),
+        sees_config: None,
+    };
     if sync_start {
-        match start_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => slog_warn!("{error}"),
-            Err(error) => slog_warn!(
-                "timed out waiting for watcher startup for generation {generation}: {error}"
-            ),
+        let ready = match start_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Ok(())) => true,
+            Ok(Err(error)) => {
+                slog_warn!("{error}");
+                false
+            }
+            Err(error) => {
+                slog_warn!(
+                    "timed out waiting for watcher startup for generation {generation}: {error}"
+                );
+                false
+            }
+        };
+        if await_backend && !ready {
+            return None;
         }
     }
+    Some(prepared)
 }
 
 #[cfg(test)]
@@ -534,9 +644,13 @@ fn file_watcher_disabled_for_test() -> bool {
     std::env::var("AFT_TEST_DISABLE_FILE_WATCHER").is_ok_and(|value| value == "1")
 }
 
-fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
+fn prepare_project_watcher(
+    ctx: &AppContext,
+    root_path: &Path,
+    await_backend: bool,
+) -> Option<PreparedWatcher> {
     if ctx.root_too_broad() || file_watcher_disabled_for_test() {
-        return;
+        return None;
     }
     let mut extra_watch_paths = external_ignore_watch_paths(ctx, root_path);
     // Watch `<root>/.cortexkit/` directly as well, so an edit to the project
@@ -548,11 +662,9 @@ fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
     if sees_config {
         extra_watch_paths.push(config_dir);
     }
-    ctx.config_live()
-        .set_project_watcher_sees_config(sees_config);
     let matcher = ctx.shared_gitignore();
     let matcher_generation = ctx.gitignore_generation();
-    start_project_watcher_with(
+    let mut prepared = prepare_project_watcher_runtime(
         ctx,
         root_path,
         extra_watch_paths,
@@ -565,44 +677,75 @@ fn start_project_watcher(ctx: &AppContext, root_path: &Path) {
                 matcher_generation,
             )
         },
-    );
+        |builder, job| builder.spawn(job),
+        await_backend,
+    )?;
+    prepared.sees_config = Some(sees_config);
+    Some(prepared)
 }
 
-fn install_project_watcher(ctx: &AppContext, root_path: &Path) {
-    ctx.stop_watcher_runtime();
-    start_project_watcher(ctx, root_path);
-}
-
-/// Restore the watcher after an idle root released its runtime. Artifact stores
-/// are lazy by design, so the first request is the natural point to reattach
-/// external-change invalidation as well.
-#[doc(hidden)]
-pub fn ensure_project_watcher(ctx: &AppContext) {
+fn begin_watcher_restore(ctx: &AppContext) -> Option<(u64, u64)> {
     if ctx.root_too_broad() || ctx.subc_unbound_quiesced() {
         ctx.stop_watcher_runtime();
-        return;
+        return None;
     }
-    if ctx.watcher_runtime_active() {
-        return;
+    if ctx.watcher_runtime_active() || file_watcher_disabled_for_test() {
+        return None;
     }
-    // A dead-but-installed runtime means the watcher failed while drains were
-    // suppressed (unbound root): events since the failure are lost, so the
-    // retained warm state must not be trusted. Clean up the corpse and apply
-    // the same gap invalidation a deliberate watcher stop applies. Roots
-    // whose watcher was stopped deliberately (idle eviction, root deletion)
-    // have no installed handle here and were already invalidated at the stop.
     if ctx.take_finished_watcher_runtime() {
+        // A dead but installed watcher lost events before quiescence could
+        // clear the cached artifacts. Fence them before exposing the route.
         ctx.invalidate_artifacts_after_watcher_gap();
+    } else if !ctx.watcher_gap_pending() {
+        ctx.mark_watcher_gap_pending();
     }
+    Some((ctx.configure_generation(), ctx.watcher_gap_epoch()))
+}
+
+fn restore_watcher(ctx: &AppContext, generation: u64, gap_epoch: u64) {
     let Some(root_path) = ctx.canonical_cache_root_opt() else {
         return;
     };
-    if root_path.exists() {
-        install_project_watcher(ctx, &root_path);
+    if !root_path.is_dir() {
+        return;
+    }
+    let Some(prepared) = prepare_project_watcher(ctx, &root_path, true) else {
+        return;
+    };
+    if prepared.publish_if_current(ctx, generation, gap_epoch, false) == Some(true) {
+        ctx.rescan_after_watcher_gap(generation, gap_epoch);
         // Config edits made while nothing watched the files are picked up
         // now; the reload compares file contents, so it is a no-op otherwise.
         crate::config_live::sync_config_watches(ctx);
         ctx.config_live().signal().request_now();
+    }
+}
+
+/// Fence cached views before acknowledging a rebind, without any filesystem
+/// or database work on the daemon frame loop.
+pub(crate) fn fence_subc_watcher_gap(ctx: &AppContext) {
+    let _ = begin_watcher_restore(ctx);
+}
+
+/// Restore after the route is installed: only a bound root may rescan its
+/// indexes. Filesystem and SQLite work never runs on the frame loop.
+pub(crate) fn restore_subc_watcher(ctx: Arc<AppContext>) {
+    let Some((generation, epoch)) = begin_watcher_restore(&ctx) else {
+        return;
+    };
+    if let Err(error) = thread::Builder::new()
+        .name("aft-watcher-restore".into())
+        .spawn(move || restore_watcher(&ctx, generation, epoch))
+    {
+        slog_warn!("watcher restoration could not start: {error}");
+    }
+}
+
+/// Synchronous watcher restoration for callers outside the daemon frame loop.
+#[doc(hidden)]
+pub fn ensure_project_watcher(ctx: &AppContext) {
+    if let Some((generation, epoch)) = begin_watcher_restore(ctx) {
+        restore_watcher(ctx, generation, epoch);
     }
 }
 
@@ -4510,24 +4653,34 @@ fn run_configure_maintenance_unit_inner(
                         return ConfigureMaintenanceUnitResult::Complete;
                     }
 
-                    // Joining a prior FSEvents thread can block in the OS. Do that
-                    // outside lifecycle admission, then reacquire admission only for
-                    // the atomic watcher start. An unbind or superseding configure that
-                    // wins during the join prevents the replacement from being started.
-                    ctx.stop_watcher_runtime();
-                    if ctx
-                        .run_if_subc_bound_generation(job.generation, || {
-                            if !job.root_too_broad {
-                                start_project_watcher(ctx, &job.canonical_cache_root);
+                    let gap_epoch = ctx.watcher_gap_epoch();
+                    let prepared = if job.root_too_broad {
+                        None
+                    } else {
+                        prepare_project_watcher(ctx, &job.canonical_cache_root, gap_epoch & 1 != 0)
+                    };
+                    // The lifecycle gate covers publication, not the SQLite
+                    // read, file probes, or the backend's startup handshake.
+                    let published = match prepared {
+                        Some(prepared) => {
+                            prepared.publish_if_current(ctx, job.generation, gap_epoch, true)
+                        }
+                        None => ctx.run_if_subc_bound_generation(job.generation, || {
+                            if job.root_too_broad {
+                                ctx.stop_watcher_runtime();
                             }
-                        })
-                        .is_none()
-                    {
+                            false
+                        }),
+                    };
+                    let Some(published) = published else {
                         if ctx.subc_unbound_quiesced() {
                             return ConfigureMaintenanceUnitResult::CancelAll;
                         }
                         forget_configure_job_binding(ctx, job);
                         return ConfigureMaintenanceUnitResult::Complete;
+                    };
+                    if published {
+                        ctx.rescan_after_watcher_gap(job.generation, gap_epoch);
                     }
                 }
             }

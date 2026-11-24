@@ -1806,6 +1806,27 @@ impl DataCheckout {
         self.work.start_rescan(false);
     }
 
+    /// A new watcher is already live. Compare disk on the owning maintenance
+    /// lane before telling its caller the unobserved interval is covered.
+    pub(crate) fn rescan_watcher_gap(&self, done: impl FnOnce(bool) + Send + 'static) {
+        let work = Arc::clone(&self.work);
+        self.work
+            .runner
+            .run("data-watcher-gap-rescan", Pool::Refresh, move || {
+                let scanned = work.checkout.rescan();
+                if scanned.is_ok() {
+                    work.settle.note_change();
+                    work.catch_up(Publish::WhenMany, false);
+                } else if let Err(error) = &scanned {
+                    crate::slog_warn!(
+                        "watcher gap rescan did not cover {}: {error}",
+                        work.checkout.root().display()
+                    );
+                }
+                done(scanned.is_ok());
+            });
+    }
+
     /// Updates automatic maintenance when bound routes change. A non-worker
     /// route starts a quiet window for edits left pending by worker-only routes.
     pub(crate) fn set_background_refresh(&self, allowed: bool) {

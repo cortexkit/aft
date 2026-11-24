@@ -204,6 +204,100 @@ fn session(route: RouteChannel) -> String {
     format!("grace-session-{}", route.channel)
 }
 
+#[test]
+fn rebind_queues_ack_while_watcher_observation_database_is_locked() {
+    let _env = crate::test_env::hermetic_git_env_guard();
+    let (_dir, root) = test_root("watcher-restore-db-fence");
+    let storage = tempfile::tempdir().unwrap();
+    let ctx = test_ctx();
+    let route = route_key(1, 1);
+    let response = configure(&ctx, &root, storage.path(), session(route));
+    assert!(response.success, "{response:?}");
+    let db = ctx.app().open_db(&storage.path().join("aft.db")).unwrap();
+    ctx.stop_watcher_runtime();
+    ctx.update_config(|config| {
+        config.indexes.trigram = true;
+        config.indexes.callgraph = true;
+    });
+    std::fs::write(root.as_path().join("seed.rs"), "fn seed() {}\n").unwrap();
+    let checkout = ctx
+        .data_checkout()
+        .expect("test root binds to the index store");
+    let crate::data_layer::runtime::Fresh::Ready(before) =
+        checkout.fresh_view(Duration::from_secs(60))
+    else {
+        panic!("initial call graph did not publish");
+    };
+    assert!(before.callgraph_has_file("seed.rs"));
+    assert!(!before.callgraph_has_file("gap_edit.rs"));
+    drop(before);
+    let mut attach = Attach::new();
+    assert!(attach.executor.register_actor(root.clone(), ctx.clone()));
+    let mut evicted = RootMeta::new(Instant::now());
+    evicted.idle_artifacts_evicted = true;
+    attach.live.insert(root.clone(), evicted);
+    attach.begin_bind(&root, route);
+
+    std::thread::scope(|scope| {
+        let guard = db.lock().unwrap();
+        let (queued, received) = std::sync::mpsc::channel();
+        let root_for_bind = root.clone();
+        let ctx_for_bind = ctx.clone();
+        let bind = scope.spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    attach
+                        .configure_ready(&root_for_bind, route, success())
+                        .await;
+                    let ack_queued = !attach.writer_rx.is_empty();
+                    attach.ack().await;
+                    queued.send(ack_queued).unwrap();
+                    tokio::time::timeout(
+                        Duration::from_secs(60),
+                        ctx_for_bind.await_watcher_gap_rescan_for_test(),
+                    )
+                    .await
+                    .expect("the live watcher rescan closes the gap");
+                    let crate::data_layer::runtime::Fresh::Ready(refreshed) =
+                        checkout.fresh_view(Duration::from_secs(60))
+                    else {
+                        panic!("call graph did not refresh once watcher coverage recovered");
+                    };
+                    assert!(refreshed.callgraph_has_file("gap_edit.rs"));
+                    attach.close();
+                });
+        });
+        let before_release = received.recv_timeout(Duration::from_secs(5));
+        if before_release == Ok(true) {
+            assert!(ctx.watcher_gap_pending());
+            std::fs::write(
+                root.as_path().join("gap_edit.rs"),
+                "fn after_bind_before_watch() {}\n",
+            )
+            .unwrap();
+            let request = serde_json::from_value(json!({
+                "id": "grep-watcher-gap", "command": "grep", "pattern": "after_bind_before_watch",
+            }))
+            .unwrap();
+            let grep = crate::commands::grep::handle_grep(&request, &ctx);
+            assert!(grep.success, "{:?}", grep.data);
+            assert_eq!(grep.data["total_matches"], 1);
+            assert!(matches!(
+                crate::commands::data_callgraph::access(&ctx),
+                crate::commands::data_callgraph::Access::Building
+            ));
+        }
+        // Always release the guard before joining, including when the old
+        // frame loop is parked inside watcher preparation.
+        drop(guard);
+        bind.join().unwrap();
+        assert_eq!(before_release, Ok(true));
+    });
+}
+
 #[tokio::test(start_paused = true)]
 async fn attach_goodbye_rebind_preserves_configure_and_watcher() {
     let _env = crate::test_env::hermetic_git_env_guard();

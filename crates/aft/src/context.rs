@@ -2900,6 +2900,7 @@ pub struct AppContext {
     /// ([`Self::pin_data_checkout`]) rather than bound by it: it is then kept
     /// whatever this context's own root and index switches say.
     data_checkout_pinned: AtomicBool,
+    watcher_gap: Arc<runtime_handles::WatcherGap>,
     /// The configure generation a standalone AFT last bound the data
     /// layer's checkout after (see
     /// [`crate::runtime_drain::follow_configure_with_data_layer`]).
@@ -3474,6 +3475,7 @@ impl AppContext {
             cold_build_limiter: RwLock::new(crate::cold_build_limiter::global_limiter()),
             data_checkout: parking_lot::Mutex::new(None),
             data_checkout_pinned: AtomicBool::new(false),
+            watcher_gap: Arc::default(),
             data_layer_followed_configure: AtomicU64::new(0),
             data_bind_failure: parking_lot::Mutex::new(None),
             data_children: Default::default(),
@@ -6868,6 +6870,9 @@ impl AppContext {
     /// [`Self::data_checkout`]. With the text index switched off, grep and
     /// glob walk the folder instead.
     pub(crate) fn data_view(&self) -> Option<crate::data_layer::checkout::CheckoutView> {
+        if self.watcher_gap_pending() {
+            return None;
+        }
         self.data_checkout()?
             .view()
             .filter(|view| view.planes().text)
@@ -7299,44 +7304,6 @@ impl AppContext {
         &self,
     ) -> Option<crate::executor::RootMaintenanceExecutor> {
         self.callgraph_executor.lock().clone()
-    }
-
-    /// Fence and drain standalone call-graph acquisition before process teardown.
-    /// Daemon acquisitions are also cancelled, and their executor owns the drain.
-    /// Gate every watcher-maintained artifact after the last route detaches. Files
-    /// may change before the watcher is restored, so a later bind must reconcile
-    /// from disk instead of serving retained snapshots that missed those edits.
-    pub(crate) fn invalidate_artifacts_after_watcher_gap(&self) {
-        self.next_semantic_persist_epoch();
-
-        self.semantic_index
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take();
-        // Keep semantic status reloadable when the feature is enabled: the
-        // query path's self-healing reload only fires from Ready (or Failed on
-        // read-only roots), so Disabled would strand an already-bound root
-        // with no way back short of a reconfigure. The advanced persist epoch
-        // and strict verify memo force the reload to re-verify from disk.
-        *self
-            .semantic_index_status
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = if self.config().indexes.semantic
-        {
-            SemanticIndexStatus::ready()
-        } else {
-            SemanticIndexStatus::Disabled
-        };
-
-        if let Some(root) = self
-            .canonical_cache_root_opt()
-            .or_else(|| self.config().project_root.clone())
-        {
-            crate::cache_freshness::invalidate_verify_memo_strict(&root);
-        }
-        self.inspect_manager.evict_idle_caches();
-        self.reset_symbol_cache();
-        self.clear_tsconfig_membership_cache();
     }
 
     /// The Git checkout holding `requested_path`, resolved from the session's

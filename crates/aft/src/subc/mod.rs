@@ -254,7 +254,9 @@ mod root_quiesce;
 mod route_census;
 mod route_delivery;
 use crate::bash_background::registry::RouteDeliverySessions;
-use root_quiesce::{quiesce_connection_roots, quiesce_unbound_root, QuiescedLsp};
+use root_quiesce::{
+    quiesce_connection_roots, quiesce_unbound_root, submit_ignore_rule_load, QuiescedLsp,
+};
 #[cfg(test)]
 use route_delivery::sync_all_callgraph_refresh_policies as sync_bg_live_delivery_sessions;
 mod secret_consent;
@@ -2319,32 +2321,6 @@ fn note_unbound_ttl_retention(
             label
         );
     }
-}
-
-/// Queue the ignore-rule load for a root whose watcher was restored before
-/// anything built its gitignore matcher. The load walks the project for ignore
-/// files, so it runs as a maintenance job on the root's actor, never on this
-/// transport loop. Publishing the matcher bumps its generation, and the running
-/// watcher backend re-derives its exclusions (`target/`, `node_modules/`, ...)
-/// from it without a restart.
-fn submit_ignore_rule_load(executor: &Executor, root_id: &ProjectRootId) {
-    let request_id = format!(
-        "subc-ignore-rule-load-{}",
-        root_id.as_path().to_string_lossy()
-    );
-    let response_id = request_id.clone();
-    let job: crate::context::ExecutorJob = Box::new(move |ctx: &AppContext| {
-        let published = crate::commands::configure::load_ignore_rules_if_unpublished(ctx);
-        Response::success(response_id, json!({ "published": published }))
-    });
-    // Nothing waits on the outcome: an unpublished root is queued again on
-    // its next rebind.
-    drop(executor.submit_maintenance_async(
-        root_id.clone(),
-        Lane::MaintenanceCommit,
-        request_id,
-        job,
-    ));
 }
 
 /// Queue the final artifact work for an unbound root past its idle TTL:
@@ -7284,7 +7260,7 @@ async fn handle_route_bind_completion(
         if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
             ctx.mark_subc_bound();
             if restore_watcher {
-                crate::commands::configure::ensure_project_watcher(&ctx);
+                crate::commands::configure::fence_subc_watcher_gap(&ctx);
             }
         }
         let ack = route_bind_ack_frame(completion.ver, completion.corr, completion.flags)?;
@@ -7460,6 +7436,9 @@ async fn handle_route_bind_completion(
     }
     if let Some(ctx) = executor.actor_context(&completion.bind_root_id) {
         debug_assert!(ack_written);
+        if ctx.watcher_gap_pending() {
+            crate::commands::configure::restore_subc_watcher(ctx.clone());
+        }
         if crate::commands::configure::ignore_rules_load_pending(&ctx) {
             submit_ignore_rule_load(executor, &completion.bind_root_id);
         }
@@ -10552,7 +10531,7 @@ async fn handle_tool_call_with_capabilities(
     }
     if restore_watcher {
         if let Some(ctx) = executor.actor_context(&identity.root) {
-            crate::commands::configure::ensure_project_watcher(&ctx);
+            crate::commands::configure::restore_subc_watcher(ctx.clone());
             if crate::commands::configure::ignore_rules_load_pending(&ctx) {
                 submit_ignore_rule_load(executor, &identity.root);
             }
