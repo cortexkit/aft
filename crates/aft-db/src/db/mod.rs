@@ -89,6 +89,8 @@ CREATE INDEX IF NOT EXISTS idx_bash_tasks_project_replay
      OR CASE WHEN json_valid(metadata)
              THEN json_type(metadata, '$.completion_delivered') = 'false'
              ELSE 0 END;
+CREATE INDEX IF NOT EXISTS idx_bash_watch_delivery_acks_acknowledged
+  ON bash_watch_delivery_acks(acknowledged_at);
 "#;
 
 const MIGRATION_V14: &str = r#"
