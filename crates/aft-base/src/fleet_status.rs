@@ -909,23 +909,20 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                     continue;
                 }
             };
-            match consumer.request(opened_route, body).await {
-                Ok(response) => {
-                    if !complete_status_publish_call(request, &response) {
-                        route = None;
-                        route_events = None;
-                        client.set_route_live(false);
-                        next_discovery_at = tokio::time::Instant::now();
-                    }
-                }
+            let route_live = match consumer.request(opened_route, body).await {
+                Ok(response) => complete_status_publish_call(request, &response),
                 Err(error) => {
                     log::debug!("fleet status dial: publish unavailable: {error}");
                     request.complete_unavailable();
-                    route = None;
-                    route_events = None;
-                    client.set_route_live(false);
-                    next_discovery_at = tokio::time::Instant::now();
+                    false
                 }
+            };
+            if !route_live {
+                drain_queued_route_closes(&mut control_pushes, last_route_channel, &mut reopen_forbidden);
+                route = None;
+                route_events = None;
+                client.set_route_live(false);
+                next_discovery_at = tokio::time::Instant::now();
             }
             continue;
         }
@@ -988,14 +985,7 @@ async fn run_connected_status_dial<C: StatusConsumer>(
                     .await
             }, if route_events.is_some() => {
                 if maybe_event.is_none() {
-                    // The daemon sends `route.closed` before it ends the route,
-                    // so its reason is already queued: read it before deciding
-                    // whether the next discovery may reopen.
-                    if let Some(receiver) = control_pushes.as_mut() {
-                        while let Ok(push) = receiver.try_recv() {
-                            record_forbidden_reopen(&push, last_route_channel, &mut reopen_forbidden);
-                        }
-                    }
+                    drain_queued_route_closes(&mut control_pushes, last_route_channel, &mut reopen_forbidden);
                     route = None;
                     route_events = None;
                     client.set_route_live(false);
@@ -1023,6 +1013,20 @@ async fn run_connected_status_dial<C: StatusConsumer>(
         }
     }
 }
+}
+
+// The daemon sends a close reason before it ends the route. Check queued
+// reasons before rediscovery can open a route with a different channel.
+fn drain_queued_route_closes(
+    control_pushes: &mut Option<mpsc::Receiver<ControlPush>>,
+    last_route_channel: Option<u16>,
+    reopen_forbidden: &mut Option<String>,
+) {
+    if let Some(receiver) = control_pushes.as_mut() {
+        while let Ok(push) = receiver.try_recv() {
+            record_forbidden_reopen(&push, last_route_channel, reopen_forbidden);
+        }
+    }
 }
 
 fn encode_status_publish_call(body: &Value) -> Option<Vec<u8>> {
@@ -1236,6 +1240,7 @@ pub mod tests {
         targets: parking_lot::Mutex<Vec<String>>,
         generation: AtomicU64,
         sender: parking_lot::Mutex<Option<mpsc::Sender<u64>>>,
+        close_during_publish: parking_lot::Mutex<Option<ControlPush>>,
     }
 
     impl StatusCatalogWatch for mpsc::Receiver<u64> {
@@ -1336,6 +1341,15 @@ pub mod tests {
 
         async fn request(&self, _route: &usize, _body: Vec<u8>) -> Result<Vec<u8>, String> {
             self.publish_calls.fetch_add(1, Ordering::Relaxed);
+            if let Some(push) = self.watch.close_during_publish.lock().take() {
+                self.control_sender
+                    .lock()
+                    .as_ref()
+                    .unwrap()
+                    .try_send(push)
+                    .unwrap();
+                self.push_sender.lock().take();
+            }
             Err("not used in discovery test".to_owned())
         }
     }
@@ -1666,6 +1680,60 @@ pub mod tests {
     /// cadences pass, and returns how many route opens the dial made.
     async fn route_opens_after_holder_close(reason: &str) -> usize {
         route_opens_after_holder_close_naming(reason, None).await
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_publish_observes_queued_close_before_reopening() {
+        use std::future::Future as _;
+
+        for (reason, expected_opens) in [("scope_ended", 1), ("reload", 2)] {
+            let (client, mut wire_rx) = FleetStatusClient::dial_channel(1);
+            assert!(!client.publish(Path::new("/tmp/project"), "opencode", "session-1", "local"));
+            let request = wire_rx.try_recv().unwrap();
+            let identity = FleetRouteIdentity::from(&request);
+            let watch = Arc::new(FakeCatalogWatch::default());
+            *watch.close_during_publish.lock() = Some(ControlPush {
+                op: "route.closed".into(),
+                body: json!({
+                    "op": "route.closed", "module_id": STATUS_HOLDER_MODULE,
+                    "reason": reason, "channels": [1],
+                }),
+            });
+            let attempts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let publish_calls = Arc::new(AtomicU64::new(0));
+            let consumer = RejectingConsumer {
+                attempts: attempts.clone(),
+                succeeds_on: Some(1),
+                failure: transient_failure(),
+                advertises_status_line: true,
+                catalog_calls: Arc::default(),
+                publish_calls: publish_calls.clone(),
+                connection_callback: Arc::default(),
+                push_sender: Arc::default(),
+                control_sender: Arc::default(),
+                watch,
+            };
+            let mut dial = std::pin::pin!(run_connected_status_dial(
+                consumer,
+                client,
+                wire_rx,
+                identity,
+                Some(request),
+            ));
+            // All fake calls are ready, including the failed publish that queues
+            // route.closed. The dial runs through rediscovery before going idle.
+            std::future::poll_fn(|cx| {
+                assert!(dial.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(publish_calls.load(Ordering::Relaxed), 1);
+            assert_eq!(
+                attempts.lock().len(),
+                expected_opens,
+                "close reason: {reason}"
+            );
+        }
     }
 
     /// [`route_opens_after_holder_close`] with a push that names the closed
