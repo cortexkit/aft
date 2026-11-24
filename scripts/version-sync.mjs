@@ -298,10 +298,33 @@ for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-index", "aft-parse", "
 for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-store"]) {
   results.push(updateCargoPathDep(githubPath, dep, version, dryRun));
 }
-for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-github", "aft-index", "aft-inspect", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules"]) {
+for (const dep of [
+  "aft-base",
+  "aft-db",
+  "aft-edit",
+  "aft-github",
+  "aft-index",
+  "aft-inspect",
+  "aft-parse",
+  "aft-store",
+  "aft-tokenizer",
+  "secret-rules",
+]) {
   results.push(updateCargoPathDep(shellPath, dep, version, dryRun));
 }
-for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-github", "aft-index", "aft-inspect", "aft-parse", "aft-shell", "aft-store", "aft-tokenizer", "secret-rules"]) {
+for (const dep of [
+  "aft-base",
+  "aft-db",
+  "aft-edit",
+  "aft-github",
+  "aft-index",
+  "aft-inspect",
+  "aft-parse",
+  "aft-shell",
+  "aft-store",
+  "aft-tokenizer",
+  "secret-rules",
+]) {
   results.push(updateCargoPathDep(enginePath, dep, version, dryRun));
 }
 for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "secret-rules"]) {
