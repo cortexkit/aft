@@ -369,6 +369,10 @@ impl StandingActor {
             }
         };
         self.log_reconciliation_outcome(&report.refused);
+        // This bind may be the first to observe a root removed from
+        // configuration. The next tick will not see that removal again, so
+        // retire the root's standing actor now.
+        self.retire_removed_actors(&report.removed, Some(ctx));
         let entries = self.roots.entries();
         // With no standing family there is nothing to revoke. Deriving an
         // otherwise unused session key can spawn Git on a cold root, and must
@@ -526,7 +530,7 @@ impl StandingActor {
         *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
         self.log_reconciliation_outcome(&report.refused);
 
-        self.retire_removed_actors(&report.removed);
+        self.retire_removed_actors(&report.removed, None);
         let contended = self.resume_entries_without_bound_session(&report.active_entries);
         for entry in report.active_entries {
             if !contended.iter().any(|claim| claim.covers(&entry)) {
@@ -628,15 +632,23 @@ impl StandingActor {
         contended
     }
 
-    fn retire_removed_actors(&self, removed: &[String]) {
+    /// `binding` is the context of a session bind in progress, if any. When
+    /// that session binds the folder of a removed root, it has taken over the
+    /// actor standing maintenance created there, which then stays registered.
+    fn retire_removed_actors(&self, removed: &[String], binding: Option<&AppContext>) {
         let mut owned = self.owned_actors.lock();
         for literal_path in removed {
             if let Some((root_id, owned_here)) = owned.remove(literal_path) {
                 self.executor.cancel_queued_maintenance(&root_id);
-                if let Some(ctx) = self.executor.actor_context(&root_id) {
+                let ctx = self.executor.actor_context(&root_id);
+                if let Some(ctx) = &ctx {
                     ctx.set_standing_artifact_exempt(false);
                 }
-                if owned_here {
+                let taken_over = ctx
+                    .as_ref()
+                    .zip(binding)
+                    .is_some_and(|(ctx, binding)| std::ptr::eq(Arc::as_ptr(ctx), binding));
+                if owned_here && !taken_over {
                     self.executor.remove_actor(&root_id);
                 }
             }
@@ -1883,6 +1895,93 @@ mod tests {
             IndexKind::ALL,
             [IndexKind::Search, IndexKind::Semantic, IndexKind::Callgraph]
         );
+    }
+
+    /// A bound session whose configuration lists one standing root in a
+    /// folder no session has bound, so standing maintenance hosts that root on
+    /// an actor of its own.
+    struct OwnedActorFixture {
+        _storage: tempfile::TempDir,
+        _session_dir: tempfile::TempDir,
+        _standing_dir: tempfile::TempDir,
+        executor: Arc<Executor>,
+        session: Arc<AppContext>,
+        actor: StandingActor,
+        standing_root: ProjectRootId,
+    }
+
+    impl OwnedActorFixture {
+        fn new() -> Self {
+            use crate::config::{IndexConfig, IndexRootConfig};
+
+            let storage = tempfile::tempdir().unwrap();
+            let session_dir = tempfile::tempdir().unwrap();
+            let standing_dir = tempfile::tempdir().unwrap();
+            let session_root = std::fs::canonicalize(session_dir.path()).unwrap();
+            let standing = std::fs::canonicalize(standing_dir.path()).unwrap();
+            let session = Arc::new(AppContext::from_app(
+                App::default_shared(),
+                Config {
+                    project_root: Some(session_root.clone()),
+                    storage_dir: Some(storage.path().to_path_buf()),
+                    index: IndexConfig {
+                        roots: vec![IndexRootConfig {
+                            path: standing.to_string_lossy().into_owned(),
+                            indexes: vec![IndexKind::Search],
+                        }],
+                    },
+                    ..Config::default()
+                },
+            ));
+            session.set_canonical_cache_root(session_root.clone());
+            let executor = Arc::new(Executor::new());
+            executor.register_actor(
+                ProjectRootId::from_path(&session_root).unwrap(),
+                Arc::clone(&session),
+            );
+            let actor = StandingActor::new(session.app(), Arc::clone(&executor))
+                .with_startup_storage_dir(storage.path());
+            Self {
+                _storage: storage,
+                _session_dir: session_dir,
+                _standing_dir: standing_dir,
+                executor,
+                session,
+                actor,
+                standing_root: ProjectRootId::from_path(&standing).unwrap(),
+            }
+        }
+
+        fn standing_actor_registered(&self) -> bool {
+            self.executor.actor_context(&self.standing_root).is_some()
+        }
+
+        /// The user removes the standing root from configuration; the session
+        /// carries the new snapshot.
+        fn remove_standing_root_from_config(&self) {
+            self.session
+                .update_config(|config| config.index.roots.clear());
+        }
+    }
+
+    /// A session bind can be the first to observe that a standing root was
+    /// removed. The actor standing maintenance created for that root must be
+    /// retired then, because the next tick sees no removal left to process.
+    #[test]
+    fn a_session_bind_that_removes_a_standing_root_retires_its_actor() {
+        let fixture = OwnedActorFixture::new();
+        fixture.actor.tick();
+        assert!(fixture.standing_actor_registered());
+
+        fixture.remove_standing_root_from_config();
+        fixture.actor.begin_session_bind(&fixture.session);
+        assert!(fixture.actor.roots.entries().is_empty());
+        assert!(
+            !fixture.standing_actor_registered(),
+            "the bind removed the standing root but left its actor registered"
+        );
+        fixture.actor.tick();
+        assert!(!fixture.standing_actor_registered());
     }
 
     /// A standing entry over a small Rust crate, reconciled but with no
