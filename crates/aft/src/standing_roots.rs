@@ -120,6 +120,14 @@ impl StandingBuildAdmission {
     pub fn cancellation_requested(&self) -> bool {
         self.lifecycle.cancellation_requested()
     }
+
+    /// The strict-mark count at this moment. A pass captures it before its
+    /// verification and hands it to
+    /// [`StandingRoots::record_strict_verification_unless_marked`].
+    #[must_use]
+    pub fn strict_mark_revision(&self) -> u64 {
+        *self.lifecycle.strict_marks.lock()
+    }
 }
 
 impl Drop for StandingBuildAdmission {
@@ -169,6 +177,11 @@ struct ArtifactLifecycle {
     state: Mutex<ArtifactLifecycleState>,
     checkpoint_acknowledged: Condvar,
     admission_epoch: AtomicU64,
+    /// Counts the durable strict marks made through this lifecycle. A mark
+    /// and a standing pass's clear each hold this lock, and a pass clears
+    /// only while the count still equals the one it captured at admission,
+    /// so a mark made during the pass is never undone by it.
+    strict_marks: Mutex<u64>,
 }
 
 #[derive(Default)]
@@ -190,6 +203,7 @@ impl Default for ArtifactLifecycle {
             }),
             checkpoint_acknowledged: Condvar::new(),
             admission_epoch: AtomicU64::new(0),
+            strict_marks: Mutex::new(0),
         }
     }
 }
@@ -228,6 +242,14 @@ impl ArtifactLifecycle {
 
     fn bind_pending(&self) -> bool {
         self.state.lock().bind_pending
+    }
+
+    /// Runs a durable strict mark while no pass can clear the flag, counting
+    /// it first so a pass admitted earlier will not clear it.
+    fn mark_strict<T>(&self, mark: impl FnOnce() -> T) -> T {
+        let mut marks = self.strict_marks.lock();
+        *marks = marks.wrapping_add(1);
+        mark()
     }
 
     /// Stop standing work on a root that reconciliation refused: cancel running
@@ -440,11 +462,13 @@ impl StandingRoots {
                 None => *outcome == standing_roots::EnsureStandingRoot::Reloaded,
             };
             if !previous_first_snapshot || unobserved {
-                mark_kinds_needing_strict_verify(
-                    &mut conn,
-                    &entry.literal_path,
-                    &entry.indexes,
-                )?;
+                let mut mark = || {
+                    mark_kinds_needing_strict_verify(&mut conn, &entry.literal_path, &entry.indexes)
+                };
+                match state.entries.get(&entry.literal_path) {
+                    Some(old) => old.lifecycle.mark_strict(mark)?,
+                    None => mark()?,
+                }
             }
         }
 
@@ -559,8 +583,10 @@ impl StandingRoots {
             (Arc::clone(&entry.lifecycle), entry.entry.indexes.clone())
         };
         let admission_epoch = lifecycle.revoke_and_mint(true);
-        let mut conn = self.open_database()?;
-        mark_kinds_needing_strict_verify(&mut conn, literal_path, &indexes)?;
+        lifecycle.mark_strict(|| {
+            let mut conn = self.open_database()?;
+            mark_kinds_needing_strict_verify(&mut conn, literal_path, &indexes)
+        })?;
         let cancelled_builds = lifecycle.state.lock().active_builds;
         Ok(BindTransition {
             admission_epoch,
@@ -604,8 +630,10 @@ impl StandingRoots {
             return Ok(());
         }
         if !missing.is_empty() {
-            let mut conn = self.open_database()?;
-            mark_kinds_needing_strict_verify(&mut conn, literal_path, &missing)?;
+            lifecycle.mark_strict(|| {
+                let mut conn = self.open_database()?;
+                mark_kinds_needing_strict_verify(&mut conn, literal_path, &missing)
+            })?;
         }
         lifecycle.resume_unbound();
         Ok(())
@@ -619,8 +647,14 @@ impl StandingRoots {
         literal_path: &str,
         kinds: &[IndexKind],
     ) -> Result<(), StandingRootsError> {
-        let mut conn = self.open_database()?;
-        mark_kinds_needing_strict_verify(&mut conn, literal_path, kinds)
+        let mark = || {
+            let mut conn = self.open_database()?;
+            mark_kinds_needing_strict_verify(&mut conn, literal_path, kinds)
+        };
+        match self.lifecycle(literal_path) {
+            Ok(lifecycle) => lifecycle.mark_strict(mark),
+            Err(_) => mark(),
+        }
     }
 
     /// Clear a durable gap only after a successful current-state strict verify.
@@ -639,6 +673,27 @@ impl StandingRoots {
             now_ms(),
         )?;
         Ok(())
+    }
+
+    /// Clear a durable gap after a standing pass's strict verification, unless
+    /// a strict mark was made since the pass captured `revision`
+    /// ([`StandingBuildAdmission::strict_mark_revision`]): then the pass's
+    /// proof predates that mark and the flag stays set. Returns whether it
+    /// cleared. Marks from another process are not counted here.
+    pub fn record_strict_verification_unless_marked(
+        &self,
+        literal_path: &str,
+        kind: IndexKind,
+        revision: u64,
+    ) -> Result<bool, StandingRootsError> {
+        let lifecycle = self.lifecycle(literal_path)?;
+        let marks = lifecycle.strict_marks.lock();
+        if *marks != revision {
+            return Ok(false);
+        }
+        self.record_strict_verification(literal_path, kind)?;
+        drop(marks);
+        Ok(true)
     }
 
     fn lifecycle(&self, literal_path: &str) -> Result<Arc<ArtifactLifecycle>, StandingRootsError> {

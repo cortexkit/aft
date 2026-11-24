@@ -703,6 +703,10 @@ impl StandingActor {
                 permit.admission_epoch,
                 admission.publication.admission_epoch
             );
+            // A strict mark made after this point (a session bind, a resume or
+            // an observation gap) postdates the verification below, which then
+            // must not clear it.
+            let strict_revision = admission.strict_mark_revision();
             // One data-layer bind or build covers every kind it builds.
             let mut data_layer_verified = None;
             for kind in IndexKind::ALL {
@@ -720,7 +724,7 @@ impl StandingActor {
                     // no search cache is read or written and no writer lease
                     // is taken.
                     *data_layer_verified.get_or_insert_with(|| {
-                        crate::data_layer::standing::verify_current(
+                        let verified = crate::data_layer::standing::verify_current(
                             &entry.resolved_target,
                             &ctx.storage_dir(),
                             crate::data_layer::standing::planes(&entry.indexes),
@@ -728,7 +732,10 @@ impl StandingActor {
                                 !admission.cancellation_requested()
                                     && !crate::executor::current_job_cancelled()
                             },
-                        )
+                        );
+                        #[cfg(test)]
+                        after_verify_for_test(&literal_path);
+                        verified
                     })
                 } else {
                     // Meaning search is not verified by standing passes;
@@ -736,13 +743,23 @@ impl StandingActor {
                     false
                 };
                 if verified {
-                    if let Err(error) = roots.record_strict_verification(&literal_path, kind) {
-                        log::warn!(
+                    match roots.record_strict_verification_unless_marked(
+                        &literal_path,
+                        kind,
+                        strict_revision,
+                    ) {
+                        Ok(true) => {}
+                        Ok(false) => log::debug!(
+                            "standing strict verification for {} {} predates a newer strict mark; flag kept",
+                            literal_path,
+                            kind.as_str()
+                        ),
+                        Err(error) => log::warn!(
                             "standing strict verification outcome could not commit for {} {}: {}",
                             literal_path,
                             kind.as_str(),
                             error
-                        );
+                        ),
                     }
                 }
             }
@@ -806,6 +823,29 @@ impl StandingActor {
             .lock()
             .insert(entry.literal_path.clone(), (root_id.clone(), true));
         Some(root_id)
+    }
+}
+
+/// A test runs `hook` inside the standing pass over `literal_path`, right
+/// after its verification and before it records the outcome.
+#[cfg(test)]
+static AFTER_VERIFY_FOR_TEST: std::sync::Mutex<Option<(String, Box<dyn FnOnce() + Send>)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn after_verify_for_test(literal_path: &str) {
+    let hook = {
+        let mut slot = AFTER_VERIFY_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if slot.as_ref().is_some_and(|(path, _)| path == literal_path) {
+            slot.take()
+        } else {
+            None
+        }
+    };
+    if let Some((_, hook)) = hook {
+        hook();
     }
 }
 
@@ -2192,5 +2232,36 @@ mod tests {
             !fixture.search_cache().exists(),
             "a failed data layer build fell back to today's search cache"
         );
+    }
+
+    /// A session bind that marks the root strict after the pass verified it,
+    /// but before the pass records that, keeps the mark: the pass's proof
+    /// predates the bind. Without the bind the same pass clears the flags
+    /// (`with_the_data_layer_a_standing_pass_builds_and_verifies_without_cache_bin`).
+    #[test]
+    fn a_bind_between_verification_and_its_record_keeps_the_strict_flag() {
+        let fixture = StandingFixture::new(vec![IndexKind::Search, IndexKind::Callgraph]);
+        let roots = fixture.actor.roots.clone();
+        let literal_path = fixture.entry.literal_path.clone();
+        *AFTER_VERIFY_FOR_TEST
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some((
+            literal_path.clone(),
+            Box::new(move || {
+                roots.begin_case_a_bind(&literal_path).unwrap();
+            }),
+        ));
+
+        fixture.pass();
+        assert!(
+            AFTER_VERIFY_FOR_TEST
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "the pass never reached its verification"
+        );
+        assert_eq!(fixture.published(), (3, true), "the pass verified the root");
+        assert!(fixture.strict(IndexKind::Search));
+        assert!(fixture.strict(IndexKind::Callgraph));
     }
 }
