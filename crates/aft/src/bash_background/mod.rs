@@ -12,6 +12,7 @@ mod memory_limit;
 pub mod output;
 pub mod persistence;
 pub mod process;
+pub(crate) mod pty_input;
 pub mod pty_process;
 pub mod pty_runtime;
 pub mod registry;

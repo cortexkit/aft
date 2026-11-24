@@ -1,12 +1,11 @@
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[allow(dead_code)]
 pub(crate) struct PtyRuntime {
     pub(crate) bootstrap_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>>,
     pub(crate) master: Option<Box<dyn portable_pty::MasterPty + Send>>,
-    pub(crate) writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    pub(crate) input: Arc<super::pty_input::PtyInput>,
     pub(crate) killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     pub(crate) child_pid: Option<u32>,
     pub(crate) reader_done: Arc<AtomicBool>,
@@ -44,7 +43,8 @@ impl PtyRuntime {
             .store(true, std::sync::atomic::Ordering::SeqCst);
         self.master.take();
         *self
-            .writer
+            .input
+            .writer()
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = Box::new(std::io::sink());
         if !self.exit_observed.load(std::sync::atomic::Ordering::SeqCst) {

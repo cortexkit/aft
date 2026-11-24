@@ -6920,49 +6920,6 @@ impl BgTaskRegistry {
         Ok(task_id)
     }
 
-    pub fn write_pty(
-        &self,
-        task_id: &str,
-        session_id: &str,
-        input: &[u8],
-    ) -> Result<usize, String> {
-        let task = self
-            .task_for_session(task_id, session_id)
-            .ok_or_else(|| "task_not_found".to_string())?;
-
-        let writer = {
-            let state = task
-                .lock_state()
-                .map_err(|_| "background task lock poisoned".to_string())?;
-            if state.metadata.mode != BgMode::Pty {
-                return Err("task_not_pty".to_string());
-            }
-            if state.metadata.status.is_terminal() {
-                return Err("task_exited".to_string());
-            }
-            match &state.runtime {
-                TaskRuntime::Pty(Some(runtime)) => Arc::clone(&runtime.writer),
-                TaskRuntime::Pty(None) => return Err("task_exited".to_string()),
-                TaskRuntime::Piped(_) => return Err("task_not_pty".to_string()),
-            }
-        };
-
-        let mut writer = writer
-            .lock()
-            .map_err(|_| "PTY writer lock poisoned".to_string())?;
-        writer
-            .write_all(input)
-            .map_err(|error| format!("failed to write to PTY: {error}"))?;
-        writer
-            .flush()
-            .map_err(|error| format!("failed to flush PTY writer: {error}"))?;
-        // Record that typed input reached the terminal, so a task that later
-        // seems to ignore its input can be told apart from one that never got
-        // it. Only the size is logged: the input can contain secrets.
-        crate::slog_info!("bash_write task={task_id} bytes={}", input.len());
-        Ok(input.len())
-    }
-
     pub fn replay_session(&self, storage_dir: &Path, session_id: &str) -> Result<(), String> {
         self.replay_session_inner(storage_dir, session_id, None)
     }
@@ -18429,6 +18386,9 @@ mod watch_scan;
 
 #[path = "pty_replay.rs"]
 mod pty_replay;
+
+#[path = "pty_input_write.rs"]
+mod pty_input_write;
 
 #[path = "adopted_identity.rs"]
 mod adopted_identity;

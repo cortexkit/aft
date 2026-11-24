@@ -7,7 +7,9 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
 use portable_pty::PtySize;
 
@@ -506,7 +508,14 @@ fn try_spawn_pty(
         .unwrap()
         .take_writer()
         .map_err(|error| format!("take PTY writer failed: {error}"))?;
-    let writer = Arc::new(Mutex::new(writer));
+    #[cfg(unix)]
+    let input = Arc::new(super::pty_input::PtyInput::for_master(
+        writer,
+        child.master.as_ref().unwrap().as_raw_fd(),
+    ));
+    #[cfg(not(unix))]
+    let input = Arc::new(super::pty_input::PtyInput::blocking(writer));
+    let writer = Arc::clone(input.writer());
     let mut bootstrap_release: Option<Box<dyn FnOnce() -> Result<(), String> + Send>> = None;
     if memory_monitor.is_some() || defer_bootstrap || {
         #[cfg(unix)]
@@ -578,7 +587,7 @@ fn try_spawn_pty(
         Arc::clone(&reader_done),
         Arc::clone(&reader_eof),
         Arc::clone(&coordinator),
-        Some(Arc::clone(&writer)),
+        Some(Arc::clone(&input)),
     )
     .map_err(|error| format!("failed to start PTY reader: {error}"))?;
     spawn_waiter(
@@ -594,7 +603,7 @@ fn try_spawn_pty(
     Ok(PtyRuntime {
         bootstrap_release,
         master: child.master.take(),
-        writer,
+        input,
         killer,
         child_pid,
         reader_done,
@@ -659,7 +668,7 @@ pub(crate) fn spawn_reader(
     reader_done: Arc<AtomicBool>,
     reader_eof: Arc<AtomicBool>,
     coordinator: Arc<CompletionCoordinator>,
-    writer: Option<Arc<Mutex<Box<dyn Write + Send>>>>,
+    input: Option<Arc<super::pty_input::PtyInput>>,
 ) -> io::Result<()> {
     super::worker_thread::spawn(super::worker_thread::Worker::PtyReader, move || {
         let result = (|| -> io::Result<()> {
@@ -698,15 +707,23 @@ pub(crate) fn spawn_reader(
                             // process can sit forever after emitting only the
                             // query. We own both ends of the PTY, so provide a
                             // conservative 1;1 response.
-                            if let Some(writer) = writer.as_ref() {
-                                if let Ok(mut writer) = writer.lock() {
-                                    let _ = writer.write_all(b"\x1b[1;1R");
-                                    let _ = writer.flush();
-                                }
+                            if let Some(input) = input.as_ref() {
+                                input.reply_cursor_position();
                             }
+                        } else if let Some(input) = input.as_ref() {
+                            input.try_send_replies();
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    // A non-blocking terminal with no output yet.
+                    Err(error)
+                        if error.kind() == io::ErrorKind::WouldBlock
+                            && input.as_ref().is_some_and(|input| input.non_blocking()) =>
+                    {
+                        if let Some(input) = input.as_ref() {
+                            input.wait_for_output();
+                        }
+                    }
                     Err(error) => return Err(error),
                 }
             }
