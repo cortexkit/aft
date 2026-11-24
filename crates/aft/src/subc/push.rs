@@ -307,10 +307,20 @@ fn completion_dropped(
     }
 }
 
+pub(super) fn discard_replay_frame(
+    metrics: &DispatchPathMetrics,
+    key: &ReplayKey,
+    frame: PushFrame,
+    reason: &str,
+) {
+    completion_dropped(metrics, key, &frame, reason);
+    metrics.watch_delivery.evicted(key.clone(), frame);
+}
+
 pub(super) fn purge_completion_root(
     metrics: &DispatchPathMetrics,
     root: &ProjectRootId,
-    push_buffer: &HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &PushBuffer,
     retry_buffer: &RetryBuffer,
 ) {
     for (key, queue) in push_buffer.iter().filter(|(key, _)| &key.root == root) {
@@ -348,7 +358,7 @@ pub(super) fn recover_registry_completions_after_maintenance(
     registry: &crate::bash_background::BgTaskRegistry,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     root: &ProjectRootId,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
@@ -376,7 +386,7 @@ pub(super) fn recover_registry_completions(
     registry: &crate::bash_background::BgTaskRegistry,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     root: &ProjectRootId,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) {
@@ -403,6 +413,17 @@ pub(super) fn recover_registry_completions(
         .values()
         .filter(|route| &route.root == root && route.trust.allows_bash_observation())
         .map(RouteIdentity::task_identity)
+        .collect();
+    push_buffer.expire(metrics);
+    let mut already_queued: HashSet<_> = push_buffer
+        .iter()
+        .filter(|(key, _)| &key.root == root)
+        .flat_map(|(_, queue)| {
+            queue
+                .iter()
+                .filter_map(completed_task_id)
+                .map(str::to_owned)
+        })
         .collect();
     let mut retired_backlog = 0usize;
     let mut retired_runner = 0usize;
@@ -470,13 +491,7 @@ pub(super) fn recover_registry_completions(
                 continue;
             }
             let task = completion.task_id.clone();
-            let already_queued = push_buffer.iter().any(|(key, queue)| {
-                &key.root == root
-                    && queue
-                        .iter()
-                        .any(|frame| completed_task_id(frame) == Some(task.as_str()))
-            });
-            if already_queued {
+            if !already_queued.insert(task) {
                 continue;
             }
             let key = ReplayKey {
@@ -1141,15 +1156,16 @@ fn bounded_push_back<T>(queue: &mut VecDeque<T>, item: T) -> Option<T> {
 
 fn buffer_push_frame(
     metrics: &DispatchPathMetrics,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     key: ReplayKey,
     frame: PushFrame,
 ) {
+    push_buffer.expire(metrics);
     completion_buffered(metrics, &key, &frame, "awaiting_matching_route_or_replay");
-    if let Some(evicted) = bounded_push_back(push_buffer.entry(key.clone()).or_default(), frame) {
-        completion_dropped(metrics, &key, &evicted, "replay_buffer_eviction");
-        metrics.watch_delivery.evicted(key, evicted);
+    if let Some(evicted) = bounded_push_back(push_buffer.queue(&key), frame) {
+        discard_replay_frame(metrics, &key, evicted, "replay_buffer_eviction");
     }
+    push_buffer.expire(metrics);
 }
 
 pub(super) fn buffer_retry_frame(
@@ -1174,8 +1190,9 @@ pub(super) fn migrate_retry_buffer_to_push_buffer(
     metrics: &DispatchPathMetrics,
     retry_buffer: &mut RetryBuffer,
     channel: RouteChannel,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
 ) -> usize {
+    push_buffer.expire(metrics);
     let Some(frames) = retry_buffer.remove(&channel) else {
         return 0;
     };
@@ -1191,11 +1208,12 @@ pub(super) fn replay_buffered_push_frames(
     writer_tx: &WriterSender,
     metrics: &DispatchPathMetrics,
     channel: RouteChannel,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     key: &ReplayKey,
     trust: BindTrust,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
 ) -> usize {
+    push_buffer.expire(metrics);
     let runner = super::runner_notices::is_runner(&crate::bash_background::TaskIdentity {
         principal: key.principal.clone(),
         harness: key.harness.clone(),
@@ -1220,7 +1238,9 @@ pub(super) fn replay_buffered_push_frames(
             .cloned()
             .collect();
         for legacy_key in legacy_keys {
-            let queue = push_buffer.get_mut(&legacy_key).unwrap();
+            let Some(queue) = push_buffer.get_mut(&legacy_key) else {
+                continue;
+            };
             let (legacy, owned): (VecDeque<_>, VecDeque<_>) =
                 std::mem::take(queue).into_iter().partition(|frame| {
                     frame_is_bash_observation(frame) && frame_task_identity(frame).is_none()
@@ -1455,8 +1475,8 @@ fn matching_session_route_channels(
 
 fn buffer_detached_reliable_push_frame(
     metrics: &DispatchPathMetrics,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    push_buffer: &mut PushBuffer,
+    session_identity: &SessionIdentities,
     root: &ProjectRootId,
     frame: &PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -1487,7 +1507,7 @@ fn buffer_detached_reliable_push_frame(
         return;
     }
 
-    if let Some((key, trust)) = replay_key_for_session(session_identity, root, session) {
+    if let Some((key, trust)) = session_identity.replay_key(root, session) {
         if frame_is_bash_observation(frame) && !trust.allows_bash_observation() {
             completion_dropped(metrics, &key, frame, "untrusted_retained_identity");
             return;
@@ -1647,9 +1667,9 @@ fn fan_out_reliable_push_frame(
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    session_identity: &SessionIdentities,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     root: &ProjectRootId,
     frame: &PushFrame,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -1751,9 +1771,9 @@ fn process_reliable_push_frame(
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    session_identity: &SessionIdentities,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     completed_tasks: &mut CompletedTaskIds,
     root: ProjectRootId,
     frame: PushFrame,
@@ -1869,9 +1889,9 @@ fn process_reliable_push_and_arm_bg_wake(
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    session_identity: &SessionIdentities,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
@@ -1911,9 +1931,9 @@ pub(super) fn drain_reliable_push_turn(
     metrics: &DispatchPathMetrics,
     routes: &HashMap<RouteChannel, RouteIdentity>,
     root_channels: &HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
+    session_identity: &SessionIdentities,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
     completed_tasks: &mut CompletedTaskIds,
     bg_sub_by_session: &BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
@@ -2373,7 +2393,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(16);
         let mut retry = RetryBuffer::new();
-        let mut buffered = HashMap::new();
+        let mut buffered = PushBuffer::default();
         let mut completed = CompletedTaskIds::default();
         let mut pending = BgWakePending::new();
         let mut epochs = HashMap::new();
@@ -2397,7 +2417,7 @@ mod tests {
                 &metrics,
                 &routes,
                 &root_channels,
-                &HashMap::new(),
+                &SessionIdentities::default(),
                 &mut retry,
                 &mut buffered,
                 &mut completed,
@@ -2470,7 +2490,7 @@ mod tests {
             &metrics,
             &detached_routes,
             &detached_channels,
-            &HashMap::new(),
+            &SessionIdentities::default(),
             &mut retry,
             &mut buffered,
             &root,
@@ -2510,7 +2530,7 @@ mod tests {
             Some("detached-task")
         );
         assert!(writer_rx.try_recv().is_err());
-        assert!(buffered.is_empty());
+        assert!(buffered.queues_for_test().is_empty());
 
         if other_harness == "opencode" {
             buffer_push_frame(
@@ -2733,9 +2753,9 @@ mod tests {
             &DispatchPathMetrics::new(),
             &routes,
             &root_channels,
-            &HashMap::new(),
+            &SessionIdentities::default(),
             &mut RetryBuffer::new(),
-            &mut HashMap::new(),
+            &mut PushBuffer::default(),
             &root,
             &completion,
             None,
@@ -3149,9 +3169,9 @@ mod tests {
             &metrics,
             &routes,
             &roots,
-            &HashMap::new(),
+            &SessionIdentities::default(),
             &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut PushBuffer::default(),
             &root,
             &warnings,
             None,
@@ -3275,9 +3295,9 @@ mod tests {
         );
         let mut root_channels = HashMap::new();
         root_channels.insert(root.clone(), HashSet::from([route_key(1, 1)]));
-        let session_identity = HashMap::new();
+        let session_identity = SessionIdentities::default();
         let mut retry_buffer = RetryBuffer::new();
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         let mut completed_tasks = CompletedTaskIds::default();
         let bg_sub_by_session = HashMap::new();
         let mut bg_wake_pending = BgWakePending::new();
@@ -3418,11 +3438,11 @@ mod tests {
             root.clone(),
             HashSet::from([route_key(1, 1), route_key(2, 1)]),
         );
-        let mut session_identity = HashMap::new();
-        remember_session_identity(&mut session_identity, &identity1);
-        remember_session_identity(&mut session_identity, &identity2);
+        let mut session_identity = SessionIdentities::default();
+        session_identity.remember(&identity1);
+        session_identity.remember(&identity2);
         let mut retry_buffer = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
 
         let session_result = fan_out_reliable_push_frame(
             &writer_tx,
@@ -3444,7 +3464,7 @@ mod tests {
             }
         );
         assert!(retry_buffer.is_empty());
-        assert!(push_buffer.is_empty());
+        assert!(push_buffer.queues_for_test().is_empty());
         let session_push = writer_rx.try_recv().expect("session push queued");
         assert_eq!(session_push.header.ty, FrameType::Push);
         assert_eq!(session_push.header.channel, 1);
@@ -3487,6 +3507,32 @@ mod tests {
     }
 
     #[test]
+    fn detached_replay_bounds_the_number_of_session_keys() {
+        const KEYS: usize = 256;
+        let (_root_dir, root) = test_root("replay-key-count");
+        let metrics = DispatchPathMetrics::new();
+        let mut push_buffer = PushBuffer::default();
+        for index in 0..=KEYS {
+            buffer_push_frame(
+                &metrics,
+                &mut push_buffer,
+                ReplayKey {
+                    root: root.clone(),
+                    principal: Some("direct".into()),
+                    harness: "opencode".into(),
+                    session: format!("closed-{index}"),
+                },
+                completion_frame(&format!("task-{index}")),
+            );
+        }
+        assert_eq!(push_buffer.queues_for_test().len(), KEYS);
+        assert!(!push_buffer.keys().any(|key| key.session == "closed-0"));
+        assert!(push_buffer
+            .keys()
+            .any(|key| key.session == format!("closed-{KEYS}")));
+    }
+
+    #[test]
     fn push_buffer_drops_oldest_per_replay_key() {
         let (_root_dir, root) = test_root("subc-buffer-bound-root");
         let key = ReplayKey {
@@ -3495,7 +3541,7 @@ mod tests {
             harness: "opencode".to_string(),
             session: "session-1".to_string(),
         };
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         let total = PUSH_BUFFER_MAX_PER_KEY + 3;
 
         for index in 0..total {
@@ -3507,7 +3553,10 @@ mod tests {
             );
         }
 
-        let buffered = push_buffer.get(&key).expect("buffer entry");
+        let buffered = push_buffer
+            .queues_for_test()
+            .get(&key)
+            .expect("buffer entry");
         assert_eq!(buffered.len(), PUSH_BUFFER_MAX_PER_KEY);
         let tasks: Vec<String> = buffered
             .iter()
@@ -3532,7 +3581,7 @@ mod tests {
         };
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         buffer_push_frame(
             &DispatchPathMetrics::new(),
             &mut push_buffer,
@@ -3557,7 +3606,7 @@ mod tests {
         );
 
         assert_eq!(replayed, 2);
-        assert!(!push_buffer.contains_key(&key));
+        assert!(!push_buffer.queues_for_test().contains_key(&key));
         for expected_task in ["task-a", "task-b"] {
             let frame = writer_rx.try_recv().expect("replayed push");
             assert_eq!(frame.header.ty, FrameType::Push);
@@ -3579,7 +3628,7 @@ mod tests {
         };
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(4);
         let metrics = DispatchPathMetrics::new();
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         buffer_push_frame(
             &DispatchPathMetrics::new(),
             &mut push_buffer,
@@ -3598,7 +3647,7 @@ mod tests {
         );
 
         assert_eq!(replayed, 0);
-        assert!(!push_buffer.contains_key(&key));
+        assert!(!push_buffer.queues_for_test().contains_key(&key));
         assert!(writer_rx.try_recv().is_err());
     }
 
@@ -3857,9 +3906,9 @@ mod tests {
                 &metrics,
                 &routes,
                 &roots,
-                &HashMap::new(),
+                &SessionIdentities::default(),
                 &mut HashMap::new(),
-                &mut HashMap::new(),
+                &mut PushBuffer::default(),
                 completed,
                 root.clone(),
                 completion_frame_with_session(task, "same-session"),
@@ -4118,10 +4167,10 @@ mod tests {
         routes.insert(route_key(9, 1), identity.clone());
         let mut root_channels = HashMap::new();
         root_channels.insert(root.clone(), HashSet::from([route_key(9, 1)]));
-        let mut session_identity = HashMap::new();
-        remember_session_identity(&mut session_identity, &identity);
+        let mut session_identity = SessionIdentities::default();
+        session_identity.remember(&identity);
         let mut retry_buffer = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
@@ -4150,7 +4199,7 @@ mod tests {
                 sent_frames: 0,
             }
         );
-        assert!(push_buffer.is_empty());
+        assert!(push_buffer.queues_for_test().is_empty());
         assert_eq!(
             retry_buffer.get(&route_key(9, 1)).map(VecDeque::len),
             Some(1)
@@ -4183,10 +4232,10 @@ mod tests {
         routes.insert(route_key(9, 1), identity.clone());
         let mut root_channels = HashMap::new();
         root_channels.insert(root.clone(), HashSet::from([route_key(9, 1)]));
-        let mut session_identity = HashMap::new();
-        remember_session_identity(&mut session_identity, &identity);
+        let mut session_identity = SessionIdentities::default();
+        session_identity.remember(&identity);
         let mut retry_buffer = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         let (writer_tx, mut writer_rx) = mpsc::channel::<WriterFrame>(1);
         let metrics = DispatchPathMetrics::new();
         writer_tx
@@ -4275,7 +4324,7 @@ mod tests {
                 Frame::build(FrameType::Ping, control_flags(), 0, 0, 1, Vec::new()).unwrap(),
             ))
             .expect("prefill writer queue");
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         for task in ["replay-1", "replay-2", "replay-3"] {
             buffer_push_frame(
                 &DispatchPathMetrics::new(),
@@ -4297,8 +4346,11 @@ mod tests {
             ),
             1
         );
-        assert_eq!(push_buffer.get(&key).map(VecDeque::len), Some(2));
-        let remaining: Vec<_> = push_buffer[&key]
+        assert_eq!(
+            push_buffer.queues_for_test().get(&key).map(VecDeque::len),
+            Some(2)
+        );
+        let remaining: Vec<_> = push_buffer.queues_for_test()[&key]
             .iter()
             .filter_map(completion_task)
             .collect();
@@ -4325,7 +4377,7 @@ mod tests {
         let third = writer_rx.try_recv().expect("third replayed push");
         assert_eq!(push_frame_task_id(&second).as_deref(), Some("replay-2"));
         assert_eq!(push_frame_task_id(&third).as_deref(), Some("replay-3"));
-        assert!(!push_buffer.contains_key(&key));
+        assert!(!push_buffer.queues_for_test().contains_key(&key));
     }
 
     #[test]
@@ -4345,7 +4397,7 @@ mod tests {
             key.clone(),
             completion_frame("migrated-task"),
         );
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
 
         assert_eq!(
             migrate_retry_buffer_to_push_buffer(
@@ -4358,9 +4410,12 @@ mod tests {
         );
 
         assert!(!retry_buffer.contains_key(&route_key(5, 1)));
-        assert_eq!(push_buffer.get(&key).map(VecDeque::len), Some(1));
         assert_eq!(
-            completion_task(&push_buffer[&key][0]),
+            push_buffer.queues_for_test().get(&key).map(VecDeque::len),
+            Some(1)
+        );
+        assert_eq!(
+            completion_task(&push_buffer.queues_for_test()[&key][0]),
             Some("migrated-task")
         );
     }
@@ -4378,7 +4433,7 @@ mod tests {
         let metrics = DispatchPathMetrics::new();
         drop(writer_rx);
 
-        let mut push_buffer = HashMap::new();
+        let mut push_buffer = PushBuffer::default();
         buffer_push_frame(
             &DispatchPathMetrics::new(),
             &mut push_buffer,
@@ -4397,7 +4452,7 @@ mod tests {
             ),
             0
         );
-        assert!(!push_buffer.contains_key(&key));
+        assert!(!push_buffer.queues_for_test().contains_key(&key));
 
         let mut retry_buffer = HashMap::new();
         buffer_retry_frame(

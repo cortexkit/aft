@@ -905,8 +905,8 @@ mod fixup_tests {
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut RootChannels::default(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
+            &mut PushBuffer::default(),
             &mut HashMap::new(),
             &mut pending,
             &mut installed,
@@ -1228,13 +1228,13 @@ mod ordering_tests {
         )]);
         let mut routes = HashMap::new();
         let mut roots = RootChannels::default();
-        let mut sessions = HashMap::new();
-        let mut buffered = HashMap::from([(
-            replay_key.clone(),
-            VecDeque::from([crate::subc::test_support::completion_frame(
+        let mut sessions = SessionIdentities::default();
+        let mut buffered = PushBuffer::default();
+        buffered
+            .queue(&replay_key)
+            .push_back(crate::subc::test_support::completion_frame(
                 "cross-lane-replay",
-            )]),
-        )]);
+            ));
         let mut live = HashMap::new();
         let mut installed = HashMap::from([(7, 1)]);
         let mut management = HashMap::new();
@@ -1268,7 +1268,7 @@ mod ordering_tests {
             "a queued ACK is not publication authority"
         );
         assert_eq!(
-            buffered[&replay_key].len(),
+            buffered.queues_for_test()[&replay_key].len(),
             1,
             "buffer ownership must survive the blocked ACK"
         );

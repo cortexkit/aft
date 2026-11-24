@@ -57,7 +57,7 @@ fn maintenance_recovery_skips_ordinary_drains_but_replays_configure_tail_after_b
     let channel = route_key(4, 9);
     let routes = HashMap::from([(channel, owner)]);
     let channels = HashMap::from([(root.clone(), HashSet::from([channel]))]);
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
 
     // Bind can precede the configure tail's durable task loading.
     recover_registry_completions(
@@ -99,7 +99,7 @@ fn maintenance_recovery_skips_ordinary_drains_but_replays_configure_tail_after_b
         }
     }
     assert!(output.try_recv().is_err());
-    assert!(buffered.is_empty());
+    assert!(buffered.queues_for_test().is_empty());
     // Recovery refreshes this snapshot even if it finds nothing to send, so
     // keeping the bind's empty snapshot proves no recovery pass ran.
     assert!(metrics.completion_delivery.unacked.lock().unwrap()[&root].is_empty());
@@ -153,7 +153,7 @@ fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
         root.clone(),
         HashSet::from([route_key(2, 1), route_key(3, 1)]),
     )]);
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
     let mut retry = RetryBuffer::new();
     let mut completed = CompletedTaskIds::default();
     // The launching route closed; a core catalog route is still open on the
@@ -163,7 +163,7 @@ fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
         &metrics,
         &routes,
         &channels,
-        &HashMap::new(),
+        &SessionIdentities::default(),
         &mut retry,
         &mut buffered,
         &mut completed,
@@ -172,7 +172,10 @@ fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
         None,
     );
     assert!(output.try_recv().is_err());
-    assert_eq!(buffered[&ReplayKey::from_identity(&owner)].len(), 1);
+    assert_eq!(
+        buffered.queues_for_test()[&ReplayKey::from_identity(&owner)].len(),
+        1
+    );
     assert_eq!(metrics.completion_delivery.health()["unacked_total"], 1);
     recover_registry_completions(
         &writer,
@@ -206,14 +209,14 @@ fn plugin_completion_churn_recovers_from_registry_once_per_connection() {
     assert_eq!((pushed.header.channel, pushed.header.epoch), (4, 9));
     assert_eq!(push_frame_task_id(&pushed).as_deref(), Some(TASK));
     assert!(output.try_recv().is_err());
-    assert!(buffered.is_empty());
+    assert!(buffered.queues_for_test().is_empty());
     // A watchdog emission queued before bind recovery must not duplicate it.
     process_reliable_push_frame(
         &writer,
         &metrics,
         &routes,
         &channels,
-        &HashMap::new(),
+        &SessionIdentities::default(),
         &mut retry,
         &mut buffered,
         &mut completed,
@@ -237,7 +240,7 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
         registry.replay_session(storage.path(), SESSION).unwrap();
         let (writer, mut output) = mpsc::channel(4);
         let metrics = DispatchPathMetrics::new();
-        let mut buffered = HashMap::new();
+        let mut buffered = PushBuffer::default();
         let completion = {
             let _scope = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
             registry
@@ -251,7 +254,7 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
             &metrics,
             &HashMap::new(),
             &HashMap::new(),
-            &HashMap::new(),
+            &SessionIdentities::default(),
             &mut RetryBuffer::new(),
             &mut buffered,
             &mut CompletedTaskIds::default(),
@@ -259,7 +262,7 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
             completion,
             None,
         );
-        assert_eq!(buffered.len(), 1);
+        assert_eq!(buffered.queues_for_test().len(), 1);
         assert!(output.try_recv().is_err());
         registry.detach();
         // Drop every in-memory hold and the original registry, as AFT restart does.
@@ -267,7 +270,7 @@ fn plugin_completion_survives_restart_and_late_configure_recovery_until_ack() {
     let registry = BgTaskRegistry::default();
     let metrics = DispatchPathMetrics::new();
     let (writer, mut output) = mpsc::channel(4);
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
     let mut routes = HashMap::from([(route_key(2, 1), core)]);
     let mut channels = HashMap::from([(root.clone(), HashSet::from([route_key(2, 1)]))]);
     registry.replay_session(storage.path(), SESSION).unwrap();
@@ -384,7 +387,7 @@ fn plugin_bind_before_configure_tail_recovers_unacked_completion() {
     let (writer, mut output) = mpsc::channel(4);
     let routes = HashMap::from([(route_key(7, 1), owner)]);
     let channels = HashMap::from([(root.clone(), HashSet::from([route_key(7, 1)]))]);
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
     recover_registry_completions(
         &writer,
         &metrics,
@@ -425,7 +428,7 @@ fn plugin_bind_before_configure_tail_recovers_unacked_completion() {
         &metrics,
         &routes,
         &channels,
-        &HashMap::new(),
+        &SessionIdentities::default(),
         &mut RetryBuffer::new(),
         &mut buffered,
         &mut CompletedTaskIds::default(),
@@ -441,6 +444,65 @@ fn plugin_bind_before_configure_tail_recovers_unacked_completion() {
     registry.detach();
 }
 
+#[tokio::test(start_paused = true)]
+async fn detached_replay_expiry_recovers_unacked_completion_from_durable_storage() {
+    let (_dir, root) = test_root("completion-after-detached-expiry");
+    let storage = tempfile::tempdir().unwrap();
+    let owner = tests::caller_route(&root, "direct", "opencode");
+    persisted_completion(storage.path(), &root, &owner);
+    let metrics = DispatchPathMetrics::new();
+    let mut identities = SessionIdentities::default();
+    identities.remember(&owner);
+    identities.detach(&owner);
+    let mut buffered = PushBuffer::default();
+    {
+        let registry = BgTaskRegistry::default();
+        registry.replay_session(storage.path(), SESSION).unwrap();
+        let _scope = crate::bash_background::task_identity_scope(Some(owner.task_identity()));
+        let completion = registry
+            .pending_completions_for_session(SESSION)
+            .pop()
+            .unwrap();
+        assert!(metrics.completion_delivery.admit(&root, TASK));
+        buffer_push_frame(
+            &metrics,
+            &mut buffered,
+            ReplayKey::from_identity(&owner),
+            completion.into_push_frame(),
+        );
+        registry.detach();
+    }
+    assert!(!buffered.queues_for_test().is_empty());
+    assert!(identities.replay_key(&root, SESSION).is_some());
+    tokio::time::advance(super::super::detached_replay::TTL).await;
+    identities.expire();
+    buffered.expire(&metrics);
+    assert!(buffered.queues_for_test().is_empty());
+    assert!(identities.replay_key(&root, SESSION).is_none());
+
+    let resumed = BgTaskRegistry::default();
+    resumed.replay_session(storage.path(), SESSION).unwrap();
+    let (writer, mut output) = mpsc::channel(4);
+    let route = route_key(8, 1);
+    let routes = HashMap::from([(route, owner)]);
+    let roots = HashMap::from([(root.clone(), HashSet::from([route]))]);
+    recover_registry_completions(
+        &writer,
+        &metrics,
+        &resumed,
+        &routes,
+        &roots,
+        &mut buffered,
+        &root,
+        None,
+    );
+    let recovered = output.try_recv().expect("durable unacked completion");
+    assert_eq!(recovered.header.channel, route.channel);
+    assert_eq!(push_frame_task_id(&recovered).as_deref(), Some(TASK));
+    assert!(output.try_recv().is_err());
+    resumed.detach();
+}
+
 #[test]
 fn completion_buffer_and_drop_health_counts_transport_outcomes() {
     let (_dir, root) = test_root("completion-push-counters");
@@ -448,7 +510,7 @@ fn completion_buffer_and_drop_health_counts_transport_outcomes() {
     let key = ReplayKey::from_identity(&owner);
     let frame = completion_frame_with_session(TASK, SESSION);
     let metrics = DispatchPathMetrics::new();
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
     buffer_push_frame(&metrics, &mut buffered, key.clone(), frame);
     let (writer, output) = mpsc::channel(1);
     drop(output);
@@ -507,13 +569,13 @@ fn unacked_completion_reoffers_only_after_every_recipient_route_closes() {
     let next = route_key(3, 1);
     let mut routes = HashMap::from([(first, owner.clone()), (second, owner.clone())]);
     let mut channels = HashMap::from([(root.clone(), HashSet::from([first, second]))]);
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
     process_reliable_push_frame(
         &writer,
         &metrics,
         &routes,
         &channels,
-        &HashMap::new(),
+        &SessionIdentities::default(),
         &mut RetryBuffer::new(),
         &mut buffered,
         &mut CompletedTaskIds::default(),
@@ -609,14 +671,14 @@ fn closing_recipient_does_not_duplicate_an_outstanding_retry_copy() {
         root.clone(),
         HashSet::from([route_key(1, 1), route_key(2, 1)]),
     )]);
-    let mut buffered = HashMap::new();
+    let mut buffered = PushBuffer::default();
     let mut retry = RetryBuffer::new();
     process_reliable_push_frame(
         &writer,
         &metrics,
         &routes,
         &channels,
-        &HashMap::new(),
+        &SessionIdentities::default(),
         &mut retry,
         &mut buffered,
         &mut CompletedTaskIds::default(),
@@ -709,7 +771,7 @@ fn runner_notice_recovery_retries_same_id_and_stays_delivered_after_restart() {
             &registry,
             &routes,
             &channels,
-            &mut HashMap::new(),
+            &mut PushBuffer::default(),
             &root,
             None,
         );
@@ -749,7 +811,7 @@ fn runner_notice_recovery_retries_same_id_and_stays_delivered_after_restart() {
         &restarted,
         &routes,
         &channels,
-        &mut HashMap::new(),
+        &mut PushBuffer::default(),
         &root,
         None,
     );
@@ -779,7 +841,7 @@ fn retired_thalamus_pi_completion_is_unsendable_without_frames_or_retries() {
         &registry,
         &routes,
         &channels,
-        &mut HashMap::new(),
+        &mut PushBuffer::default(),
         &root,
         None,
     );

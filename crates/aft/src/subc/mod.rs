@@ -1804,12 +1804,8 @@ impl Deref for RouteIdentity {
     }
 }
 
-#[derive(Debug, Clone)]
-struct RetainedSessionIdentity {
-    principal: Option<String>,
-    harness: String,
-    trust: BindTrust,
-}
+mod detached_replay;
+use detached_replay::{PushBuffer, SessionIdentities};
 
 #[derive(Clone)]
 struct BgSub {
@@ -2848,8 +2844,8 @@ fn purge_deleted_root_residents(
     executor: &Executor,
     retry_buffer: &mut RetryBuffer,
     reclaimed_routes: &mut ReclaimedRoutes,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &mut SessionIdentities,
+    push_buffer: &mut PushBuffer,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
@@ -2911,7 +2907,7 @@ fn purge_deleted_root_residents(
         bg_wake_pending.remove(&route);
     }
     root_channels.remove(root_id);
-    session_identity.retain(|(root, _), _| root != root_id);
+    session_identity.remove_root(root_id);
     push_buffer.retain(|key, _| &key.root != root_id);
     bg_wake_epoch.retain(|(root, _), _| root != root_id);
     pending_bash_asks.retain(|_, ask| {
@@ -3795,7 +3791,8 @@ async fn teardown_installed_route(
     pending_responses: &mut PendingSubcResponses,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
+    session_identity: &mut SessionIdentities,
     shutdown: &Arc<Notify>,
     tool_response_body_limit: usize,
     lifecycle_probe: Option<&SubcTestLifecycleProbe>,
@@ -3947,6 +3944,7 @@ async fn teardown_installed_route(
             .values()
             .any(|route| route.root == identity.root && route.session == identity.session);
         if !session_still_routed {
+            session_identity.detach(&identity);
             if let Some(ctx) = executor.actor_context(&identity.root) {
                 // The binding goes with the session's last route, but the edit
                 // mode its runner head's catalog recorded stays in aft.db: the
@@ -4019,49 +4017,6 @@ async fn delay_route_detach_for_test(lifecycle_probe: Option<&SubcTestLifecycleP
     tokio::time::sleep(Duration::from_millis(delay)).await;
 }
 
-fn remember_session_identity(
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    identity: &RouteIdentity,
-) {
-    let key = (identity.root.clone(), identity.session.clone());
-    if matches!(identity.trust, BindTrust::Untrusted)
-        && session_identity
-            .get(&key)
-            .is_some_and(|retained| matches!(retained.trust, BindTrust::FirstParty))
-    {
-        return;
-    }
-
-    // Retained after route Goodbye so reliable session-scoped frames emitted while
-    // the session is detached can still be keyed by the full (root,harness,session)
-    // replay triple. Untrusted binds never overwrite a retained first-party
-    // session identity, because bash completion replay is an observation channel.
-    session_identity.insert(
-        key,
-        RetainedSessionIdentity {
-            principal: identity.task_identity().principal,
-            harness: identity.harness.clone(),
-            trust: identity.trust,
-        },
-    );
-}
-
-fn replay_key_for_session(
-    session_identity: &HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    root: &ProjectRootId,
-    session: &str,
-) -> Option<(push::ReplayKey, BindTrust)> {
-    let retained = session_identity.get(&(root.clone(), session.to_string()))?;
-    Some((
-        push::ReplayKey {
-            root: root.clone(),
-            principal: retained.principal.clone(),
-            harness: retained.harness.clone(),
-            session: session.to_string(),
-        },
-        retained.trust,
-    ))
-}
 /// Sync command dispatch, passed in from `main` (the binary owns the command
 /// table). Invoked only inside executor jobs in subc mode.
 pub type DispatchFn = fn(RawRequest, &AppContext) -> Response;
@@ -4651,8 +4606,8 @@ async fn drain_pending_route_bind_completions(
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut RootChannels,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &mut SessionIdentities,
+    push_buffer: &mut PushBuffer,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -5000,9 +4955,8 @@ where
         HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
     let mut root_channels = RootChannels::default();
-    let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
-        HashMap::new();
-    let mut push_buffer: HashMap<push::ReplayKey, VecDeque<PushFrame>> = HashMap::new();
+    let mut session_identity = SessionIdentities::default();
+    let mut push_buffer = PushBuffer::default();
     let mut retry_buffer: RetryBuffer = HashMap::new();
     let mut reclaimed_routes = ReclaimedRoutes::default();
     let mut completed_tasks = push::CompletedTaskIds::default();
@@ -5339,6 +5293,7 @@ where
             Some(ended) = scopes_ended_rx.recv() => {
                 dispatch_path_metrics.mark_frame_loop_step("run_scopes::revoke", "", 0);
                 run_scopes.revoke(&ended.stamp);
+                session_identity.end_scope(&ended.stamp, &mut push_buffer, &dispatch_path_metrics);
                 ledger_edge.scope_ended(&ended.keys);
                 let keys: Vec<_> = pending_bash_asks.iter().filter(|(_, pending)| {
                     pending.cancel.scope.as_ref().is_some_and(|stamp| scope_describe::stamp_key(stamp) == scope_describe::stamp_key(&ended.stamp))
@@ -5513,6 +5468,7 @@ where
                             &mut pending_binds,
                             &mut retry_buffer,
                             &mut push_buffer,
+                            &mut session_identity,
                             &shutdown,
                             tool_response_body_limit,
                             lifecycle_probe.as_ref(),
@@ -5592,6 +5548,7 @@ where
                             &mut pending_responses,
                             &mut retry_buffer,
                             &mut push_buffer,
+                            &mut session_identity,
                             &shutdown,
                             &configure_completion_tx,
                             &dispatch_path_metrics,
@@ -6429,6 +6386,8 @@ where
                 orphaned_children.request(shared_app.lsp_child_registry());
                 dispatch_path_metrics.mark_frame_loop_step("reap_idle_lsp_servers", "", 0);
                 let now = Instant::now();
+                session_identity.expire();
+                push_buffer.expire(&dispatch_path_metrics);
                 reap_idle_lsp_servers(now, &live_roots, &executor);
                 dispatch_path_metrics.mark_frame_loop_step("reap_idle_roots_with_presence", "", 0);
                 let presence = root_presence.latest();
@@ -7284,8 +7243,8 @@ async fn handle_route_bind_completion(
     a0: &A0Egress,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     root_channels: &mut RootChannels,
-    session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    session_identity: &mut SessionIdentities,
+    push_buffer: &mut PushBuffer,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     installed_route_epochs: &mut HashMap<u16, u32>,
@@ -7472,7 +7431,7 @@ async fn handle_route_bind_completion(
         return Ok(());
     }
 
-    remember_session_identity(session_identity, &completion.identity);
+    session_identity.remember(&completion.identity);
     let replay_key = push::ReplayKey::from_identity(&completion.identity);
     let bind_trust = completion.identity.trust;
     route_delivery::install_route(
@@ -7745,7 +7704,8 @@ async fn handle_control_request(
     active_tool_calls: &ActiveToolCalls,
     pending_responses: &mut PendingSubcResponses,
     retry_buffer: &mut RetryBuffer,
-    push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
+    push_buffer: &mut PushBuffer,
+    session_identity: &mut SessionIdentities,
     shutdown: &Arc<Notify>,
     control_completion_tx: &mpsc::Sender<ControlCompletion>,
     metrics: &Arc<DispatchPathMetrics>,
@@ -8016,6 +7976,7 @@ async fn handle_control_request(
                         pending_binds,
                         retry_buffer,
                         push_buffer,
+                        session_identity,
                         shutdown,
                         tool_response_body_limit,
                         lifecycle_probe,
@@ -8151,6 +8112,7 @@ async fn handle_control_request(
                     pending_binds,
                     retry_buffer,
                     push_buffer,
+                    session_identity,
                     shutdown,
                     tool_response_body_limit,
                     lifecycle_probe,
@@ -15974,8 +15936,8 @@ mod tests {
 
         let mut retry_buffer = HashMap::new();
         let mut reclaimed_routes = ReclaimedRoutes::default();
-        let mut session_identity = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut session_identity = SessionIdentities::default();
+        let mut push_buffer = PushBuffer::default();
         let mut bg_subs = HashMap::from([(
             route,
             BgSub {
@@ -16151,8 +16113,8 @@ mod tests {
             &executor,
             &mut HashMap::new(),
             &mut ReclaimedRoutes::default(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
+            &mut PushBuffer::default(),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
@@ -16851,8 +16813,8 @@ mod tests {
             &executor,
             &metrics,
         );
-        let mut session_identity = HashMap::new();
-        let mut push_buffer = HashMap::new();
+        let mut session_identity = SessionIdentities::default();
+        let mut push_buffer = PushBuffer::default();
         let mut bg_subs = HashMap::new();
         let mut bg_sub_by_session = HashMap::new();
         let mut bg_wake_pending = BgWakePending::new();
@@ -18894,8 +18856,10 @@ mod tests {
             },
         )]);
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
-        let mut push_buffer =
-            HashMap::from([(replay_key, VecDeque::from([completion_frame("b2-replay")]))]);
+        let mut push_buffer = PushBuffer::default();
+        push_buffer
+            .queue(&replay_key)
+            .push_back(completion_frame("b2-replay"));
         let (writer_tx, mut writer_rx) = mpsc::channel(8);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let executor = Arc::new(Executor::new());
@@ -18913,7 +18877,7 @@ mod tests {
             &a0,
             &mut published_routes,
             &mut RootChannels::default(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
             &mut push_buffer,
             &mut HashMap::new(),
             &mut pending_binds,
@@ -18949,7 +18913,7 @@ mod tests {
             &a0,
             &mut published_routes,
             &mut RootChannels::default(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
             &mut push_buffer,
             &mut HashMap::new(),
             &mut pending_binds,
@@ -19046,8 +19010,8 @@ mod tests {
             &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &mut HashMap::new(),
             &mut RootChannels::default(),
-            &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut SessionIdentities::default(),
+            &mut PushBuffer::default(),
             &mut HashMap::new(),
             &mut pending_binds,
             &mut installed_route_epochs,
@@ -22213,7 +22177,8 @@ mod terminal_lifecycle_tests {
                         &mut registry,
                         &mut HashMap::new(),
                         &mut RetryBuffer::new(),
-                        &mut HashMap::new(),
+                        &mut PushBuffer::default(),
+                        &mut SessionIdentities::default(),
                         &shutdown_signal,
                         MAX_FRAME_BODY_LEN as usize,
                         None,
