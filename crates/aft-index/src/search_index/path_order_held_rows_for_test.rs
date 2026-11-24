@@ -12,7 +12,8 @@ pub(crate) fn note(root: &Path, rows: usize) {
 }
 
 /// The most rows held at once since the last call, and resets it.
-pub(crate) fn take(root: &Path) -> usize {
+#[doc(hidden)]
+pub fn take(root: &Path) -> usize {
     PEAKS
         .get_or_init(Default::default)
         .lock()

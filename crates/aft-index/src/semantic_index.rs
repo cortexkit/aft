@@ -498,6 +498,12 @@ fn retain_reuse_files(
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
+mod test_clock;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use test_clock::with_lane_pause_clock;
+
 /// Delay before the cold semantic build retries an unreachable embedding backend.
 /// `AFT_SEMANTIC_RETRY_BACKOFF_MS` is a test seam that shrinks the schedule so
 /// recovery integration tests do not wait real 15s+ windows; not a user knob.

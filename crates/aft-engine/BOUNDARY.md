@@ -331,6 +331,14 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `data_layer::meaning` | visibility widened | `aft-index` | Keep the preexisting embedding test fixtures available through the engine bridge. |
 | `data_layer::meaning::use_constant_vectors` | test-support visibility widened | `aft-index` | Preserve the deterministic embedding fixture for parity checks. |
 
+| `data_layer::checkout::composed_checks` | test-support drivers | `aft-index` | Keep private snapshot and refresh assertions and let composition supply inspect’s real entry-point policy. |
+| `semantic_index::with_lane_pause_clock` | test-support compatibility re-export | `aft-index` | Keep the existing clock helper name after moving the implementation beside `semantic_index.rs`. |
+| `DataCheckout::configure_meaning_without_fill_for_test` | test-support visibility widened | `aft-index` | Change fixture meaning configuration without starting a fill from the test itself. |
+| `data_layer::surfaces::OFF` | visibility widened | `aft-index` | Keep the exact off-state wording in composed status checks. |
+| `data_layer::surfaces::UNAVAILABLE` | visibility widened | `aft-index` | Keep the exact unavailable-state wording in composed status checks. |
+| `data_layer::surfaces::reason::HOME_ROOT` | visibility widened | `aft-index` | Check composed status against its existing home-root reason. |
+| `data_layer::surfaces::reason::ROOT_TOO_BROAD` | visibility widened | `aft-index` | Check composed status against its existing broad-root reason. |
+
 ### Index test bridge
 
 | Item | Kind | Owning crate | Reason |
@@ -426,6 +434,17 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `memory_census::rollup_snapshot` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
 | `data_layer::checkout::CallGraphHold` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
 | `data_layer::checkout::hold_call_graph_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `search_state::rerank::remote::remote_fixture` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `search_state::rerank::synapse::synapse_fixture` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `data_layer::outline::tables::without_sharing` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `data_layer::outline::tables::shared` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `data_layer::text_scope::today_only` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `grep_executor::set` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `search_index::path_order_held_rows_for_test::take` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `search_state::request_files::record_disk_read` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `data_layer::query::MemorySlices` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `watcher_filter::WatcherExclusion` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
+| `watcher_filter::ForcedExclusionFailure` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
 
 ## Visibility widened for cross-crate callers
 

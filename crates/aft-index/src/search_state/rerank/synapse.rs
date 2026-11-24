@@ -238,7 +238,8 @@ fn parse_response(response: &Value, pin: &str, count: usize) -> Result<Vec<f32>,
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "synapse_fixture.rs"]
-pub(crate) mod synapse_fixture;
+#[doc(hidden)]
+pub mod synapse_fixture;
 
 #[cfg(test)]
 pub(crate) mod tests {

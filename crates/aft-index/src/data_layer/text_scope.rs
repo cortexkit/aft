@@ -322,7 +322,8 @@ pub mod test_hooks {
         static ANSWERS: Cell<usize> = const { Cell::new(0) };
     }
 
-    pub(crate) fn today_only() -> bool {
+    #[doc(hidden)]
+    pub fn today_only() -> bool {
         TODAY_ONLY.with(Cell::get)
     }
 

@@ -644,7 +644,8 @@ impl WatcherExclusionSource {
     feature = "test-support"
 ))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WatcherExclusion {
+#[doc(hidden)]
+pub struct WatcherExclusion {
     path: PathBuf,
     source: WatcherExclusionSource,
 }
@@ -1585,7 +1586,8 @@ fn forced_exclusion_failures() -> &'static Mutex<std::collections::HashSet<PathB
     any(test, feature = "test-support"),
     any(target_os = "linux", target_os = "macos")
 ))]
-pub(crate) struct ForcedExclusionFailure(PathBuf);
+#[doc(hidden)]
+pub struct ForcedExclusionFailure(PathBuf);
 
 #[cfg(all(
     any(test, feature = "test-support"),

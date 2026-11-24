@@ -658,7 +658,8 @@ pub mod read_probe {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use read_probe::record_disk_read;
+#[doc(hidden)]
+pub use read_probe::record_disk_read;
 
 #[cfg(test)]
 mod tests {

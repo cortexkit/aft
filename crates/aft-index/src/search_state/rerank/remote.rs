@@ -162,7 +162,8 @@ fn parse_scores(value: &Value, count: usize, tei: bool) -> Result<Vec<f32>, Rera
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "remote_fixture.rs"]
-pub(crate) mod remote_fixture;
+#[doc(hidden)]
+pub mod remote_fixture;
 
 #[cfg(test)]
 pub(crate) mod tests {

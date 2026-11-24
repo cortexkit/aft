@@ -2301,8 +2301,9 @@ impl DataCheckout {
     /// Gives meaning search `config` as [`Self::configure_meaning`] does,
     /// without starting a fill, so a test can read how the plane reports
     /// before any model loads.
-    #[cfg(test)]
-    pub(crate) fn configure_meaning_without_fill_for_test(
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn configure_meaning_without_fill_for_test(
         &self,
         config: Option<&crate::config::SemanticBackendConfig>,
     ) {

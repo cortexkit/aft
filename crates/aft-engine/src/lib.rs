@@ -342,6 +342,8 @@ pub(crate) use aft_base::persistence_gate;
 pub mod test_bridge;
 
 #[cfg(test)]
+mod index_checkout_composed_tests;
+#[cfg(test)]
 mod index_embedding_composed_tests;
 #[cfg(any(test, feature = "test-support"))]
 mod index_publication_fixture;

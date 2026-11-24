@@ -15,3 +15,4 @@ pub fn with_lane_pause_clock<T>(
         Restore(LANE_PAUSE_TEST_CLOCK.with(|current| current.replace(Some(clock.clone()))));
     run(clock)
 }
+use super::LANE_PAUSE_TEST_CLOCK;

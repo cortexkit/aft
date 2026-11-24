@@ -45,6 +45,9 @@ use super::slice::FileSlice;
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
 use staged_records::StagedKind;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod composed_checks;
 mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
@@ -6361,6 +6364,7 @@ impl Checkout {
 
 #[cfg(test)]
 mod tests {
+    use super::composed_checks::{callers_of, family, write};
     use super::*;
     use aft_store::text::plan_pattern;
 

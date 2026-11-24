@@ -125,7 +125,8 @@ pub(crate) struct TableStats {
 }
 
 /// The process's shared symbol tables.
-pub(crate) fn shared() -> &'static Tables {
+#[doc(hidden)]
+pub fn shared() -> &'static Tables {
     static TABLES: OnceLock<Tables> = OnceLock::new();
     TABLES.get_or_init(|| Tables::new(KEPT_BYTES))
 }
@@ -252,7 +253,8 @@ fn sharing_off() -> bool {
 /// Runs `work` on this thread as if no table were shared: nothing is
 /// found here and nothing is listed, as before tables were shared.
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn without_sharing<T>(work: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn without_sharing<T>(work: impl FnOnce() -> T) -> T {
     SHARING_OFF.with(|off| off.set(true));
     let result = work();
     SHARING_OFF.with(|off| off.set(false));

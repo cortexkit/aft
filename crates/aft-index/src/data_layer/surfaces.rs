@@ -36,12 +36,14 @@ use aft_store::family::NewerFormat;
 
 /// A plane's state on the status surfaces, in the words the consumers of
 /// `feature_status` already use.
-pub(crate) const OFF: &str = "off";
+#[doc(hidden)]
+pub const OFF: &str = "off";
 #[doc(hidden)]
 pub const BUILDING: &str = "building";
 #[doc(hidden)]
 pub const READY: &str = "ready";
-pub(crate) const UNAVAILABLE: &str = "unavailable";
+#[doc(hidden)]
+pub const UNAVAILABLE: &str = "unavailable";
 
 /// Why a plane is off or unavailable.
 #[doc(hidden)]
@@ -73,8 +75,10 @@ pub mod reason {
     pub const REQUIRES_NEWER_READER: &str = crate::persisted_format::CODE;
     /// Configure leaves the root unindexed: it is too broad to index (a
     /// filesystem or volume root), or it is the home folder.
-    pub(crate) const ROOT_TOO_BROAD: &str = crate::feature_status::cause::ROOT_TOO_BROAD;
-    pub(crate) const HOME_ROOT: &str = crate::feature_status::cause::HOME_ROOT;
+    #[doc(hidden)]
+    pub const ROOT_TOO_BROAD: &str = crate::feature_status::cause::ROOT_TOO_BROAD;
+    #[doc(hidden)]
+    pub const HOME_ROOT: &str = crate::feature_status::cause::HOME_ROOT;
 }
 
 /// This root's checkout in the data layer, as a status read finds it.

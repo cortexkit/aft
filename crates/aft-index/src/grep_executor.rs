@@ -674,7 +674,8 @@ pub mod scan_order_for_test {
 
     static ORDERS: OnceLock<Mutex<HashMap<PathBuf, bool>>> = OnceLock::new();
 
-    pub(crate) fn set(root: &Path, reversed: bool) {
+    #[doc(hidden)]
+    pub fn set(root: &Path, reversed: bool) {
         if let Ok(mut orders) = ORDERS.get_or_init(Default::default).lock() {
             orders.insert(root.to_path_buf(), reversed);
         }
