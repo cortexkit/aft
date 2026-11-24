@@ -270,7 +270,7 @@ mod standalone;
 pub use self::health::SubcTestHealthRollupProbe;
 mod bash_notice_text;
 mod keepalive;
-mod manifest;
+pub(crate) mod manifest;
 mod page_collect;
 mod permissions;
 mod persistence;

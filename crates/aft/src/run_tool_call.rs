@@ -29,25 +29,7 @@ pub fn is_read_only_request(request: &RawRequest) -> bool {
     } else {
         &request.command
     };
-    matches!(
-        command.strip_prefix("aft_").unwrap_or(command),
-        "outline"
-            | "zoom"
-            | "read"
-            | "grep"
-            | "glob"
-            | "search"
-            | "semantic_search"
-            | "callgraph"
-            | "callers"
-            | "call_tree"
-            | "impact"
-            | "trace_to"
-            | "trace_to_symbol"
-            | "trace_data"
-            | "version"
-            | "ping"
-    )
+    crate::subc::manifest::is_read_only_command(command.strip_prefix("aft_").unwrap_or(command))
 }
 
 /// Finalizes a formatted tool result. It receives the agent-visible text so the finalizer can

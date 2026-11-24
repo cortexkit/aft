@@ -28,6 +28,10 @@ fn backup_bookkeeping_is_conservative_for_mutations_and_tool_envelopes() {
         "trace_to",
         "trace_to_symbol",
         "trace_data",
+        "inspect",
+        "inspect_tier2_run",
+        "undo_preview",
+        "safety_purge_paths",
     ] {
         assert!(
             is_read_only_request(&request(command, json!({}))),
@@ -57,15 +61,12 @@ fn backup_bookkeeping_is_conservative_for_mutations_and_tool_envelopes() {
         "inline_symbol",
         "ast_replace",
         "undo",
-        "undo_preview",
         "checkpoint",
         "restore_checkpoint",
         "safety_purge",
-        "safety_purge_paths",
         "bash",
         "powershell",
         "configure",
-        "inspect",
         "unknown",
         "",
     ] {

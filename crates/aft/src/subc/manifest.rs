@@ -24,6 +24,13 @@ pub(super) fn is_subc_agent_core_tool(name: &str) -> bool {
 
 pub(crate) use crate::host_tool_names::{is_native_plumbing_call, is_subc_native_plumbing_tool};
 
+pub(crate) fn is_read_only_command(command: &str) -> bool {
+    matches!(
+        command_lane_explicit(command),
+        Some(Lane::PureRead | Lane::SerialLspStatus | Lane::HeavyInit)
+    )
+}
+
 pub(super) fn command_lane_explicit(command: &str) -> Option<Lane> {
     match command {
         "ping"
