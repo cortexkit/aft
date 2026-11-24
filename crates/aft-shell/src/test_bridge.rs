@@ -349,3 +349,7 @@ pub fn cleanup_expired(
 ) -> crate::output_store::CleanupReport {
     crate::output_store::cleanup_expired(harness, retention)
 }
+
+pub fn seal_spawn(metadata: &persistence::PersistedTask) {
+    crate::gh_shim_ticket::seal_spawn(metadata);
+}
