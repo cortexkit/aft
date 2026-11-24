@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tree_sitter::Node;
 
-use super::source_text::{read_source_text, write_skipped_files, SourceText, NOT_VALID_UTF8};
+use super::source_text::{write_skipped_files, NOT_VALID_UTF8};
 #[cfg(test)]
 use crate::cache_freshness;
 use crate::cache_freshness::FileFreshness;
@@ -40,8 +40,8 @@ struct ComplexityContribution {
     parse_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     language_skipped: Option<String>,
-    /// Set when the file could not be analyzed at all (its bytes are not
-    /// valid UTF-8). The aggregate names it in `skipped_files`.
+    /// Set when the file could not be analyzed at all (too large, not valid
+    /// UTF-8, or unreadable). The aggregate names it in `skipped_files`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     skipped_reason: Option<String>,
 }
@@ -424,41 +424,103 @@ pub(crate) fn aggregate_complexity_contributions_with_limit(
 }
 
 /// Scan one scope file. `Ok(None)` means the file vanished between the walk
-/// and this scan and is treated as deleted. A file that is not valid UTF-8 is
-/// a per-file skip; other read failures keep failing the scan as before.
+/// and this scan and is treated as deleted. A file that is too large, not
+/// valid UTF-8 or unreadable is a named per-file skip, never a failure of the
+/// whole category.
 fn scan_file(project_root: &Path, path: &Path) -> Result<Option<FileComplexityScan>, String> {
-    let (freshness, _permit) = match super::source_text::source_freshness(path) {
-        Ok(freshness) => freshness,
+    use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("freshness failed for {}: {error}", path.display())),
+        Err(error) => {
+            return Ok(Some(unreadable_scan(project_root, path, 0, &error)));
+        }
+    };
+    let _permit = super::source_text::source_scan_permit(metadata.len());
+    let metadata_freshness = FileFreshness {
+        mtime: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash: crate::cache_freshness::zero_hash(),
+    };
+    let scan = |freshness: FileFreshness,
+                contribution: ComplexityContribution|
+     -> Result<Option<FileComplexityScan>, String> {
+        Ok(Some(FileComplexityScan {
+            path: path.to_path_buf(),
+            freshness,
+            contribution,
+        }))
     };
     // Only languages with a complexity table are read: a data or document
     // file (JSON, YAML, Markdown, ...) can never contribute, so its bytes,
-    // whatever their encoding, are never opened as source.
+    // whatever their encoding, are never opened, and its stat is enough to
+    // notice a change.
     let analyzable =
         detect_language(path).is_some_and(|language| language_spec(language).is_some());
-    let contribution = if freshness.size > super::source_text::MAX_SOURCE_BYTES {
-        unreadable_contribution(project_root, path, super::source_text::TOO_LARGE)
-    } else if analyzable {
-        match read_source_text(path) {
-            Ok(SourceText::Text(source)) => scan_source(project_root, path, &source),
-            Ok(SourceText::NotUtf8) => unreadable_contribution(project_root, path, NOT_VALID_UTF8),
-            Ok(SourceText::TooLarge) => {
-                unreadable_contribution(project_root, path, super::source_text::TOO_LARGE)
-            }
-            Ok(SourceText::Vanished) => return Ok(None),
-            Err(error) => return Err(format!("read failed for {}: {error}", path.display())),
-        }
-    } else {
+    if metadata.len() > super::source_text::MAX_SOURCE_BYTES {
+        return scan(
+            metadata_freshness,
+            unreadable_contribution(project_root, path, TOO_LARGE),
+        );
+    }
+    if !analyzable {
         // `scan_source` reports the language as skipped before it looks at
         // the source text, so no text is needed here.
-        scan_source(project_root, path, "")
+        return scan(metadata_freshness, scan_source(project_root, path, ""));
+    }
+    let bytes = match read_source_bytes(path) {
+        Ok(SourceBytes::Bytes(bytes)) => bytes,
+        Ok(SourceBytes::TooLarge) => {
+            return scan(
+                metadata_freshness,
+                unreadable_contribution(project_root, path, TOO_LARGE),
+            );
+        }
+        Ok(SourceBytes::Vanished) => return Ok(None),
+        Err(error) => {
+            return Ok(Some(unreadable_scan(
+                project_root,
+                path,
+                metadata.len(),
+                &error,
+            )));
+        }
     };
-    Ok(Some(FileComplexityScan {
+    // Hash the bytes already read instead of reading the file a second time.
+    let freshness = FileFreshness {
+        content_hash: crate::cache_freshness::hash_bytes(&bytes),
+        ..metadata_freshness
+    };
+    let contribution = match String::from_utf8(bytes) {
+        Ok(source) => scan_source(project_root, path, &source),
+        Err(_) => unreadable_contribution(project_root, path, NOT_VALID_UTF8),
+    };
+    scan(freshness, contribution)
+}
+
+/// A file whose read failed. Its freshness carries no real mtime and no
+/// content hash, so the cached skip never verifies as fresh and the file is
+/// tried again on the next scan: fixing permissions changes neither its mtime
+/// nor its size.
+fn unreadable_scan(
+    project_root: &Path,
+    path: &Path,
+    size: u64,
+    error: &std::io::Error,
+) -> FileComplexityScan {
+    FileComplexityScan {
         path: path.to_path_buf(),
-        freshness,
-        contribution,
-    }))
+        freshness: FileFreshness {
+            mtime: std::time::UNIX_EPOCH,
+            size,
+            content_hash: crate::cache_freshness::zero_hash(),
+        },
+        contribution: unreadable_contribution(
+            project_root,
+            path,
+            &super::source_text::unreadable_reason(error),
+        ),
+    }
 }
 
 fn unreadable_contribution(
@@ -1076,6 +1138,89 @@ mod tests {
                 .is_none(),
             "a file removed after the walk is treated as deleted"
         );
+    }
+
+    #[test]
+    fn complexity_reads_each_analyzable_file_once_and_never_hashes_data_files() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        let source = root.join("lib.rs");
+        let data = root.join("data.json");
+        fs::write(&source, "fn f(a: bool) -> u8 { if a { 1 } else { 0 } }\n").unwrap();
+        fs::write(&data, "{\"k\": 1}\n").unwrap();
+        // Called on this thread so the thread-local hash counter sees it.
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        let source_scan = scan_file(root, &source).unwrap().unwrap();
+        let data_scan = scan_file(root, &data).unwrap().unwrap();
+        assert_eq!(source_scan.contribution.functions.len(), 1);
+        assert_eq!(data_scan.contribution.language_skipped.as_deref(), Some("json"));
+        assert_eq!(
+            cache_freshness::hash_file_if_small_count_for_debug(),
+            0,
+            "freshness must hash the bytes already read, and never a data file"
+        );
+        assert_eq!(super::super::source_text::source_read_count_for_debug(&source), 1);
+        assert_eq!(super::super::source_text::source_read_count_for_debug(&data), 0);
+        // The freshness still proves the content it was computed from.
+        assert_eq!(
+            source_scan.freshness,
+            cache_freshness::collect(&source).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn complexity_unreadable_file_is_a_named_skip_not_a_failed_category() {
+        let dir = tempfile::tempdir().expect("project");
+        let root = dir.path();
+        let good = root.join("good.rs");
+        fs::write(&good, "fn good() {}\n").unwrap();
+        // A FIFO fails the source read with an error other than NotFound,
+        // even for a privileged user, so it stands in for an unreadable file.
+        let unreadable = root.join("unreadable.rs");
+        crate::bounded_io::tests::fifo(&unreadable);
+        let scope = crate::inspect::JobScope::for_project(root);
+        let job = InspectJob {
+            job_id: 1,
+            key: crate::inspect::JobKey::for_category_scope(InspectCategory::Complexity, &scope),
+            category: InspectCategory::Complexity,
+            scope_files: vec![good.clone(), unreadable.clone()],
+            project_root: root.to_path_buf(),
+            inspect_dir: root.join("inspect"),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            symbol_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::parser::SymbolCache::new(),
+            )),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+        let success = run_complexity_scan(&job)
+            .outcome
+            .expect("one unreadable file must not fail the category");
+        assert_eq!(success.scanned_files, vec![good]);
+        assert_eq!(success.aggregate["complete"], json!(false));
+        let rows = success.aggregate["skipped_files"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["file"], "unreadable.rs");
+        assert!(
+            rows[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("could not be read: ")),
+            "{rows:?}"
+        );
+        // The cached skip must not verify as fresh, or it would outlive a
+        // permission fix that changes neither mtime nor size.
+        let skipped = success
+            .contributions
+            .iter()
+            .find(|contribution| contribution.file_path == unreadable)
+            .expect("the skip is a contribution");
+        assert!(!matches!(
+            cache_freshness::verify_file(&unreadable, &skipped.freshness),
+            cache_freshness::FreshnessVerdict::HotFresh
+                | cache_freshness::FreshnessVerdict::ContentFresh { .. }
+        ));
     }
 
     fn test_contribution(
