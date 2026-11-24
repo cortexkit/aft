@@ -532,6 +532,42 @@ mod tests {
     }
 
     #[test]
+    fn review_opus12_supplied_source_invalidates_cached_tree() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("snapshot.rs");
+        let disk = "fn old() {}\n";
+        let source = "struct B;  \n";
+        assert_eq!(disk.len(), source.len());
+        std::fs::write(&path, disk).unwrap();
+        let mut parser = FileParser::new();
+        assert_eq!(
+            parser
+                .parse(&path)
+                .unwrap()
+                .0
+                .root_node()
+                .named_child(0)
+                .unwrap()
+                .kind(),
+            "function_item"
+        );
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let (tree, _) = parser
+            .parse_with_source(
+                &path,
+                source,
+                mtime,
+                source.len() as u64,
+                content_hash_for_source(source),
+            )
+            .unwrap();
+        assert_eq!(
+            tree.root_node().named_child(0).unwrap().kind(),
+            "struct_item"
+        );
+    }
+
+    #[test]
     fn h_header_missing_nodes_count_as_errors_and_keep_c_when_all_fail() {
         let source = "int missing_semicolon(void)";
         let old_c = parse_source_with_parser(Path::new("missing.c"), source, LangId::C).unwrap();

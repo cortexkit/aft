@@ -2218,7 +2218,7 @@ impl FileParser {
         /// real cost when warming the symbol cache / call graph over a large repo.
         /// This variant takes the already-read `source` and the already-computed
         /// `current_mtime`/`size`/`content_hash` so the cold path does one read and
-        /// one hash. Tree-cache freshness semantics are identical to `parse()`.
+        /// one hash. Reuse requires the tree to match the supplied bytes.
         fn parse_with_source(
             &mut self,
             path: &Path,
@@ -2243,18 +2243,12 @@ impl FileParser {
                 })?;
 
             let canon = path.to_path_buf();
-            let needs_reparse = match self.cache.get(&canon) {
-                Some(cached) => !cached_file_is_fresh(
-                    path,
-                    cached.mtime,
-                    cached.size,
-                    cached.content_hash,
-                    current_mtime,
-                ),
-                None => true,
-            };
+            let reusable = size <= cache_freshness::CONTENT_HASH_SIZE_CAP
+                && self.cache.get(&canon).is_some_and(|cached| {
+                    cached.size == size && cached.content_hash == content_hash
+                });
 
-            if needs_reparse {
+            if !reusable {
                 let (tree, lang) = parse_resolved_source(path, source, lang)?;
                 #[cfg(any(test, feature = "test-support"))]
                 work_counters::TREE_PARSES.with(|count| count.set(count.get() + 1));
