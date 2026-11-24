@@ -787,6 +787,7 @@ class EngineUnwiredGateTests(unittest.TestCase):
     def test_split_preserves_ranking_fence_at_each_moved_owner(self) -> None:
         source = "crates/aft/src/"
         engine = "crates/aft-engine/src/"
+        index = "crates/aft-index/src/"
         tools = "crates/aft-tools/src/"
         semantic = source + "commands/semantic_search/"
         engine_state = engine + "search_state/"
@@ -826,21 +827,32 @@ class EngineUnwiredGateTests(unittest.TestCase):
             )
         ]
         root = Path(__file__).resolve().parents[2]
-        for old, new in moves:
+        indexed = tuple(engine + path for path in (
+            "search_index.rs", "search_index/exact_lane.rs", "search_state/",
+            "search_b2/", "semantic_index.rs",
+        ))
+        for old, owner in moves:
+            if owner.startswith(indexed):
+                self.assertEqual(derive_slice_class([owner]), "ranking", owner)
+                new = index + owner.removeprefix(engine)
+            else:
+                new = owner
             with self.subTest(old=old, new=new):
                 self.assertTrue((root / new).is_file(), "update the fence when its owner moves")
                 self.assertEqual(derive_slice_class([old]), "ranking")
                 self.assertEqual(derive_slice_class([new]), derive_slice_class([old]))
 
-    def test_facade_tools_and_engine_roots_require_and_accept_the_split_descriptor(self) -> None:
+    def test_split_crate_roots_require_and_accept_the_split_descriptor(self) -> None:
         root = Path(__file__).resolve().parents[2]
         descriptor_path = root / "benchmarks/aft-search/slice-descriptors/crate-split-step4.json"
         descriptor = json.loads(descriptor_path.read_text())
         self.assertIn(TOOL_CALL_PARITY_FIXTURE_SOURCE, descriptor["fixtures"])
         for fixture in descriptor["fixtures"]:
+            if fixture == "crates/aft-engine/src/search_state/mod.rs":
+                fixture = "crates/aft-index/src/search_state/mod.rs"
             self.assertTrue((root / fixture).is_file(), fixture)
 
-        for crate in ("aft", "aft-tools", "aft-engine"):
+        for crate in ("aft", "aft-tools", "aft-engine", "aft-index"):
             path = f"crates/{crate}/src/lib.rs"
             with self.subTest(path=path):
                 derived, missing_ranking = resolve_descriptor(None, [path])
