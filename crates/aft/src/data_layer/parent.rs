@@ -93,9 +93,24 @@ impl ChildCheckouts {
 
     /// Records the watcher's changed `paths` (absolute) in the child that
     /// holds each one. Child repositories never nest: discovery does not
-    /// look inside one.
+    /// look inside one. A child whose bind is in progress is waited for only
+    /// when it holds one of the paths, so the bind's scan sees the change;
+    /// the other children's paths are recorded without waiting for it.
     pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
-        for checkout in self.bound() {
+        let slots = self
+            .inner
+            .lock()
+            .slots
+            .iter()
+            .map(|(child, slot)| (child.clone(), Arc::clone(slot)))
+            .collect::<Vec<_>>();
+        for (child, slot) in slots {
+            if !paths.iter().any(|path| path.starts_with(&child)) {
+                continue;
+            }
+            let Some(checkout) = slot.lock().clone() else {
+                continue;
+            };
             let held = paths
                 .iter()
                 .filter(|path| path.starts_with(checkout.root()))
