@@ -256,9 +256,8 @@ pub fn handle_remove_import(req: &RawRequest, ctx: &AppContext) -> Response {
     // restored — the import was NOT removed. Report that honestly with an error
     // instead of claiming `removed: true`.
     if write_result.rolled_back {
-        return Response::error(
-            &req.id,
-            "generated_invalid_syntax",
+        return super::add_import::rolled_back_import_error(
+            req, ctx, &op_id, &path, &write_result,
             format!(
                 "remove_import: removing '{module}' from {file} would produce invalid syntax; file left unchanged"
             ),
