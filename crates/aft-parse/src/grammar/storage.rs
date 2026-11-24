@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use sha2::{Digest, Sha256};
 
-use crate::pinned_dir::PinnedDir;
+use crate::pinned_dir::{validate_regular_handle, PinnedDir};
 
 use super::GrammarManifest;
 
@@ -138,20 +138,14 @@ impl Storage {
             }
             file.write_all(bytes)?;
             aft_store::sync::sync_all(&file, &dir.path().join(&temp))?;
-            drop(file);
             if self.fault == StorageFault::Publish {
                 return Err(io::Error::other("injected grammar publication failure"));
             }
             // A valid artifact at this hash-named entry is byte-identical to
             // these verified bytes. Replacing the entry is therefore safe even
             // if another process published first, and never follows a symlink target.
-            crate::atomic_replace::atomic_replace_with_hooks(
-                &dir,
-                OsStr::new(&dest),
-                bytes,
-                crate::atomic_replace::ReplaceSync::None,
-                &mut crate::atomic_replace::NoReplaceHooks,
-            )
+            validate_regular_handle(&file)
+                .and_then(|()| dir.rename(OsStr::new(&temp), OsStr::new(&dest)))
             .map_err(|error| {
                 io::Error::new(
                     error.kind(),
@@ -161,6 +155,7 @@ impl Storage {
                     ),
                 )
             })?;
+            drop(file);
             self.read_at(&dir, manifest)?.ok_or_else(|| {
                 io::Error::other(format!(
                     "stored grammar is unavailable: {}",
@@ -178,3 +173,6 @@ pub fn stored_path(root: &std::path::Path, manifest: &GrammarManifest) -> PathBu
     root.join("grammars")
         .join(artifact_name(manifest))
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests;
