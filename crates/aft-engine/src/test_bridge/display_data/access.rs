@@ -203,7 +203,7 @@ impl CheckoutViewTestExt for CheckoutView {
     }
 
     fn outline_symbols(&self, path: &[u8]) -> Result<Option<StoredOutline>, DataError> {
-        self.outline_symbols(path)
+        crate::data_layer::checkout::composed_checks::outline_symbols_for_test(self, path)
             .map(|found| found.map(StoredOutline))
     }
 }

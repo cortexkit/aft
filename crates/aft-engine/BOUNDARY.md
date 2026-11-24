@@ -488,7 +488,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `data_layer::checkout::dead_code_snapshot_shared` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
 | `data_layer::checkout::source_work_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
 | `data_layer::checkout::todo_count_memo_stats_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
-| `data_layer::checkout::outline_symbols` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `checkout::composed_checks::outline_symbols_for_test` | test-support driver | `aft-index` | Keep tools tests on the `CheckoutViewTestExt` return type while reading the real stored outline. |
 | `data_layer::checkout::parse_gaps_identity` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
 | `data_layer::parent_query::discovery_scope` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
 | `semantic_index::for_config_dimension` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |

@@ -5948,8 +5948,7 @@ impl CheckoutView {
     /// # Errors
     ///
     /// When the record cannot be read.
-    #[doc(hidden)]
-    pub fn outline_symbols(
+    pub(crate) fn outline_symbols(
         &self,
         path: &[u8],
     ) -> Result<Option<super::outline::StoredOutline>, DataError> {

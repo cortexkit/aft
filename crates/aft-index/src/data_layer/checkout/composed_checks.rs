@@ -661,3 +661,10 @@ pub fn canonical_graph_path(root: &Path, path: &str) -> PathBuf {
     }
     .resolve(path)
 }
+#[doc(hidden)]
+pub fn outline_symbols_for_test(
+    view: &CheckoutView,
+    path: &[u8],
+) -> Result<Option<crate::data_layer::outline::StoredOutline>, DataError> {
+    view.outline_symbols(path)
+}
