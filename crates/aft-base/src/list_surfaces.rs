@@ -1658,8 +1658,14 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
         enclosing_item: "sweep_after_metadata",
-        location_or_primitive: "commands::semantic_search::external_exact::sweep skipped_foreign_mounts",
-        reason: "counts mount points of other filesystems that the walk does not enter; no list is cut here, and a walk the deadline stops is reported through the sweep's enumeration_stopped and the reply's coverage line",
+        location_or_primitive: "fallback_walk_limit / skipped_foreign_mounts",
+        reason: "bounds the internal corpus, not the displayed hit list; the sweep reports incomplete coverage and an unknown total after a file limit, deadline or skipped mount",
+    },
+    ExclusionEntry {
+        file: "commands/semantic_search/external_disk_check.rs",
+        enclosing_item: "collect_bounded_corpus",
+        location_or_primitive: "fallback_walk_limit",
+        reason: "bounds the unpublished pattern corpus, not a response list; reaching the limit makes unindexed_scan.walk_complete false" ,
     },
     ExclusionEntry {
         file: "commands/semantic_search/mod.rs",

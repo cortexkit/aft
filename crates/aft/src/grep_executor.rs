@@ -35,7 +35,7 @@ use crate::search_index::{
     WalkBound,
 };
 
-/// Maximum files enumerated during grep/glob index-unavailable fallback walks.
+/// Maximum files enumerated during filesystem search fallback walks.
 pub(crate) const MAX_FALLBACK_WALK_FILES: usize = 50_000;
 
 #[cfg(test)]
@@ -84,7 +84,7 @@ pub(crate) fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
-fn fallback_walk_limit() -> usize {
+pub(crate) fn fallback_walk_limit() -> usize {
     #[cfg(test)]
     {
         WALK_LIMIT.with(|limit| limit.get())

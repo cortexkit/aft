@@ -118,6 +118,7 @@ struct WalkedFile {
 pub(super) fn collect_bounded_corpus(root: &Path) -> CheckedIndex {
     let budgets = budgets();
     let walk_deadline = Instant::now() + budgets.walk;
+    let file_limit = crate::grep_executor::fallback_walk_limit();
     let mut check = DiskCheck::default();
     let coverage = crate::grep_executor::WalkCoverage::default();
     let mut walked = Vec::new();
@@ -137,6 +138,10 @@ pub(super) fn collect_bounded_corpus(root: &Path) -> CheckedIndex {
         };
         if !entry.file_type().is_some_and(|kind| kind.is_file()) {
             continue;
+        }
+        if walked.len() == file_limit {
+            check.walk_complete = false;
+            break;
         }
         let metadata = match entry.metadata() {
             Ok(metadata) => metadata,
@@ -247,6 +252,20 @@ mod tests {
         assert!(!checked.check.time_limit_reached);
         assert_eq!(checked.check.reread, 1);
         assert_eq!(checked.check.not_reread, 1);
+    }
+
+    #[test]
+    fn review_search_unpublished_corpus_stops_at_the_fallback_file_limit() {
+        let (_dir, root) = project(&[("a.rs", "needle"), ("b.rs", "needle"), ("c.rs", "needle")]);
+        let run =
+            |limit| crate::grep_executor::with_walk_limit(limit, || collect_bounded_corpus(&root));
+        let capped = run(2);
+        assert_eq!(capped.check.files_examined, 2);
+        assert_eq!(capped.check.reread, 2);
+        assert!(!capped.check.walk_complete);
+        assert!(!capped.check.verified());
+        assert!(!capped.check.time_limit_reached);
+        assert!(run(3).check.verified());
     }
 
     #[test]

@@ -13,7 +13,7 @@
 //! For an identifier the useful answer is every line that contains it, so this
 //! module finds those lines directly:
 //!
-//! - files are enumerated once, under a deadline checked at every walk entry,
+//! - files are enumerated once, under a file limit and a deadline checked at each entry,
 //!   then searched source first, documentation and other text second, data
 //!   (JSON, logs, minified bundles, ...) last;
 //! - a file whose size and modification time still match the borrowed index is
@@ -202,10 +202,12 @@ pub(super) struct SweepOutcome {
     pub files_discovered: usize,
     /// Files whose outcome is known: ruled out by the index or read from disk.
     pub files_checked: usize,
-    /// The walk itself stopped at the deadline, so the file total is unknown.
+    /// The walk stopped early, so the file total is unknown.
     pub enumeration_stopped: bool,
-    /// Reading stopped at the deadline before every discovered file was checked.
+    /// Reading stopped before every discovered file was checked.
     pub scan_stopped: bool,
+    file_limit_reached: bool,
+    time_limit_reached: bool,
     /// Whether a borrowed index was consulted.
     pub used_index: bool,
     pub index_read_gap: Option<String>,
@@ -274,8 +276,15 @@ impl SweepOutcome {
                     self.files_checked, self.files_discovered
                 )
             };
+            let limit = if self.file_limit_reached {
+                ", file limit"
+            } else if self.time_limit_reached {
+                ", time limit"
+            } else {
+                ""
+            };
             format!(
-                "exact pass: bounded ({} files, time limit); checked {coverage} ({source}){oversized}; source code and other files under {} not fully searched; use grep for an exhaustive check",
+                "exact pass: bounded ({} files{limit}); checked {coverage} ({source}){oversized}; source code and other files under {} not fully searched; use grep for an exhaustive check",
                 self.files_checked,
                 root.display()
             )
@@ -341,9 +350,11 @@ fn sweep_after_metadata(
     // and rejected entries included), so a huge tree cannot hold the request.
     let coverage = crate::grep_executor::WalkCoverage::default();
     let walker = crate::grep_executor::fallback_project_walk_builder(root, coverage.clone());
+    let file_limit = crate::grep_executor::fallback_walk_limit();
     let mut files: Vec<(FileClass, PathBuf)> = Vec::new();
     for entry in walker.build() {
-        if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+        outcome.time_limit_reached = Instant::now() >= deadline;
+        if outcome.time_limit_reached || crate::executor::current_job_cancelled() {
             outcome.enumeration_stopped = true;
             break;
         }
@@ -360,6 +371,11 @@ fn sweep_after_metadata(
         let path = entry.into_path();
         if !super::path_allowed_by_include_tests(&path, root, include_tests) {
             continue;
+        }
+        if files.len() == file_limit {
+            outcome.enumeration_stopped = true;
+            outcome.file_limit_reached = true;
+            break;
         }
         files.push((classify_file(&path), path));
     }
@@ -384,7 +400,8 @@ fn sweep_after_metadata(
     };
     let mut hits = Vec::new();
     for (class, path) in &files {
-        if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
+        outcome.time_limit_reached |= Instant::now() >= deadline;
+        if outcome.time_limit_reached || crate::executor::current_job_cancelled() {
             outcome.scan_stopped = true;
             break;
         }
@@ -887,6 +904,28 @@ mod tests {
         assert!(!outcome
             .coverage_line(root.path())
             .contains("exact pass: complete"));
+    }
+
+    #[test]
+    fn review_search_exact_sweep_stops_at_the_fallback_file_limit() {
+        let root = tempfile::tempdir().unwrap();
+        for name in ["a.rs", "b.rs", "c.rs"] {
+            std::fs::write(root.path().join(name), IDENTIFIER).unwrap();
+        }
+        let run = |limit| {
+            crate::grep_executor::with_walk_limit(limit, || {
+                sweep(root.path(), &terms(), None, true, far_deadline())
+            })
+        };
+        let capped = run(2);
+        assert_eq!(capped.files_discovered, 2);
+        assert_eq!(capped.files_checked, 2);
+        assert!(capped.enumeration_stopped);
+        assert!(!capped.fully_covered());
+        assert!(capped
+            .coverage_line(root.path())
+            .contains("2 files, file limit"));
+        assert!(run(3).fully_covered());
     }
 
     const IDENTIFIER: &str = "requireCredentialStamps";
