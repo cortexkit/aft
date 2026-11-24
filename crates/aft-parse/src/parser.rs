@@ -6962,6 +6962,20 @@ fn extract_toml_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErr
 /// A named constant so widening it later does not touch the rest of the module.
 const NIX_OUTLINE_DEPTH: usize = 1;
 
+/// Upper bound on the name bytes one file's Nix outline may keep: symbol
+/// names plus the parent and scope-chain copies each child carries.
+///
+/// Every child of a wide binding copies the parent name into two fields
+/// (`parent` and the one-element `scope_chain`), so a file with one long
+/// parent name and many small children retains about 2 × name length ×
+/// child count bytes: quadratically more than the file itself, which cold
+/// indexing would pay for a file even under the scanner's read limit. Four
+/// MiB per file — the read limit itself — leaves every real file whole (a
+/// normal outline keeps a small multiple of the file's own attr-path
+/// bytes) and caps the pathological one; past the bound the walk stops
+/// emitting, so the outline keeps its leading, exact portion.
+const NIX_OUTLINE_NAME_BUDGET: usize = 4 << 20;
+
 /// Read an `attrpath` node as the dotted name written in the source.
 fn nix_attrpath_name(source: &str, attrpath: &Node) -> String {
     let mut cursor = attrpath.walk();
@@ -7094,6 +7108,7 @@ fn nix_emit_binding(
     scope_chain: &[String],
     parent: Option<&str>,
     depth: usize,
+    budget: &mut usize,
     symbols: &mut Vec<Symbol>,
 ) {
     // Inherit clauses are aliases, not definitions; only `binding` nodes count.
@@ -7107,6 +7122,18 @@ fn nix_emit_binding(
     if name.is_empty() {
         return;
     }
+
+    // Charge this symbol's name bytes before allocating anything they would
+    // be copied into (`parent` and `scope_chain` below repeat the enclosing
+    // name for every child); a binding whose copies no longer fit is dropped
+    // without descending, so the walk stops spending work with the budget.
+    let name_bytes = name.len()
+        + parent.map(str::len).unwrap_or(0)
+        + scope_chain.iter().map(String::len).sum::<usize>();
+    if name_bytes > *budget {
+        return;
+    }
+    *budget -= name_bytes;
 
     let value = binding.child_by_field_name("expression");
     let is_function = value
@@ -7144,7 +7171,15 @@ fn nix_emit_binding(
     let mut cursor = set.walk();
     let children: Vec<Node> = set.named_children(&mut cursor).collect();
     for child in children {
-        nix_emit_binding(source, child, &child_scope, Some(&name), depth + 1, symbols);
+        nix_emit_binding(
+            source,
+            child,
+            &child_scope,
+            Some(&name),
+            depth + 1,
+            budget,
+            symbols,
+        );
     }
 }
 
@@ -7255,13 +7290,17 @@ fn extract_nix_symbols(source: &str, root: &Node) -> Result<Vec<Symbol>, AftErro
         .map(|(name, _)| name.as_str())
         .collect();
 
+    // One budget for the file: the walk charges every emitted symbol against
+    // it, so a wide or huge file caps its retained names and the walk stops
+    // early instead of copying an enclosing name once per child.
+    let mut budget = NIX_OUTLINE_NAME_BUDGET;
     for binding in top_level {
         let depth = if full_name(binding).is_some_and(|name| collided.contains(name.as_str())) {
             NIX_OUTLINE_DEPTH
         } else {
             0
         };
-        nix_emit_binding(source, binding, &[], None, depth, &mut symbols);
+        nix_emit_binding(source, binding, &[], None, depth, &mut budget, &mut symbols);
     }
     Ok(symbols)
 }
@@ -10376,6 +10415,56 @@ mod tests {
         let names = nix_names("stdenv.mkDerivation (let v = \"1\"; in { version = v; })\n");
         assert!(names.contains(&"v".to_string()), "{names:?}");
         assert!(names.contains(&"version".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn nix_wide_binding_file_stays_inside_the_outline_name_budget() {
+        // One long parent name over many small children: without the budget
+        // each child copies the parent name twice (`parent` plus its
+        // one-element `scope_chain`), so retained name bytes grow with the
+        // square of the file and a small source becomes quadratic work.
+        let parent = "p".repeat(3000);
+        let children = 2000;
+        let mut source = format!("{{ {parent} = {{\n");
+        for child in 0..children {
+            source.push_str(&format!("  c{child} = 1;\n"));
+        }
+        source.push_str("}; }\n");
+        assert!(
+            source.len() < 64 << 10,
+            "the input itself must stay small: {} bytes",
+            source.len()
+        );
+
+        let symbols = nix_symbols(&source);
+        let kept: usize = symbols
+            .iter()
+            .map(|symbol| {
+                symbol.name.len()
+                    + symbol.parent.as_deref().map_or(0, str::len)
+                    + symbol.scope_chain.iter().map(String::len).sum::<usize>()
+            })
+            .sum();
+        assert!(
+            kept <= NIX_OUTLINE_NAME_BUDGET,
+            "the outline kept {kept} name bytes from a {}-byte file, over the bound",
+            source.len()
+        );
+
+        // The stop truncates the tail, not the head: the first children are
+        // emitted with exact names and parents, and the stop actually fired.
+        assert!(symbols.len() > 1, "the outline emitted nothing");
+        assert!(
+            symbols.len() < children + 1,
+            "the budget never fired: {} symbols for {children} children",
+            symbols.len()
+        );
+        let first = symbols
+            .iter()
+            .find(|symbol| symbol.name == "c0")
+            .expect("the first child is emitted");
+        assert_eq!(first.parent.as_deref(), Some(parent.as_str()));
+        assert_eq!(first.scope_chain, vec![parent.clone()]);
     }
 
     #[test]

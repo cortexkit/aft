@@ -877,7 +877,7 @@ fn formatter_candidates(lang: LangId, config: &Config, path: &Path) -> Vec<ToolC
     let project_root = config.project_root.as_deref();
     let file_str = path.to_string_lossy();
     if let Some(preferred) = config.formatter.get(lang_key(lang)) {
-        return explicit_formatter_candidate(preferred, &file_str);
+        return explicit_formatter_candidate(preferred, &file_str, lang);
     }
 
     match lang {
@@ -1146,7 +1146,7 @@ fn checker_candidates(lang: LangId, config: &Config, file_str: &str) -> Vec<Tool
     }
 }
 
-fn explicit_formatter_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate> {
+fn explicit_formatter_candidate(name: &str, file_str: &str, lang: LangId) -> Vec<ToolCandidate> {
     match name {
         "none" | "off" | "false" => Vec::new(),
         "biome" => vec![ToolCandidate {
@@ -1195,7 +1195,10 @@ fn explicit_formatter_candidate(name: &str, file_str: &str) -> Vec<ToolCandidate
             args: vec!["-w".to_string(), file_str.to_string()],
             required: true,
         }],
-        "nixfmt" => vec![ToolCandidate {
+        // nixfmt only formats Nix; accepting it under another language's key
+        // would run it over Rust or TypeScript sources, so the arm is gated
+        // on the key the value was configured under.
+        "nixfmt" if lang == LangId::Nix => vec![ToolCandidate {
             tool: name.to_string(),
             source: "formatter config".to_string(),
             args: vec![file_str.to_string()],
@@ -2844,6 +2847,22 @@ mod tests {
         assert_eq!(candidates.len(), 1, "{candidates:?}");
         assert_eq!(candidates[0].tool, "nixfmt");
         assert_eq!(candidates[0].args, vec!["flake.nix".to_string()]);
+
+        // nixfmt formats only Nix: the same value under another language's
+        // key must contribute no candidate, not run nixfmt over that file.
+        let mut cross = crate::config::Config::default();
+        cross
+            .formatter
+            .insert("rust".to_string(), "nixfmt".to_string());
+        assert!(
+            super::formatter_candidates(
+                crate::parser::LangId::Rust,
+                &cross,
+                std::path::Path::new("lib.rs"),
+            )
+            .is_empty(),
+            "nixfmt must be refused for Rust"
+        );
     }
 
     #[cfg(unix)]

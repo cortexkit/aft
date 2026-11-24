@@ -174,6 +174,64 @@ fn nix_ast_search_and_replace_preserve_siblings() {
 }
 
 #[test]
+fn nix_two_binding_pattern_reports_the_hint_in_the_real_response() {
+    // The pattern-hint unit tests compose the message themselves; this pins
+    // that the shipped ast_search response carries the same hint, exactly as
+    // an agent sees it: code invalid_pattern, message with the hint below.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let file = dir.path().join("ast.nix");
+    fs::write(&file, "{ foo = true; }\n").unwrap();
+
+    let mut aft = AftProcess::spawn();
+    assert_eq!(aft.configure(dir.path())["success"], true);
+
+    let search = aft.send(
+        &json!({
+            "id": "ast-search-nix-two-bindings",
+            "command": "ast_search",
+            "pattern": "$A = true; $B = false;",
+            "lang": "nix",
+            "paths": [file.display().to_string()],
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        search["success"], false,
+        "two bindings are not one node: {search:?}"
+    );
+    assert_eq!(search["code"], "invalid_pattern", "{search:?}");
+    let message = search["message"].as_str().expect("error message");
+    assert!(
+        message.contains("nix pattern must contain one binding or one inherit clause"),
+        "the real error response must carry the Nix hint: {message}"
+    );
+
+    let replace = aft.send(
+        &json!({
+            "id": "ast-replace-nix-two-bindings",
+            "command": "ast_replace",
+            "pattern": "$A = true; $B = false;",
+            "rewrite": "$A = false;",
+            "lang": "nix",
+            "paths": [file.display().to_string()],
+            "dry_run": true,
+        })
+        .to_string(),
+    );
+    assert_eq!(replace["success"], false, "{replace:?}");
+    assert_eq!(replace["code"], "invalid_pattern", "{replace:?}");
+    assert!(
+        replace["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nix pattern must contain one binding or one inherit clause"),
+        "ast_replace must carry the same hint: {replace:?}"
+    );
+
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn nix_unsupported_columns_report_no_edges() {
     let dir = write_project();
     let file = dir.path().join("nix_module.nix");

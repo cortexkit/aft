@@ -1455,6 +1455,19 @@ mod tests {
     /// stack pressure would return `Ok` with a truncated outline; asserting
     /// the name catches that where `is_ok` alone would pass.
     fn extract_names_on_a_small_stack(path: &'static str, source: String) -> Vec<String> {
+        extract_outline_on_a_small_stack(path, source)
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect()
+    }
+
+    /// [`extract_names_on_a_small_stack`] returning the stored outline
+    /// symbols, so a case can assert signature fields as the record holds
+    /// them, not just names.
+    fn extract_outline_on_a_small_stack(
+        path: &'static str,
+        source: String,
+    ) -> Vec<aft_store::content::OutlineSymbol> {
         let language =
             language_for(path, source.as_bytes()).unwrap_or_else(|| panic!("{path}: no language"));
         std::thread::Builder::new()
@@ -1466,11 +1479,7 @@ mod tests {
                 let RecordBody::Parsed { body, .. } = record.data else {
                     panic!("{path}: a parsed language gives a parsed record");
                 };
-                body.outline
-                    .unwrap_or_else(|| panic!("{path}: no outline"))
-                    .into_iter()
-                    .map(|symbol| symbol.name)
-                    .collect()
+                body.outline.unwrap_or_else(|| panic!("{path}: no outline"))
             })
             .unwrap()
             .join()
@@ -1506,13 +1515,39 @@ mod tests {
         // header, including a formal's default value; a default nested this
         // deep had to be carried on the heap, and the function binding inside
         // it still has to be reported.
-        let names = extract_names_on_a_small_stack(
-            "deep_formal.nix",
-            // A comment sits inside the innermost wrapper so the doc-comment
-            // walk traverses the full depth with real comments in range.
-            format!("{{ f = {{ x ? {} }}: x; }}\n", nested("(", "# c\n1", ")")),
+        // A comment sits inside the innermost wrapper so the doc-comment
+        // walk traverses the full depth with real comments in range. That
+        // core comment sits at byte ~10,011 of the header, past the 1024-byte
+        // signature truncation, so it cannot answer whether comments are
+        // stripped; a second comment sits right after the outermost paren,
+        // inside the retained prefix, where its presence would prove the
+        // splice failed — the same placement rule the attrset test above
+        // uses with `# early`.
+        let source = format!(
+            "{{ f = {{ x ? ( # outer\n{} ): x; }}\n",
+            nested("(", "# c\n1", ")")
         );
-        assert!(names.iter().any(|name| name == "f"), "{names:?}");
+        let outline = extract_outline_on_a_small_stack("deep_formal.nix", source);
+        let binding = outline
+            .iter()
+            .find(|symbol| symbol.name == "f")
+            .expect("f must survive the nest");
+        assert!(
+            !binding
+                .signature
+                .as_deref()
+                .is_some_and(|s| s.contains("# c")),
+            "the reviewer's named comment must stay out of the signature: {:?}",
+            binding.signature
+        );
+        let signature = binding
+            .signature
+            .as_deref()
+            .expect("f is a function binding and carries a signature");
+        assert!(
+            !signature.contains('#'),
+            "header comments must be spliced out of f's signature: {signature}"
+        );
     }
 
     #[test]
