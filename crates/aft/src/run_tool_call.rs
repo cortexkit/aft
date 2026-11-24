@@ -1205,23 +1205,6 @@ pub(crate) fn strip_agent_preview_arg_owned(mut args: Value) -> Value {
     args
 }
 
-fn tool_call_result_from_response(
-    bare_name: &str,
-    format_context: &crate::subc_format::FormatContext,
-    mut response: Response,
-    surface_downgraded: bool,
-) -> ToolCallResult {
-    if surface_downgraded {
-        attach_hashline_downgrade(&mut response);
-    }
-    let mut text =
-        crate::subc_format::format_response_with_context(bare_name, &response, format_context);
-    if surface_downgraded {
-        append_hashline_downgrade_text(&mut text);
-    }
-    ToolCallResult { text, response }
-}
-
 fn refusal_result(
     bare_name: &str,
     format_context: &crate::subc_format::FormatContext,
@@ -1233,18 +1216,41 @@ fn refusal_result(
         trace.mark_translate_done();
         trace.mark_execute_done();
     }
-    let result =
-        tool_call_result_from_response(bare_name, format_context, response, surface_downgraded);
-    if let Some(trace) = phase_trace.as_mut() {
-        trace.mark_format_done();
-        trace.mark_finalize_done();
-    }
-    result
+    finish_tool_call_response(
+        bare_name,
+        format_context,
+        response,
+        surface_downgraded,
+        None,
+        phase_trace,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_delivers_pending_notice_without_rewording() {
+        use crate::subc::runner_notices::notice_templates::{Notice, Target};
+
+        let mut response = Response::error_with_data(
+            "refused",
+            "invalid_request",
+            "Request refused.",
+            json!({"text": "details"}),
+        );
+        response.notices.items.push(Notice::template(
+            "test.notice",
+            json!({}),
+            "pending notice".into(),
+            Target::Text,
+        ));
+        let result = refusal_result("read", &Default::default(), response, false, None);
+        assert_eq!(result.text, "Request refused.");
+        assert_eq!(result.response.data["text"], "details\n\npending notice");
+        assert!(result.response.notices.items.is_empty());
+    }
 
     fn finish_cpu_phase(mut trace: PhaseTrace) -> ToolCallPhaseDurations {
         trace.mark_execute_done();
