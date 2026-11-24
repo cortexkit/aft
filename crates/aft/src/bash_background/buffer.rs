@@ -545,7 +545,7 @@ fn record_stderr_scan(path: &Path, bytes: u64, opened: bool) {
 }
 
 /// Opens of `path` for a stderr scan, and the bytes read through them.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn take_stderr_scans(path: &Path) -> (usize, u64) {
     STDERR_SCANS
         .get_or_init(Default::default)

@@ -57,7 +57,7 @@ pub(super) fn push_read_only_note(output: &mut String, note: Option<&str>) {
     output.push_str(note);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(super) fn append_source_read_only_note(
     output: &mut String,
     metadata: &PersistedTask,

@@ -18299,7 +18299,7 @@ mod raw_render;
 use raw_render::{render_raw_passthrough, render_structured_output};
 #[path = "read_only_status.rs"]
 mod read_only_status;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use read_only_status::append_source_read_only_note;
 use read_only_status::{push_read_only_note, source_read_only_note_for};
 
