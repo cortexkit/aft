@@ -1243,6 +1243,44 @@ function hidden() {}
     }
 
     #[test]
+    fn review_opus6_tsconfig_wildcard_rejects_overlap() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("tsconfig.json"),
+            r#"{"compilerOptions":{"paths":{"@/*/":["src/*"]}}}"#,
+        )
+        .unwrap();
+        fs::create_dir(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/ok.ts"), "export {};\n").unwrap();
+        assert!(resolve_module_path(dir.path(), "@/").is_none());
+        assert!(resolve_module_path(dir.path(), "@/ok/")
+            .unwrap()
+            .ends_with("src/ok.ts"));
+    }
+
+    #[test]
+    fn review_opus6_package_export_wildcard_rejects_overlap() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"workspaces":["packages/*"]}"#,
+        )
+        .unwrap();
+        let package = dir.path().join("packages/lib");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(
+            package.join("package.json"),
+            r#"{"name":"@scope/lib","exports":{"./a*a":"./entry-*.ts"}}"#,
+        )
+        .unwrap();
+        fs::write(package.join("entry-.ts"), "export {};\n").unwrap();
+        assert!(resolve_module_path(dir.path(), "@scope/lib/a").is_none());
+        assert!(resolve_module_path(dir.path(), "@scope/lib/aa")
+            .unwrap()
+            .ends_with("entry-.ts"));
+    }
+
+    #[test]
     fn workspace_package_resolution_prefers_modern_ts_source_extensions() {
         let dir = TempDir::new().unwrap();
         fs::write(

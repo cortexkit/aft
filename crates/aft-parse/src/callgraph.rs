@@ -3430,13 +3430,8 @@ fn find_tsconfig_dir(from_dir: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> 
 }
 
 fn ts_path_capture<'a>(alias: &str, module_path: &'a str) -> Option<&'a str> {
-    if let Some(star_index) = alias.find('*') {
-        let (prefix, suffix_with_star) = alias.split_at(star_index);
-        let suffix = &suffix_with_star[1..];
-        if module_path.starts_with(prefix) && module_path.ends_with(suffix) {
-            return Some(&module_path[prefix.len()..module_path.len() - suffix.len()]);
-        }
-        return None;
+    if let Some((prefix, suffix)) = alias.split_once('*') {
+        return module_path.strip_prefix(prefix)?.strip_suffix(suffix);
     }
 
     (alias == module_path).then_some("")
@@ -4036,15 +4031,15 @@ fn export_target_for_subpath(exports: &Value, subpath: Option<&str>) -> Option<S
 
 fn wildcard_export_target(map: &serde_json::Map<String, Value>, key: &str) -> Option<String> {
     for (pattern, target) in map {
-        let Some(star_index) = pattern.find('*') else {
+        let Some((prefix, suffix)) = pattern.split_once('*') else {
             continue;
         };
-        let (prefix, suffix_with_star) = pattern.split_at(star_index);
-        let suffix = &suffix_with_star[1..];
-        if !key.starts_with(prefix) || !key.ends_with(suffix) {
+        let Some(matched) = key
+            .strip_prefix(prefix)
+            .and_then(|part| part.strip_suffix(suffix))
+        else {
             continue;
-        }
-        let matched = &key[prefix.len()..key.len() - suffix.len()];
+        };
         if let Some(target_pattern) = export_condition_target(target) {
             return Some(target_pattern.replace('*', matched));
         }
