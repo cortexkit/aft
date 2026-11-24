@@ -3228,7 +3228,7 @@ impl BgTaskRegistry {
                 self.compress_output(&metadata.command, raw.text, metadata.exit_code);
             // Repair all compressor tiers here, before either byte cap runs.
             let final_lines = restore_stream_endings(&mut compressed.text, &endings);
-            render_compressed_with_recovery(
+            let mut cache = render_compressed_with_recovery(
                 buffer,
                 compressed,
                 final_lines,
@@ -3236,7 +3236,9 @@ impl BgTaskRegistry {
                 disk_truncation,
                 artifact_access,
                 matches!(metadata.exit_code, Some(code) if code != 0),
-            )
+            );
+            raw_render::disclose_read_gaps(&mut cache, &raw.read_gaps);
+            cache
         };
         normalize_piped_display_output(&mut rendered.output_preview);
         append_pipeline_warning(&mut rendered, metadata, paths);
@@ -16500,65 +16502,6 @@ fn structured_output_pointer(
     }
 }
 
-fn render_structured_output(
-    command: &str,
-    buffer: &BgBuffer,
-    disk_truncation: DiskTruncation,
-    artifact_access: ArtifactRecoveryAccess,
-) -> Option<TerminalOutputCache> {
-    if !is_gh_structured_command(command) {
-        return None;
-    }
-
-    let output_path = buffer
-        .output_path()
-        .map(|path| path.display().to_string())?;
-    let stdout_bytes = buffer.stream_len(StreamKind::Stdout);
-    if stdout_bytes == 0 {
-        return None;
-    }
-
-    if stdout_bytes > STRUCTURED_OUTPUT_CAP_BYTES as u64 {
-        if !stream_starts_like_json(buffer, StreamKind::Stdout) {
-            return None;
-        }
-        let output_preview = structured_output_pointer(
-            stdout_bytes,
-            &output_path,
-            disk_truncation.total_prefix_bytes(),
-            &artifact_access,
-        );
-        return Some(TerminalOutputCache {
-            output_preview,
-            output_truncated: true,
-            compression_input_line_count: None,
-            kind: TerminalOutputKind::Structured,
-            output_path: Some(output_path),
-            stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
-            artifact_access,
-            recovery: None,
-            read_only_note: None,
-        });
-    }
-
-    let stdout = buffer.read_stream_bounded(StreamKind::Stdout, STRUCTURED_OUTPUT_CAP_BYTES);
-    if stdout.truncated || !is_structured_body(&stdout.text) {
-        return None;
-    }
-
-    Some(TerminalOutputCache {
-        output_preview: stdout.text,
-        output_truncated: false,
-        compression_input_line_count: None,
-        kind: TerminalOutputKind::Structured,
-        output_path: Some(output_path),
-        stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
-        artifact_access,
-        recovery: None,
-        read_only_note: None,
-    })
-}
-
 fn append_bash_output_envelope(
     cache: &TerminalOutputCache,
     output: &mut String,
@@ -18353,7 +18296,7 @@ use completion_preview::{append_remote_report, rendered_execution_note};
 
 #[path = "raw_render.rs"]
 mod raw_render;
-use raw_render::render_raw_passthrough;
+use raw_render::{render_raw_passthrough, render_structured_output};
 #[path = "read_only_status.rs"]
 mod read_only_status;
 #[cfg(test)]
@@ -19061,6 +19004,36 @@ mod tests {
         );
         task.lock_state().unwrap().metadata.status = BgTaskStatus::Completed;
         assert!(registry.live_scope_stamps().is_empty());
+    }
+
+    /// A capture that cannot be read at render time is named in the reply
+    /// instead of looking like a command that printed nothing; the readable
+    /// stream and a legitimately empty capture are unaffected.
+    #[test]
+    fn unreadable_piped_capture_is_named_not_rendered_as_empty() {
+        for compressed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let registry = BgTaskRegistry::default();
+            let (task_id, task) =
+                insert_terminal_piped_task(&registry, &dir, "cmd", "", "warning: kept\n", compressed);
+            fs::remove_file(&task.paths.stdout).unwrap();
+            let status = registry.observed_status(&task_id, "session", 8192).unwrap();
+            assert!(status.output_preview.contains("warning: kept"), "{status:?}");
+            assert!(
+                status.output_preview.contains("[stdout could not be read (")
+                    && status
+                        .output_preview
+                        .contains("); the output above may be incomplete]"),
+                "compressed={compressed}: {status:?}"
+            );
+            assert!(status.output_truncated, "compressed={compressed}");
+
+            let (task_id, _) =
+                insert_terminal_piped_task(&registry, &dir, "cmd", "", "warning: kept\n", compressed);
+            let status = registry.observed_status(&task_id, "session", 8192).unwrap();
+            assert!(!status.output_preview.contains("could not be read"), "{status:?}");
+            assert!(!status.output_truncated, "compressed={compressed}");
+        }
     }
 
     pub(super) fn insert_terminal_piped_task(

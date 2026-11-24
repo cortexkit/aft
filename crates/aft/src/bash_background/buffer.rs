@@ -100,6 +100,9 @@ pub struct BoundedRead {
     pub text: String,
     pub truncated: bool,
     pub total_bytes: u64,
+    /// One disclosure line per capture that could not be opened or read, so a
+    /// failed read is never mistaken for a command that printed nothing.
+    pub read_gaps: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -469,6 +472,7 @@ fn empty_bounded_read() -> BoundedRead {
         text: String::new(),
         truncated: false,
         total_bytes: 0,
+        read_gaps: Vec::new(),
     }
 }
 
@@ -595,6 +599,7 @@ fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<
                 text: String::new(),
                 truncated: true,
                 total_bytes,
+                read_gaps: Vec::new(),
             });
         }
         return read_single_file_head_tail(
@@ -609,6 +614,7 @@ fn read_source_bounded(source: &ArtifactSource, max_bytes: usize) -> io::Result<
         text: String::from_utf8_lossy(&bytes).into_owned(),
         truncated: false,
         total_bytes,
+        read_gaps: Vec::new(),
     })
 }
 
@@ -630,6 +636,7 @@ fn read_single_file_head_tail(
             text: String::from_utf8_lossy(&bytes).into_owned(),
             truncated: false,
             total_bytes,
+            read_gaps: Vec::new(),
         });
     }
     let head_len = head_bytes.min(max_bytes) as u64;
@@ -641,6 +648,7 @@ fn read_single_file_head_tail(
         text: join_head_tail_bytes(head, tail, total_bytes.saturating_sub(head_len + tail_len)),
         truncated: true,
         total_bytes,
+        read_gaps: Vec::new(),
     })
 }
 
@@ -651,28 +659,42 @@ fn read_two_file_head_tail(
     head_bytes: usize,
     tail_bytes: usize,
 ) -> (BoundedRead, usize) {
-    let (mut first_file, first_len) = first
-        .sampled()
-        .map(|(file, len)| (Some(file), len))
-        .unwrap_or((None, 0));
-    let (mut second_file, second_len) = second
-        .sampled()
-        .map(|(file, len)| (Some(file), len))
-        .unwrap_or((None, 0));
+    // `first` is stdout and `second` stderr. A failed open or read still
+    // renders as an empty stream, but is named in `read_gaps`.
+    let mut gaps: [Option<String>; 2] = [None, None];
+    let mut note = |index: usize, error: &io::Error| {
+        gaps[index].get_or_insert_with(|| {
+            let stream = ["stdout", "stderr"][index];
+            format!("[{stream} could not be read ({error}); the output above may be incomplete]")
+        });
+    };
+    let (mut first_file, first_len) = match first.sampled() {
+        Ok((file, len)) => (Some(file), len),
+        Err(error) => {
+            note(0, &error);
+            (None, 0)
+        }
+    };
+    let (mut second_file, second_len) = match second.sampled() {
+        Ok((file, len)) => (Some(file), len),
+        Err(error) => {
+            note(1, &error);
+            (None, 0)
+        }
+    };
     let total_bytes = first_len.saturating_add(second_len);
     if total_bytes <= max_bytes as u64 {
-        let first_bytes = first_file
-            .as_mut()
-            .map(|file| first.read_range(file, 0, first_len))
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .unwrap_or_default();
-        let second_bytes = second_file
-            .as_mut()
-            .map(|file| second.read_range(file, 0, second_len))
-            .transpose()
-            .map(Option::unwrap_or_default)
-            .unwrap_or_default();
+        let mut read_all = |index: usize, source: &ArtifactSource, file: Option<&mut ValidatedArtifact>, len: u64| {
+            file.map(|file| source.read_range(file, 0, len))
+                .transpose()
+                .unwrap_or_else(|error| {
+                    note(index, &error);
+                    None
+                })
+                .unwrap_or_default()
+        };
+        let first_bytes = read_all(0, first, first_file.as_mut(), first_len);
+        let second_bytes = read_all(1, second, second_file.as_mut(), second_len);
         let first_text = String::from_utf8_lossy(&first_bytes);
         let second_text = String::from_utf8_lossy(&second_bytes);
         let boundary = first_text.len();
@@ -691,6 +713,7 @@ fn read_two_file_head_tail(
                 text: format!("{first_text}{separator}{second_text}"),
                 truncated: false,
                 total_bytes,
+                read_gaps: gaps.into_iter().flatten().collect(),
             },
             boundary,
         );
@@ -704,16 +727,23 @@ fn read_two_file_head_tail(
         split_stream_budget(first_remaining, second_remaining, tail_budget);
     let first_read =
         read_single_file_head_tail(first, first_head + first_tail, first_head, first_tail)
-            .unwrap_or_else(|_| empty_bounded_read());
+            .unwrap_or_else(|error| {
+                note(0, &error);
+                empty_bounded_read()
+            });
     let second_read =
         read_single_file_head_tail(second, second_head + second_tail, second_head, second_tail)
-            .unwrap_or_else(|_| empty_bounded_read());
+            .unwrap_or_else(|error| {
+                note(1, &error);
+                empty_bounded_read()
+            });
     let boundary = first_read.text.len();
     (
         BoundedRead {
             text: combine_streams(&first_read.text, &second_read.text),
             truncated: true,
             total_bytes,
+            read_gaps: gaps.into_iter().flatten().collect(),
         },
         boundary,
     )
