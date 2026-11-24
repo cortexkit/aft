@@ -2579,7 +2579,7 @@ fn walk_resolver_config_files(project_root: &Path) -> BTreeSet<PathBuf> {
     // Resolver configs inside a nested linked worktree of this repository
     // belong to that checkout's own scope, not this one.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(project_root);
-    let walker = crate::context::apply_project_ignore_rules(
+    let walker = crate::project_walk::apply_project_ignore_rules(
         &mut builder,
         project_root,
         if crate::data_layer::read_fence::active() {

@@ -16,7 +16,8 @@ const TOOL_CONFIG_DEFAULT_EXPORTS: &[&str] = &["default"];
 const STORYBOOK_CSF_EXPORTS: &[&str] = &[EXECUTABLE_ROOT_ALL_EXPORTS];
 const MOCHA_ROOT_HOOK_EXPORTS: &[&str] = &["mochaHooks"];
 
-pub(crate) struct InspectEntryPoints;
+#[doc(hidden)]
+pub struct InspectEntryPoints;
 
 impl crate::data_layer::dead_code_snapshot::EntryPoints for InspectEntryPoints {
     fn resolve(&self, root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf> {

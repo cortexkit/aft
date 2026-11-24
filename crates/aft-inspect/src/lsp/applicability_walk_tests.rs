@@ -1406,7 +1406,7 @@ fn legacy_scoped_walk(
         builder.add(root);
     }
     builder.same_file_system(true).standard_filters(true);
-    let walker = crate::context::apply_project_ignore_rules(
+    let walker = crate::project_walk::apply_project_ignore_rules(
         &mut builder,
         project_root,
         if crate::data_layer::read_fence::active() {

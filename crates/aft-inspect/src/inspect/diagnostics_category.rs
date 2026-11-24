@@ -5,6 +5,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use super::diagnostics_host::DiagnosticsHost;
 use super::job::{InspectSnapshot, JobOutcome, JobScope};
 use super::scoped_diagnostics_sweep::{
     producer_keys_for_file, sweep_scoped_files, ScopedSweep, SCOPED_SWEEP_FILE_CAP,
@@ -13,7 +14,6 @@ use super::scoped_diagnostics_sweep::{
 use crate::config::{
     Config, MAX_INSPECT_DIAGNOSTICS_TIMEOUT_MS, MIN_INSPECT_DIAGNOSTICS_TIMEOUT_MS,
 };
-use crate::context::AppContext;
 use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
 use crate::lsp::manager::{ApplicableServerFailure, NotApplicableServer, ServerAttemptResult};
@@ -62,12 +62,13 @@ pub struct InspectRustCheck {
 /// the outcomes with [`run_diagnostics_category`].
 #[doc(hidden)]
 pub fn start_inspect_rust_checks(
-    ctx: &AppContext,
+    ctx: &dyn DiagnosticsHost,
     producers: &[ServerKey],
     deadline: Instant,
 ) -> Vec<InspectRustCheck> {
-    let worker_policy = ctx.lsp().rust_worker_policy();
-    let work = ctx.lsp().inspect_rust_check_work(producers);
+    let manager = ctx.lsp_manager();
+    let worker_policy = manager.lock().rust_worker_policy();
+    let work = manager.lock().inspect_rust_check_work(producers);
     work.into_iter()
         .map(|(key, check)| {
             let worker_policy = worker_policy.clone();
@@ -233,7 +234,7 @@ struct DiagnosticsCollection {
 /// provisional; other categories can still be returned.
 #[doc(hidden)]
 pub fn run_diagnostics_category(
-    ctx: &AppContext,
+    ctx: &dyn DiagnosticsHost,
     snapshot: &InspectSnapshot,
     scope: &JobScope,
     scope_was_provided: bool,
@@ -246,6 +247,7 @@ pub fn run_diagnostics_category(
     sweep_deadline: Option<Instant>,
     rust_checks: Vec<InspectRustCheck>,
 ) -> JobOutcome {
+    let manager = ctx.lsp_manager();
     // A scoped request reports on the servers of its own files only, so a
     // server started earlier for another part of the project cannot add its
     // notes or failures to this answer.
@@ -305,13 +307,14 @@ pub fn run_diagnostics_category(
             }
         }
     }
-    let saved = ctx.lsp().saved_rust_checks(
+    let saved = manager.lock().saved_rust_checks(
         sweep_deadline
             .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
             .min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
     );
     let warm_files = if scoped.is_none() {
-        ctx.lsp()
+        manager
+            .lock()
             .diagnostic_working_files()
             .into_iter()
             .filter(|file| file.starts_with(&snapshot.project_root))
@@ -341,7 +344,7 @@ pub fn run_diagnostics_category(
         }
         (None, Some(deadline)) if !applicability_is_empty && !warm_files.is_empty() => {
             let refresh = {
-                let lsp = ctx.lsp();
+                let lsp = manager.lock();
                 warm_files
                     .iter()
                     .filter(|file| !lsp.has_diagnostic_report_for_file(file))
@@ -386,7 +389,7 @@ pub fn run_diagnostics_category(
         .map(|(server, reason)| ((server_id(server), server.root.clone()), reason.clone()))
         .collect();
     for key in expected_producers {
-        if let Some(authority) = ctx.lsp().analysis_progress_authority(key) {
+        if let Some(authority) = manager.lock().analysis_progress_authority(key) {
             collection.producer_authority.push((
                 server_id(key),
                 key.root.clone(),
@@ -434,7 +437,7 @@ pub fn run_diagnostics_category(
         .map(|server| (server.server_id.clone(), server.reason()))
         .collect();
     if scoped.is_none() {
-        let lsp = ctx.lsp();
+        let lsp = manager.lock();
         for (key, file) in lsp.unverified_diagnostic_files() {
             if !file.starts_with(&snapshot.project_root)
                 || sweep.as_ref().is_some_and(|sweep| {
@@ -486,13 +489,13 @@ pub fn run_diagnostics_category(
         };
         collection.checking_reasons.insert(
             (id.clone(), root.clone()),
-            ctx.lsp().rust_check_running_reason(&key),
+            manager.lock().rust_check_running_reason(&key),
         );
     }
 
     // Revalidate after per-file work. A successful early validation only skips
     // the cold wait; it cannot certify inputs which changed during that wait.
-    let saved = ctx.lsp().saved_rust_checks(
+    let saved = manager.lock().saved_rust_checks(
         sweep_deadline
             .unwrap_or_else(|| Instant::now() + crate::lsp::completed_rust_check::BUDGET)
             .min(Instant::now() + crate::lsp::completed_rust_check::BUDGET),
@@ -563,7 +566,7 @@ pub fn run_diagnostics_category(
         collection.checking_producers.insert(producer.clone());
         collection.checking_reasons.insert(producer, reason);
     }
-    if ctx.lsp().rust_cargo_disabled_for_worker() {
+    if manager.lock().rust_cargo_disabled_for_worker() {
         let scope_producers = scoped
             .as_ref()
             .map(|(_, keys)| keys.clone())
@@ -596,7 +599,7 @@ pub fn run_diagnostics_category(
         // open files may still have workspace progress; that cannot downgrade
         // successful file pulls or certify any unrequested file.
         {
-            let lsp = ctx.lsp();
+            let lsp = manager.lock();
             for key in expected_producers {
                 if lsp.analysis_progress_authority(key) != Some("document_pull") {
                     continue;
@@ -685,13 +688,14 @@ pub fn run_diagnostics_category(
 }
 
 fn collect_warm_working_set(
-    ctx: &AppContext,
+    ctx: &dyn DiagnosticsHost,
     snapshot: &InspectSnapshot,
     expected_producers: &[ServerKey],
     scope_producers: Option<&HashSet<ServerKey>>,
     scoped_files: Option<&[PathBuf]>,
     sweep: Option<&ScopedSweep>,
 ) -> DiagnosticsCollection {
+    let manager = ctx.lsp_manager();
     let mut collection = DiagnosticsCollection::default();
     let mut tsconfig_membership = TsconfigMembershipCache::new();
     // External workspace servers can publish unrelated files too. Retain only
@@ -719,9 +723,9 @@ fn collect_warm_working_set(
     };
     // Watcher changes still queued for the manager lock have not reached the
     // servers; deliver them first so the state read below accounts for them.
-    ctx.lsp_forward_queued_watcher_changes();
+    ctx.forward_queued_watcher_changes();
     {
-        let mut lsp = ctx.lsp();
+        let mut lsp = manager.lock();
         // Live language-server diagnostics come from queued events and the
         // warm store. Completed compiler-check snapshots are applied separately
         // below; this read does not open files or spawn servers.
@@ -907,14 +911,19 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-fn scoped_file_coverage(ctx: &AppContext, config: &Config, file: &Path) -> ScopedFileCoverage {
+fn scoped_file_coverage(
+    ctx: &dyn DiagnosticsHost,
+    config: &Config,
+    file: &Path,
+) -> ScopedFileCoverage {
     if FORCE_SCOPED_DIAGNOSTIC_COVERAGE.with(std::cell::Cell::get) {
         return ScopedFileCoverage::Covered;
     }
     if servers_for_file(file, config).is_empty() {
         return ScopedFileCoverage::NoProducer;
     }
-    let lsp = ctx.lsp();
+    let manager = ctx.lsp_manager();
+    let lsp = manager.lock();
     if lsp.has_authoritative_report_for_file(file) {
         return ScopedFileCoverage::Covered;
     }
@@ -1160,7 +1169,7 @@ impl DiagnosticsCollection {
     /// (`complete: false`) instead.
     fn record_scope_coverage_gaps(
         &mut self,
-        ctx: &AppContext,
+        ctx: &dyn DiagnosticsHost,
         snapshot: &InspectSnapshot,
         candidates: &[PathBuf],
         sweep: Option<&ScopedSweep>,
@@ -1168,7 +1177,8 @@ impl DiagnosticsCollection {
         if candidates.is_empty() {
             return;
         }
-        let active: HashSet<ServerKey> = ctx.lsp().active_server_keys().into_iter().collect();
+        let manager = ctx.lsp_manager();
+        let active: HashSet<ServerKey> = manager.lock().active_server_keys().into_iter().collect();
         let mut tsconfig_membership = TsconfigMembershipCache::new();
         for file in candidates {
             if self.saved_files.contains(file) {
@@ -1223,7 +1233,7 @@ impl DiagnosticsCollection {
                         producer: Some(server_id(&key)),
                         root: Some(key.root.clone()),
                         reason: {
-                            let reason = ctx.lsp().rust_check_running_reason(&key);
+                            let reason = manager.lock().rust_check_running_reason(&key);
                             if reason == RUST_CHECK_RUNNING_REASON {
                                 STILL_CHECKING_REASON.to_string()
                             } else {
@@ -1244,7 +1254,7 @@ impl DiagnosticsCollection {
                     .filter(|(key, reason)| {
                         matches!(key.kind, ServerKind::Rust | ServerKind::TypeScript(_))
                             || reason.starts_with("analysis_progress_pending:")
-                            || ctx.lsp().analysis_progress_authority(key).is_some()
+                            || manager.lock().analysis_progress_authority(key).is_some()
                     })
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
@@ -1263,7 +1273,7 @@ impl DiagnosticsCollection {
                 ScopedFileCoverage::Covered
                     | ScopedFileCoverage::NoProducer
                     | ScopedFileCoverage::ExcludedByTsconfig
-            ) && ctx.lsp().unverified_diagnostic_file(file).is_some()
+            ) && manager.lock().unverified_diagnostic_file(file).is_some()
             {
                 self.scope_coverage_gaps.push(ScopedCoverageGap {
                     file: file.clone(),
@@ -1318,13 +1328,14 @@ impl DiagnosticsCollection {
     /// marker. Ties keep registry order.
     fn uncovered_file_cause(
         &self,
-        ctx: &AppContext,
+        ctx: &dyn DiagnosticsHost,
         snapshot: &InspectSnapshot,
         active: &HashSet<ServerKey>,
         file: &Path,
     ) -> Option<CoverageCause> {
         let config = &snapshot.config;
-        let lsp = ctx.lsp();
+        let manager = ctx.lsp_manager();
+        let lsp = manager.lock();
         let mut best: Option<(u8, CoverageCause)> = None;
         for def in servers_for_file(file, config) {
             let producer = def.kind.id_str().to_string();

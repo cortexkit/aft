@@ -1,5 +1,11 @@
-use super::*;
 use serde_json::json;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::config::Config;
+use crate::lsp::client::LspClient;
+use crate::lsp::manager::settled_lsp;
+use crate::lsp::registry::ServerKind;
 
 pub struct IdleLspFixture {
     pub(crate) ctx: std::sync::Arc<crate::context::AppContext>,

@@ -19,7 +19,7 @@
     "lines": 11286,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
-  "crates/aft-engine/src/lsp/manager.rs": {
+  "crates/aft-inspect/src/lsp/manager.rs": {
     "lines": 11097,
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
@@ -51,7 +51,7 @@
     "lines": 7977,
     "reason": "Split inspect integration tests by diagnostic area pending; AFT crate split lane."
   },
-  "crates/aft-engine/src/inspect/scanners/dead_code.rs": {
+  "crates/aft-inspect/src/inspect/scanners/dead_code.rs": {
     "lines": 5038,
     "reason": "Split dead-code analysis by language pending; AFT crate split lane."
   },
@@ -67,7 +67,7 @@
     "lines": 6104,
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
-  "crates/aft-engine/src/inspect/manager.rs": {
+  "crates/aft-inspect/src/inspect/manager.rs": {
     "lines": 6051,
     "reason": "Split inspection scheduling and coordination pending; AFT crate split lane."
   },

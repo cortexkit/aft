@@ -884,19 +884,19 @@ mod tests {
         let cases = [
             (
                 "shaped.rs",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.rs"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.rs"),
             ),
             (
                 "shaped.ts",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.ts"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.ts"),
             ),
             (
                 "shaped.py",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.py"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.py"),
             ),
             (
                 "shaped.go",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.go"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.go"),
             ),
             (
                 "nested.ts",
@@ -925,21 +925,21 @@ mod tests {
         let cases = [
             (
                 "shaped.rs",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.rs"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.rs"),
                 6,
                 // Rust: base 1 + if 1 + && 1 + for 1 + (three match arms - 1) 2.
                 "Rust has no ternary expression",
             ),
             (
                 "shaped.ts",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.ts"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.ts"),
                 7,
                 // TS: base 1 + if 1 + && 1 + for 1 + (three switch arms - 1) 2 + ternary 1.
                 "TypeScript decision count",
             ),
             (
                 "shaped.py",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.py"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.py"),
                 7,
                 // Python: base 1 + if 1 + and 1 + for 1 + (three match arms - 1) 2 + conditional expression 1.
                 // External oracle: radon 6.x computes the same fixture as complexity 7 (cross-checked 2026-08-27).
@@ -947,7 +947,7 @@ mod tests {
             ),
             (
                 "shaped.go",
-                include_str!("../../../../aft/tests/fixtures/inspect_complexity/shaped.go"),
+                include_str!("../../../fixtures/inspect_complexity/shaped.go"),
                 6,
                 // Go: base 1 + if 1 + && 1 + for 1 + (three switch arms - 1) 2.
                 "Go has no ternary expression",
@@ -996,8 +996,7 @@ mod tests {
 
     #[test]
     fn absent_language_table_entry_is_an_honest_zero_finding_gap() {
-        let source =
-            include_str!("../../../../aft/tests/fixtures/inspect_complexity/unsupported.pas");
+        let source = include_str!("../../../fixtures/inspect_complexity/unsupported.pas");
         let scan = fixture_scan("unsupported.pas", source);
 
         assert!(scan.functions.is_empty());

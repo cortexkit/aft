@@ -10422,7 +10422,7 @@ fn walk_applicable_area_uncached(
         .same_file_system(true)
         .standard_filters(true)
         .follow_links(false);
-    let walker = crate::context::apply_project_ignore_rules(
+    let walker = crate::project_walk::apply_project_ignore_rules(
         &mut builder,
         &walk_roots[0],
         if crate::data_layer::read_fence::active() {
@@ -10655,10 +10655,6 @@ fn env_binary_override_from(
         .filter(|value| !value.is_empty())
         .map(PathBuf::from)
 }
-
-#[cfg(any(test, feature = "test-support"))]
-#[path = "idle_fixture.rs"]
-pub(crate) mod idle_fixture;
 
 #[cfg(test)]
 #[path = "manager_regression_tests.rs"]

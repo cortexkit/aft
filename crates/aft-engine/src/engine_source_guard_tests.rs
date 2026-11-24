@@ -524,6 +524,7 @@ fn production_engine_sources_do_not_reach_the_upper_crate() {
         (root, Scan::Engine),
         (crates.join("aft-edit/src"), Scan::Area),
         (crates.join("aft-index/src"), Scan::Area),
+        (crates.join("aft-inspect/src"), Scan::Area),
     ] {
         let mut guard = Guard::new(&source, scan);
         guard.upper_files.clone_from(&registration.upper_files);

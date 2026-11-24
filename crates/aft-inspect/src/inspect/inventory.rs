@@ -574,7 +574,7 @@ impl StoreListMiss {
 /// Jujutsu-only repository. There the two walks run separately rather than
 /// broadening either set.
 fn walks_use_other_ignore_settings(root: &Path) -> bool {
-    crate::context::confinement::active()
+    aft_db::read_fence::active()
         || (root.ancestors().any(|path| path.join(".jj").exists())
             && !root.ancestors().any(|path| path.join(".git").exists()))
 }

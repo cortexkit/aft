@@ -2,9 +2,14 @@ pub mod cache;
 #[doc(hidden)]
 pub mod diagnostics_category;
 #[doc(hidden)]
+pub mod diagnostics_host;
+#[doc(hidden)]
 pub mod dispatch;
 mod entry_points;
-pub(crate) use entry_points::InspectEntryPoints;
+#[doc(hidden)]
+pub use entry_points::InspectEntryPoints;
+#[cfg(feature = "test-hooks")]
+mod exactness_port;
 mod frameworks;
 pub mod freshness;
 pub(crate) use crate::file_kind::generated;

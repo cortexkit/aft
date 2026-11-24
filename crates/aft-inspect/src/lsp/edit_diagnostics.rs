@@ -1,4 +1,4 @@
-impl crate::edit::ports::PostWriteDiagnostics for crate::lsp::manager::PostEditWaitOutcome {
+impl aft_edit::edit::ports::PostWriteDiagnostics for crate::lsp::manager::PostEditWaitOutcome {
     fn append_to(&self, result: &mut serde_json::Value) {
         let outcome = self;
         result["lsp_diagnostics"] = serde_json::json!(outcome
@@ -45,11 +45,11 @@ impl crate::edit::ports::PostWriteDiagnostics for crate::lsp::manager::PostEditW
 
 #[cfg(test)]
 mod tests {
-    use crate::edit::WriteResult;
     use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
     use crate::lsp::manager::PostEditWaitOutcome;
     use crate::lsp::registry::ServerKind;
     use crate::lsp::roots::ServerKey;
+    use aft_edit::edit::WriteResult;
     use std::sync::Arc;
 
     #[test]

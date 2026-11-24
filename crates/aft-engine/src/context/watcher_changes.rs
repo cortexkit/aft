@@ -6,6 +6,9 @@ use crate::bash_changed_files::Journal;
 use crate::watcher_backend::change_sink::WatcherChangeSink;
 use crate::watcher_backend::counters::WatcherCounters;
 
+#[path = "inspect_diagnostics_host.rs"]
+mod inspect_diagnostics_host;
+
 impl WatcherChangeSink for Journal {
     fn event_for_root(
         &self,

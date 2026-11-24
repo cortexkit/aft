@@ -15,8 +15,8 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use super::diagnostics_host::DiagnosticsHost;
 use crate::config::Config;
-use crate::context::AppContext;
 use crate::lsp::client::RustCheckState;
 use crate::lsp::diagnostics::StoredDiagnostic;
 use crate::lsp::manager::PullFileOutcome;
@@ -124,12 +124,13 @@ impl ScopedSweep {
     /// Close documents within the sweep's remaining budget. Documents left
     /// open retain their synchronized versions, so the next request can resync
     /// changes rather than treating the server's old text as current.
-    pub(crate) fn close_opened(&mut self, ctx: &AppContext) {
+    pub(crate) fn close_opened(&mut self, ctx: &dyn DiagnosticsHost) {
         let opened = std::mem::take(&mut self.opened);
         if opened.is_empty() {
             return;
         }
-        let mut lsp = ctx.lsp();
+        let manager = ctx.lsp_manager();
+        let mut lsp = manager.lock();
         for (file, keys) in opened {
             if cancellation_requested() || self.deadline.is_some_and(|at| Instant::now() >= at) {
                 break;
@@ -151,15 +152,16 @@ fn cancellation_requested() -> bool {
 /// server works on it, which can take seconds. Returns the outcome and, when
 /// a report was stored, that server's diagnostics for the file.
 fn pull_unlocked(
-    ctx: &AppContext,
+    ctx: &dyn DiagnosticsHost,
     key: &ServerKey,
     file: &Path,
     deadline: Instant,
 ) -> Result<(PullFileOutcome, Option<Vec<StoredDiagnostic>>), crate::lsp::LspError> {
-    let pull = ctx.lsp().begin_document_pull(key, file, deadline)?;
+    let manager = ctx.lsp_manager();
+    let pull = manager.lock().begin_document_pull(key, file, deadline)?;
     let pull = pull.wait();
     crate::tool_progress::report();
-    let mut lsp = ctx.lsp();
+    let mut lsp = manager.lock();
     let outcome = lsp.finish_document_pull(pull);
     let diagnostics = matches!(
         outcome,
@@ -174,13 +176,14 @@ fn pull_unlocked(
 /// until `deadline`, for their reports. Only servers in `producers` are
 /// used; none is started here.
 pub(crate) fn sweep_scoped_files(
-    ctx: &AppContext,
+    ctx: &dyn DiagnosticsHost,
     config: &Config,
     project_root: &Path,
     candidates: &[PathBuf],
     producers: &[ServerKey],
     deadline: Instant,
 ) -> ScopedSweep {
+    let manager = ctx.lsp_manager();
     let mut sweep = ScopedSweep {
         deadline: Some(deadline),
         ..ScopedSweep::default()
@@ -227,7 +230,7 @@ pub(crate) fn sweep_scoped_files(
         matches!(key.kind, ServerKind::Python)
             || matches!(&key.kind, ServerKind::Custom(id) if id.as_ref() == "basedpyright")
     }) {
-        let mut pause = ctx.lsp().pause_background_document_pulls();
+        let mut pause = manager.lock().pause_background_document_pulls();
         let idle = pause.wait_until_idle(deadline);
         sweep.pull_pause = Some(pause);
         if !idle {
@@ -247,11 +250,11 @@ pub(crate) fn sweep_scoped_files(
     // Watcher changes still queued for the manager lock (an edit made by
     // another program, say) have not reached the servers, which would
     // otherwise be read as if they had analyzed the files as they are now.
-    ctx.lsp_forward_queued_watcher_changes();
+    ctx.forward_queued_watcher_changes();
     // A check an earlier request expected and that never began is asked for
     // again now, so it can run while the files are opened.
     {
-        let mut lsp = ctx.lsp();
+        let mut lsp = manager.lock();
         // Apply queued compiler pushes first, so the files whose compiler
         // errors could not be matched to their content are known below.
         lsp.drain_events();
@@ -283,7 +286,7 @@ pub(crate) fn sweep_scoped_files(
             }
             continue;
         }
-        let mut lsp = ctx.lsp();
+        let mut lsp = manager.lock();
         // A document left open (by an AFT edit, say) still holds the text
         // the server was last sent. When the file changed on disk since, send
         // the current text first, so the decisions below are about the
@@ -405,7 +408,7 @@ pub(crate) fn sweep_scoped_files(
     // One save per server is enough: the check covers the whole workspace,
     // and each further save would restart the check it asked for.
     for (key, file) in recheck {
-        if !ctx.lsp().request_rust_check(&key, &file) {
+        if !manager.lock().request_rust_check(&key, &file) {
             crate::slog_debug!(
                 "scoped inspect could not ask rust-analyzer to check {} again",
                 file.display()
@@ -422,7 +425,7 @@ pub(crate) fn sweep_scoped_files(
                     .insert(file.clone(), (key.clone(), NO_PUBLISH_REASON.to_string()));
                 continue;
             }
-            let mut lsp = ctx.lsp();
+            let mut lsp = manager.lock();
             if matches!(key.kind, ServerKind::TypeScript(_))
                 && !lsp.server_supports_pull_for_file(key, file)
             {
@@ -459,15 +462,15 @@ pub(crate) fn sweep_scoped_files(
         }
         for (file, key, request) in typescript_in_flight {
             let reply = request.wait();
-            let result =
-                ctx.lsp()
-                    .finish_scoped_typescript_diagnostics(reply)
-                    .map(|(hash, diagnostics)| {
-                        sweep
-                            .requested_content
-                            .insert((file.clone(), key.clone()), hash);
-                        diagnostics
-                    });
+            let result = manager
+                .lock()
+                .finish_scoped_typescript_diagnostics(reply)
+                .map(|(hash, diagnostics)| {
+                    sweep
+                        .requested_content
+                        .insert((file.clone(), key.clone()), hash);
+                    diagnostics
+                });
             sweep
                 .requested_reports
                 .insert((file, key), result.map_err(|error| error.to_string()));
@@ -475,7 +478,7 @@ pub(crate) fn sweep_scoped_files(
         for (file, key, epoch_before, pull) in in_flight {
             let pull = pull.wait();
             let outcome = {
-                let mut lsp = ctx.lsp();
+                let mut lsp = manager.lock();
                 let outcome = lsp.finish_document_pull(pull);
                 let diagnostics = matches!(
                     outcome,
@@ -519,7 +522,7 @@ pub(crate) fn sweep_scoped_files(
         .collect::<Vec<_>>();
     loop {
         let (checking, unreported, analysis_pending, newly_registered) = {
-            let mut lsp = ctx.lsp();
+            let mut lsp = manager.lock();
             lsp.drain_events();
             let mut newly_registered = Vec::new();
             waiting.retain(|(file, key, before)| {
@@ -593,9 +596,9 @@ pub(crate) fn sweep_scoped_files(
         let now = Instant::now();
         if now >= deadline || cancellation_requested() {
             for (file, key, _) in waiting {
-                let reason = if ctx.lsp().diagnostic_epoch(&key, &file).is_none() {
+                let reason = if manager.lock().diagnostic_epoch(&key, &file).is_none() {
                     NO_PUBLISH_REASON
-                } else if !ctx.lsp().analysis_progress_certifies_file(&key, &file) {
+                } else if !manager.lock().analysis_progress_certifies_file(&key, &file) {
                     "analysis_progress_pending: the server has not completed analysis after didOpen; retry aft_inspect"
                 } else {
                     NO_PUBLISH_REASON
@@ -619,7 +622,7 @@ pub(crate) fn sweep_scoped_files(
     // analysis request: retry it, or leave the file unknown if it fails again.
     for (file, key, epoch_before, first_failure) in retry_pulls {
         {
-            let mut lsp = ctx.lsp();
+            let mut lsp = manager.lock();
             lsp.drain_events();
             if !lsp.has_client(&key) {
                 continue;
@@ -661,7 +664,7 @@ pub(crate) fn sweep_scoped_files(
     // the pull replaced the pulled report in the store. Store both, now that
     // the check has had its chance to finish.
     if !pulled.is_empty() {
-        let mut lsp = ctx.lsp();
+        let mut lsp = manager.lock();
         lsp.drain_events();
         for (file, key, diagnostics) in pulled {
             if key.kind == ServerKind::Rust && lsp.has_client(&key) {

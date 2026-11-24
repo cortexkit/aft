@@ -1,0 +1,78 @@
+[package]
+name = "aft-inspect"
+version = "0.66.0"
+edition = "2021"
+description = "Source inspection and language server management for Agent Foundational Toolkit"
+license = "MIT"
+repository = "https://github.com/cortexkit/aft"
+rust-version.workspace = true
+exclude = ["tests/", "examples/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
+autotests = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
+
+[features]
+wasm-grammars = ["tree-sitter/wasm", "aft-index/wasm-grammars", "aft-parse/wasm-grammars"]
+test-support = ["aft-base/test-support", "aft-db/test-support", "aft-edit/test-support", "aft-index/test-support", "aft-parse/test-support", "dep:tempfile", "dep:filetime"]
+test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-index/test-timing-hooks", "aft-parse/test-timing-hooks"]
+test-hooks = ["aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-edit/test-hooks", "aft-edit/test-support", "aft-index/test-hooks", "aft-index/test-support", "aft-parse/test-hooks", "aft-parse/test-support"]
+
+[dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0" }
+aft-db = { path = "../aft-db", version = "0.66.0" }
+aft-edit = { path = "../aft-edit", version = "0.66.0" }
+aft-index = { path = "../aft-index", version = "0.66.0" }
+aft-parse = { path = "../aft-parse", version = "0.66.0" }
+aft-store = { path = "../aft-store", version = "0.66.0" }
+blake3 = "1"
+crossbeam-channel = "0.5"
+filetime = { version = "0.2.29", optional = true }
+getrandom = "0.3"
+globset = "0.4"
+ignore = "0.4"
+libc = "0.2"
+log = "0.4"
+lsp-types = "0.97"
+oxc_allocator = "0.126"
+oxc_ast = "0.126"
+oxc_ast_visit = "0.126"
+oxc_parser = "0.126"
+oxc_resolver = "11"
+oxc_semantic = "0.126"
+oxc_span = "0.126"
+oxc_str = "0.126"
+parking_lot = "0.12"
+rayon = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+rustc-hash = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = { version = "0.10", features = ["compress"] }
+tempfile = { version = "3.27.0", optional = true }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tree-sitter = "=0.26.7"
+tree-sitter-rust = "0.24"
+unicode-normalization = "0.1"
+url = "2"
+which = "7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+] }
+
+[dev-dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
+aft-edit = { path = "../aft-edit", version = "0.66.0", features = ["test-support"] }
+aft-index = { path = "../aft-index", version = "0.66.0", features = ["test-support"] }
+aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }
+filetime = "0.2"
+notify = "8"
+tempfile = "3"

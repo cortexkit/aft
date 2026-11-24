@@ -7,6 +7,7 @@ members = [
     "crates/aft-edit",
     "crates/aft-engine",
     "crates/aft-index",
+    "crates/aft-inspect",
     "crates/aft-parse",
     "crates/aft-store",
     "crates/aft-subc",
@@ -15,7 +16,7 @@ members = [
     "crates/aft-fake-lsp",
     "crates/secret-rules",
 ]
-default-members = ["crates/aft", "crates/aft-base", "crates/aft-db", "crates/aft-edit", "crates/aft-engine", "crates/aft-index", "crates/aft-parse", "crates/aft-subc", "crates/aft-tokenizer", "crates/aft-tools"]
+default-members = ["crates/aft", "crates/aft-base", "crates/aft-db", "crates/aft-edit", "crates/aft-engine", "crates/aft-index", "crates/aft-inspect", "crates/aft-parse", "crates/aft-subc", "crates/aft-tokenizer", "crates/aft-tools"]
 
 # MSRV contract: the locked oxc 0.126 dependency family requires rustc 1.92,
 # so `cargo check --locked` on an older toolchain dies with a transitive

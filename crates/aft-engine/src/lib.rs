@@ -58,7 +58,7 @@ pub mod agent_child_env;
 pub(crate) use aft_base::agent_commands;
 pub use aft_base::alert_records;
 pub use aft_edit::agent_data;
-pub mod alert_state;
+pub use aft_inspect::alert_state;
 // The `aft` binary installs its allocator; the library sets the operation
 // labels it attributes allocations to.
 pub use aft_base::alloc_trace;
@@ -115,7 +115,6 @@ pub(crate) use aft_base::durability;
 pub mod edit;
 #[cfg(test)]
 mod edit_composed_tests;
-mod edit_lsp;
 pub use aft_base::effective_path;
 pub mod engram_catalog;
 #[doc(hidden)]
@@ -193,8 +192,12 @@ pub use aft_base::log_ctx;
 pub use aft_base::log_redact;
 pub use aft_index::local_embed;
 pub mod logging;
-pub mod lsp;
-pub mod lsp_hints;
+pub mod lsp {
+    pub use aft_inspect::lsp::*;
+}
+#[cfg(any(test, feature = "test-support"))]
+mod lsp_idle_fixture;
+pub use aft_inspect::lsp_hints;
 pub mod memory;
 pub use aft_index::memory_census;
 pub mod native_route;
@@ -328,11 +331,10 @@ use aft_base::test_support as test_helpers;
 #[cfg(all(test, target_os = "macos"))]
 mod disk_write_hunt;
 
+pub(crate) use aft_base::persistence_gate;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-#[path = "test_fixtures/fake_lsp.rs"]
-pub mod fake_lsp_test_helper;
-pub(crate) use aft_base::persistence_gate;
+pub use aft_inspect::fake_lsp_test_helper;
 
 #[cfg(feature = "test-support")]
 pub mod test_bridge;

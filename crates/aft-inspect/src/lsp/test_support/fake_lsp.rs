@@ -18,8 +18,8 @@ const SOURCES: &[&str] = &[
     "crates/aft-fake-lsp/build.rs",
     "crates/aft-fake-lsp/src/main.rs",
     "crates/aft/tests/lsp/fake_server.rs",
-    "crates/aft-engine/src/lsp/jsonrpc.rs",
-    "crates/aft-engine/src/lsp/transport.rs",
+    "crates/aft-inspect/src/lsp/jsonrpc.rs",
+    "crates/aft-inspect/src/lsp/transport.rs",
 ];
 
 pub fn fake_server_binary() -> PathBuf {
@@ -33,7 +33,7 @@ pub fn fake_server_binary() -> PathBuf {
 /// `CARGO_MANIFEST_DIR` when a test runs, and nextest points it at the
 /// remapped checkout when an archive is extracted elsewhere.
 fn workspace_root() -> PathBuf {
-    crate::test_helpers::manifest_dir().join("../..")
+    aft_base::test_support::manifest_dir().join("../..")
 }
 
 #[allow(dead_code)]
