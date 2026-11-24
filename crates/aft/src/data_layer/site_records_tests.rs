@@ -117,6 +117,21 @@ fn a_typescript_receiver_declared_in_a_tsx_file_keeps_its_exact_edge() {
 }
 
 #[test]
+fn audit_resolution_typescript_super_uses_extends_not_implements() {
+    let inputs = checkout(
+        &[(
+            "fixture.ts",
+            "interface Alpha { m(): void; }\nclass Zulu { m() {} }\nclass Child extends Zulu implements Alpha { call() { super.m(); } }",
+        )],
+        &[],
+    );
+    assert_eq!(
+        targets(&records_match_files(&inputs), "fixture.ts", "m"),
+        [("fixture.ts".into(), "Zulu::m".into(), "exact")]
+    );
+}
+
+#[test]
 fn python_super_follows_a_diamond_across_files_and_reused_ordinals() {
     let inputs = checkout(
         &[

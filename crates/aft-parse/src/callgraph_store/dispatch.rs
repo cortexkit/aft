@@ -1721,7 +1721,10 @@ fn receiver_type<'tree, N: Nav<'tree>>(
             return None;
         }
         "rust" if value == "self" => return current_owner,
-        "typescript" | "tsx" | "javascript" | "java" | "csharp" | "kotlin" if value == "super" => {
+        "typescript" | "tsx" | "javascript" if value == "super" => {
+            return typescript::superclass(function, source, language, nav);
+        }
+        "java" | "csharp" | "kotlin" if value == "super" => {
             return facts
                 .types
                 .iter()
