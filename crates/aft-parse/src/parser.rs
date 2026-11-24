@@ -3005,15 +3005,11 @@ fn mark_named_exports(symbols: &mut [Symbol], exported_names: &HashSet<String>) 
     }
 }
 
+mod signature;
 test_support_visibility! {
 /// Extract the first line of a node as its signature.
 fn extract_signature(source: &str, node: &Node) -> String {
-    let text = node_text(source, node);
-    let first_line = text.lines().next().unwrap_or(text);
-    // Trim trailing opening brace if present
-    let trimmed = first_line.trim_end();
-    let trimmed = trimmed.strip_suffix('{').unwrap_or(trimmed).trim_end();
-    trimmed.to_string()
+    signature::bounded_parts([signature::first_line(node_text(source, node))])
 }
 }
 
@@ -3740,7 +3736,7 @@ fn extract_py_symbols<'tree>(
                         if dc.goto_first_child() {
                             loop {
                                 if dc.node().kind() == "decorator" {
-                                    sig_parts.push(node_text(source, &dc.node()).to_string());
+                                    sig_parts.push(node_text(source, &dc.node()));
                                 }
                                 if !dc.goto_next_sibling() {
                                     break;
@@ -3751,8 +3747,8 @@ fn extract_py_symbols<'tree>(
                     }
                     parent = nav.parent(p);
                 }
-                sig_parts.push(extract_signature(source, &def_node));
-                Some(sig_parts.join("\n"))
+                sig_parts.push(signature::first_line(node_text(source, &def_node)));
+                Some(signature::join_lines(&sig_parts))
             } else {
                 Some(extract_signature(source, &def_node))
             };
@@ -3782,7 +3778,7 @@ fn extract_py_symbols<'tree>(
                         if dc.goto_first_child() {
                             loop {
                                 if dc.node().kind() == "decorator" {
-                                    sig_parts.push(node_text(source, &dc.node()).to_string());
+                                    sig_parts.push(node_text(source, &dc.node()));
                                 }
                                 if !dc.goto_next_sibling() {
                                     break;
@@ -3793,8 +3789,8 @@ fn extract_py_symbols<'tree>(
                     }
                     parent = nav.parent(p);
                 }
-                sig_parts.push(extract_signature(source, &def_node));
-                Some(sig_parts.join("\n"))
+                sig_parts.push(signature::first_line(node_text(source, &def_node)));
+                Some(signature::join_lines(&sig_parts))
             } else {
                 Some(extract_signature(source, &def_node))
             };
@@ -4745,10 +4741,8 @@ fn cpp_parent_scope_chain(node: &Node, source: &str) -> Vec<String> {
 }
 
 fn template_signature(source: &str, template_node: &Node, item_node: &Node) -> String {
-    format!(
-        "{}\n{}",
-        extract_signature(source, template_node),
-        extract_signature(source, item_node)
+    signature::join_lines(
+        &[template_node, item_node].map(|node| signature::first_line(node_text(source, node))),
     )
 }
 
@@ -5302,7 +5296,7 @@ fn extract_zig_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
         }
 
         if let (Some(name_node), Some(def_node)) = (const_name_node, const_def_node) {
-            let signature = extract_signature(source, &def_node);
+            let signature = signature::first_line(node_text(source, &def_node));
             let is_container = signature.contains("= struct")
                 || signature.contains("= enum")
                 || signature.contains("= union")
@@ -5314,7 +5308,7 @@ fn extract_zig_symbols(source: &str, root: &Node, query: &Query) -> Result<Vec<S
                     name: name.to_string(),
                     kind: SymbolKind::Variable,
                     range: node_range_with_decorators(&def_node, source, lang),
-                    signature: Some(signature),
+                    signature: Some(signature::bounded_parts([signature])),
                     scope_chain: vec![],
                     exported: false,
                     parent: None,
@@ -5953,7 +5947,7 @@ fn extract_solidity_symbols(
         // receive() / fallback() — synthetic names, parent is the enclosing contract
         if let Some(def_node) = fallback_receive_def_node {
             let scope_chain = solidity_scope_chain(&def_node, source);
-            let signature = extract_signature(source, &def_node);
+            let signature = signature::first_line(node_text(source, &def_node));
             let name = if signature.trim_start().starts_with("receive") {
                 "receive"
             } else {
@@ -5963,7 +5957,7 @@ fn extract_solidity_symbols(
                 name: name.to_string(),
                 kind: SymbolKind::Method,
                 range: node_range_with_decorators(&def_node, source, lang),
-                signature: Some(signature),
+                signature: Some(signature::bounded_parts([signature])),
                 parent: scope_chain.last().cloned(),
                 scope_chain,
                 exported: true,
@@ -6292,11 +6286,11 @@ fn r_rightward_function_assignment_symbol(
 }
 
 fn r_rightward_function_signature(source: &str, function_node: &Node, name: &str) -> String {
-    let signature = extract_signature(source, function_node);
+    let signature = signature::first_line(node_text(source, function_node));
     if signature.contains(name) {
-        signature
+        signature::bounded_parts([signature])
     } else {
-        format!("{signature} -> {name}")
+        signature::bounded_parts([signature, " -> ", name])
     }
 }
 

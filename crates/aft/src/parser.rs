@@ -509,6 +509,29 @@ mod tests {
     }
 
     #[test]
+    fn review_opus8_signature_allocation_is_bounded() {
+        let prefix = "function f(){/*";
+        let source = format!(
+            "{prefix}{}é{}*/}}",
+            "x".repeat(MAX_SIGNATURE_BYTES - prefix.len() - 1),
+            "y".repeat(256 * 1024)
+        );
+        let tree =
+            parse_source_with_parser(Path::new("long.js"), &source, LangId::JavaScript).unwrap();
+        let node = tree.root_node().named_child(0).unwrap();
+        let signature = extract_signature(&source, &node);
+        assert!(
+            signature.capacity() <= MAX_SIGNATURE_BYTES + '…'.len_utf8(),
+            "signature allocated {} bytes",
+            signature.capacity()
+        );
+        assert_eq!(
+            signature,
+            format!("{}…", &source[..MAX_SIGNATURE_BYTES - 1])
+        );
+    }
+
+    #[test]
     fn h_header_missing_nodes_count_as_errors_and_keep_c_when_all_fail() {
         let source = "int missing_semicolon(void)";
         let old_c = parse_source_with_parser(Path::new("missing.c"), source, LangId::C).unwrap();
