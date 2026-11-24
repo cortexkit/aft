@@ -140,6 +140,8 @@ pub(super) fn start_for_speech(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         Some(speech),
         Some(run_scopes),
+        #[cfg(test)]
+        None,
     )
 }
 impl ScopeDescribes {
@@ -176,6 +178,12 @@ type ScopeReference = (String, String);
 type ProbeGroup = Vec<(scope_watch::Key, ScopeStamp, bool)>;
 
 #[cfg(test)]
+struct TestGrantSweep {
+    control: Arc<readiness::DaemonControl>,
+    start: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
 #[allow(
     dead_code,
     reason = "the binary's consent fixtures use this helper; library fixtures do not"
@@ -197,6 +205,7 @@ pub(super) fn start(
         move || work_scopes(executor.clone(), watched_runs.clone()),
         None,
         Some(run_scopes),
+        None,
     )
 }
 
@@ -229,6 +238,7 @@ where
         },
         None,
         None,
+        None,
     )
 }
 
@@ -239,6 +249,7 @@ fn start_with_scope_source_impl<F, Fut>(
     scope_source: F,
     speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
     run_scopes: Option<Arc<super::run_scope::RunScopes>>,
+    #[cfg(test)] test_grant_sweep: Option<TestGrantSweep>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -272,11 +283,18 @@ where
     }
     let worker = tokio::spawn(async move {
         let (coverage, covered) = tokio::sync::watch::channel(scope_watch::Coverage::default());
-        let mut grant_sweep = Box::pin(access_grants::sweep::run(
-            control.clone(),
-            executor.clone(),
-            covered,
-        ));
+        let sweep_control = control.clone();
+        let sweep_executor = executor.clone();
+        let mut grant_sweep = Box::pin(async move {
+            #[cfg(test)]
+            let sweep_control = if let Some(sweep) = test_grant_sweep {
+                sweep.start.await.expect("start saved-grant sweep");
+                sweep.control
+            } else {
+                sweep_control
+            };
+            access_grants::sweep::run(sweep_control, sweep_executor, covered).await
+        });
         if !control.advertises(subc_protocol::scope::SCOPE_DESCRIBE_OP) {
             grant_sweep.await;
             return;
