@@ -137,9 +137,18 @@ pub(crate) fn run_cycles_scan_with_oxc(
     }
 
     contributions.sort_by(|left, right| left.file_path.cmp(&right.file_path));
-    let aggregate = aggregate_cycle_contributions_with_limit(
-        &project_root,
-        &contributions,
+    // The import graph is already resolved in `oxc_result`; building the
+    // cycle graph from it avoids a second analysis of every file's facts.
+    // The from-contributions path remains for rolling up cached contributions.
+    let honesty = contributions
+        .iter()
+        .filter_map(|contribution| CycleHonesty::deserialize(&contribution.contribution).ok())
+        .collect::<Vec<_>>();
+    let aggregate = cycles_aggregate(
+        &CycleGraph::from_oxc_result(&project_root, oxc_result),
+        honesty
+            .iter()
+            .map(|item| (item.parse_errors.as_slice(), item.skipped_files.as_slice())),
         skipped_languages(&job.scope_files),
         Some(DRILL_DOWN_LIMIT),
     );
@@ -177,17 +186,49 @@ pub(crate) fn aggregate_cycle_contributions_with_limit(
     } else {
         CycleGraph::from_contributions(&parsed)
     };
+    cycles_aggregate(
+        &graph,
+        parsed.iter().map(|contribution| {
+            (
+                contribution.parse_errors.as_slice(),
+                contribution.skipped_files.as_slice(),
+            )
+        }),
+        languages_skipped,
+        drill_down_limit,
+    )
+}
+
+/// The honesty fields of one contribution, read without its import facts.
+#[derive(Debug, Deserialize)]
+struct CycleHonesty {
+    // Required, like `CycleContribution::file`, so both paths count the same
+    // contributions as scanned.
+    #[serde(rename = "file")]
+    _file: serde::de::IgnoredAny,
+    #[serde(default)]
+    parse_errors: Vec<Value>,
+    #[serde(default)]
+    skipped_files: Vec<Value>,
+}
+
+fn cycles_aggregate<'a>(
+    graph: &CycleGraph,
+    honesty: impl Iterator<Item = (&'a [Value], &'a [Value])>,
+    languages_skipped: Vec<String>,
+    drill_down_limit: Option<usize>,
+) -> Value {
     let (count, largest, cycles) = graph.cycles(drill_down_limit.unwrap_or(usize::MAX));
     let limit = drill_down_limit.unwrap_or(usize::MAX);
     let items = cycles.iter().map(CycleReport::to_value).collect::<Vec<_>>();
-    let (parse_errors, skipped_files) = honesty_fields(&parsed);
+    let (scanned_files, parse_errors, skipped_files) = honesty_fields(honesty);
 
     let mut aggregate = json!({
         "count": count,
         "largest": largest,
         "items": items,
         "drill_down_capped": count > limit,
-        "scanned_files": parsed.len(),
+        "scanned_files": scanned_files,
         "languages_skipped": languages_skipped,
         "complete": parse_errors.is_empty() && skipped_files.is_empty(),
         "note": "TS/JS import cycles only; Rust module cycles are out of scope.",
@@ -263,7 +304,7 @@ fn cycle_file_contribution(
     skipped_files: &[Value],
 ) -> Option<FileContribution> {
     let path = &facts.path;
-    let freshness = cache_freshness::collect(path).ok()?;
+    let freshness = freshness_from_facts(facts)?;
     let relative = relative_string(project_root, path);
     let facts_payload = OxcCycleFactsPayload {
         format_version: FACTS_FORMAT_VERSION,
@@ -349,6 +390,22 @@ fn non_js_empty_contribution(project_root: &Path, path: &Path) -> Option<FileCon
         freshness,
         contribution,
     ))
+}
+
+/// Freshness for a file whose facts were just built: stat it, and reuse the
+/// content hash the facts already carry (the same hash of the same bytes)
+/// instead of reading the file again.
+fn freshness_from_facts(facts: &FileFacts) -> Option<FileFreshness> {
+    let metadata = fs::metadata(&facts.path).ok()?;
+    let content_hash = match blake3::Hash::from_hex(&facts.content_hash) {
+        Ok(hash) if metadata.len() <= cache_freshness::CONTENT_HASH_SIZE_CAP => hash,
+        _ => return cache_freshness::collect(&facts.path).ok(),
+    };
+    Some(FileFreshness {
+        mtime: metadata.modified().unwrap_or(UNIX_EPOCH),
+        size: metadata.len(),
+        content_hash,
+    })
 }
 
 fn freshness_for_existing_file(path: &Path) -> Option<FileFreshness> {
@@ -457,9 +514,12 @@ impl CycleGraph {
             .collect::<Vec<_>>();
         let oxc_result =
             analyze_file_facts(project_root, facts, AnalyzeOptions::default(), Vec::new());
+        Self::from_oxc_result(project_root, &oxc_result)
+    }
 
+    fn from_oxc_result(project_root: &Path, oxc_result: &OxcEngineResult) -> Self {
         let mut graph = Self::default();
-        let mut edges_by_file = cycle_edges_by_file(project_root, &oxc_result);
+        let mut edges_by_file = cycle_edges_by_file(project_root, oxc_result);
         for facts in &oxc_result.facts {
             let path = normalize_path(&facts.path);
             let from = relative_string(project_root, &path);
@@ -727,24 +787,28 @@ fn parse_errors_by_file(oxc_result: &OxcEngineResult) -> BTreeMap<PathBuf, Vec<S
     )
 }
 
-fn honesty_fields(contributions: &[CycleContribution]) -> (Vec<Value>, Vec<Value>) {
+fn honesty_fields<'a>(
+    contributions: impl Iterator<Item = (&'a [Value], &'a [Value])>,
+) -> (usize, Vec<Value>, Vec<Value>) {
+    let mut scanned_files = 0;
     let mut parse_error_keys = BTreeSet::new();
     let mut parse_errors = Vec::new();
     let mut skipped_file_keys = BTreeSet::new();
     let mut skipped_files = Vec::new();
-    for contribution in contributions {
-        for value in &contribution.parse_errors {
+    for (contribution_parse_errors, contribution_skipped_files) in contributions {
+        scanned_files += 1;
+        for value in contribution_parse_errors {
             if parse_error_keys.insert(value.to_string()) {
                 parse_errors.push(value.clone());
             }
         }
-        for value in &contribution.skipped_files {
+        for value in contribution_skipped_files {
             if skipped_file_keys.insert(value.to_string()) {
                 skipped_files.push(value.clone());
             }
         }
     }
-    (parse_errors, skipped_files)
+    (scanned_files, parse_errors, skipped_files)
 }
 
 fn skipped_files_payload(project_root: &Path, oxc_result: &OxcEngineResult) -> Vec<Value> {
@@ -863,6 +927,67 @@ mod tests {
         components.sort();
         assert_eq!(components, vec![vec!["a"], vec!["b"], vec!["c", "d"]]);
         assert_eq!(graph.cycles(usize::MAX).2.len(), 1);
+    }
+
+    #[test]
+    fn cycles_scan_reuses_the_oxc_analysis_and_the_facts_hashes() {
+        use crate::inspect::oxc_engine::{analyze_files, ANALYZE_FILE_FACTS_CALLS};
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonicalize_normalized(dir.path());
+        let a = root.join("a.ts");
+        let b = root.join("b.ts");
+        fs::write(&a, "import { b } from './b';\nexport const a = b + 1;\n").unwrap();
+        fs::write(&b, "import { a } from './a';\nexport const b = a + 1;\n").unwrap();
+        let files = vec![a, b];
+        let oxc_result = analyze_files(&root, &files, AnalyzeOptions::default()).unwrap();
+        let scope = crate::inspect::JobScope::for_project(root.clone());
+        let job = InspectJob {
+            job_id: 1,
+            key: crate::inspect::JobKey::for_category_scope(InspectCategory::Cycles, &scope),
+            category: InspectCategory::Cycles,
+            scope_files: files.clone(),
+            project_root: root.clone(),
+            inspect_dir: root.join("inspect"),
+            config: std::sync::Arc::new(crate::config::Config::default()),
+            symbol_cache: std::sync::Arc::new(std::sync::RwLock::new(
+                crate::parser::SymbolCache::new(),
+            )),
+            inspect_writer: true,
+            callgraph_writer: true,
+            callgraph_snapshot: None,
+        };
+
+        ANALYZE_FILE_FACTS_CALLS.with(|calls| calls.set(0));
+        cache_freshness::reset_hash_file_if_small_count_for_debug();
+        let success = run_cycles_scan_with_oxc(&job, Some(&oxc_result))
+            .outcome
+            .unwrap();
+        assert_eq!(
+            ANALYZE_FILE_FACTS_CALLS.with(std::cell::Cell::get),
+            0,
+            "the scan must use the analysis it was given"
+        );
+        assert_eq!(
+            cache_freshness::hash_file_if_small_count_for_debug(),
+            0,
+            "freshness must reuse the facts' content hash"
+        );
+        assert_eq!(success.aggregate["count"], 1);
+        for contribution in &success.contributions {
+            assert_eq!(
+                contribution.freshness,
+                cache_freshness::collect(&contribution.file_path).unwrap()
+            );
+        }
+        // Rolling the same contributions up from the cache gives the same
+        // aggregate.
+        let rolled_up = aggregate_cycle_contributions_with_limit(
+            &root,
+            &success.contributions,
+            skipped_languages(&files),
+            Some(DRILL_DOWN_LIMIT),
+        );
+        assert_eq!(success.aggregate, rolled_up);
     }
 
     fn import(graph: &mut CycleGraph, from: &str, to: &str) {

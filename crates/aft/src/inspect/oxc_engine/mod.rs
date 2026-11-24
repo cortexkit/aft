@@ -317,6 +317,8 @@ pub(crate) fn analyze_file_facts(
     options: AnalyzeOptions,
     skipped_outside_root: Vec<PathBuf>,
 ) -> OxcEngineResult {
+    #[cfg(test)]
+    ANALYZE_FILE_FACTS_CALLS.with(|calls| calls.set(calls.get() + 1));
     // Same de-verbatim rule as analyze_files_with_cache: FileFacts paths are
     // normalize_path-built, so the root they are relativized against must be too.
     let project_root = fs::canonicalize(project_root)
@@ -330,6 +332,13 @@ pub(crate) fn analyze_file_facts(
         Vec::new(),
         skipped_outside_root,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `analyze_file_facts` calls made on this thread.
+    pub(crate) static ANALYZE_FILE_FACTS_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 fn analyze_preparsed_facts(
