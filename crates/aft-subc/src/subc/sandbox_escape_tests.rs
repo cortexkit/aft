@@ -377,6 +377,7 @@ async fn sandbox_escape_inapplicable_calls_are_refused_before_filing() {
     let f = fixture(FakeCingulate::up());
     let head = head(&f);
     let long = "x".repeat(2_001);
+    let long_reason = "y".repeat(161);
     let cases = [
         (
             &f.worker,
@@ -396,6 +397,16 @@ async fn sandbox_escape_inapplicable_calls_are_refused_before_filing() {
         (
             &head,
             json!({"command":"pwd", "escape_sandbox":"two\nlines"}),
+            aft_engine::sandbox_escape::REASON_INVALID,
+        ),
+        (
+            &head,
+            json!({"command":"pwd", "escape_sandbox":""}),
+            aft_engine::sandbox_escape::REASON_INVALID,
+        ),
+        (
+            &head,
+            json!({"command":"pwd", "escape_sandbox":long_reason}),
             aft_engine::sandbox_escape::REASON_INVALID,
         ),
     ];

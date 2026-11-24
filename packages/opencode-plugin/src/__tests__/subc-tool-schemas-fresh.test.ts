@@ -24,6 +24,24 @@ const REMOTE_GUIDANCE =
 const PLACEHOLDER = JSON.stringify({ type: "object" });
 
 describe("subc tool schemas artifact", () => {
+  test("bash alone offers the optional escape reason in every shell schema", () => {
+    const schemas = [
+      buildSubcToolSchemas(),
+      buildSubcToolSchemas(true),
+      buildSubcToolPresets().worker,
+    ];
+    for (const schema of schemas) {
+      const bash = schema.bash as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      const powershell = schema.powershell as { properties?: Record<string, unknown> };
+      expect(bash.properties?.escape_sandbox).toMatchObject({ type: "string" });
+      expect(bash.required ?? []).not.toContain("escape_sandbox");
+      expect(powershell.properties?.escape_sandbox).toBeUndefined();
+    }
+  });
+
   test("default schemas omit the remote parameter and guidance", () => {
     const schemas = [
       ...Object.values(buildSubcToolSchemas()),

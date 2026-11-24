@@ -20,7 +20,6 @@ pub const COMMAND_UNSHOWABLE: &str =
     "The command contains characters the sandbox escape card cannot show.";
 pub const REASON_INVALID: &str =
     "Give one nonblank line of at most 160 characters in `escape_sandbox`.";
-pub const FOLDER_GONE: &str = "The command folder no longer exists; the command did not run.";
 pub const DECLINED: &str = "Sandbox escape declined; the command did not run.";
 pub const EXPIRED: &str = "Sandbox escape approval expired; the command did not run.";
 pub const WITHDRAWN: &str = "Sandbox escape approval was withdrawn; the command did not run.";

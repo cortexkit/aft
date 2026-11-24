@@ -1,14 +1,15 @@
 /**
  * The shell tool surface shown to a model must match the features that are on.
  *
- * Every parameter, companion tool and description sentence of the shell family
- * depends on one setting: `compressed` on `bash.compress`; `wait`,
- * `background`, the PTY parameters and the companion tools (`bash_status`,
- * `bash_watch`, `bash_write`, `bash_kill`) on `bash.background`; `sandbox` on
- * `sandbox.profile.head`. A model shown an option that does nothing, or a tool whose
- * description points at a parameter it cannot pass, wastes calls on it. This
- * file walks every combination of the three settings through the production
- * registration path of both plugins and checks the schema keys, the registered
+ * Most parameters, companion tools and description sentences depend on one setting:
+ * `compressed` on `bash.compress`; `wait`, `background`, the pseudo-terminal
+ * (PTY) parameters and the companion tools (`bash_status`, `bash_watch`,
+ * `bash_write`, `bash_kill`) on `bash.background`; and `sandbox` on
+ * `sandbox.profile.head`. The optional `escape_sandbox` reason is deliberately
+ * present in every combination. A model shown an option that does nothing, or a
+ * tool whose description points at a parameter it cannot pass, wastes calls on
+ * it. This file walks every combination of the three settings through the
+ * production registration path of both plugins and checks the schema keys, the registered
  * names, and that no description or workflow hint names something absent.
  */
 import { describe, expect, test } from "bun:test";
