@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, Weak};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub mod progress;
@@ -235,14 +235,14 @@ fn acquire_blocking_while_inner(
     let started = Instant::now();
     let mut logged = false;
     loop {
+        let generation = limiter.wake_generation.load(Ordering::Acquire);
         if !admitted() || cancelled() {
             return None;
         }
         // Standing yields to any already-queued interactive or ordinary
         // maintenance contender. Returning None keeps it resumable; callers
         // use the same path again at the next checkpoint without priority tags.
-        if request.class == ColdBuildAdmissionClass::Standing
-            && limiter.has_non_standing_waiters()
+        if request.class == ColdBuildAdmissionClass::Standing && limiter.has_non_standing_waiters()
         {
             return None;
         }
@@ -292,7 +292,7 @@ fn acquire_blocking_while_inner(
             );
             logged = true;
         }
-        std::thread::sleep(Duration::from_millis(100));
+        limiter.wait_for_admission_change(generation);
     }
 }
 
@@ -313,6 +313,10 @@ pub struct ColdBuildLimiter {
     /// second hot-path lock. Rotation still uses `admission_state` below.
     waiting_by_class: [AtomicUsize; ADMISSION_CLASS_COUNT],
     admission_state: Mutex<AdmissionState>,
+    wake_generation: AtomicUsize,
+    admission_changed: Condvar,
+    #[cfg(test)]
+    rank_records_examined: AtomicUsize,
     #[cfg(any(test, feature = "test-support"))]
     refusal_observer: Mutex<Option<crossbeam_channel::Sender<String>>>,
 }
@@ -446,6 +450,10 @@ impl ColdBuildLimiter {
                 holders_by_root: BTreeMap::new(),
                 queued: BTreeMap::new(),
             }),
+            wake_generation: AtomicUsize::new(0),
+            admission_changed: Condvar::new(),
+            #[cfg(test)]
+            rank_records_examined: AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-support"))]
             refusal_observer: Mutex::new(None),
         }
@@ -453,6 +461,29 @@ impl ColdBuildLimiter {
 
     pub(crate) fn limit(&self) -> usize {
         self.limit
+    }
+
+    fn wait_for_admission_change(&self, generation: usize) -> bool {
+        let state = self
+            .admission_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Cancellation and lifecycle predicates are external to the limiter and
+        // do not signal this condition variable. The timeout rechecks them.
+        let (_state, wake) = self
+            .admission_changed
+            .wait_timeout_while(state, Duration::from_secs(1), |_| {
+                self.wake_generation.load(Ordering::Acquire) == generation
+            })
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !wake.timed_out()
+    }
+
+    // The admission lock prevents a release between checking the generation
+    // and parking. The caller must still hold it when notifying.
+    fn wake_waiters_locked(&self, _state: &AdmissionState) {
+        self.wake_generation.fetch_add(1, Ordering::Release);
+        self.admission_changed.notify_all();
     }
 
     fn try_take_slot(&self) -> bool {
@@ -563,14 +594,18 @@ impl ColdBuildLimiter {
         }
 
         let available = self.available.load(Ordering::Acquire);
+        if available == 0 {
+            return None;
+        }
         if let Some(ticket) = ticket {
             let class = request.class.label();
-            let older_same_class = state
-                .queued
-                .range(..ticket)
-                .filter(|(_, record)| record.domain == class)
-                .count();
-            if older_same_class >= available {
+            let mut older_same_class = 0;
+            if state.queued.range(..ticket).any(|(_, record)| {
+                #[cfg(test)]
+                self.rank_records_examined.fetch_add(1, Ordering::Relaxed);
+                older_same_class += usize::from(record.domain == class);
+                older_same_class >= available
+            }) {
                 return None;
             }
         }
@@ -793,12 +828,13 @@ impl Drop for AdmissionWaiter {
         let previous =
             self.limiter.waiting_by_class[self.class.index()].fetch_sub(1, Ordering::AcqRel);
         debug_assert!(previous > 0);
-        self.limiter
+        let mut state = self
+            .limiter
             .admission_state
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .queued
-            .remove(&self.census_id);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.queued.remove(&self.census_id);
+        self.limiter.wake_waiters_locked(&state);
     }
 }
 
@@ -851,15 +887,42 @@ impl Drop for ColdBuildPermitLease {
                 state.holders_by_root.remove(root);
             }
         }
-        drop(state);
         let previous = self.limiter.available.fetch_add(1, Ordering::Release);
         debug_assert!(previous < self.limiter.limit);
+        self.limiter.wake_waiters_locked(&state);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cold_build_saturated_retry_skips_fifo_scan() {
+        let limiter = isolated_limiter(1);
+        let _hold = limiter.try_acquire().unwrap();
+        let request =
+            ColdBuildAdmissionRequest::new("waiting", ColdBuildAdmissionClass::Maintenance);
+        let _older: Vec<_> = (0..32)
+            .map(|_| AdmissionWaiter::register(&limiter, &request, "older"))
+            .collect();
+        let waiter = AdmissionWaiter::register(&limiter, &request, "waiting");
+        assert!(limiter
+            .install_classified_permit(&request, "waiting", Some(waiter.census_id))
+            .is_none());
+        assert_eq!(limiter.rank_records_examined.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cold_build_release_between_refusal_and_park_is_not_lost() {
+        let limiter = isolated_limiter(1);
+        let held = limiter.try_acquire().unwrap();
+        let generation = limiter.wake_generation.load(Ordering::Acquire);
+        assert!(limiter.try_acquire().is_none());
+        drop(held);
+        assert!(limiter.wait_for_admission_change(generation));
+        assert!(limiter.try_acquire().is_some());
+    }
 
     // These tests mutate the process-global limiter; run them one at a time.
     fn serial() -> std::sync::MutexGuard<'static, ()> {
