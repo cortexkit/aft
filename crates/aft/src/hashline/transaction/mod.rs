@@ -2321,7 +2321,7 @@ mod tests {
         );
     }
 
-    /// Journal entry created before a later failure still yields op_id.
+    /// A write failure after journaling keeps the entry and its undo ID.
     #[test]
     fn op_id_present_when_journal_entry_exists_before_failure() {
         let temp = tempfile::tempdir().unwrap();
@@ -2338,19 +2338,30 @@ mod tests {
         let mut backups = backup_store(&temp.path().join("backups"));
         let mut snapshots = SnapshotStore::new();
         let mut session_regs = RegisterStore::new();
-        // Drift after journal: backup succeeds, write never happens, op_id remains.
-        // Force drift by mutating after plan; backup still runs first in execute.
-        write_file(&a, b"changed\n");
-        let mut exec = ctx(&mut backups, &mut snapshots, &mut session_regs, true, None);
+        let mut exec = ctx(
+            &mut backups,
+            &mut snapshots,
+            &mut session_regs,
+            true,
+            Some(ExecuteFault::Write { step: 0 }),
+        );
         let envelope = execute_transaction(plan, &mut exec);
         assert!(!envelope.success);
         assert_eq!(
             envelope.files[0].classification,
-            FileClassification::FailedBaselineDrift
+            FileClassification::FailedWrite
         );
-        // Backup is taken before baseline recheck, so op_id must be present.
-        assert!(envelope.op_id.is_some());
-        assert_eq!(fs::read(&a).unwrap(), b"changed\n");
+        assert_eq!(fs::read(&a).unwrap(), b"a\n");
+        let op_id = envelope.op_id.expect("the write failure kept its journal");
+        let undo = backups.plan_last_operation(SESSION).unwrap();
+        assert_eq!(undo.op_id, op_id);
+        let restored = backups
+            .restore_planned_operation(SESSION, &undo, &mut |_| panic!("unexpected drift"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.op_id, op_id);
+        assert_eq!(restored.restored.len(), 1);
+        assert_eq!(fs::read(&a).unwrap(), b"a\n");
     }
 }
 
