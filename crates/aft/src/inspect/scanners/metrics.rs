@@ -42,6 +42,8 @@ struct FileMetric {
     path: PathBuf,
     language: &'static str,
     symbol_count: usize,
+    /// False when the parse cache had no current entry for this file.
+    symbols_counted: bool,
     loc: usize,
 }
 
@@ -118,8 +120,10 @@ fn run_metrics_scan_with_memo(
                 skipped_files.push((display_path(&job.project_root, &cached.path), reason));
                 return None;
             }
+            let symbol_count = cached_symbol_count(&cached.path, job);
             Some(FileMetric {
-                symbol_count: cached_symbol_count(&cached.path, job),
+                symbol_count: symbol_count.unwrap_or(0),
+                symbols_counted: symbol_count.is_some(),
                 path: cached.path,
                 language: cached.language,
                 loc: cached.loc,
@@ -211,20 +215,13 @@ fn read_file_bytes(path: &Path) -> MetricRead {
     }
 }
 
-fn cached_symbol_count(path: &Path, job: &crate::inspect::InspectJob) -> usize {
-    let Ok(metadata) = fs::metadata(path) else {
-        return 0;
-    };
-    let Ok(mtime) = metadata.modified() else {
-        return 0;
-    };
-    let Ok(cache) = job.symbol_cache.read() else {
-        return 0;
-    };
-
-    cache
-        .symbol_count_if_metadata_matches(path, mtime, metadata.len())
-        .unwrap_or(0)
+/// Symbols come from the session's parse cache, so a file nobody has parsed
+/// yet has no count. `None` keeps that apart from a file with zero symbols.
+fn cached_symbol_count(path: &Path, job: &crate::inspect::InspectJob) -> Option<usize> {
+    let metadata = fs::metadata(path).ok()?;
+    let mtime = metadata.modified().ok()?;
+    let cache = job.symbol_cache.read().ok()?;
+    cache.symbol_count_if_metadata_matches(path, mtime, metadata.len())
 }
 
 /// Same rule as `source_text::count_lines_bounded`: a trailing newline ends
@@ -238,6 +235,7 @@ fn aggregate_metrics(project_root: &Path, per_file: &[FileMetric]) -> serde_json
     let mut totals = MetricCounts::default();
     let mut by_language = BTreeMap::<&'static str, MetricCounts>::new();
     let mut top_files = Vec::with_capacity(per_file.len());
+    let symbols_counted_files = per_file.iter().filter(|file| file.symbols_counted).count();
 
     for file in per_file {
         totals.add_file(file);
@@ -260,6 +258,10 @@ fn aggregate_metrics(project_root: &Path, per_file: &[FileMetric]) -> serde_json
     serde_json::json!({
         "files": totals.file_count,
         "symbols": totals.symbol_count,
+        // `symbols` is a lower bound unless every counted file had a current
+        // parse-cache entry.
+        "symbols_complete": symbols_counted_files == per_file.len(),
+        "symbols_counted_files": symbols_counted_files,
         "loc": totals.loc,
         "totals": totals,
         "by_language": by_language,

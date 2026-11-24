@@ -125,10 +125,33 @@ fn inspect_metrics_mixed_rust_and_typescript_uses_cached_symbol_counts() {
 
     assert_eq!(payload["files"], 2);
     assert_eq!(payload["symbols"], 5);
+    assert_eq!(payload["symbols_complete"], true);
+    assert_eq!(payload["symbols_counted_files"], 2);
     assert_eq!(payload["by_language"]["rust"]["file_count"], 1);
     assert_eq!(payload["by_language"]["rust"]["symbol_count"], 2);
     assert_eq!(payload["by_language"]["typescript"]["file_count"], 1);
     assert_eq!(payload["by_language"]["typescript"]["symbol_count"], 3);
+}
+
+#[test]
+fn inspect_metrics_symbols_name_files_missing_from_the_parse_cache() {
+    let project = tempfile::tempdir().expect("temp project");
+    let parsed = write_file(project.path(), "src/parsed.rs", "pub fn alpha() {}\n");
+    let unparsed = write_file(
+        project.path(),
+        "src/unparsed.rs",
+        "pub fn beta() {}\npub fn gamma() {}\n",
+    );
+    let cache = shared_cache();
+    insert_symbol_count(&cache, &parsed, 1);
+    let job = metrics_job(project.path(), vec![parsed, unparsed], cache);
+
+    let payload = metrics_payload(&job);
+
+    assert_eq!(payload["files"], 2);
+    assert_eq!(payload["symbols"], 1);
+    assert_eq!(payload["symbols_complete"], false);
+    assert_eq!(payload["symbols_counted_files"], 1);
 }
 
 #[test]
