@@ -242,12 +242,35 @@ mod tests {
         symbols: &[Symbol],
     ) -> HashMap<String, Vec<CallSite>> {
         let mut calls_by_symbol = HashMap::new();
+        let symbol_range = |symbol: &Symbol| {
+            line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col)
+                ..line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col)
+        };
+        let is_callable =
+            |symbol: &Symbol| matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method);
         for symbol in symbols {
-            let byte_start =
-                line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col);
-            let byte_end = line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col);
-            let sites = extract_calls_full(source, root, byte_start, byte_end, lang)
+            let range = symbol_range(symbol);
+            let nested_bodies = symbols
+                .iter()
+                .filter(|inner| is_callable(symbol) && is_callable(inner))
+                .map(symbol_range)
+                .filter(|inner| {
+                    range.start <= inner.start && inner.end <= range.end && *inner != range
+                })
+                .map(|inner| {
+                    root.descendant_for_byte_range(inner.start, inner.end)
+                        .and_then(|node| node.child_by_field_name("body"))
+                        .map(|body| body.byte_range())
+                        .unwrap_or(inner)
+                })
+                .collect::<Vec<_>>();
+            let sites = extract_calls_full(source, root, range.start, range.end, lang)
                 .into_iter()
+                .filter(|(_, _, _, start, end)| {
+                    !nested_bodies
+                        .iter()
+                        .any(|body| body.start <= *start && *end <= body.end)
+                })
                 .map(
                     |(full, short, line, call_byte_start, call_byte_end)| CallSite {
                         kind: CallSiteKind::Call,
@@ -264,21 +287,13 @@ mod tests {
             }
         }
 
-        let symbol_ranges = symbols
-            .iter()
-            .map(|symbol| {
-                (
-                    line_col_to_byte(source, symbol.range.start_line, symbol.range.start_col),
-                    line_col_to_byte(source, symbol.range.end_line, symbol.range.end_col),
-                )
-            })
-            .collect::<Vec<_>>();
+        let symbol_ranges = symbols.iter().map(symbol_range).collect::<Vec<_>>();
         let top_level_sites = collect_calls_full_with_ranges(root, source, 0, source.len(), lang)
             .into_iter()
             .filter(|site| {
                 !symbol_ranges
                     .iter()
-                    .any(|(start, end)| site.byte_start >= *start && site.byte_end <= *end)
+                    .any(|range| site.byte_start >= range.start && site.byte_end <= range.end)
             })
             .map(|site| CallSite {
                 kind: CallSiteKind::Call,
@@ -507,13 +522,7 @@ def right():
             Direct,
         );
         assert_eq!(actual, reference, "overlapping and adjacent ranges changed");
-        assert_eq!(
-            actual["outer"]
-                .iter()
-                .map(|site| site.callee_name.as_str())
-                .collect::<Vec<_>>(),
-            ["first", "second"]
-        );
+        assert!(!actual.contains_key("outer"));
         assert_eq!(actual["left"][0].callee_name, "first");
         assert_eq!(actual["right"][0].callee_name, "second");
         assert_eq!(actual[TOP_LEVEL_SYMBOL][0].callee_name, "third");

@@ -136,7 +136,7 @@ mod tests {
             })
             .filter_map(|r| r.caller_symbol.as_deref())
             .collect::<BTreeSet<_>>();
-        assert_eq!(callers, BTreeSet::from(["at_pin", "pinned_domains"]));
+        assert_eq!(callers, BTreeSet::from(["at_pin"]));
 
         // Check the construction order as well as final serialization: later
         // stable sorts preserve input order when several references share a key.
