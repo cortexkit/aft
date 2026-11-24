@@ -29,7 +29,8 @@ pub(super) fn queue_root(root: PathBuf) {
 
 /// Called only by the detached watchdog cleanup worker. Retaining the iterator
 /// between bounded passes makes progress even through a large fresh backlog.
-pub(crate) fn sweep_queued() {
+#[doc(hidden)]
+pub fn sweep_queued() {
     let Some(pending) = PENDING.get() else { return };
     // Never hold this mutex during filesystem work: startup and launch only
     // enqueue a path and must not wait behind a sweep's directory iteration.

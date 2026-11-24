@@ -20,6 +20,10 @@ use std::sync::{
 use std::sync::{LazyLock, Mutex};
 
 pub use crate::gh_shim_paths::{GH_SHIM_TICKET_ENV, GH_SHIM_WORKER_ENV};
+#[doc(hidden)]
+pub mod spawn_metadata;
+use spawn_metadata::SpawnMetadata;
+use subc_protocol::scope::ScopeStamp;
 
 const TICKET_BYTES: usize = 16;
 
@@ -69,27 +73,32 @@ struct Entry {
 
 #[path = "gh_shim_speech/ticket_type.rs"]
 pub(crate) mod ticket_type;
-pub(crate) use ticket_type::SpeechTicket;
+#[doc(hidden)]
+pub use ticket_type::SpeechTicket;
 thread_local! {static SPAWN_TICKET:std::cell::RefCell<Option<[u8;TICKET_BYTES]>>=const{std::cell::RefCell::new(None)};}
 
-pub(crate) struct SpawnTicketGuard(Option<[u8; TICKET_BYTES]>);
+#[doc(hidden)]
+pub struct SpawnTicketGuard(Option<[u8; TICKET_BYTES]>);
 impl Drop for SpawnTicketGuard {
     fn drop(&mut self) {
         SPAWN_TICKET.with(|slot| *slot.borrow_mut() = self.0.take());
     }
 }
-pub(crate) fn spawn_ticket_guard(ticket: Option<&str>) -> SpawnTicketGuard {
+#[doc(hidden)]
+pub fn spawn_ticket_guard(ticket: Option<&str>) -> SpawnTicketGuard {
     SpawnTicketGuard(SPAWN_TICKET.with(|slot| slot.replace(ticket.and_then(decode))))
 }
 
-pub(crate) fn capture_spawn(metadata: &crate::bash_background::persistence::PersistedTask) {
+#[doc(hidden)]
+pub fn capture_spawn(metadata: &SpawnMetadata) {
     let Some((speech, _)) = spawn_speech(&metadata.task_id) else {
         return;
     };
     capture_record(&speech, &metadata.session_id, &metadata.task_id);
 }
 
-pub(crate) fn pty_seal_required() -> bool {
+#[doc(hidden)]
+pub fn pty_seal_required() -> bool {
     let raw = SPAWN_TICKET.with(|slot| *slot.borrow());
     let Some(raw) = raw else { return false };
     registry()
@@ -103,9 +112,8 @@ pub(crate) fn pty_seal_required() -> bool {
         })
 }
 
-pub(crate) fn finish_pty_seal_or_revoke(
-    task_id: &str,
-) -> Result<(), crate::gh_shim_speech::Refusal> {
+#[doc(hidden)]
+pub fn finish_pty_seal_or_revoke(task_id: &str) -> Result<(), crate::gh_shim_speech::Refusal> {
     use crate::gh_shim_speech::{Code, Refusal, ScopeRole};
     let Some((speech, _)) = spawn_speech(task_id) else {
         return Err(Refusal::new(
@@ -229,7 +237,8 @@ fn capture_record(speech: &SpeechTicket, session: &str, task: &str) {
     }
 }
 
-pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::PersistedTask) {
+#[doc(hidden)]
+pub fn seal_spawn(metadata: &SpawnMetadata) {
     let Some((speech, raw)) = spawn_speech(&metadata.task_id) else {
         return;
     };
@@ -245,7 +254,7 @@ pub(crate) fn seal_spawn(metadata: &crate::bash_background::persistence::Persist
         return;
     }
     #[cfg(unix)]
-    if metadata.remote.is_some() {
+    if metadata.remote {
         *speech
             .failure
             .lock()
@@ -333,7 +342,8 @@ fn activate_speech_locked(speech: &SpeechTicket, raw: &[u8; TICKET_BYTES]) {
     }
 }
 
-pub(crate) fn mark_spawn_background(background: bool) {
+#[doc(hidden)]
+pub fn mark_spawn_background(background: bool) {
     let raw = SPAWN_TICKET.with(|slot| *slot.borrow());
     if let Some(raw) = raw {
         if let Some(speech) = registry()
@@ -346,7 +356,8 @@ pub(crate) fn mark_spawn_background(background: bool) {
     }
 }
 
-pub(crate) fn promote_speech_task(session: &str, task: &str) {
+#[doc(hidden)]
+pub fn promote_speech_task(session: &str, task: &str) {
     let entries: Vec<_> = registry()
         .iter()
         .filter(|entry| {
@@ -452,7 +463,12 @@ fn constant_time_eq(left: &[u8; TICKET_BYTES], right: &[u8; TICKET_BYTES]) -> bo
     difference == 0
 }
 
-fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> {
+fn insert(
+    session_id: &str,
+    owner: Owner,
+    project_root: &str,
+    scope_for_spawn: &dyn Fn() -> Option<ScopeStamp>,
+) -> Option<String> {
     if !session_can_hold_ticket(session_id) {
         return None;
     }
@@ -471,7 +487,7 @@ fn insert(session_id: &str, owner: Owner, project_root: &str) -> Option<String> 
     let lifecycle = context
         .as_ref()
         .and_then(|context| context.seed.lifecycle.clone())
-        .or_else(crate::bash_background::registry::scope_for_spawn);
+        .or_else(scope_for_spawn);
     let launch = context
         .as_ref()
         .and_then(|context| context.seed.launch.as_ref().ok().cloned())
@@ -618,22 +634,39 @@ impl PendingTicket {
     /// Issue a ticket for `session_id`, or none for a session that is absent
     /// or the shared default namespace.
     pub fn issue(session_id: &str, project_root: &str) -> Self {
+        Self::issue_with_scope(session_id, project_root, &|| None)
+    }
+
+    #[doc(hidden)]
+    pub fn issue_with_scope(
+        session_id: &str,
+        project_root: &str,
+        scope_for_spawn: &dyn Fn() -> Option<ScopeStamp>,
+    ) -> Self {
         Self {
-            ticket: insert(session_id, Owner::Task(String::new()), project_root),
+            ticket: insert(
+                session_id,
+                Owner::Task(String::new()),
+                project_root,
+                scope_for_spawn,
+            ),
         }
     }
 
     /// A caller-selected command workdir is not a repository binding. Missing
     /// trusted project context leaves reads unbound rather than inferring it.
-    pub(crate) fn issue_for_project(
+    #[doc(hidden)]
+    pub fn issue_for_project(
         session_id: &str,
         project_root: Option<&std::path::Path>,
+        scope_for_spawn: &dyn Fn() -> Option<ScopeStamp>,
     ) -> Self {
-        Self::issue(
+        Self::issue_with_scope(
             session_id,
             &project_root
                 .map(|root| root.display().to_string())
                 .unwrap_or_default(),
+            scope_for_spawn,
         )
     }
 
@@ -644,7 +677,8 @@ impl PendingTicket {
     /// Reserve the task identity before exec, while retaining drop-on-error
     /// revocation until the spawning code commits the ticket with bind_task.
     #[cfg(unix)]
-    pub(crate) fn reserve_task(&self, task_id: &str) {
+    #[doc(hidden)]
+    pub fn reserve_task(&self, task_id: &str) {
         if let Some(candidate) = self.ticket.as_deref().and_then(decode) {
             for entry in registry().iter_mut() {
                 if constant_time_eq(&entry.ticket, &candidate) {
@@ -657,7 +691,8 @@ impl PendingTicket {
     /// Called only after resolving a native worker-jail plan with the shim
     /// enabled. Host synchronous calls have no entry point to mint this grant.
     #[cfg(unix)]
-    pub(crate) fn worker_read_capability(
+    #[doc(hidden)]
+    pub fn worker_read_capability(
         &self,
         socket: std::path::PathBuf,
         deadline: std::time::Instant,
@@ -690,7 +725,8 @@ impl PendingTicket {
     }
 
     #[cfg(unix)]
-    pub(crate) fn attach_worker_read_endpoint(
+    #[doc(hidden)]
+    pub fn attach_worker_read_endpoint(
         &self,
         endpoint: std::sync::Arc<crate::gh_shim_worker_endpoints::Endpoint>,
     ) -> bool {
@@ -715,7 +751,8 @@ impl PendingTicket {
     /// Abandon only optional read authority after a failed setup. The pending
     /// command ticket still follows its normal bind/drop/terminal lifecycle.
     #[cfg(unix)]
-    pub(crate) fn abandon_worker_read(&self) {
+    #[doc(hidden)]
+    pub fn abandon_worker_read(&self) {
         let Some(candidate) = self.ticket.as_deref().and_then(decode) else {
             return;
         };
@@ -750,7 +787,8 @@ impl PendingTicket {
 /// Redeem only at the endpoint that minted this purpose-specific capability.
 /// A general ticket, another command's endpoint, and expired grants all fail.
 #[cfg(unix)]
-pub(crate) fn redeem_worker_read(capability: &str, socket: &std::path::Path) -> Option<Redeemed> {
+#[doc(hidden)]
+pub fn redeem_worker_read(capability: &str, socket: &std::path::Path) -> Option<Redeemed> {
     let candidate = decode(capability)?;
     let entries = registry();
     entries.iter().find_map(|entry| {
@@ -774,7 +812,8 @@ pub(crate) fn redeem_worker_read(capability: &str, socket: &std::path::Path) -> 
 }
 
 #[cfg(unix)]
-pub(crate) fn worker_read_scope_matches(
+#[doc(hidden)]
+pub fn worker_read_scope_matches(
     capability: &str,
     socket: &std::path::Path,
     stamp: &crate::gh_shim_relay::ScopeStamp,
@@ -795,7 +834,8 @@ pub(crate) fn worker_read_scope_matches(
 }
 
 #[cfg(unix)]
-pub(crate) fn renew_worker_read_deadline(task_id: &str, deadline: std::time::Instant) {
+#[doc(hidden)]
+pub fn renew_worker_read_deadline(task_id: &str, deadline: std::time::Instant) {
     for entry in registry().iter_mut() {
         if matches!(&entry.owner, Owner::Task(id) if id == task_id) {
             if let Some(grant) = &mut entry.worker_read {
@@ -806,7 +846,8 @@ pub(crate) fn renew_worker_read_deadline(task_id: &str, deadline: std::time::Ins
 }
 
 #[cfg(unix)]
-pub(crate) fn worker_read_deadline(socket: &std::path::Path) -> Option<std::time::Instant> {
+#[doc(hidden)]
+pub fn worker_read_deadline(socket: &std::path::Path) -> Option<std::time::Instant> {
     registry()
         .iter()
         .filter_map(|entry| entry.worker_read.as_ref())
@@ -830,8 +871,23 @@ pub struct ScopedTicket {
 
 impl ScopedTicket {
     pub fn issue(session_id: &str, call_id: &str, project_root: &str) -> Self {
+        Self::issue_with_scope(session_id, call_id, project_root, &|| None)
+    }
+
+    #[doc(hidden)]
+    pub fn issue_with_scope(
+        session_id: &str,
+        call_id: &str,
+        project_root: &str,
+        scope_for_spawn: &dyn Fn() -> Option<ScopeStamp>,
+    ) -> Self {
         Self {
-            ticket: insert(session_id, Owner::Call(call_id.to_string()), project_root),
+            ticket: insert(
+                session_id,
+                Owner::Call(call_id.to_string()),
+                project_root,
+                scope_for_spawn,
+            ),
         }
     }
 
@@ -869,8 +925,8 @@ mod tests {
         )
         .with_owner_authorized(true);
         let pending =
-            crate::bash_background::registry::with_scope_spawn(Some(scope.clone()), || {
-                PendingTicket::issue("launch-pin-session", "/does-not-exist")
+            PendingTicket::issue_with_scope("launch-pin-session", "/does-not-exist", &|| {
+                Some(scope.clone())
             });
         let redeemed = redeem(pending.value().unwrap()).unwrap();
         assert_eq!(
@@ -998,10 +1054,11 @@ pub(crate) fn redeem_speech_cold(
     )
     .map_err(|_| invalid())?
     .ok_or_else(invalid)?;
-    let metadata: crate::bash_background::persistence::PersistedTask =
-        serde_json::from_str(&row.metadata).map_err(|_| invalid())?;
+    let metadata = service
+        .decode_cold_task(&row.metadata)
+        .ok_or_else(invalid)?;
     #[cfg(unix)]
-    if metadata.remote.is_some() {
+    if metadata.spawn.remote {
         return Err(Refusal::new(
             Code::AuthorityUnavailable,
             "guard_unsupported",
@@ -1022,10 +1079,10 @@ pub(crate) fn redeem_speech_cold(
         || row.session_id != stored.record.session_id
         || row.task_id != stored.record.task_id
         || metadata.harness.as_deref() != Some(stored.record.harness.as_str())
-        || metadata.session_id != row.session_id
-        || metadata.task_id != row.task_id
-        || metadata.child_pid != Some(seal.child_pid)
-        || metadata.child_start_time_ms != Some(seal.child_start_time_ms)
+        || metadata.spawn.session_id != row.session_id
+        || metadata.spawn.task_id != row.task_id
+        || metadata.spawn.child_pid != Some(seal.child_pid)
+        || metadata.spawn.child_start_time_ms != Some(seal.child_start_time_ms)
         || metadata.scope.as_ref() != Some(lifecycle)
         || row.pid != Some(i64::from(seal.child_pid))
         || row.project_key
@@ -1051,7 +1108,8 @@ pub(crate) fn redeem_speech_cold(
     })
 }
 
-pub(crate) fn speech_for_task(session: &str, task: &str) -> Vec<Arc<SpeechTicket>> {
+#[doc(hidden)]
+pub fn speech_for_task(session: &str, task: &str) -> Vec<Arc<SpeechTicket>> {
     registry()
         .iter()
         .filter(|entry| {

@@ -41,14 +41,14 @@ use subc_transport::connection_file::{self, ConnectionInfo, Endpoint, SCHEMA_VER
 const FAKE_DAEMON_VERSION: &str = "0.39.0";
 use subc_transport::{DAEMON_ID_LEN, KEY_LEN};
 
-#[path = "../../aft-engine/src/gh_shim/plexus_bindings_contract.rs"]
+#[path = "../../aft-github/src/gh_shim/plexus_bindings_contract.rs"]
 mod plexus_bindings_contract;
 /// The stand-in holder's copy of Plexus's published `gh.route` request
-/// contract (`crates/aft/src/gh_shim/plexus_contract_judge.rs`, vendored
+/// contract (`crates/aft-github/src/gh_shim/plexus_contract_judge.rs`, vendored
 /// fixtures under `crates/aft/tests/fixtures/gh_shim/plexus-contract/`).
 /// Judging every incoming `gh.route` request against it is what keeps a test
 /// stand-in from ever again being more lenient than Plexus's real route.
-#[path = "../../aft-engine/src/gh_shim/plexus_contract_judge.rs"]
+#[path = "../../aft-github/src/gh_shim/plexus_contract_judge.rs"]
 mod plexus_contract_judge;
 
 /// Seed of the dev manifest-signing key compiled into debug builds; see

@@ -307,7 +307,7 @@ fn github_diff_recorded_gh_reads_and_pages_through_protocol() {
     let bin = project.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
     let metadata =
-        include_str!("../../../aft-engine/src/github_read/fixtures/pr-42-diff-metadata.json");
+        include_str!("../../../aft-github/src/github_read/fixtures/pr-42-diff-metadata.json");
     // `gh api --paginate --jq` applies the filter to each page and prints one
     // compact JSON value per line, so the double answers with what the real
     // projection prints, not with the raw page.
@@ -318,7 +318,7 @@ fn github_diff_recorded_gh_reads_and_pages_through_protocol() {
         .map(|file| json!({"path": file["path"], "previousPath": null}).to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    let patch = include_str!("../../../aft-engine/src/github_read/fixtures/pr-42.diff");
+    let patch = include_str!("../../../aft-github/src/github_read/fixtures/pr-42.diff");
     let script = format!(
         r#"#!/bin/sh
 # Real gh refuses --slurp together with --jq or --template.

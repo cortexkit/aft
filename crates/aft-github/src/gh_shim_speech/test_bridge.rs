@@ -1,4 +1,3 @@
-use crate::bash_background::persistence::PersistedTask;
 use crate::gh_shim_speech::{self, service::Service, store::Store, Code, Refusal, ScopeRole};
 use crate::gh_shim_ticket;
 use serde_json::Value;
@@ -42,10 +41,6 @@ pub fn redeem_speech_cold(
 
 pub fn promote_speech_task(session: &str, task: &str) {
     gh_shim_ticket::promote_speech_task(session, task);
-}
-
-pub fn seal_spawn(metadata: &PersistedTask) {
-    gh_shim_ticket::seal_spawn(metadata);
 }
 
 pub fn spawn_ticket_guard(ticket: Option<&str>) -> impl Drop {

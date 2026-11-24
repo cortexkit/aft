@@ -1,7 +1,26 @@
-pub(crate) const SOCKET_ENV: &str = "AFT_GH_READ_SOCKET";
-pub(crate) const CAPABILITY_FILE_ENV: &str = "AFT_GH_READ_CAPABILITY_FILE";
-pub(crate) const STATE_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
-pub(crate) const CHILD_KEYS: [&str; 5] = [
+//! Shared worker read broker client and wire protocol.
+
+#[cfg(unix)]
+use std::path::PathBuf;
+use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+#[cfg(unix)]
+use {
+    crate::gh_shim_relay::RelayReply,
+    serde_json::json,
+    tokio::io::{AsyncReadExt, AsyncWriteExt},
+};
+
+#[doc(hidden)]
+pub const SOCKET_ENV: &str = "AFT_GH_READ_SOCKET";
+#[doc(hidden)]
+pub const CAPABILITY_FILE_ENV: &str = "AFT_GH_READ_CAPABILITY_FILE";
+#[doc(hidden)]
+pub const STATE_ENV: &str = "AFT_GH_SHIM_STATE_DIR";
+#[doc(hidden)]
+pub const CHILD_KEYS: [&str; 5] = [
     crate::gh_shim_paths::GH_SHIM_TICKET_ENV,
     crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
     SOCKET_ENV,
@@ -9,20 +28,25 @@ pub(crate) const CHILD_KEYS: [&str; 5] = [
     STATE_ENV,
 ];
 #[cfg(unix)]
-const MAX_FRAME: usize = 65_536;
+#[doc(hidden)]
+pub const MAX_FRAME: usize = 65_536;
 #[cfg(unix)]
-const MAX_RESPONSE: usize = 2_097_152;
+#[doc(hidden)]
+pub const MAX_RESPONSE: usize = 2_097_152;
 // A UTF-8 body byte can expand to six JSON bytes (for example, NUL becomes
 // \u0000). Leave one request frame for the typed result's metadata and wrapper.
 #[cfg(unix)]
-const MAX_ENCODED_RESPONSE: usize =
+#[doc(hidden)]
+pub const MAX_ENCODED_RESPONSE: usize =
     crate::gh_shim::read_contract::MAX_REPLY_BYTES as usize * 6 + MAX_FRAME;
 
 #[cfg(unix)]
-pub(crate) const CALL_DEADLINE: Duration = Duration::from_secs(20);
+#[doc(hidden)]
+pub const CALL_DEADLINE: Duration = Duration::from_secs(20);
 
 // Keep overload and transport failures actionable at every lookup/read boundary.
-pub(crate) fn failure_text(code: &str) -> String {
+#[doc(hidden)]
+pub fn failure_text(code: &str) -> String {
     match code {
         "broker_busy" => "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel.",
         "request_rate_exceeded" => "gh read refused: more than 30 gh reads in one second. Retry in 1 second.",
@@ -40,7 +64,8 @@ pub(crate) fn failure_text(code: &str) -> String {
 /// envelope; it is not a SUBC connection and has no subscription protocol.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "op")]
-pub(crate) enum Operation {
+#[doc(hidden)]
+pub enum Operation {
     #[serde(rename = "gh_shim.session_context")]
     SessionContext,
     #[serde(rename = "gh_shim.read_request")]
@@ -52,13 +77,15 @@ pub(crate) enum Operation {
 #[cfg(unix)]
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct Envelope {
-    capability: String,
-    operation: Operation,
+#[doc(hidden)]
+pub struct Envelope {
+    pub capability: String,
+    pub operation: Operation,
 }
 
 #[cfg(unix)]
-fn refusal(code: &str) -> RelayReply {
+#[doc(hidden)]
+pub fn refusal(code: &str) -> RelayReply {
     RelayReply {
         ok: false,
         data: json!({"refusal_code": code, "stage": "worker_broker", "message": failure_text(code)}),
@@ -66,7 +93,8 @@ fn refusal(code: &str) -> RelayReply {
 }
 
 #[cfg(unix)]
-fn decode(bytes: &[u8]) -> Result<Envelope, RelayReply> {
+#[doc(hidden)]
+pub fn decode(bytes: &[u8]) -> Result<Envelope, RelayReply> {
     if bytes.len() > MAX_FRAME {
         return Err(refusal("frame_too_large"));
     }
@@ -74,7 +102,8 @@ fn decode(bytes: &[u8]) -> Result<Envelope, RelayReply> {
 }
 
 #[cfg(unix)]
-async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
+#[doc(hidden)]
+pub async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     mut response: RelayReply,
 ) -> std::io::Result<()> {
@@ -142,7 +171,8 @@ async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 #[cfg(unix)]
-async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Value, String> {
+#[doc(hidden)]
+pub async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Value, String> {
     let bytes = read_frame(reader, MAX_RESPONSE)
         .await
         .map_err(|error| format!("worker read broker reply failed: {error}"))?;
@@ -170,7 +200,8 @@ async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<V
 }
 
 #[cfg(unix)]
-pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
+#[doc(hidden)]
+pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut R,
     cap: usize,
 ) -> std::io::Result<Vec<u8>> {
@@ -187,7 +218,8 @@ pub(crate) async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
 }
 
 #[cfg(unix)]
-pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+#[doc(hidden)]
+pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
 ) -> std::io::Result<()> {
@@ -195,11 +227,11 @@ pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     writer.write_all(bytes).await
 }
 
-
 /// Client discovery never opens user configuration or a general connection file.
 /// In worker mode, absent paths are an error rather than a discovery fallback.
 #[derive(Clone, Debug)]
-pub(crate) enum ClientError {
+#[doc(hidden)]
+pub enum ClientError {
     #[cfg(not(unix))]
     UnsupportedPlatform(&'static str),
     #[cfg(unix)]
@@ -217,14 +249,15 @@ impl std::fmt::Display for ClientError {
     }
 }
 
-pub(crate) struct Client {
+#[doc(hidden)]
+pub struct Client {
     #[cfg(unix)]
     socket: PathBuf,
     #[cfg(unix)]
     capability_file: PathBuf,
 }
 impl Client {
-    pub(crate) fn from_process() -> Result<Self, ClientError> {
+    pub fn from_process() -> Result<Self, ClientError> {
         #[cfg(not(unix))]
         return Err(ClientError::UnsupportedPlatform(std::env::consts::OS));
         #[cfg(unix)]
@@ -255,11 +288,8 @@ mod windows_tests {
     }
 }
 
-pub(crate) fn request(
-    client: &Client,
-    operation: Operation,
-    budget: Duration,
-) -> Result<Value, String> {
+#[doc(hidden)]
+pub fn request(client: &Client, operation: Operation, budget: Duration) -> Result<Value, String> {
     #[cfg(not(unix))]
     {
         let _ = (client, operation, budget);

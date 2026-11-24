@@ -8,15 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
 #[cfg(unix)]
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use serde::{Deserialize, Serialize};
 #[cfg(unix)]
 use serde_json::json;
+#[cfg(all(unix, test))]
 use serde_json::Value;
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 #[cfg(unix)]
@@ -25,6 +24,8 @@ use tokio::sync::{watch, Semaphore};
 #[cfg(unix)]
 use crate::gh_shim_relay::{self as relay, RelayReply};
 use crate::gh_shim_relay::{GhRelay, ScopeStamp};
+
+pub use aft_github::gh_shim_worker_broker::*;
 
 #[cfg(unix)]
 const FRAME_DEADLINE: Duration = Duration::from_secs(2);
@@ -36,7 +37,6 @@ const REQUESTS_PER_SECOND: u32 = 30;
 const READS_PER_COMMAND: u32 = 600;
 #[cfg(unix)]
 static GLOBAL: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(64)));
-
 
 #[doc(hidden)]
 pub struct ScopeQuery {
@@ -165,7 +165,6 @@ pub fn install(relay: Arc<GhRelay>) -> (ServiceGuard, mpsc::Receiver<ScopeQuery>
     (guard, rx)
 }
 
-
 #[cfg(unix)]
 struct ReadAudit<'a> {
     identity: &'a crate::gh_shim_ticket::Redeemed,
@@ -187,7 +186,6 @@ impl Drop for ReadAudit<'_> {
         ));
     }
 }
-
 
 #[cfg(unix)]
 struct Budget {
@@ -496,7 +494,6 @@ async fn connection(
 
 #[cfg(unix)]
 use crate::gh_shim_relay::RelayTransport;
-
 
 #[cfg(unix)]
 async fn dispatch<T, A, L, S, F>(

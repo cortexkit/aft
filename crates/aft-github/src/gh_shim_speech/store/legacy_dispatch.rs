@@ -113,11 +113,8 @@ impl Store {
         tx.commit().map_err(db_error)
     }
 
-    pub(crate) fn pending_legacy_for_identity(
-        &self,
-        session: &str,
-        task: &str,
-    ) -> Result<u64, Refusal> {
+    #[doc(hidden)]
+    pub fn pending_legacy_for_identity(&self, session: &str, task: &str) -> Result<u64, Refusal> {
         let conn = self.connect()?;
         conn.query_row("SELECT COUNT(*) FROM gh_speech_legacy_dispatch d JOIN gh_speech_authorities a ON a.incarnation=d.incarnation WHERE a.session_id=?1 AND a.task_id=?2 AND d.state='queued'",
             params![session,task], |row| row.get(0)).map_err(db_error)

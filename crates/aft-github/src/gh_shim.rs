@@ -37,7 +37,8 @@ pub mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
 mod prefrontal_route;
-pub(crate) mod read_contract;
+#[doc(hidden)]
+pub mod read_contract;
 mod rename_guard;
 mod ticket_repository;
 mod v22_rows;
@@ -773,7 +774,7 @@ fn run_with(
         &RelayContext,
     ) -> Result<Option<bool>, String>,
 ) -> i32 {
-    if crate::sandbox_spawn::remote_shell_guard::active() {
+    if aft_base::remote_shell_marker::active() {
         return refuse(
             RefusalCode::WorkerWriteRefused,
             "GitHub commands are not available in remote shells.",
@@ -3461,7 +3462,8 @@ pub(crate) fn verified_worker_read_repository(
 /// The child still verifies signatures, while the daemon independently checks
 /// its own current manifest before serving reads. No cache or audit is shared.
 #[cfg(unix)]
-pub(crate) fn seed_worker_state(root: &Path) -> Result<(), String> {
+#[doc(hidden)]
+pub fn seed_worker_state(root: &Path) -> Result<(), String> {
     use std::io::{Read, Write};
     use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
     std::fs::DirBuilder::new()

@@ -150,6 +150,8 @@ pub mod protocol;
 pub mod pty_render;
 pub mod query_shape;
 pub mod read_policy;
+#[doc(hidden)]
+pub mod remote_shell_marker;
 pub mod runner_status_state;
 pub mod scope_watch_events;
 pub mod secret;

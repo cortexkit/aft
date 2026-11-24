@@ -154,6 +154,7 @@ dependencies = [
  "aft-base",
  "aft-db",
  "aft-edit",
+ "aft-github",
  "aft-index",
  "aft-inspect",
  "aft-parse",
@@ -302,6 +303,42 @@ dependencies = [
  "which",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "aft-github"
+version = "0.66.0"
+dependencies = [
+ "aft-base",
+ "aft-db",
+ "aft-edit",
+ "aft-store",
+ "apollo-parser",
+ "base64 0.22.1",
+ "blake3",
+ "getrandom 0.3.4",
+ "glob",
+ "graphql-parser",
+ "image",
+ "libc",
+ "log",
+ "parking_lot",
+ "regex",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subc-client-rs",
+ "subc-protocol",
+ "subc-transport",
+ "tempfile",
+ "tokio",
+ "tree-sitter",
+ "tree-sitter-yaml",
+ "url",
+ "which",
 ]
 
 [[package]]

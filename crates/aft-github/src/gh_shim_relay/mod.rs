@@ -671,7 +671,8 @@ fn bot_authority(
 
 /// Match the worker rule used for access grants: parented runs inherit worker
 /// policy, while an unparented run belongs to the head.
-pub(crate) fn worker_scope(stamp: &ScopeStamp) -> bool {
+#[doc(hidden)]
+pub fn worker_scope(stamp: &ScopeStamp) -> bool {
     use subc_protocol::scope::ScopeKind;
     stamp.owner_authorized
         && crate::access_policy::prefrontal::is_principal(&stamp.owner)
@@ -687,7 +688,8 @@ fn head_scope(stamp: &ScopeStamp) -> bool {
         && matches!(stamp.kind, ScopeKind::Head | ScopeKind::Ephemeral)
 }
 
-pub(crate) fn session_context(
+#[doc(hidden)]
+pub fn session_context(
     redeemed: &crate::gh_shim_ticket::Redeemed,
     stamp: Option<&ScopeStamp>,
 ) -> RelayReply {
@@ -730,7 +732,8 @@ pub(crate) async fn read_request<T: RelayTransport>(
 
 /// Check that the typed request targets the repository bound to the redeemed
 /// ticket and require an authenticated worker scope before relaying it.
-pub(crate) async fn read_validated_request<T: RelayTransport>(
+#[doc(hidden)]
+pub async fn read_validated_request<T: RelayTransport>(
     transport: &T,
     redeemed: &crate::gh_shim_ticket::Redeemed,
     stamp: Option<&ScopeStamp>,

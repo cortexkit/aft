@@ -2524,7 +2524,7 @@ impl BgTaskRegistry {
             paths.insert(path);
         } else {
             for speech in crate::gh_shim_ticket::speech_for_task(session, task) {
-                paths.insert(speech.prepared.context.service.store.path().to_path_buf());
+                paths.insert(speech.database_path().to_path_buf());
             }
         }
         let mut queued = 0_u64;

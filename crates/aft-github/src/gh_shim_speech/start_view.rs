@@ -107,7 +107,9 @@ pub fn inject(
 }
 
 mod sweep;
-pub(crate) use sweep::{queue_sweep, sweep_queued};
+pub(crate) use sweep::queue_sweep;
+#[doc(hidden)]
+pub use sweep::sweep_queued;
 
 pub(crate) fn protected(args: &[std::ffi::OsString]) -> bool {
     if crate::environment::non_empty_var(PROVISIONED_ENV).as_deref() != Some("1") {

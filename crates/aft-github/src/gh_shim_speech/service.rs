@@ -14,8 +14,10 @@ use super::store::Store;
 use super::{Code, Refusal, ScopeRole};
 use crate::db::access_grants::ScopeKey;
 use crate::gh_shim_relay::{facade_reply, GhRelay};
+use crate::gh_shim_ticket::spawn_metadata::{ColdTaskDecoder, ColdTaskMetadata};
 
-type Describe = Arc<
+#[doc(hidden)]
+pub type Describe = Arc<
     dyn Fn(
             ScopeStamp,
         ) -> std::pin::Pin<
@@ -154,6 +156,7 @@ struct Cached {
 #[doc(hidden)]
 pub struct Service {
     pub store: Store,
+    cold_task_decoder: OnceLock<ColdTaskDecoder>,
     root: PathBuf,
     runtime: Mutex<Option<Runtime>>,
     lease: Mutex<Option<Arc<crate::cache_location::SpeechServingLease>>>,
@@ -176,6 +179,7 @@ pub(crate) mod lifecycle;
 fn new_service(root: PathBuf) -> Arc<Service> {
     Arc::new(Service {
         store: Store::new(root.join("aft.db")),
+        cold_task_decoder: OnceLock::new(),
         root,
         runtime: Mutex::new(None),
         lease: Mutex::new(None),
@@ -211,13 +215,25 @@ pub(crate) fn lookup(root: &Path) -> Option<Arc<Service>> {
         .cloned()
 }
 
-#[doc(hidden)]
-pub fn start(
+#[cfg(test)]
+pub(crate) fn start(
     root: &Path,
     relay: &Arc<GhRelay>,
     describe: Describe,
     generation: String,
     describe_supported: bool,
+) -> Arc<Service> {
+    start_with_task_decoder(root, relay, describe, generation, describe_supported, None)
+}
+
+#[doc(hidden)]
+pub fn start_with_task_decoder(
+    root: &Path,
+    relay: &Arc<GhRelay>,
+    describe: Describe,
+    generation: String,
+    describe_supported: bool,
+    decoder: Option<ColdTaskDecoder>,
 ) -> Arc<Service> {
     let root = key(root);
     let schema = crate::db::open(&root.join("aft.db"));
@@ -238,6 +254,9 @@ pub fn start(
         })
         .cloned()
         .unwrap_or_else(|| new_service(root.clone()));
+    if let Some(decoder) = decoder {
+        let _ = service.cold_task_decoder.set(decoder);
+    }
     match schema {
         Ok(conn) => service.store.keep_schema_connection(conn),
         Err(error) => log::warn!("speech authority initialization unavailable: {error}"),
@@ -282,6 +301,10 @@ pub fn start(
 }
 
 impl Service {
+    pub(crate) fn decode_cold_task(&self, row: &str) -> Option<ColdTaskMetadata> {
+        self.cold_task_decoder.get()?(row)
+    }
+
     pub(crate) fn try_serve(&self) -> bool {
         let lifecycle = self
             .lifecycle
@@ -882,7 +905,8 @@ impl Service {
 }
 
 /// The registry has already authorized this exact server-generated task lookup.
-pub(crate) fn revoke_task_records(session: &str, task: &str) -> bool {
+#[doc(hidden)]
+pub fn revoke_task_records(session: &str, task: &str) -> bool {
     crate::gh_shim_ticket::speech_for_task(session, task)
         .into_iter()
         .fold(false, |failed, speech| {
@@ -970,6 +994,14 @@ pub(crate) fn record_service(root: &Path) -> Arc<Service> {
         .clone()
 }
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn record_service_with_task_decoder(root: &Path, decoder: ColdTaskDecoder) -> Arc<Service> {
+    let service = record_service(root);
+    let _ = service.cold_task_decoder.set(decoder);
+    service
+}
+
 impl Service {
     pub(crate) fn identity_pending(&self, session: &str, task: &str) -> bool {
         self.pending_ids
@@ -1037,7 +1069,8 @@ impl Service {
     }
 }
 
-pub(crate) fn revoke_at(path: &Path, session: &str, task: &str) -> bool {
+#[doc(hidden)]
+pub fn revoke_at(path: &Path, session: &str, task: &str) -> bool {
     let Some(root) = path.parent() else {
         return true;
     };

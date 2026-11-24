@@ -10,7 +10,7 @@ import sys
 
 
 ENGINE_AND_UPPER = {"aft-engine", "aft-tools", "aft-subc", "agent-file-tools"}
-LOWER_FORBIDDEN_TARGETS = ENGINE_AND_UPPER | {"aft-edit", "aft-index", "aft-inspect"}
+LOWER_FORBIDDEN_TARGETS = ENGINE_AND_UPPER | {"aft-edit", "aft-github", "aft-index", "aft-inspect"}
 LEAF_FORBIDDEN_TARGETS = LOWER_FORBIDDEN_TARGETS | {
     "aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer",
     "aft-secret-rules", "aft-test-fake-lsp-server",
@@ -25,6 +25,7 @@ FORBIDDEN_TARGETS = {
     "aft-secret-rules": LEAF_FORBIDDEN_TARGETS - {"aft-secret-rules"},
     "aft-test-fake-lsp-server": LEAF_FORBIDDEN_TARGETS - {"aft-test-fake-lsp-server"},
     "aft-edit": ENGINE_AND_UPPER | {"aft-index", "aft-inspect", "aft-github", "aft-shell"},
+    "aft-github": ENGINE_AND_UPPER | {"aft-index", "aft-inspect", "aft-shell"},
     "aft-index": ENGINE_AND_UPPER | {"aft-inspect", "aft-github", "aft-shell"},
     "aft-inspect": ENGINE_AND_UPPER | {"aft-github", "aft-shell"},
     "aft-engine": {"aft-tools", "aft-subc", "agent-file-tools"},

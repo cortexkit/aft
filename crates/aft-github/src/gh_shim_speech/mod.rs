@@ -15,6 +15,9 @@ pub mod service;
 pub mod start_view;
 #[doc(hidden)]
 pub mod store;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_bridge;
 
 pub(crate) const REFUSAL_STAGE: &str = "task_authority";
 

@@ -119,14 +119,16 @@ fn publish_index(path: &Path, registration: &Registration) -> io::Result<()> {
     )
 }
 
-pub(crate) struct Generation {
+#[doc(hidden)]
+pub struct Generation {
     root: PathBuf,
     name: String,
     directory: PathBuf,
     _lease: crate::fs_lock::AdvisoryLockGuard,
 }
 impl Generation {
-    pub(crate) fn new(root: &Path) -> io::Result<Arc<Self>> {
+    #[doc(hidden)]
+    pub fn new(root: &Path) -> io::Result<Arc<Self>> {
         match fs::DirBuilder::new().mode(0o700).create(root) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
@@ -155,7 +157,8 @@ impl Generation {
             _lease: crate::fs_lock::AdvisoryLockGuard::from_locked_file(lease),
         }))
     }
-    pub(crate) fn bind(self: &Arc<Self>, task: &str) -> io::Result<(UnixListener, Arc<Endpoint>)> {
+    #[doc(hidden)]
+    pub fn bind(self: &Arc<Self>, task: &str) -> io::Result<(UnixListener, Arc<Endpoint>)> {
         if !task_name(task) {
             return Err(io::Error::other("invalid command temp name"));
         }
@@ -217,16 +220,19 @@ impl Generation {
 
 /// One object owns removal. Revocation and later drops may call remove, but only
 /// the first call can consume the registration; no delayed second unlink exists.
-pub(crate) struct Endpoint {
+#[doc(hidden)]
+pub struct Endpoint {
     path: PathBuf,
     generation: Arc<Generation>,
     state: Mutex<Option<(Registration, PathBuf, bool)>>,
 }
 impl Endpoint {
-    pub(crate) fn path(&self) -> PathBuf {
+    #[doc(hidden)]
+    pub fn path(&self) -> PathBuf {
         self.path.clone()
     }
-    pub(crate) fn remove(&self) {
+    #[doc(hidden)]
+    pub fn remove(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         let Some((registration, record, bound)) = state.as_ref() else {
             return;

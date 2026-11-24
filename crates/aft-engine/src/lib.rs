@@ -132,37 +132,37 @@ pub use aft_edit::extract;
 pub use aft_index::feature_status;
 pub mod file_kind;
 pub use aft_base::fleet_status;
+pub use aft_base::gh_shim_paths;
 pub use aft_db::fs_lock;
 #[doc(hidden)]
 pub use aft_edit::file_read_exact;
 pub use aft_edit::format;
+pub use aft_github::gh_shim;
+pub use aft_github::gh_shim_relay;
 pub use aft_parse::fuzzy_match;
-pub mod gh_shim;
-pub use aft_base::gh_shim_paths;
-pub mod gh_shim_relay;
 #[doc(hidden)]
 pub mod gh_shim_speech;
 pub mod gh_shim_ticket;
 #[doc(hidden)]
 pub mod gh_shim_worker_broker;
-#[cfg(unix)]
-#[doc(hidden)]
-pub mod gh_shim_worker_endpoints;
 pub use aft_base::git_head;
 #[cfg(all(test, unix))]
 pub(crate) use aft_base::git_probe;
 pub(crate) use aft_base::git_revision;
+#[cfg(unix)]
+#[doc(hidden)]
+pub use aft_github::gh_shim_worker_endpoints;
 pub use aft_index::git_index_reader;
 #[doc(hidden)]
 pub mod git_root_resolution;
 pub(crate) use aft_base::github_address;
-pub mod github_read;
 pub use aft_base::grammar_state;
 pub use aft_base::harness;
 pub use aft_base::harness_partition_guard;
 pub use aft_base::host_tool_names;
 pub use aft_edit::hashline;
 pub use aft_edit::{imports, indent};
+pub use aft_github::github_read;
 pub use aft_index::grammar;
 pub use aft_index::grep_executor;
 pub mod inspect;

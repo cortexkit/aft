@@ -1,5 +1,9 @@
 //! The shim identifies remote shells from an inherited native policy, not environment variables.
 
+pub(crate) use aft_base::remote_shell_marker::active;
+#[cfg(target_os = "linux")]
+use aft_base::remote_shell_marker::PROBE;
+
 #[cfg(target_os = "linux")]
 #[doc(hidden)]
 pub fn verify() -> Result<(), String> {
