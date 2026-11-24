@@ -991,12 +991,24 @@ pub(super) async fn finish_confirmed_end(
     metrics: Arc<DispatchPathMetrics>,
     notices: mpsc::UnboundedSender<EndedScope>,
 ) -> Option<EndedScope> {
+    finish_confirmed_end_with(stamp.clone(), metrics, notices, || {
+        revoke(executor.clone(), &stamp)
+    })
+    .await
+}
+
+async fn finish_confirmed_end_with<F: std::future::Future<Output = ScopeRevokeResult>>(
+    stamp: ScopeStamp,
+    metrics: Arc<DispatchPathMetrics>,
+    notices: mpsc::UnboundedSender<EndedScope>,
+    mut revoke: impl FnMut() -> F,
+) -> Option<EndedScope> {
     metrics
         .scope_descriptions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .cleanup_started(&stamp);
-    let first = revoke(executor.clone(), &stamp).await;
+    let first = revoke().await;
     metrics
         .scope_descriptions
         .lock()
@@ -1022,7 +1034,7 @@ pub(super) async fn finish_confirmed_end(
             _ => 5,
         };
         tokio::time::sleep(Duration::from_secs(delay)).await;
-        let result = revoke(executor.clone(), &stamp).await;
+        let result = revoke().await;
         metrics
             .scope_descriptions
             .lock()
@@ -1031,6 +1043,14 @@ pub(super) async fn finish_confirmed_end(
         if result.complete {
             return Some(EndedScope {
                 stamp,
+                keys: result.keys,
+            });
+        }
+        if !result.keys.is_empty() {
+            // A settled ledger row won't be selected again, even if another
+            // part of this cleanup pass still needs to retry.
+            let _ = notices.send(EndedScope {
+                stamp: stamp.clone(),
                 keys: result.keys,
             });
         }
@@ -1323,6 +1343,57 @@ mod tests {
             "an approval must not be able to advance the settled row"
         );
         assert!(!ledger::begin_approved(&conn, &key).unwrap());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn daemon_edge_scope_retry_delivers_keys_from_incomplete_passes() {
+        let stamp = ScopeStamp::new(
+            Principal::Direct,
+            "partial-end",
+            1,
+            subc_protocol::scope::ScopeKind::Head,
+        );
+        let key = crate::db::call_ledger::Key {
+            carrier: "fixture".into(),
+            call_key: "held-call".into(),
+        };
+        let mut passes = [
+            ScopeRevokeResult {
+                keys: vec![],
+                complete: false,
+            },
+            ScopeRevokeResult {
+                keys: vec![key.clone()],
+                complete: false,
+            },
+            ScopeRevokeResult {
+                keys: vec![],
+                complete: true,
+            },
+        ]
+        .into_iter();
+        let (notices, mut received) = mpsc::unbounded_channel();
+        let final_notice = finish_confirmed_end_with(
+            stamp.clone(),
+            Arc::new(DispatchPathMetrics::new()),
+            notices,
+            || std::future::ready(passes.next().expect("only three passes")),
+        )
+        .await;
+        let mut collected = Vec::new();
+        while let Ok(notice) = received.try_recv() {
+            assert_eq!(notice.stamp, stamp);
+            collected.extend(notice.keys);
+        }
+        if let Some(notice) = final_notice {
+            assert_eq!(notice.stamp, stamp);
+            collected.extend(notice.keys);
+        }
+        assert_eq!(
+            collected,
+            [key],
+            "the committed settlement must be delivered exactly once"
+        );
     }
 
     #[tokio::test]
