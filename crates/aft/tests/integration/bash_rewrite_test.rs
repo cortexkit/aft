@@ -191,7 +191,7 @@ fn rewrites_grep_and_rejects_pipes() {
     let ctx = context(dir.path(), true);
 
     let data = rewrite(
-        &format!("grep -ni needle {}", dir.path().join("src").display()),
+        &format!("grep -rni needle {}", dir.path().join("src").display()),
         &ctx,
     )
     .expect("grep should rewrite");
@@ -231,7 +231,7 @@ fn grep_footer_steers_to_aft_search_when_registered() {
         filetime::FileTime::from_system_time(SystemTime::now() - Duration::from_secs(61)),
     )
     .unwrap();
-    let target = format!("grep -ni needle {}", dir.path().join("src").display());
+    let target = format!("grep -rni needle {}", dir.path().join("src").display());
 
     // Registered → footer names `aft_search`, not the grep tool.
     let registered = context_with_search(dir.path(), true);

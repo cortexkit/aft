@@ -79,6 +79,10 @@ impl ParsedRewriteRule for GrepRule {
                     "grep path is outside the project root or missing",
                 );
             }
+            // Without -r, native grep refuses a directory operand.
+            if !grep_flags_recursive(parsed) && path_candidate(ctx, path).is_dir() {
+                return decline("grep", "grep.decline", "nonrecursive grep on a directory");
+            }
         }
         accept(
             "grep",
@@ -1004,6 +1008,19 @@ fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
     })
 }
 
+/// Whether the option words before the pattern include `-r`. The shape parser
+/// accepts only bundled single-letter flags, so `r` in one means recursion.
+fn grep_flags_recursive(parsed: Option<&ParsedCommand>) -> bool {
+    parsed.is_some_and(|parsed| {
+        parsed
+            .args
+            .iter()
+            .skip(1)
+            .take_while(|arg| arg.starts_with('-') && arg.as_str() != "-")
+            .any(|arg| arg[1..].contains('r'))
+    })
+}
+
 fn grep_request_from_parsed(parsed: Option<&ParsedCommand>, binary: &str) -> Option<Value> {
     let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != binary {
@@ -1035,6 +1052,10 @@ fn grep_request_from_parsed(parsed: Option<&ParsedCommand>, binary: &str) -> Opt
     }
     let path = parsed.args.get(index + 1).cloned();
     if parsed.args.len() > index + 2 {
+        return None;
+    }
+    // Native grep with no path and no -r reads stdin, not the project.
+    if binary == "grep" && path.is_none() && !grep_flags_recursive(Some(parsed)) {
         return None;
     }
 
@@ -1630,6 +1651,36 @@ mod tests {
             grep_request("grep -rn 'a.b' src", "grep").unwrap()["pattern"],
             "a.b"
         );
+    }
+
+    /// Native grep without -r reads stdin when given no path and refuses a
+    /// directory, so neither form may become a project search. With -r both
+    /// search the tree, and rg keeps its own default of the working directory.
+    #[test]
+    fn grep_keeps_stdin_and_nonrecursive_directory_forms_native() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("match.txt"), "needle\n").unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let decide = |command: &str| super::GrepRule.decide(command, "grep-shape", None, &ctx);
+        for command in ["grep needle", "grep -n needle", "grep needle .", "grep -in needle ."] {
+            assert!(
+                !matches!(decide(command), RewriteDecision::Accept(_)),
+                "{command} must stay native"
+            );
+        }
+        for command in ["grep -r needle", "grep -r needle .", "grep -rn needle .", "grep needle match.txt"] {
+            assert!(
+                matches!(decide(command), RewriteDecision::Accept(_)),
+                "{command} must be rewritten"
+            );
+        }
+        assert!(grep_request("rg needle", "rg").is_some());
     }
 
     #[test]
