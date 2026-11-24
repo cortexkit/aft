@@ -183,7 +183,7 @@ fn child(exe: &Path, store: &Path, root: &Path) -> Command {
     command
 }
 
-/// Run alone by [`killed_build`] and [`no_stage_after_the_scan_reads_the_checkout`]
+/// Run alone by [`killed_build`] and [`check_no_stage_after_the_scan_reads_the_checkout`]
 /// in a child process; a no-op otherwise. With `AFT_TEST_REPLACE_EXE` set,
 /// the child first renames another binary over its own executable's path,
 /// as an upgrade that places a new binary under a running daemon does.
@@ -231,8 +231,7 @@ fn workspaces(dir: &Path) -> Vec<String> {
     names
 }
 
-#[test]
-fn a_build_killed_at_any_stage_resumes_to_the_same_publication() {
+fn check_kill_stage_publication(point: &str, records: bool, passes: bool) {
     let root = tempfile::tempdir().unwrap();
     project(root.path());
     let reference_store = tempfile::tempdir().unwrap();
@@ -242,42 +241,51 @@ fn a_build_killed_at_any_stage_resumes_to_the_same_publication() {
     let expected = published(&reference);
     drop(reference);
 
-    // Each point, with whether the resumed build reuses the staged records
-    // and passes 2-3.
-    let points = [
-        ("records.append:50", false, false),
-        ("records.segment", false, false),
-        ("records.committed", true, false),
-        ("passes.range:1", true, false),
-        ("passes.committed", true, true),
-        ("stage.projection", true, true),
-        ("stage.sites", true, true),
-        ("assembly.batch:2", true, true),
-        ("stage.write", true, true),
-        ("stage.publish", true, true),
-    ];
-    let mut log = Vec::new();
-    for (point, records, passes) in points {
-        let store = tempfile::tempdir().unwrap();
-        killed_build(store.path(), root.path(), point);
-        let (checkout, report) = build(store.path(), root.path());
-        assert_eq!(report.resumed_records > 0, records, "{point}: {report:?}");
-        assert_eq!(report.resumed_passes, passes, "{point}: {report:?}");
-        assert_same(&expected, &published(&checkout), point);
-        assert_eq!(
-            std::fs::read_dir(builds(&checkout))
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-                .collect::<Vec<_>>(),
-            ["checkout.lock"],
-            "{point}: publishing deletes the workspace and the attempts record"
-        );
-        log.push(format!(
-            "{point}: killed, resumed with records={} passes={}, publication identical",
-            report.resumed_records, report.resumed_passes
-        ));
-    }
-    eprintln!("RESUME KILL TEST\n{}", log.join("\n"));
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), point);
+    let (checkout, report) = build(store.path(), root.path());
+    assert_eq!(report.resumed_records > 0, records, "{point}: {report:?}");
+    assert_eq!(report.resumed_passes, passes, "{point}: {report:?}");
+    assert_same(&expected, &published(&checkout), point);
+    assert_eq!(
+        std::fs::read_dir(builds(&checkout))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        ["checkout.lock"],
+        "{point}: publishing deletes the workspace and the attempts record"
+    );
+    eprintln!(
+        "{point}: killed, resumed with records={} passes={}, publication identical",
+        report.resumed_records, report.resumed_passes
+    );
+}
+
+macro_rules! resume_cases {
+    ($check:ident; $($(#[$attr:meta])* $name:ident: ($($arg:expr),+ $(,)?)),+ $(,)?) => {
+        $(
+            $(#[$attr])*
+            #[test]
+            fn $name() {
+                $check($($arg),+);
+            }
+        )+
+    };
+}
+
+// Each test owns its fixture so nextest can schedule kill points independently.
+// The booleans say whether staged records and passes 2-3 are reused, respectively.
+resume_cases! { check_kill_stage_publication;
+    killed_at_records_append: ("records.append:50", false, false),
+    killed_at_records_segment: ("records.segment", false, false),
+    killed_at_records_commit: ("records.committed", true, false),
+    killed_at_passes_range: ("passes.range:1", true, false),
+    killed_at_passes_commit: ("passes.committed", true, true),
+    killed_at_projection: ("stage.projection", true, true),
+    killed_at_sites: ("stage.sites", true, true),
+    killed_at_assembly_batch: ("assembly.batch:2", true, true),
+    killed_at_write: ("stage.write", true, true),
+    killed_at_publish: ("stage.publish", true, true),
 }
 
 #[test]
@@ -686,12 +694,9 @@ fn a_build_of_a_checkout_another_build_holds_is_busy() {
 }
 
 /// Inputs that are not parsed files but that resolution reads, each
-/// changed so that a call resolves to another function: a configuration
-/// file's bytes, a symlink's target and a path that is not parsed (a link
-/// that appears). Resolutions (passes 2-3) resumed stale would publish the
-/// old edge.
-#[test]
-fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_again() {
+/// changed so that a call resolves to another function. Resolutions (passes
+/// 2-3) resumed stale would publish the old edge.
+fn check_resolution_input_change(what: &str, change: fn(&Path)) {
     /// `main` calls `run` through a tsconfig path alias, `via` through a
     /// symlinked folder and `later` through a link that is not there yet:
     /// all three reach `old/lib.ts` or nothing.
@@ -722,27 +727,6 @@ fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_agai
         #[cfg(unix)]
         std::os::unix::fs::symlink("old", root.join("linked")).unwrap();
     }
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut changes: Vec<(&str, fn(&Path))> = vec![("a configuration file's bytes", |root| {
-        write(
-            root,
-            "tsconfig.json",
-            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"new/*\"]}}}\n",
-        );
-    })];
-    // Windows creates symlinks only with a privilege tests cannot count on.
-    #[cfg(unix)]
-    {
-        let retarget: fn(&Path) = |root| {
-            std::fs::remove_file(root.join("linked")).unwrap();
-            std::os::unix::fs::symlink("new", root.join("linked")).unwrap();
-        };
-        let appear: fn(&Path) = |root| {
-            std::os::unix::fs::symlink("new", root.join("alias")).unwrap();
-        };
-        changes.push(("a symlink's target", retarget));
-        changes.push(("a path that is not parsed", appear));
-    }
     fn graph(published: &[(String, Vec<u8>)]) -> Vec<&(String, Vec<u8>)> {
         published
             .iter()
@@ -754,31 +738,68 @@ fn inputs_besides_parsed_files_changed_between_kill_and_resume_are_resolved_agai
     let before_store = tempfile::tempdir().unwrap();
     let (before, _) = build(before_store.path(), unchanged.path());
     let before = published(&before);
-    for (what, change) in changes {
-        let root = tempfile::tempdir().unwrap();
-        aliased(root.path());
-        let store = tempfile::tempdir().unwrap();
-        killed_build(store.path(), root.path(), "passes.committed");
-        change(root.path());
-        let (resumed, report) = build(store.path(), root.path());
-        assert!(report.resumed_records > 0, "{what}: {report:?}");
-        assert!(!report.resumed_passes, "{what}: {report:?}");
-        let reference_store = tempfile::tempdir().unwrap();
-        let (reference, _) = build(reference_store.path(), root.path());
-        let reference = published(&reference);
-        assert_ne!(
-            graph(&reference),
-            graph(&before),
-            "{what}: the change moved a call edge"
-        );
-        assert_same(&reference, &published(&resumed), what);
-    }
+    let root = tempfile::tempdir().unwrap();
+    aliased(root.path());
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "passes.committed");
+    change(root.path());
+    let (resumed, report) = build(store.path(), root.path());
+    assert!(report.resumed_records > 0, "{what}: {report:?}");
+    assert!(!report.resumed_passes, "{what}: {report:?}");
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    let reference = published(&reference);
+    assert_ne!(
+        graph(&reference),
+        graph(&before),
+        "{what}: the change moved a call edge"
+    );
+    assert_same(&reference, &published(&resumed), what);
 }
 
-/// Each kind of damage to a checkpoint drops what it damaged, and the
-/// resumed build still publishes what a fresh build does.
-#[test]
-fn damaged_or_torn_checkpoints_are_built_again_to_the_same_publication() {
+resume_cases! { check_resolution_input_change;
+    changed_config_bytes_are_resolved_again: ("a configuration file's bytes", |root| {
+        write(
+            root,
+            "tsconfig.json",
+            "{\"compilerOptions\":{\"baseUrl\":\".\",\"paths\":{\"@lib/*\":[\"new/*\"]}}}\n",
+        );
+    }),
+    // Windows creates symlinks only with a privilege tests cannot count on.
+    #[cfg(unix)]
+    changed_symlink_target_is_resolved_again: ("a symlink's target", |root| {
+        std::fs::remove_file(root.join("linked")).unwrap();
+        std::os::unix::fs::symlink("new", root.join("linked")).unwrap();
+    }),
+    #[cfg(unix)]
+    a_new_unparsed_path_is_resolved_again: ("a path that is not parsed", |root| {
+        std::os::unix::fs::symlink("new", root.join("alias")).unwrap();
+    }),
+}
+
+/// Damage to a checkpoint drops what it damaged, and the resumed build
+/// still publishes what a fresh build does.
+fn check_checkpoint_damage(what: &str, damage: fn(&Path, &Path), records: bool, passes: bool) {
+    let root = tempfile::tempdir().unwrap();
+    project(root.path());
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), root.path());
+    let expected = published(&reference);
+    drop(reference);
+    let store = tempfile::tempdir().unwrap();
+    killed_build(store.path(), root.path(), "stage.sites");
+    let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
+    let dir = builds(&checkout);
+    damage(&only_workspace(&dir), &dir);
+    let report = checkout.build().unwrap();
+    assert_eq!(report.resumed_records > 0, records, "{what}: {report:?}");
+    assert_eq!(report.resumed_passes, passes, "{what}: {report:?}");
+    assert_same(&expected, &published(&checkout), what);
+}
+
+mod checkpoint_damage {
+    use super::*;
+
     fn flip(path: &Path) {
         let mut bytes = std::fs::read(path).unwrap();
         let middle = bytes.len() / 2;
@@ -799,66 +820,49 @@ fn damaged_or_torn_checkpoints_are_built_again_to_the_same_publication() {
             .unwrap()
     }
     // Each damage, with whether the records and passes 2-3 are reused.
-    let cases: [(&str, fn(&Path, &Path), bool, bool); 7] = [
-        (
+    resume_cases! { check_checkpoint_damage;
+        torn_staging_segment: (
             "a torn staging segment",
             |w, _| tear(&first(w, "records", ".seg")),
             false,
             true,
         ),
-        (
+        changed_staging_segment: (
             "a changed staging segment",
             |w, _| flip(&first(w, "records", ".seg")),
             false,
             true,
         ),
-        (
+        changed_records_table: (
             "a changed records table",
             |w, _| flip(&first(w, "records", ".keys")),
             false,
             true,
         ),
-        (
+        torn_records_marker: (
             "a torn records marker",
             |w, _| tear(&w.join("STAGE-records")),
             false,
             true,
         ),
-        (
+        changed_passes_marker: (
             "a changed passes marker",
             |w, _| flip(&w.join("STAGE-passes-2-3")),
             true,
             false,
         ),
-        (
+        torn_spooled_range: (
             "a torn spooled range",
             |w, _| tear(&first(w, "runs", "")),
             true,
             false,
         ),
-        (
+        unreadable_attempts_record: (
             "an unreadable attempts record",
             |_, dir| std::fs::write(dir.join("attempts"), b"torn").unwrap(),
             false,
             false,
         ),
-    ];
-    let root = tempfile::tempdir().unwrap();
-    project(root.path());
-    let reference_store = tempfile::tempdir().unwrap();
-    let (reference, _) = build(reference_store.path(), root.path());
-    let expected = published(&reference);
-    drop(reference);
-    for (what, damage, records, passes) in cases {
-        let store = tempfile::tempdir().unwrap();
-        killed_build(store.path(), root.path(), "stage.sites");
-        let checkout = Checkout::bind(layer(), store.path(), family(), root.path()).unwrap();
-        let dir = builds(&checkout);
-        damage(&only_workspace(&dir), &dir);
-        let report = checkout.build().unwrap();
-        assert_eq!(report.resumed_records > 0, records, "{what}: {report:?}");
-        assert_eq!(report.resumed_passes, passes, "{what}: {report:?}");
-        assert_same(&expected, &published(&checkout), what);
     }
 }
 
@@ -976,41 +980,43 @@ fn an_upgrade_from_record_13_rebuilds_once_and_never_adopts_its_workspace() {
 /// segment is written: every stage between, resolution and the write
 /// included, reads only what the scan captured. Run on a fresh build and on
 /// one that resumes its resolutions (passes 2-3) from their spool.
-#[test]
-fn no_stage_after_the_scan_reads_the_checkout() {
-    for resumed in [false, true] {
-        let root = tempfile::tempdir().unwrap();
-        let checkout_root = root.path().join("checkout");
-        project(&checkout_root);
-        let store = tempfile::tempdir().unwrap();
-        if resumed {
-            killed_build(store.path(), &checkout_root, "passes.committed");
-        }
-        let output = child(
-            &std::env::current_exe().unwrap(),
-            store.path(),
-            &checkout_root,
-        )
-        .env("AFT_TEST_HIDE_ROOT", &checkout_root)
-        .output()
-        .unwrap();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(output.status.success(), "{stderr}");
-        assert!(stderr.contains("HIDE ROOT at stage.resolve"), "{stderr}");
-        assert!(stderr.contains("HIDE ROOT at stage.publish"), "{stderr}");
-        assert!(
-            stderr.contains(&format!("resumed_passes: {resumed}")),
-            "{stderr}"
-        );
-        let hidden = Checkout::bind(layer(), store.path(), family(), &checkout_root).unwrap();
-        let reference_store = tempfile::tempdir().unwrap();
-        let (reference, _) = build(reference_store.path(), &checkout_root);
-        assert_same(
-            &published(&reference),
-            &published(&hidden),
-            "with the checkout hidden after the scan",
-        );
+fn check_no_stage_after_the_scan_reads_the_checkout(resumed: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let checkout_root = root.path().join("checkout");
+    project(&checkout_root);
+    let store = tempfile::tempdir().unwrap();
+    if resumed {
+        killed_build(store.path(), &checkout_root, "passes.committed");
     }
+    let output = child(
+        &std::env::current_exe().unwrap(),
+        store.path(),
+        &checkout_root,
+    )
+    .env("AFT_TEST_HIDE_ROOT", &checkout_root)
+    .output()
+    .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(stderr.contains("HIDE ROOT at stage.resolve"), "{stderr}");
+    assert!(stderr.contains("HIDE ROOT at stage.publish"), "{stderr}");
+    assert!(
+        stderr.contains(&format!("resumed_passes: {resumed}")),
+        "{stderr}"
+    );
+    let hidden = Checkout::bind(layer(), store.path(), family(), &checkout_root).unwrap();
+    let reference_store = tempfile::tempdir().unwrap();
+    let (reference, _) = build(reference_store.path(), &checkout_root);
+    assert_same(
+        &published(&reference),
+        &published(&hidden),
+        "with the checkout hidden after the scan",
+    );
+}
+
+resume_cases! { check_no_stage_after_the_scan_reads_the_checkout;
+    fresh_build_reads_only_the_scan: (false),
+    resumed_build_reads_only_the_scan: (true),
 }
 
 #[test]
