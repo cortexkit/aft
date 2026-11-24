@@ -74,6 +74,74 @@ use crate::bash_background::{persistence::PersistedTask, BgTaskStatus};
 use crate::db::call_ledger::Key;
 use std::time::Duration;
 
+#[test]
+fn pipeline_review_durable_background_displays_do_not_block_new_foreground_capture() {
+    TEST_SINK.with(|sink| sink.replace(Some(Vec::new())));
+    let registry = Captures::default();
+    let (_dir, root) = crate::subc::test_support::test_root("deferred-display-cap");
+    let mut route = crate::subc::test_support::route_identity(&root, "deferred-display-cap");
+    let data = Arc::get_mut(&mut route.0).unwrap();
+    data.role = crate::subc::tool_provider::RouteRole::ToolProviderV1;
+    if let crate::sandbox_spawn::AuthenticatedPrincipal::RouteBind { principal_id, .. } =
+        &mut data.spawn_principal
+    {
+        *principal_id = Some("reserved:broca".into());
+    }
+    let bash_pin = crate::subc::tool_views::SHIPPED
+        .keys()
+        .find(|pin| crate::subc::tool_views::has_bash_tail(pin))
+        .unwrap();
+    for index in 0..64 {
+        let name = format!("background-{index}");
+        let mut call = subc_protocol::tool_call::ToolCallRequest::new("bash", json!({}));
+        call.call_key = Some(name.clone());
+        call.schema_pin = Some(bash_pin.clone());
+        let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, &name);
+        register_in(&registry, &ledger, &route, &call);
+        let capture_key = key(&ledger);
+        let identity = registry.lock().unwrap()[&capture_key]
+            .lock()
+            .unwrap()
+            .identity
+            .clone();
+        let mut display = TaskDisplay {
+            identity,
+            capture_key,
+            reply_produced: false,
+            deferred: false,
+            held_ms: None,
+            attempted: false,
+        };
+        let mut running = task();
+        running.status = BgTaskStatus::Running;
+        let bodies = bash_bodies(&running, Some(0), None);
+        bash_reply_in(&registry, &mut display, bodies, true);
+        assert!(display.reply_produced && display.deferred);
+        bash_reply_persisted_in(&registry, &display);
+        reply_in(&registry, &ledger, true, false, Some("running"));
+    }
+    assert_eq!(
+        TEST_SINK.with(|sink| sink
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.kind == DisplayKind::Record)
+            .count()),
+        64
+    );
+    let mut call = subc_protocol::tool_call::ToolCallRequest::new("edit", json!({}));
+    call.call_key = Some("foreground".into());
+    call.schema_pin = crate::subc::tool_views::SHIPPED
+        .keys()
+        .find(|pin| pin.starts_with("tp1:edit:"))
+        .cloned();
+    let ledger = crate::subc::tool_provider::LedgerEdge::key(&route, "foreground");
+    register_in(&registry, &ledger, &route, &call);
+    TEST_SINK.with(|sink| sink.replace(None));
+    assert!(registry.lock().unwrap().contains_key(&key(&ledger)));
+}
+
 struct Fixture {
     _dir: tempfile::TempDir,
     key: Key,
@@ -174,6 +242,96 @@ fn terminal(f: &Fixture, display: &mut TaskDisplay, status: BgTaskStatus, exit: 
     bash_terminal(&snapshot, bodies, "bash-demo1", Some(2400));
     let capture = f.capture.lock().unwrap();
     assert!(capture.terminal || capture.finished);
+}
+
+fn prepare_durable_bash_reply(
+    f: &Fixture,
+) -> (
+    PersistedTask,
+    crate::bash_background::persistence::ResolvedTask,
+) {
+    let _capture = enter(Some(&f.key));
+    let mut display = current_task().unwrap();
+    let mut running = task();
+    running.task_id = "bash-0123456789abcdef".into();
+    running.status = BgTaskStatus::Running;
+    bash_reply(&mut display, bash_bodies(&running, Some(0), None), true);
+    running.display = Some(display);
+    let layout = crate::bash_background::persistence::create_task_layout(
+        f._dir.path(),
+        &running.session_id,
+        &running.task_id,
+    )
+    .unwrap();
+    crate::bash_background::persistence::write_task_at(&layout, &running).unwrap();
+    let persisted = crate::bash_background::persistence::read_task(&layout.paths.json).unwrap();
+    (persisted, layout)
+}
+
+fn complete_durable_bash_reply(
+    mut metadata: PersistedTask,
+    layout: &crate::bash_background::persistence::ResolvedTask,
+) {
+    metadata.status = BgTaskStatus::Completed;
+    metadata.exit_code = Some(0);
+    let snapshot = metadata.display.clone().unwrap();
+    assert!(snapshot.reply_produced && snapshot.deferred && !snapshot.attempted);
+    metadata.display.as_mut().unwrap().attempted = true;
+    crate::bash_background::persistence::write_task_at(layout, &metadata).unwrap();
+    let bodies = terminal_bodies(&metadata, "ok\n", "");
+    bash_terminal(&snapshot, bodies, &metadata.task_id, Some(2400));
+}
+
+#[test]
+fn pipeline_review_bash_handoff_preserves_completion_record_and_detail() {
+    let publish = |name, detach| {
+        let f = fixture("bash", name);
+        let (persisted, layout) = prepare_durable_bash_reply(&f);
+        if detach {
+            bash_reply_persisted(persisted.display.as_ref().unwrap());
+            assert!(
+                CALLS.lock().unwrap().contains_key(&key(&f.key)),
+                "launch not yet queued"
+            );
+        }
+        reply(&f.key, false, false, None);
+        assert_eq!(CALLS.lock().unwrap().contains_key(&key(&f.key)), !detach);
+        assert_eq!(publications().len(), 1);
+        complete_durable_bash_reply(persisted, &layout);
+        let records = publications();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].kind, DisplayKind::Detail);
+        assert_eq!(records[2].kind, DisplayKind::Completion);
+        [records[1].body.clone(), records[2].body.clone()]
+    };
+    assert_eq!(
+        publish("bash-durable-handoff", true),
+        publish("bash-retained-capture", false)
+    );
+}
+
+#[test]
+fn pipeline_review_bash_terminal_between_launch_and_handoff_completes_once() {
+    let f = fixture("bash", "bash-terminal-during-handoff");
+    let (persisted, layout) = prepare_durable_bash_reply(&f);
+    let display = persisted.display.clone().unwrap();
+    reply(&f.key, false, false, None);
+    assert!(CALLS.lock().unwrap().contains_key(&key(&f.key)));
+    complete_durable_bash_reply(persisted, &layout);
+    bash_reply_persisted(&display);
+    reply(&f.key, false, false, None);
+    let kinds: Vec<_> = publications()
+        .into_iter()
+        .map(|record| record.kind)
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            DisplayKind::Record,
+            DisplayKind::Detail,
+            DisplayKind::Completion
+        ]
+    );
 }
 
 #[test]

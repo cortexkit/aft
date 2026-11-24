@@ -124,6 +124,7 @@ pub(crate) struct Hooks {
     pub enabled: fn() -> bool,
     pub current_task: fn() -> Option<TaskDisplay>,
     pub bash_reply: fn(&mut TaskDisplay, BashBodies, bool),
+    pub bash_reply_persisted: fn(&TaskDisplay),
     pub bash_terminal: fn(&TaskDisplay, BashBodies, &str, Option<u64>),
     pub bash_tail: BashTail,
     pub bash_detail_byte_limit: fn() -> u64,
@@ -153,6 +154,11 @@ pub(crate) fn current_task() -> Option<TaskDisplay> {
 pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
     if let Some(hooks) = HOOKS.get() {
         (hooks.bash_reply)(display, body, deferred);
+    }
+}
+pub(crate) fn bash_reply_persisted(display: &TaskDisplay) {
+    if let Some(hooks) = HOOKS.get() {
+        (hooks.bash_reply_persisted)(display);
     }
 }
 pub(crate) fn bash_terminal(

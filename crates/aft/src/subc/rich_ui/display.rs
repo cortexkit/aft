@@ -33,8 +33,8 @@ struct Writer {
     store: store::Store,
 }
 static SENDER: OnceLock<Writer> = OnceLock::new();
-static CALLS: LazyLock<Mutex<HashMap<String, Arc<Mutex<Capture>>>>> =
-    LazyLock::new(Default::default);
+type Captures = Mutex<HashMap<String, Arc<Mutex<Capture>>>>;
+static CALLS: LazyLock<Captures> = LazyLock::new(Default::default);
 thread_local! { static ACTIVE: RefCell<Option<Arc<Mutex<Capture>>>> = const { RefCell::new(None) }; }
 
 pub(crate) fn key(key: &crate::db::call_ledger::Key) -> String {
@@ -52,6 +52,8 @@ pub(crate) struct Capture {
     held_at: Option<Instant>,
     held_ms: Option<u64>,
     record_sent: bool,
+    launch_admitted: bool,
+    deferred_persisted: bool,
     finished: bool,
     files: Vec<FileChange>,
     file_snapshot: Option<(Value, Option<Value>)>,
@@ -142,6 +144,15 @@ pub(in crate::subc) fn register(
     route: &crate::subc::RouteIdentity,
     call: &subc_protocol::tool_call::ToolCallRequest,
 ) {
+    register_in(&CALLS, ledger_key, route, call);
+}
+
+fn register_in(
+    registry: &Captures,
+    ledger_key: &crate::db::call_ledger::Key,
+    route: &crate::subc::RouteIdentity,
+    call: &subc_protocol::tool_call::ToolCallRequest,
+) {
     // The outer key is used only by execution's existing replay ledger. An
     // origin-only, keyless forward is display-free until it has durable
     // display-attempt retention independent of execution replay.
@@ -219,7 +230,7 @@ pub(in crate::subc) fn register(
         call_key,
         schema_pin,
     };
-    if let Ok(mut calls) = CALLS.lock() {
+    if let Ok(mut calls) = registry.lock() {
         calls.retain(|_, capture| capture.try_lock().map_or(true, |capture| !capture.finished));
         if calls.len() >= 64 {
             count(RegisterCallCap);
@@ -246,6 +257,8 @@ pub(in crate::subc) fn register(
                 held_at: None,
                 held_ms: None,
                 record_sent: false,
+                launch_admitted: false,
+                deferred_persisted: false,
                 finished: false,
                 files: Vec::new(),
                 file_snapshot: None,
@@ -511,15 +524,15 @@ fn unified_diff(
 
 pub(crate) use edit_hunks::capture_no_match as edit_no_match;
 
-fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
+fn emit(capture: &Capture, kind: DisplayKind, body: Value) -> bool {
     let Some(view) = crate::subc::tool_views::view(&capture.identity.schema_pin) else {
         count(EmitUnknownView);
-        return;
+        return false;
     };
     let schema = &view.record_schema;
     let Some(map) = body.as_object() else {
         count(EmitNotObject);
-        return;
+        return false;
     };
     let valid = match kind {
         DisplayKind::Record => validate_record(map, schema),
@@ -532,7 +545,7 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
             DisplayKind::Completion => EmitInvalidCompletion,
             _ => EmitInvalidDetail,
         });
-        return;
+        return false;
     }
     #[cfg(test)]
     if TEST_SINK.with(|sink| {
@@ -548,15 +561,17 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
         }
     }) {
         count(Emitted);
-        return;
+        return true;
     }
     let Some(writer) = SENDER.get() else {
         count(EmitNoSender);
-        return;
+        return false;
     };
-    if enqueue_snapshot(writer, capture.identity.clone(), kind, body) {
+    let admitted = enqueue_snapshot(writer, capture.identity.clone(), kind, body);
+    if admitted {
         count(Emitted);
     }
+    admitted
 }
 
 fn enqueue_snapshot(
@@ -601,16 +616,36 @@ pub(crate) fn reply(
     error: bool,
     reason: Option<&str>,
 ) {
-    let capture = CALLS
+    reply_in(&CALLS, ledger_key, held, error, reason);
+}
+
+fn reply_in(
+    registry: &Captures,
+    ledger_key: &crate::db::call_ledger::Key,
+    held: bool,
+    error: bool,
+    reason: Option<&str>,
+) {
+    let capture_key = key(ledger_key);
+    let capture = registry
         .lock()
         .ok()
-        .and_then(|calls| calls.get(&key(ledger_key)).cloned());
+        .and_then(|calls| calls.get(&capture_key).cloned());
     let Some(capture) = capture else {
         return;
     };
-    let Ok(mut capture) = capture.lock() else {
-        return;
+    let may_retire = if let Ok(mut capture) = capture.lock() {
+        publish_reply(&mut capture, held, error, reason);
+        capture.can_retire()
+    } else {
+        false
     };
+    if may_retire {
+        retire_capture(registry, &capture_key, false);
+    }
+}
+
+fn publish_reply(capture: &mut Capture, held: bool, error: bool, reason: Option<&str>) {
     if capture.finished {
         return;
     }
@@ -652,7 +687,8 @@ pub(crate) fn reply(
                     fields.remove("runDurationMs");
                 }
             }
-            emit(&capture, DisplayKind::Record, body);
+            let admitted = emit(capture, DisplayKind::Record, body);
+            capture.launch_admitted = running && admitted;
             capture.record_sent = true;
             capture.processing_ms = duration;
             capture.began = None;
@@ -663,11 +699,11 @@ pub(crate) fn reply(
             capture.held_at = Some(Instant::now());
         }
         if capture.deferred && capture.terminal {
-            emit_bash_completion(&mut capture);
+            emit_bash_completion(capture);
         }
         return;
     }
-    end_person_wait(&mut capture);
+    end_person_wait(capture);
     let completion = capture.record_sent;
     let mut tail = None;
     let (mut body, detail) = if capture.tool == "bash" {
@@ -694,7 +730,7 @@ pub(crate) fn reply(
     } else {
         capture.file_snapshot.clone().unwrap_or_else(|| {
             if capture.files.is_empty() {
-                file_bodies(&capture, !error)
+                file_bodies(capture, !error)
             } else {
                 (
                     json!({"outcome": if error { "error" } else { "success" }}),
@@ -706,7 +742,7 @@ pub(crate) fn reply(
     if capture.tool == "bash" && capture.deferred {
         if completion {
             if capture.terminal {
-                emit_bash_completion(&mut capture);
+                emit_bash_completion(capture);
             }
             return;
         }
@@ -754,8 +790,8 @@ pub(crate) fn reply(
             }
         }
     }
-    emit(
-        &capture,
+    let admitted = emit(
+        capture,
         if completion {
             DisplayKind::Completion
         } else {
@@ -763,25 +799,22 @@ pub(crate) fn reply(
         },
         body,
     );
+    capture.launch_admitted = capture.deferred && !completion && admitted;
     capture.record_sent = true;
     if capture.deferred && capture.terminal {
-        emit_bash_completion(&mut capture);
+        emit_bash_completion(capture);
     }
     if !capture.deferred {
         if let Some(mut detail) = detail {
             if capture.tool == "bash" {
                 detail.as_object_mut().unwrap().remove("taskId");
             }
-            emit(&capture, DisplayKind::Detail, detail);
+            emit(capture, DisplayKind::Detail, detail);
         }
         if let Some(body) = foreground_completion {
-            emit(&capture, DisplayKind::Completion, body);
+            emit(capture, DisplayKind::Completion, body);
         }
         capture.finished = true;
-        drop(capture);
-        if let Ok(mut calls) = CALLS.lock() {
-            calls.remove(&key(ledger_key));
-        }
     }
 }
 
@@ -1070,7 +1103,11 @@ pub(in crate::subc) fn bash_tail(
 }
 
 pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
-    let capture = CALLS
+    bash_reply_in(&CALLS, display, body, deferred);
+}
+
+fn bash_reply_in(registry: &Captures, display: &mut TaskDisplay, body: BashBodies, deferred: bool) {
+    let capture = registry
         .lock()
         .ok()
         .and_then(|calls| calls.get(&display.capture_key).cloned());
@@ -1093,6 +1130,44 @@ pub(crate) fn bash_reply(display: &mut TaskDisplay, body: BashBodies, deferred: 
         capture.processing_ms = capture
             .processing_ms
             .saturating_add(began.elapsed().as_millis() as u64);
+    }
+}
+
+pub(crate) fn bash_reply_persisted(display: &TaskDisplay) {
+    bash_reply_persisted_in(&CALLS, display);
+}
+
+fn bash_reply_persisted_in(registry: &Captures, display: &TaskDisplay) {
+    if display.reply_produced && display.deferred {
+        retire_capture(registry, &display.capture_key, true);
+    }
+}
+
+impl Capture {
+    fn can_retire(&self) -> bool {
+        if self.deferred {
+            // A terminal result seen before the launch record stays in memory
+            // until its completion is claimed and emitted.
+            self.launch_admitted && self.deferred_persisted && !self.terminal
+        } else {
+            self.finished
+        }
+    }
+}
+
+fn retire_capture(registry: &Captures, key: &str, deferred_persisted: bool) {
+    let Ok(mut calls) = registry.lock() else {
+        return;
+    };
+    let retire = calls
+        .get(key)
+        .and_then(|capture| capture.lock().ok())
+        .is_some_and(|mut capture| {
+            capture.deferred_persisted |= deferred_persisted;
+            capture.can_retire()
+        });
+    if retire {
+        calls.remove(key);
     }
 }
 
@@ -1176,6 +1251,8 @@ pub(crate) fn bash_terminal(
             held_at: None,
             held_ms: display.held_ms,
             record_sent: true,
+            launch_admitted: true,
+            deferred_persisted: true,
             finished: false,
             files: Vec::new(),
             file_snapshot: None,

@@ -3632,69 +3632,6 @@ impl BgTaskRegistry {
         Ok(())
     }
 
-    /// Records which task this `bash` call's reply started, so the call's
-    /// display completion can be written when the task ends. Only the handler
-    /// that produced the call's own reply calls this; later `bash_status` or
-    /// `bash_watch` calls for the same task don't, so they can't attach the
-    /// task to their own call's display records.
-    pub(crate) fn capture_display_reply(&self, response: &serde_json::Value) {
-        if !crate::bash_background::frames::enabled() {
-            return;
-        }
-        let Some(task_id) = response.get("task_id").and_then(serde_json::Value::as_str) else {
-            return;
-        };
-        let Some(task) = self.task(task_id) else {
-            return;
-        };
-        let (mut metadata, buffer) = {
-            let Ok(state) = task.lock_state() else {
-                return;
-            };
-            if state
-                .metadata
-                .display
-                .as_ref()
-                .is_none_or(|display| display.reply_produced)
-            {
-                return;
-            }
-            (state.metadata.clone(), state.buffer.clone())
-        };
-        let bodies = self.display_bodies(&task, &metadata, &buffer);
-        let deferred = !Self::response_status_is_terminal(
-            response.get("status").and_then(serde_json::Value::as_str),
-        );
-        let Some(display) = metadata.display.as_mut() else {
-            return;
-        };
-        crate::bash_background::frames::bash_reply(display, bodies, deferred);
-        let terminal = {
-            let mut db = DeferredDbWrites::new(self, &task);
-            let Ok(mut state) = task.lock_state() else {
-                return;
-            };
-            if let Some(current) = state.metadata.display.as_mut() {
-                if !current.reply_produced {
-                    // A terminal worker may already have claimed completion;
-                    // copying reply facts must never reset its durable marker.
-                    let selected = metadata.display.as_ref().unwrap();
-                    current.reply_produced = selected.reply_produced;
-                    current.deferred = selected.deferred;
-                    current.held_ms = selected.held_ms;
-                }
-            }
-            let _ = self.persist_task_locked(&task, &state.metadata, &mut db);
-            state
-                .metadata
-                .is_terminal()
-                .then(|| (state.metadata.clone(), state.buffer.clone()))
-        };
-        if let Some((metadata, buffer)) = terminal {
-            self.capture_display_terminal(&task, &metadata, &buffer);
-        }
-    }
-
     fn publish_uncaptured_drain_terminal(&self, task: &Arc<BgTask>, metadata: &PersistedTask) {
         if metadata
             .remote
