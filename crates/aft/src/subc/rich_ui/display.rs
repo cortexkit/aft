@@ -516,14 +516,14 @@ fn emit(capture: &Capture, kind: DisplayKind, body: Value) {
         count(EmitUnknownView);
         return;
     };
-    let schema = view.record_schema;
+    let schema = &view.record_schema;
     let Some(map) = body.as_object() else {
         count(EmitNotObject);
         return;
     };
     let valid = match kind {
-        DisplayKind::Record => validate_record(map, &schema),
-        DisplayKind::Completion => validate_completion(map, &schema),
+        DisplayKind::Record => validate_record(map, schema),
+        DisplayKind::Completion => validate_completion(map, schema),
         _ => cortexkit_role_tool_display::schema::validate_detail(map),
     };
     if valid.is_err() {

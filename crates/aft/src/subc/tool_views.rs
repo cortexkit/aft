@@ -1,6 +1,7 @@
 //! View templates answered through `tool.views`. Legacy pins keep their exact
 //! views; versioned pins resolve to current or shipped tool definitions so
 //! transcripts can still draw calls made against an older schema.
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
@@ -64,7 +65,21 @@ pub(crate) fn has_bash_tail(pin: &str) -> bool {
         .is_some_and(|entry| entry.tool.name == "bash" && entry.tool.semantics == BASH_SEMANTICS)
 }
 
-pub(crate) fn view(pin: &str) -> Option<ViewManifest> {
+pub(crate) fn view(pin: &str) -> Option<Cow<'static, ViewManifest>> {
+    static VIEWS: LazyLock<BTreeMap<String, ViewManifest>> = LazyLock::new(|| {
+        SHIPPED
+            .keys()
+            .chain(VERSIONED_VIEW_PINS.iter())
+            .filter_map(|pin| build_view(pin).map(|view| (pin.clone(), view)))
+            .collect()
+    });
+    VIEWS
+        .get(pin)
+        .map(Cow::Borrowed)
+        .or_else(|| build_view(pin).map(Cow::Owned))
+}
+
+fn build_view(pin: &str) -> Option<ViewManifest> {
     if let Some(shipped) = SHIPPED.get(pin) {
         return Some(shipped.history.last()?.clone().with_tool(ViewTool::new(
             &shipped.tool.name,
@@ -161,7 +176,7 @@ pub(crate) fn answer(body: Value) -> Result<Value, ErrorBody> {
             (
                 pin.clone(),
                 view(pin)
-                    .map(ViewEntry::Manifest)
+                    .map(|view| ViewEntry::Manifest(view.into_owned()))
                     .or_else(|| notices::view(pin).map(ViewEntry::Notice))
                     .unwrap_or(ViewEntry::Unknown),
             )
@@ -174,19 +189,22 @@ pub(crate) fn answer(body: Value) -> Result<Value, ErrorBody> {
 
 /// The management route serializes this same answer value without an envelope.
 /// Definitions are immutable for a process; a catalog revision ships on restart.
-pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
-    SHIPPED
-        .keys()
-        .chain(notice_view_pins())
-        .chain(VERSIONED_VIEW_PINS.iter())
-        .map(|pin| {
-            let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
-            (
-                pin.clone(),
-                serde_json::to_vec(&reply).expect("view response"),
-            )
-        })
-        .collect()
+pub(crate) fn bus_snapshot() -> &'static [(String, Vec<u8>)] {
+    static SNAPSHOT: LazyLock<Vec<(String, Vec<u8>)>> = LazyLock::new(|| {
+        SHIPPED
+            .keys()
+            .chain(notice_view_pins())
+            .chain(VERSIONED_VIEW_PINS.iter())
+            .map(|pin| {
+                let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
+                (
+                    pin.clone(),
+                    serde_json::to_vec(&reply).expect("view response"),
+                )
+            })
+            .collect()
+    });
+    &SNAPSHOT
 }
 
 pub(crate) fn notice_view_pins() -> impl Iterator<Item = &'static String> {
@@ -199,6 +217,34 @@ mod tests {
     use cortexkit_role_tool_provider::{catalog::schema_digest, views::ViewChange};
     use serde_json::json;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn pipeline_review_view_lookups_do_not_allocate_after_warmup() {
+        let legacy = SHIPPED.keys().next().unwrap();
+        let versioned = VERSIONED_VIEW_PINS.iter().next().unwrap();
+        for pin in [legacy, versioned] {
+            assert!(view(pin).is_some());
+        }
+        let (_, allocations) = crate::test_allocations::count(|| {
+            for _ in 0..1000 {
+                for pin in [legacy, versioned] {
+                    assert!(std::hint::black_box(view(pin)).is_some());
+                }
+            }
+        });
+        assert_eq!(allocations, 0, "warm display lookups rebuilt views");
+    }
+
+    #[test]
+    fn pipeline_review_bus_snapshots_do_not_allocate_after_warmup() {
+        assert!(!bus_snapshot().is_empty());
+        let (_, allocations) = crate::test_allocations::count(|| {
+            for _ in 0..3 {
+                assert!(!std::hint::black_box(bus_snapshot()).is_empty());
+            }
+        });
+        assert_eq!(allocations, 0, "warm bus ticks rebuilt view snapshots");
+    }
 
     fn assert_template_digests(template: &Value, expected: [&str; 2]) {
         for (slot, digest) in ["row", "page"].into_iter().zip(expected) {
@@ -246,7 +292,10 @@ mod tests {
         let view = view(&pin).unwrap();
         assert_eq!(view.template_revision, 5);
         assert!(view.check_pin(&pin).unwrap());
-        assert_eq!(view.tool.unwrap().input_schema, hashline.input_schema);
+        assert_eq!(
+            view.tool.as_ref().unwrap().input_schema,
+            hashline.input_schema
+        );
     }
 
     #[test]
