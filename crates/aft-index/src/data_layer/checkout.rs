@@ -48,6 +48,9 @@ use staged_records::StagedKind;
 mod engines;
 #[cfg(feature = "test-hooks")]
 pub mod exactness;
+#[cfg(feature = "test-hooks")]
+#[doc(hidden)]
+pub mod exactness_port;
 mod fold;
 mod memory_profile;
 mod recording;

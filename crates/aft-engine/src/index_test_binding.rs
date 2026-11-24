@@ -62,3 +62,5 @@ pub(crate) fn bind_for_test(ctx: &AppContext) {
     ctx.data_checkout()
         .unwrap_or_else(|| panic!("the index store binds the root: {:?}", report(ctx)));
 }
+use crate::context::AppContext;
+use crate::data_layer::surfaces::{report, text_plane_ready};

@@ -89,7 +89,7 @@ pub(crate) use aft_base::clock;
 pub use aft_base::cold_build_limiter;
 pub use aft_base::compress;
 pub use aft_edit::checkpoint;
-pub use aft_index::callgraph_store;
+pub mod callgraph_store;
 pub use aft_index::calls;
 pub use aft_parse::callgraph_extractor;
 #[cfg(test)]
@@ -103,7 +103,7 @@ pub use aft_base::config_resolve;
 pub use aft_base::config_sources;
 pub mod context;
 pub(crate) use aft_base::cross_volume;
-pub use aft_index::data_layer;
+pub mod data_layer;
 #[doc(hidden)]
 pub mod database_open;
 pub mod db;
@@ -340,3 +340,14 @@ pub(crate) use aft_base::persistence_gate;
 
 #[cfg(feature = "test-support")]
 pub mod test_bridge;
+
+#[cfg(test)]
+mod index_embedding_composed_tests;
+#[cfg(feature = "test-support")]
+mod index_publication_fixture;
+#[cfg(test)]
+mod index_status_composed_tests;
+#[cfg(any(test, feature = "test-support"))]
+mod index_test_binding;
+#[cfg(test)]
+mod index_watcher_composed_tests;

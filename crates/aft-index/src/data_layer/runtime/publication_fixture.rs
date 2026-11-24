@@ -65,6 +65,16 @@ impl PublicationFixture {
         self.handle.root()
     }
 
+    #[doc(hidden)]
+    pub fn checkout_handle(&self) -> Arc<DataCheckout> {
+        Arc::clone(&self.handle)
+    }
+
+    #[doc(hidden)]
+    pub fn storage(&self) -> &Path {
+        self._storage.path()
+    }
+
     pub fn note_paths(&self, paths: &[PathBuf]) {
         self.handle.note_paths(paths);
     }

@@ -225,7 +225,7 @@ pub mod read_fence {
     }
 }
 
-pub use crate::data_layer::runtime::publication_fixture::PublicationFixture;
+pub use crate::index_publication_fixture::PublicationFixture;
 pub use crate::runtime_drain::watcher_fixture::watcher_context_with;
 
 pub mod surfaces {

@@ -60,9 +60,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tree_sitter::Node;
 
 #[cfg(test)]
-pub mod dead_code_projection;
-
-#[cfg(test)]
 mod local_symbol_memo_tests {
     use super::*;
 

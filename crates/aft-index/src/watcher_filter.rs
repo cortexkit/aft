@@ -13,6 +13,9 @@ use ignore::gitignore::Gitignore;
 
 pub mod config_events;
 mod directory_arrival;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_helpers;
 
 pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
 
@@ -3519,6 +3522,7 @@ pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::filter_with_full_dispatch_channel;
     #[test]
     fn watcher_directory_arrival_uses_file_paths_and_skips_empty_and_ignored_trees() {
         let temp = tempfile::tempdir().unwrap();

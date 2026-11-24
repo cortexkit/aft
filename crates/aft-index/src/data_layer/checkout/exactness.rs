@@ -8,8 +8,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
+use super::exactness_port::ExactnessDeadCode;
 use crate::callgraph_store::CallGraphRead;
-use crate::inspect::job::is_test_file;
+use crate::file_kind::is_test_file;
 
 type GateResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -411,6 +412,7 @@ fn queries(
     out: &Path,
     reference: Option<&Path>,
     sample: usize,
+    dead_code: &dyn ExactnessDeadCode,
 ) -> GateResult<()> {
     use crate::data_layer::callgraph_store_adapter as adapter;
     let view = checkout.view().ok_or("no published view")?;
@@ -507,10 +509,10 @@ fn queries(
     }
     // Preserve every dead-code input row, including initializer groups and
     // protected roots. The timestamp is deliberately outside the comparison.
-    let dead = view.rows_dead_code_snapshot(&crate::inspect::InspectEntryPoints)?;
+    let dead = view.rows_dead_code_snapshot(dead_code)?;
     save(
         &out.join("dead-code-findings.json"),
-        &crate::inspect::dead_code_gate::exactness_rows(&view, &out.join("dead-code-work"))?,
+        &dead_code.findings(&view, &out.join("dead-code-work"))?,
     )?;
     let initializers = dead.go_initializers.iter().map(|group| json!({"caller_file": group.caller_file, "callers": group.callers, "targets": group.targets.iter().map(|(file, symbol)| (file.as_ref(), symbol.as_ref())).collect::<Vec<_>>()})).collect::<Vec<_>>();
     save(
@@ -524,7 +526,7 @@ fn queries(
 
 /// Commands are deliberately separate processes: `refresh` must bind the
 /// on-disk publication, never inherit the cold builder's engine.
-pub fn run(args: Vec<String>) -> GateResult<()> {
+pub fn run(args: Vec<String>, dead_code: &dyn ExactnessDeadCode) -> GateResult<()> {
     if args.first().is_some_and(|mode| mode == "validate") {
         let path = Path::new(args.get(1).ok_or("validate requires a path")?);
         let source = std::fs::read_to_string(path)?;
@@ -603,7 +605,7 @@ pub fn run(args: Vec<String>) -> GateResult<()> {
     if reference.is_none() {
         native_plan(&checkout.view().ok_or("no published view")?, out)?;
     }
-    queries(&checkout, out, reference, sample)?;
+    queries(&checkout, out, reference, sample, dead_code)?;
     println!("EXACTNESS snapshot: {count} full FileResolutions; StoredSlices::failures()=[]");
     Ok(())
 }

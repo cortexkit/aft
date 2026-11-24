@@ -807,8 +807,13 @@ fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf)
     Ok((model, tokenizer))
 }
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_helpers;
+
 #[cfg(test)]
 mod tests {
+    use super::test_helpers::{native_test, wait_for_sessions};
     use super::{
         derive_intra_threads, embedding_cache_dir_from, parse_cgroup_v1_cpu_quota,
         parse_cgroup_v2_cpu_max, CgroupCpuQuota, MINILM_MAX_LENGTH,

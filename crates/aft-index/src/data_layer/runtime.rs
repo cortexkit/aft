@@ -2351,7 +2351,7 @@ impl DataCheckout {
         #[cfg(not(any(test, feature = "test-support")))]
         let now = Instant::now();
         #[cfg(any(test, feature = "test-support"))]
-        let now = crate::context::memory_walk_now_for_test();
+        let now = aft_base::test_support::memory_walk::memory_walk_now_for_test();
         if let Some(previous) = slot.as_ref() {
             let age = now.saturating_duration_since(previous.measured_at);
             let complete =
@@ -2443,7 +2443,8 @@ pub(crate) fn memory_figure_walks_for_test() -> usize {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod publication_fixture;
+#[doc(hidden)]
+pub mod publication_fixture;
 
 #[cfg(test)]
 pub(crate) mod tests {

@@ -40,7 +40,7 @@ pub(crate) mod kept;
 pub(crate) use crate::data_layer::dead_code_reads as reads;
 pub(crate) mod section;
 
-use index::{Index, TrackedIndex, TrackedPairIndex};
+use index::{Index, TrackedIndex, TrackedPairIndex, TrackedRustItems};
 use reads::{Lookup, Tracked};
 
 pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 11;

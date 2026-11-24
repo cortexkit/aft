@@ -23,8 +23,6 @@ pub use walk_coverage::{plural, walk_coverage_note};
 use self::multi_path::{
     canonical_key, dedupe_nested_paths, resolve_path_or_multi, SearchPathResolution,
 };
-#[cfg(test)]
-use crate::context::AppContext;
 use crate::data_layer::host::IndexHost;
 use crate::large_read::{MatchVisit, ScanLines};
 use crate::pattern_compile::CompiledPattern;
@@ -701,6 +699,26 @@ pub fn resolve_grep_scope(
     policy: &dyn ReadPolicy,
 ) -> Result<GrepScope, Response> {
     let project_root = project_root(ctx);
+    resolve_grep_scope_for_root(
+        project_root,
+        paths,
+        max_results,
+        req_id,
+        session_id,
+        policy,
+        &|session, root| ctx.explicit_task_artifacts(session, root),
+    )
+}
+
+fn resolve_grep_scope_for_root(
+    project_root: PathBuf,
+    paths: Option<&serde_json::Value>,
+    max_results: usize,
+    req_id: &str,
+    session_id: &str,
+    policy: &dyn ReadPolicy,
+    explicit_task_artifacts: &dyn Fn(&str, &Path) -> Option<Vec<PathBuf>>,
+) -> Result<GrepScope, Response> {
     let search_roots = resolve_roots(paths, &project_root, req_id, session_id, policy)?;
 
     if let Some(missing_root) = search_roots
@@ -730,7 +748,7 @@ pub fn resolve_grep_scope(
         .flat_map(|search_root| {
             let outputs = paths
                 .filter(|paths| !confined && !paths.is_null())
-                .and_then(|_| ctx.explicit_task_artifacts(session_id, &search_root));
+                .and_then(|_| explicit_task_artifacts(session_id, &search_root));
             match outputs {
                 Some(outputs) => {
                     let filter_root = if search_root.is_dir() {
@@ -4072,13 +4090,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join(".gitignore"), ".agents/\n").unwrap();
         std::fs::create_dir(dir.path().join(".agents")).unwrap();
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(dir.path().to_path_buf()),
-                ..Default::default()
-            },
-        );
         let scope = GrepScope {
             roots: vec![ResolvedRoot {
                 search_root: dir.path().to_path_buf(),
@@ -4092,7 +4103,7 @@ mod tests {
             per_root_max: 10,
         };
         assert_eq!(scope_ignored_entries(&scope).unwrap().names, [".agents/"]);
-        aft_db::read_fence::with_root(&ctx, "ignore-disclosure", || {
+        aft_db::read_fence::with_root("ignore-disclosure", || {
             TARGET_WALK_BUILDERS.with(|count| count.set(0));
             assert!(scope_ignored_entries(&scope).is_none());
             TARGET_WALK_BUILDERS.with(|count| assert_eq!(count.get(), 0));
@@ -4187,21 +4198,45 @@ mod tests {
     #[test]
     fn multi_root_uses_double_per_root_max() {
         let project = tempfile::tempdir().expect("project");
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project.path().to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
+        struct PathsWithin<'a>(&'a Path);
+        impl ReadPolicy for PathsWithin<'_> {
+            fn validate_read_path(
+                &self,
+                request: &str,
+                _session: &str,
+                path: &Path,
+            ) -> Result<PathBuf, Response> {
+                if path.starts_with(self.0) {
+                    Ok(path.to_path_buf())
+                } else {
+                    Err(aft_db::read_fence::refusal(request, path))
+                }
+            }
+
+            fn root_too_broad(&self) -> bool {
+                false
+            }
+
+            fn is_home_root(&self) -> bool {
+                false
+            }
+        }
         let left = project.path().join("left");
         let right = project.path().join("right");
         std::fs::create_dir_all(&left).expect("left");
         std::fs::create_dir_all(&right).expect("right");
         let paths = serde_json::json!([left.display().to_string(), right.display().to_string()]);
 
-        let scope =
-            resolve_grep_scope(&ctx, Some(&paths), 10, "test", "test", &ctx).expect("scope");
+        let scope = resolve_grep_scope_for_root(
+            project.path().to_path_buf(),
+            Some(&paths),
+            10,
+            "test",
+            "test",
+            &PathsWithin(project.path()),
+            &|_, _| None,
+        )
+        .expect("scope");
 
         assert!(scope.multi_root);
         assert_eq!(scope.per_root_max, 20);
@@ -4391,12 +4426,12 @@ mod tests {
     fn fallback_walk_set(root: &Path) -> std::collections::BTreeSet<String> {
         let outcome = bounded_fallback_walk_files(root, root, &PathFilters::default(), "grep");
         assert!(!outcome.walk_truncated, "fixture walk must not truncate");
-        crate::context::ignore_rules_fixture::relative_set(root, &outcome.files)
+        crate::data_layer::ignore_rules::ignore_rules_fixture::relative_set(root, &outcome.files)
     }
 
     #[test]
     fn fallback_walk_honours_gitignore_in_non_git_root_like_git_root() {
-        use crate::context::ignore_rules_fixture as fixture;
+        use crate::data_layer::ignore_rules::ignore_rules_fixture as fixture;
         let plain_dir = tempfile::tempdir().unwrap();
         let git_dir = tempfile::tempdir().unwrap();
         fixture::write(plain_dir.path(), false);

@@ -3,6 +3,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod memory_walk;
+
 pub fn manifest_dir() -> &'static Path {
     static DIRECTORY: OnceLock<PathBuf> = OnceLock::new();
     DIRECTORY

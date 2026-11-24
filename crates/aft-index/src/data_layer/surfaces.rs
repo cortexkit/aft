@@ -29,8 +29,6 @@ use super::checkout::{
     PlaneStatus, INDEX_STORE,
 };
 use super::runtime::{DataCheckout, DataFailure};
-#[cfg(any(test, feature = "test-support"))]
-use crate::context::AppContext;
 use crate::data_layer::host::IndexHost;
 use crate::data_layer::status::{SemanticFillHealth, SemanticHealthComponentSnapshot};
 use crate::memory::MemoryEstimate;
@@ -1861,7 +1859,8 @@ pub fn warm_meaning(ctx: &dyn IndexHost) -> Option<WarmState> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod fixtures;
+#[doc(hidden)]
+pub mod fixtures;
 
 #[cfg(test)]
 pub(crate) mod tests {

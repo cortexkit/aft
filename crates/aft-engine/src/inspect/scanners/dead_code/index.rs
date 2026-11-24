@@ -10,7 +10,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
-use super::reads::Tracked;
+use super::reads::{self, Lookup, Tracked};
+use super::RustApiItem;
 
 /// Reads the entries kept in one slot: usually one, more when keys share a
 /// slot.
@@ -186,7 +187,7 @@ impl TrackedPairIndex for Tracked<Index<BTreeSet<String>>> {
     }
 }
 
-trait TrackedRustItems {
+pub(super) trait TrackedRustItems {
     /// The items of the Rust file `file` named `name`, recorded as a read of
     /// that name only, so an edit to the file's other items leaves the
     /// answer, and every file that asked for it, alone.

@@ -126,6 +126,12 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 
 | Item | Kind | Owning crate | Reason |
 |---|---|---|---|
+| `data_layer`, `semantic_index`, `search_index`, `search_state`, `grep_executor`, `large_read`, `search_b2`, `synapse_embed`, `local_embed`, `feature_status`, `semantic_admission`, `watcher_filter`, `watcher_backend`, `watcher`, `git_index_reader`, `callgraph_store`, `calls`, `grammar`, `luau`, `url_fetch`, `ort_pin`, `memory_census` | modules moved down | `aft-index` | Keep index storage, query execution, embedding, grammar and event ingestion below composition. |
+| Index module paths | compatibility re-exports | `aft-engine` | Keep the paths used by tools, daemon, and facade, except for the private Luau implementation. |
+| `root_cache`, `cache_location`, `fs_lock`, `path_identity`, `production_storage` | compatibility re-exports | `aft-engine` | Keep cache access and its filesystem policy on a single lower-owned implementation. |
+| `root_cache::WriterLease::acquire_shared_until` | visibility widened | `aft-db` | Keep the existing writer lease acquisition and retry budget in composed cache callers. |
+| `root_cache::{canonical_root, check_cache_access, identity_storage_root, prepare_third_party_cache_dir}` | re-export visibility widened | `aft-db` | Use one cache identity and access policy across index and engine. |
+| `root_cache::{prepare_cache_root_for_test, sweep_all_read_markers}` | test-support re-exports | `aft-db` | Make lower cache preparation and marker sweeping available to moved tests. |
 | `IndexHost::explicit_task_artifacts` | port | `aft-index` | Grep asks for visible task artifacts without acquiring shell state or bypassing session and root checks. |
 | `impl IndexHost for AppContext` (`explicit_task_artifacts`) | adapter | `aft-engine` | Delegate the artifact query to the real Bash registry. |
 | `IndexHost::semantic_building` | port | `aft-index` | Give the backend probe a blocking observation without exposing the status lock. |
@@ -302,6 +308,22 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `MeaningReport` | visibility widened | `aft-index` | Let composition read health from the emitted meaning plane. |
 | `MeaningReport::health` | visibility widened | `aft-index` | Keep the same semantic health projection in composition. |
 | `WatcherRescanInterval::raw_events` | visibility widened | `aft-index` | Report the raw event count from the completed rescan interval. |
+
+| `test_support::memory_walk::with_memory_walk_clock_for_test` | moved test utility | `aft-base` | Engine, index and upper tests use one thread-local memory-walk clock override. |
+| `test_support::memory_walk::memory_walk_now_for_test` | moved test utility | `aft-base` | Read the shared override during synchronous memory walks, only with test support. |
+| `context::{memory_walk_now_for_test, with_memory_walk_clock_for_test}` and `test_bridge::display_data::memory::with_memory_walk_clock_for_test` | test-support compatibility re-exports | `aft-engine` | Keep memory timing tests on the same clock through their old bridge path. |
+| `ExactnessDeadCode` | test-hook port | `aft-index` | Run the graph exactness check with inspect’s real dead-code projection. |
+| `data_layer::checkout::exactness::run` | test-hook compatibility wrapper | `aft-engine` | Supply inspect’s real entry-point and finding policies under the established example path. |
+| `impl ExactnessDeadCode for InspectEntryPoints` | test-hook adapter | `aft-engine` | Preserve inspect findings alongside index rows in the exactness output. |
+| `data_layer::surfaces::fixtures` | test-support visibility widened | `aft-index` | Share the same fixture checkout and status polling with composition tests. |
+| `index_test_binding::{bind_for_test, serve_text_index_for_test, serve_text_only_for_test}` | test-support compatibility wrappers | `aft-engine` | Configure the actual context before waiting for the index store. |
+| `data_layer::runtime::publication_fixture` | test-support visibility widened | `aft-index` | Exercise the same configurable publication fixture in composition tests. |
+| `PublicationFixture::checkout_handle` | test-support accessor | `aft-index` | Bind the fixture’s real checkout to the composed test context. |
+| `PublicationFixture::storage` | test-support accessor | `aft-index` | Point the composed test context at the fixture’s temporary storage. |
+| `test_bridge::display_data::PublicationFixture` | test-support compatibility wrapper | `aft-engine` | Keep the context-building method at the existing bridge path. |
+| `WatcherFilterConfig::note_raw_event_for_test` | test-support driver | `aft-index` | Observe a raw event in the same counters shared by filter and context. |
+| `watcher_filter::test_helpers::verify_full_dispatch_backlog` | test-support driver | `aft-index` | Assert private backlog behavior with the actual application pending-state probe. |
+| `local_embed::test_helpers::{native_test, wait_for_sessions}` | test-support helpers | `aft-index` | Keep one serial native-embedding guard and the same session-release check in both test binaries. |
 
 ## Visibility widened for cross-crate callers
 

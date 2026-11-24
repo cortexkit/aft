@@ -14,6 +14,11 @@ pub(crate) use crate::executor::root_lifecycle::SubcLifecycleAdmission;
 pub(crate) use crate::watcher_backend::counters::WatcherCounters;
 pub use crate::watcher_backend::counters::{watcher_counters_for_root, WatcherCountersSnapshot};
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) use aft_base::test_support::memory_walk::{
+    memory_walk_now_for_test, with_memory_walk_clock_for_test,
+};
+
 mod watcher_changes;
 #[doc(hidden)]
 pub use watcher_changes::{BashChanges, WatcherCountersHandle};

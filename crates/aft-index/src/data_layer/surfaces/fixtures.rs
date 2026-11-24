@@ -31,7 +31,7 @@ pub fn root_fixture_config(
 
 /// Waits up to 60 s for both planes of `ctx`'s bound checkout to be
 /// ready with no edit pending.
-pub fn settled(ctx: &AppContext) -> DataStoreReport {
+pub fn settled(ctx: &dyn IndexHost) -> DataStoreReport {
     let started = Instant::now();
     loop {
         let report = report(ctx).expect("data layer on");
