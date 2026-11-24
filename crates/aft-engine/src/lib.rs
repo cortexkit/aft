@@ -319,8 +319,6 @@ pub(crate) use aft_base::test_allocations;
 pub(crate) mod test_env;
 #[cfg(all(test, unix))]
 pub(crate) use aft_base::test_gate;
-#[cfg(all(test, windows))]
-pub(crate) use aft_base::test_read_denial;
 #[cfg(test)]
 pub(crate) use aft_base::test_support;
 // The fake LSP builder also compiles in integration tests under this helper name.

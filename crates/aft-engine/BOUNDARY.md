@@ -151,6 +151,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `TodoSummary::language` | visibility widened | `aft-index` | Keep inspect's stored-language check. |
 | `TodoSummary::counts` | visibility widened | `aft-index` | Keep inspect's stored marker counts. |
 | `watcher_backend::counters` | visibility widened | `aft-index` | Composition uses the same per-root watcher counters as native backends. |
+| `watcher_backend::assert_watch_restarts_never_stall_file_io` | Windows test-support driver | `aft-index` | The composed configuration-watcher test shares the index crate's file I/O progress check. |
 | `WatcherChangeSink` | port | `aft-index` | Deliver raw watcher events and losses without naming the Bash journal. |
 | `WatcherChanges` | handle | `aft-index` | Hold the optional sink in one slot shared with the root's counters. |
 | `WatcherCounters::bash_changes` | handle accessor | `aft-index` | Access the existing root-local sink slot without exposing its lock. |

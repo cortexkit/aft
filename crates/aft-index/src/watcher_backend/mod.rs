@@ -274,8 +274,9 @@ pub(crate) fn log_exclusions(
 /// directory; one thread runs `cycle` over and over, which must start a watch
 /// on the directory it is given and stop it again. Every thread must keep
 /// making progress. `what` names the watch in the failure message.
-#[cfg(all(windows, test))]
-pub(crate) fn assert_watch_restarts_never_stall_file_io(
+#[cfg(all(windows, any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub fn assert_watch_restarts_never_stall_file_io(
     what: &str,
     cycle: impl Fn(&std::path::Path) + Send + 'static,
 ) {
