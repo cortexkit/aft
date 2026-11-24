@@ -10,7 +10,13 @@ pub fn render_screen(raw: &[u8], rows: u16, cols: u16) -> String {
 fn render_screen_inner(raw: &[u8], rows: u16, cols: u16) -> String {
     let mut parser = vt100::Parser::new(rows, cols, 0);
     parser.process(raw);
-    let screen = parser.screen();
+    render_parsed_screen(parser.screen(), rows, cols)
+}
+
+/// The text of `screen`, a terminal of `rows` by `cols`, as [`render_screen`]
+/// shows it: one line per row with trailing blanks and blank last rows
+/// removed.
+pub fn render_parsed_screen(screen: &vt100::Screen, rows: u16, cols: u16) -> String {
     let mut lines: Vec<String> = Vec::new();
     for y in 0..rows {
         let mut text = String::new();
@@ -41,7 +47,14 @@ pub fn render_raw_fallback(raw: &[u8]) -> String {
     } else {
         raw
     };
-    let note = if raw.len() > FALLBACK_TAIL_BYTES {
+    render_raw_tail_fallback(tail, raw.len())
+}
+
+/// [`render_raw_fallback`] for a capture of `total` bytes when only its
+/// last bytes, `tail`, were read.
+pub fn render_raw_tail_fallback(tail: &[u8], total: usize) -> String {
+    let tail = &tail[tail.len().saturating_sub(FALLBACK_TAIL_BYTES)..];
+    let note = if total > FALLBACK_TAIL_BYTES {
         format!("[PTY screen render panicked; showing last {FALLBACK_TAIL_BYTES} raw bytes]\n")
     } else {
         "[PTY screen render panicked; showing raw PTY bytes]\n".to_string()

@@ -288,8 +288,11 @@ pub(crate) fn handle_with_observation_only(
                     ));
                 }
                 if matches!(output_mode.as_deref(), Some("raw" | "both")) {
-                    if let Some(raw) = pty_raw {
-                        data["pty_raw"] = json!(String::from_utf8_lossy(&raw));
+                    if let Some(tail) = pty_raw {
+                        data["pty_raw"] = json!(tail.text());
+                        if tail.omitted > 0 {
+                            data["pty_raw_omitted_bytes"] = json!(tail.omitted);
+                        }
                     }
                 }
                 if let Some(offset) = output_offset {
@@ -436,41 +439,62 @@ fn maybe_render_pty_screen(
     snapshot: &mut BgTaskSnapshot,
     output_mode: Option<&str>,
     disk_paths: Option<&crate::bash_background::persistence::TaskPaths>,
-) -> Option<Vec<u8>> {
+) -> Option<pty_view::RawTail> {
     if snapshot.info.mode != BgMode::Pty {
         return None;
     }
-    let raw = if let Some(paths) = disk_paths {
-        crate::bash_background::persistence::open_task_artifact(
+    let (mut capture, key) = match disk_paths {
+        Some(paths) => match crate::bash_background::persistence::open_task_artifact(
             paths,
             crate::bash_background::persistence::TaskArtifact::Pty,
-        )
-        .and_then(|mut file| file.read_all())
-        .map_err(|error| error.to_string())
-    } else {
-        ctx.bash_background().read_artifact(
-            task_id,
-            session_id,
-            crate::bash_background::persistence::TaskArtifact::Pty,
-        )
-    };
-    match raw {
-        Ok(raw) => {
-            if !matches!(output_mode, Some("raw")) {
-                let rows = snapshot.pty_rows.unwrap_or(24);
-                let cols = snapshot.pty_cols.unwrap_or(80);
-                snapshot.pty_screen = Some(crate::pty_render::render_screen(&raw, rows, cols));
+        ) {
+            Ok(file) => (
+                pty_view::PtyCapture::Disk(file),
+                format!("file:{}", paths.pty.display()),
+            ),
+            Err(error) => {
+                snapshot.pty_screen = Some(pty_screen_unavailable(&error.to_string()));
+                return None;
             }
-            Some(raw)
+        },
+        None => (
+            pty_view::PtyCapture::Registry {
+                ctx,
+                task_id,
+                session_id,
+            },
+            format!("task:{session_id}/{task_id}"),
+        ),
+    };
+    if !matches!(output_mode, Some("raw")) {
+        let rows = snapshot.pty_rows.unwrap_or(24);
+        let cols = snapshot.pty_cols.unwrap_or(80);
+        match pty_view::render_screen(&key, &mut capture, rows, cols) {
+            Ok(screen) => snapshot.pty_screen = Some(screen),
+            Err(error) => {
+                snapshot.pty_screen = Some(pty_screen_unavailable(&error));
+                return None;
+            }
         }
+    }
+    if !matches!(output_mode, Some("raw" | "both")) {
+        return None;
+    }
+    match pty_view::raw_tail(&mut capture) {
+        Ok(tail) => Some(tail),
         Err(error) => {
-            snapshot.pty_screen = Some(format!(
-                "[PTY screen unavailable: failed to read raw output: {error}]"
-            ));
+            snapshot.pty_screen = Some(pty_screen_unavailable(&error));
             None
         }
     }
 }
+
+fn pty_screen_unavailable(error: &str) -> String {
+    format!("[PTY screen unavailable: failed to read raw output: {error}]")
+}
+
+#[path = "bash_status_pty.rs"]
+mod pty_view;
 
 fn read_status_artifact_page(
     ctx: &AppContext,

@@ -18385,6 +18385,10 @@ mod pty_lifecycle_tests;
 mod watch_scan_tests;
 
 #[cfg(test)]
+#[path = "pty_status_tests.rs"]
+mod pty_status_tests;
+
+#[cfg(test)]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
     // at `generate_unique_task_id`. The width is load-bearing for the subc
