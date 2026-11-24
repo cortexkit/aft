@@ -1554,8 +1554,26 @@ impl WalkCoverage {
             .get_or_insert(reason);
     }
 
-    fn complete(&self) -> bool {
+    pub(crate) fn complete(&self) -> bool {
         self.skipped_foreign_mounts() == 0 && self.error().is_none()
+    }
+
+    pub(crate) fn allows_device(
+        &self,
+        path: &Path,
+        boundary: Option<&crate::walk_boundary::DeviceBoundary>,
+    ) -> bool {
+        match boundary.map(|boundary| boundary.should_descend(path)) {
+            Some(Ok(false)) => {
+                self.foreign_mounts.fetch_add(1, Ordering::Relaxed);
+                false
+            }
+            Some(Err(error)) => {
+                self.record_error(path, error);
+                false
+            }
+            _ => true,
+        }
     }
 }
 
@@ -1692,25 +1710,10 @@ fn target_walk_builder(
         if !is_dir || max_depth.is_some_and(|depth| entry.depth() >= depth) {
             return true;
         }
-        if entry.depth() > 0 {
-            match boundary
-                .as_ref()
-                .map(|boundary| boundary.should_descend(entry.path()))
-            {
-                Some(Ok(false)) => {
-                    coverage.foreign_mounts.fetch_add(1, Ordering::Relaxed);
-                    return false;
-                }
-                Some(Err(error)) => {
-                    coverage.record_error(entry.path(), error);
-                    return false;
-                }
-                _ => {}
-            }
-        }
-        crate::bounded_io::probe_walk_directory(&permission_root, entry.path())
-            .inspect_err(|error| coverage.record_error(entry.path(), error))
-            .is_ok()
+        (entry.depth() == 0 || coverage.allows_device(entry.path(), boundary.as_ref()))
+            && crate::bounded_io::probe_walk_directory(&permission_root, entry.path())
+                .inspect_err(|error| coverage.record_error(entry.path(), error))
+                .is_ok()
     });
     if ignored_target {
         // Like outline, an explicitly ignored target also honors Git rules

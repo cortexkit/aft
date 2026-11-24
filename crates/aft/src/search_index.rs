@@ -3613,6 +3613,27 @@ fn project_walk_builder_with_admission(
     project_walk_builder_pruned(search_root, excludes, |_| true)
 }
 
+/// The ordinary index walk, with coverage accounting for the unpublished corpus.
+pub(crate) fn checked_project_walk_builder(
+    root: &Path,
+    coverage: crate::grep_executor::WalkCoverage,
+) -> WalkBuilder {
+    crate::io_accounting::WORK
+        .full_walks
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let boundary = crate::walk_boundary::DeviceBoundary::for_root(root)
+        .inspect_err(|error| coverage.record_error(root, error))
+        .ok();
+    project_walk_builder_pruned(
+        root,
+        crate::project_content::is_excluded_with_file_type,
+        move |entry| {
+            !entry.file_type().is_some_and(|kind| kind.is_dir())
+                || coverage.allows_device(entry.path(), boundary.as_ref())
+        },
+    )
+}
+
 /// The project walk with one more condition, `descend`, on every entry below
 /// the root. Every decision the walk makes about an entry it does visit is
 /// unchanged: the ignore rules, the excluded directories and the content
@@ -3621,7 +3642,7 @@ fn project_walk_builder_with_admission(
 fn project_walk_builder_pruned(
     search_root: &Path,
     excludes: fn(&Path, Option<&std::fs::FileType>) -> bool,
-    descend: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    descend: impl Fn(&ignore::DirEntry) -> bool + Send + Sync + 'static,
 ) -> WalkBuilder {
     let mut builder = WalkBuilder::new(search_root);
     // A disappearing child mount can make ReadDir::drop panic on ENXIO and abort
@@ -3643,8 +3664,8 @@ fn project_walk_builder_pruned(
     )
     .filter_entry(move |entry| {
         project_walk_admits_entry(entry, excludes)
-            && descend(entry.path())
             && !is_nested_worktree_entry(entry, &worktrees)
+            && descend(entry)
     });
     builder
 }
