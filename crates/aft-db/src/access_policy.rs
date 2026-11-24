@@ -936,18 +936,17 @@ impl AccessPolicy {
             }
             match floor.rule {
                 FloorRule::AftStorage => return aft_storage_denial_message(original.display()),
-                FloorRule::CortexkitModuleData | FloorRule::CortexkitModuleState => {
-                    // The resolved identity names the target module even through an alias.
-                    // Shared CortexKit roots have no module name and keep the generic refusal.
+                FloorRule::CortexkitModuleData => {
+                    return format!("AFT never changes files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon to remove or change '{}'.", original.display());
+                }
+                FloorRule::CortexkitModuleState => {
+                    // The state-folder name comes from the resolved path, even through an alias.
                     if let Some(std::path::Component::Normal(module)) =
                         identity.components().nth(floor.path.components().count())
                     {
                         let module = module.to_string_lossy();
                         let path = original.display();
-                        return match floor.rule {
-                            FloorRule::CortexkitModuleData => format!("path '{path}' is in the {module} module's data folder. AFT's file tools never open it, because it can hold live databases. Use the {module} module's own commands, or ask the agent that owns it."),
-                            _ => format!("path '{path}' is in the {module} module's state folder. AFT's file tools never open it. Use the {module} module's own commands, or ask the agent that owns it."),
-                        };
+                        return format!("path '{path}' is in the {module} module's state folder. AFT's file tools never open it. Use the {module} module's own commands, or ask the agent that owns it.");
                     }
                 }
                 _ => {}
@@ -1472,14 +1471,17 @@ mod tests {
         let mut config = Config::default();
         config.sandbox.read_deny.push(home.join("denied"));
         let policy = AccessPolicy::from_config(&config, &storage, vec![], &home);
+        let data_denial = "AFT never changes files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon to remove or change '<path>'.";
         for (relative, expected) in [
-            (".local/share/cortexkit/synapse/memory.db", "path '<path>' is in the synapse module's data folder. AFT's file tools never open it, because it can hold live databases. Use the synapse module's own commands, or ask the agent that owns it."),
+            (".local/share/cortexkit/synapse/memory.db", data_denial),
+            (".local/share/cortexkit/aiproxy-commit-backup", data_denial),
+            (".local/share/cortexkit/live", data_denial),
             (".local/state/cortexkit/alfonso/state.json", "path '<path>' is in the alfonso module's state folder. AFT's file tools never open it. Use the alfonso module's own commands, or ask the agent that owns it."),
             (".local/share/cortexkit/aft/aft.db", "path '<path>' is in AFT's own storage, which file tools never open. For a shell task's output, use bash_status."),
             ("denied", "path '<path>' is denied by the access policy floor"),
             (".ssh/id_ed25519", "path '<path>' is denied by the access policy floor"),
             (".local/share/cortexkit/run/subc-connection.json", "path '<path>' is denied by the access policy floor"),
-            (".local/share/cortexkit", "path '<path>' is denied by the access policy floor"),
+            (".local/share/cortexkit", data_denial),
             (".local/state/cortexkit", "path '<path>' is denied by the access policy floor"),
         ] {
             let identity = home.join(relative);
