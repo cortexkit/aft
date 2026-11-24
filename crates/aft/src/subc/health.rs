@@ -1929,7 +1929,7 @@ const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
 /// no `memory.census` read asked for a new one. Measuring it renders an
 /// uncapped row for every actor root, and only `memory.census` reads it; the
 /// compact memory figures in the health reply are measured on every rollup.
-/// A read asks the next rollup for a fresh census, and a read that finds the
+/// A read can ask the next rollup for a fresh census, and a read that finds the
 /// census older than one rollup interval (`HEALTH_ROLLUP_TTL`) wakes the
 /// rollup and waits for a census measured after it (see
 /// [`fresh_memory_census`]). Only if none is published before the request's
@@ -3697,15 +3697,14 @@ impl Drop for CensusWaiter<'_> {
 /// [`MEMORY_CENSUS_REPLY_MARGIN`]. If none arrives in time, the census served
 /// then is returned with its age, as any census is.
 pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Instant) -> Value {
-    let ticket = cache.request_census();
-    let answered = |snapshot: &HealthDiagnosticRollup| snapshot.memory_census_answers >= ticket;
     let snapshot = cache.published_snapshot();
     let current = cache
         .census_age_ms(&snapshot)
         .is_some_and(|age| age <= duration_millis_u64(HEALTH_ROLLUP_TTL));
-    if (current || answered(&snapshot)) && !cache.allocator_breakdown_due() {
+    if current && !cache.allocator_breakdown_due() {
         return cache.render_memory_census(&snapshot);
     }
+    let ticket = cache.request_census();
     let Some(wait_until) = deadline.checked_sub(MEMORY_CENSUS_REPLY_MARGIN) else {
         return cache.render_memory_census(&snapshot);
     };
@@ -3716,7 +3715,7 @@ pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Ins
     cache.wake_for_census();
     loop {
         let snapshot = cache.published_snapshot();
-        if answered(&snapshot) {
+        if snapshot.memory_census_answers >= ticket {
             return cache.render_memory_census(&snapshot);
         }
         match tokio::time::timeout_at(
@@ -9893,6 +9892,30 @@ mod tests {
             .enable_all()
             .build()
             .expect("census test runtime")
+    }
+
+    #[test]
+    fn a_fresh_census_read_does_not_force_the_next_rollup_to_resample() {
+        let (_dir, root) = test_root("census-fresh-hit");
+        let executor = Executor::new();
+        assert!(executor.register_actor(root, test_ctx()));
+        let cache = HealthRollupCache::new();
+        let app = crate::context::App::default_shared();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        // Populate the allocator cache too; a first breakdown is a cache miss
+        // even when the last memory census is fresh.
+        cache.request_census();
+        cache.refresh_for_test(&executor, &app);
+        assert!(!cache.allocator_breakdown_due());
+        let builds_before = cache.census_builds_for_test();
+
+        cache.clock_ms.store(1, Ordering::Relaxed);
+        let census = census_runtime().block_on(fresh_memory_census(&cache, Instant::now()));
+        assert_eq!(census["health_rollup_tick"]["age_ms"], 1);
+        cache.clock_ms.store(2, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        assert_eq!(cache.census_builds_for_test() - builds_before, 0);
+        assert_eq!(cache.published_snapshot().memory_census_at_ms, Some(0));
     }
 
     /// After a quiet period longer than the census interval, the served
