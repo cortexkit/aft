@@ -69,6 +69,7 @@ pub mod checkout_controls;
 use checkout_controls::checkout_control_denies;
 pub use checkout_controls::remote_control_denies;
 mod launcher_image;
+mod plan_access;
 pub mod remote;
 #[doc(hidden)]
 pub mod remote_shell_guard;

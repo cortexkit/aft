@@ -84,6 +84,7 @@ mod composition;
 mod saved_delivery;
 use saved_delivery::list_delivery_gaps;
 mod live_delivery;
+mod live_process_count;
 use live_delivery::LiveDelivery;
 pub use live_delivery::RouteDeliverySessions;
 
@@ -15677,7 +15678,6 @@ impl BgTaskRegistry {
                 .load(Ordering::Relaxed),
         })
     }
-
 
     /// Estimate resident bash output caches without reading disk-backed task
     /// streams. Spill files are deliberately excluded because they do not
