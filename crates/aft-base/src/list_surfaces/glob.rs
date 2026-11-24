@@ -22,7 +22,7 @@ pub const MAX_DISPLAY_DIRECTORIES: usize = 6;
 ///
 /// Parameters:
 /// - `shown`: rendered file count after display-only selectors (from the seam `rendered_glob_file_count`)
-/// - `total`: discovered matching paths, excluding candidates known to be missing or denied
+/// - `total`: matching paths checked on disk and admitted
 /// - `executor_capped`: true if the page/refill window left candidates unchecked
 /// - `walk_truncated`: true if directory traversal stopped early
 /// - `skipped_foreign_mounts`: count of foreign filesystem mounts skipped

@@ -315,9 +315,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let presence_budget_exhausted = presence.budget_exhausted;
     let files = presence.present;
     let admitted_count = files.len();
-    // The public count includes discovered candidates beyond the returned page.
-    // Missing or denied candidates checked in this window are already excluded.
-    let total = admitted_count.saturating_add(presence.unexamined);
+    // Unchecked candidates may be stale or denied and do not establish a lower bound.
+    let total = admitted_count;
     let all_candidates_checked = presence.unexamined == 0;
     let result_truncated = presence.unexamined > 0 || presence_budget_exhausted;
 
@@ -1069,6 +1068,40 @@ mod tests {
         let rendered = crate::subc_format::format_response("glob", &response, false);
         assert!(rendered.ends_with(trailer), "{rendered}");
         assert_eq!(rendered.matches(trailer).count(), 1, "{rendered}");
+    }
+
+    #[test]
+    fn review_search_glob_lower_bound_only_counts_checked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(dir.path()).unwrap();
+        for index in 0..=DEFAULT_MAX_RESULTS {
+            std::fs::write(project.join(format!("file-{index:03}.txt")), "text").unwrap();
+        }
+        let ctx = AppContext::new(
+            crate::context::default_language_provider_factory(),
+            crate::config::Config {
+                project_root: Some(project),
+                ..Default::default()
+            },
+        );
+        let request = serde_json::from_value(serde_json::json!({
+            "id": "glob-lower-bound",
+            "command": "glob",
+            "pattern": "*.txt",
+        }))
+        .unwrap();
+        let response = handle_glob(&request, &ctx);
+        let body = &response.data;
+        assert_eq!(body["complete"], false, "{body}");
+        assert_eq!(body["candidate_count"], DEFAULT_MAX_RESULTS + 1, "{body}");
+        assert_eq!(body["unexamined_files"], 1, "{body}");
+        assert_eq!(body["total_lower_bound"], DEFAULT_MAX_RESULTS, "{body}");
+        let envelope: crate::list_envelope::ListEnvelope =
+            serde_json::from_value(body["files_list_envelope"].clone()).unwrap();
+        assert_eq!(
+            envelope.total,
+            crate::list_envelope::Total::AtLeast(DEFAULT_MAX_RESULTS)
+        );
     }
 
     #[test]
