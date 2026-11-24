@@ -711,7 +711,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "db/call_ledger.rs",
-        enclosing_item: "enforce_retention_bounds",
+        enclosing_item: "enforce_retention_bounds, drop_expired_entries_over_bound",
         location_or_primitive: "UNACKED_RESULTS_MAX (1000), EXPIRED_ENTRIES_MAX (1000), SQL OFFSET",
         reason: "durable protocol retention quotas bound stored terminal answers and non-terminal update payloads rather than shortening a command result list; acknowledged updates keep deduplication keys until their admitted call is removed",
     },

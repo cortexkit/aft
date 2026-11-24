@@ -41,6 +41,7 @@ use cortexkit_role_tool_provider::withdraw::{CompletedResult, StartedOutcome, Wi
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use subc_protocol::{ErrorBody, FrameType};
 
 pub const RETENTION_MS: i64 = 24 * 60 * 60 * 1000;
@@ -845,24 +846,35 @@ pub fn reduce_expired(conn: &Connection, key: &Key, now: i64) -> rusqlite::Resul
 /// A SQL LIMIT bounds the work before collecting any rows.
 pub fn sweep(conn: &Connection, now: i64) -> rusqlite::Result<usize> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let mut stmt = tx.prepare("SELECT carrier,call_key FROM call_ledger WHERE state='Settled' AND (acked=1 OR (settled_at<=?1 AND (owner IS NULL OR json_extract(late_entry,'$.kind')!='expired'))) ORDER BY settled_at,carrier,call_key LIMIT ?2")?;
+    let mut stmt = tx.prepare("SELECT carrier,call_key,custodian FROM call_ledger WHERE state='Settled' AND (acked=1 OR (settled_at<=?1 AND (owner IS NULL OR json_extract(late_entry,'$.kind')!='expired'))) ORDER BY settled_at,carrier,call_key LIMIT ?2")?;
     let keys = stmt
         .query_map(params![now - RETENTION_MS, SWEEP_BATCH], |r| {
-            Ok(Key {
-                carrier: r.get(0)?,
-                call_key: r.get(1)?,
-            })
+            Ok((
+                Key {
+                    carrier: r.get(0)?,
+                    call_key: r.get(1)?,
+                },
+                r.get::<_, Option<String>>(2)?,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
     let mut delete = tx.prepare(
         "DELETE FROM call_ledger WHERE carrier=?1 AND call_key=?2 AND (acked=1 OR owner IS NULL)",
     )?;
-    for key in &keys {
-        delete.execute(params![key.carrier, key.call_key])?;
-        reduce_expired(&tx, key, now)?;
+    let mut converted = HashSet::new();
+    for (key, custodian) in &keys {
+        if delete.execute(params![key.carrier, key.call_key])? == 0 {
+            reduce_expired(&tx, key, now)?;
+            if let Some(custodian) = custodian {
+                converted.insert(custodian);
+            }
+        }
     }
     drop(delete);
+    for custodian in converted {
+        drop_expired_entries_over_bound(&tx, custodian)?;
+    }
     tx.commit()?;
     Ok(keys.len())
 }
@@ -913,8 +925,7 @@ pub fn ack(conn: &Connection, custodian: &str, through: u64) -> rusqlite::Result
 /// would, and clears held-update payloads beyond [`UNACKED_RESULTS_MAX`].
 /// Every settle and held update runs this in its own transaction, so the
 /// bounds hold after each of them; `late_results` runs it again before
-/// reading, because expiry ([`reduce_expired`]) can push the expired count
-/// over its bound between settles.
+/// reading to enforce the bounds on existing rows.
 ///
 /// Its cost must not follow the size of the stored results, since a late
 /// entry can carry a whole tool result. A custodian with no more rows than
@@ -951,6 +962,19 @@ fn enforce_retention_bounds(conn: &Connection, custodian: &str) -> rusqlite::Res
     if over_update_bound {
         conn.execute("UPDATE call_ledger_updates SET entry=NULL WHERE rowid IN (SELECT rowid FROM call_ledger_updates WHERE custodian=?1 AND entry IS NOT NULL ORDER BY seq DESC LIMIT -1 OFFSET ?2)", params![custodian,UNACKED_RESULTS_MAX as i64])?;
     }
+    Ok(())
+}
+
+fn drop_expired_entries_over_bound(conn: &Connection, custodian: &str) -> rusqlite::Result<()> {
+    // Only Error rows can be expired, so this never reads a large result body.
+    conn.execute(
+        "DELETE FROM call_ledger WHERE rowid IN (
+             SELECT rowid FROM call_ledger WHERE custodian=?1
+             AND CASE WHEN frame_type='Error' THEN json_extract(late_entry,'$.kind')='expired' END
+             ORDER BY seq DESC LIMIT -1 OFFSET ?2
+         )",
+        params![custodian, EXPIRED_ENTRIES_MAX],
+    )?;
     Ok(())
 }
 
@@ -1314,6 +1338,7 @@ pub fn late_results_for_consumer(
     let mut size = overhead;
     let mut last = since_seq;
     let mut entries = Vec::new();
+    let mut converted = false;
     for (key, seq, update) in rows.into_iter().take(cap) {
         if update {
             let (raw, effective_at): (String, i64) = tx.query_row("SELECT entry,settled_at FROM call_ledger_updates WHERE carrier=?1 AND call_key=?2 AND seq=?3", params![key.carrier,key.call_key,seq], |row| Ok((row.get(0)?,row.get(1)?)))?;
@@ -1355,6 +1380,7 @@ pub fn late_results_for_consumer(
         };
         if due && entry_kind(&row)?.as_deref() != Some("expired") {
             reduce_expired(&tx, &key, now)?;
+            converted = true;
             row = get(&tx, &key)?.expect("the row read above still exists");
         }
         let mut entry = parse_entry(row.late_entry.as_deref().unwrap_or("null"))?;
@@ -1373,6 +1399,11 @@ pub fn late_results_for_consumer(
         size += added;
         last = seq;
         entries.push(entry);
+    }
+    // Finish the page before trimming so retention cannot remove a row while
+    // the page is still reading it or move its cursor back.
+    if converted {
+        drop_expired_entries_over_bound(&tx, custodian)?;
     }
     tx.commit()?;
     let reply = json!({
@@ -2131,6 +2162,84 @@ pub mod tests {
         );
         assert!(get(&conn, &key("b")).unwrap().is_some());
     }
+
+    #[cfg(test)]
+    fn expiry_at_capacity_fixture() -> (Connection, i64) {
+        let conn = database();
+        let scope = scope("scope-owner");
+        let frame = success();
+        for index in 0..EXPIRED_ENTRIES_MAX + UNACKED_RESULTS_MAX {
+            let key = expiry_fixture_key(index);
+            let old = index < EXPIRED_ENTRIES_MAX;
+            admit(&conn, &key, "digest", Some(&scope), State::DispatchStarted).unwrap();
+            settle(&conn, &key, &frame, "ok", None, if old { 1 } else { 101 }).unwrap();
+            if old {
+                reduce_expired(&conn, &key, RETENTION_MS + 1).unwrap();
+            }
+        }
+        assert_eq!(expired_fixture_count(&conn), EXPIRED_ENTRIES_MAX);
+        (conn, RETENTION_MS + 101)
+    }
+
+    #[cfg(test)]
+    fn expiry_fixture_key(index: usize) -> Key {
+        Key {
+            carrier: "expiry-carrier".into(),
+            call_key: format!("key-{index:04}"),
+        }
+    }
+
+    #[cfg(test)]
+    fn expired_fixture_count(conn: &Connection) -> usize {
+        conn.query_row(
+            "SELECT count(*) FROM call_ledger WHERE custodian='expiry-carrier' AND json_extract(late_entry, '$.kind')='expired'",
+            [],
+            |row| row.get(0),
+        ).unwrap()
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn ledger_expiry_keeps_tombstone_cap_after_sweep() {
+        let (conn, now) = expiry_at_capacity_fixture();
+        assert_eq!(sweep(&conn, now).unwrap(), SWEEP_BATCH);
+        assert_eq!(expired_fixture_count(&conn), EXPIRED_ENTRIES_MAX);
+        assert!(get(&conn, &expiry_fixture_key(SWEEP_BATCH - 1))
+            .unwrap()
+            .is_none());
+        assert!(get(&conn, &expiry_fixture_key(SWEEP_BATCH))
+            .unwrap()
+            .is_some());
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn ledger_expiry_keeps_tombstone_cap_during_late_results() {
+        let (conn, now) = expiry_at_capacity_fixture();
+        let cursor = Cursor {
+            provider_incarnation: "incarnation".into(),
+            seq: EXPIRED_ENTRIES_MAX as u64,
+        };
+        let page = late_results(
+            &conn,
+            "expiry-carrier",
+            "incarnation",
+            Some(&cursor),
+            Some(1),
+            now,
+            4096,
+        )
+        .unwrap()
+        .unwrap();
+        let reply: Value = serde_json::from_slice(&page).unwrap();
+        assert_eq!(reply["entries"][0]["kind"], "expired");
+        assert_eq!(reply["cursor"]["seq"], cursor.seq + 1);
+        assert_eq!(reply["more"], true);
+        assert_eq!(expired_fixture_count(&conn), EXPIRED_ENTRIES_MAX);
+        assert!(get(&conn, &expiry_fixture_key(0)).unwrap().is_none());
+        assert!(get(&conn, &expiry_fixture_key(1)).unwrap().is_some());
+    }
+
     pub fn database() -> Connection {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::run_migrations(&mut conn).unwrap();
