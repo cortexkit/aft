@@ -139,9 +139,7 @@ async fn settings_review_classifies_live_and_restart_fields() {
 
 #[tokio::test]
 async fn settings_review_classifies_harness_overrides_like_their_root_field() {
-    let schema = Arc::new(
-        Schema::new(crate::config_live::schema::settings_declaration()).unwrap(),
-    );
+    let schema = Arc::new(Schema::new(crate::config_live::schema::settings_declaration()).unwrap());
     let candidate = ConfigLayerSnapshot::file(
         "aft",
         ConfigLayer::User,
@@ -389,8 +387,7 @@ async fn settings_first_declaration_timeout_is_retried_without_a_push() {
             crate::config::Config::default(),
         ));
         let schema = sample_schema();
-        let declaration =
-            ConfigDeclareRequest::new(schema.clone(), "/config/aft.jsonc", vec![]);
+        let declaration = ConfigDeclareRequest::new(schema.clone(), "/config/aft.jsonc", vec![]);
         let (boot, ()) = tokio::join!(
             startup::drive_first_view(
                 &control,
@@ -419,7 +416,8 @@ async fn settings_first_declaration_timeout_is_retried_without_a_push() {
                 .await;
                 let (corr, get) = next(&mut written).await;
                 assert_eq!(get, json_as::<Value>(golden!("config_get_request")));
-                // A gated answer is not transient: the module waits for a push
+                // A `config_gated` refusal (no approved settings yet) is not
+                // transient: the module waits for a `config.changed` push
                 // and sends nothing more until the connection closes.
                 incoming(
                     &incoming_tx,

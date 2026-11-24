@@ -213,7 +213,10 @@ mod tests {
         assert_eq!(waited, 0, "{}", std::io::Error::last_os_error());
         let before = walks();
         assert!(session_alive(pid));
-        assert!(walks() > before, "an exited leader needs the descendant walk");
+        assert!(
+            walks() > before,
+            "an exited leader needs the descendant walk"
+        );
         unsafe { libc::kill(descendant, libc::SIGKILL) };
         leader.wait().unwrap();
     }

@@ -1326,8 +1326,13 @@ mod tests {
             (table, count)
         })
         .to_vec();
-        register_scope(&conn, &ScopeKey::from_policy(&policy(6)), None, &Config::default())
-            .unwrap();
+        register_scope(
+            &conn,
+            &ScopeKey::from_policy(&policy(6)),
+            None,
+            &Config::default(),
+        )
+        .unwrap();
         (left, launch_params(&conn, &policy(6)).unwrap())
     }
 
