@@ -39,6 +39,7 @@ fn detect_language(path: &Path) -> Option<LangId> {
 #[cfg(test)]
 thread_local! {
     static TABLE_RENDERS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PLANNER_ROW_MEASUREMENTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 pub(crate) use crate::parser::outline_facts::symbol_to_entry;
@@ -1982,21 +1983,18 @@ fn compare_directory_code_share(
     (a_code as u128 * b_total as u128).cmp(&(b_code as u128 * a_total as u128))
 }
 
+mod file_plan;
+
 fn plan_outline_file_rows(
     roots: &[usize],
     directory_nodes: &[OutlineDirectoryNode],
     file_entries: &[OutlineFileEntry],
     max_bytes: usize,
 ) -> Vec<OutlineTableRow> {
-    plan_outline_file_rows_with_length(
-        roots,
-        directory_nodes,
-        file_entries,
-        max_bytes,
-        files_table_rendered_len,
-    )
+    file_plan::plan(roots, directory_nodes, file_entries, max_bytes)
 }
 
+#[cfg(test)]
 fn plan_outline_file_rows_with_length(
     roots: &[usize],
     directory_nodes: &[OutlineDirectoryNode],
@@ -2476,6 +2474,7 @@ fn files_table_fields(
 
 /// Rust string formatting pads by character count, but the output budget counts
 /// bytes. Keep both quantities so Unicode paths make the same budget decisions.
+#[cfg(test)]
 fn files_table_rendered_len(
     rows: &[OutlineTableRow],
     directory_nodes: &[OutlineDirectoryNode],
@@ -2518,6 +2517,14 @@ fn files_table_trailer_len(
         }
     }
 
+    files_table_trailer_len_counts(shown, budget_rollup_files, budget_rollups_present)
+}
+
+fn files_table_trailer_len_counts(
+    shown: usize,
+    budget_rollup_files: usize,
+    budget_rollups_present: bool,
+) -> usize {
     if budget_rollups_present {
         let envelope = crate::list_envelope::ListEnvelope::new(
             shown,
@@ -5139,6 +5146,26 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
     }
 
     #[test]
+    fn edit_review_gpt_7_planner_measures_each_sibling_only_once() {
+        for size in [50, 100] {
+            let (mut nodes, files) = planner_fixture();
+            nodes[0].children = (1..=size).collect();
+            for node in &mut nodes[1..=size] {
+                node.direct_files = vec![node.direct_files[0]];
+                node.stats.files = 1;
+                node.stats.code_files = 1;
+            }
+            PLANNER_ROW_MEASUREMENTS.with(|count| count.set(0));
+            let rows = plan_outline_file_rows(&[0], &nodes, &files, usize::MAX);
+            assert_eq!(rows.len(), size);
+            assert!(rows
+                .iter()
+                .all(|row| matches!(row, OutlineTableRow::File(_))));
+            assert_eq!(PLANNER_ROW_MEASUREMENTS.with(|count| count.get()), 2 * size);
+        }
+    }
+
+    #[test]
     fn files_planner_materializes_only_the_final_table() {
         let (nodes, files) = planner_fixture();
         let before = TABLE_RENDERS.with(|count| count.get());
@@ -5223,6 +5250,10 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
             );
             assert!(candidates > 0);
             assert_eq!(measured, reference);
+            assert_eq!(
+                plan_outline_file_rows(&[0, 3], &nodes, &files, budget),
+                reference
+            );
             assert_eq!(
                 format_files_table(&measured, &nodes, &files, budget),
                 format_files_table(&reference, &nodes, &files, budget)
