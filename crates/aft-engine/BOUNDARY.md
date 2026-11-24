@@ -597,6 +597,18 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 
 | `rerank::onnx::{experimental_tuning, profiling_tuning}` | moved test-support constructors | `aft-index` | Build the same test tuning values without exposing their private fields. |
 | `test_bridge::search_misc::rerank::onnx::{experimental_tuning, profiling_tuning}` | test-support compatibility re-exports | `aft-engine` | Keep both existing ONNX tuning test paths. |
+| `watcher_backend::windows::DirectoryWatcher` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::windows::DirectoryWatcher::new` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::windows::DirectoryWatcher::watch` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::windows::DirectoryWatcher::unwatch` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::fsevents::DirectoryWatcher` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::fsevents::DirectoryWatcher::new` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::fsevents::DirectoryWatcher::watch` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+| `watcher_backend::fsevents::DirectoryWatcher::unwatch` | visibility widened | `aft-index` | Keep composition’s native configuration directory watcher on the same backend. |
+
+| `watcher_backend::DirectoryWatcher` | compatibility re-export visibility widened | `aft-index` | Keep the same platform-specific directory watcher available under its original path. |
+| `watcher_backend::readiness` | visibility widened | `aft-index` | Let inspect supply the existing native store-readiness watcher. |
+| `NativeReadinessWatcherFactory` | visibility widened | `aft-index` | Feed native events to the lower call graph’s readiness capability. |
 
 ## Visibility widened for cross-crate callers
 

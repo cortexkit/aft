@@ -120,7 +120,8 @@ mod notification_buffer {
 }
 
 #[cfg(target_os = "macos")]
-pub(crate) use fsevents::DirectoryWatcher;
+#[doc(hidden)]
+pub use fsevents::DirectoryWatcher;
 #[cfg(target_os = "macos")]
 #[doc(hidden)]
 pub use fsevents::ProjectWatcher;
@@ -128,7 +129,8 @@ pub use fsevents::ProjectWatcher;
 #[doc(hidden)]
 pub use inotify::ProjectWatcher;
 #[cfg(windows)]
-pub(crate) use windows::DirectoryWatcher;
+#[doc(hidden)]
+pub use windows::DirectoryWatcher;
 #[cfg(windows)]
 #[doc(hidden)]
 pub use windows::ProjectWatcher;
@@ -431,4 +433,5 @@ mod tests {
 #[doc(hidden)]
 pub mod change_sink;
 #[cfg(windows)]
-pub(crate) mod readiness;
+#[doc(hidden)]
+pub mod readiness;

@@ -239,13 +239,15 @@ impl Drop for ProjectWatcher {
 /// a read that completes during shutdown may still be re-armed, but on the
 /// watch's own open handle: the loop cancels and drains every pending read
 /// before any handle is closed.
-pub(crate) struct DirectoryWatcher {
+#[doc(hidden)]
+pub struct DirectoryWatcher {
     sender: mpsc::Sender<notify::Result<Event>>,
     watcher: Option<ProjectWatcher>,
 }
 
 impl DirectoryWatcher {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         sender: mpsc::Sender<notify::Result<Event>>,
         _counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> Self {
@@ -255,7 +257,8 @@ impl DirectoryWatcher {
         }
     }
 
-    pub(crate) fn watch(&mut self, path: &Path, mode: notify::RecursiveMode) -> notify::Result<()> {
+    #[doc(hidden)]
+    pub fn watch(&mut self, path: &Path, mode: notify::RecursiveMode) -> notify::Result<()> {
         debug_assert_eq!(mode, notify::RecursiveMode::NonRecursive);
         // Stop the previous directory first: its thread and handle end here.
         self.watcher = None;
@@ -284,7 +287,8 @@ impl DirectoryWatcher {
         Ok(())
     }
 
-    pub(crate) fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+    #[doc(hidden)]
+    pub fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
         self.watcher = None;
         Ok(())
     }

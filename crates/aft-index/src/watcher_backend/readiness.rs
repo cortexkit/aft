@@ -2,7 +2,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 /// The native store-readiness watcher is supplied by the application layer.
-pub(crate) struct NativeReadinessWatcherFactory;
+#[doc(hidden)]
+pub struct NativeReadinessWatcherFactory;
 
 impl crate::callgraph_store::ReadinessWatcherFactory for NativeReadinessWatcherFactory {
     fn watch(

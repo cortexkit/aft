@@ -408,14 +408,16 @@ impl Drop for ProjectWatcher {
 /// its path argument. Incremental multi-path watch/unwatch is not supported.
 /// FSEvents itself is recursive; the callback admits only each attachment and
 /// its immediate children.
-pub(crate) struct DirectoryWatcher {
+#[doc(hidden)]
+pub struct DirectoryWatcher {
     stream: Option<FsEventsStream>,
     sender: NativeEventSender,
     counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
 }
 
 impl DirectoryWatcher {
-    pub(crate) fn new(
+    #[doc(hidden)]
+    pub fn new(
         sender: mpsc::Sender<notify::Result<Event>>,
         counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> Self {
@@ -447,12 +449,14 @@ impl DirectoryWatcher {
         Ok(())
     }
 
-    pub(crate) fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
+    #[doc(hidden)]
+    pub fn watch(&mut self, path: &Path, mode: RecursiveMode) -> notify::Result<()> {
         debug_assert_eq!(mode, RecursiveMode::NonRecursive);
         self.watch_paths(&[path.to_path_buf()])
     }
 
-    pub(crate) fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
+    #[doc(hidden)]
+    pub fn unwatch(&mut self, _path: &Path) -> notify::Result<()> {
         self.stream.take();
         Ok(())
     }
