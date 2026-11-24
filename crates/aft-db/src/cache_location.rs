@@ -52,10 +52,6 @@ use std::sync::Weak;
 #[allow(unused_imports)]
 use std::time::Duration;
 
-#[cfg(test)]
-#[path = "gh_shim_speech/serving_tests.rs"]
-#[allow(hidden_glob_reexports)]
-mod speech_serving_tests;
 
 #[cfg(test)]
 #[allow(hidden_glob_reexports)]
