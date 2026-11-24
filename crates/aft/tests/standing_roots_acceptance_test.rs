@@ -13,9 +13,9 @@
 //! | Resolved-path drift | `subc::health::tests::standing_health_names_resolved_path_drift_without_re_recording`; `scoped_key::tests::symlink_retargeting_resolves_to_a_different_pinned_identity` |
 //! | Three artifact identities, scoped vectors, worktrees, and duplicates | `scoped_key::tests::subtree_key_never_equals_or_prewarms_the_repository_session_key`; `scoped_key::tests::non_git_roots_use_the_existing_path_scope_key`; `scoped_key::tests::scoped_v1_has_domain_separation_and_stable_bytes`; `scoped_key::tests::scoped_v1_preserves_unicode_case_and_never_normalizes`; `scoped_key::tests::scoped_v1_rejects_unsafe_logical_paths`; `scoped_key::tests::same_repo_worktree_and_logical_subtree_share_scoped_v1_key`; `scoped_key::tests::duplicate_artifact_keys_are_refused_before_admission` |
 //! | Initial and periodic maintenance, cadence, and coalescing | `subc::standing::tests::standing_interval_uses_the_existing_subc_maintenance_cadence`; `standing_roots::tests::maintenance_snapshot_preserves_configuration_and_fixed_kind_order`; executor coalescing is exercised by `subc::standing::StandingActor::submit_entry_pass` |
-//! | Case-A publication fence and paired admission epoch | `standing_roots::tests::publication_is_a_noop_after_bind_epoch_revocation`; `standing_roots::tests::publication_fence_holds_epoch_mutex_through_final_rename`; `case_a_fence_and_resume_smoke` |
-//! | Suspension-resume freshness and shared-key selection | `standing_roots::tests::suspension_edit_resume_requires_strict_verification_before_query`; `standing_roots::tests::shared_key_handoff_preserves_session_proven_kind_and_marks_other_kind`; `case_a_fence_and_resume_smoke` |
-//! | Configuration snapshots and removals | `standing_roots::tests::configuration_add_modify_and_remove_mint_boundaries_and_delete_rows`; `standing_roots::tests::superseded_snapshot_publication_is_a_noop` |
+//! | Case-A bind admission epoch and stale-build publication | `standing_roots::tests::bind_revokes_admission_and_checkpoint_join_is_bounded`; `data_layer::checkout::tests::a_build_stands_down_when_another_process_published_first`; `case_a_bind_and_resume_smoke` |
+//! | Suspension-resume freshness and shared-key selection | `standing_roots::tests::suspension_edit_resume_requires_strict_verification_before_query`; `standing_roots::tests::shared_key_handoff_preserves_session_proven_kind_and_marks_other_kind`; `case_a_bind_and_resume_smoke` |
+//! | Configuration snapshots and removals | `standing_roots::tests::configuration_add_modify_and_remove_mint_boundaries_and_delete_rows` |
 //! | Standing limiter yielding at initial and checkpoint acquisition | `cold_build_limiter::tests::standing_yields_before_initial_and_checkpoint_reacquisition_when_non_standing_waits` |
 //! | CLI no-op, trust, aggregation, disclosure, and shared freshness | `cli::index::tests::bare_empty_snapshot_is_an_explicit_successful_noop`; `cli::index::tests::validation_and_project_tier_trust_refusals_admit_no_builds`; `cli::index::tests::search_snapshot_discloses_zero_results_and_clears_shared_strict_state`; `cli::index::tests::aggregate_exit_states_preserve_usable_partial_output` |
 //! | Stale-snapshot disclosure | `cli_snapshot_daemonless_query_discloses_stale_snapshot` |
@@ -23,15 +23,14 @@
 //! | Network, budget, breaker, bind trust, and Windows | Existing shared paths remain unchanged; Windows scoped-key vectors run in `scoped_key::tests::windows_native_separators_match_logical_forward_slashes` on the Windows CI oracle. The local Parallels lane is not an oracle when its VM preflight is unavailable. |
 //!
 //! The standing-root mutation-control rerun is `cargo test -p agent-file-tools
-//! --lib standing_roots::tests --quiet`. It covers epoch ordering, serialized
-//! snapshot publication, durable strict-state clearing, crash recovery, and
+//! --lib standing_roots::tests --quiet`. It covers epoch ordering, durable
+//! strict-state clearing, crash recovery, and
 //! suspension-resume behavior. This target deliberately exercises the same
 //! public transitions so a later refactor cannot turn the map into
 //! documentation-only coverage.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use aft::commands::semantic_search::handle_semantic_search;
 use aft::config::{Config, IndexConfig, IndexKind, IndexRootConfig};
@@ -39,7 +38,6 @@ use aft::context::AppContext;
 use aft::db::standing_roots::{get_standing_root, mark_needs_strict_verify, needs_strict_verify};
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
-use aft::root_cache::{configure_artifact_access, RootCacheDomain, WriterLease};
 use aft::standing_roots::StandingRoots;
 use serde_json::Value;
 
@@ -161,50 +159,24 @@ fn shared_database_smoke() {
 }
 
 #[test]
-fn case_a_fence_and_resume_smoke() {
+fn case_a_bind_and_resume_smoke() {
     let storage = tempfile::tempdir().expect("storage directory");
     let root_dir = tempfile::tempdir().expect("standing root");
     let literal_path = root_dir.path().display().to_string();
     let roots = StandingRoots::default();
-    let report = roots
+    roots
         .reconcile(&config(
             storage.path(),
             vec![root(root_dir.path(), vec![IndexKind::Search])],
         ))
         .expect("standing reconciliation");
-    let entry = report
-        .active_entries
-        .into_iter()
-        .next()
-        .expect("standing entry");
     let admission = roots
         .admit_build(&literal_path)
         .expect("standing admission");
-    configure_artifact_access(&entry.resolved_target, &entry.artifact_key, false);
-    let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-    let lease = WriterLease::acquire_shared(
-        RootCacheDomain::Index,
-        &cache_dir,
-        &entry.artifact_key,
-        &entry.resolved_target,
-    )
-    .expect("writer lease result")
-    .expect("writer lease");
 
     roots.begin_case_a_bind(&literal_path).expect("Case-A bind");
-    let published = AtomicBool::new(false);
-    assert!(roots
-        .publish_if_current(
-            &literal_path,
-            admission.publication,
-            &lease,
-            || true,
-            || true,
-            || published.store(true, Ordering::SeqCst),
-        )
-        .expect("publication fence")
-        .is_none());
-    assert!(!published.load(Ordering::SeqCst));
+    assert!(roots.admit_build(&literal_path).is_none());
+    assert!(admission.cancellation_requested());
     assert!(admission.checkpoint());
 
     roots

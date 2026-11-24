@@ -15,7 +15,6 @@ use parking_lot::{Condvar, Mutex};
 
 use crate::config::{Config, IndexKind};
 use crate::db::standing_roots::{self, StandingRootRecord};
-use crate::root_cache::{ArtifactPublishEpoch, WriterLease};
 use crate::scoped_key::{reject_duplicate_artifact_keys, ResolvedStandingRoot};
 
 /// Configuration snapshots are observed only at standing maintenance-pass
@@ -101,7 +100,6 @@ pub struct StandingRootRefusal {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StandingPublicationAdmission {
     pub admission_epoch: u64,
-    publication_epoch: u64,
 }
 
 /// An admitted build retains a lifecycle reference until it reaches a
@@ -171,7 +169,6 @@ struct ArtifactLifecycle {
     state: Mutex<ArtifactLifecycleState>,
     checkpoint_acknowledged: Condvar,
     admission_epoch: AtomicU64,
-    publication_epoch: ArtifactPublishEpoch,
 }
 
 #[derive(Default)]
@@ -193,7 +190,6 @@ impl Default for ArtifactLifecycle {
             }),
             checkpoint_acknowledged: Condvar::new(),
             admission_epoch: AtomicU64::new(0),
-            publication_epoch: ArtifactPublishEpoch::default(),
         }
     }
 }
@@ -209,7 +205,6 @@ impl ArtifactLifecycle {
             lifecycle: Arc::clone(self),
             publication: StandingPublicationAdmission {
                 admission_epoch: self.admission_epoch.load(Ordering::SeqCst),
-                publication_epoch: self.publication_epoch.current(),
             },
         })
     }
@@ -225,10 +220,6 @@ impl ArtifactLifecycle {
             .admission_epoch
             .fetch_add(1, Ordering::SeqCst)
             .wrapping_add(1);
-        // Advance the publication epoch so any admission captured before this
-        // lifecycle transition is rejected by `StandingRoots::publish_if_current`
-        // while ArtifactPublishEpoch holds its mutex.
-        self.publication_epoch.next();
         if state.checkpoint_acknowledged {
             self.checkpoint_acknowledged.notify_all();
         }
@@ -648,39 +639,6 @@ impl StandingRoots {
             now_ms(),
         )?;
         Ok(())
-    }
-
-    /// Execute a standing publication while `ArtifactPublishEpoch` holds its
-    /// exclusive per-root mutex continuously across WriterLease validation,
-    /// admission comparison, caller-supplied fingerprint/generation comparisons,
-    /// and the final rename closure. A failed comparison is a no-op.
-    pub fn publish_if_current<R>(
-        &self,
-        literal_path: &str,
-        admission: StandingPublicationAdmission,
-        writer_lease: &WriterLease,
-        fingerprint_is_current: impl FnOnce() -> bool,
-        generation_is_current: impl FnOnce() -> bool,
-        publish_and_rename: impl FnOnce() -> R,
-    ) -> Result<Option<R>, StandingRootsError> {
-        let lifecycle = self.lifecycle(literal_path)?;
-        Ok(lifecycle
-            .publication_epoch
-            .run_if_current(admission.publication_epoch, || {
-                // Compare the worker's captured admission epoch with the epoch
-                // advanced by a bind or configuration replacement. A mismatch
-                // rejects stale publication before the final rename can run.
-                if lifecycle.admission_epoch.load(Ordering::SeqCst) != admission.admission_epoch
-                    || !lifecycle.state.lock().standing_admission_open
-                    || !writer_lease.verify().unwrap_or(false)
-                    || !fingerprint_is_current()
-                    || !generation_is_current()
-                {
-                    return None;
-                }
-                Some(publish_and_rename())
-            })
-            .flatten())
     }
 
     fn lifecycle(&self, literal_path: &str) -> Result<Arc<ArtifactLifecycle>, StandingRootsError> {
@@ -1357,160 +1315,6 @@ mod tests {
                 ),
             ]
         );
-    }
-
-    #[test]
-    fn publication_is_a_noop_after_bind_epoch_revocation() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut report = roots.reconcile(&cfg).unwrap();
-        let entry = report.active_entries.remove(0);
-        let build = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        roots.begin_case_a_bind(&entry.literal_path).unwrap();
-        let published = std::sync::atomic::AtomicBool::new(false);
-        let result = roots
-            .publish_if_current(
-                &entry.literal_path,
-                build.publication,
-                &lease,
-                || true,
-                || true,
-                || published.store(true, Ordering::SeqCst),
-            )
-            .unwrap();
-        assert!(result.is_none());
-        assert!(!published.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn publication_fence_holds_epoch_mutex_through_final_rename() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut report = roots.reconcile(&cfg).unwrap();
-        let entry = report.active_entries.remove(0);
-        let admission = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        let (rename_entered_tx, rename_entered_rx) = std::sync::mpsc::channel();
-        let (release_rename_tx, release_rename_rx) = std::sync::mpsc::channel();
-        let publish_roots = roots.clone();
-        let publish_literal = entry.literal_path.clone();
-        let publisher = std::thread::spawn(move || {
-            publish_roots
-                .publish_if_current(
-                    &publish_literal,
-                    admission.publication,
-                    &lease,
-                    || true,
-                    || true,
-                    || {
-                        rename_entered_tx.send(()).unwrap();
-                        release_rename_rx.recv().unwrap();
-                    },
-                )
-                .unwrap()
-        });
-        rename_entered_rx.recv().unwrap();
-        let (bind_done_tx, bind_done_rx) = std::sync::mpsc::channel();
-        let bind_roots = roots.clone();
-        let bind_literal = entry.literal_path.clone();
-        let binder = std::thread::spawn(move || {
-            bind_done_tx
-                .send(bind_roots.begin_case_a_bind(&bind_literal))
-                .unwrap();
-        });
-        assert!(bind_done_rx
-            .recv_timeout(Duration::from_millis(100))
-            .is_err());
-        release_rename_tx.send(()).unwrap();
-        assert!(publisher.join().unwrap().is_some());
-        // Only the 100 ms check above is about ordering: the bind must not
-        // finish while the rename holds the fence. Once released, the bind does
-        // real filesystem work, so this receive is just a hang guard, sized
-        // for a loaded Windows runner.
-        bind_done_rx
-            .recv_timeout(Duration::from_secs(30))
-            .unwrap()
-            .unwrap();
-        binder.join().unwrap();
-    }
-
-    #[test]
-    fn superseded_snapshot_publication_is_a_noop() {
-        let storage = tempdir().unwrap();
-        let root_dir = tempdir().unwrap();
-        let roots = StandingRoots::default();
-        let mut cfg = config(
-            storage.path(),
-            vec![root(root_dir.path(), vec![IndexKind::Search])],
-        );
-        let mut initial = roots.reconcile(&cfg).unwrap();
-        let entry = initial.active_entries.remove(0);
-        let build = roots.admit_build(&entry.literal_path).unwrap();
-        crate::root_cache::configure_artifact_access(
-            &entry.resolved_target,
-            &entry.artifact_key,
-            false,
-        );
-        cfg.index.roots[0].indexes = vec![IndexKind::Semantic];
-        let report = roots.reconcile(&cfg).unwrap();
-        assert_eq!(report.replaced, vec![entry.literal_path.clone()]);
-        let cache_dir = storage.path().join("index").join(&entry.artifact_key);
-        let lease = crate::root_cache::WriterLease::acquire_shared(
-            crate::root_cache::RootCacheDomain::Index,
-            &cache_dir,
-            &entry.artifact_key,
-            &entry.resolved_target,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(roots
-            .publish_if_current(
-                &entry.literal_path,
-                build.publication,
-                &lease,
-                || true,
-                || true,
-                || (),
-            )
-            .unwrap()
-            .is_none());
     }
 
     #[test]
