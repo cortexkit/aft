@@ -399,21 +399,6 @@ impl CheckpointStoreTestExt for crate::checkpoint::CheckpointStore {
     }
 }
 
-pub trait BuildDeathBreakerTestExt {
-    fn reset_open_calls_for_test();
-    fn open_calls_for_test() -> u64;
-}
-
-impl BuildDeathBreakerTestExt for crate::build_breaker::BuildDeathBreaker {
-    fn reset_open_calls_for_test() {
-        Self::reset_open_calls_for_test();
-    }
-
-    fn open_calls_for_test() -> u64 {
-        Self::open_calls_for_test()
-    }
-}
-
 pub trait LspManagerTestExt {
     fn resume(&self);
 }

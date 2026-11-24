@@ -16,7 +16,7 @@
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft-engine/src/context.rs": {
-    "lines": 11382,
+    "lines": 11381,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft-engine/src/lsp/manager.rs": {

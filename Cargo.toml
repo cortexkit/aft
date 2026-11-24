@@ -31,8 +31,8 @@ rust-version = "1.92"
 # the shell, in order, joined with &&. Keep them in step with the gate flags.
 [workspace.metadata.motor]
 warm-commands = [
-  "cargo nextest run --no-run -p agent-file-tools -p aft-engine -p aft-tools -p aft-subc --features test-hooks",
-  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools -p aft-engine -p aft-tools -p aft-subc --tests --features test-hooks",
+  "cargo nextest run --no-run --workspace --features wasm-grammars,test-hooks",
+  "cargo check --target x86_64-pc-windows-gnu -p agent-file-tools -p aft-base -p aft-db -p aft-engine -p aft-tools -p aft-subc --tests --features test-hooks",
 ]
 
 [profile.release]
