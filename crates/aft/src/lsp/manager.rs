@@ -84,6 +84,8 @@ impl Drop for BackgroundDocumentPullPause {
     }
 }
 
+#[path = "manager/document_close.rs"]
+mod document_close;
 #[path = "manager/document_pull_lifetime.rs"]
 mod document_pull_lifetime;
 mod memory;
@@ -593,7 +595,7 @@ pub(crate) struct DocumentPull {
     previous_report: Option<DiagnosticEntry>,
     /// The pull itself opened the document in this server (it was not open
     /// for an edit or an earlier query).
-    opened_for_pull: bool,
+    opened_for_pull: Option<(ServerInstanceId, i32)>,
     state: DocumentPullState,
 }
 
@@ -678,15 +680,23 @@ fn pull_file_diagnostics_unlocked_inner<G>(
 where
     G: std::ops::DerefMut<Target = LspManager>,
 {
+    let file_path = &canonicalize_for_lsp(file_path)?;
     let deadline = timeout.map(|timeout| Instant::now() + timeout);
     // Start any missing server without the lock; the pulls below then only
     // open the document and send the requests under it.
     let mut pulls = None;
     for _ in 0..FILE_SERVER_RESTART_ATTEMPTS {
-        let opened = ensure_file_open_unlocked(&lock, file_path, config)?;
+        let outcomes = ensure_server_for_file_detailed_unlocked(&lock, file_path, config);
+        if outcomes
+            .attempts
+            .iter()
+            .any(|attempt| matches!(attempt.result, ServerAttemptResult::InProgress { .. }))
+        {
+            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
+        }
         let mut manager = lock();
-        if opened
-            .server_keys
+        if outcomes
+            .successful
             .iter()
             .any(|key| !manager.clients.contains_key(key))
         {
@@ -885,7 +895,7 @@ pub struct PullFileResult {
     /// [`LspManager::close_documents_opened_for_pulls`]), so documents
     /// nobody edits do not stay open in the server for the rest of the
     /// session.
-    pub opened_for_pull: bool,
+    opened_for_pull: Option<(ServerInstanceId, i32)>,
 }
 
 /// Result of `pull_workspace_diagnostics` for a single server.
@@ -3786,64 +3796,6 @@ impl LspManager {
         self.close_file_for_servers(&canonical_path, &keys)
     }
 
-    /// Close a document only in the specified servers.
-    ///
-    /// Scoped inspection uses this to release documents it opened without
-    /// disturbing pre-existing editor documents in other server stores.
-    pub(crate) fn close_file_for_servers(
-        &mut self,
-        file_path: &Path,
-        server_keys: &[ServerKey],
-    ) -> Result<(), LspError> {
-        let canonical_path = canonicalize_for_lsp(file_path)?;
-        let uri = uri_for_path(&canonical_path)?;
-        let mut first_error = None;
-
-        for key in server_keys {
-            let was_open = self
-                .documents
-                .get(key)
-                .is_some_and(|store| store.is_open(&canonical_path));
-            if !was_open {
-                continue;
-            }
-
-            if let Some(client) = self.clients.get_mut(key) {
-                if let Err(err) =
-                    client.send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
-                        text_document: TextDocumentIdentifier::new(uri.clone()),
-                    })
-                {
-                    let was_queued = matches!(err, LspError::Timeout(_));
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                    if !was_queued {
-                        // A pre-queue rejection leaves the server's document
-                        // open. Keep local state so a later retry sends didClose
-                        // rather than a duplicate didOpen.
-                        continue;
-                    }
-                }
-            }
-
-            if let Some(store) = self.documents.get_mut(key) {
-                store.close(&canonical_path);
-            }
-            self.diagnostics.clear_for_server_file(key, &canonical_path);
-            // This close clears the file's diagnostics, so the server's empty
-            // reply to it is stored, even if it might be the reply to an
-            // earlier scoped inspect close.
-            self.late_close_replies
-                .remove(&(key.clone(), canonical_path.clone()));
-        }
-
-        match first_error {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
-    }
-
     /// Open a document in the given running servers so they analyze it and
     /// publish its diagnostics. Unlike [`Self::ensure_file_open`] this never
     /// starts a server: a scoped inspect has already started exactly the
@@ -3909,91 +3861,6 @@ impl LspManager {
             opened.push(key);
         }
         Ok(opened)
-    }
-
-    /// Close documents a scoped inspect opened with
-    /// [`Self::open_document_for_servers`]. The diagnostics collected while
-    /// they were open stay in the store: they are the latest analysis of the
-    /// file. A later change makes them stale: an AFT edit marks a pulled
-    /// report stale when it sends the new text, the watcher marks every
-    /// report stale on an external edit inside the project, and the next
-    /// scoped inspect re-sends a document that changed on disk (see
-    /// [`Self::resync_drifted_document`]). The server's reply to the close is
-    /// ignored (see `inspect_closed_documents`).
-    pub(crate) fn close_inspect_documents(
-        &mut self,
-        file_path: &Path,
-        server_keys: &[ServerKey],
-    ) -> Result<(), LspError> {
-        let canonical_path = canonicalize_for_lsp(file_path)?;
-        let uri = uri_for_path(&canonical_path)?;
-        let mut first_error = None;
-        for key in server_keys {
-            let was_open = self
-                .documents
-                .get(key)
-                .is_some_and(|store| store.is_open(&canonical_path));
-            if !was_open {
-                continue;
-            }
-            if let Some(client) = self.clients.get_mut(key) {
-                match client.send_notification::<DidCloseTextDocument>(DidCloseTextDocumentParams {
-                    text_document: TextDocumentIdentifier::new(uri.clone()),
-                }) {
-                    Ok(()) => {
-                        self.note_inspect_closed_document(key, &canonical_path);
-                    }
-                    Err(err) => {
-                        if first_error.is_none() {
-                            first_error = Some(err);
-                        }
-                    }
-                }
-            }
-            if let Some(store) = self.documents.get_mut(key) {
-                store.close(&canonical_path);
-            }
-        }
-        match first_error {
-            Some(err) => Err(err),
-            None => Ok(()),
-        }
-    }
-
-    /// Close the documents a file pull opened only to ask about them (see
-    /// [`PullFileResult::opened_for_pull`]), keeping the diagnostics they
-    /// produced, as a scoped inspect does with
-    /// [`Self::close_inspect_documents`]. A document AFT edits stays open:
-    /// an edit opens it through `didOpen`/`didChange`, not through a pull.
-    /// A document reopened or edited since the pull is left open.
-    pub(crate) fn close_documents_opened_for_pulls(
-        &mut self,
-        file_path: &Path,
-        results: &[PullFileResult],
-    ) {
-        let keys: Vec<ServerKey> = results
-            .iter()
-            .filter(|result| result.opened_for_pull)
-            .map(|result| result.server_key.clone())
-            .filter(|key| {
-                // Still at the version the pull opened: no edit since.
-                canonicalize_for_lsp(file_path).is_ok_and(|canonical| {
-                    self.documents
-                        .get(key)
-                        .and_then(|store| store.version(&canonical))
-                        == Some(0)
-                })
-            })
-            .collect();
-        if keys.is_empty() {
-            return;
-        }
-        if let Err(error) = self.close_inspect_documents(file_path, &keys) {
-            crate::slog_warn!(
-                "closing {} after a diagnostics pull failed: {error}",
-                file_path.display()
-            );
-        }
     }
 
     /// Whether the running server answers `textDocument/diagnostic` requests.
@@ -5300,9 +5167,12 @@ impl LspManager {
             .server_keys
             .into_iter()
             .map(|key| {
-                let opened_for_pull = opened.newly_opened.contains(&key);
+                let newly_opened = opened.newly_opened.contains(&key);
+                let instance = self.clients.get(&key).map(|client| client.instance);
                 let mut pull = self.begin_open_document_pull(key, &canonical_path, &uri, deadline);
-                pull.opened_for_pull = opened_for_pull;
+                if newly_opened {
+                    pull.opened_for_pull = instance.zip(pull.document_version);
+                }
                 pull
             })
             .collect())
@@ -5354,7 +5224,7 @@ impl LspManager {
                 .map(|(_, entry)| entry.clone()),
             key,
             canonical_path,
-            opened_for_pull: false,
+            opened_for_pull: None,
             state: DocumentPullState::Done(PullFileOutcome::PullNotSupported),
         };
         if self.starting.contains_key(&pull.key) {

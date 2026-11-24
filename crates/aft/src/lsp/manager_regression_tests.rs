@@ -964,6 +964,138 @@ fn rejected_close_preserves_open_document_and_diagnostics() {
     assert!(manager.diagnostics.has_report_for_server_file(&key, &file));
 }
 
+fn lifecycle_fake_client(manager: &LspManager, key: &ServerKey) -> LspClient {
+    let mut client = LspClient::spawn_with_reclaim_root(
+        key.kind.clone(),
+        key.root.clone(),
+        &crate::fake_lsp_test_helper::fake_server_binary(),
+        &[],
+        &HashMap::from([("AFT_FAKE_LSP_DISABLE_PUSH".into(), "1".into())]),
+        LspEventSender::Managed {
+            sender: manager.event_tx.clone(),
+            instance: ServerInstanceId::next(),
+        },
+        manager.child_registry.clone(),
+        None,
+        false,
+    )
+    .unwrap();
+    client.initialize(&key.root, None).unwrap();
+    client
+}
+
+fn reject_fixture_writes(client: &mut LspClient, file: &Path) {
+    // Wait for the fake's hover reply before marking it unresponsive. Any
+    // earlier notification received after the mark would clear it.
+    client
+        .send_request::<lsp_types::request::HoverRequest>(idle_hover_params(file))
+        .unwrap();
+    client.mark_unresponsive_if_silent(client.received_message_count());
+}
+
+#[test]
+fn scoped_close_rejected_before_queue_keeps_the_open_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let file = root.join("index.ts");
+    std::fs::write(&file, "export const n = 1;\n").unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Biome,
+        root,
+    };
+    let mut manager = LspManager::new();
+    let client = lifecycle_fake_client(&manager, &key);
+    manager.clients.insert(key.clone(), client);
+    let keys = std::slice::from_ref(&key);
+    assert_eq!(
+        manager.open_document_for_servers(&file, keys).unwrap(),
+        keys
+    );
+    manager
+        .diagnostics
+        .publish(key.clone(), file.clone(), Vec::new());
+    reject_fixture_writes(manager.clients.get_mut(&key).unwrap(), &file);
+
+    assert!(matches!(
+        manager.close_inspect_documents(&file, keys),
+        Err(LspError::ServerNotReady(_))
+    ));
+    assert!(manager.documents[&key].is_open(&file));
+    assert!(manager
+        .open_document_for_servers(&file, keys)
+        .unwrap()
+        .is_empty());
+    assert!(manager.diagnostics.has_report_for_server_file(&key, &file));
+}
+
+#[test]
+fn per_file_pulls_close_temporary_documents_at_each_open_version() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Config::default()
+    };
+    let key = key(&root);
+    let manager = parking_lot::Mutex::new(LspManager::new());
+    manager.lock().override_binary(
+        ServerKind::Rust,
+        crate::fake_lsp_test_helper::fake_server_binary(),
+    );
+    std::fs::write(
+        root.join("Cargo.toml"),
+        "[package]\nname = 'temporary-pulls'\nversion = '0.0.0'\n",
+    )
+    .unwrap();
+    std::fs::create_dir(root.join("src")).unwrap();
+    for (name, initial_version) in [("lib.rs", 0), ("other.rs", 1)] {
+        let file = root.join("src").join(name);
+        std::fs::write(&file, "pub fn f() {}\n").unwrap();
+        let results =
+            pull_file_diagnostics_unlocked_inner(|| manager.lock(), &file, &config, None, false)
+                .unwrap();
+        let mut manager = manager.lock();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            manager.documents[&key].version(&file),
+            Some(initial_version)
+        );
+        manager.close_documents_opened_for_pulls(&file, &results);
+        assert!(
+            !manager.documents[&key].is_open(&file),
+            "{name} stayed open"
+        );
+    }
+
+    let file = root.join("src/edited.rs");
+    std::fs::write(&file, "pub fn f() {}\n").unwrap();
+    let pulls = manager
+        .lock()
+        .begin_file_pulls(&file, &config, None)
+        .unwrap();
+    let edited = "pub fn edited() {}\n";
+    std::fs::write(&file, edited).unwrap();
+    manager
+        .lock()
+        .notify_file_changed_for_server_keys(file.clone(), edited, vec![key.clone()])
+        .unwrap();
+    let replies = pulls
+        .into_iter()
+        .map(DocumentPull::wait)
+        .collect::<Vec<_>>();
+    let mut manager = manager.lock();
+    let results = replies
+        .into_iter()
+        .map(|pull| PullFileResult {
+            server_key: pull.key.clone(),
+            opened_for_pull: pull.opened_for_pull,
+            outcome: manager.finish_document_pull(pull),
+        })
+        .collect::<Vec<_>>();
+    manager.close_documents_opened_for_pulls(&file, &results);
+    assert_eq!(manager.documents[&key].version(&file), Some(3));
+}
+
 #[test]
 fn owned_pull_ingestion_reuses_diagnostic_and_result_id_allocations() {
     let tmp = tempfile::tempdir().unwrap();
