@@ -1,6 +1,8 @@
 //! Run on Linux with `cargo test -p agent-file-tools --lib -- measure_moved_rust_refresh
 //! --ignored --nocapture`. Set `AFT_TEST_MOVED_REPO` to a Git checkout of AFT to
 //! use as the source instead of this build's checkout.
+//! Set `AFT_TEST_MOVED_STOCK=parse` or `AFT_TEST_MOVED_STOCK=reuse` to run each
+//! side with the production refresh limits in its own process.
 
 use super::super::refresh_cost_measure::timed;
 use super::*;
@@ -67,14 +69,29 @@ fn measure_moved_rust_refresh() {
         PathBuf::from,
     );
     let temp = tempfile::tempdir().unwrap();
+    git(
+        temp.path(),
+        &[
+            "clone",
+            "--quiet",
+            "--shared",
+            repo.to_str().unwrap(),
+            "aft",
+        ],
+    );
+    let root = temp.path().join("aft");
+    let stock = match std::env::var("AFT_TEST_MOVED_STOCK").as_deref() {
+        Ok("parse") => Some(false),
+        Ok("reuse") => Some(true),
+        Err(std::env::VarError::NotPresent) => None,
+        _ => panic!("AFT_TEST_MOVED_STOCK must be 'parse' or 'reuse'"),
+    };
     let mut results = Vec::new();
-    for reuse in [false, true] {
+    for reuse in [false, true]
+        .into_iter()
+        .filter(|&reuse| stock.is_none_or(|s| s == reuse))
+    {
         let name = if reuse { "reuse" } else { "parse" };
-        git(
-            temp.path(),
-            &["clone", "--quiet", "--shared", repo.to_str().unwrap(), name],
-        );
-        let root = temp.path().join(name);
         let store = tempfile::tempdir().unwrap();
         let checkout = Checkout::bind(
             Arc::new(DataLayer::new(64 << 20, 8)),
@@ -100,11 +117,16 @@ fn measure_moved_rust_refresh() {
                 .sum::<usize>()
         };
         let before = parses();
-        let guard = RefreshMemory::start(checkout.family.dir());
-        // Moving a file also invalidates callers at other paths. Disable the
-        // affected-file limit so both runs time the incremental update, not
-        // a cold rebuild triggered by the number of callers to re-resolve.
-        *RECORD.lock().unwrap() = Some(Vec::new());
+        let guard = if stock.is_some() {
+            RefreshMemory::start(checkout.family.dir())
+        } else {
+            // Moving a file also invalidates callers at other paths. Disable
+            // the affected-file and memory limits so both runs can time the
+            // incremental update without falling back to a cold rebuild.
+            *RECORD.lock().unwrap() = Some(Vec::new());
+            RefreshMemory::simulated(u64::MAX, |_, _| None)
+        };
+        eprintln!("MEASURE {name}: refreshing 500 moved Rust files");
         let (result, timing) = timed(|| {
             checkout.refresh_inner(false, &guard, || {
                 if reuse {
@@ -117,19 +139,27 @@ fn measure_moved_rust_refresh() {
         let _ = RECORD.lock().unwrap().take();
         let stats = result.unwrap().unwrap();
         let extractions = parses() - before;
+        let counts = checkout.refresh_counts();
         eprintln!(
-            "MEASURE {name}: {timing} moved={} changed={} parsed_before={} grammar_extractions={extractions} cold_rebuild={}",
-            paths.len() / 2, stats.changed_paths, report.parsed_files, stats.cold_build
+            "MEASURE {name} stock={}: {timing} moved={} paths={} parsed_before={} grammar_extractions={extractions} cold_rebuild={} memory_fallbacks={} budget_fallbacks={}",
+            stock.is_some(), paths.len() / 2, paths.len(), report.parsed_files,
+            stats.cold_build, counts.guard_fallbacks, counts.precheck_fallbacks,
         );
-        assert!(!stats.cold_build);
-        assert_eq!(stats.changed_paths, paths.len());
-        assert_eq!(extractions, if reuse { 0 } else { paths.len() / 2 });
-        checkout.publish_changes().unwrap().unwrap();
-        results.push(delta_sections(&checkout));
+        if stock.is_none() {
+            assert!(!stats.cold_build);
+            assert_eq!(stats.changed_paths, paths.len());
+            assert_eq!(extractions, if reuse { 0 } else { paths.len() / 2 });
+            checkout.publish_changes().unwrap().unwrap();
+            results.push(delta_sections(&checkout));
+            drop(checkout);
+            git(&root, &["reset", "--hard", "HEAD"]);
+        }
     }
-    assert_eq!(results[0], results[1], "publication section bytes changed");
-    eprintln!(
-        "MEASURE identical publication: {} content/graph sections",
-        results[0].len()
-    );
+    if stock.is_none() {
+        assert_eq!(results[0], results[1], "publication section bytes changed");
+        eprintln!(
+            "MEASURE identical publication: {} content/graph sections",
+            results[0].len()
+        );
+    }
 }
