@@ -394,7 +394,7 @@ fn start_project_watcher_with<W, E, F>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
 {
@@ -412,7 +412,7 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
     S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,
@@ -445,7 +445,7 @@ fn start_project_watcher_with_spawn<W, E, F, S>(
                 let attach_with_start =
                     move |root: PathBuf,
                           extra_watch_paths: Vec<PathBuf>,
-                          tx: mpsc::Sender<notify::Result<notify::Event>>| {
+                          tx: crate::watcher_filter::RawEventSender| {
                         let result = attach(root, extra_watch_paths, tx);
                         if let Some(start_tx) = start_tx {
                             let _ = start_tx.send(
@@ -506,7 +506,7 @@ fn install_project_watcher_with<W, E, F>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
 {
@@ -8769,7 +8769,7 @@ mod tests {
         struct FakeBackend {
             stop: Arc<AtomicBool>,
             join: Option<std::thread::JoinHandle<()>>,
-            _tx: mpsc::Sender<notify::Result<notify::Event>>,
+            _tx: crate::watcher_filter::RawEventSender,
         }
         impl Drop for FakeBackend {
             fn drop(&mut self) {
@@ -8970,7 +8970,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         struct FakeWatcher {
-            _tx: mpsc::Sender<notify::Result<notify::Event>>,
+            _tx: crate::watcher_filter::RawEventSender,
             drops: Arc<std::sync::atomic::AtomicUsize>,
         }
 

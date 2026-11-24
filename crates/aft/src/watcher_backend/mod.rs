@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::sync::{mpsc, Arc};
+use std::sync::Arc;
 
 use crate::watcher_filter::SharedGitignore;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -156,11 +156,13 @@ impl ProjectWatcher {
     fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
-        tx: mpsc::Sender<notify::Result<notify::Event>>,
+        tx: crate::watcher_filter::RawEventSender,
     ) -> notify::Result<Self> {
         use notify::{RecursiveMode, Watcher};
 
-        let mut watcher = notify::recommended_watcher(tx)?;
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = tx.send(event);
+        })?;
         watcher.watch(&root, RecursiveMode::Recursive)?;
         for path in extra_watch_paths {
             if path.exists() {
@@ -174,10 +176,11 @@ impl ProjectWatcher {
 pub(crate) fn create_project_watcher(
     root: PathBuf,
     extra_watch_paths: Vec<PathBuf>,
-    tx: mpsc::Sender<notify::Result<notify::Event>>,
+    tx: impl Into<crate::watcher_filter::RawEventSender>,
     matcher: SharedGitignore,
     matcher_generation: Arc<AtomicU64>,
 ) -> notify::Result<ProjectWatcher> {
+    let tx = tx.into();
     #[cfg(target_os = "macos")]
     {
         return ProjectWatcher::create(root, extra_watch_paths, tx, matcher, matcher_generation);

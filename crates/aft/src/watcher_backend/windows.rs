@@ -108,10 +108,11 @@ impl ProjectWatcher {
     pub(crate) fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
-        tx: mpsc::Sender<notify::Result<Event>>,
+        tx: impl Into<crate::watcher_filter::RawEventSender>,
         _matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
+        let tx = tx.into();
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         // The handle setup belongs to the matcher state visible at this point.
         // Capture it before spawning: a bump before the backend's first
@@ -139,11 +140,12 @@ impl ProjectWatcher {
         root: PathBuf,
         targets: Vec<WatchTarget>,
         buffer_size: usize,
-        tx: mpsc::Sender<notify::Result<Event>>,
+        tx: impl Into<crate::watcher_filter::RawEventSender>,
         matcher_generation: Arc<AtomicU64>,
         observed_generation: u64,
         counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> notify::Result<Self> {
+        let tx = tx.into();
         let completion_port = CompletionPort::create()?;
         let thread_port = Arc::clone(&completion_port);
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -239,17 +241,17 @@ impl Drop for ProjectWatcher {
 /// watch's own open handle: the loop cancels and drains every pending read
 /// before any handle is closed.
 pub(crate) struct DirectoryWatcher {
-    sender: mpsc::Sender<notify::Result<Event>>,
+    sender: crate::watcher_filter::RawEventSender,
     watcher: Option<ProjectWatcher>,
 }
 
 impl DirectoryWatcher {
     pub(crate) fn new(
-        sender: mpsc::Sender<notify::Result<Event>>,
+        sender: impl Into<crate::watcher_filter::RawEventSender>,
         _counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     ) -> Self {
         Self {
-            sender,
+            sender: sender.into(),
             watcher: None,
         }
     }
@@ -413,7 +415,7 @@ fn run_completion_loop(
     root: PathBuf,
     targets: Vec<WatchTarget>,
     buffer_size: usize,
-    tx: mpsc::Sender<notify::Result<Event>>,
+    tx: crate::watcher_filter::RawEventSender,
     shutdown: Arc<AtomicBool>,
     matcher_generation: Arc<AtomicU64>,
     mut observed_generation: u64,

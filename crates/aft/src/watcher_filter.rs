@@ -13,6 +13,11 @@ use ignore::gitignore::Gitignore;
 
 pub mod config_events;
 mod directory_arrival;
+pub mod raw_inbox;
+
+pub use raw_inbox::{
+    raw_event_channel, RawEventReceiver, RawEventSender, RawInboxWaker, RAW_INBOX_CAPACITY,
+};
 
 pub type SharedGitignore = Arc<RwLock<Option<Arc<Gitignore>>>>;
 
@@ -46,7 +51,6 @@ const WATCHER_DROPPED_CANDIDATE_LOG_LIMIT: usize = 3;
 // 0.2 per second per root. With a draining dispatch receiver, RootDeleted is
 // dispatched within five seconds plus scheduling latency, even with no events.
 const ROOT_DELETED_CHECK_INTERVAL: Duration = Duration::from_secs(5);
-const WATCHER_SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const GITIGNORE_REBUILD_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DISPATCH_SEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// How often the watcher thread retries handing held events to a dispatch
@@ -207,6 +211,7 @@ impl WatcherThreadHandle {
 
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::SeqCst);
+        wake_for_shutdown(&self.shutdown);
     }
 
     pub fn is_finished(&self) -> bool {
@@ -2281,6 +2286,54 @@ where
     filter_canonical_paths(config, matcher, raw_paths)
 }
 
+type ShutdownWakers = std::collections::HashMap<usize, RawInboxWaker>;
+
+/// The inbox waker of each running filter thread, keyed by the address of its
+/// shutdown flag, so [`WatcherThreadHandle::request_shutdown`] can wake the
+/// thread instead of the thread polling the flag.
+fn shutdown_wakers() -> &'static Mutex<ShutdownWakers> {
+    static WAKERS: std::sync::OnceLock<Mutex<ShutdownWakers>> = std::sync::OnceLock::new();
+    WAKERS.get_or_init(Mutex::default)
+}
+
+/// Removes a filter thread's waker when the thread ends. It holds the flag so
+/// the flag's address, the key, cannot be reused meanwhile.
+struct ShutdownWakerRegistration(Arc<AtomicBool>);
+
+impl Drop for ShutdownWakerRegistration {
+    fn drop(&mut self) {
+        shutdown_wakers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(Arc::as_ptr(&self.0) as usize));
+    }
+}
+
+/// Registered before the filter loop first reads the flag: a shutdown
+/// requested before registration is seen by that read, and one requested
+/// after it finds the waker.
+fn register_shutdown_waker(
+    shutdown: &Arc<AtomicBool>,
+    waker: RawInboxWaker,
+) -> ShutdownWakerRegistration {
+    shutdown_wakers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(Arc::as_ptr(shutdown) as usize, waker);
+    ShutdownWakerRegistration(Arc::clone(shutdown))
+}
+
+fn wake_for_shutdown(shutdown: &Arc<AtomicBool>) {
+    let waker = shutdown_wakers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(Arc::as_ptr(shutdown) as usize))
+        .cloned();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
 pub fn run_watcher_thread<W, E, F>(
     config: WatcherFilterConfig,
     extra_watch_paths: Vec<PathBuf>,
@@ -2292,9 +2345,10 @@ pub fn run_watcher_thread<W, E, F>(
 ) where
     W: Send + 'static,
     E: std::fmt::Display,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>,
+    F: FnOnce(PathBuf, Vec<PathBuf>, RawEventSender) -> Result<W, E>,
 {
-    let (raw_tx, raw_rx) = mpsc::channel();
+    let (raw_tx, raw_rx) = raw_event_channel();
+    let _waker = register_shutdown_waker(&shutdown, raw_rx.waker());
     let root_path = config.project_root.clone();
     #[cfg(feature = "test-timing-hooks")]
     if hold_watcher_attach_for_test(&shutdown) {
@@ -2346,6 +2400,9 @@ struct WatcherFilterThread {
     overflow_burst: Option<(RescanReason, u64, Instant, Instant, bool)>,
     #[cfg(test)]
     delay_before_rescan_for_test: Duration,
+    /// Waits that ended without an event (timeouts and wakes).
+    #[cfg(test)]
+    idle_wakeups_for_test: Arc<AtomicU64>,
 }
 
 /// What happened to an event handed to the dispatch channel.
@@ -2383,15 +2440,17 @@ impl WatcherFilterThread {
             overflow_burst: None,
             #[cfg(test)]
             delay_before_rescan_for_test: Duration::ZERO,
+            #[cfg(test)]
+            idle_wakeups_for_test: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    fn run(&mut self, raw_rx: mpsc::Receiver<notify::Result<notify::Event>>) {
+    fn run(&mut self, raw_rx: RawEventReceiver) {
         self.run_until_stopped(raw_rx);
         self.flush_overflow_summary();
     }
 
-    fn run_until_stopped(&mut self, raw_rx: mpsc::Receiver<notify::Result<notify::Event>>) {
+    fn run_until_stopped(&mut self, raw_rx: RawEventReceiver) {
         loop {
             if self.overflow_burst.as_ref().is_some_and(|burst| {
                 burst.3.elapsed() >= WATCHER_OVERFLOW_QUIET_INTERVAL
@@ -2416,7 +2475,21 @@ impl WatcherFilterThread {
                 continue;
             }
 
-            match raw_rx.recv_timeout(self.next_recv_timeout()) {
+            // A full inbox dropped events. Like an operating-system queue
+            // overflow, that is handled as a rescan request.
+            let received = if raw_rx.take_overflow() {
+                Ok(Ok(notify::Event::new(notify::EventKind::Other)
+                    .set_flag(notify::event::Flag::Rescan)
+                    .set_info(raw_inbox::RAW_INBOX_OVERFLOW_INFO)))
+            } else {
+                raw_rx.recv_timeout(self.next_recv_timeout())
+            };
+            #[cfg(test)]
+            if matches!(received, Err(mpsc::RecvTimeoutError::Timeout)) {
+                self.idle_wakeups_for_test
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            match received {
                 Ok(Ok(mut event)) => {
                     #[cfg(feature = "test-timing-hooks")]
                     hold_watcher_intake_for_test(&self.shutdown);
@@ -2879,13 +2952,12 @@ impl WatcherFilterThread {
 
     fn next_recv_timeout(&self) -> Duration {
         // Wake in time to flush a pending overflow summary, and sooner while
-        // dispatch-backlogged events are waiting for room.
-        // Shutdown only sets an atomic flag, so preserve its 250 ms response
-        // independently of the much slower root-existence probes.
+        // dispatch-backlogged events are waiting for room. An idle thread
+        // sleeps until its next root-existence probe; a shutdown request
+        // wakes it through its inbox.
         let root_timeout = self
             .next_root_check
-            .saturating_duration_since(Instant::now())
-            .min(WATCHER_SHUTDOWN_POLL_INTERVAL);
+            .saturating_duration_since(Instant::now());
         let mut timeout = self.overflow_burst.as_ref().map_or(root_timeout, |burst| {
             (burst.3 + WATCHER_OVERFLOW_QUIET_INTERVAL)
                 .min(burst.2 + WATCHER_OVERFLOW_MAX_INTERVAL)
@@ -3324,7 +3396,7 @@ mod tests {
         let config = WatcherFilterConfig::new(root.clone(), None);
         let counters = Arc::clone(&config.counters);
         let (tx, rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut filter = WatcherFilterThread::new(
             config,
@@ -3411,7 +3483,7 @@ mod tests {
         builder.add_line(None, ".aft-cookie-*").unwrap();
         let matcher = Arc::new(RwLock::new(Some(Arc::new(builder.build().unwrap()))));
         let (tx, rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut filter = WatcherFilterThread::new(
             WatcherFilterConfig::new(root.clone(), None),
@@ -3576,7 +3648,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let (tx, _rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let mut filter = WatcherFilterThread::new(
             WatcherFilterConfig::new(root.clone(), None),
             Arc::new(RwLock::new(None)),
@@ -3607,7 +3679,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let (tx, _rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(root.clone(), None);
         let counters = config.counters.clone();
         let mut filter = WatcherFilterThread::new(
@@ -3639,7 +3711,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().canonicalize().unwrap();
         let (tx, _rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let mut filter = WatcherFilterThread::new(
             WatcherFilterConfig::new(root.clone(), None),
             Arc::new(RwLock::new(None)),
@@ -3695,7 +3767,7 @@ mod tests {
                 "",
             ] {
                 let (tx, _rx) = watcher_dispatch_channel();
-                let (raw_tx, raw_rx) = mpsc::channel();
+                let (raw_tx, raw_rx) = raw_event_channel();
                 let config = WatcherFilterConfig::new(root.clone(), None);
                 let counters = config.counters.clone();
                 let mut filter = WatcherFilterThread::new(
@@ -4071,7 +4143,7 @@ mod tests {
         let (mut filter, _rx, shutdown) = filter_with_full_dispatch_channel(&root);
         let counters = Arc::clone(&filter.config.counters);
         let raw_before = counters.snapshot().raw_events_total;
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let handle = thread::spawn(move || {
             let cpu_start = thread_cpu_time();
             filter.run(raw_rx);
@@ -4268,7 +4340,7 @@ mod tests {
     fn idle_watcher_root_probes_are_at_most_once_per_five_seconds() {
         let root = TempDir::new().unwrap();
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut filter = WatcherFilterThread::new(
@@ -4305,7 +4377,7 @@ mod tests {
     fn root_deleted_without_events_is_detected_within_five_seconds() {
         let root = TempDir::new().unwrap();
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut filter = WatcherFilterThread::new(
@@ -4346,7 +4418,7 @@ mod tests {
         ] {
             let root = TempDir::new().unwrap();
             let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-            let (raw_tx, raw_rx) = mpsc::channel();
+            let (raw_tx, raw_rx) = raw_event_channel();
             let shutdown = Arc::new(AtomicBool::new(false));
             let mut filter = WatcherFilterThread::new(
                 WatcherFilterConfig::new(root.path().to_path_buf(), None),
@@ -4373,7 +4445,7 @@ mod tests {
         for send_error in [false, true] {
             let root = TempDir::new().unwrap();
             let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-            let (raw_tx, raw_rx) = mpsc::channel();
+            let (raw_tx, raw_rx) = raw_event_channel();
             let mut filter = WatcherFilterThread::new(
                 WatcherFilterConfig::new(root.path().to_path_buf(), None),
                 Arc::new(RwLock::new(None)),
@@ -5484,7 +5556,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(4));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(canonical_root.clone(), None);
         let mut filter = WatcherFilterThread::new(
             config,
@@ -6145,7 +6217,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(1));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(canonical_root.clone(), None);
         let mut filter = WatcherFilterThread::new(
             config,
@@ -6277,7 +6349,7 @@ mod tests {
         assert!(burst_len > 0 && burst_len <= WATCHER_ATTRIBUTION_RING_CAPACITY);
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let mut filter = WatcherFilterThread::new(
             WatcherFilterConfig::new(root.to_path_buf(), None),
             Arc::clone(matcher),
@@ -7012,7 +7084,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(root, None);
         let counters = Arc::clone(&config.counters);
         let mut filter = WatcherFilterThread::new(
@@ -7089,7 +7161,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let mut filter = WatcherFilterThread::new(
             config,
             matcher,
@@ -7143,7 +7215,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(7));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = crossbeam_channel::bounded(1);
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(root.clone(), None);
         config.counters.set_backend_exclusions(
             7,
@@ -7224,7 +7296,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(root, None);
         let counters = Arc::clone(&config.counters);
         let mut filter = WatcherFilterThread::new(
@@ -7409,7 +7481,7 @@ mod tests {
         let generation = Arc::new(AtomicU64::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
-        let (raw_tx, raw_rx) = mpsc::channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
         let config = WatcherFilterConfig::new(root.clone(), None);
         let mut filter = WatcherFilterThread::new(
             config,
@@ -7428,5 +7500,174 @@ mod tests {
         assert_eq!(event, WatcherDispatchEvent::RootDeleted);
         shutdown.store(true, Ordering::SeqCst);
         handle.join().unwrap();
+    }
+
+    /// An idle filter thread sleeps until its next root-existence probe; it
+    /// does not wake on a short timer to look for a shutdown request.
+    #[test]
+    fn an_idle_filter_waits_for_its_root_check() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (tx, _rx) = watcher_dispatch_channel();
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root, None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::new(AtomicBool::new(false)),
+        );
+        filter.next_root_check = Instant::now() + ROOT_DELETED_CHECK_INTERVAL;
+        let timeout = filter.next_recv_timeout();
+        assert!(
+            timeout > ROOT_DELETED_CHECK_INTERVAL / 2,
+            "an idle filter wakes after {timeout:?}"
+        );
+    }
+
+    /// Counts an idle filter thread's wakeups over two seconds. A measurement
+    /// for reports, not a gate: run it with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "idle wakeup measurement"]
+    fn measure_idle_filter_wakeups() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (tx, _rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = raw_event_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root, None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            tx,
+            Arc::clone(&shutdown),
+        );
+        let wakeups = Arc::clone(&filter.idle_wakeups_for_test);
+        let handle = thread::spawn(move || filter.run(raw_rx));
+        thread::sleep(Duration::from_secs(2));
+        eprintln!(
+            "idle filter wakeups in 2 s: {}",
+            wakeups.load(Ordering::Relaxed)
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+    }
+
+    /// A shutdown request wakes the filter thread through its inbox, without
+    /// the wake counting as an event sender.
+    #[test]
+    fn a_shutdown_request_wakes_the_waiting_filter() {
+        let (raw_tx, raw_rx) = raw_event_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let _registration = register_shutdown_waker(&shutdown, raw_rx.waker());
+        let join = thread::spawn(|| ());
+        let handle = WatcherThreadHandle::new(Arc::clone(&shutdown), join);
+        handle.request_shutdown();
+        let started = Instant::now();
+        // Bounded only so a broken wake fails instead of hanging.
+        assert_eq!(
+            raw_rx.recv_timeout(Duration::from_secs(60)).unwrap_err(),
+            mpsc::RecvTimeoutError::Timeout
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the shutdown request did not wake the inbox"
+        );
+        assert!(shutdown.load(Ordering::SeqCst));
+        drop(raw_tx);
+        assert_eq!(
+            raw_rx.recv_timeout(Duration::from_secs(60)).unwrap_err(),
+            mpsc::RecvTimeoutError::Disconnected,
+            "the registered waker must not keep the inbox connected"
+        );
+    }
+
+    /// A backend whose sender goes away on its own, while the filter thread
+    /// is still wanted, is reported as a watcher error.
+    #[test]
+    fn a_backend_that_dies_alone_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let filter_shutdown = Arc::clone(&shutdown);
+        let filter = thread::spawn(move || {
+            run_watcher_thread(
+                WatcherFilterConfig::new(root, None),
+                Vec::new(),
+                Arc::new(RwLock::new(None)),
+                Arc::new(AtomicU64::new(0)),
+                dispatch_tx,
+                filter_shutdown,
+                // The backend thread exits at once and drops its sender.
+                move |_root, _extra, raw_tx| {
+                    thread::spawn(move || drop(raw_tx));
+                    Ok::<(), std::io::Error>(())
+                },
+            );
+        });
+        let event = dispatch_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the filter reports the dead backend");
+        assert_eq!(
+            event,
+            WatcherDispatchEvent::Error("watcher channel disconnected".into())
+        );
+        filter.join().unwrap();
+        assert!(!shutdown.load(Ordering::SeqCst));
+    }
+
+    /// A full inbox drops further events without blocking the backend, and
+    /// the filter turns the drop into one rescan request.
+    #[test]
+    fn a_full_inbox_drops_events_and_requests_one_rescan() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let (dispatch_tx, dispatch_rx) = watcher_dispatch_channel();
+        let (raw_tx, raw_rx) = raw_inbox::raw_event_channel_with_capacity(4);
+        // The consumer has not started yet, as if it were busy.
+        for index in 0..6 {
+            std::fs::write(root.join(format!("file{index}.rs")), "").unwrap();
+            raw_tx
+                .send(Ok(notify::Event::new(notify::EventKind::Modify(
+                    notify::event::ModifyKind::Any,
+                ))
+                .add_path(root.join(format!("file{index}.rs")))))
+                .unwrap();
+        }
+        assert_eq!(raw_rx.len(), 4, "the inbox holds at most its capacity");
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut filter = WatcherFilterThread::new(
+            WatcherFilterConfig::new(root, None),
+            Arc::new(RwLock::new(None)),
+            Arc::new(AtomicU64::new(0)),
+            dispatch_tx,
+            Arc::clone(&shutdown),
+        );
+        let handle = thread::spawn(move || filter.run(raw_rx));
+        let first = dispatch_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the filter reports the dropped events");
+        assert_eq!(
+            first,
+            WatcherDispatchEvent::RescanRequired(RescanReason::UserDropped)
+        );
+        // The queued events still arrive after the rescan request.
+        let queued = dispatch_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the queued events are dispatched");
+        assert!(
+            matches!(queued, WatcherDispatchEvent::Paths(_)),
+            "{queued:?}"
+        );
+        shutdown.store(true, Ordering::SeqCst);
+        drop(raw_tx);
+        handle.join().unwrap();
+        assert!(
+            dispatch_rx
+                .try_iter()
+                .all(|event| !matches!(event, WatcherDispatchEvent::RescanRequired(_))),
+            "one overflow must request one rescan"
+        );
     }
 }

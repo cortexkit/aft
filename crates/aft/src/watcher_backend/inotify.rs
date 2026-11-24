@@ -38,7 +38,7 @@ impl ProjectWatcher {
     pub(crate) fn create(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
-        tx: mpsc::Sender<notify::Result<Event>>,
+        tx: impl Into<crate::watcher_filter::RawEventSender>,
         matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
     ) -> notify::Result<Self> {
@@ -55,7 +55,7 @@ impl ProjectWatcher {
     fn create_with_watch<F>(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
-        tx: mpsc::Sender<notify::Result<Event>>,
+        tx: impl Into<crate::watcher_filter::RawEventSender>,
         matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
         watch: F,
@@ -79,7 +79,7 @@ impl ProjectWatcher {
     fn create_with_plan<F, P>(
         root: PathBuf,
         extra_watch_paths: Vec<PathBuf>,
-        tx: mpsc::Sender<notify::Result<Event>>,
+        tx: impl Into<crate::watcher_filter::RawEventSender>,
         matcher: SharedGitignore,
         matcher_generation: Arc<AtomicU64>,
         mut watch: F,
@@ -96,6 +96,7 @@ impl ProjectWatcher {
             > + Send
             + 'static,
     {
+        let tx = tx.into();
         let root = std::fs::canonicalize(&root).unwrap_or(root);
         // The watch set below describes the matcher at this generation. Capture
         // it here, not on the backend thread: a bump between spawn and the
