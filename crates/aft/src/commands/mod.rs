@@ -44,6 +44,8 @@ pub mod edit_history;
 pub mod edit_match;
 pub mod edit_symbol;
 pub mod extract_function;
+#[cfg(all(test, unix))]
+mod fifo_mutation_tests;
 pub mod policy_environment;
 pub(crate) use crate::file_read_exact;
 pub(crate) mod github_comments;

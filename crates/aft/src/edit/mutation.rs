@@ -5,6 +5,29 @@ use crate::file_identity::FileIdentity;
 use parking_lot::{Condvar, Mutex};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    // The name can be replaced after the metadata check; use a nonblocking
+    // open and check the opened handle before consuming any bytes.
+    crate::bounded_io::open_content_file(path)
+}
+
+pub(crate) fn read_regular(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    open_regular(path)?.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+pub(crate) fn read_regular_text(path: &Path) -> std::io::Result<String> {
+    std::io::read_to_string(open_regular(path)?)
+}
 use std::sync::LazyLock;
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -111,7 +134,7 @@ pub(crate) struct Version {
 impl Version {
     pub(crate) fn read(path: &Path) -> Self {
         let mut version = Self::existing(path, std::sync::Arc::from([]));
-        match std::fs::read(path) {
+        match read_regular(path) {
             Ok(bytes) => {
                 version.bytes = Some(bytes.into());
                 version
@@ -162,8 +185,7 @@ impl Version {
                 && self.modified == metadata.and_then(|(metadata, _)| metadata.modified().ok())
                 && (self.stat.is_some()
                     || self.bytes.as_ref().is_none_or(|bytes| {
-                        std::fs::read(path)
-                            .is_ok_and(|current| current.as_slice() == bytes.as_ref())
+                        read_regular(path).is_ok_and(|current| current.as_slice() == bytes.as_ref())
                     }))
         } else {
             std::fs::symlink_metadata(path)

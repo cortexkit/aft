@@ -667,7 +667,7 @@ fn read_captured_content(path: &Path, metadata: &std::fs::Metadata) -> std::io::
         let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         *CAPTURE_READ_COUNTS.lock().unwrap().entry(key).or_default() += 1;
     }
-    std::fs::read(path)
+    crate::edit::mutation::read_regular(path)
 }
 
 #[cfg(test)]

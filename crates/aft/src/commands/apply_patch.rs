@@ -431,7 +431,7 @@ fn write_patched_file(
     let existed = path.exists();
     let original = if existed {
         Some(
-            fs::read_to_string(path)
+            edit::mutation::read_regular_text(path)
                 .map_err(|error| format!("failed to read pre-write content: {error}"))?,
         )
     } else {
@@ -484,7 +484,8 @@ fn write_patched_file(
         return Err("produced invalid syntax (rolled back)".to_string());
     }
 
-    let final_content = fs::read_to_string(path).unwrap_or_else(|_| content.to_string());
+    let final_content =
+        edit::mutation::read_regular_text(path).unwrap_or_else(|_| content.to_string());
     let change_type = if existed {
         FileChangeType::CHANGED
     } else {
@@ -537,7 +538,8 @@ fn delete_file_with_backup(
 }
 
 fn read_required(path: &Path, action: &str, patch_path: &str) -> Result<String, String> {
-    fs::read_to_string(path).map_err(|error| format!("Failed to {action} {patch_path}: {error}"))
+    edit::mutation::read_regular_text(path)
+        .map_err(|error| format!("Failed to {action} {patch_path}: {error}"))
 }
 
 fn preview_virtual_content(
@@ -697,7 +699,7 @@ fn created_file_syntax_checks(
     created
         .keys()
         .filter_map(|path| {
-            let content = fs::read_to_string(path).ok()?;
+            let content = edit::mutation::read_regular_text(path).ok()?;
             let check = edit::check_created_file_syntax(tool_policy, path, &content);
             Some((path.clone(), check))
         })
@@ -800,7 +802,7 @@ fn apply_delete(
         return Err("not a regular file".to_string());
     }
 
-    let before = fs::read_to_string(&resolved.source.abs)
+    let before = edit::mutation::read_regular_text(&resolved.source.abs)
         .map_err(|error| format!("failed to read before delete: {error}"))?;
     let deletions = line_count(&before);
     delete_file_with_backup(req, ctx, &resolved.source.abs, op_id, backed_paths)?;
@@ -832,7 +834,7 @@ fn apply_update(
     write_warnings: &mut Vec<String>,
     admission: &PatchAdmission,
 ) -> Result<AppliedHunkResult, String> {
-    let original = fs::read_to_string(&resolved.source.abs)
+    let original = edit::mutation::read_regular_text(&resolved.source.abs)
         .map_err(|error| format!("failed to read file: {error}"))?;
     let new_content = apply_update_chunks(&original, &path_string(&resolved.source.abs), chunks)?;
 
@@ -904,7 +906,7 @@ fn apply_move_update(
     }
     let dest_snapshot = if dest_existed {
         Some(
-            fs::read_to_string(&dest.abs)
+            edit::mutation::read_regular_text(&dest.abs)
                 .map_err(|error| format!("move: failed to read destination snapshot: {error}"))?,
         )
     } else {

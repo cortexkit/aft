@@ -1391,7 +1391,7 @@ pub(crate) fn read_edit_bytes(
         None => {
             #[cfg(test)]
             A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
-            (std::fs::read(path)?.into(), None)
+            (mutation::read_regular(path)?.into(), None)
         }
     };
     let version =
@@ -1467,7 +1467,7 @@ impl ObservedFinalText {
 pub(crate) fn read_edit_text(path: &Path) -> std::io::Result<String> {
     #[cfg(test)]
     A03_HANDLER_READS.with(|count| count.set(count.get() + 1));
-    std::fs::read_to_string(path)
+    mutation::read_regular_text(path)
 }
 
 /// Render a reference patch for size-limited GitHub comment bodies and tests.
