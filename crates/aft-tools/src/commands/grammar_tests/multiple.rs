@@ -9,7 +9,7 @@ fn grammar_registries_download_fail_and_retry_independently() {
     }
 
     let dir = tempfile::tempdir().unwrap();
-    let fixtures = crate::test_support::manifest_dir().join("tests/fixtures/grammars");
+    let fixtures = crate::test_support::manifest_dir().join("../aft/tests/fixtures/grammars");
     let mut manifest: Value =
         serde_json::from_slice(&std::fs::read(fixtures.join("manifest-a.json")).unwrap()).unwrap();
     let variant: Value =
@@ -84,7 +84,7 @@ fn check_registries(dir: &Path) {
     );
     assert_eq!(fake.status_snapshot().unwrap().retry_after_ms, Some(20_000));
 
-    let fixtures = crate::test_support::manifest_dir().join("tests/fixtures/grammars");
+    let fixtures = crate::test_support::manifest_dir().join("../aft/tests/fixtures/grammars");
     let cache = crate::root_cache::cache_root(&ctx.config());
     let supply_artifact = |language| {
         let entry = grammar::manifest(language).unwrap();
