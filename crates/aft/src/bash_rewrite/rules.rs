@@ -318,10 +318,13 @@ impl ParsedRewriteRule for HeadRule {
             .and_then(Value::as_str)
             .unwrap_or_default();
         let lines = params.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        if !effective_hashline_session(ctx, session_id)
-            || !path_is_safe(ctx, path, true)
-            || !head_tail_shape_is_faithful(ctx, path, lines, false)
-        {
+        // Cheap eligibility first: the file is read only when a rewrite could
+        // follow, and only once.
+        let faithful = effective_hashline_session(ctx, session_id)
+            && path_is_safe(ctx, path, true)
+            && head_tail_text(ctx, path)
+                .is_some_and(|text| head_tail_shape_is_faithful(&text, lines, false));
+        if !faithful {
             return decline(
                 "head",
                 "head.decline",
@@ -382,7 +385,18 @@ impl ParsedRewriteRule for TailRule {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if params.get("start_line").is_some() && !resolve_tail_start_range(ctx, &path, &mut params)
+        const REQUIREMENT: &str =
+            "tail requires an effective hashline session and a faithful text-read shape";
+        // Cheap eligibility first: the file is read only when a rewrite could
+        // follow, and only once.
+        if !effective_hashline_session(ctx, session_id) || !path_is_safe(ctx, &path, true) {
+            return decline("tail", "tail.decline", REQUIREMENT);
+        }
+        let text = head_tail_text(ctx, &path);
+        if params.get("start_line").is_some()
+            && !text
+                .as_deref()
+                .is_some_and(|text| resolve_tail_start_range(text, &mut params))
         {
             return decline(
                 "tail",
@@ -391,15 +405,11 @@ impl ParsedRewriteRule for TailRule {
             );
         }
         let lines = params.get("limit").and_then(Value::as_u64).unwrap_or(10) as usize;
-        if !effective_hashline_session(ctx, session_id)
-            || !path_is_safe(ctx, &path, true)
-            || !head_tail_shape_is_faithful(ctx, &path, lines, true)
+        if !text
+            .as_deref()
+            .is_some_and(|text| head_tail_shape_is_faithful(text, lines, true))
         {
-            return decline(
-                "tail",
-                "tail.decline",
-                "tail requires an effective hashline session and a faithful text-read shape",
-            );
+            return decline("tail", "tail.decline", REQUIREMENT);
         }
         accept(
             "tail",
@@ -896,33 +906,42 @@ fn effective_hashline_session(ctx: &AppContext, session_id: Option<&str>) -> boo
         .is_some_and(|binding| binding.effective())
 }
 
-fn head_tail_shape_is_faithful(ctx: &AppContext, path: &str, lines: usize, tail: bool) -> bool {
-    let root = grep_project_root(ctx);
-    let candidate = if Path::new(path).is_absolute() {
-        Path::new(path).to_path_buf()
-    } else {
-        root.join(path)
-    };
-    let Ok(metadata) = std::fs::metadata(&candidate) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
+/// Largest file a head/tail rewrite decision reads. Larger files stay with
+/// the native command, which reads only the lines it prints.
+const HEAD_TAIL_REWRITE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// The whole text of a regular UTF-8 file within the rewrite budget, read once
+/// per decision. The read itself stops past the budget, so a file that grows
+/// after its size check is not loaded in full.
+fn head_tail_text(ctx: &AppContext, path: &str) -> Option<String> {
+    use std::io::Read;
+
+    let candidate = path_candidate(ctx, path);
+    let metadata = std::fs::metadata(&candidate).ok()?;
+    if !metadata.is_file() || metadata.len() > HEAD_TAIL_REWRITE_MAX_BYTES {
+        return None;
     }
-    let Ok(bytes) = std::fs::read(candidate) else {
-        return false;
-    };
-    let Ok(text) = std::str::from_utf8(&bytes) else {
-        return false;
-    };
-    let records = text.lines().collect::<Vec<_>>();
-    let selected: Box<dyn Iterator<Item = &&str>> = if tail {
-        Box::new(records.iter().skip(records.len().saturating_sub(lines)))
+    record_head_tail_preflight_read();
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::fs::File::open(candidate)
+        .ok()?
+        .take(HEAD_TAIL_REWRITE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > HEAD_TAIL_REWRITE_MAX_BYTES {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn head_tail_shape_is_faithful(text: &str, lines: usize, tail: bool) -> bool {
+    let skip = if tail {
+        text.lines().count().saturating_sub(lines)
     } else {
-        Box::new(records.iter().take(lines))
+        0
     };
     let mut displayed_bytes = 0_usize;
-    for record in selected {
+    for record in text.lines().skip(skip).take(lines) {
         if record.len() > 2_000 {
             return false;
         }
@@ -937,18 +956,20 @@ fn head_tail_shape_is_faithful(ctx: &AppContext, path: &str, lines: usize, tail:
 }
 
 fn text_file_line_count(path: &Path) -> Option<usize> {
+    record_head_tail_preflight_read();
     let bytes = std::fs::read(path).ok()?;
     std::str::from_utf8(&bytes).ok()?;
-    if bytes.is_empty() {
-        return Some(0);
-    }
-    Some(
-        bytes.iter().filter(|byte| **byte == b'\n').count()
-            + usize::from(bytes.last() != Some(&b'\n')),
-    )
+    Some(text_line_count(&bytes))
 }
 
-fn resolve_tail_start_range(ctx: &AppContext, path: &str, params: &mut Value) -> bool {
+fn text_line_count(bytes: &[u8]) -> usize {
+    if bytes.is_empty() {
+        return 0;
+    }
+    bytes.iter().filter(|byte| **byte == b'\n').count() + usize::from(bytes.last() != Some(&b'\n'))
+}
+
+fn resolve_tail_start_range(text: &str, params: &mut Value) -> bool {
     let Some(requested_start) = params.get("start_line").and_then(Value::as_u64) else {
         return false;
     };
@@ -956,9 +977,7 @@ fn resolve_tail_start_range(ctx: &AppContext, path: &str, params: &mut Value) ->
         return false;
     };
     let start_line = requested_start.max(1);
-    let Some(total_lines) = text_file_line_count(&path_candidate(ctx, path)) else {
-        return false;
-    };
+    let total_lines = text_line_count(text.as_bytes());
     if total_lines == 0 || start_line > total_lines {
         return false;
     }
@@ -1439,6 +1458,27 @@ fn grep_request(command: &str, binary: &str) -> Option<Value> {
 }
 
 #[cfg(test)]
+thread_local! {
+    static HEAD_TAIL_PREFLIGHT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts whole-file reads made while deciding a head/tail rewrite.
+fn record_head_tail_preflight_read() {
+    #[cfg(test)]
+    HEAD_TAIL_PREFLIGHT_READS.with(|reads| reads.set(reads.get() + 1));
+}
+
+#[cfg(test)]
+fn reset_head_tail_preflight_reads() {
+    HEAD_TAIL_PREFLIGHT_READS.with(|reads| reads.set(0));
+}
+
+#[cfg(test)]
+fn head_tail_preflight_reads() -> usize {
+    HEAD_TAIL_PREFLIGHT_READS.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
 fn find_request(command: &str) -> Option<Value> {
     find_request_from_parsed(parse(command).as_ref())
 }
@@ -1770,5 +1810,67 @@ mod tests {
         let content = response.data["content"].as_str().unwrap();
         assert!(content.starts_with("[src/app.ts#"), "{content}");
         assert!(content.contains("3:three\n4:four\n"), "{content}");
+    }
+
+    /// Deciding a head/tail rewrite must not load a file larger than the
+    /// preflight budget, and a session that cannot rewrite reads nothing.
+    #[test]
+    fn head_tail_decisions_skip_whole_file_reads_they_cannot_use() {
+        let dir = fixture();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::write(root.join("src/app.ts"), "one\ntwo\nthree\nfour\n").unwrap();
+        // A sparse file: large on disk metadata, cheap to create.
+        let big = fs::File::create(root.join("src/big.log")).unwrap();
+        big.set_len(64 * 1024 * 1024).unwrap();
+        drop(big);
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.clone()),
+                experimental_bash_rewrite: true,
+                ..Default::default()
+            },
+        );
+
+        // No hashline session: tail -n +N declines before any read.
+        super::reset_head_tail_preflight_reads();
+        assert!(matches!(
+            TailRule.decide("tail -n +2 src/app.ts", "tail-off", None, &ctx),
+            RewriteDecision::Decline(_)
+        ));
+        assert_eq!(super::head_tail_preflight_reads(), 0);
+
+        ctx.hashline_bindings().register(
+            &root,
+            DEFAULT_SESSION_ID.to_string(),
+            RegistrationRequest {
+                configured_enabled: true,
+                edit_slot_survives: true,
+                read_slot_survives: true,
+            },
+        );
+        super::reset_head_tail_preflight_reads();
+        assert!(matches!(
+            HeadRule.decide("head -n 1 src/big.log", "big", None, &ctx),
+            RewriteDecision::Decline(_)
+        ));
+        for command in ["tail -n 1 src/big.log", "tail -n +2 src/big.log"] {
+            assert!(
+                matches!(
+                    TailRule.decide(command, "big", None, &ctx),
+                    RewriteDecision::Decline(_)
+                ),
+                "{command}"
+            );
+        }
+        assert_eq!(super::head_tail_preflight_reads(), 0);
+
+        // A small file is read once to decide, even for tail -n +N.
+        super::reset_head_tail_preflight_reads();
+        assert!(matches!(
+            TailRule.decide("tail -n +2 src/app.ts", "tail-on", None, &ctx),
+            RewriteDecision::Accept(_)
+        ));
+        assert_eq!(super::head_tail_preflight_reads(), 1);
     }
 }
