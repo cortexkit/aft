@@ -177,23 +177,9 @@ pub(crate) fn aggregate_cycle_contributions_with_limit(
     } else {
         CycleGraph::from_contributions(&parsed)
     };
-    let mut cycles = graph.cycles();
-    cycles.sort_by(|left, right| {
-        right
-            .files
-            .len()
-            .cmp(&left.files.len())
-            .then_with(|| left.files.cmp(&right.files))
-    });
-
-    let count = cycles.len();
-    let largest = cycles.first().map(|cycle| cycle.files.len()).unwrap_or(0);
+    let (count, largest, cycles) = graph.cycles(drill_down_limit.unwrap_or(usize::MAX));
     let limit = drill_down_limit.unwrap_or(usize::MAX);
-    let items = cycles
-        .iter()
-        .take(limit)
-        .map(CycleReport::to_value)
-        .collect::<Vec<_>>();
+    let items = cycles.iter().map(CycleReport::to_value).collect::<Vec<_>>();
     let (parse_errors, skipped_files) = honesty_fields(&parsed);
 
     let mut aggregate = json!({
@@ -520,8 +506,12 @@ impl CycleGraph {
         }
     }
 
-    fn cycles(&self) -> Vec<CycleReport> {
-        self.strongly_connected_components()
+    /// Every cycle's count and the largest size, with reports built only for
+    /// the first `limit` cycles (largest first, then by file list): a report
+    /// costs a graph search, and the rest would be cut anyway.
+    fn cycles(&self, limit: usize) -> (usize, usize, Vec<CycleReport>) {
+        let mut components = self
+            .strongly_connected_components()
             .into_iter()
             .filter(|component| {
                 component.len() >= 2
@@ -531,8 +521,16 @@ impl CycleGraph {
                             .is_some_and(|neighbors| neighbors.contains(node))
                     })
             })
+            .collect::<Vec<_>>();
+        components.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        let count = components.len();
+        let largest = components.first().map_or(0, Vec::len);
+        let reports = components
+            .into_iter()
+            .take(limit)
             .filter_map(|component| self.report_for_component(component))
-            .collect()
+            .collect();
+        (count, largest, reports)
     }
 
     fn strongly_connected_components(&self) -> Vec<Vec<String>> {
@@ -593,7 +591,12 @@ impl CycleGraph {
         }
     }
 
+    /// Report one shortest cycle through the component's first file. `files`
+    /// still names the whole component; the chain is the cycle an agent can
+    /// break, at most one hop per file, found with a single search.
     fn report_for_component(&self, files: Vec<String>) -> Option<CycleReport> {
+        #[cfg(test)]
+        REPORTS_BUILT.with(|built| built.set(built.get() + 1));
         if files.len() == 1 {
             let file = files.first()?.clone();
             let edge = self.edge_report(&file, &file);
@@ -606,22 +609,31 @@ impl CycleGraph {
             });
         }
 
-        let component_set = files.iter().cloned().collect::<BTreeSet<_>>();
-        let mut chain = vec![files.first()?.clone()];
-        let mut edges = Vec::new();
-
-        for target in files.iter().skip(1).chain(files.first()) {
-            let current = chain.last()?.clone();
-            let path = self.shortest_path_in_component(&current, target, &component_set)?;
-            for pair in path.windows(2) {
-                let from = pair[0].clone();
-                let to = pair[1].clone();
-                if chain.last() != Some(&to) {
-                    chain.push(to.clone());
-                }
-                edges.push(self.edge_report(&from, &to));
-            }
+        let component_set = files.iter().map(String::as_str).collect::<BTreeSet<_>>();
+        let start = files.first()?.as_str();
+        let distances = self.distances_in_component(start, &component_set);
+        // The shortest cycle through `start` closes on the in-component
+        // predecessor nearest to it; ties go to the first file name.
+        let closing = self
+            .reverse_adjacency
+            .get(start)?
+            .iter()
+            .filter(|from| from.as_str() != start)
+            .filter_map(|from| Some((distances.get(from.as_str())?.0, from.as_str())))
+            .min()?
+            .1;
+        let mut chain = vec![closing.to_string()];
+        let mut current = closing;
+        while current != start {
+            current = distances.get(current)?.1?;
+            chain.push(current.to_string());
         }
+        chain.reverse();
+        chain.push(start.to_string());
+        let edges = chain
+            .windows(2)
+            .map(|pair| self.edge_report(&pair[0], &pair[1]))
+            .collect::<Vec<_>>();
 
         let edge_kind = cycle_edge_kind(edges.iter().map(|edge| edge.edge_kind.as_str()));
         Some(CycleReport {
@@ -632,31 +644,27 @@ impl CycleGraph {
         })
     }
 
-    fn shortest_path_in_component(
-        &self,
-        start: &str,
-        target: &str,
-        component: &BTreeSet<String>,
-    ) -> Option<Vec<String>> {
-        if start == target {
-            return Some(vec![start.to_string()]);
-        }
-        let mut queue = VecDeque::from([start.to_string()]);
-        let mut seen = BTreeSet::from([start.to_string()]);
-        let mut previous = BTreeMap::<String, String>::new();
+    /// Breadth-first distances from `start` inside one component, with each
+    /// file's predecessor on a shortest path.
+    fn distances_in_component<'a>(
+        &'a self,
+        start: &'a str,
+        component: &BTreeSet<&str>,
+    ) -> BTreeMap<&'a str, (usize, Option<&'a str>)> {
+        let mut distances = BTreeMap::from([(start, (0, None))]);
+        let mut queue = VecDeque::from([start]);
         while let Some(node) = queue.pop_front() {
-            for neighbor in self.adjacency.get(&node).into_iter().flatten() {
-                if !component.contains(neighbor) || !seen.insert(neighbor.clone()) {
+            let distance = distances[node].0;
+            for neighbor in self.adjacency.get(node).into_iter().flatten() {
+                let neighbor = neighbor.as_str();
+                if !component.contains(neighbor) || distances.contains_key(neighbor) {
                     continue;
                 }
-                previous.insert(neighbor.clone(), node.clone());
-                if neighbor == target {
-                    return Some(reconstruct_path(start, target, &previous));
-                }
-                queue.push_back(neighbor.clone());
+                distances.insert(neighbor, (distance + 1, Some(node)));
+                queue.push_back(neighbor);
             }
         }
-        None
+        distances
     }
 
     fn edge_report(&self, from: &str, to: &str) -> CycleEdgeReport {
@@ -675,18 +683,9 @@ impl CycleGraph {
     }
 }
 
-fn reconstruct_path(start: &str, target: &str, previous: &BTreeMap<String, String>) -> Vec<String> {
-    let mut path = vec![target.to_string()];
-    let mut current = target;
-    while current != start {
-        let Some(prior) = previous.get(current) else {
-            break;
-        };
-        path.push(prior.clone());
-        current = prior;
-    }
-    path.reverse();
-    path
+#[cfg(test)]
+thread_local! {
+    static REPORTS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn edge_rank(edge_kind: &str) -> u8 {
@@ -863,6 +862,73 @@ mod tests {
         let mut components = graph.strongly_connected_components();
         components.sort();
         assert_eq!(components, vec![vec!["a"], vec!["b"], vec!["c", "d"]]);
-        assert_eq!(graph.cycles().len(), 1);
+        assert_eq!(graph.cycles(usize::MAX).2.len(), 1);
+    }
+
+    fn import(graph: &mut CycleGraph, from: &str, to: &str) {
+        graph.add_edge(
+            from,
+            CycleEdgeContribution {
+                to: to.to_string(),
+                specifier: format!("./{to}"),
+                kind: "import".to_string(),
+                line: 1,
+                edge_kind: "static".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn cycle_report_is_one_shortest_cycle_through_the_first_file() {
+        // A barrel: index imports every file and each imports it back.
+        let mut barrel = CycleGraph::default();
+        for index in 0..3_000 {
+            let file = format!("m{index:04}.ts");
+            import(&mut barrel, "index.ts", &file);
+            import(&mut barrel, &file, "index.ts");
+        }
+        let (count, largest, reports) = barrel.cycles(usize::MAX);
+        assert_eq!((count, largest), (1, 3_001));
+        assert_eq!(reports[0].files.len(), 3_001);
+        assert_eq!(reports[0].chain, vec!["index.ts", "m0000.ts", "index.ts"]);
+        assert_eq!(reports[0].edges.len(), 2);
+
+        // A ring whose file names are out of import order: the old tour
+        // walked between alphabetically adjacent files and grew quadratically.
+        let n = 800;
+        let name = |index: usize| format!("r{:04}.ts", (index * 337) % n);
+        let mut ring = CycleGraph::default();
+        for index in 0..n {
+            import(&mut ring, &name(index), &name(index + 1));
+        }
+        let (_, largest, reports) = ring.cycles(usize::MAX);
+        assert_eq!(largest, n);
+        let report = &reports[0];
+        assert_eq!(report.chain.len(), n + 1);
+        assert_eq!(report.edges.len(), n);
+        assert_eq!(report.chain.first(), report.chain.last());
+        for (edge, pair) in report.edges.iter().zip(report.chain.windows(2)) {
+            assert_eq!((&edge.from, &edge.to), (&pair[0], &pair[1]));
+            assert_eq!(edge.imports.len(), 1, "every hop is a real import");
+        }
+    }
+
+    #[test]
+    fn cycle_reports_are_built_only_for_the_reported_cycles() {
+        let mut graph = CycleGraph::default();
+        for index in 0..5 {
+            let (a, b) = (format!("a{index}.ts"), format!("b{index}.ts"));
+            import(&mut graph, &a, &b);
+            import(&mut graph, &b, &a);
+        }
+        import(&mut graph, "c0.ts", "c1.ts");
+        import(&mut graph, "c1.ts", "c2.ts");
+        import(&mut graph, "c2.ts", "c0.ts");
+        REPORTS_BUILT.with(|built| built.set(0));
+        let (count, largest, reports) = graph.cycles(2);
+        assert_eq!(REPORTS_BUILT.with(std::cell::Cell::get), 2);
+        assert_eq!((count, largest), (6, 3));
+        assert_eq!(reports[0].files, vec!["c0.ts", "c1.ts", "c2.ts"]);
+        assert_eq!(reports[1].files, vec!["a0.ts", "b0.ts"]);
     }
 }
