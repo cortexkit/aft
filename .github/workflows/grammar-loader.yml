@@ -114,7 +114,13 @@ jobs:
         run: |
           args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-tools --lib -- grammar_)
           listing="$(cargo test "${args[@]}" --list)"
-          [[ "$listing" == *"commands::grammar_tests::luau_s4_round4_non_luau_failures_preserve_main_search_contract: test"* ]] || { echo 'missing aft-tools grammar loader tests' >&2; exit 1; }
+          if [[ "${{ matrix.os }}" == windows-11-arm ]]; then
+            # Downloaded grammars don't run on Windows ARM, so aft-tools leaves out
+            # its grammar command tests there; the engine's loader tests still run.
+            [[ "$listing" == *"grammar_state_messages_are_pinned: test"* ]] || { echo 'missing aft-engine grammar loader tests' >&2; exit 1; }
+          else
+            [[ "$listing" == *"commands::grammar_tests::luau_s4_round4_non_luau_failures_preserve_main_search_contract: test"* ]] || { echo 'missing aft-tools grammar loader tests' >&2; exit 1; }
+          fi
           cargo test "${args[@]}"
       - name: Process restart and concurrent publication
         run: |
