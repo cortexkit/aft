@@ -8,6 +8,40 @@ mod audit_regressions {
     use super::*;
 
     #[test]
+    fn edit_review_opus_9_undo_preview_probes_without_backup_mutex() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("file.txt");
+        std::fs::write(&file, b"original").unwrap();
+        let ctx = std::sync::Arc::new(AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        ));
+        ctx.backup()
+            .lock()
+            .set_storage_dir(dir.path().join("backup"), 72);
+        let req: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "preview-lock", "command": "undo_preview", "file": file,
+        }))
+        .unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot(req.session(), &file, "original")
+            .unwrap();
+        let checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _hook = install_authorization_hook_for_test(&req.id, {
+            let ctx = ctx.clone();
+            let checked = checked.clone();
+            std::sync::Arc::new(move || {
+                assert!(ctx.backup().try_lock().is_some());
+                checked.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        });
+        let response = handle_undo_preview(&req, &ctx);
+        assert!(response.success, "{response:?}");
+        assert!(checked.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
     fn undo_filepath_alias_restores_only_requested_file() {
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("first.txt");
@@ -154,7 +188,7 @@ pub(crate) fn install_authorization_hook_for_test(
 }
 
 #[cfg(test)]
-fn authorization_hook_for_test(req_id: &str) {
+pub(super) fn authorization_hook_for_test(req_id: &str) {
     // Released before the hook runs: a hook that blocks must not stop other
     // requests from looking up their own.
     let hook = AUTHORIZATION_HOOKS.lock().unwrap().get(req_id).cloned();
@@ -170,9 +204,9 @@ fn authorization_hook_for_test(req_id: &str) {
 /// the file had changed outside AFT, its content is first saved as a
 /// checkpoint, named in `external_change_checkpoint` and in `warning`.
 ///
-/// Authorization can ask a person and wait for the answer, so it never runs
-/// while the backup store or its stack locks are held: other edits and undos
-/// would queue behind the person. An operation undo plans under the locks,
+/// Authorization can run bounded filesystem probes or return a request for user
+/// approval. Keep those probes outside the backup store and stack locks so
+/// other edits and undos do not queue behind them. An operation undo plans under the locks,
 /// releases them, authorizes the plan, then restores only if the plan is
 /// still current, planning again (a bounded number of times) if not.
 pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
@@ -197,7 +231,6 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
                 Ok(plan) => plan,
                 Err(e) => return Response::error(&req.id, e.code(), e.to_string()),
             };
-            // No backup lock is held here: this may wait for a person.
             if let Err(response) = authorize_stored_keys(ctx, &req.id, &plan.touched) {
                 return response;
             }
@@ -232,7 +265,6 @@ pub fn handle_undo(req: &RawRequest, ctx: &AppContext) -> Response {
     // passed straight to `canonicalize_key` would be joined against the daemon's
     // cwd, missing the stack and reporting a false `no_undo_history`.
     let input = ctx.resolve_relative_path(Path::new(file));
-    // Validated before the backup store is locked: this may wait for a person.
     let resolved = match ctx.validate_write_location(&req.id, &input) {
         Ok(path) => path,
         Err(resp) => return resp,
@@ -309,8 +341,6 @@ fn backup_skipped_response(
 /// otherwise previews the most recent operation in the session.
 /// Returns: `{ paths, count }` on success, or `no_undo_history` error.
 pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
-    let backup = ctx.backup().lock();
-
     let path = match req
         .params
         .get("file")
@@ -319,6 +349,8 @@ pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
     {
         Some(file) => {
             let input = ctx.resolve_relative_path(Path::new(file));
+            #[cfg(test)]
+            authorization_hook_for_test(&req.id);
             match ctx.validate_write_location(&req.id, &input) {
                 Ok(path) => Some(path),
                 Err(response) => return response,
@@ -327,6 +359,7 @@ pub fn handle_undo_preview(req: &RawRequest, ctx: &AppContext) -> Response {
         None => None,
     };
 
+    let backup = ctx.backup().lock();
     if let Some(reason) = backup.latest_skipped_reason_for_undo(req.session(), path.as_deref()) {
         return Response::success(
             &req.id,
