@@ -276,7 +276,6 @@ use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
 pub(crate) use aft_base::walk_boundary;
-pub mod watcher;
 pub(crate) mod watcher_backend;
 pub mod watcher_filter;
 pub(crate) use aft_base::watcher_markers;
