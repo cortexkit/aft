@@ -48,7 +48,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `watcher_backend::counters::WatcherCounters` | stays in composition | `aft-engine` | Owns live flush and shell-journal handles; add the consumer port when separating `aft-index`. |
 | `root_cache::{WriterLease, ArtifactAccess}` | items moved down | `aft-db` | Share cache access with index and composition through one process lease registry. |
 | `test_env`, `subc_fake` and shared `test_storage` primitives | existing test-support helpers | `aft-base` | Lower tests share hermetic environment, daemon fakes and test-storage checks. |
-| `fake_lsp_test_helper` and its `binary_cache` module | test-support helper | `aft-engine` | Engine LSP tests own this helper; its feature-compiled inputs stay in the engine package. |
+| `fake_lsp_test_helper` and its `binary_cache` module | test-support helper | `aft-inspect` | Build and cache the shared fake server from the same protocol sources the LSP tests use. |
 | `test_storage` context adapter | stays in composition | `aft-engine` | Test `AppContext` constructors use private temporary directories instead of the live database root. |
 | `tests/fixtures/root_identity_upgrade/cases.json` | test fixture | `aft-db` | Keep the facade copy byte-identical until final composition cleanup can remove it after its last reader is gone. |
 
@@ -315,7 +315,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `context::{memory_walk_now_for_test, with_memory_walk_clock_for_test}` and `test_bridge::display_data::memory::with_memory_walk_clock_for_test` | test-support compatibility re-exports | `aft-engine` | Keep memory timing tests on the same clock through their old bridge path. |
 | `ExactnessDeadCode` | test-hook port | `aft-index` | Run the graph exactness check with inspect’s real dead-code projection. |
 | `data_layer::checkout::exactness::run` | test-hook compatibility wrapper | `aft-engine` | Supply inspect’s real entry-point and finding policies under the established example path. |
-| `impl ExactnessDeadCode for InspectEntryPoints` | test-hook adapter | `aft-engine` | Preserve inspect findings alongside index rows in the exactness output. |
+| `impl ExactnessDeadCode for InspectEntryPoints` | test-hook adapter | `aft-inspect` | Preserve inspect findings alongside index rows in the exactness output. |
 | `data_layer::surfaces::fixtures` | test-support visibility widened | `aft-index` | Share the same fixture checkout and status polling with composition tests. |
 | `index_test_binding::{bind_for_test, serve_text_index_for_test, serve_text_only_for_test}` | test-support compatibility wrappers | `aft-engine` | Configure the actual context before waiting for the index store. |
 | `data_layer::runtime::publication_fixture` | test-support visibility widened | `aft-index` | Exercise the same configurable publication fixture in composition tests. |
@@ -693,4 +693,56 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `memory::profile::admitted` | visibility widened | `aft-base` | Engine builds pin the lower admission profile. |
 | `path_filters::to_glob_path` | visibility widened | `aft-db` | The engine search code retains the identical path operation. |
 | `root_identity::key::git_command_for_test` | test-support visibility widened | `aft-db` | The engine and lower identity tests share hermetic Git setup. |
-| `fake_lsp_test_helper` | test-support visibility widened | `aft-engine` | Expose the helper to opt-in test consumers, not production crate builds. |
+| `fake_lsp_test_helper` | test-support re-export | `aft-engine` | Keep the existing builder path for opt-in LSP fixtures. |
+
+## Inspect area
+
+| Item | Kind | Owning crate | Reason |
+|---|---|---|---|
+| `alert_state`, `inspect`, `lsp`, `lsp_hints` | modules moved down | `aft-inspect` | Keep language server management, inspection, and diagnostic alert state together. |
+| `alert_state`, `inspect`, `lsp`, `lsp_hints` | compatibility re-exports | `aft-engine` | Preserve the module paths used by unchanged callers. |
+| `inspect::job::{canonicalize_normalized, normalize_path}` | compatibility re-exports | `aft-engine` | Keep existing callers on the same lower path-identity functions. |
+| `inspect::diagnostics_host::DiagnosticsHost` | port | `aft-inspect` | Request diagnostic inputs from the composition root without depending on the engine. |
+| `DiagnosticsHost::lsp_manager` | shared manager handle | `aft-inspect` | Let diagnostics use the existing manager and acquire its lock at the original call sites. |
+| `DiagnosticsHost::forward_queued_watcher_changes` | port method | `aft-inspect` | Ask composition to deliver pending watcher changes before reading authoritative reports. |
+| `impl DiagnosticsHost for AppContext` | port adapter | `aft-engine` | Clone the root's LSP manager and call the existing watcher backlog flush, retaining the slot and helper in composition. |
+| `diagnostics_category::run_diagnostics_category` | compatibility wrapper | `aft-engine` | Preserve the old context-taking function and pass it through the diagnostic host port. |
+| `diagnostics_category::start_inspect_rust_checks` | compatibility wrapper | `aft-engine` | Preserve the old context-taking function when scheduling explicit Rust checks. |
+| `impl PostWriteDiagnostics for PostEditWaitOutcome` | port adapter moved down | `aft-inspect` | Keep edit response formatting with the LSP outcome and retain edit's consumer-owned port. |
+| `InspectEntryPoints` | visibility widened | `aft-inspect` | Reuse the same entry-point decisions in the engine's call-graph fixtures and exactness gate. |
+| `InspectManager::{set_root_lifecycle, resume_root_work, cancel_root_work}` | visibility widened | `aft-inspect` | Attach and pause or cancel inspect work when the root lifecycle changes. |
+| `InspectManager::{set_cold_build_limiter, try_tier2_builder_busy, try_tier2_any_in_flight}` | visibility widened | `aft-inspect` | Keep the root's cold-build admission and nonblocking status probes available to composition. |
+| `InspectManager::try_callgraph_projection_snapshot` | visibility widened | `aft-inspect` | Let the index host reuse the current inspect projection without waiting behind it. |
+| `InspectManager::{record_tier2_attempt_outcome_for_test, dead_code_timer_registration_for_test}` | test-support visibility widened | `aft-inspect` | Let tests over the real context observe scheduling results and timer identity. |
+| `InspectBuilderState`, `MetricsWaitForTest`, `filter_payload_for_scope_for_test` | test-support re-exports | `aft-inspect` | Provide the original inspect test bridge with the scheduler types and result filter. |
+| `InspectCache::{contribution_set_hash_for_version_for_test, page_size_for_test}` | test-support visibility widened | `aft-inspect` | Preserve the cache format and write-attribution test inputs. |
+| `cache::{aggregate_memory_walks_for_test, foreign_writer_fixture}` | test-support visibility widened | `aft-inspect` | Keep the existing allocation counters and concurrent cache writer fixtures available. |
+| `data_sources::set_todo_store_wait_for_test` | test-support visibility widened | `aft-inspect` | Let the engine bridge adjust the wait of a specific checkout in tests. |
+| `compatibility_test::{InspectCacheTest, InspectManagerTest}` | test-support adapters | `aft-inspect` | Call inspect's private helpers without making them inherent public methods. |
+| `compatibility_test::{TIER2_CONTRIBUTION_CACHE_VERSION, TODOS_NO_INDEX_STORE}` | test-support adapters | `aft-inspect` | Mirror the original cache version and reason constants without widening the production definitions. |
+| `compatibility_test::{callgraph_unavailable_aggregate, run_unused_exports_scan_with_oxc, run_cycles_scan_with_oxc}` | test-support adapters | `aft-inspect` | Exercise the real scanner and aggregation logic through the existing test bridge. |
+| `compatibility_test::{read_source_without_io_error, apply_contribution_upserts}` | test-support drivers | `aft-inspect` | Run scanner access and cache writes for composition tests without exposing their internal result types. |
+| `test_bridge::search_misc::inspect` | compatibility adapters | `aft-engine` | Preserve the original scanner, cache, and builder test bridge names. |
+| `lsp::client::{rust_analyzer_capacity_refusals, kill_lsp_child_group}` | visibility widened | `aft-inspect` | Keep rust-analyzer capacity-refusal reporting and the shell's process-group wrapper on their existing implementations. |
+| `lsp::client::ServerInstanceId` and `DrainedLspEvents::instances` | visibility widened | `aft-inspect` | Let composition revalidate that each receipt still belongs to a current server instance. |
+| `LspManager::{take_idle_clients, accept_event_instance}` | visibility widened | `aft-inspect` | Preserve idle teardown and the post-drain event check in the runtime loop. |
+| `LspManager::resume_for_composition` | composition adapter | `aft-inspect` | Resume the existing manager while preserving the separate test extension method. |
+| `ServerCapacity`, `LspManager::set_server_capacity` | visibility widened | `aft-inspect` | Share the same server limits across managers belonging to the application. |
+| `LspManager::{enable_background_document_pulls, rust_worker_policy, rust_cargo_disabled_for_worker}` | visibility widened | `aft-inspect` | Preserve the manager's worker policy flag and the root's background pull setup. |
+| `LspManager::{clear_project_applicability, has_project_applicability, project_diagnostics_authority, project_analysis_progress_pending}` | visibility widened | `aft-inspect` | Read or clear the real manager's state when computing application health. |
+| `LspManager::{notify_files_watched_changed_with_stamps, forward_watcher_file_events_with_stamps}` | visibility widened | `aft-inspect` | Deliver the same watched changes and file stamps from composition. |
+| `lsp::manager::{WatchedFileStamp, WatchedFileStamps, capture_watched_file_stamps}` | visibility widened | `aft-inspect` | Capture and reuse the original content observations across watcher and edit notifications. |
+| `WatcherForwardBacklog::{merge_with_stamps, apply}` | visibility widened | `aft-inspect` | Apply the same backlog at the original points in the engine's watcher-forwarding lifecycle. |
+| `lsp::manager::{run_watcher_forward_helper, spawn_watcher_rust_workspace_reloads}` | visibility widened | `aft-inspect` | Keep the existing helper and reload submission in use without moving the root-owned queue. |
+| `lsp::manager::{InvalidationCause, applicability_metrics, invalidate_applicability_walk, invalidate_applicability_walk_with_trigger, invalidate_applicability_batch}` | visibility widened | `aft-inspect` | Keep the engine's watcher invalidations and lifecycle meters tied to the manager's real cache. |
+| `lsp::pending_changes::{queue_lsp_change, PendingLspChanges::queue_document, PendingLspChanges::queue_watched_with_stamps, PendingLspChanges::queue_mutation_watched}` | visibility widened | `aft-inspect` | Preserve document and watcher batching while the engine owns when work is queued. |
+| `TsconfigMembershipCache::{new, clear, generation, should_skip_diagnostics}` | visibility widened | `aft-inspect` | Share membership decisions with the context's project health view. |
+| `lsp::typescript_project::invalidate_typescript_selection` | visibility widened | `aft-inspect` | Reuse TypeScript's selection invalidation when composition sees changed project inputs. |
+| `lsp::manager::{format_retry_delay, language_id_for_path}` | visibility widened | `aft-inspect` | Keep the retry text and test bridge language decisions on the original helpers. |
+| `lsp::manager::{startup_fixture, settled_lsp}` | test-support visibility widened | `aft-inspect` | Preserve the server startup and synchronization fixtures used by the engine test bridge. |
+| `startup_fixture::{spawn_client_for_test, LspManager::insert_client_for_test}` | test-support adapters | `aft-inspect` | Set up a real managed client for composition tests without exposing reader internals. |
+| `lsp::manager::instance_regression_tests::{pause_dispatch, drain_dispatch_rechecks_instance_after_restart, drain_dispatch_does_not_wait_for_a_contended_manager}` | test-support drivers | `aft-inspect` | Keep private receipt and client assertions while using the engine's actual runtime drain. |
+| `ApplicabilityWalk::has_candidate_for_test` | test-support driver | `aft-inspect` | Check the real selection after a composition-owned watcher notification. |
+| `lsp::test_support::{idle_fixture::IdleLspFixture, child_pid_for_test}` | test-support adapters | `aft-inspect` | Share the existing idle-manager setup and keep PID reads opt-in. |
+| `lsp_idle_fixture::IdleLspFixture` | test-support compatibility adapter | `aft-engine` | Use the same idle fixture with a real context for composed teardown and unchanged upper call sites. |
+| `test_bridge::search_misc::{LspManagerTestExt, LspClientTestExt}` | test-support compatibility adapters | `aft-engine` | Keep upper `resume` and `child_pid` call shapes without exposing the lower methods through the release API. |

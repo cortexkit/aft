@@ -1,5 +1,10 @@
 //! Source inspection, language server management, and diagnostic alerts.
 
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: aft_base::test_allocations::CountingAllocator =
+    aft_base::test_allocations::CountingAllocator;
+
 pub mod alert_state;
 pub mod inspect;
 pub mod lsp;

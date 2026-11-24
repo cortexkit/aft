@@ -29,7 +29,7 @@ pub fn run_cycles_scan_with_oxc(
     cycles::run_cycles_scan_with_oxc(job, graph)
 }
 
-pub fn read_source_is_disclosed(path: &Path) -> bool {
+pub fn read_source_without_io_error(path: &Path) -> bool {
     source_text::read_source_text(path).is_ok()
 }
 
