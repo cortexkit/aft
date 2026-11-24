@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the engine, tools and daemon compiler inputs from a Cargo JSON build."""
+"""Check split-crate compiler inputs from a Cargo JSON build."""
 
 import argparse
 from dataclasses import dataclass
@@ -27,9 +27,14 @@ class Audit:
         return CRATES / self.name
 
 
-# Match the feature selections in .github/workflows/_unit-suite.yml. The daemon
-# library does not declare wasm-grammars or test-support.
+# Match the feature selections in .github/workflows/_unit-suite.yml. The
+# workspace test build forwards test-support to both lower crates via test-hooks.
+ABOVE_LOWER = ("aft", "aft-engine", "aft-tools", "aft-subc")
 AUDITS = (
+    Audit("aft-base", ABOVE_LOWER,
+          ("test-hooks", "test-support"), ("test-hooks", "test-support")),
+    Audit("aft-db", ABOVE_LOWER,
+          ("test-hooks", "test-support"), ("test-hooks", "test-support")),
     Audit("aft-engine", ("aft", "aft-tools", "aft-subc"),
           ("test-hooks", "wasm-grammars"), ("test-hooks", "test-support")),
     Audit("aft-tools", ("aft", "aft-subc"),

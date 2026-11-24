@@ -114,4 +114,6 @@ if errors:
         print(f"secret-test-fake guard: {error}", file=sys.stderr)
     sys.exit("secret-test-fake guard: FAILED")
 print(f"secret-test-fake guard: ok ({len(members) + len(others)} manifests, {len(PROTECTED)} test-only features stay opt-in)")
+fake_owners = sorted(member["name"] for member in members.values() if "secret-test-fake" in member["features"])
+print(f"secret-test-fake guard: checked declarations in {', '.join(fake_owners) or '(none)'}")
 PY
