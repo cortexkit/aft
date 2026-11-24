@@ -316,10 +316,8 @@ fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
             SemanticIndexStatus::Building { .. } => IndexObservation::building(),
         };
     }
-    let status = match ctx.semantic_index_status().try_read() {
-        Ok(guard) => guard.clone(),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
-        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
+    let Some(status) = ctx.try_semantic_index_status() else {
+        return IndexObservation::building();
     };
     if let SemanticIndexStatus::Failed(message) = &status {
         return IndexObservation::unavailable(semantic_failure_cause(ctx, message));
@@ -330,21 +328,13 @@ fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
     {
         return IndexObservation::unavailable(cause::SEMANTIC_BACKEND_UNAVAILABLE);
     }
-    let resident = match ctx.semantic_index().try_read() {
-        Ok(guard) => guard.is_some(),
-        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().is_some(),
-        Err(std::sync::TryLockError::WouldBlock) => return IndexObservation::building(),
+    let Some(resident) = ctx.try_semantic_index_resident() else {
+        return IndexObservation::building();
     };
     match status {
         SemanticIndexStatus::Ready { .. } if resident => IndexObservation::ready(),
         SemanticIndexStatus::Building { .. } => IndexObservation::building(),
-        _ if ctx
-            .semantic_index_rx()
-            .try_lock()
-            .is_none_or(|rx| rx.is_some()) =>
-        {
-            IndexObservation::building()
-        }
+        _ if ctx.semantic_build_in_progress() => IndexObservation::building(),
         _ => IndexObservation::unavailable(cause::RUNTIME_NOT_OBSERVED),
     }
 }

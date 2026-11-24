@@ -46,7 +46,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `pinned_executable::startup_image_metadata`, `secret::transport::ManagementSession` and `secret::eligibility::alfonso_of_kind` | existing lower owners | `aft-base` | Use the lower implementations directly at the crossings. |
 | `context::App` | stays in composition | `aft-engine` | Owns live LSP, shell and actor handles; add the consumer port when separating `aft-shell`. |
 | `watcher_backend::counters::WatcherCounters` | stays in composition | `aft-engine` | Owns live flush and shell-journal handles; add the consumer port when separating `aft-index`. |
-| `root_cache::{WriterLease, ArtifactAccess}` | stays in composition | `aft-engine` | Owns acquisition, filesystem policy and the process lease registry. |
+| `root_cache::{WriterLease, ArtifactAccess}` | items moved down | `aft-db` | Share cache access with index and composition through one process lease registry. |
 | `test_env`, `subc_fake` and shared `test_storage` primitives | existing test-support helpers | `aft-base` | Lower tests share hermetic environment, daemon fakes and test-storage checks. |
 | `fake_lsp_test_helper` and its `binary_cache` module | test-support helper | `aft-engine` | Engine LSP tests own this helper; its feature-compiled inputs stay in the engine package. |
 | `test_storage` context adapter | stays in composition | `aft-engine` | Test `AppContext` constructors use private temporary directories instead of the live database root. |
@@ -121,6 +121,18 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `format::kill_process_tree` | re-export visibility widened | `aft-edit` | Preserve the existing format path for lower process cleanup used by index and GitHub. |
 | `format::first_batch_skip_reason_for_test` | test-support driver | `aft-edit` | Read the first batch result's skip reason under the real sandbox policy. |
 | `backup::ORDINARY_SCHEMA_VERSION` | re-export visibility widened | `aft-edit` | Engine's compatibility test reads the same ordinary backup schema constant. |
+
+## Index area
+
+| Item | Kind | Owning crate | Reason |
+|---|---|---|---|
+| `IndexHost::explicit_task_artifacts` | port | `aft-index` | Grep asks for visible task artifacts without acquiring shell state or bypassing session and root checks. |
+| `impl IndexHost for AppContext` (`explicit_task_artifacts`) | adapter | `aft-engine` | Delegate the artifact query to the real Bash registry. |
+| `IndexHost::semantic_building` | port | `aft-index` | Give the backend probe a blocking observation without exposing the status lock. |
+| `IndexHost::try_semantic_index_status` | port | `aft-index` | Observe status without waiting or giving the caller a lock guard. |
+| `IndexHost::try_semantic_index_resident` | port | `aft-index` | Distinguish a busy index slot from an empty one without exposing its lock. |
+| `IndexHost::semantic_build_in_progress` | port | `aft-index` | A present or busy build receiver remains evidence of an in-progress build. |
+| `impl IndexHost for AppContext` (semantic observations) | adapter | `aft-engine` | Keep lock acquisition and poison handling in composition. |
 
 ## Visibility widened for cross-crate callers
 

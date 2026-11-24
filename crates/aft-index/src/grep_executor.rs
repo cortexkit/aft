@@ -1813,10 +1813,7 @@ fn scope_ignored_entries_cancellable(
     let [root] = scope.roots.as_slice() else {
         return None;
     };
-    if cancelled.load(Ordering::Acquire)
-        || aft_db::read_fence::active()
-        || root.ignored_target
-    {
+    if cancelled.load(Ordering::Acquire) || aft_db::read_fence::active() || root.ignored_target {
         return None;
     }
     let filter_root = root.filter_root.clone();

@@ -4,15 +4,12 @@ use crate::config::{Config, SemanticBackendConfig};
 use crate::data_layer::checkout::CheckoutView;
 pub use crate::data_layer::parent::ChildCheckouts;
 pub use crate::data_layer::runtime::DataCheckout;
-use crate::data_layer::status::{
-    EmbeddingBackendHealthSnapshot, SemanticIndexEvent, SemanticIndexStatus,
-};
+use crate::data_layer::status::{EmbeddingBackendHealthSnapshot, SemanticIndexStatus};
 use crate::data_layer::surfaces::{DataCheckoutProbe, Withheld};
 use crate::executor::RootMaintenanceExecutor;
 use crate::parser::SharedSymbolCache;
-use crate::semantic_index::SemanticIndex;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// Runtime-owned state, exposed without giving the index an application context.
 pub trait IndexHost: Send + Sync {
@@ -33,11 +30,13 @@ pub trait IndexHost: Send + Sync {
     fn artifact_identity_provisional(&self) -> bool;
     fn cache_dir(&self) -> PathBuf;
     fn cached_artifact_cache_key(&self, root: &Path) -> Option<String>;
-    fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus>;
-    fn semantic_index(&self) -> &RwLock<Option<SemanticIndex>>;
-    fn semantic_index_rx(
-        &self,
-    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>>;
+    fn semantic_building(&self) -> bool;
+    /// `None` means the status is being updated.
+    fn try_semantic_index_status(&self) -> Option<SemanticIndexStatus>;
+    /// `None` means the resident index is being updated.
+    fn try_semantic_index_resident(&self) -> Option<bool>;
+    /// Also reports an in-progress build while its event receiver is locked.
+    fn semantic_build_in_progress(&self) -> bool;
     fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot>;
     /// The snapshot reported separately by the root's callgraph memory accounting.
     /// Its shared allocation must not also be counted as index memory.
@@ -98,16 +97,17 @@ impl<T: IndexHost + ?Sized> IndexHost for Arc<T> {
     fn cached_artifact_cache_key(&self, root: &Path) -> Option<String> {
         (**self).cached_artifact_cache_key(root)
     }
-    fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
-        (**self).semantic_index_status()
+    fn semantic_building(&self) -> bool {
+        (**self).semantic_building()
     }
-    fn semantic_index(&self) -> &RwLock<Option<SemanticIndex>> {
-        (**self).semantic_index()
+    fn try_semantic_index_status(&self) -> Option<SemanticIndexStatus> {
+        (**self).try_semantic_index_status()
     }
-    fn semantic_index_rx(
-        &self,
-    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>> {
-        (**self).semantic_index_rx()
+    fn try_semantic_index_resident(&self) -> Option<bool> {
+        (**self).try_semantic_index_resident()
+    }
+    fn semantic_build_in_progress(&self) -> bool {
+        (**self).semantic_build_in_progress()
     }
     fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot> {
         (**self).try_semantic_backend_health_snapshot()

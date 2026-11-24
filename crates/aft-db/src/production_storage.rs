@@ -121,7 +121,6 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
-
     #[cfg(not(debug_assertions))]
     #[test]
     fn optimized_build_migrates_fake_production_without_opt_in() {

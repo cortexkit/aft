@@ -57,16 +57,35 @@ impl IndexHost for AppContext {
     fn cached_artifact_cache_key(&self, root: &Path) -> Option<String> {
         self.cached_artifact_cache_key(root)
     }
-    fn semantic_index_status(&self) -> &RwLock<SemanticIndexStatus> {
-        self.semantic_index_status()
+    fn semantic_building(&self) -> bool {
+        matches!(
+            &*self
+                .semantic_index_status()
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            SemanticIndexStatus::Building { .. }
+        )
     }
-    fn semantic_index(&self) -> &RwLock<Option<SemanticIndex>> {
-        self.semantic_index()
+    fn try_semantic_index_status(&self) -> Option<SemanticIndexStatus> {
+        match self.semantic_index_status().try_read() {
+            Ok(guard) => Some(guard.clone()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner().clone()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
     }
-    fn semantic_index_rx(
-        &self,
-    ) -> &parking_lot::Mutex<Option<crossbeam_channel::Receiver<SemanticIndexEvent>>> {
+    fn try_semantic_index_resident(&self) -> Option<bool> {
+        match self.semantic_index().try_read() {
+            Ok(guard) => Some(guard.is_some()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().is_some())
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        }
+    }
+    fn semantic_build_in_progress(&self) -> bool {
         self.semantic_index_rx()
+            .try_lock()
+            .is_none_or(|rx| rx.is_some())
     }
     fn try_semantic_backend_health_snapshot(&self) -> Option<EmbeddingBackendHealthSnapshot> {
         self.try_semantic_backend_health_snapshot()

@@ -84,13 +84,13 @@ pub use aft_db::build_breaker;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
-pub use aft_parse::callgraph_extractor;
-pub use aft_index::callgraph_store;
-pub use aft_index::calls;
 pub(crate) use aft_base::clock;
 pub use aft_base::cold_build_limiter;
 pub use aft_base::compress;
 pub use aft_edit::checkpoint;
+pub use aft_index::callgraph_store;
+pub use aft_index::calls;
+pub use aft_parse::callgraph_extractor;
 #[cfg(test)]
 mod compress_boundary_tests;
 #[cfg(test)]
@@ -126,15 +126,15 @@ pub mod exec_remote;
 use aft_base::executable_cache;
 pub mod executor;
 pub use aft_base::feature_config;
+pub(crate) use aft_base::file_identity;
 pub use aft_edit::extract;
 pub use aft_index::feature_status;
-pub(crate) use aft_base::file_identity;
 pub mod file_kind;
 pub use aft_base::fleet_status;
+pub use aft_db::fs_lock;
 #[doc(hidden)]
 pub use aft_edit::file_read_exact;
 pub use aft_edit::format;
-pub use aft_db::fs_lock;
 pub use aft_parse::fuzzy_match;
 pub mod gh_shim;
 pub use aft_base::gh_shim_paths;
@@ -148,22 +148,22 @@ pub mod gh_shim_worker_broker;
 #[doc(hidden)]
 pub mod gh_shim_worker_endpoints;
 pub use aft_base::git_head;
-pub use aft_index::git_index_reader;
 #[cfg(test)]
 pub(crate) use aft_base::git_probe;
 pub(crate) use aft_base::git_revision;
+pub use aft_index::git_index_reader;
 #[doc(hidden)]
 pub mod git_root_resolution;
 pub(crate) use aft_base::github_address;
 pub mod github_read;
 pub use aft_base::grammar_state;
-pub use aft_index::grammar;
-pub use aft_index::grep_executor;
 pub use aft_base::harness;
 pub use aft_base::harness_partition_guard;
 pub use aft_base::host_tool_names;
 pub use aft_edit::hashline;
 pub use aft_edit::{imports, indent};
+pub use aft_index::grammar;
+pub use aft_index::grep_executor;
 pub mod inspect;
 pub use aft_base::inspect_category;
 #[doc(hidden)]
@@ -185,10 +185,10 @@ pub mod lifecycle_census;
 pub use aft_base::list_envelope;
 pub use aft_base::list_surfaces;
 pub mod live_db_files;
-pub use aft_index::local_embed;
 pub(crate) use aft_base::lock_diagnostics;
 pub use aft_base::log_ctx;
 pub use aft_base::log_redact;
+pub use aft_index::local_embed;
 pub mod logging;
 pub mod lsp;
 pub mod lsp_hints;
@@ -207,10 +207,10 @@ pub mod output_store;
 pub mod page_collect;
 pub mod parent_search;
 pub mod parser;
-pub use aft_edit::patch;
-pub use aft_db::path_identity;
 pub use aft_base::pattern_compile;
 pub use aft_base::pending_response;
+pub use aft_db::path_identity;
+pub use aft_edit::patch;
 pub mod persisted_format;
 pub(crate) use aft_base::pinned_dir;
 pub mod pinned_executable;
@@ -273,12 +273,12 @@ pub use aft_base::subc_config;
 #[path = "../tests/helpers/subc_fake.rs"]
 mod subc_fake;
 pub use aft_base::symbols;
-pub use aft_edit::symbol_diff;
-pub use aft_index::synapse_embed;
 pub(crate) use aft_base::system_temp;
 pub(crate) use aft_base::task_temp_reads;
 pub use aft_base::task_watch_lines;
 pub use aft_base::task_watches;
+pub use aft_edit::symbol_diff;
+pub use aft_index::synapse_embed;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) mod test_storage;
 #[doc(hidden)]
@@ -286,17 +286,17 @@ pub use aft_base::tool_call_result;
 pub use aft_base::tool_gate;
 pub use aft_base::tool_path;
 pub(crate) use aft_base::tool_progress;
-pub use aft_index::url_fetch;
 use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
 pub(crate) use aft_base::walk_boundary;
+pub(crate) use aft_base::watcher_markers;
+pub use aft_base::write_counters;
+pub use aft_index::url_fetch;
 pub use aft_index::watcher;
 #[doc(hidden)]
 pub use aft_index::watcher_backend;
 pub use aft_index::watcher_filter;
-pub(crate) use aft_base::watcher_markers;
-pub use aft_base::write_counters;
 pub mod write_intent;
 pub mod write_ledger;
 // Compiled on all platforms so cross-platform unit tests in

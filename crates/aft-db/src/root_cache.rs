@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
-use crate::fs_lock;
 pub use crate::artifact_publish_epoch::ArtifactPublishEpoch;
+use crate::fs_lock;
 
 #[cfg(test)]
 #[path = "root_cache_paths_tests.rs"]
@@ -64,9 +64,7 @@ pub use location::{
 };
 use location::{canonical_process_lease_dir, existing_ancestor};
 #[doc(hidden)]
-pub use location::{
-    check_cache_access, identity_storage_root, prepare_third_party_cache_dir,
-};
+pub use location::{check_cache_access, identity_storage_root, prepare_third_party_cache_dir};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RootCacheDomain {

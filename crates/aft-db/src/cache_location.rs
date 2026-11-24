@@ -52,7 +52,6 @@ use std::sync::Weak;
 #[allow(unused_imports)]
 use std::time::Duration;
 
-
 #[cfg(test)]
 #[allow(hidden_glob_reexports)]
 mod prune_legacy_tests {

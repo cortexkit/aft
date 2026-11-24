@@ -5,7 +5,6 @@ use crate::config::Config;
 use crate::context::AppContext;
 use crate::parser::TreeSitterProvider;
 
-
 #[test]
 fn cache_root_unavailable_refuses_inspect_lane_before_open() {
     let temp = tempfile::tempdir().unwrap();
@@ -42,7 +41,6 @@ fn cache_root_unavailable_refuses_inspect_lane_before_open() {
     assert!(!storage.exists());
 }
 
-
 fn fixture(custom: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, AppContext) {
     let temp = tempfile::tempdir().unwrap();
     let storage = temp.path().join("aft");
@@ -76,7 +74,6 @@ fn fixture(custom: bool) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, AppCo
     configure_artifact_access(&project, &key, false);
     (temp, storage, cache, project, ctx)
 }
-
 
 #[test]
 fn cache_root_change_is_fresh_and_doctor_reclaims_only_marked_inactive_domains() {
@@ -172,7 +169,6 @@ fn cache_root_doctor_keeps_in_use_root_and_active_alias() {
     assert!(report.error.is_none(), "{report:?}");
     assert!(cache.join("views/canary").is_file());
 }
-
 
 #[test]
 fn cache_root_doctor_ignores_harness_redirects_and_keeps_user_base() {
