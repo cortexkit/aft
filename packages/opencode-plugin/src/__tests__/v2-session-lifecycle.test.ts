@@ -514,6 +514,84 @@ test("V2 session deletion after a reload kills only the tasks the bridge says th
   }
 });
 
+test("V2 session deletion closes only the deleted session's routes, after its cleanup calls", async () => {
+  _resetSubagentCacheForTest();
+  _resetSessionDirectoryCacheForTest();
+  const bus = await Effect.runPromise(
+    PubSub.unbounded<{
+      type: string;
+      location?: { directory: string };
+      data: { sessionID: string };
+    }>(),
+  );
+  const scope = await Effect.runPromise(Scope.make());
+  // One ordered record of bridge calls and route closes.
+  const order: string[] = [];
+  const bridge = {
+    getCwd: () => process.cwd(),
+    send: async (name: string, args: Record<string, unknown>) => {
+      order.push(`${name}:${String(args.session_id ?? "")}`);
+      return name === "bash_owned_tasks" ? { success: true, task_ids: [] } : { success: true };
+    },
+  };
+  const host = {
+    location: { directory: process.cwd() },
+    event: { subscribe: () => Stream.fromPubSub(bus) },
+    session: {
+      get: () => Effect.succeed({ parentID: "parent", location: { directory: process.cwd() } }),
+    },
+  };
+  const ctx = {
+    client: host,
+    pool: {
+      getBridge: () => bridge,
+      getActiveBridgeForRoot: () => bridge,
+      activeBridges: () => [bridge],
+      closeSession: async (root: string, sessionID: string) => {
+        order.push(`close:${sessionID}@${root}`);
+      },
+    },
+    config: {},
+  } as unknown as PluginContext;
+  try {
+    await Effect.runPromise(
+      registerV2SessionLifecycle(host, ctx).pipe(Effect.provideService(Scope.Scope, scope)),
+    );
+    // A session with live local state, and one known only to the engine.
+    await trackV2BackgroundTask(
+      ctx,
+      { sessionID: "stateful-child", directory: process.cwd() },
+      "bash-stateful",
+      0,
+    );
+    for (const sessionID of ["stateful-child", "reloaded-child"]) {
+      await Effect.runPromise(
+        PubSub.publish(bus, {
+          type: "session.deleted",
+          location: host.location,
+          data: { sessionID },
+        }),
+      );
+    }
+    await Bun.sleep(20);
+    const closes = order.filter((entry) => entry.startsWith("close:"));
+    expect(closes.sort()).toEqual([
+      `close:reloaded-child@${process.cwd()}`,
+      `close:stateful-child@${process.cwd()}`,
+    ]);
+    // Each close comes after that session's last bridge call, so the cleanup
+    // cannot reopen a route that was just closed.
+    for (const sessionID of ["stateful-child", "reloaded-child"]) {
+      const lastCall = order.findLastIndex((entry) => entry.endsWith(`:${sessionID}`));
+      expect(order.indexOf(`close:${sessionID}@${process.cwd()}`)).toBeGreaterThan(lastCall);
+    }
+  } finally {
+    await Effect.runPromise(Scope.close(scope, Exit.void));
+    sessionBgStates.clear();
+    _resetSessionDirectoryCacheForTest();
+  }
+});
+
 test("V2 completion arriving after session deletion creates no session state and is acknowledged", async () => {
   _resetSubagentCacheForTest();
   __resetV2WakeRoutesForTests();

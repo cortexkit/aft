@@ -4,6 +4,7 @@ import { error as logError, warn } from "./logger.js";
 import { releaseSessionState } from "./shared/session-cleanup.js";
 import {
   clearSessionDirectory,
+  closeDeletedSessionRoutes,
   getSessionDirectoryForDeletedEvent,
   getSessionDirectoryForEvent,
 } from "./shared/session-directory.js";
@@ -329,8 +330,26 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                     rememberDeleted(context, sessionID);
                     sessions.delete(sessionID);
                     releaseSessionState(sessionID);
+                    // Close the session's transport routes once its cleanup
+                    // calls have settled, so they cannot reopen a closed route.
+                    // Best effort, as on OpenCode 1: never block the event loop.
+                    // The directory record is kept: every Location sees this
+                    // deletion, and the owning one may still need it.
+                    const closeRoutes = () => {
+                      if (!ctx) return;
+                      const fallback =
+                        event.location?.directory ??
+                        (context as { location?: { directory?: string } }).location?.directory;
+                      if (!fallback) return;
+                      void closeDeletedSessionRoutes(ctx.pool, sessionID, fallback, false).catch(
+                        () => {},
+                      );
+                    };
                     if (!state) {
-                      void kills.finally(() => releaseSessionState(sessionID));
+                      void kills.finally(() => {
+                        releaseSessionState(sessionID);
+                        closeRoutes();
+                      });
                       return;
                     }
                     state.settling?.resolve();
@@ -355,7 +374,10 @@ export function registerV2SessionLifecycle(context: unknown, ctx?: PluginContext
                             ),
                           ),
                       ),
-                    ]).finally(() => releaseSessionState(sessionID));
+                    ]).finally(() => {
+                      releaseSessionState(sessionID);
+                      closeRoutes();
+                    });
                     return;
                   }
                   if (!event.type.startsWith("session.execution.")) return;
