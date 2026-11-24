@@ -1365,14 +1365,12 @@ fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> O
                     // Directory reads are single-level; recursive listing must
                     // stay with the shell to preserve all descendants.
                     'R' => return None,
-                    // Plain `ls` hides dotfiles, while `read` normally includes
-                    // them. Preserve the caller's explicit request to show all
-                    // entries without changing direct `read` behavior.
-                    'a' => include_hidden = true,
-                    // `ls -A` shows hidden entries except `.` and `..`. Keep this
-                    // distinct spelling unsupported so native bash preserves its
-                    // exact contract.
-                    'A' => return None,
+                    // `read` lists a directory without `.` and `..`, which is
+                    // exactly the `ls -A` contract (hidden entries included).
+                    'A' => include_hidden = true,
+                    // `ls -a` also prints `.` and `..`, which a directory read
+                    // never returns, so it stays with the shell.
+                    'a' => return None,
                     // -l: long format. Shows size, mtime, permissions, owner.
                     // `read` returns directory entries (no metadata) or file
                     // contents (not metadata at all). Rewriting drops the
@@ -1456,10 +1454,29 @@ mod tests {
                 ..Config::default()
             },
         );
-        for command in ["ls -R", "ls -aR", "ls -Ra ."] {
+        for command in ["ls -R", "ls -AR", "ls -RA ."] {
             assert!(super::ls_request(command, &ctx).is_none(), "{command}");
         }
-        assert!(super::ls_request("ls -a", &ctx).is_some());
+        assert!(super::ls_request("ls -A", &ctx).is_some());
+    }
+
+    /// A directory read never lists `.` and `..`, which is the `ls -A`
+    /// contract. `ls -a` prints them too, so only `-A` may be rewritten.
+    #[test]
+    fn ls_rewrites_dash_capital_a_and_keeps_dash_a_native() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            default_language_provider_factory(),
+            Config {
+                project_root: Some(root.path().to_path_buf()),
+                ..Config::default()
+            },
+        );
+        let request = super::ls_request("ls -A", &ctx).expect("ls -A is rewritten");
+        assert_eq!(request["include_hidden"], json!(true));
+        for command in ["ls -a", "ls -la", "ls -aA", "ls -Aa ."] {
+            assert!(super::ls_request(command, &ctx).is_none(), "{command}");
+        }
     }
 
     // The oracle needs a real POSIX bash. On Windows `bash` on PATH is often the
