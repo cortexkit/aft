@@ -7,3 +7,17 @@ aft-tools	lib:aft_tools	allocator_tests::lib_test_counts_known_allocation	1	1	1
 aft-tools	lib:aft_tools	boundary_source_guard_tests::source_guard_detects_planted_paths_in_tools_modules_only	1	1	1
 aft-tools	lib:aft_tools	boundary_source_guard_tests::tools_module_tree_does_not_reference_subc	1	1	1
 aft-tools	lib:aft_tools	commands::bash_watch::restart::tests::watch_completion_between_reservation_and_persistence_is_settled_once	1	1	1
+aft-db	lib:aft_db	db::sandbox_escape_records::tests::record_contains_request_and_outcome_but_has_no_output_field	1	1	1
+aft-db	lib:aft_db	db::sandbox_escape_records::tests::maintenance_prunes_ninety_days_and_keeps_newest_ten_thousand	1	1	1
+aft-engine	lib:aft_engine	sandbox_spawn::sandbox_escape_grant_tests::sandbox_escape_grant_outlives_the_ordinary_host_prompt_window	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_run_once_executes_once_and_reports_without_output	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_decline_and_expiry_run_nothing_and_send_no_report	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_approved_dispatch_outcomes_use_execution_report_contract	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_pruned_execution_report_is_not_retried	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_without_a_channel_runs_nothing	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_inapplicable_calls_are_refused_before_filing	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_off_level_runs_without_a_card	1	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_run_once_reads_a_blocked_path_at_off	0	1	0
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_release_vectors_roundtrip_through_request_and_answer_types	1	1	1
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_development_vectors_roundtrip_through_answer_types	1	1	1
+aft-subc	lib:aft_subc	subc::consent::tests::sandbox_escape_tests::sandbox_escape_windows_is_refused_before_filing	0	0	1

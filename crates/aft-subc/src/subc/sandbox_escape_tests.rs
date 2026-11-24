@@ -1,12 +1,18 @@
 use super::super::sandbox_escape as escape;
 use super::*;
+#[cfg(unix)]
 use crate::config::SandboxMode;
+#[cfg(unix)]
 use crate::db::sandbox_escape_records as records;
+#[cfg(unix)]
 use aft_engine::sandbox_escape::EscapePlan;
+#[cfg(unix)]
 use std::sync::atomic::AtomicU64;
 
+#[cfg(unix)]
 static CORR: AtomicU64 = AtomicU64::new(20_000);
 
+#[cfg(unix)]
 fn head(f: &Fixture) -> RouteIdentity {
     let root = f.ctx.config().project_root.clone().unwrap();
     let mut stamp = stamp("escape-head", "head", None);
@@ -16,6 +22,7 @@ fn head(f: &Fixture) -> RouteIdentity {
     identity
 }
 
+#[cfg(unix)]
 fn request_plan(request_id: &str, command: &str, cwd: &Path) -> (Response, Value) {
     let arguments = json!({
         "command": command,
@@ -38,6 +45,7 @@ fn request_plan(request_id: &str, command: &str, cwd: &Path) -> (Response, Value
     (response, arguments)
 }
 
+#[cfg(unix)]
 fn held_call(f: &Fixture, identity: &RouteIdentity, arguments: Value) -> HeldCall {
     let corr = CORR.fetch_add(1, Ordering::SeqCst);
     HeldCall {
@@ -60,6 +68,7 @@ fn held_call(f: &Fixture, identity: &RouteIdentity, arguments: Value) -> HeldCal
     }
 }
 
+#[cfg(unix)]
 async fn wait_for_request(fake: &FakeCingulate) -> Value {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -73,6 +82,7 @@ async fn wait_for_request(fake: &FakeCingulate) -> Value {
     .expect("sandbox escape card was filed")
 }
 
+#[cfg(unix)]
 fn answer(request: &Value, state: &str, choice: Option<&str>) -> Value {
     let mut answer = json!({
         "kind": "sandbox_escape",
@@ -85,6 +95,7 @@ fn answer(request: &Value, state: &str, choice: Option<&str>) -> Value {
     answer
 }
 
+#[cfg(unix)]
 #[derive(Clone, Copy)]
 enum Behavior {
     Run,
@@ -92,6 +103,7 @@ enum Behavior {
     Unknown,
 }
 
+#[cfg(unix)]
 struct FlowOptions<'a> {
     state: &'a str,
     choice: Option<&'a str>,
@@ -101,6 +113,7 @@ struct FlowOptions<'a> {
     refuse_report: bool,
 }
 
+#[cfg(unix)]
 impl Default for FlowOptions<'_> {
     fn default() -> Self {
         Self {
@@ -114,6 +127,7 @@ impl Default for FlowOptions<'_> {
     }
 }
 
+#[cfg(unix)]
 async fn flow(options: FlowOptions<'_>) -> (Option<Response>, Arc<FakeCingulate>, Fixture) {
     let f = fixture(FakeCingulate::up());
     if options.refuse_report {
@@ -198,6 +212,7 @@ async fn flow(options: FlowOptions<'_>) -> (Option<Response>, Arc<FakeCingulate>
     (response, fake, f)
 }
 
+#[cfg(unix)]
 async fn outcome_case(
     state: &str,
     choice: Option<&str>,
@@ -210,6 +225,7 @@ async fn outcome_case(
     .await
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sandbox_escape_run_once_executes_once_and_reports_without_output() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -248,6 +264,7 @@ async fn sandbox_escape_run_once_executes_once_and_reports_without_output() {
     assert!(!columns.iter().any(|name| name.contains("output")));
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sandbox_escape_approved_dispatch_outcomes_use_execution_report_contract() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -293,6 +310,7 @@ async fn sandbox_escape_approved_dispatch_outcomes_use_execution_report_contract
     );
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sandbox_escape_pruned_execution_report_is_not_retried() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -305,6 +323,7 @@ async fn sandbox_escape_pruned_execution_report_is_not_retried() {
     assert_eq!(fake.calls("consent.report_execution").len(), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sandbox_escape_without_a_channel_runs_nothing() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -339,6 +358,7 @@ async fn sandbox_escape_without_a_channel_runs_nothing() {
     assert_eq!(decision, "unavailable");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sandbox_escape_decline_and_expiry_run_nothing_and_send_no_report() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -371,6 +391,7 @@ async fn sandbox_escape_decline_and_expiry_run_nothing_and_send_no_report() {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn sandbox_escape_inapplicable_calls_are_refused_before_filing() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
@@ -693,4 +714,26 @@ async fn sandbox_escape_run_once_reads_a_blocked_path_at_off() {
         fake.calls("consent.report_execution"),
         [json!({"elicitation_id":"el_1", "execution":"executed"})]
     );
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn sandbox_escape_windows_is_refused_before_filing() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let f = fixture(FakeCingulate::up());
+    let response = escape::preflight_response(
+        &f.head,
+        "windows-escape",
+        &json!({"command":"pwd", "escape_sandbox":"Windows request"}),
+    )
+    .unwrap();
+    assert_eq!(
+        response.data["code"],
+        aft_engine::sandbox_escape::REFUSED_CODE
+    );
+    assert_eq!(
+        response.data["message"],
+        aft_engine::sandbox_escape::WINDOWS_REFUSED
+    );
+    assert!(f.fake.calls("consent.request").is_empty());
 }
