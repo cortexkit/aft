@@ -264,7 +264,21 @@ impl Pool {
             .spawn(move || {
                 let mut next = Some(job);
                 while let Some(job) = next.take() {
-                    crate::memory::profile::admitted(profile, job);
+                    // A job that panics must still give its place back:
+                    // otherwise each panic holds one of the pool's few
+                    // places until the daemon restarts, and every job queued
+                    // behind them never runs.
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::memory::profile::admitted(profile, job)
+                    }));
+                    if let Err(panic) = outcome {
+                        let message = panic
+                            .downcast_ref::<&str>()
+                            .map(|message| (*message).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "non-string panic payload".to_string());
+                        crate::slog_warn!("data layer {self:?} job panicked: {message}");
+                    }
                     if matches!(self, Pool::Build) {
                         // A build frees most of what it allocated when it
                         // ends. Hand those pages back now, as dead code does
@@ -2554,6 +2568,22 @@ mod tests {
         memory_profile::admitted(next, job);
         ctx.set_config(published);
         assert_eq!(Pool::Build.cap(), 2);
+    }
+
+    /// A pool job that panics gives its place back. Before, the worker thread
+    /// unwound past the place's release, so as many panics as the pool has
+    /// places stopped every later job of that kind for the life of the
+    /// process.
+    #[test]
+    fn a_panicking_pool_job_frees_its_place_for_the_next_job() {
+        for _ in 0..Pool::Fill.cap() {
+            Pool::Fill.submit(Box::new(|| panic!("pool job panics on purpose")));
+        }
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        Pool::Fill.submit(Box::new(move || ran_tx.send(()).unwrap()));
+        ran_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("a job queued behind panicking jobs never ran");
     }
 
     fn planned_pause(until: u64) -> crate::synapse_embed::LanePause {
