@@ -1,0 +1,13 @@
+{
+  "job_id": "job-live-fixture",
+  "fingerprint": "fp-a",
+  "table_epoch": 7,
+  "next_chunk_id": "chunk-2",
+  "vectors": [
+    {
+      "id": "item:0",
+      "content_sha256": "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb",
+      "vector": [1.0, 0.0]
+    }
+  ]
+}

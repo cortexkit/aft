@@ -1,0 +1,1 @@
+{"error":{"class":"permanent","code":"not_certified","message":"fingerprint 5a2374bcb587ae22cd7ca93404ee7e89e9889527d15f8671feb0a226625278d8 has only stale certification rows for a different machine profile","safe_to_retry_same_request":false},"module_generation":69}

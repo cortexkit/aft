@@ -1,0 +1,13 @@
+{
+  "job_id": "job-live-fixture",
+  "fingerprint": "fp-a",
+  "table_epoch": 7,
+  "done": true,
+  "vectors": [
+    {
+      "id": "item:1",
+      "content_sha256": "3e23e8160039594a33894f6564e1b1348bbd7a0088d42c4acb73eeaed59c009d",
+      "vector": [0.0, 1.0]
+    }
+  ]
+}
