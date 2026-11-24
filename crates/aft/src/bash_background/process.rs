@@ -932,27 +932,12 @@ pub(crate) fn terminate_pgid_with(pgid: i32, mut reap_leader: impl FnMut() -> bo
     });
 }
 
-#[cfg(unix)]
-pub(crate) fn terminate_pgid_leader_grace(pgid: i32, child: &mut Child) {
-    terminate_pgid_until(pgid, || {
-        // The leader's exit ends the wait, but its descendants may still hold
-        // the group, so they get the group SIGKILL.
-        if matches!(child.try_wait(), Ok(Some(_))) {
-            GraceCheck::LeaderExited
-        } else {
-            GraceCheck::Running
-        }
-    });
-}
-
 /// What one check during the SIGTERM grace period found.
 #[cfg(unix)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GraceCheck {
     /// Keep waiting.
     Running,
-    /// Stop waiting; members of the group may remain.
-    LeaderExited,
     /// The whole group was confirmed gone. Its id is free for the kernel to
     /// hand to an unrelated process group, so it must not be signalled again.
     GroupGone,
@@ -971,7 +956,6 @@ mod grace_tests {
     #[test]
     fn group_kill_is_skipped_only_once_the_group_is_confirmed_gone() {
         assert!(group_kill_needed(GraceCheck::Running));
-        assert!(group_kill_needed(GraceCheck::LeaderExited));
         assert!(!group_kill_needed(GraceCheck::GroupGone));
     }
 }

@@ -287,7 +287,7 @@ fn spawn_lsp_child(
     reclaim_root: Option<&Path>,
     root: &Path,
     kind: &ServerKind,
-) -> io::Result<Child> {
+) -> io::Result<(Child, super::child_registry::TrackedProcess)> {
     #[cfg(not(target_os = "linux"))]
     {
         registry.spawn_tracked_child(&mut command, reclaim_root, Some(root), Some(kind))
@@ -1024,6 +1024,7 @@ pub struct LspClient {
     root: PathBuf,
     state: ServerState,
     child: Child,
+    child_process: super::child_registry::TrackedProcess,
     // Held until the child exits or Drop kills/reaps it, including failed handshakes.
     _rust_analyzer_permit: Option<RustAnalyzerPermit>,
     // Drop runs after the process group has been killed and reaped.
@@ -1286,18 +1287,20 @@ impl LspClient {
                 .join(" "),
             COMMAND_DISPLAY_BYTES,
         );
-        let mut child = spawn_lsp_child(command, &child_registry, reclaim_root, &root, &kind)
-            .map_err(|err| {
-                // A spawn error from the OS names neither the program nor the
-                // directory; both are what a reader needs to fix it.
-                io::Error::new(
-                    err.kind(),
-                    format!(
-                        "failed to start `{command_display}` in {}: {err}",
-                        root.display()
-                    ),
-                )
-            })?;
+        let (mut child, child_process) =
+            spawn_lsp_child(command, &child_registry, reclaim_root, &root, &kind).map_err(
+                |err| {
+                    // A spawn error from the OS names neither the program nor the
+                    // directory; both are what a reader needs to fix it.
+                    io::Error::new(
+                        err.kind(),
+                        format!(
+                            "failed to start `{command_display}` in {}: {err}",
+                            root.display()
+                        ),
+                    )
+                },
+            )?;
         let child_pid = child.id();
 
         let (stdout, stdin, stderr) =
@@ -1306,9 +1309,8 @@ impl LspClient {
                 _ => {
                     // No client will own this child, so stop it here rather
                     // than leave an untracked process behind.
-                    kill_lsp_child_group(&mut child);
-                    let _ = child.wait();
-                    child_registry.untrack(child_pid);
+                    stop_tracked_child(&child_registry, &child_process, &mut child);
+                    child_registry.finish_client(&child_process);
                     return Err(io::Error::other("language server is missing a stdio pipe"));
                 }
             };
@@ -1319,9 +1321,8 @@ impl LspClient {
         let writer = match LspWriter::spawn(stdin) {
             Ok(writer) => writer,
             Err(err) => {
-                kill_lsp_child_group(&mut child);
-                let _ = child.wait();
-                child_registry.untrack(child_pid);
+                stop_tracked_child(&child_registry, &child_process, &mut child);
+                child_registry.finish_client(&child_process);
                 return Err(err);
             }
         };
@@ -1469,6 +1470,7 @@ impl LspClient {
             root,
             state: ServerState::Starting,
             child,
+            child_process,
             child_pid,
             writer,
             pending,
@@ -2534,7 +2536,7 @@ impl LspClient {
 
     fn shutdown_with_request_timeout(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         let result = self.shutdown_child(request_timeout);
-        if self.child.try_wait().ok().flatten().is_some() {
+        if self.try_wait_child().ok().flatten().is_some() {
             self._rust_analyzer_permit.take();
         }
         result
@@ -2542,13 +2544,11 @@ impl LspClient {
 
     fn shutdown_child(&mut self, request_timeout: Duration) -> Result<(), LspError> {
         if self.state == ServerState::Exited {
-            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
-        if self.child.try_wait()?.is_some() {
+        if self.try_wait_child()?.is_some() {
             self.state = ServerState::Exited;
-            self.child_registry.untrack(self.child_pid);
             return Ok(());
         }
 
@@ -2561,9 +2561,8 @@ impl LspClient {
             if matches!(err, LspError::ServerDisconnected(_)) {
                 return self.abort_live_child_after_shutdown_error(err);
             }
-            if matches!(err, LspError::Timeout(_)) && self.child.try_wait()?.is_some() {
+            if matches!(err, LspError::Timeout(_)) && self.try_wait_child()?.is_some() {
                 self.state = ServerState::Exited;
-                self.child_registry.untrack(self.child_pid);
                 return Err(LspError::ServerDisconnected(
                     "server exited during shutdown".into(),
                 ));
@@ -2585,7 +2584,7 @@ impl LspClient {
 
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         loop {
-            if self.child.try_wait()?.is_some() {
+            if self.try_wait_child()?.is_some() {
                 self.state = ServerState::Exited;
                 return Ok(());
             }
@@ -2593,9 +2592,8 @@ impl LspClient {
                 // Kill the entire process group, not just the wrapper PID, so
                 // npm-wrapped servers (biome's `node biome lsp-proxy` spawns
                 // a separate cli-darwin-arm64 child) don't leak orphans.
-                kill_lsp_child_group(&mut self.child);
+                self.stop_child();
                 self.state = ServerState::Exited;
-                self.child_registry.untrack(self.child_pid);
                 return Err(LspError::Timeout(format!(
                     "timed out waiting for {:?} to exit; did not exit within {}ms; killed and reaped",
                     self.kind,
@@ -2618,7 +2616,7 @@ impl LspClient {
     }
 
     pub fn child_exit_status(&mut self) -> Option<std::process::ExitStatus> {
-        let status = self.child.try_wait().ok().flatten();
+        let status = self.try_wait_child().ok().flatten();
         if status.is_some() {
             self._rust_analyzer_permit.take();
         }
@@ -2627,6 +2625,19 @@ impl LspClient {
 
     pub(crate) fn child_pid(&self) -> u32 {
         self.child_pid
+    }
+
+    pub(super) fn child_process(&self) -> super::child_registry::TrackedProcess {
+        self.child_process.clone()
+    }
+
+    fn try_wait_child(&mut self) -> io::Result<Option<std::process::ExitStatus>> {
+        self.child_registry
+            .try_wait_client(&self.child_process, &mut self.child)
+    }
+
+    fn stop_child(&mut self) {
+        stop_tracked_child(&self.child_registry, &self.child_process, &mut self.child);
     }
 
     /// Which part of its life this server is in, for exit reports.
@@ -2692,57 +2703,39 @@ impl LspClient {
         match self.reap_after_reader_exit(reason) {
             ReaderExitReap::AlreadyExited(status) => self.exit_report(phase, Some(status), false),
             ReaderExitReap::KilledWhileAlive => {
-                let killed_status = self.child.try_wait().ok().flatten();
+                let killed_status = self.try_wait_child().ok().flatten();
                 self.exit_report(phase, killed_status, true)
             }
         }
     }
 
     /// If the child is still running, kill its process group and wait bounded.
-    /// Always untrack. The caller logs whether this was a real exit or a reader
-    /// death that left the child alive.
+    /// The caller logs whether this was a real exit or a reader death that
+    /// left the child alive.
     pub(crate) fn reap_after_reader_exit(&mut self, _reason: &ServerExitReason) -> ReaderExitReap {
-        let outcome = match self.child.try_wait() {
+        let outcome = match self.try_wait_child() {
             Ok(Some(status)) => ReaderExitReap::AlreadyExited(status),
             Ok(None) | Err(_) => {
-                kill_lsp_child_group(&mut self.child);
-                self.wait_for_child_exit_bounded();
+                self.stop_child();
                 ReaderExitReap::KilledWhileAlive
             }
         };
         self.state = ServerState::Exited;
-        self.child_registry.untrack(self.child_pid);
         outcome
     }
 
     fn abort_live_child_after_shutdown_error(&mut self, err: LspError) -> Result<(), LspError> {
-        if self.child.try_wait()?.is_some() {
+        if self.try_wait_child()?.is_some() {
             self.state = ServerState::Exited;
-            self.child_registry.untrack(self.child_pid);
             return if matches!(err, LspError::ServerDisconnected(_)) {
                 Err(err)
             } else {
                 Ok(())
             };
         }
-        kill_lsp_child_group(&mut self.child);
-        self.wait_for_child_exit_bounded();
+        self.stop_child();
         self.state = ServerState::Exited;
-        self.child_registry.untrack(self.child_pid);
         Err(err)
-    }
-
-    fn wait_for_child_exit_bounded(&mut self) {
-        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        loop {
-            if self.child.try_wait().ok().flatten().is_some() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                return;
-            }
-            thread::sleep(EXIT_POLL_INTERVAL);
-        }
     }
 
     // Used only by the Unix-gated child-spawning test modules.
@@ -2961,14 +2954,8 @@ impl Drop for LspClient {
             self.child_registry.mark_client_gone(self.child_pid);
             return;
         }
-        // Record the transition before normal teardown untracks it. A control
-        // thread that snapshots in this narrow window sees an honest orphan
-        // rather than a child that is still reported as client-owned.
-        self.child_registry.mark_client_gone(self.child_pid);
-        // Untrack before the synchronous kill so signal cleanup cannot race this
-        // normal teardown.
-        self.child_registry.untrack(self.child_pid);
-        kill_lsp_child_group(&mut self.child);
+        self.stop_child();
+        self.child_registry.finish_client(&self.child_process);
     }
 }
 
@@ -3032,19 +3019,57 @@ fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
 /// Necessary because some LSP servers ship as npm-installed Node shims that
 /// spawn the real binary as a child. Killing only the wrapper PID leaves the
 /// real server orphaned to PID 1 and accumulates over time.
-pub(crate) fn kill_lsp_child_group(child: &mut std::process::Child) {
+fn stop_tracked_child(
+    registry: &LspChildRegistry,
+    process: &super::child_registry::TrackedProcess,
+    child: &mut Child,
+) {
+    if registry
+        .try_wait_client(process, child)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return;
+    }
     #[cfg(unix)]
     {
-        let pgid = child.id() as i32;
-        // LSP cleanup holds the manager lock, so retain the short leader-only wait.
-        crate::bash_background::process::terminate_pgid_leader_grace(pgid, child);
-        let _ = child.wait();
+        registry.signal_client(process, false);
+        let grace = Instant::now() + crate::bash_background::process::TERMINATE_GRACE;
+        for (deadline, force) in [(grace, false), (grace + SHUTDOWN_TIMEOUT, true)] {
+            if force {
+                registry.signal_client(process, true);
+            }
+            loop {
+                if registry
+                    .try_wait_client(process, child)
+                    .ok()
+                    .flatten()
+                    .is_some()
+                {
+                    return;
+                }
+                if Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(EXIT_POLL_INTERVAL);
+            }
+        }
     }
     #[cfg(not(unix))]
     {
+        let _ = registry;
         crate::bash_background::process::terminate_process(child);
         let _ = child.wait();
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn kill_lsp_child_group(child: &mut Child) {
+    let registry = LspChildRegistry::new();
+    registry.track(child.id());
+    let process = registry.tracked_processes().pop().unwrap();
+    stop_tracked_child(&registry, &process, child);
 }
 
 fn record_watched_file_registration(
