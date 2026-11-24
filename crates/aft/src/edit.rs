@@ -2630,7 +2630,7 @@ fn write_format_validate_impl(
         if let Some(original) = pre_write_content.as_ref() {
             #[cfg(test)]
             {
-                let hook = BEFORE_SYNTAX_ROLLBACK.with(|slot| slot.borrow_mut().take());
+                let hook = BEFORE_SYNTAX_ROLLBACK.with(|slot| slot.replace(None));
                 if let Some(hook) = hook {
                     hook();
                 }
