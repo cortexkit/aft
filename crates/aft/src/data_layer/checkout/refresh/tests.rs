@@ -21,6 +21,39 @@ fn published_graph_sections(checkout: &Checkout) -> BTreeMap<(u16, u16), Vec<u8>
     sections
 }
 
+fn assert_cold_build_log(log: &[String], root: &Path, trigger: &str) {
+    let completed = log
+        .iter()
+        .filter(|line| line.contains("cold call-graph build completed:"))
+        .collect::<Vec<_>>();
+    assert_eq!(completed.len(), 1, "{log:?}");
+    let prefix = format!(
+        "INFO cold call-graph build completed: root={} trigger={trigger} wall_ms=",
+        root.display()
+    );
+    let fields = completed[0]
+        .strip_prefix(prefix.as_str())
+        .unwrap_or_else(|| panic!("expected prefix {prefix:?}: {completed:?}"));
+    let wall_ms: f64 = fields.split_whitespace().next().unwrap().parse().unwrap();
+    assert!(wall_ms.is_finite() && wall_ms > 0.0, "{completed:?}");
+}
+
+#[test]
+fn cold_build_logs_one_completion_for_first_build_and_forced_rebuild() {
+    let root = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("lib.rs"), "pub fn callee() {}\n").unwrap();
+    let layer = Arc::new(DataLayer::new(8 << 20, 2));
+    let family = FamilyId::from_digest(Digest128::of(b"cold build completion"));
+    let checkout = Checkout::bind(layer, store.path(), family, root.path()).unwrap();
+
+    for trigger in ["first_build", "forced_rebuild"] {
+        let (report, log) = crate::logging::capture_log_lines(|| checkout.build().unwrap());
+        assert!(!report.superseded);
+        assert_cold_build_log(&log, root.path(), trigger);
+    }
+}
+
 #[test]
 fn refresh_memory_guard_publishes_the_cold_graph_byte_for_byte() {
     let root = tempfile::tempdir().unwrap();
@@ -49,6 +82,7 @@ fn refresh_memory_guard_publishes_the_cold_graph_byte_for_byte() {
             .unwrap()
     });
     assert!(stats.cold_build);
+    assert_cold_build_log(&log, root.path(), "refresh_fallback");
     let work = log
         .iter()
         .filter(|line| line.contains("guard_fallback="))
