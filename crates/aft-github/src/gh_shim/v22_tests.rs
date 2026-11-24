@@ -6,20 +6,15 @@ pub(super) fn args(raw: &[&str]) -> Vec<OsString> {
 }
 
 fn additions() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v22-additions.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("../../fixtures/gh_shim/v22-additions.json")).unwrap()
 }
 
 /// A synthetic v21 baseline: the tracked v20 fixture's rows at version 21 with
 /// only the test binding (cortexkit/aft -> alfonso-aft). The production v21
 /// payload is not tracked; v21 changed only bindings, so its rows are these.
 fn v21_value() -> Value {
-    let mut value: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let mut value: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     value["manifest_version"] = json!(21);
     value["bindings"] = json!({ "cortexkit/aft": "alfonso-aft" });
     value
@@ -300,10 +295,8 @@ fn v22_additions_validate_and_bind_claustrum_auth_like_its_siblings() {
         bindings,
         json!({ "cortexkit/claustrum-auth": "agent_0f4d7713e64e7cc4" })
     );
-    let previous: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let previous: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     for sibling in ["cortexkit/openai-auth", "cortexkit/common-auth"] {
         assert_eq!(
             previous["bindings"][sibling],

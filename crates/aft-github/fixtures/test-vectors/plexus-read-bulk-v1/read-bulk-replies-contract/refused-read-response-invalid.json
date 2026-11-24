@@ -1,0 +1,17 @@
+{
+  "name": "refused-read-response-invalid",
+  "reply": {
+    "content": [
+      {
+        "text": "read_response_invalid: GitHub returned an unusable read response",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "read_response_invalid",
+      "message": "GitHub returned an unusable read response",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

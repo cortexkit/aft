@@ -1,0 +1,233 @@
+{
+  "cases": [
+    {
+      "github_requests": [
+        {
+          "body": null,
+          "headers": [
+            [
+              "Accept",
+              "application/vnd.github+json"
+            ],
+            [
+              "Authorization",
+              "Bearer ghs_test_token"
+            ],
+            [
+              "User-Agent",
+              "prefrontal-core/0.1.0"
+            ],
+            [
+              "X-GitHub-Api-Version",
+              "2022-11-28"
+            ]
+          ],
+          "method": "GET",
+          "url": "https://api.github.com/repos/cortexkit/aft/issues/42/comments?per_page=100&page=1"
+        },
+        {
+          "body": "{\"body\":\"A concise comment.\"}",
+          "headers": [
+            [
+              "Accept",
+              "application/vnd.github+json"
+            ],
+            [
+              "Authorization",
+              "Bearer ghs_test_token"
+            ],
+            [
+              "User-Agent",
+              "prefrontal-core/0.1.0"
+            ],
+            [
+              "X-GitHub-Api-Version",
+              "2022-11-28"
+            ],
+            [
+              "Content-Type",
+              "application/json"
+            ]
+          ],
+          "method": "PATCH",
+          "url": "https://api.github.com/repos/cortexkit/aft/issues/comments/102"
+        }
+      ],
+      "name": "edit_last_happy",
+      "request": {
+        "action": "issue comment",
+        "body": {
+          "body": "A concise comment."
+        },
+        "edit_last": true,
+        "gh_route_schema": 1,
+        "manifest_version": 1,
+        "metadata": {
+          "agent_id": "<captured-agent-id>",
+          "pid": 4242
+        },
+        "operation": "gh.route",
+        "repository": "cortexkit/aft",
+        "rung_as_of_unix_secs": 1700000000,
+        "target": {
+          "number": "42"
+        }
+      },
+      "response": {
+        "field_order": [
+          "body",
+          "id"
+        ],
+        "gh_route_schema": 1,
+        "outcome": "result",
+        "result": {
+          "body": "A concise comment.",
+          "id": 102
+        }
+      }
+    },
+    {
+      "github_requests": [
+        {
+          "body": null,
+          "headers": [
+            [
+              "Accept",
+              "application/vnd.github+json"
+            ],
+            [
+              "Authorization",
+              "Bearer ghs_test_token"
+            ],
+            [
+              "User-Agent",
+              "prefrontal-core/0.1.0"
+            ],
+            [
+              "X-GitHub-Api-Version",
+              "2022-11-28"
+            ]
+          ],
+          "method": "GET",
+          "url": "https://api.github.com/repos/cortexkit/aft/issues/42/comments?per_page=100&page=1"
+        }
+      ],
+      "name": "edit_last_no_own_comment",
+      "request": {
+        "action": "issue comment",
+        "body": {
+          "body": "A concise comment."
+        },
+        "edit_last": true,
+        "gh_route_schema": 1,
+        "manifest_version": 1,
+        "metadata": {
+          "agent_id": "<captured-agent-id>",
+          "pid": 4242
+        },
+        "operation": "gh.route",
+        "repository": "cortexkit/aft",
+        "rung_as_of_unix_secs": 1700000000,
+        "target": {
+          "number": "42"
+        }
+      },
+      "response": {
+        "outcome": "refusal",
+        "refusal_code": "edit_last_no_own_comment"
+      }
+    },
+    {
+      "github_requests": [],
+      "name": "edit_last_unsupported_action",
+      "request": {
+        "action": "pr close",
+        "body": {
+          "body": "A concise comment."
+        },
+        "edit_last": true,
+        "gh_route_schema": 1,
+        "manifest_version": 1,
+        "metadata": {
+          "agent_id": "<captured-agent-id>",
+          "pid": 4242
+        },
+        "operation": "gh.route",
+        "repository": "cortexkit/aft",
+        "rung_as_of_unix_secs": 1700000000,
+        "target": {
+          "number": "42"
+        }
+      },
+      "response": {
+        "outcome": "refusal",
+        "refusal_code": "edit_last_unsupported_action"
+      }
+    },
+    {
+      "github_requests": [
+        {
+          "body": "{\"body\":\"A concise comment.\"}",
+          "headers": [
+            [
+              "Accept",
+              "application/vnd.github+json"
+            ],
+            [
+              "Authorization",
+              "Bearer ghs_test_token"
+            ],
+            [
+              "User-Agent",
+              "prefrontal-core/0.1.0"
+            ],
+            [
+              "X-GitHub-Api-Version",
+              "2022-11-28"
+            ],
+            [
+              "Content-Type",
+              "application/json"
+            ]
+          ],
+          "method": "POST",
+          "url": "https://api.github.com/repos/cortexkit/aft/issues/42/comments"
+        }
+      ],
+      "name": "absent_edit_last_create",
+      "request": {
+        "action": "issue comment",
+        "body": {
+          "body": "A concise comment."
+        },
+        "gh_route_schema": 1,
+        "manifest_version": 1,
+        "metadata": {
+          "agent_id": "<captured-agent-id>",
+          "pid": 4242
+        },
+        "operation": "gh.route",
+        "repository": "cortexkit/aft",
+        "rung_as_of_unix_secs": 1700000000,
+        "target": {
+          "number": "42"
+        }
+      },
+      "response": {
+        "field_order": [
+          "id"
+        ],
+        "gh_route_schema": 1,
+        "outcome": "result",
+        "result": {
+          "id": 1
+        }
+      }
+    }
+  ],
+  "provenance": {
+    "captured_on": "2026-08-28",
+    "normalization": "metadata.agent_id is replaced because the test store mints it randomly",
+    "source_test": "gh_route::tests::mint_edit_last_vectors_v1"
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "refused-job-log-unavailable",
+  "reply": {
+    "content": [
+      {
+        "text": "job_log_unavailable: GitHub has no available log for this job",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "job_log_unavailable",
+      "message": "GitHub has no available log for this job",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

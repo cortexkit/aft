@@ -1,16 +1,16 @@
 use super::*;
 
-include!("../../../aft/tests/fixtures/gh_shim/status_normalization.rs");
+include!("../../fixtures/gh_shim/status_normalization.rs");
 
 const MAIN: &str = "bdbf17caf5d0dae171399937876d454e0974b55a";
 
 #[test]
 fn audit_v19_classifier_matches_pinned_main_corpus() {
     let _lock = crate::test_env::process_env_lock();
-    let input = include_str!("../../../aft/tests/fixtures/gh_shim/v19-main-classifier-corpus.json");
+    let input = include_str!("../../fixtures/gh_shim/v19-main-classifier-corpus.json");
     let corpus: Value = serde_json::from_str(input).unwrap();
     let oracle: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v19-main-classifier-decisions.json"
+        "../../fixtures/gh_shim/v19-main-classifier-decisions.json"
     ))
     .unwrap();
     assert_eq!(corpus["reference_commit"], MAIN);
@@ -19,7 +19,7 @@ fn audit_v19_classifier_matches_pinned_main_corpus() {
         format!("{:x}", Sha256::digest(input.as_bytes())),
         oracle["corpus_sha256"]
     );
-    let manifest_bytes = include_str!("../../../aft/tests/fixtures/gh_shim/v19-manifest.json");
+    let manifest_bytes = include_str!("../../fixtures/gh_shim/v19-manifest.json");
     assert_eq!(
         format!("{:x}", Sha256::digest(manifest_bytes.as_bytes())),
         oracle["manifest_sha256"]
@@ -34,7 +34,7 @@ fn audit_v19_classifier_matches_pinned_main_corpus() {
         let binary = std::env::var_os("AFT_GH_MAIN_BINARY")
             .expect("live main probe requires its production binary");
         let corpus_path = Path::new(crate::test_support::manifest_dir())
-            .join("../aft/tests/fixtures/gh_shim/v19-main-classifier-corpus.json");
+            .join("fixtures/gh_shim/v19-main-classifier-corpus.json");
         let output = Command::new(probe)
             .args([
                 "--exact",

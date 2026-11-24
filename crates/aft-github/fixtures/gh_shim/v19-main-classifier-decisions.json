@@ -1,0 +1,4329 @@
+{
+  "reference_commit": "bdbf17caf5d0dae171399937876d454e0974b55a",
+  "corpus_sha256": "1319c2bc684c559888ff0a9d0b1a46706d3b194f57221dd5072cee4ff9518f44",
+  "manifest_sha256": "12c14ca1c8779b358998b000ef6210c75147ceec1f8c318fd5e7be42799a3573",
+  "decisions": [
+    {
+      "index": 0,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 0,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 0,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 1,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 1,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 1,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 2,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 2,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 2,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 3,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 3,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 3,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 4,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 4,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 4,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 5,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 5,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 5,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 6,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 6,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 6,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 7,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 7,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 7,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 8,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 8,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 8,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 9,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 9,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 9,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 10,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 10,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 10,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 11,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 11,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 11,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 12,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 12,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 12,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 13,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr review",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 13,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr review",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 13,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 14,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr review",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 14,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr review",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 14,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 15,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 15,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 15,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 16,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reaction",
+        "canonical": {
+          "argv_forms": [
+            "target-and-reaction"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "reaction"
+          ]
+        }
+      }
+    },
+    {
+      "index": 16,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reaction",
+        "canonical": {
+          "argv_forms": [
+            "target-and-reaction"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "reaction"
+          ]
+        }
+      }
+    },
+    {
+      "index": 16,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 17,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reaction",
+        "canonical": {
+          "argv_forms": [
+            "target-and-reaction"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "reaction"
+          ]
+        }
+      }
+    },
+    {
+      "index": 17,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reaction",
+        "canonical": {
+          "argv_forms": [
+            "target-and-reaction"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "reaction"
+          ]
+        }
+      }
+    },
+    {
+      "index": 17,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 18,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 18,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 18,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 19,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 19,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 19,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 20,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 20,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 20,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 21,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 21,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 21,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 22,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 22,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 22,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 23,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 23,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 23,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 24,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 24,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 24,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 25,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 25,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 25,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 26,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 26,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 26,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 27,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 27,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 27,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 28,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 28,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 28,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 29,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 29,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr reopen",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 29,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 30,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 30,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 30,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 31,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "labels"
+          ]
+        }
+      }
+    },
+    {
+      "index": 31,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "labels"
+          ]
+        }
+      }
+    },
+    {
+      "index": 31,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 32,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "labels"
+          ]
+        }
+      }
+    },
+    {
+      "index": 32,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "labels"
+          ]
+        }
+      }
+    },
+    {
+      "index": 32,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 33,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 33,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 33,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 34,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue edit",
+        "canonical": {
+          "argv_forms": [
+            "target-and-fields"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "title",
+            "body",
+            "add_labels",
+            "remove_labels",
+            "add_assignees",
+            "remove_assignees"
+          ]
+        }
+      }
+    },
+    {
+      "index": 34,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue edit",
+        "canonical": {
+          "argv_forms": [
+            "target-and-fields"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "title",
+            "body",
+            "add_labels",
+            "remove_labels",
+            "add_assignees",
+            "remove_assignees"
+          ]
+        }
+      }
+    },
+    {
+      "index": 34,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 35,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue edit",
+        "canonical": {
+          "argv_forms": [
+            "target-and-fields"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "title",
+            "body",
+            "add_labels",
+            "remove_labels",
+            "add_assignees",
+            "remove_assignees"
+          ]
+        }
+      }
+    },
+    {
+      "index": 35,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue edit",
+        "canonical": {
+          "argv_forms": [
+            "target-and-fields"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "title",
+            "body",
+            "add_labels",
+            "remove_labels",
+            "add_assignees",
+            "remove_assignees"
+          ]
+        }
+      }
+    },
+    {
+      "index": 35,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 36,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 36,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 36,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 37,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "base",
+            "head",
+            "draft"
+          ]
+        }
+      }
+    },
+    {
+      "index": 37,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "base",
+            "head",
+            "draft"
+          ]
+        }
+      }
+    },
+    {
+      "index": 37,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 38,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "base",
+            "head",
+            "draft"
+          ]
+        }
+      }
+    },
+    {
+      "index": 38,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr create",
+        "canonical": {
+          "argv_forms": [
+            "fields-only"
+          ],
+          "target_fields": [],
+          "body_fields": [
+            "title",
+            "body",
+            "base",
+            "head",
+            "draft"
+          ]
+        }
+      }
+    },
+    {
+      "index": 38,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 39,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 39,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 39,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 40,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr ready",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "undo"
+          ]
+        }
+      }
+    },
+    {
+      "index": 40,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr ready",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "undo"
+          ]
+        }
+      }
+    },
+    {
+      "index": 40,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 41,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr ready",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "undo"
+          ]
+        }
+      }
+    },
+    {
+      "index": 41,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr ready",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "undo"
+          ]
+        }
+      }
+    },
+    {
+      "index": 41,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 42,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 42,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 42,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 43,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr merge"
+      }
+    },
+    {
+      "index": 43,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr merge"
+      }
+    },
+    {
+      "index": 43,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 44,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr merge"
+      }
+    },
+    {
+      "index": 44,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr merge"
+      }
+    },
+    {
+      "index": 44,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 45,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 45,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 45,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 46,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release create"
+      }
+    },
+    {
+      "index": 46,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release create"
+      }
+    },
+    {
+      "index": 46,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 47,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release create"
+      }
+    },
+    {
+      "index": 47,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release create"
+      }
+    },
+    {
+      "index": 47,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 48,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 48,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 48,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 49,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release edit"
+      }
+    },
+    {
+      "index": 49,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release edit"
+      }
+    },
+    {
+      "index": 49,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 50,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release edit"
+      }
+    },
+    {
+      "index": 50,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release edit"
+      }
+    },
+    {
+      "index": 50,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 51,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 51,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 51,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 52,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release upload"
+      }
+    },
+    {
+      "index": 52,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release upload"
+      }
+    },
+    {
+      "index": 52,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 53,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release upload"
+      }
+    },
+    {
+      "index": 53,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release upload"
+      }
+    },
+    {
+      "index": 53,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 54,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 54,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 54,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 55,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo edit"
+      }
+    },
+    {
+      "index": 55,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo edit"
+      }
+    },
+    {
+      "index": 55,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 56,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo edit"
+      }
+    },
+    {
+      "index": 56,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo edit"
+      }
+    },
+    {
+      "index": 56,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 57,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 57,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 57,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 58,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run delete"
+      }
+    },
+    {
+      "index": 58,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run delete"
+      }
+    },
+    {
+      "index": 58,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 59,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run delete"
+      }
+    },
+    {
+      "index": 59,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run delete"
+      }
+    },
+    {
+      "index": 59,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 60,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 60,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 60,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 61,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run rerun"
+      }
+    },
+    {
+      "index": 61,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run rerun"
+      }
+    },
+    {
+      "index": 61,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 62,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run rerun"
+      }
+    },
+    {
+      "index": 62,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run rerun"
+      }
+    },
+    {
+      "index": 62,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 63,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 63,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 63,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 64,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow run"
+      }
+    },
+    {
+      "index": 64,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow run"
+      }
+    },
+    {
+      "index": 64,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 65,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow run"
+      }
+    },
+    {
+      "index": 65,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow run"
+      }
+    },
+    {
+      "index": 65,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 66,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 66,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 66,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 67,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr edit"
+      }
+    },
+    {
+      "index": 67,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr edit"
+      }
+    },
+    {
+      "index": 67,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 68,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr edit"
+      }
+    },
+    {
+      "index": 68,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr edit"
+      }
+    },
+    {
+      "index": 68,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 69,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 69,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 69,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 70,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "label create"
+      }
+    },
+    {
+      "index": 70,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "label create"
+      }
+    },
+    {
+      "index": 70,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 71,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "label create"
+      }
+    },
+    {
+      "index": 71,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "label create"
+      }
+    },
+    {
+      "index": 71,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 72,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 72,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 72,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 73,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run cancel"
+      }
+    },
+    {
+      "index": 73,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run cancel"
+      }
+    },
+    {
+      "index": 73,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 74,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run cancel"
+      }
+    },
+    {
+      "index": 74,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run cancel"
+      }
+    },
+    {
+      "index": 74,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 75,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 75,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 75,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 76,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo rename"
+      }
+    },
+    {
+      "index": 76,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo rename"
+      }
+    },
+    {
+      "index": 76,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 77,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo rename"
+      }
+    },
+    {
+      "index": 77,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo rename"
+      }
+    },
+    {
+      "index": 77,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 78,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 78,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 78,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 79,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo create"
+      }
+    },
+    {
+      "index": 79,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo create"
+      }
+    },
+    {
+      "index": 79,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 80,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo create"
+      }
+    },
+    {
+      "index": 80,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "repo create"
+      }
+    },
+    {
+      "index": 80,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 81,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 81,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 81,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 82,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow disable"
+      }
+    },
+    {
+      "index": 82,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow disable"
+      }
+    },
+    {
+      "index": 82,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 83,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow disable"
+      }
+    },
+    {
+      "index": 83,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow disable"
+      }
+    },
+    {
+      "index": 83,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 84,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 84,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 84,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 85,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow enable"
+      }
+    },
+    {
+      "index": 85,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow enable"
+      }
+    },
+    {
+      "index": 85,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 86,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow enable"
+      }
+    },
+    {
+      "index": 86,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow enable"
+      }
+    },
+    {
+      "index": 86,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 87,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 87,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 87,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 88,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 88,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 88,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 89,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 89,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 89,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 90,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 90,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 90,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 91,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 91,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 91,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 92,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 92,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 92,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 93,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 93,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 93,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 94,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 94,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 94,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 95,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 95,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 95,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 96,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 96,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 96,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 97,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 97,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 97,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 98,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 98,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 98,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 99,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 99,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 99,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 100,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 100,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 100,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 101,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 101,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 101,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 102,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 102,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 102,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 103,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 103,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 103,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 104,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 104,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 104,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 105,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 105,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 105,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 106,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 106,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 106,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 107,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 107,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 107,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 108,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 108,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 108,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 109,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 109,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 109,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 110,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 110,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 110,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 111,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 111,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 111,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 112,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 112,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 112,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 113,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 113,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 113,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 114,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 114,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 114,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 115,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 115,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 115,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 116,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 116,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 116,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 117,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 117,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 117,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 118,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 118,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 118,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 119,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 119,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 119,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 120,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 120,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 120,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 121,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 121,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 121,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 122,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 122,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 122,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 123,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:PUT:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 123,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:PUT:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 123,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 124,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 124,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 124,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 125,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 125,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 125,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 126,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 126,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 126,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 127,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:DELETE:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 127,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:DELETE:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 127,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 128,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 128,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 128,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 129,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 129,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 129,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 130,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 130,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 130,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 131,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:PUT:/repos/*/*/branches/*/protection"
+      }
+    },
+    {
+      "index": 131,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:PUT:/repos/*/*/branches/*/protection"
+      }
+    },
+    {
+      "index": 131,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 132,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:DELETE:/repos/*/*/branches/*/protection"
+      }
+    },
+    {
+      "index": 132,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:DELETE:/repos/*/*/branches/*/protection"
+      }
+    },
+    {
+      "index": 132,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 133,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "api:PATCH:/repos/*/*/issues/comments/*",
+        "canonical": {
+          "argv_forms": [
+            "body-only"
+          ],
+          "target_fields": [
+            "comment_id"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 133,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "api:PATCH:/repos/*/*/issues/comments/*",
+        "canonical": {
+          "argv_forms": [
+            "body-only"
+          ],
+          "target_fields": [
+            "comment_id"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 133,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 134,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:PUT:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 134,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:PUT:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 134,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 135,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:DELETE:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 135,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "api:DELETE:/repos/*/*/private-vulnerability-reporting"
+      }
+    },
+    {
+      "index": 135,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 136,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 136,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 136,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 137,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 137,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 137,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 138,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 138,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 138,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 139,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 139,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 139,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 140,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 140,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 140,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 141,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 141,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 141,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 142,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 142,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 142,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 143,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 143,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 143,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 144,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 144,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 144,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 145,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 145,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 145,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 146,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 146,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 146,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 147,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 147,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue comment",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 147,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 148,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr review",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 148,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr review",
+        "canonical": {
+          "argv_forms": [
+            "target-and-body"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "body"
+          ]
+        }
+      }
+    },
+    {
+      "index": 148,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 149,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 149,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "issue close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 149,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 150,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 150,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr close",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "comment"
+          ]
+        }
+      }
+    },
+    {
+      "index": 150,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 151,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 151,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 151,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 152,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 152,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 152,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 153,
+      "platform": "linux",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr ready",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "undo"
+          ]
+        }
+      }
+    },
+    {
+      "index": 153,
+      "platform": "macos",
+      "decision": {
+        "class": "governed",
+        "tuple": "pr ready",
+        "canonical": {
+          "argv_forms": [
+            "target-and-state"
+          ],
+          "target_fields": [
+            "number"
+          ],
+          "body_fields": [
+            "undo"
+          ]
+        }
+      }
+    },
+    {
+      "index": 153,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 154,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow run"
+      }
+    },
+    {
+      "index": 154,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "workflow run"
+      }
+    },
+    {
+      "index": 154,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 155,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "run cancel"
+      }
+    },
+    {
+      "index": 155,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "run cancel"
+      }
+    },
+    {
+      "index": 155,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 156,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "release edit"
+      }
+    },
+    {
+      "index": 156,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "release edit"
+      }
+    },
+    {
+      "index": 156,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 157,
+      "platform": "linux",
+      "decision": {
+        "class": "destructive"
+      }
+    },
+    {
+      "index": 157,
+      "platform": "macos",
+      "decision": {
+        "class": "destructive"
+      }
+    },
+    {
+      "index": 157,
+      "platform": "windows",
+      "decision": {
+        "class": "destructive"
+      }
+    },
+    {
+      "index": 158,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "label create"
+      }
+    },
+    {
+      "index": 158,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "label create"
+      }
+    },
+    {
+      "index": 158,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 159,
+      "platform": "linux",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr edit"
+      }
+    },
+    {
+      "index": 159,
+      "platform": "macos",
+      "decision": {
+        "class": "admin",
+        "tuple": "pr edit"
+      }
+    },
+    {
+      "index": 159,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 160,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 160,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 160,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 161,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 161,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 161,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 162,
+      "platform": "linux",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 162,
+      "platform": "macos",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 162,
+      "platform": "windows",
+      "decision": {
+        "class": "unclassified"
+      }
+    },
+    {
+      "index": 163,
+      "platform": "linux",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 163,
+      "platform": "macos",
+      "decision": {
+        "class": "mechanical"
+      }
+    },
+    {
+      "index": 163,
+      "platform": "windows",
+      "decision": {
+        "class": "mechanical"
+      }
+    }
+  ]
+}

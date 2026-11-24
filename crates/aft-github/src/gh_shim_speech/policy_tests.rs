@@ -659,10 +659,8 @@ fn protected_restart_and_disabled_writes_refuse_without_native_delegation() {
 #[test]
 fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
     let _lock = crate::test_env::process_env_lock();
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v10-manifest.json")).unwrap();
     let _fixture = RunWithFixture::new(&manifest);
     let _provisioned = Env::set(
         crate::gh_shim_speech::start_view::PROVISIONED_ENV,
@@ -685,10 +683,8 @@ fn provisioned_head_run_rerun_names_the_audited_operator_bypass() {
 #[test]
 fn provisioned_worker_run_rerun_never_suggests_the_operator_bypass() {
     let _lock = crate::test_env::process_env_lock();
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v10-manifest.json")).unwrap();
     let _fixture = RunWithFixture::new(&manifest);
     let _provisioned = Env::set(
         crate::gh_shim_speech::start_view::PROVISIONED_ENV,
@@ -874,10 +870,8 @@ fn post_probe_policy_arms_recheck_protection_and_refuse_provisioned_writes() {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn provisioned_admin_or_pr_labels_without_bypass_cannot_delegate() {
     let _lock = crate::test_env::process_env_lock();
-    let workflow: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v10-manifest.json"
-    ))
-    .unwrap();
+    let workflow: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v10-manifest.json")).unwrap();
     for (manifest, argv) in [
         (workflow, vec!["workflow", "run", "ci.yml", "--ref", "main"]),
         (

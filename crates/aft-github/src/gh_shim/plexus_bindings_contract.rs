@@ -7,8 +7,7 @@ use serde_json::Value;
 #[test]
 fn binding_provenance_pins_all_nineteen_upstream_files() {
     let files = files();
-    let provenance =
-        include_str!("../../../aft/tests/fixtures/gh_shim/plexus-bindings-contract/PROVENANCE.md");
+    let provenance = include_str!("../../fixtures/gh_shim/plexus-bindings-contract/PROVENANCE.md");
     assert!(provenance.contains("https://github.com/cortexkit/plexus"));
     assert!(
         provenance.contains("crates/plexus-core/tests/fixtures/gh_shim_wire/bindings-contract/")

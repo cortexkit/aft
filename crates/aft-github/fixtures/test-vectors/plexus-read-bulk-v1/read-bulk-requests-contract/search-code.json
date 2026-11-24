@@ -1,0 +1,54 @@
+{
+  "github": {
+    "expected_requests": [
+      {
+        "action": "github.search.code",
+        "args": {
+          "owner": "o",
+          "per_page": 10,
+          "q": "parse_config language:rust repo:o/x",
+          "repo": "x"
+        },
+        "connection_id": "github-handle-app-x"
+      }
+    ],
+    "replies": {
+      "github.search.code": {
+        "success": {
+          "body": {
+            "incomplete_results": false,
+            "items": [
+              {
+                "name": "config.rs",
+                "path": "src/config.rs"
+              }
+            ],
+            "total_count": 1
+          },
+          "next_page": null,
+          "rate_limit": {
+            "remaining": 4000,
+            "reset_at_ms": 4102444800000
+          },
+          "status": 200
+        }
+      }
+    }
+  },
+  "name": "search-code",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.search.code",
+      "args": {
+        "per_page": 10,
+        "q": "parse_config language:rust"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "agent_id": "agent-x",
+    "kind": "head"
+  }
+}

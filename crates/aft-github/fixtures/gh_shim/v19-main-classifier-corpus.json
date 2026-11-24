@@ -1,0 +1,1277 @@
+{
+  "reference_commit": "bdbf17caf5d0dae171399937876d454e0974b55a",
+  "manifest_fixture": "v19-manifest.json",
+  "platforms": [
+    "linux",
+    "macos",
+    "windows"
+  ],
+  "commands": [
+    {
+      "argv": []
+    },
+    {
+      "argv": [
+        "--version"
+      ]
+    },
+    {
+      "argv": [
+        "help"
+      ]
+    },
+    {
+      "argv": [
+        "help",
+        "api"
+      ]
+    },
+    {
+      "argv": [
+        "auth",
+        "status"
+      ]
+    },
+    {
+      "argv": [
+        "auth",
+        "token"
+      ]
+    },
+    {
+      "argv": [
+        "auth",
+        "login"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "comment",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "comment",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "comment",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "comment",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "comment",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "comment",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "review",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "review",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "review",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "reaction",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "reaction",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "reaction",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "close",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "close",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "close",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "reopen",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "reopen",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "reopen",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "close",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "close",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "close",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "reopen",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "reopen",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "reopen",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "create",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "create",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "create",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "edit",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "edit",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "edit",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "create",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "create",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "create",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "ready",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "ready",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "ready",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "merge",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "merge",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "merge",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "create",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "create",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "create",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "edit",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "edit",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "edit",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "upload",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "upload",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "upload",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "edit",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "edit",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "edit",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "delete",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "delete",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "delete",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "rerun",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "rerun",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "rerun",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "run",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "run",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "run",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "edit",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "edit",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "edit",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "label",
+        "create",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "label",
+        "create",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "label",
+        "create",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "cancel",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "cancel",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "cancel",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "rename",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "rename",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "rename",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "create",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "create",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "create",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "disable",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "disable",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "disable",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "enable",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "enable",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "enable",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "view",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "view",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "view",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "list"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "list",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "list",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "view",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "view",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "view",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "list"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "list",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "list",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "diff",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "diff",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "diff",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "checks",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "checks",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "checks",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "view",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "view",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "view",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "list"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "list",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "list",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "clone",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "clone",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "clone",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "view",
+        "7"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "view",
+        "7",
+        "--repo",
+        "cortexkit/aft"
+      ]
+    },
+    {
+      "argv": [
+        "repo",
+        "view",
+        "7",
+        "--edit-last"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "GET",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--method=GET",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "POST",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--method=POST",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "PUT",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--method=PUT",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "PATCH",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--method=PATCH",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "DELETE",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--method=DELETE",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "HEAD",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--method=HEAD",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "GET",
+        "**"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "PUT",
+        "/repos/cortexkit/aft/branches/7/protection"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "DELETE",
+        "/repos/cortexkit/aft/branches/7/protection"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "PATCH",
+        "/repos/cortexkit/aft/issues/comments/7"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "PUT",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "DELETE",
+        "/repos/cortexkit/aft/private-vulnerability-reporting"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "/repos/other/repo/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "https://api.github.com/repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-f",
+        "title=x",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "-X",
+        "GET",
+        "-F",
+        "title=x",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--input",
+        "body.json",
+        "repos/cortexkit/aft/issues"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "graphql"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "graphql",
+        "-f",
+        "query=query { viewer { login } }"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "graphql",
+        "-f",
+        "query=mutation { addComment(input:{}) { clientMutationId } }"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "GRAPHQL",
+        "-f",
+        "query=query { viewer { login } }"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "comment",
+        "7",
+        "--body",
+        "hello"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "review",
+        "7",
+        "--approve",
+        "--body",
+        "hello"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "close",
+        "7",
+        "--reason",
+        "completed"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "close",
+        "7",
+        "--delete-branch"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "comment",
+        "7",
+        "--delete-last"
+      ]
+    },
+    {
+      "argv": [
+        "issue",
+        "comment",
+        "7",
+        "--create-if-none"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "ready",
+        "7",
+        "--undo"
+      ]
+    },
+    {
+      "argv": [
+        "workflow",
+        "run",
+        "ci.yml"
+      ]
+    },
+    {
+      "argv": [
+        "run",
+        "cancel",
+        "7",
+        "--force"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "edit",
+        "v1",
+        "--draft=false"
+      ]
+    },
+    {
+      "argv": [
+        "release",
+        "edit",
+        "v1",
+        "--delete-tag"
+      ]
+    },
+    {
+      "argv": [
+        "label",
+        "create",
+        "new",
+        "--color",
+        "ffffff"
+      ]
+    },
+    {
+      "argv": [
+        "pr",
+        "edit",
+        "7",
+        "--add-label",
+        "bug"
+      ]
+    },
+    {
+      "argv": [
+        "totally-unknown",
+        "verb"
+      ]
+    },
+    {
+      "argv": [
+        "--repo"
+      ]
+    },
+    {
+      "argv": [
+        "pr"
+      ]
+    },
+    {
+      "argv": [
+        "api",
+        "--unknown",
+        "x"
+      ]
+    }
+  ]
+}

@@ -8595,31 +8595,23 @@ pub(crate) mod tests {
     }
 
     fn v9_fixture_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/v9-manifest.json"
-        ))
-        .expect("v9 manifest fixture")
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v9-manifest.json"))
+            .expect("v9 manifest fixture")
     }
 
     fn v10_fixture_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/v10-manifest.json"
-        ))
-        .expect("v10 manifest fixture")
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v10-manifest.json"))
+            .expect("v10 manifest fixture")
     }
 
     fn v11_fixture_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/v11-manifest.json"
-        ))
-        .expect("v11 manifest fixture")
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v11-manifest.json"))
+            .expect("v11 manifest fixture")
     }
 
     fn v12_fixture_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/v12-manifest.json"
-        ))
-        .expect("v12 manifest fixture")
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v12-manifest.json"))
+            .expect("v12 manifest fixture")
     }
 
     fn branch_protection_manifest(method: &str, tier: Tier) -> Manifest {
@@ -8645,7 +8637,7 @@ pub(crate) mod tests {
     fn edit_last_vectors_fixture() -> Value {
         // JSON has no comment syntax, so strip the human-readable provenance
         // header before parsing the copied producer fixture.
-        let fixture = include_str!("../../aft/tests/fixtures/gh_shim/edit-last-vectors-v1.json");
+        let fixture = include_str!("../fixtures/gh_shim/edit-last-vectors-v1.json");
         let json = fixture
             .lines()
             .filter(|line| !line.starts_with("//"))
@@ -9396,10 +9388,8 @@ pub(crate) mod tests {
     }
 
     fn v15_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/v15-manifest.json"
-        ))
-        .expect("synthetic v15 manifest fixture")
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v15-manifest.json"))
+            .expect("synthetic v15 manifest fixture")
     }
 
     #[test]
@@ -10032,8 +10022,7 @@ pub(crate) mod tests {
         let _gh_repo = ScopedTestEnvVar::set("GH_REPO", Some(CONSUMER_REPOSITORY));
         const EXPECTED_SHA256: &str =
             "cd22bb4de80b5c44b500d75220f03d3b0908f0e67101842de0c29c86b1e9b9e0";
-        let fixture_bytes =
-            include_bytes!("../../aft/tests/fixtures/gh_shim/edit-last-vectors-v1.json");
+        let fixture_bytes = include_bytes!("../fixtures/gh_shim/edit-last-vectors-v1.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(fixture_bytes)),
             EXPECTED_SHA256,
@@ -11985,10 +11974,8 @@ pub(crate) mod tests {
     }
 
     fn v16_manifest() -> Manifest {
-        serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/v16-manifest.json"
-        ))
-        .expect("synthetic v16 manifest fixture")
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v16-manifest.json"))
+            .expect("synthetic v16 manifest fixture")
     }
 
     /// Classify under the v16 fixture and canonicalize, returning the request
@@ -14974,14 +14961,13 @@ INHERITED FLAGS
     #[cfg(debug_assertions)] // verifies under the dev test key, which release trust sets exclude
     #[test]
     fn raw_bytes_round_trip_verifies_then_parses_from_the_fixture_envelope() {
-        let envelope: SignedManifest = serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/signed-envelope-v2.json"
-        ))
-        .expect("signed envelope fixture");
+        let envelope: SignedManifest =
+            serde_json::from_str(include_str!("../fixtures/gh_shim/signed-envelope-v2.json"))
+                .expect("signed envelope fixture");
         // The embedded bytes are exactly the published manifest file.
         assert_eq!(
             envelope.manifest_bytes,
-            include_str!("../../aft/tests/fixtures/gh_shim/initial-manifest-v1.json")
+            include_str!("../fixtures/gh_shim/initial-manifest-v1.json")
         );
         // Verify the received bytes first, parse second.
         let manifest = verify_manifest_signature(&envelope).expect("fixture signature verifies");
@@ -14992,12 +14978,11 @@ INHERITED FLAGS
 
     #[test]
     fn tampered_single_byte_fixture_fails_signature_verification() {
-        let canonical: SignedManifest = serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/signed-envelope-v2.json"
-        ))
-        .expect("canonical envelope fixture");
+        let canonical: SignedManifest =
+            serde_json::from_str(include_str!("../fixtures/gh_shim/signed-envelope-v2.json"))
+                .expect("canonical envelope fixture");
         let tampered: SignedManifest = serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"
+            "../fixtures/gh_shim/signed-envelope-v2-tampered.json"
         ))
         .expect("tampered envelope fixture");
         // The tampering is exactly one substituted byte inside the signed
@@ -15044,9 +15029,7 @@ INHERITED FLAGS
 
         write_envelope_fixture(
             &paths,
-            include_str!(
-                "../../aft/tests/fixtures/gh_shim/signed-envelope-v2-future-issued-at.json"
-            ),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2-future-issued-at.json"),
         );
         match load_manifest(&paths, TEST_NOW) {
             Err(ManifestProblem::Invalid(error)) => {
@@ -15060,9 +15043,7 @@ INHERITED FLAGS
         // classifies governed commands instead of scheduling an outage.
         write_envelope_fixture(
             &paths,
-            include_str!(
-                "../../aft/tests/fixtures/gh_shim/signed-envelope-v2-stale-issued-at.json"
-            ),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2-stale-issued-at.json"),
         );
         let ManifestResolution::Active(manifest) = resolve_manifest(&paths, TEST_NOW) else {
             panic!("expected the aged signed manifest to remain active");
@@ -15096,7 +15077,7 @@ INHERITED FLAGS
     #[test]
     fn standby_key_fixture_verifies_under_a_two_slot_trust_set_and_unknown_key_ids_are_refused() {
         let envelope: SignedManifest = serde_json::from_str(include_str!(
-            "../../aft/tests/fixtures/gh_shim/signed-envelope-v2-standby-key.json"
+            "../fixtures/gh_shim/signed-envelope-v2-standby-key.json"
         ))
         .expect("standby envelope fixture");
 
@@ -15236,7 +15217,7 @@ INHERITED FLAGS
         // Break the installed artifact: signed bytes tampered after signing.
         write_envelope_fixture(
             &paths,
-            include_str!("../../aft/tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2-tampered.json"),
         );
 
         // A failed validation immediately enters the regressed arm; time passing
@@ -15426,7 +15407,7 @@ INHERITED FLAGS
         // Accept the newer manifest first.
         write_envelope_fixture(
             &paths,
-            include_str!("../../aft/tests/fixtures/gh_shim/signed-envelope-v2-version-2.json"),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2-version-2.json"),
         );
         assert_eq!(load_manifest(&paths, TEST_NOW).unwrap().manifest_version, 2);
         assert_eq!(version_high_water(&paths), 2);
@@ -15435,7 +15416,7 @@ INHERITED FLAGS
         // incident, never as ordinary out-of-order arrival.
         write_envelope_fixture(
             &paths,
-            include_str!("../../aft/tests/fixtures/gh_shim/signed-envelope-v2.json"),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2.json"),
         );
         assert!(matches!(
             load_manifest(&paths, TEST_NOW),
@@ -15459,13 +15440,13 @@ INHERITED FLAGS
         // Re-presenting the newest accepted version is not a rollback.
         write_envelope_fixture(
             &paths,
-            include_str!("../../aft/tests/fixtures/gh_shim/signed-envelope-v2-version-2.json"),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2-version-2.json"),
         );
         assert_eq!(load_manifest(&paths, TEST_NOW).unwrap().manifest_version, 2);
     }
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(crate::test_support::manifest_dir()).join("../aft/tests/fixtures/gh_shim")
+        PathBuf::from(crate::test_support::manifest_dir()).join("fixtures/gh_shim")
     }
 
     fn canonical_manifest_bytes() -> Vec<u8> {
@@ -15668,7 +15649,7 @@ INHERITED FLAGS
         // refused and nothing is filed.
         write_envelope_fixture(
             &paths,
-            include_str!("../../aft/tests/fixtures/gh_shim/signed-envelope-v2-tampered.json"),
+            include_str!("../fixtures/gh_shim/signed-envelope-v2-tampered.json"),
         );
         assert!(load_manifest(&paths, TEST_NOW).is_err());
         assert!(retained_files(&paths).is_empty());

@@ -1,0 +1,45 @@
+{
+  "github": {
+    "expected_requests": [
+      {
+        "action": "github.repo.get",
+        "args": {
+          "accept": "application/vnd.github.diff",
+          "owner": "o",
+          "path": "pulls/12",
+          "repo": "x"
+        },
+        "connection_id": "github-handle-app-x"
+      }
+    ],
+    "replies": {
+      "github.repo.get": {
+        "success": {
+          "body": "diff --git a/src/lib.rs b/src/lib.rs\n",
+          "next_page": null,
+          "rate_limit": {
+            "remaining": 4000,
+            "reset_at_ms": 4102444800000
+          },
+          "status": 200
+        }
+      }
+    }
+  },
+  "name": "repo-get-diff",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.repo.get",
+      "args": {
+        "accept": "application/vnd.github.diff",
+        "path": "pulls/12"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "agent_id": "agent-x",
+    "kind": "head"
+  }
+}

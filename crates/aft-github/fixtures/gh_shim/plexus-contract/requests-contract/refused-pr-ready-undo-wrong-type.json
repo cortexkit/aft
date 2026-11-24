@@ -1,0 +1,20 @@
+{
+  "name": "refused-pr-ready-undo-wrong-type",
+  "request": {
+    "operation": "gh.route",
+    "gh_route_schema": 1,
+    "verb": "pr ready",
+    "repository": "cortexkit/aft",
+    "number": "7",
+    "manifest_version": 22,
+    "rung_as_of_unix_secs": 1793066213,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "undo": "false"
+  },
+  "expect": {
+    "refused": "request_field_forbidden{field: undo}"
+  }
+}

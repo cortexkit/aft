@@ -1,0 +1,130 @@
+{
+  "manifest_version": 22,
+  "tiers": {
+    "governed": [
+      {
+        "tuple": "pr edit",
+        "platform": ["macos", "linux"],
+        "reasoning": "Speech tier from v22 (operator-approved 2026-10-26): the bot edits the title and body of a pull request it opened. author_scope own: the route holder refuses a pull request whose author is not the calling seat's bot. Label changes keep the operator's label-only row under GH_SHIM_BYPASS=operator; reviewers, assignees, base, milestones and projects are refused before routing."
+      },
+      {
+        "tuple": "graphql resolvereviewthread",
+        "platform": ["macos", "linux"],
+        "reasoning": "Speech tier from v22: resolving a pull request review thread changes only that thread's public state, like closing an issue. The shim admits one inline resolveReviewThread mutation whose only input is threadId; the route holder checks the thread belongs to the bound repository."
+      },
+      {
+        "tuple": "graphql unresolvereviewthread",
+        "platform": ["macos", "linux"],
+        "reasoning": "Speech tier from v22, the inverse of resolveReviewThread, declared together so a resolution is reversible by the same seat."
+      }
+    ],
+    "admin": [
+      { "tuple": "extension install", "platform": ["macos", "linux"] },
+      { "tuple": "extension upgrade", "platform": ["macos", "linux"] },
+      { "tuple": "extension remove", "platform": ["macos", "linux"] },
+      {
+        "tuple": "stack merge",
+        "platform": ["macos", "linux"],
+        "reasoning": "Administration from v22, the same class as pr merge: gh stack merge lands a stack through the asynchronous merge endpoint under the operator's identity, with the audited bypass."
+      },
+      {
+        "tuple": "stack submit",
+        "platform": ["macos", "linux"],
+        "reasoning": "The gh-stack extension calls the GitHub API in-process with gh's own login, never through gh, so this verb would speak as the operator. Refused with the bot route named (git push, gh pr create, gh api on the stacks endpoints); runs only as audited operator administration under GH_SHIM_BYPASS=operator."
+      },
+      { "tuple": "stack sync", "platform": ["macos", "linux"] },
+      { "tuple": "stack link", "platform": ["macos", "linux"] },
+      { "tuple": "stack unstack", "platform": ["macos", "linux"] },
+      { "tuple": "stack delete", "platform": ["macos", "linux"] },
+      { "tuple": "stack checkout", "platform": ["macos", "linux"] },
+      {
+        "tuple": "stack push",
+        "platform": ["macos", "linux"],
+        "reasoning": "gh stack push writes the stack's branches to GitHub with the operator's git credentials, always as a --force-with-lease push (github/gh-stack cmd/push.go:103-109 calling internal/git/gitops.go:258-305), so it is the operator writing, not the bot: refused with the bot route named, or run as audited operator administration under GH_SHIM_BYPASS=operator."
+      }
+    ],
+    "mechanical": [
+      { "tuple": "extension list", "platform": ["macos", "linux"] },
+      {
+        "tuple": "stack view",
+        "platform": ["macos", "linux"],
+        "reasoning": "gh-stack subcommands whose source makes no GitHub write: reads under the operator's login and local git work only."
+      },
+      { "tuple": "stack switch", "platform": ["macos", "linux"] },
+      { "tuple": "stack up", "platform": ["macos", "linux"] },
+      { "tuple": "stack down", "platform": ["macos", "linux"] },
+      { "tuple": "stack top", "platform": ["macos", "linux"] },
+      { "tuple": "stack bottom", "platform": ["macos", "linux"] },
+      { "tuple": "stack trunk", "platform": ["macos", "linux"] },
+      { "tuple": "stack rebase", "platform": ["macos", "linux"] },
+      { "tuple": "stack modify", "platform": ["macos", "linux"] },
+      { "tuple": "stack init", "platform": ["macos", "linux"] },
+      { "tuple": "stack add", "platform": ["macos", "linux"] }
+    ]
+  },
+  "removed_from_admin": ["pr edit"],
+  "api_rules": [
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/pulls/*/comments/*/replies",
+      "tier": "governed",
+      "platform": ["macos", "linux"],
+      "rationale": "bot reply in a pull request review thread; body only"
+    },
+    {
+      "method": "PATCH",
+      "path_glob": "/repos/*/*/pulls/*",
+      "tier": "governed",
+      "platform": ["macos", "linux"],
+      "rationale": "routed as pr edit (author_scope own); title and body only, base refused"
+    },
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/stacks",
+      "tier": "governed",
+      "platform": ["macos", "linux"],
+      "rationale": "create a pull request stack as the bot; pull_requests only"
+    },
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/stacks/*/add",
+      "tier": "governed",
+      "platform": ["macos", "linux"],
+      "rationale": "append pull requests to a stack as the bot; pull_requests only"
+    },
+    {
+      "method": "POST",
+      "path_glob": "/repos/*/*/stacks/*/unstack",
+      "tier": "governed",
+      "platform": ["macos", "linux"],
+      "rationale": "dissolve a stack as the bot; no payload"
+    },
+    {
+      "method": "PUT",
+      "path_glob": "/repos/*/*/pulls/*/merge-async",
+      "tier": "admin",
+      "platform": ["macos", "linux"],
+      "rationale": "asynchronous merge, the same class as pr merge; operator identity, audited bypass"
+    }
+  ],
+  "canonicalization": {
+    "pr edit": {
+      "argv_forms": ["target-and-fields"],
+      "target_fields": ["number"],
+      "body_fields": ["title", "body"]
+    },
+    "graphql resolvereviewthread": {
+      "argv_forms": ["graphql-mutation"],
+      "target_fields": ["thread_id"],
+      "body_fields": []
+    },
+    "graphql unresolvereviewthread": {
+      "argv_forms": ["graphql-mutation"],
+      "target_fields": ["thread_id"],
+      "body_fields": []
+    }
+  },
+  "bindings": {
+    "cortexkit/claustrum-auth": "agent_0f4d7713e64e7cc4"
+  }
+}

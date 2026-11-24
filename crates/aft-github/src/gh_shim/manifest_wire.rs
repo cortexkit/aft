@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn manifest_sync_vectors_pin_requests_replies_refusals_and_notices() {
-        let bytes = include_bytes!("../../../../test-vectors/manifest-binding-v1.json");
+        let bytes = include_bytes!("../../fixtures/test-vectors/manifest-binding-v1.json");
         assert_eq!(
             format!("{:x}", Sha256::digest(bytes)),
             "8c070db5272be78e6682714a53628453e5bf7fda5a43431d4e73b4d663218433"

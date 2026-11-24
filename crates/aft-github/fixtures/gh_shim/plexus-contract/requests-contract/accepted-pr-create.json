@@ -1,0 +1,26 @@
+{
+  "name": "accepted-pr-create",
+  "request": {
+    "operation": "gh.route",
+    "gh_route_schema": 1,
+    "action": "pr create",
+    "target": {},
+    "body": {
+      "title": "Add the thing",
+      "body": "Opened by the bot.",
+      "base": "main",
+      "head": "feature",
+      "draft": true
+    },
+    "repository": "cortexkit/aft",
+    "manifest_version": 22,
+    "rung_as_of_unix_secs": 1793066213,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    }
+  },
+  "expect": {
+    "accepted": true
+  }
+}

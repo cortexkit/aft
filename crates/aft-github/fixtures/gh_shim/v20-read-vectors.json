@@ -1,0 +1,62 @@
+{
+  "get_success": {
+    "result": { "status": 200, "body": [{ "filename": "src/lib.rs" }], "next_page": 2 },
+    "content": [{ "type": "text", "text": "This presentation text is deliberately not a JSON envelope." }],
+    "isError": false,
+    "structuredContent": { "status": 200, "body": [{ "filename": "src/lib.rs" }], "next_page": 2 }
+  },
+  "search_success": {
+    "result": { "total_count": 1, "incomplete_results": false, "items": [{ "number": 7 }], "next_page": null },
+    "content": [{ "type": "text", "text": "Presentation only." }],
+    "isError": false,
+    "structuredContent": { "total_count": 1, "incomplete_results": false, "items": [{ "number": 7 }], "next_page": null }
+  },
+  "log_success": {
+    "result": { "body": "hello\n", "offset": 0, "length": 6, "total_bytes": 6 },
+    "content": [{ "type": "text", "text": "Presentation only." }],
+    "isError": false,
+    "structuredContent": { "body": "hello\n", "offset": 0, "length": 6, "total_bytes": 6 }
+  },
+  "log_ansi_and_split_character": {
+    "result": { "body": "\ufffdok\n\ufffd", "offset": 1, "length": 14, "total_bytes": 16 },
+    "content": [{ "type": "text", "text": "Raw log bytes: C3 A9 1B[32m ok 1B[0m 0A C3 BC. The page is raw bytes 1..15, so both edges split a character and the ANSI codes are stripped from the display body." }],
+    "isError": false,
+    "structuredContent": { "body": "\ufffdok\n\ufffd", "offset": 1, "length": 14, "total_bytes": 16 }
+  },
+  "log_split_character_growth": {
+    "result": { "body": "\ufffdx\ufffd", "offset": 1, "length": 3, "total_bytes": 5 },
+    "content": [{ "type": "text", "text": "Raw log bytes: C3 A9 78 C3 A9. The page is raw bytes 1..4, so each split character becomes a 3-byte U+FFFD and the display body is longer than the raw length." }],
+    "isError": false,
+    "structuredContent": { "body": "\ufffdx\ufffd", "offset": 1, "length": 3, "total_bytes": 5 }
+  },
+  "read_budget_exhausted": {
+    "error": { "code": "read_budget_exhausted", "message": "read budget used up for this bot", "transmission": "not_sent", "retry_after_ms": 1800000 },
+    "content": [{ "type": "text", "text": "read_budget_exhausted: read budget used up for this bot (retry after 1800 s)" }],
+    "isError": true
+  },
+  "repository_not_visible": {
+    "error": { "code": "repository_not_visible", "message": "repository is not visible to this installation", "transmission": "not_sent" },
+    "content": [{ "type": "text", "text": "Presentation only." }],
+    "isError": true
+  },
+  "endpoint_not_allowed": {
+    "error": { "code": "endpoint_not_allowed", "message": "query field is not allowed", "transmission": "not_sent", "field": "query.secret" },
+    "content": [{ "type": "text", "text": "Presentation only." }],
+    "isError": true
+  },
+  "response_too_large": {
+    "error": { "code": "response_too_large", "message": "response body exceeds 1048576 bytes", "transmission": "not_sent" },
+    "content": [{ "type": "text", "text": "Presentation only." }],
+    "isError": true
+  },
+  "agent_identity_required": {
+    "error": { "code": "agent_identity_required", "message": "scope has no bot identity", "transmission": "not_sent" },
+    "content": [{ "type": "text", "text": "Presentation only." }],
+    "isError": true
+  },
+  "vendor_error": {
+    "error": { "code": "vendor_error", "message": "GitHub answered 404", "status": 404, "transmission": "sent" },
+    "content": [{ "type": "text", "text": "vendor_error: GitHub answered 404" }],
+    "isError": true
+  }
+}

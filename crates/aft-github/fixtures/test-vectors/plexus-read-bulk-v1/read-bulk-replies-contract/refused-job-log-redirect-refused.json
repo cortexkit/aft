@@ -1,0 +1,17 @@
+{
+  "name": "refused-job-log-redirect-refused",
+  "reply": {
+    "content": [
+      {
+        "text": "job_log_redirect_refused: The job log download did not provide an allowed storage redirect",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "job_log_redirect_refused",
+      "message": "The job log download did not provide an allowed storage redirect",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

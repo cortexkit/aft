@@ -1,0 +1,37 @@
+{
+  "github": {
+    "expected_requests": [
+      {
+        "action": "github.repo.get",
+        "args": {
+          "accept": "application/vnd.github.patch",
+          "owner": "o",
+          "path": "pulls/12",
+          "repo": "x"
+        },
+        "connection_id": "github-handle-app-x"
+      }
+    ],
+    "replies": {
+      "github.repo.get": {
+        "vendor_error": "response_too_large"
+      }
+    }
+  },
+  "name": "refused-response-too-large",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.repo.get",
+      "args": {
+        "accept": "application/vnd.github.patch",
+        "path": "pulls/12"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "agent_id": "agent-x",
+    "kind": "head"
+  }
+}

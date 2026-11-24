@@ -687,7 +687,7 @@ fn every_vendored_plexus_refusal_code_has_an_explanation() {
         }
     }
     let dir = std::path::Path::new(crate::test_support::manifest_dir())
-        .join("../aft/tests/fixtures/gh_shim/plexus-contract/replies-contract");
+        .join("fixtures/gh_shim/plexus-contract/replies-contract");
     let mut found = std::collections::BTreeSet::new();
     let mut files = 0;
     for entry in std::fs::read_dir(&dir).unwrap() {
@@ -894,10 +894,8 @@ fn completed_replies_render_every_plexus_shape() {
         "id: 99\ncontent: \"eyes\"\n"
     );
     // Plexus's own reaction golden, captured from a real facade run.
-    let golden: Value = serde_json::from_str(include_str!(
-        "../../aft/tests/fixtures/plexus/seen-marker-reaction.json"
-    ))
-    .unwrap();
+    let golden: Value =
+        serde_json::from_str(include_str!("../fixtures/plexus/seen-marker-reaction.json")).unwrap();
     assert_eq!(
         rendered(golden["success"].clone()),
         "content: \"eyes\"\nid: 701\n"
@@ -1291,10 +1289,7 @@ impl Drop for FakeRelayDaemon {
 const TEST_NOW: u64 = 1_790_000_000;
 
 fn v12_manifest() -> Manifest {
-    serde_json::from_str(include_str!(
-        "../../aft/tests/fixtures/gh_shim/v12-manifest.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("../fixtures/gh_shim/v12-manifest.json")).unwrap()
 }
 
 fn bindings_ok() -> Value {
@@ -2921,10 +2916,7 @@ fn a_silent_retry_is_an_unknown_outcome_at_the_relay_budget() {
 }
 
 fn v16_manifest() -> Manifest {
-    serde_json::from_str(include_str!(
-        "../../aft/tests/fixtures/gh_shim/v16-manifest.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("../fixtures/gh_shim/v16-manifest.json")).unwrap()
 }
 
 /// Run a governed `gh pr create` through dispatch against the v16 fixture and

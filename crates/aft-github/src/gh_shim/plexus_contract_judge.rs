@@ -494,12 +494,10 @@ pub enum ContractExpect {
 /// name. Fails while the directory is empty or a file is not a vector, the
 /// way Plexus's own contract test does.
 ///
-/// The path uses the test runner's remapped `CARGO_MANIFEST_DIR`, so this works for
-/// the library unit tests and for the integration test that includes this
-/// file: in both cases the manifest directory is `crates/aft`.
+/// The test runner supplies the manifest directory of either `aft-github`
+/// or the facade integration test that includes this judge.
 pub fn load_vectors() -> Vec<ContractVector> {
-    let directory = Path::new(crate::test_support::manifest_dir())
-        .join("../aft/tests/fixtures/gh_shim/plexus-contract/requests-contract");
+    let directory = contract_vectors().join("requests-contract");
     let mut entries: Vec<_> = std::fs::read_dir(&directory)
         .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()))
         .map(|entry| entry.expect("contract vector entry").path())
@@ -578,8 +576,7 @@ pub fn load_vectors() -> Vec<ContractVector> {
 /// Load the native facade replies separately from the request-map decisions.
 /// GitHub pre-reads belong to Plexus, not to the shim's request-shape judge.
 pub fn load_reply_vectors() -> Vec<Value> {
-    let directory = Path::new(crate::test_support::manifest_dir())
-        .join("../aft/tests/fixtures/gh_shim/plexus-contract/replies-contract");
+    let directory = contract_vectors().join("replies-contract");
     let mut paths: Vec<_> = std::fs::read_dir(&directory)
         .expect("reply contract directory")
         .map(|entry| entry.expect("reply contract entry").path())
@@ -600,6 +597,16 @@ pub fn load_reply_vectors() -> Vec<Value> {
             vector
         })
         .collect()
+}
+
+fn contract_vectors() -> std::path::PathBuf {
+    let package = Path::new(crate::test_support::manifest_dir());
+    let fixtures = if package.ends_with("aft-github") {
+        "fixtures"
+    } else {
+        "tests/fixtures"
+    };
+    package.join(fixtures).join("gh_shim/plexus-contract")
 }
 
 /// Check the upstream exchange recorded by a reply vector before feeding its

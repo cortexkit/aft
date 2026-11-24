@@ -1,0 +1,21 @@
+{
+  "github": {
+    "expected_requests": [],
+    "replies": {}
+  },
+  "name": "refused-endpoint-not-allowed-path",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.repo.get",
+      "args": {
+        "path": "/user"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "agent_id": "agent-x",
+    "kind": "head"
+  }
+}

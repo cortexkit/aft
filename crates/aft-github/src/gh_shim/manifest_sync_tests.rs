@@ -132,7 +132,7 @@ fn manifest_sync_cursor_detects_version_seq_gap_and_epoch_change() {
 
 fn samples() -> Value {
     serde_json::from_slice::<Value>(include_bytes!(
-        "../../../../test-vectors/manifest-binding-v1.json"
+        "../../fixtures/test-vectors/manifest-binding-v1.json"
     ))
     .unwrap()["samples"]
         .clone()

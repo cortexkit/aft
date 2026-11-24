@@ -4,10 +4,8 @@ fn args(raw: &[&str]) -> Vec<OsString> {
     raw.iter().map(OsString::from).collect()
 }
 fn manifest() -> Manifest {
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     manifest.validate().unwrap();
     manifest
 }
@@ -663,7 +661,7 @@ fn render_failed_log(body: &str, job: Value) -> (Result<i32, ReadError>, Vec<u8>
 fn v20_log_failed_real_same_second_steps_print_whole_job_as_unknown_step() {
     // The companion native fixture preserves the operator's per-step archive;
     // this excerpt is from the worker's whole-job display-text response.
-    let body = include_str!("../../../aft/tests/fixtures/gh_shim/run-40083893167-job-display.txt");
+    let body = include_str!("../../fixtures/gh_shim/run-40083893167-job-display.txt");
     let (result, output) = render_failed_log(body, landing_policy_job());
     assert_eq!(result.unwrap(), 0);
     let expected = concat!(
@@ -1255,10 +1253,8 @@ fn v20_head_and_older_manifests_keep_mechanical_classification() {
 #[test]
 fn v20_signed_read_class_cannot_add_unknown_rows_or_change_v19_writes() {
     let manifest = manifest();
-    let previous: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v19-manifest.json"
-    ))
-    .unwrap();
+    let previous: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v19-manifest.json")).unwrap();
     for raw in [
         vec!["pr", "ready", "42"],
         vec!["issue", "comment", "42", "--body", "hello"],
@@ -2168,7 +2164,7 @@ fn v20_missing_ticket_refuses_without_delegation_or_credentials() {
 #[test]
 fn v20_preparer_pins_test_only_fixture_and_preserves_every_v19_row() {
     let root = Path::new(crate::test_support::manifest_dir()).join("../..");
-    let fixture = root.join("crates/aft/tests/fixtures/gh_shim/v19-manifest.json");
+    let fixture = crate::test_support::manifest_dir().join("fixtures/gh_shim/v19-manifest.json");
     let raw = fs::read(&fixture).unwrap();
     // This fixture digest is pinned for this test, not used as signing material.
     assert_eq!(
@@ -2584,7 +2580,7 @@ m.prepare(path, pathlib.Path(sys.argv[3]) / 'output.json', issued)
     Command::new("python3")
         .args(["-c", code])
         .arg(root.join("scripts/prepare-gh-shim-v20.py"))
-        .arg(root.join("crates/aft/tests/fixtures/gh_shim/v19-manifest.json"))
+        .arg(crate::test_support::manifest_dir().join("fixtures/gh_shim/v19-manifest.json"))
         .arg(dir.path())
         .arg(mode)
         .output()

@@ -1,0 +1,54 @@
+{
+  "github": {
+    "expected_requests": [
+      {
+        "action": "github.search.issues",
+        "args": {
+          "owner": "o",
+          "page": 2,
+          "q": "is:open label:bug repo:o/x",
+          "repo": "x"
+        },
+        "connection_id": "github-handle-app-x"
+      }
+    ],
+    "replies": {
+      "github.search.issues": {
+        "success": {
+          "body": {
+            "incomplete_results": false,
+            "items": [
+              {
+                "number": 7,
+                "title": "Crash on start"
+              }
+            ],
+            "total_count": 31
+          },
+          "next_page": 3,
+          "rate_limit": {
+            "remaining": 4000,
+            "reset_at_ms": 4102444800000
+          },
+          "status": 200
+        }
+      }
+    }
+  },
+  "name": "search-issues",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.search.issues",
+      "args": {
+        "page": 2,
+        "q": "is:open label:bug"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "kind": "worker",
+    "on_behalf_of_agent": "agent-x"
+  }
+}

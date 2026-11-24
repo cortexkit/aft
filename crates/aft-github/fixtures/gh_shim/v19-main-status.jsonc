@@ -1,0 +1,14 @@
+// Captured from origin/main bdbf17caf5d0dae171399937876d454e0974b55a.
+// Source: git archive of that commit, built on Linux; actual aft gh-shim --status stdout.
+// Profile: debug, development signing fixture; no production login or signing key is used.
+// Do not reformat the payload: it is a byte-level historical oracle.
+// The classifier capture adds only a cfg(test) probe; the production binary has no probe.
+// Normalized top-level fields (all other bytes remain exactly as emitted):
+// shim_version: package/build version provenance differs between reference and candidate.
+// executing_image: absolute executable path is host/build dependent.
+// manifests_dir: isolated state directory is a per-run temporary path.
+// real_gh_resolution: executable path and PATH positions depend on the host; normalized to null.
+// real_gh_resolution_error: PATH-resolution outcome/text is host dependent.
+// Raw stdout SHA-256: 001ebce4e871c2b14597b19c7539d983362dd2e36dd6eec1a46b58f4d680472e
+// END HEADER
+{"shim_version":"<VERSION_PROVENANCE>","gh_routing_schema_floor":1,"unexpected_gh_route_advertiser":null,"bound_holder":null,"agent_binding":null,"last_seam_refusal":null,"cached_manifest":{"version":19,"issued_at_unix_secs":1792326319,"verified_by_key_id":"gh-routing-dev-test-key-v1","compiled_trust_set_key_ids":["c9ad111282d1da10","gh-routing-dev-test-key-v1"],"version_error":null,"state":"valid","state_error":null,"diagnostics":[],"diagnostic_guidance":null},"last_rung":{"rung":null,"rung_error":"rung cache is unavailable","as_of_unix_secs":null,"as_of_unix_secs_error":"rung cache is unavailable","determination_inputs":null,"determination_inputs_error":"rung cache is unavailable","recorded_by_image_path":null,"recorded_by_version":null,"recorded_by_repo_key":null},"last_probe":null,"bypass_audit":[],"bypass_audit_error":null,"executing_image":"<EXECUTING_IMAGE>","executing_image_error":null,"real_gh_resolution":null,"real_gh_resolution_error":"<HOST_PATH_RESOLUTION>","manifests_retained":1,"manifests_dir":"<STATE_DIR>/manifests"}

@@ -1,0 +1,17 @@
+{
+  "name": "refused-job-log-read-limit",
+  "reply": {
+    "content": [
+      {
+        "text": "job_log_read_limit: The job log download exceeded its time or byte limit",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "job_log_read_limit",
+      "message": "The job log download exceeded its time or byte limit",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

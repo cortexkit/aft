@@ -1,10 +1,7 @@
 use super::*;
 
 fn vectors() -> Value {
-    serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-read-vectors.json"
-    ))
-    .unwrap()
+    serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-read-vectors.json")).unwrap()
 }
 
 fn bulk_vectors() -> Vec<(&'static str, &'static [u8], &'static [u8])> {
@@ -13,13 +10,13 @@ fn bulk_vectors() -> Vec<(&'static str, &'static [u8], &'static [u8])> {
             (
                 $name,
                 include_bytes!(concat!(
-                    "../../../../test-vectors/plexus-read-bulk-v1/read-bulk-requests-contract/",
+                    "../../fixtures/test-vectors/plexus-read-bulk-v1/read-bulk-requests-contract/",
                     $name,
                     ".json"
                 ))
                 .as_slice(),
                 include_bytes!(concat!(
-                    "../../../../test-vectors/plexus-read-bulk-v1/read-bulk-replies-contract/",
+                    "../../fixtures/test-vectors/plexus-read-bulk-v1/read-bulk-replies-contract/",
                     $name,
                     ".json"
                 ))
@@ -144,10 +141,8 @@ fn plexus_read_bulk_refusals_retry_only_the_three_safe_read_vectors() {
         repo: "cortexkit/aft".into(),
         agent_id: "aft-bot".into(),
     };
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     let relay = RelayContext {
         worker_broker: None,
         connection_file: None,
@@ -776,10 +771,8 @@ fn read_draft_v19_stops_before_the_executor_transport() {
         repo: "cortexkit/aft".into(),
         agent_id: "not-sent".into(),
     };
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v19-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v19-manifest.json")).unwrap();
     let relay = RelayContext {
         worker_broker: None,
         connection_file: None,
@@ -817,10 +810,8 @@ fn read_draft_executor_crosses_real_daemon_framing_without_identity_or_retries()
         repo: "cortexkit/aft".into(),
         agent_id: "must-not-be-transmitted".into(),
     };
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     let relay = RelayContext {
         worker_broker: None,
         connection_file: Some(connection),
@@ -1095,11 +1086,11 @@ fn job_log_reply_with_ansi_and_split_characters_is_accepted() {
 #[test]
 fn job_log_reply_matches_plexus_display_text_vector() {
     let request: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.request.json"
+        "../../fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.request.json"
     ))
     .unwrap();
     let reply: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.reply.json"
+        "../../fixtures/gh_shim/plexus-github-read-bot/job-log-range-display-text.reply.json"
     ))
     .unwrap();
     let request: WireRequest =

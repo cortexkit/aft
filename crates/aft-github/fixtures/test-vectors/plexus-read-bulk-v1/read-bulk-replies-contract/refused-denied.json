@@ -1,0 +1,18 @@
+{
+  "name": "refused-denied",
+  "reply": {
+    "content": [
+      {
+        "text": "grant_action_selector: governance denied the connector operation",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "grant_action_selector",
+      "message": "governance denied the connector operation",
+      "terminal": true,
+      "transmission": "not_sent"
+    },
+    "isError": true
+  }
+}

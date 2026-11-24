@@ -1,0 +1,17 @@
+{
+  "name": "refused-response-too-large",
+  "reply": {
+    "content": [
+      {
+        "text": "response_too_large: GitHub's reply is larger than 1 MiB and was not returned",
+        "type": "text"
+      }
+    ],
+    "error": {
+      "code": "response_too_large",
+      "message": "GitHub's reply is larger than 1 MiB and was not returned",
+      "transmission": "sent"
+    },
+    "isError": true
+  }
+}

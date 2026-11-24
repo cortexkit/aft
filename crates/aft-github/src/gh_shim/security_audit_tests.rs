@@ -48,9 +48,9 @@ impl Fixture {
         }
         let paths = StatePaths::from_process();
         let name = if version == 19 {
-            include_str!("../../../aft/tests/fixtures/gh_shim/v19-manifest.json")
+            include_str!("../../fixtures/gh_shim/v19-manifest.json")
         } else {
-            include_str!("../../../aft/tests/fixtures/gh_shim/v20-manifest.json")
+            include_str!("../../fixtures/gh_shim/v20-manifest.json")
         };
         let manifest: Manifest = serde_json::from_str(name).unwrap();
         tests::write_signed_manifest(&paths, manifest, unix_seconds());
@@ -208,7 +208,7 @@ fn audit_v19_full_audit_status_matches_legacy_bytes_even_with_a_lookup_record() 
     .unwrap();
     // The historical capture predates the summary default; --audit retains its schema.
     let rendered = render_self_report(&fixture.paths, true).unwrap();
-    let captured = include_str!("../../../aft/tests/fixtures/gh_shim/v19-main-status.jsonc");
+    let captured = include_str!("../../fixtures/gh_shim/v19-main-status.jsonc");
     let (_, expected) = captured.split_once("// END HEADER\n").unwrap();
     let normalized = super::v19_compat_tests::normalize_v19_status(&rendered).unwrap();
     assert_eq!(
@@ -1316,10 +1316,8 @@ fn audit_head_write_still_routes_through_the_relay() {
     // Windows LocalAppData storage default to the fixture's temporary home.
     let storage = fixture.home.path().join("storage");
     let _storage = Env::set("AFT_STORAGE_DIR", Some(storage.as_os_str()));
-    let mut manifest_value: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let mut manifest_value: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     // The fixture manifests review only macOS and Linux, but the shim
     // classifies with current_platform(): anywhere else the exercised tuple
     // would read as undeclared and the write could never route. Extend the

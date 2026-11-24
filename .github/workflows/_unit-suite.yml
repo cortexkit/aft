@@ -90,6 +90,7 @@ jobs:
         run: |
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/github-fixture-copies.py
       - name: Audit packaged library test inputs
         run: |
           cargo check --locked -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-index -p aft-inspect -p aft-tools -p aft-subc --lib \
@@ -99,6 +100,7 @@ jobs:
             --features aft-engine/test-support,aft-engine/test-hooks,aft-tools/test-support,aft-tools/test-hooks,aft-subc/test-hooks,aft-subc/test-runner-notice-fixtures \
             --message-format=json > "$RUNNER_TEMP/aft-engine-packaged-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-packaged-build.jsonl" --packaged
+          python3 crates/aft-engine/checks/github-fixture-copies.py
       - name: Engine source and shell registration guards (default features)
         run: |
           output="$RUNNER_TEMP/engine-source-guards.txt"
@@ -954,6 +956,7 @@ jobs:
           # Keep the archive's codegen setting so Cargo can reuse its libtest build.
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
+          python3 crates/aft-engine/checks/github-fixture-copies.py
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -1734,6 +1737,7 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"
           python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"
+          python crates/aft-engine/checks/github-fixture-copies.py
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 

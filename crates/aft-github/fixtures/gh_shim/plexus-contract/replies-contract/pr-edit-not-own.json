@@ -1,0 +1,54 @@
+{
+  "github_reads": [
+    {
+      "request_body": null,
+      "request_line": "GET /repos/org/repo/pulls/7 HTTP/1.1",
+      "response": {
+        "base": {
+          "repo": {
+            "url": "https://api.github.com/repos/org/repo"
+          }
+        },
+        "html_url": "https://github.com/org/repo/pull/7",
+        "number": 7,
+        "user": {
+          "login": "octocat",
+          "type": "User"
+        }
+      },
+      "status": 200
+    }
+  ],
+  "name": "pr-edit-not-own",
+  "reply": {
+    "repo_binding_generation": 1,
+    "result": {
+      "code": "pr_edit_not_own",
+      "detail": {
+        "message": "'pr edit' changes only pull requests this repository's bot opened (app-fixture[bot]); #7 was opened by octocat. Ask the author, or run it as the operator with GH_SHIM_BYPASS=operator."
+      },
+      "refusal_code": "pr_edit_not_own",
+      "retry_same_nonce": false,
+      "status": "refused"
+    }
+  },
+  "request": {
+    "action": "pr edit",
+    "author_scope": "own",
+    "body": {
+      "title": "T"
+    },
+    "gh_route_schema": 1,
+    "manifest_version": 22,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "operation": "gh.route",
+    "repository": "org/repo",
+    "rung_as_of_unix_secs": 1793066213,
+    "target": {
+      "number": "7"
+    }
+  }
+}

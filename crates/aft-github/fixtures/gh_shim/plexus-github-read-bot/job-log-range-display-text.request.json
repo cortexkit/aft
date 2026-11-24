@@ -1,0 +1,18 @@
+{
+  "scope": {
+    "kind": "head",
+    "agent_id": "agent-x"
+  },
+  "call": {
+    "name": "github_read",
+    "arguments": {
+      "action": "github.actions.job_log",
+      "repository": "o/x",
+      "args": {
+        "job_id": 42,
+        "offset": 100,
+        "length": 18
+      }
+    }
+  }
+}

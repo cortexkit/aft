@@ -1,0 +1,30 @@
+{
+  "name": "accepted-issue-edit-labels",
+  "request": {
+    "operation": "gh.route",
+    "gh_route_schema": 1,
+    "action": "issue edit",
+    "target": {
+      "number": "42"
+    },
+    "body": {
+      "add_labels": [
+        "triaged"
+      ],
+      "remove_labels": [
+        "needs-triage"
+      ]
+    },
+    "repository": "cortexkit/aft",
+    "manifest_version": 22,
+    "rung_as_of_unix_secs": 1793066213,
+    "metadata": {
+      "agent_id": "alfonso-aft",
+      "pid": 4242
+    },
+    "author_scope": "own"
+  },
+  "expect": {
+    "accepted": true
+  }
+}

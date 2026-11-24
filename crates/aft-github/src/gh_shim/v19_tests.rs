@@ -1,19 +1,15 @@
 use super::*;
 
 fn manifest() -> Manifest {
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v19-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v19-manifest.json")).unwrap();
     manifest.validate().unwrap();
     manifest
 }
 
 fn v18_manifest() -> Manifest {
-    let manifest: Manifest = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v18-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Manifest =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v18-manifest.json")).unwrap();
     manifest.validate().unwrap();
     manifest
 }

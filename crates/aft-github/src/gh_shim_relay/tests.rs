@@ -95,7 +95,7 @@ impl RelayTransport for FakeTransport {
 
 fn golden() -> Value {
     serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/plexus/seen-marker-reaction.json"
+        "../../fixtures/plexus/seen-marker-reaction.json"
     ))
     .unwrap()
 }
@@ -1622,7 +1622,7 @@ async fn read_bulk_selection_follows_each_routes_live_advertisement() {
     let description = Arc::new(Mutex::new(json!({})));
     let advertised = description.clone();
     let reply: Value = serde_json::from_str(include_str!(
-        "../../../../test-vectors/plexus-read-bulk-v1/read-bulk-replies-contract/repo-get-diff.json"
+        "../../fixtures/test-vectors/plexus-read-bulk-v1/read-bulk-replies-contract/repo-get-diff.json"
     ))
     .unwrap();
     let expected_reply = reply["reply"].clone();
@@ -1715,10 +1715,9 @@ fn read_relay_uses_github_read_and_the_ticket_scope_without_identity_fields() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read", "read-call", "/p");
     for worker in [true] {
         let transport = FakeTransport::scoped();
-        let vector: Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/gh_shim/v20-read-vectors.json"
-        ))
-        .unwrap();
+        let vector: Value =
+            serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-read-vectors.json"))
+                .unwrap();
         transport.push_plexus(Ok(vector["get_success"].clone()));
         let mut scope = stamp(None, false, true);
         if worker {
@@ -1815,10 +1814,8 @@ fn read_relay_requires_live_ticket_and_scoped_transport_without_fallback() {
 fn read_relay_preserves_tool_refusals_and_treats_error_frames_as_transport_errors() {
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue("ses-read-errors", "read-call", "/p");
     let scopes = scopes_for("ses-read-errors", Some(read_worker_stamp()));
-    let vector: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-read-vectors.json"
-    ))
-    .unwrap();
+    let vector: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-read-vectors.json")).unwrap();
     for code in [
         "read_budget_exhausted",
         "repository_not_visible",
@@ -1860,10 +1857,8 @@ fn read_relay_preserves_tool_refusals_and_treats_error_frames_as_transport_error
 fn audit_daemon_read_rejects_head_and_unparented_run_scopes() {
     let ticket =
         crate::gh_shim_ticket::ScopedTicket::issue("ses-read-head-audit", "read-call", "/p");
-    let vector: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-read-vectors.json"
-    ))
-    .unwrap();
+    let vector: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-read-vectors.json")).unwrap();
     for kind in [
         subc_protocol::scope::ScopeKind::Head,
         subc_protocol::scope::ScopeKind::Ephemeral,
@@ -1887,10 +1882,8 @@ fn audit_daemon_read_rejects_head_and_unparented_run_scopes() {
 
 #[test]
 fn audit_daemon_read_binds_repository_to_the_redeemed_checkout() {
-    let manifest: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v20-manifest.json")).unwrap();
     assert!(manifest["bindings"].get("cortexkit/aft").is_some());
     assert!(manifest["bindings"].get("cortexkit/common-auth").is_some());
     let ticket = crate::gh_shim_ticket::ScopedTicket::issue(

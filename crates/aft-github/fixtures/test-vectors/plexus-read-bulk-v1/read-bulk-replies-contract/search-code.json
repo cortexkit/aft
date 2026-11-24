@@ -1,0 +1,34 @@
+{
+  "name": "search-code",
+  "reply": {
+    "content": [
+      {
+        "text": "{\n  \"result\": {\n    \"incomplete_results\": false,\n    \"items\": [\n      {\n        \"name\": \"config.rs\",\n        \"path\": \"src/config.rs\"\n      }\n    ],\n    \"next_page\": null,\n    \"total_count\": 1\n  }\n}",
+        "type": "text"
+      }
+    ],
+    "isError": false,
+    "result": {
+      "incomplete_results": false,
+      "items": [
+        {
+          "name": "config.rs",
+          "path": "src/config.rs"
+        }
+      ],
+      "next_page": null,
+      "total_count": 1
+    },
+    "structuredContent": {
+      "incomplete_results": false,
+      "items": [
+        {
+          "name": "config.rs",
+          "path": "src/config.rs"
+        }
+      ],
+      "next_page": null,
+      "total_count": 1
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "github": {
+    "expected_requests": [
+      {
+        "action": "github.repo.get",
+        "args": {
+          "accept": "application/vnd.github+json",
+          "owner": "o",
+          "path": "pulls/999",
+          "repo": "x"
+        },
+        "connection_id": "github-handle-app-x"
+      }
+    ],
+    "replies": {
+      "github.repo.get": {
+        "vendor_error": "http_404"
+      }
+    }
+  },
+  "name": "refused-vendor-error",
+  "request": {
+    "method": "github.read.bulk",
+    "params": {
+      "action": "github.repo.get",
+      "args": {
+        "path": "pulls/999"
+      },
+      "repository": "o/x"
+    }
+  },
+  "scope": {
+    "agent_id": "agent-x",
+    "kind": "head"
+  }
+}

@@ -2,10 +2,8 @@ use super::*;
 
 pub(super) fn manifest() -> Manifest {
     let mut manifest = v22_tests::manifest();
-    let additions: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/gh_shim/v23-additions.json"
-    ))
-    .unwrap();
+    let additions: Value =
+        serde_json::from_str(include_str!("../../fixtures/gh_shim/v23-additions.json")).unwrap();
     manifest.manifest_version = 23;
     manifest.tiers.get_mut(&Tier::Governed).unwrap().extend(
         serde_json::from_value::<Vec<TupleDecl>>(additions["tiers"]["governed"].clone()).unwrap(),
