@@ -2764,6 +2764,42 @@ describe("subc AbortSignal transport", () => {
     await pool.shutdown();
   });
 
+  test("cancels one caller during route admission without cancelling its sibling", async () => {
+    let release!: () => void;
+    const client = new FakeClient(async () => envelope({ success: true, text: "sibling" }));
+    client.routeOpenGate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { pool } = poolWith(client);
+    const transport = pool.getBridge(TEST_PROJECT_ROOT);
+    const controller = new AbortController();
+    const aborted = transport
+      .toolCall("session-abort-open", "read", {}, { abortSignal: controller.signal })
+      .catch((error: unknown) => error);
+    const sibling = transport.toolCall("session-abort-open", "read", {});
+
+    try {
+      await tick();
+      expect(client.routeOpens).toHaveLength(1);
+      controller.abort();
+      const outcome = await Promise.race([
+        aborted,
+        new Promise<string>((resolve) => setTimeout(() => resolve("still pending"), 20)),
+      ]);
+      expect(outcome).toMatchObject({ name: "AbortError" });
+      expect(client.requests).toHaveLength(0);
+      expect(client.closedRoutes).toEqual([]);
+
+      release();
+      await expect(sibling).resolves.toMatchObject({ text: "sibling" });
+      expect(client.requests).toHaveLength(1);
+    } finally {
+      release();
+      await Promise.allSettled([aborted, sibling]);
+      await pool.shutdown();
+    }
+  });
+
   test("does not dispatch a Rust call when the signal is already aborted", async () => {
     const client = new FakeClient(async () => envelope({ success: true, text: "unexpected" }));
     const { pool } = poolWith(client);
@@ -2776,7 +2812,8 @@ describe("subc AbortSignal transport", () => {
         .send("aft_search", { query: "needle" }, { abortSignal: controller.signal }),
     ).rejects.toMatchObject({ name: "AbortError" });
     expect(client.requests).toHaveLength(0);
-    expect(client.closedRoutes).toEqual([1]);
+    expect(client.routeOpens).toHaveLength(0);
+    expect(client.closedRoutes).toEqual([]);
 
     await pool.shutdown();
   });
