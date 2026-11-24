@@ -490,6 +490,25 @@ mod tests {
     }
 
     #[test]
+    fn review_opus3_rust_modules_walk_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                let nested = "(".repeat(10_000) + "1" + &")".repeat(10_000);
+                let source = format!("mod pre;\nfn f() {{ let n = {nested}; mod local {{ mod child; }} }}\npub mod post;");
+                let tree = parse_source_with_parser(Path::new("nested.rs"), &source, LangId::Rust).unwrap();
+                assert!(!tree.root_node().has_error());
+                let modules = rust_modules(tree.root_node(), &source);
+                assert_eq!(modules.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(), ["pre", "local", "post"]);
+                assert_eq!(modules[1].children[0].name, "child");
+                assert!(modules[2].exported);
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
     fn h_header_missing_nodes_count_as_errors_and_keep_c_when_all_fail() {
         let source = "int missing_semicolon(void)";
         let old_c = parse_source_with_parser(Path::new("missing.c"), source, LangId::C).unwrap();

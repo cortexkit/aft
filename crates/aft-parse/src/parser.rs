@@ -1228,44 +1228,8 @@ pub struct RustModule {
     pub children: Vec<RustModule>,
 }
 
-pub fn rust_modules(root: Node<'_>, source: &str) -> Vec<RustModule> {
-    #[cfg(any(test, feature = "test-support"))]
-    work_counters::RUST_MODULE_SCANS.with(|count| count.set(count.get() + 1));
-    fn immediate_modules<'a>(node: Node<'a>, modules: &mut Vec<Node<'a>>) {
-        let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if child.kind() == "mod_item" {
-                modules.push(child);
-            } else {
-                immediate_modules(child, modules);
-            }
-        }
-    }
-    let mut modules = Vec::new();
-    immediate_modules(root, &mut modules);
-    modules
-        .into_iter()
-        .map(|module| {
-            let mut cursor = module.walk();
-            let exported = module
-                .named_children(&mut cursor)
-                .any(|child| child.kind() == "visibility_modifier");
-            RustModule {
-                name: module
-                    .child_by_field_name("name")
-                    .map(|name| node_text(source, &name))
-                    .unwrap_or("module")
-                    .to_string(),
-                range: node_range_with_decorators(&module, source, LangId::Rust),
-                exported,
-                children: module
-                    .child_by_field_name("body")
-                    .map(|body| rust_modules(body, source))
-                    .unwrap_or_default(),
-            }
-        })
-        .collect()
-}
+mod rust_modules;
+pub use rust_modules::rust_modules;
 
 /// A request-local source and tree captured together, for read-only consumers.
 pub struct ParsedFile {
