@@ -177,4 +177,31 @@ describe.skipIf(process.platform === "win32")("ONNX Runtime resolution order", (
     expect(resolved).toBe(systemDir);
     expect(downloads).toEqual([]);
   });
+
+  for (const managedFirst of [false, true]) {
+    test(`keeps concurrent runtime resolution policies separate (managed first: ${managedFirst})`, async () => {
+      const systemDir = systemRuntime(presentDependency);
+      const storageDir = join(workDir, "storage");
+      const downloads: string[] = [];
+      const managed = () =>
+        resolveOnnxRuntime(storageDir, {
+          platformInfo,
+          systemSearchPaths: [],
+          download: fakeDownload(downloads),
+        });
+      const systemEnabled = () => resolveOnnxRuntime(storageDir, {
+        platformInfo,
+        systemSearchPaths: [systemDir],
+        download: fakeDownload(downloads),
+      });
+      // Both calls start before the first asynchronous cache check completes.
+      const [managedRuntime, systemRuntimePath] = await Promise.all(
+        managedFirst ? [managed(), systemEnabled()] : [systemEnabled(), managed()].reverse(),
+      );
+      expect(managedRuntime).not.toBe(systemDir);
+      expect(managedRuntime).not.toBeNull();
+      expect(downloads).toEqual([managedRuntime]);
+      expect(systemRuntimePath).toBe(systemDir);
+    });
+  }
 });

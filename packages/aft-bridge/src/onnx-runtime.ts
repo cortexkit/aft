@@ -227,12 +227,14 @@ function resolveOnnxRuntime(
   storageDir: string,
   seams: OnnxRuntimeResolutionSeams,
 ): Promise<string | null> {
-  const existing = inflightResolutions.get(storageDir);
+  // An empty override means managed-only; an omitted override allows system discovery.
+  const key = JSON.stringify([storageDir, seams.systemSearchPaths]);
+  const existing = inflightResolutions.get(key);
   if (existing) return existing;
   const resolution = resolveOnnxRuntimeUncoalesced(storageDir, seams).finally(() => {
-    inflightResolutions.delete(storageDir);
+    inflightResolutions.delete(key);
   });
-  inflightResolutions.set(storageDir, resolution);
+  inflightResolutions.set(key, resolution);
   return resolution;
 }
 
