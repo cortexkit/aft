@@ -157,6 +157,15 @@ pub mod late_result_bus {
 
     pub mod views {
         pub use crate::late_result_bus::views::{Publication, RecordingWriter, Writer};
+        use crate::late_result_bus::NoticeViewsReady;
+
+        pub fn confirm_notice_views(ready: &NoticeViewsReady) {
+            ready.confirm();
+        }
+
+        pub fn fail_notice_views(ready: &NoticeViewsReady, reason: &'static str) {
+            ready.fail(reason);
+        }
 
         pub fn declaration() -> &'static cortexkit_bus_naming::ModuleBucket {
             crate::late_result_bus::views::declaration()

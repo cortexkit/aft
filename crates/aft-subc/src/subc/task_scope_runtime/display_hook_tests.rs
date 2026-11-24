@@ -232,7 +232,7 @@ async fn assert_publications(storage: &Path) {
     assert_eq!(actual, Some(expected));
 
     let mut writer = ViewWrites::default();
-    views::Publication::default()
+    views::Publication::new(&crate::late_result_bus::NoticeViewsReady::default())
         .sync_with_hooks(&mut writer, Some(hooks))
         .await
         .unwrap();
