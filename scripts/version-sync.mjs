@@ -275,7 +275,14 @@ results.push(updateCargoPathDep(basePath, "secret-rules", version, dryRun));
 results.push(updateCargoPathDep(dbPath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(parsePath, "aft-base", version, dryRun));
 results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
-for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules"]) {
+for (const dep of [
+  "aft-base",
+  "aft-db",
+  "aft-parse",
+  "aft-store",
+  "aft-tokenizer",
+  "secret-rules",
+]) {
   results.push(updateCargoPathDep(enginePath, dep, version, dryRun));
 }
 for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "secret-rules"]) {
