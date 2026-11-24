@@ -111,7 +111,7 @@ test_methods! { ChildCheckoutsTestExt for crate::data_layer::parent::ChildChecko
 }}
 
 test_methods! { CheckoutTestExt for Checkout {
-    fn has_unpublished_luau_changes(&self) -> bool;
+    fn has_unpublished_grammar_changes(&self) -> bool;
     fn publish_text_first(&self) -> Result<bool, DataError>;
     #[cfg(feature = "wasm-grammars")]
     fn retry_grammar_gaps(&self) -> Result<bool, DataError>;

@@ -495,7 +495,7 @@ pub fn disclose_index_gaps(
 }
 
 /// Adds named parse gaps without changing gap-free responses.
-pub(super) fn disclose_parse_gaps(
+pub(crate) fn disclose_parse_gaps(
     view: &super::checkout::CheckoutView,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
