@@ -110,7 +110,6 @@ pub use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
 pub use aft_base::disk_floor;
 pub(crate) use aft_base::durability;
-pub(crate) use aft_base::durable_dir;
 pub mod edit;
 #[cfg(test)]
 mod edit_composed_tests;
@@ -174,7 +173,6 @@ pub use aft_base::jsonc_edit;
 pub mod lang_id;
 pub use aft_base::language;
 pub(crate) use aft_base::large_read_counts;
-pub(crate) use aft_parse::line_matcher;
 #[doc(hidden)]
 pub mod large_read;
 #[doc(hidden)]
@@ -224,7 +222,6 @@ pub(crate) use aft_base::posix_spawn;
 use aft_base::privacy_spawn;
 #[doc(hidden)]
 pub use aft_base::private_storage;
-pub(crate) use aft_base::process_group;
 pub use aft_base::process_identity;
 pub use aft_base::process_io;
 pub(crate) use aft_base::process_spawn;

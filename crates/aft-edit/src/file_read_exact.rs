@@ -31,7 +31,8 @@ pub struct ReadHooks {
 
 #[cfg(feature = "test-support")]
 impl ReadHooks {
-    pub(crate) fn with_mid_read(mid_read: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
+    #[doc(hidden)]
+    pub fn with_mid_read(mid_read: std::sync::Arc<dyn Fn() + Send + Sync>) -> Self {
         Self {
             mid_read: Some(mid_read),
             ..Self::default()

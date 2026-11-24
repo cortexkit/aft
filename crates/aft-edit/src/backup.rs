@@ -30,7 +30,8 @@ mod status_inventory_tests;
 use capture_reads::read_captured_content;
 #[cfg(any(test, feature = "test-support"))]
 pub use capture_reads::{capture_read_count, reset_capture_read_count};
-pub(crate) use status_inventory::StatusInventory;
+#[doc(hidden)]
+pub use status_inventory::StatusInventory;
 
 pub use crate::config::{DEFAULT_MAX_BACKUP_FILE_SIZE, DEFAULT_MAX_UNDO_DEPTH};
 /// Most files one recursive delete may copy into the undo store.
@@ -1053,7 +1054,7 @@ pub struct BackupStore {
     release_after_next_snapshot: bool,
     #[cfg(any(test, feature = "test-support"))]
     discovery_entry_limit: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     discovery_entries_examined: Arc<AtomicU64>,
     #[cfg(any(test, feature = "test-support"))]
     discovery_deadline_override: Option<Instant>,
@@ -1155,7 +1156,7 @@ impl BackupStore {
             release_after_next_snapshot: false,
             #[cfg(any(test, feature = "test-support"))]
             discovery_entry_limit: MAX_SESSION_DISCOVERY_ENTRIES,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             discovery_entries_examined: Arc::new(AtomicU64::new(0)),
             #[cfg(any(test, feature = "test-support"))]
             discovery_deadline_override: None,
@@ -1546,8 +1547,9 @@ impl BackupStore {
         self.disk_io_count.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
-    pub(crate) fn status_discovery_entries_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn status_discovery_entries_for_test(&self) -> u64 {
         self.discovery_entries_examined.load(Ordering::Relaxed)
     }
 
@@ -4874,7 +4876,7 @@ impl BackupStore {
         status_inventory::DiscoveryLimits {
             budget,
             entry_limit,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             examined: Arc::clone(&self.discovery_entries_examined),
         }
     }
@@ -4882,7 +4884,8 @@ impl BackupStore {
     /// Copy what a status push needs to count `session`'s tracked files, so the
     /// directory pass can run after the caller drops this store's mutex. The
     /// count equals `tracked_files(session).len()`; see `StatusInventory`.
-    pub(crate) fn status_inventory(&self, session: &str) -> StatusInventory {
+    #[doc(hidden)]
+    pub fn status_inventory(&self, session: &str) -> StatusInventory {
         StatusInventory {
             session: session.to_string(),
             resident: self.cached_tracked_files(session),

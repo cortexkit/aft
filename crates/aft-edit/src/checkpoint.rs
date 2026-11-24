@@ -68,14 +68,15 @@ impl StatusFileVersion {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static STATUS_MUTATION_LOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static STATUS_SCAN_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn status_read_counters_for_test() -> (usize, usize) {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn status_read_counters_for_test() -> (usize, usize) {
     (
         STATUS_MUTATION_LOCKS.with(|count| count.replace(0)),
         STATUS_SCAN_ENTRIES.with(|count| count.replace(0)),
@@ -506,7 +507,8 @@ impl CheckpointStore {
 
     /// Make this store read namespace requests from `request`, the handle the
     /// `AppContext` that now owns this store gives configure.
-    pub(crate) fn use_namespace_request(&mut self, request: CheckpointNamespaceRequest) {
+    #[doc(hidden)]
+    pub fn use_namespace_request(&mut self, request: CheckpointNamespaceRequest) {
         self.namespace_request = request;
     }
 
@@ -574,7 +576,7 @@ impl CheckpointStore {
     }
 
     fn acquire_mutation_lock(&self) -> Result<CheckpointLockGuard, AftError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STATUS_MUTATION_LOCKS.with(|count| count.set(count.get() + 1));
         let scope_dir = self.lock_path.parent().map(Path::to_path_buf);
         let deadline = Instant::now() + self.lock_timeout;
@@ -1205,14 +1207,16 @@ impl CheckpointStore {
             .sum()
     }
 
-    pub(crate) fn resident_session_count(&self, session: &str) -> usize {
+    #[doc(hidden)]
+    pub fn resident_session_count(&self, session: &str) -> usize {
         self.checkpoints.get(session).map_or(0, HashMap::len)
     }
 
     /// A read-only, bounded observation of the durable session. `list` remains
     /// authoritative: recovery, migration, retention or insufficient evidence
     /// makes this observation unknown rather than repairing storage on a push.
-    pub(crate) fn status_count(&self, session: &str) -> Option<usize> {
+    #[doc(hidden)]
+    pub fn status_count(&self, session: &str) -> Option<usize> {
         use std::io::Read;
         // Checkpoint commit records and blobs are published by replacement,
         // so file identity detects a concurrent publication on Windows too.
@@ -1243,7 +1247,7 @@ impl CheckpointStore {
         let mut examined = 0;
         for entry in entries.take(STATUS_DIRECTORY_ENTRIES) {
             examined += 1;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             STATUS_SCAN_ENTRIES.with(|count| count.set(count.get() + 1));
             let entry = entry.ok()?;
             if !entry.file_type().ok()?.is_dir() {

@@ -95,6 +95,28 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `CheckpointStore::unbound_in_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for explicit checkpoint stores. |
 | `CheckpointStore::lock_path_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for checkpoint lock contention. |
 | `CheckpointStore::set_lock_path_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for checkpoint lock contention. |
+| `CheckpointStore::use_namespace_request` | visibility widened | `aft-edit` | Composition keeps the requested namespace when exchanging checkpoint stores. |
+| `CheckpointStore::resident_session_count` | visibility widened | `aft-edit` | Status reconciles per-session residency with the durable count. |
+| `CheckpointStore::status_count` | visibility widened | `aft-edit` | Status reads the same checkpoint count without taking a mutation lock. |
+| `checkpoint::status_read_counters_for_test` | test-support visibility widened | `aft-edit` | Composed status tests track checkpoint directory reads and lock acquisitions. |
+| `BackupStore::status_inventory` | visibility widened | `aft-edit` | Composition copies the status inputs before releasing the backup lock. |
+| `backup::StatusInventory` | visibility widened | `aft-edit` | Carry the backup status inputs out of the lock without exposing store internals. |
+| `StatusInventory::tracked_file_count` | visibility widened | `aft-edit` | Status counts tracked files from the detached inventory. |
+| `BackupStore::status_discovery_entries_for_test` | test-support visibility widened | `aft-edit` | Composed status tests count directory traversal in the real backup store. |
+| `backup::latency::Timer` | visibility widened | `aft-edit` | Keep the existing scoped backup lock timer in the composition adapter. |
+| `backup::latency::time` | visibility widened | `aft-edit` | Record lock wait in the original edit phase accounting. |
+| `ReadHooks::with_mid_read` | test-support visibility widened | `aft-edit` | Keep the engine bridge's exact-read hook. |
+| `format::SubprocessOutcome` | visibility widened | `aft-edit` | Share the same command capture result with inspect, shell, and GitHub callers. |
+| `SubprocessOutcome::stdout` | visibility widened | `aft-edit` | Those callers parse the captured output. |
+| `SubprocessOutcome::stdout_utf8_valid` | visibility widened | `aft-edit` | Consumers reject malformed UTF-8 rather than reading replacement characters. |
+| `SubprocessOutcome::stderr` | visibility widened | `aft-edit` | Consumers retain the existing error reporting. |
+| `SubprocessOutcome::status` | visibility widened | `aft-edit` | Consumers retain exit status checks. |
+| `SubprocessOutcome::truncated` | visibility widened | `aft-edit` | Consumers reject incomplete capture. |
+| `format::AVAILABILITY_PROBE_BUDGET` | visibility widened | `aft-edit` | GitHub probes retain their existing deadline. |
+| `format::capture_probe_command` | visibility widened | `aft-edit` | GitHub probes use the existing bounded capture and cancellation. |
+| `format::capture_bounded_command` | visibility widened | `aft-edit` | Shell environment imports use the existing bounded capture. |
+| `format::wait_with_deadline` | visibility widened | `aft-edit` | Inspect and shell wait under their existing deadlines. |
+| `format::parse_cargo_messages` | visibility widened | `aft-edit` | Inspect retains the same Cargo diagnostics parser. |
 
 ## Visibility widened for cross-crate callers
 

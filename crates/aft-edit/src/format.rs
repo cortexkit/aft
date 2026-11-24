@@ -27,17 +27,24 @@ pub struct ExternalToolResult {
 mod subprocess_outcome {
     use std::process::ExitStatus;
 
+    #[doc(hidden)]
     pub struct SubprocessOutcome {
-        pub(crate) stdout: String,
+        #[doc(hidden)]
+        pub stdout: String,
         // Formatters keep lossy text; JSON providers use this bit to reject malformed
         // UTF-8 instead of silently replacing bytes before parsing.
-        pub(crate) stdout_utf8_valid: bool,
-        pub(crate) stderr: String,
-        pub(crate) status: ExitStatus,
-        pub(crate) truncated: bool,
+        #[doc(hidden)]
+        pub stdout_utf8_valid: bool,
+        #[doc(hidden)]
+        pub stderr: String,
+        #[doc(hidden)]
+        pub status: ExitStatus,
+        #[doc(hidden)]
+        pub truncated: bool,
     }
 }
-pub(crate) use subprocess_outcome::SubprocessOutcome;
+#[doc(hidden)]
+pub use subprocess_outcome::SubprocessOutcome;
 
 /// Errors from external tool execution.
 #[derive(Debug)]
@@ -146,11 +153,13 @@ const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 
 // The optional gh numeric-ID lookup and Ruff version check are best-effort probes.
 // Their short budget is separate from primary GitHub requests and formatter runs.
-pub(crate) const AVAILABILITY_PROBE_BUDGET: Duration = Duration::from_secs(3);
+#[doc(hidden)]
+pub const AVAILABILITY_PROBE_BUDGET: Duration = Duration::from_secs(3);
 const PROBE_CAPTURE_BYTES: usize = 4096;
 
 /// Bound the child and pipe lifetime together; callers must reject truncated output.
-pub(crate) fn capture_probe_command(
+#[doc(hidden)]
+pub fn capture_probe_command(
     command: Command,
     tool: &str,
     deadline: Instant,
@@ -166,7 +175,8 @@ pub(crate) fn capture_probe_command(
     )
 }
 
-pub(crate) fn capture_bounded_command(
+#[doc(hidden)]
+pub fn capture_bounded_command(
     mut command: Command,
     tool: &str,
     deadline: Instant,
@@ -189,7 +199,8 @@ pub(crate) fn capture_bounded_command(
 }
 
 /// Share output capture and process-tree cleanup with deadline-bound inspect checks.
-pub(crate) fn wait_with_deadline(
+#[doc(hidden)]
+pub fn wait_with_deadline(
     child: Child,
     command: &str,
     deadline: Instant,
@@ -2482,7 +2493,8 @@ fn parse_cargo_output(stdout: &str, _stderr: &str, file: &Path) -> Vec<Validatio
         .collect()
 }
 
-pub(crate) fn parse_cargo_messages(stdout: &str) -> Vec<ValidationError> {
+#[doc(hidden)]
+pub fn parse_cargo_messages(stdout: &str) -> Vec<ValidationError> {
     let mut errors = Vec::new();
     for line in stdout.lines() {
         if let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) {

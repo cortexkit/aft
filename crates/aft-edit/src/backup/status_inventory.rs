@@ -32,7 +32,7 @@ use crate::persisted_format::{PersistedStore, UnsupportedPersistedFormat};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Arc,
@@ -44,7 +44,7 @@ use std::time::SystemTime;
 pub(super) struct DiscoveryLimits {
     pub(super) budget: BackupIoBudget,
     pub(super) entry_limit: usize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub(super) examined: Arc<AtomicU64>,
 }
 
@@ -198,7 +198,8 @@ impl StatusMetaCaches {
 
 /// Everything a status push needs to count one session's tracked files,
 /// copied out of the store so the directory pass runs without its mutex.
-pub(crate) struct StatusInventory {
+#[doc(hidden)]
+pub struct StatusInventory {
     pub(super) session: String,
     pub(super) resident: HashSet<PathBuf>,
     pub(super) session_dir: Option<PathBuf>,
@@ -214,7 +215,8 @@ impl StatusInventory {
     /// resident keys, and the next push no longer sees it. As with
     /// `tracked_files`, a failed pass is logged and only the resident keys
     /// count.
-    pub(crate) fn tracked_file_count(self) -> usize {
+    #[doc(hidden)]
+    pub fn tracked_file_count(self) -> usize {
         let mut files = self.resident;
         let discovered = match &self.session_dir {
             None => Ok(HashMap::new()),
@@ -290,7 +292,7 @@ fn discover_into(
             break;
         };
         examined += 1;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         limits.examined.fetch_add(1, Ordering::Relaxed);
         let path_entry = path_entry.map_err(|error| session_error(error.to_string()))?;
         let path_dir = path_entry.path();

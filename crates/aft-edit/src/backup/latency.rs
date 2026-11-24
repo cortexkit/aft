@@ -179,7 +179,8 @@ pub(crate) fn add(part: Part, elapsed: Duration) {
 }
 
 /// Adds the time until it is dropped to one [`Part`] on this thread.
-pub(crate) struct Timer {
+#[doc(hidden)]
+pub struct Timer {
     part: Part,
     started: Instant,
 }
@@ -191,7 +192,8 @@ impl Drop for Timer {
 }
 
 /// Start timing `part`; see [`Timer`].
-pub(crate) fn time(part: Part) -> Timer {
+#[doc(hidden)]
+pub fn time(part: Part) -> Timer {
     Timer {
         part,
         started: Instant::now(),
