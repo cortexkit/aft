@@ -1241,40 +1241,48 @@ pub fn maybe_spawn_retention(
             // other maintenance writes: under another process's write lock they
             // defer to the next run instead of holding the connection mutex for
             // the steady busy timeout, which would stall every request's reads.
-            let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
-            let now_ms = i64::try_from(now).unwrap_or(i64::MAX);
-            let report = |what: &str, outcome: Result<(), crate::db::MaintenanceWriteError>| {
-                match outcome {
-                    Ok(()) | Err(crate::db::MaintenanceWriteError::MutexHeld) => {}
-                    Err(crate::db::MaintenanceWriteError::Busy(error)) => {
-                        crate::slog_debug!("{what} retention deferred: {error}");
-                    }
-                    Err(crate::db::MaintenanceWriteError::Poisoned) => {
-                        log::warn!("{what} retention skipped: database mutex poisoned");
-                    }
-                    Err(crate::db::MaintenanceWriteError::Failed(error)) => {
-                        crate::slog_warn!("{what} retention failed: {error}");
-                    }
-                }
-            };
-            report(
-                "display record",
-                crate::db::maintenance_write(&db, budget, |conn| {
-                    crate::db::display_records::sweep(conn, now_ms).map(|_| ())
-                }),
-            );
-            report(
-                "codemode runner snapshot",
-                crate::db::maintenance_write(&db, budget, |conn| {
-                    crate::db::codemode_owners::sweep(conn, now_ms)
-                }),
-            );
+            run_write_chores(&db, i64::try_from(now).unwrap_or(i64::MAX));
             IN_FLIGHT.store(false, Ordering::Release);
         })
     {
         IN_FLIGHT.store(false, Ordering::Release);
         crate::slog_warn!("compression retention worker failed: {}", error);
     }
+}
+
+/// One bounded pass of the retention sweeps that only delete expired rows.
+pub(crate) fn run_write_chores(db: &std::sync::Mutex<crate::db::TrackedConnection>, now_ms: i64) {
+    let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
+    let report = |what: &str, outcome: Result<(), crate::db::MaintenanceWriteError>| match outcome {
+        Ok(()) | Err(crate::db::MaintenanceWriteError::MutexHeld) => {}
+        Err(crate::db::MaintenanceWriteError::Busy(error)) => {
+            crate::slog_debug!("{what} retention deferred: {error}");
+        }
+        Err(crate::db::MaintenanceWriteError::Poisoned) => {
+            log::warn!("{what} retention skipped: database mutex poisoned");
+        }
+        Err(crate::db::MaintenanceWriteError::Failed(error)) => {
+            crate::slog_warn!("{what} retention failed: {error}");
+        }
+    };
+    report(
+        "display record",
+        crate::db::maintenance_write(db, budget, |conn| {
+            crate::db::display_records::sweep(conn, now_ms).map(|_| ())
+        }),
+    );
+    report(
+        "codemode runner snapshot",
+        crate::db::maintenance_write(db, budget, |conn| {
+            crate::db::codemode_owners::sweep(conn, now_ms)
+        }),
+    );
+    report(
+        "GitHub read cache",
+        crate::db::maintenance_write(db, budget, |conn| {
+            crate::db::github_read_cache::sweep(conn, now_ms).map(|_| ())
+        }),
+    );
 }
 
 fn log_completed_retention_sweep(sweep: &RetentionSweep) {

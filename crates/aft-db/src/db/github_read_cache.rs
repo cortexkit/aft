@@ -179,6 +179,58 @@ pub fn upsert_github_read_cache_entry_after_schema(
     Ok(())
 }
 
+/// Cache rows whose GitHub copy is older than this are deleted by storage
+/// maintenance. A row only stands in, labelled with its age, when a live fetch
+/// fails; rows are keyed per reading session, so an old one is rarely asked
+/// for again.
+pub const GITHUB_READ_CACHE_HARD_TTL_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+/// Most cache rows kept; maintenance deletes the oldest beyond this.
+pub const GITHUB_READ_CACHE_MAX_ROWS: i64 = 512;
+/// Most rows one maintenance pass deletes, so it holds the shared connection
+/// only briefly; later passes continue.
+const SWEEP_LIMIT: i64 = 256;
+
+/// One bounded retention pass: delete rows past the hard TTL, then the oldest
+/// rows beyond [`GITHUB_READ_CACHE_MAX_ROWS`], at most [`SWEEP_LIMIT`] in
+/// all. Both selections walk the `fetched_at_ms` index.
+pub(crate) fn sweep(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
+    if conn.is_readonly(rusqlite::DatabaseName::Main)? {
+        return Ok(0);
+    }
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='github_read_cache')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(0);
+    }
+    let expired = conn.execute(
+        "DELETE FROM github_read_cache WHERE rowid IN (
+             SELECT rowid FROM github_read_cache WHERE fetched_at_ms <= ?1
+             ORDER BY fetched_at_ms LIMIT ?2)",
+        params![
+            now_ms.saturating_sub(GITHUB_READ_CACHE_HARD_TTL_MS),
+            SWEEP_LIMIT
+        ],
+    )?;
+    let budget = SWEEP_LIMIT.saturating_sub(expired as i64);
+    let over_cap = if budget > 0 {
+        conn.execute(
+            "DELETE FROM github_read_cache WHERE rowid IN (
+                 SELECT rowid FROM github_read_cache
+                 ORDER BY fetched_at_ms DESC LIMIT ?2 OFFSET ?1)",
+            params![GITHUB_READ_CACHE_MAX_ROWS, budget],
+        )?
+    } else {
+        0
+    };
+    if expired + over_cap > 0 {
+        log::info!("GitHub read cache retention: expired={expired} over_cap={over_cap}");
+    }
+    Ok(expired + over_cap)
+}
+
 /// Delete rows whose source-fetch time has reached the hard-TTL cutoff.
 ///
 /// A timestamp equal to `hard_ttl_cutoff_ms` is expired, matching the normal
@@ -258,4 +310,72 @@ fn normalize_repository(repository: &str) -> String {
 
 fn authentication_identity_hash(identity: &str) -> [u8; 32] {
     *blake3::hash(identity.as_bytes()).as_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    const NOW_MS: i64 = 400 * DAY_MS;
+
+    fn insert(conn: &Connection, number: i64, session: &str, fetched_at_ms: i64) {
+        let key = GithubReadCacheKey::new(
+            GithubReadResourceKind::PullRequest,
+            "owner/repo",
+            number,
+            session,
+        );
+        upsert_github_read_cache_entry(conn, &key, "# PR\n", fetched_at_ms).unwrap();
+    }
+
+    fn rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM github_read_cache", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn storage_maintenance_evicts_expired_and_excess_github_read_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        {
+            let conn = db.lock().unwrap();
+            // Every new session that reads a PR adds a row of its own.
+            for session in 0..10 {
+                insert(
+                    &conn,
+                    1,
+                    &format!("session:{session}"),
+                    NOW_MS - 30 * DAY_MS,
+                );
+            }
+            insert(&conn, 2, "session:fresh", NOW_MS - DAY_MS);
+        }
+
+        crate::db::compression_events::run_write_chores(&db, NOW_MS);
+        let conn = db.lock().unwrap();
+        assert_eq!(rows(&conn), 1, "rows past the hard TTL are deleted");
+
+        // Past the row cap, the oldest go first, a bounded number per pass.
+        for number in 0..GITHUB_READ_CACHE_MAX_ROWS + 300 {
+            insert(&conn, 10 + number, "session:cap", NOW_MS - DAY_MS + number);
+        }
+        assert_eq!(sweep(&conn, NOW_MS).unwrap(), SWEEP_LIMIT as usize);
+        assert!(sweep(&conn, NOW_MS).unwrap() > 0);
+        assert_eq!(rows(&conn), GITHUB_READ_CACHE_MAX_ROWS);
+        let oldest_kept: i64 = conn
+            .query_row(
+                "SELECT MIN(fetched_at_ms) FROM github_read_cache",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(oldest_kept > NOW_MS - DAY_MS, "the newest rows are kept");
+    }
 }
