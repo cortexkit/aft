@@ -199,6 +199,27 @@ describe("sendAftRequests — actionable errors when the binary fails", () => {
     expect(caught?.message).toContain("something exploded");
   });
 
+  test("error keeps a bounded stderr tail and names omitted bytes", async () => {
+    const bin = makeFakeBinary(
+      "large-stderr",
+      `yes x | head -c 100000 >&2
+      printf 'FINAL_STDERR\\n' >&2
+      exit 1`,
+    );
+
+    let caught: Error | null = null;
+    try {
+      await sendAftRequests(bin, [{ id: "a", command: "configure" }]);
+    } catch (err) {
+      caught = err as Error;
+    }
+
+    const omitted = 100_000 + Buffer.byteLength("FINAL_STDERR\n") - 64 * 1024;
+    expect(caught?.message.length).toBeLessThan(70_000);
+    expect(caught?.message).toContain(`[... ${omitted} bytes of earlier stderr omitted ...]`);
+    expect(caught?.message).toContain("FINAL_STDERR");
+  });
+
   test("partial responses count is reported when the binary exits early", async () => {
     const bin = makeFakeBinary(
       "partial",
