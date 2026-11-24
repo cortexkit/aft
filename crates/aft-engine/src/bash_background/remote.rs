@@ -5999,56 +5999,10 @@ pub(crate) mod fixture;
 #[cfg(all(unix, any(test, feature = "test-support")))]
 #[path = "remote_test_support.rs"]
 pub(crate) mod seams;
-#[cfg(all(test, unix))]
-#[path = "remote_tests.rs"]
-mod tests;
 #[cfg(unix)]
 #[path = "remote/source_cancel.rs"]
 mod source_cancel;
-#[cfg(test)]
-pub(crate) mod reply_test_fixtures {
-    #[cfg(unix)]
-    use super::*;
 
-    #[cfg(unix)]
-    pub(crate) fn accepted_task_past_runner_timeout_for_test(
-        target: &BgTaskRegistry,
-        session: &str,
-    ) -> (tempfile::TempDir, Arc<BgTask>) {
-        let dir = tempfile::tempdir().unwrap();
-        let (source, id, paths) = super::tests::persist_accepted_with_snapshot(
-            dir.path(),
-            dir.path().join("unused"),
-            "printf unused",
-        );
-        let mut metadata = source
-            .task(&id)
-            .unwrap()
-            .state
-            .lock()
-            .unwrap()
-            .metadata
-            .clone();
-        // Withhold a terminal record even though the timeout would already be due
-        // if the runtime started when AFT registered the task.
-        metadata.started_at = unix_millis().saturating_sub(120_000);
-        metadata.timeout_ms = Some(60_000);
-        metadata.session_id = session.into();
-        metadata.remote.as_mut().unwrap().session = session.into();
-        target
-            .insert_rehydrated_task(metadata, paths, false)
-            .unwrap();
-        let task = target.task(&id).unwrap();
-        assert!(
-            task.state
-                .lock()
-                .unwrap()
-                .metadata
-                .remote
-                .as_ref()
-                .unwrap()
-                .accepted
-        );
-        (dir, task)
-    }
-}
+#[cfg(all(test, unix))]
+#[path = "remote_tests.rs"]
+mod tests;

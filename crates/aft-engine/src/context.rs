@@ -3955,6 +3955,7 @@ impl AppContext {
         Arc::clone(&self.gitignore)
     }
 
+    fn set_gitignore(&self, matcher: Option<Arc<ignore::gitignore::Gitignore>>) {
         *self
             .gitignore
             .write()

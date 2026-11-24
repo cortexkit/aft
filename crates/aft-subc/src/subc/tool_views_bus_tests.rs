@@ -1,7 +1,7 @@
+use crate::late_result_bus::NoticeViewsReady;
 use aft_engine::test_bridge::display_data::late_result_bus::views::{
     declaration, key, Publication, RecordingWriter, Writer,
 };
-use crate::late_result_bus::NoticeViewsReady;
 use std::time::Duration;
 
 #[tokio::test]
@@ -136,7 +136,10 @@ async fn bus_views_bytes_match_every_served_pin_and_full_pin_key() {
     assert_eq!(key(pin), "7470313a6170706c795f70617463683a666136326339373937653564313434333637313466353633306431353831356432616463313138353032336133646362613366336564323066633966303534383a31");
     assert_ne!(key(pin), key(&pin.replace(":1", ":2")));
     let writes = writer.writes().len();
-    publication.sync_for_test(&mut writer, snapshot).await.unwrap();
+    publication
+        .sync_for_test(&mut writer, snapshot)
+        .await
+        .unwrap();
     assert_eq!(writer.writes().len(), writes);
 }
 

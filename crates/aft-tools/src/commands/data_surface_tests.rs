@@ -9,8 +9,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     use aft_engine::test_bridge::display_data::surfaces::serve_text_index_for_test;
     use aft_engine::test_bridge::display_data::surfaces::{
-        bind_for_test, configure_meaning_without_fill, reserve_build, root_fixture_config,
-        settled, status_push, write, READY,
+        bind_for_test, configure_meaning_without_fill, reserve_build, root_fixture_config, settled,
+        status_push, write, READY,
     };
     use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
     use serde_json::{json, Value};

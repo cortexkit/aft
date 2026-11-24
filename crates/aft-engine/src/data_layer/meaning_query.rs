@@ -295,7 +295,11 @@ mod tests {
         let storage = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(dir.path()).unwrap();
         std::fs::create_dir(root.join("src")).unwrap();
-        std::fs::write(root.join("src/lib.rs"), "pub fn widget_count() -> u32 { 7 }\n").unwrap();
+        std::fs::write(
+            root.join("src/lib.rs"),
+            "pub fn widget_count() -> u32 { 7 }\n",
+        )
+        .unwrap();
         let (base_url, gate) = test_support::serve("never-held");
         gate.open();
         let config = crate::config::Config {

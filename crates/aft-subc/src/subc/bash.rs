@@ -6526,7 +6526,7 @@ mod grant_path_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn remote_timeout_metadata_cannot_hold_capped_bash_past_promotion() {
-        use crate::bash_background::registry::remote::reply_test_fixtures::accepted_task_past_runner_timeout_for_test;
+        use aft_engine::test_bridge::bash_remote::remote_support::accepted_task_past_runner_timeout_for_test;
 
         fn dispatch_registered_task(req: RawRequest, _: &AppContext) -> Response {
             Response::success(
