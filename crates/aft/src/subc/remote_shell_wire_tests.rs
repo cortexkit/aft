@@ -32,14 +32,14 @@ fn assert_reaped(root: &Path, corr: u64) {
 
 async fn exercise_request_cancellation(peer: &mut Peer, root: &Path) {
     peer.send(6, 610, shell(610, 30_000)).await;
-    wait_for_start(root, 610).await;
+    peer.pump_until(wait_for_start(root, 610)).await;
     peer.signal(FrameType::Cancel, 6, 610).await;
     let error = refusal(peer.receive(6, 610).await, "cancelled");
     assert_eq!(error.message, "request cancelled");
     assert_reaped(root, 610);
 
     peer.send(6, 620, shell(620, 30_000)).await;
-    wait_for_start(root, 620).await;
+    peer.pump_until(wait_for_start(root, 620)).await;
     yield_call(peer, 6, 620, "person_message").await;
     peer.signal(FrameType::Cancel, 6, 620).await;
     let result = late(peer, 6, 620).await;
@@ -56,7 +56,7 @@ async fn exercise_request_cancellation(peer: &mut Peer, root: &Path) {
     reply(peer.call(0, 61, rebound).await);
     let args = json!({"command":"touch started-630; while [ ! -e release-630 ]; do sleep .02; done; echo completed-after-close", "timeout":30_000});
     peer.send(6, 630, tool("bash", args, 630)).await;
-    wait_for_start(root, 630).await;
+    peer.pump_until(wait_for_start(root, 630)).await;
     yield_call(peer, 6, 630, "person_message").await;
     peer.signal(FrameType::Goodbye, 6, 0).await;
     // Wait until the module processes Goodbye before letting the shell exit.
@@ -178,12 +178,6 @@ async fn exercise_shell_lifetime() {
     let entries = registry(root.as_path());
     let executor = Arc::new(Executor::new());
     let (daemon, stream) = tokio::io::duplex(1024 * 1024);
-    let mut peer = Peer {
-        daemon,
-        ended: HashSet::new(),
-        probes: HashSet::new(),
-        waiting: vec![],
-    };
     let (read, write) = tokio::io::split(stream);
     let connection = storage.path().join("connection.json");
     let module = remote_bash::TEST_LAUNCHER.scope(
@@ -213,11 +207,7 @@ async fn exercise_shell_lifetime() {
         ),
     );
     let exercise = async {
-        hello(
-            &mut peer.daemon,
-            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
-        )
-        .await;
+        let mut peer = Peer::start(daemon).await;
         let mut local = bind(90, "opencode", Value::Null, root.as_path(), "tool_provider");
         local["principal"] = json!({"kind":"direct"});
         reply(peer.call(0, 50, local).await);
@@ -249,9 +239,12 @@ async fn exercise_shell_lifetime() {
         peer.send(1, 101, shell(101, 30_000)).await;
         peer.send(2, 200, shell(200, 30_000)).await;
         peer.send(3, 300, shell(300, 30_000)).await;
-        allow(card(&mut cards, "write").await);
+        for scope in ["agent-shell", "run-shell", "worker-shell"] {
+            peer.saw_probe(scope).await;
+        }
+        allow(peer.pump_until(card(&mut cards, "write")).await);
         for corr in [100, 101, 200, 300] {
-            wait_for_start(root.as_path(), corr).await;
+            peer.pump_until(wait_for_start(root.as_path(), corr)).await;
         }
         yield_call(&mut peer, 1, 100, "runner_restart").await;
         yield_call(&mut peer, 1, 101, "person_message").await;
@@ -300,8 +293,8 @@ async fn exercise_shell_lifetime() {
         reply(peer.call(0, 58, run).await);
         peer.send(5, 500, shell(500, 30_000)).await;
         peer.send(6, 600, shell(600, 1800)).await;
-        wait_for_start(root.as_path(), 500).await;
-        wait_for_start(root.as_path(), 600).await;
+        peer.pump_until(wait_for_start(root.as_path(), 500)).await;
+        peer.pump_until(wait_for_start(root.as_path(), 600)).await;
         yield_call(&mut peer, 5, 500, "person_message").await;
         yield_call(&mut peer, 6, 600, "person_message").await;
         let revoked = reply(

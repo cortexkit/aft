@@ -435,6 +435,47 @@ async fn remapped_write_grant_covers_nothing_until_replaced_by_a_new_read_answer
 }
 
 #[tokio::test]
+async fn approved_worker_run_retains_remote_probe_only_until_grant_ends() {
+    use scope_describe::remote::{test_answer, test_tracker, TEST_POLL_INTERVAL};
+    use subc_protocol::scope::ScopeStatus;
+    let mut f = Fixture::new();
+    let call = f.worker("retained-run", Mode::Read);
+    let stamp = call.scope.clone();
+    let period = Duration::from_secs(60);
+    let (mut tracker, pending, mut frames) = TEST_POLL_INTERVAL
+        .scope(period, async { test_tracker() })
+        .await;
+    let lifetime = tracker.begin_work(&stamp);
+    let frame = frames.recv().await.unwrap();
+    test_answer(&pending, &frame, ScopeStatus::Live, Some(stamp.scope_epoch));
+    assert!(lifetime.wait_for_live().await);
+
+    let registry = f.registry.clone();
+    let decision = TEST_REGISTRY
+        .scope(Arc::new(move || registry.lock().unwrap().clone()), async {
+            f.auth.request_with_lifetime(call, true, lifetime)
+        })
+        .await;
+    let (_, answer) = f.card().await;
+    allow(answer, false);
+    f.finish().await;
+    assert_eq!(authority(decision).await, Authorization::WorkerRun);
+
+    tokio::time::pause();
+    tokio::time::advance(period).await;
+    let probe = tokio::time::timeout(Duration::from_secs(1), frames.recv())
+        .await
+        .expect("worker-run grant must keep polling after call settlement")
+        .unwrap();
+    test_answer(&pending, &probe, ScopeStatus::Live, Some(stamp.scope_epoch));
+    f.auth.end_scope(PAIRING, &stamp);
+    tokio::time::timeout(Duration::from_secs(1), tracker.await_idle_probe_for_test())
+        .await
+        .expect("the probe retires when the last grant is gone");
+    assert!(frames.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn worker_runs_dont_inherit_or_save_grants_and_expire_with_their_stamp() {
     let mut f = Fixture::new();
     let saved = f.request(f.call("edit", Mode::ReadWrite)).await;

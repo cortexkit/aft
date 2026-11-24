@@ -216,6 +216,7 @@ impl Card {
 struct Waiter {
     call: Preflight,
     receiver: oneshot::Sender<Decision>,
+    lifetime: scope_describe::remote::Lifetime,
 }
 
 impl Waiter {
@@ -257,7 +258,7 @@ pub(in crate::subc) struct Authorizer {
     connection_file: PathBuf,
     transport: Option<Arc<dyn consent::ConsentTransport>>,
     pending: HashMap<Group, Pending>,
-    worker_grants: HashMap<(Folder, StampKey), Mode>,
+    worker_grants: HashMap<(Folder, StampKey), (Mode, scope_describe::remote::Lifetime)>,
     tasks: tokio::task::JoinSet<Completion>,
     generation: u64,
 }
@@ -277,23 +278,28 @@ impl Authorizer {
 
     #[cfg(test)]
     pub(in crate::subc) fn request(&mut self, call: Preflight) -> oneshot::Receiver<Decision> {
-        self.request_with_lifetime(call, true)
+        self.request_with_lifetime(call, true, scope_describe::remote::Lifetime::default())
     }
 
     pub(in crate::subc) fn request_with_lifetime(
         &mut self,
         call: Preflight,
         can_ask: bool,
+        lifetime: scope_describe::remote::Lifetime,
     ) -> oneshot::Receiver<Decision> {
         let (receiver, result) = oneshot::channel();
         let (group, card) = Card::prepare(&call, can_ask);
-        let waiter = Waiter { call, receiver };
+        let waiter = Waiter {
+            call,
+            receiver,
+            lifetime,
+        };
         if group.worker.is_some() && !can_ask {
             waiter.finish(Err(admission_refusal()));
         } else if group.worker.as_ref().is_some_and(|scope| {
             self.worker_grants
                 .get(&(group.folder.clone(), scope.clone()))
-                .is_some_and(|mode| mode.covers(group.mode))
+                .is_some_and(|(mode, _)| mode.covers(group.mode))
         }) {
             waiter.finish(Ok(Authorization::WorkerRun));
         } else if let Some(pending) = self.pending.get_mut(&group) {
@@ -423,7 +429,9 @@ impl Authorizer {
                 Outcome::Saved(id) => Ok(Authorization::Saved(id)),
                 Outcome::Approved { scope, id, label, .. } => {
                     if let Some(worker) = &group.worker {
-                        let mode = self.worker_grants.entry((group.folder.clone(), worker.clone())).or_insert(group.mode);
+                        let (mode, _) = self.worker_grants.entry((group.folder.clone(), worker.clone())).or_insert_with(|| {
+                            (group.mode, waiters[0].lifetime.clone())
+                        });
                         if !mode.covers(group.mode) {
                             *mode = group.mode;
                         }

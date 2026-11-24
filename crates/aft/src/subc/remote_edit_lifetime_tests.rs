@@ -39,13 +39,66 @@ impl consent::ConsentTransport for Cards {
 }
 
 struct Peer {
-    daemon: tokio::io::DuplexStream,
+    daemon: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    incoming: mpsc::Receiver<Frame>,
+    reader: tokio::task::JoinHandle<()>,
     ended: HashSet<String>,
     probes: HashSet<String>,
+    unsynced_once: HashSet<String>,
     waiting: Vec<Frame>,
 }
 
+impl Drop for Peer {
+    fn drop(&mut self) {
+        self.reader.abort();
+    }
+}
+
 impl Peer {
+    async fn start(mut daemon: tokio::io::DuplexStream) -> Self {
+        hello(
+            &mut daemon,
+            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
+        )
+        .await;
+        let (mut reader, daemon) = tokio::io::split(daemon);
+        let (send, incoming) = mpsc::channel(64);
+        let reader = tokio::spawn(async move {
+            while let Some(frame) = read_frame(&mut reader).await.unwrap() {
+                if send.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            daemon,
+            incoming,
+            reader,
+            ended: HashSet::new(),
+            probes: HashSet::new(),
+            unsynced_once: HashSet::new(),
+            waiting: vec![],
+        }
+    }
+
+    // Service control replies while waiting for an out-of-band event such as
+    // a consent card or shell start. Receive whole frames via the reader task
+    // so selecting the event cannot abandon a partially decoded frame.
+    async fn pump_until<T>(&mut self, event: impl std::future::Future<Output = T>) -> T {
+        tokio::pin!(event);
+        loop {
+            tokio::select! {
+                done = &mut event => return done,
+                frame = self.incoming.recv() => {
+                    let frame = frame.expect("daemon stream closed before the awaited event");
+                    if !self.describe(&frame).await {
+                        self.waiting.push(frame);
+                    }
+                }
+            }
+        }
+    }
+
     async fn signal(&mut self, ty: FrameType, channel: u16, corr: u64) {
         let frame = Frame::build(ty, control_flags(), channel, 1, corr, vec![]).unwrap();
         write_frame(&mut self.daemon, &frame).await.unwrap();
@@ -75,9 +128,14 @@ impl Peer {
         let scope_ref = body["ref"].as_str().unwrap();
         self.probes.insert(scope_ref.into());
         let ended = self.ended.contains(scope_ref);
+        let live = !ended && !self.unsynced_once.remove(scope_ref);
         let answer = ModuleControlResponseToModule::ScopeDescribe {
-            status: ScopeStatus::NotLive,
-            scope_epoch: None,
+            status: if live {
+                ScopeStatus::Live
+            } else {
+                ScopeStatus::NotLive
+            },
+            scope_epoch: live.then_some(1),
             daemon_incarnation: "remote-wire".into(),
             owner_synced: ended,
             owner_configured: true,
@@ -111,7 +169,7 @@ impl Peer {
         }
         tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let frame = read_frame(&mut self.daemon).await.unwrap().unwrap();
+                let frame = self.incoming.recv().await.unwrap();
                 if matches(&frame) {
                     return frame;
                 }
@@ -132,7 +190,7 @@ impl Peer {
     async fn saw_probe(&mut self, scope_ref: &str) {
         tokio::time::timeout(Duration::from_secs(15), async {
             while !self.probes.contains(scope_ref) {
-                let frame = read_frame(&mut self.daemon).await.unwrap().unwrap();
+                let frame = self.incoming.recv().await.unwrap();
                 if !self.describe(&frame).await {
                     self.waiting.push(frame);
                 }
@@ -487,7 +545,7 @@ async fn exercise_external_tools(
     let args =
         json!({"path":"fixture.ts", "edits":[{"oldString":"value = 0", "newString":"value = 1"}]});
     peer.send(4, 725, tool("edit", args, 725)).await;
-    allow(card(cards, "write").await);
+    allow(peer.pump_until(card(cards, "write")).await);
     let answer = reply(peer.receive(4, 725).await);
     assert_eq!(
         answer["is_error"].as_bool().unwrap_or(false),
@@ -563,12 +621,6 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
     let entries = registry(root.as_path());
     let executor = Arc::new(Executor::new());
     let (daemon, stream) = tokio::io::duplex(1024 * 1024);
-    let mut peer = Peer {
-        daemon,
-        ended: HashSet::new(),
-        probes: HashSet::new(),
-        waiting: vec![],
-    };
     let (read, write) = tokio::io::split(stream);
     let connection = storage.path().join("connection.json");
     let module = scope_describe::remote::TEST_POLL_INTERVAL.scope(
@@ -595,11 +647,7 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         ),
     );
     let exercise = async {
-        hello(
-            &mut peer.daemon,
-            vec![subc_protocol::scope::SCOPE_DESCRIBE_OP.into()],
-        )
-        .await;
+        let mut peer = Peer::start(daemon).await;
         let mut local = bind(90, "opencode", Value::Null, root.as_path(), "tool_provider");
         local["principal"] = json!({"kind":"direct"});
         reply(peer.call(0, 700, local).await);
@@ -628,8 +676,6 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
             peer.call(0, 705, remote_bind(5, "pairing-A", &[HELD, RESULT, YIELD]))
                 .await,
         );
-        peer.saw_probe("remote-session").await;
-        peer.saw_probe("run-session").await;
         for (corr, args, code) in [
             (
                 780,
@@ -766,10 +812,13 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         assert_eq!(transport.count.load(Ordering::Relaxed), 0);
         ctx.update_config(|config| config.disabled_tools.clear());
 
+        peer.probes.remove("remote-session");
         peer.send(1, 720, read(720)).await;
+        peer.saw_probe("remote-session").await;
         allow(card(&mut cards, "read").await);
         assert!(text(&reply(peer.receive(1, 720).await)).contains("original"));
         peer.probes.remove("remote-session");
+        peer.unsynced_once.insert("remote-session".into());
         peer.saw_probe("remote-session").await;
         assert!(text(&reply(peer.call(1, 721, read(721)).await)).contains("original"));
         assert_eq!(
@@ -779,9 +828,9 @@ async fn remote_edit_and_scope_end_enforce_attributed_authority() {
         );
 
         peer.send(1, 722, edit(722)).await;
-        let late = card(&mut cards, "write").await;
+        let late = peer.pump_until(card(&mut cards, "write")).await;
         peer.send(5, 726, read(726)).await;
-        let late_save = card(&mut cards, "read").await;
+        let late_save = peer.pump_until(card(&mut cards, "read")).await;
         assert_eq!(std::fs::read_to_string(&original).unwrap(), "original\n");
         peer.ended.insert("remote-session".into());
         refusal(peer.receive(1, 722).await, "remote_access_denied");
