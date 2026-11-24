@@ -15,6 +15,16 @@ struct ReadEntry {
     delay: Duration,
 }
 
+impl ReadEntry {
+    fn readable_at(&self, now: Instant) -> bool {
+        let before_expiry = now.duration_since(self.admitted) < super::EXPIRY;
+        match self.announced {
+            Some(at) => (self.push_live && before_expiry) || now <= at + MIN_READ_WINDOW,
+            None => before_expiry,
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ReadCache {
     entries: HashMap<String, ReadEntry>,
@@ -92,11 +102,7 @@ impl ReadCache {
 
     pub(crate) fn prune(&mut self, now: Instant) {
         self.entries.retain(|_, entry| {
-            if now.duration_since(entry.admitted) >= super::EXPIRY {
-                entry.push_live = false;
-            }
-            let keep =
-                entry.push_live || entry.announced.is_none_or(|at| now <= at + MIN_READ_WINDOW);
+            let keep = entry.readable_at(now);
             if !keep {
                 self.bytes -= entry.weight;
             }
@@ -106,9 +112,7 @@ impl ReadCache {
 
     pub(crate) fn read(&self, id: &str, now: Instant) -> Option<Vec<u8>> {
         let entry = self.entries.get(id)?;
-        let push_live = entry.push_live && now.duration_since(entry.admitted) < super::EXPIRY;
-        (push_live || entry.announced.is_none_or(|at| now <= at + MIN_READ_WINDOW))
-            .then(|| entry.arguments.clone())
+        entry.readable_at(now).then(|| entry.arguments.clone())
     }
 
     pub(crate) fn due(&mut self, now: Instant) -> Option<String> {
@@ -233,6 +237,26 @@ mod tests {
         outbox.reads.published(&id, true, now);
         assert!(outbox.reads.read(&id, now + MIN_READ_WINDOW * 2).is_some());
         assert!(outbox.reads.read(&id, now + super::super::EXPIRY).is_none());
+    }
+
+    #[test]
+    fn display_read_unannounced_entries_expire_even_if_push_is_live() {
+        let now = Instant::now();
+        let mut outbox = Outbox::new();
+        let finished = admit(&mut outbox, "finished", DisplayKind::Record, now);
+        let live = admit(&mut outbox, "live", DisplayKind::Record, now);
+        let announced = admit(&mut outbox, "announced", DisplayKind::Record, now);
+        outbox.reads.push_finished(&finished, now);
+        let expiry = now + super::super::EXPIRY;
+        let before_expiry = expiry - Duration::from_nanos(1);
+        outbox.reads.published(&announced, true, before_expiry);
+        assert!(outbox.reads.read(&finished, before_expiry).is_some());
+        assert!(outbox.reads.read(&live, before_expiry).is_some());
+        assert!(outbox.reads.read(&finished, expiry).is_none());
+        assert!(outbox.reads.read(&live, expiry).is_none());
+        assert!(outbox.reads.due(expiry).is_none());
+        assert_eq!(outbox.reads.entries.len(), 1);
+        assert!(outbox.reads.read(&announced, expiry).is_some());
     }
 
     #[test]
