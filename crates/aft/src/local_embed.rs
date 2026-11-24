@@ -232,7 +232,59 @@ const MODEL_IDLE_TTL: Duration = Duration::from_secs(60);
 // shares one session across every root, rather than allocating per-root copies.
 static BUILD_MODEL: Mutex<Option<Weak<Mutex<ResidentModel>>>> = Mutex::new(None);
 static QUERY_MODEL: Mutex<Option<Weak<Mutex<ResidentModel>>>> = Mutex::new(None);
-static MODEL_REAPER: OnceLock<Result<(), String>> = OnceLock::new();
+static MODEL_REAPER: OnceLock<Result<crossbeam_channel::Sender<()>, String>> = OnceLock::new();
+
+fn build_reaper_interval(possibly_resident: bool) -> Option<Duration> {
+    possibly_resident.then_some(Duration::from_secs(15))
+}
+
+fn reap_build_model() -> bool {
+    let shared = BUILD_MODEL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .and_then(Weak::upgrade);
+    let Some(shared) = shared else { return false };
+    // A running inference renews the idle clock; do not queue behind it.
+    let mut resident = match shared.try_lock() {
+        Ok(resident) => resident,
+        Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return true,
+    };
+    resident.release_if_idle(Instant::now());
+    resident.model.is_some()
+}
+
+fn start_build_reaper() -> Result<crossbeam_channel::Sender<()>, String> {
+    let (loaded, wake) = crossbeam_channel::bounded(1);
+    std::thread::Builder::new()
+        .name("embedding-idle".into())
+        .spawn(move || {
+            let mut interval = None;
+            loop {
+                let connected = match interval {
+                    Some(delay) => !matches!(
+                        wake.recv_timeout(delay),
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected)
+                    ),
+                    None => wake.recv().is_ok(),
+                };
+                if !connected {
+                    break;
+                }
+                interval = build_reaper_interval(reap_build_model());
+            }
+        })
+        .map_err(|error| format!("failed to start embedding idle reaper: {error}"))?;
+    Ok(loaded)
+}
+
+fn notify_build_model_loaded() {
+    if let Some(Ok(loaded)) = MODEL_REAPER.get() {
+        // Keep one wake pending so a concurrent load cannot miss the park.
+        let _ = loaded.try_send(());
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EmbeddingSessionMemory {
@@ -272,35 +324,11 @@ impl LocalEmbedder {
         // Initialize the query model before background work becomes available.
         // Its registry and inference lock never depend on the build session.
         let query_keepalive = shared_model(model, InferenceRole::Query, cache_dir)?;
-        let shared = shared_model(model, InferenceRole::Build, cache_dir)?;
         MODEL_REAPER
-            .get_or_init(|| {
-                std::thread::Builder::new()
-                    .name("embedding-idle".into())
-                    .spawn(|| loop {
-                        std::thread::sleep(Duration::from_secs(15));
-                        let shared = BUILD_MODEL
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .as_ref()
-                            .and_then(Weak::upgrade);
-                        if let Some(shared) = shared {
-                            // Never queue behind an inference: its completion renews
-                            // the idle clock, and its session must remain resident.
-                            match shared.try_lock() {
-                                Ok(mut resident) => resident.release_if_idle(Instant::now()),
-                                Err(std::sync::TryLockError::Poisoned(error)) => {
-                                    error.into_inner().release_if_idle(Instant::now());
-                                }
-                                Err(std::sync::TryLockError::WouldBlock) => {}
-                            }
-                        }
-                    })
-                    .map(|_| ())
-                    .map_err(|error| format!("failed to start embedding idle reaper: {error}"))
-            })
+            .get_or_init(start_build_reaper)
             .as_ref()
             .map_err(Clone::clone)?;
+        let shared = shared_model(model, InferenceRole::Build, cache_dir)?;
         Ok(Self {
             shared,
             cache_dir: cache_dir.map(Path::to_path_buf),
@@ -341,6 +369,9 @@ impl LocalEmbedder {
                 resident.role,
                 self.cache_dir.as_deref(),
             )?);
+            if resident.role == InferenceRole::Build {
+                notify_build_model_loaded();
+            }
         }
         let result = resident.model.as_mut().unwrap().embed(texts);
         resident.last_used = Instant::now();
@@ -369,6 +400,9 @@ fn shared_model(
         role,
     }));
     *registry = Some(Arc::downgrade(&shared));
+    if role == InferenceRole::Build {
+        notify_build_model_loaded();
+    }
     Ok(shared)
 }
 
@@ -815,6 +849,19 @@ mod tests {
     };
     use std::io::Write;
     use tokenizers::Tokenizer;
+
+    #[test]
+    fn idle_embedding_reaper_schedules_no_timed_wakes_without_a_model() {
+        // A sleep here would become a wake even if no embedder ever reloads.
+        let timed_wakes = (0..4)
+            .filter(|_| super::build_reaper_interval(false).is_some())
+            .count();
+        assert_eq!(timed_wakes, 0);
+        assert_eq!(
+            super::build_reaper_interval(true),
+            Some(std::time::Duration::from_secs(15))
+        );
+    }
 
     /// A cache volume that disappears after configure and leaves a writable
     /// empty folder at its path must not receive the model download: hf-hub
