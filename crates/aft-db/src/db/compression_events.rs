@@ -76,6 +76,7 @@ impl SessionAggregateKey {
 struct CachedAggregate {
     aggregate: CompressionAggregate,
     watermark: i64,
+    rolled_up_events: i64,
 }
 
 #[derive(Debug, Default)]
@@ -136,32 +137,31 @@ impl CompressionAggregateCache {
             }
             reset_for_connection_change(&mut inner, conn);
             (
-                inner
-                    .projects
-                    .get(&project_key)
-                    .filter(|cached| cached.watermark == watermark)
-                    .map(|cached| cached.aggregate),
-                inner
-                    .sessions
-                    .get(&session_key)
-                    .filter(|cached| cached.watermark == watermark)
-                    .map(|cached| cached.aggregate),
+                inner.projects.get(&project_key).copied(),
+                inner.sessions.get(&session_key).copied(),
             )
         };
         // Do not hold the cache mutex during SQL: a busy-connection status
         // reader must be able to serve the last exact values immediately.
-        let project = match cached_project {
+        let project = match current_aggregate(conn, cached_project, &project_key, None, watermark)?
+        {
             Some(project) => project,
             None => {
                 self.note_aggregate_scan();
-                aggregate_for_project(conn, harness, &project_key.project_key)?
+                read_aggregate(conn, &project_key, None, watermark)?
             }
         };
-        let session = match cached_session {
+        let session = match current_aggregate(
+            conn,
+            cached_session,
+            &project_key,
+            Some(session_id),
+            watermark,
+        )? {
             Some(session) => session,
             None => {
                 self.note_aggregate_scan();
-                aggregate_for_session(conn, harness, &project_key.project_key, session_id)?
+                read_aggregate(conn, &project_key, Some(session_id), watermark)?
             }
         };
         if let Some(read) = read {
@@ -171,26 +171,14 @@ impl CompressionAggregateCache {
         if inner.connection_identity == Some(conn as *const Connection as usize)
             && self.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch
         {
-            inner.projects.insert(
-                project_key,
-                CachedAggregate {
-                    aggregate: project,
-                    watermark,
-                },
-            );
-            inner.sessions.insert(
-                session_key,
-                CachedAggregate {
-                    aggregate: session,
-                    watermark,
-                },
-            );
+            inner.projects.insert(project_key, project);
+            inner.sessions.insert(session_key, session);
         }
-        Ok((project, session))
+        Ok((project.aggregate, session.aggregate))
     }
 
-    /// Validate warm totals with one indexed watermark lookup, never aggregate
-    /// on the push thread. A miss is recomputed by `refresh_for_status`.
+    /// Validate warm totals without reading historical event payloads. A
+    /// cold or changed key is recomputed by `refresh_for_status`.
     pub fn validated_for_status(
         &self,
         conn: &Connection,
@@ -198,18 +186,40 @@ impl CompressionAggregateCache {
         project_key: &str,
         session_id: &str,
     ) -> rusqlite::Result<Option<(CompressionAggregate, CompressionAggregate)>> {
+        let read = conn
+            .is_autocommit()
+            .then(|| conn.unchecked_transaction())
+            .transpose()?;
         let watermark = compression_event_watermark(conn)?;
         let project_key = ProjectAggregateKey::new(harness, project_key);
         let session_key = SessionAggregateKey::new(harness, &project_key.project_key, session_id);
+        let epoch = self.epoch.load(std::sync::atomic::Ordering::Acquire);
+        let (project, session) = {
+            let mut inner = self.inner.lock();
+            reset_for_connection_change(&mut inner, conn);
+            (
+                inner.projects.get(&project_key).copied(),
+                inner.sessions.get(&session_key).copied(),
+            )
+        };
+        let project = current_aggregate(conn, project, &project_key, None, watermark)?;
+        let session = current_aggregate(conn, session, &project_key, Some(session_id), watermark)?;
+        if let Some(read) = read {
+            read.commit()?;
+        }
         let mut inner = self.inner.lock();
-        reset_for_connection_change(&mut inner, conn);
-        Ok(inner
-            .projects
-            .get(&project_key)
-            .zip(inner.sessions.get(&session_key))
-            .filter(|(project, session)| {
-                project.watermark == watermark && session.watermark == watermark
-            })
+        if inner.connection_identity == Some(conn as *const Connection as usize)
+            && self.epoch.load(std::sync::atomic::Ordering::Acquire) == epoch
+        {
+            if let Some(project) = project {
+                inner.projects.insert(project_key, project);
+            }
+            if let Some(session) = session {
+                inner.sessions.insert(session_key, session);
+            }
+        }
+        Ok(project
+            .zip(session)
             .map(|(project, session)| (project.aggregate, session.aggregate)))
     }
 
@@ -375,27 +385,13 @@ pub fn aggregate_for_project(
     harness: &str,
     project_key: &str,
 ) -> rusqlite::Result<CompressionAggregate> {
-    conn.query_row(
-        r#"
-        SELECT SUM(events), SUM(original), SUM(compressed) FROM (
-            SELECT COUNT(*) AS events,
-                   COALESCE(SUM(original_tokens), 0) AS original,
-                   COALESCE(SUM(compressed_tokens), 0) AS compressed
-            FROM compression_events WHERE harness = ?1 AND project_key = ?2
-            UNION ALL
-            SELECT events, original_tokens, compressed_tokens
-            FROM compression_event_rollups WHERE harness = ?1 AND project_key = ?2
-        )
-        "#,
-        params![harness, project_key],
-        |row| {
-            Ok(CompressionAggregate {
-                events: row.get::<_, i64>(0)? as u64,
-                original_tokens: row.get::<_, i64>(1)? as u64,
-                compressed_tokens: row.get::<_, i64>(2)? as u64,
-            })
-        },
-    )
+    Ok(read_aggregate(
+        conn,
+        &ProjectAggregateKey::new(harness, project_key),
+        None,
+        0,
+    )?
+    .aggregate)
 }
 
 pub fn aggregate_for_session(
@@ -404,30 +400,124 @@ pub fn aggregate_for_session(
     project_key: &str,
     session_id: &str,
 ) -> rusqlite::Result<CompressionAggregate> {
-    // Without statistics the planner can prefer the project index, visiting
-    // every session in the project instead of just the requested session.
-    conn.query_row(
-        r#"
-        SELECT SUM(events), SUM(original), SUM(compressed) FROM (
-            SELECT COUNT(*) AS events,
-                   COALESCE(SUM(original_tokens), 0) AS original,
-                   COALESCE(SUM(compressed_tokens), 0) AS compressed
-            FROM compression_events INDEXED BY idx_compression_session
-            WHERE harness = ?1 AND project_key = ?2 AND session_id = ?3
-            UNION ALL
-            SELECT events, original_tokens, compressed_tokens
-            FROM compression_event_rollups
-            WHERE harness = ?1 AND project_key = ?2 AND session_is_null = 0 AND session_id = ?3
-        )
-        "#,
-        params![harness, project_key, session_id],
-        |row| {
-            Ok(CompressionAggregate {
+    Ok(read_aggregate(
+        conn,
+        &ProjectAggregateKey::new(harness, project_key),
+        Some(session_id),
+        0,
+    )?
+    .aggregate)
+}
+
+const PROJECT_AGGREGATE_SQL: &str = "
+    SELECT SUM(events), SUM(original), SUM(compressed), SUM(folded) FROM (
+        SELECT COUNT(*) AS events, COALESCE(SUM(original_tokens), 0) AS original,
+               COALESCE(SUM(compressed_tokens), 0) AS compressed, 0 AS folded
+        FROM compression_events INDEXED BY idx_compression_project_key
+        WHERE harness = ?1 AND project_key = ?2
+        UNION ALL
+        SELECT events, original_tokens, compressed_tokens, events
+        FROM compression_event_rollups WHERE harness = ?1 AND project_key = ?2
+    )";
+
+const SESSION_AGGREGATE_SQL: &str = "
+    SELECT SUM(events), SUM(original), SUM(compressed), SUM(folded) FROM (
+        SELECT COUNT(*) AS events, COALESCE(SUM(original_tokens), 0) AS original,
+               COALESCE(SUM(compressed_tokens), 0) AS compressed, 0 AS folded
+        FROM compression_events INDEXED BY idx_compression_session
+        WHERE harness = ?1 AND project_key = ?2 AND session_id = ?3
+        UNION ALL
+        SELECT events, original_tokens, compressed_tokens, events
+        FROM compression_event_rollups
+        WHERE harness = ?1 AND project_key = ?2 AND session_is_null = 0 AND session_id = ?3
+    )";
+
+fn read_aggregate(
+    conn: &Connection,
+    key: &ProjectAggregateKey,
+    session: Option<&str>,
+    watermark: i64,
+) -> rusqlite::Result<CachedAggregate> {
+    let read = |row: &rusqlite::Row<'_>| {
+        Ok(CachedAggregate {
+            aggregate: CompressionAggregate {
                 events: row.get::<_, i64>(0)? as u64,
                 original_tokens: row.get::<_, i64>(1)? as u64,
                 compressed_tokens: row.get::<_, i64>(2)? as u64,
-            })
-        },
+            },
+            rolled_up_events: row.get(3)?,
+            watermark,
+        })
+    };
+    // Without statistics the planner can prefer the project index, visiting
+    // every session in the project instead of just the requested session.
+    if let Some(session) = session {
+        conn.prepare_cached(SESSION_AGGREGATE_SQL)?
+            .query_row(params![key.harness, key.project_key, session], read)
+    } else {
+        conn.prepare_cached(PROJECT_AGGREGATE_SQL)?
+            .query_row(params![key.harness, key.project_key], read)
+    }
+}
+
+const PROJECT_RAW_ADVANCED_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM compression_events INDEXED BY idx_compression_project_key
+    WHERE harness = ?1 AND project_key = ?2 AND id > ?3
+)";
+const SESSION_RAW_ADVANCED_SQL: &str = "SELECT EXISTS (
+    SELECT 1 FROM compression_events INDEXED BY idx_compression_session
+    WHERE harness = ?1 AND project_key = ?2 AND id > ?3 AND session_id = ?4
+)";
+
+fn current_aggregate(
+    conn: &Connection,
+    cached: Option<CachedAggregate>,
+    key: &ProjectAggregateKey,
+    session: Option<&str>,
+    watermark: i64,
+) -> rusqlite::Result<Option<CachedAggregate>> {
+    let Some(cached) = cached else {
+        return Ok(None);
+    };
+    if cached.watermark == watermark {
+        return Ok(Some(cached));
+    }
+    let read_bool = |row: &rusqlite::Row<'_>| row.get::<_, bool>(0);
+    let raw_advanced = if let Some(session) = session {
+        conn.prepare_cached(SESSION_RAW_ADVANCED_SQL)?.query_row(
+            params![key.harness, key.project_key, cached.watermark, session],
+            read_bool,
+        )?
+    } else {
+        conn.prepare_cached(PROJECT_RAW_ADVANCED_SQL)?.query_row(
+            params![key.harness, key.project_key, cached.watermark],
+            read_bool,
+        )?
+    };
+    if raw_advanced {
+        return Ok(None);
+    }
+    // Retention can fold a newly inserted, backdated event before a reader
+    // observes it. Folded counts only grow and the primary key bounds this
+    // check to one row per relevant rolled-up session, not raw event history.
+    let rolled_up_events = if let Some(session) = session {
+        conn.prepare_cached("SELECT COALESCE((SELECT events FROM compression_event_rollups
+             WHERE harness = ?1 AND project_key = ?2 AND session_is_null = 0 AND session_id = ?3), 0)")?
+            .query_row(params![key.harness, key.project_key, session], |row| row.get::<_, i64>(0))?
+    } else {
+        conn.prepare_cached(
+            "SELECT COALESCE(SUM(events), 0) FROM compression_event_rollups
+             WHERE harness = ?1 AND project_key = ?2",
+        )?
+        .query_row(params![key.harness, key.project_key], |row| {
+            row.get::<_, i64>(0)
+        })?
+    };
+    Ok(
+        (rolled_up_events == cached.rolled_up_events).then_some(CachedAggregate {
+            watermark,
+            ..cached
+        }),
     )
 }
 
@@ -1776,6 +1866,82 @@ pub mod tests {
     }
 
     fn row<'a>(
+    #[test]
+    fn status_compression_does_not_rescan_for_unrelated_watermark_advances() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("aft.db");
+        let status = crate::db::open(&path).unwrap();
+        let external = crate::db::open(&path).unwrap();
+        let cache = CompressionAggregateCache::default();
+        insert_compression_event(&external, &row("project-a", "ours", 100, 40, 1)).unwrap();
+        let warm = cache
+            .aggregates_for_session(&status, "opencode", "project-a", "session-1")
+            .unwrap();
+        let before = cache.aggregate_scan_count_for_test();
+        // Insert one event per second for a different project over a minute.
+        for second in 1..=60 {
+            insert_compression_event(
+                &external,
+                &row("project-b", &format!("other-{second}"), 90, 30, second),
+            )
+            .unwrap();
+            assert_eq!(
+                cache
+                    .aggregates_for_session(&status, "opencode", "project-a", "session-1")
+                    .unwrap(),
+                warm
+            );
+        }
+        assert_eq!(cache.aggregate_scan_count_for_test() - before, 0);
+    }
+
+    #[test]
+    fn status_compression_reads_use_keyed_indexes() {
+        let dir = tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        for (sql, parameters, index, tail) in [
+            (
+                PROJECT_AGGREGATE_SQL,
+                params!["opencode", "project-a"],
+                "idx_compression_project_key",
+                false,
+            ),
+            (
+                SESSION_AGGREGATE_SQL,
+                params!["opencode", "project-a", "session-1"],
+                "idx_compression_session",
+                false,
+            ),
+            (
+                PROJECT_RAW_ADVANCED_SQL,
+                params!["opencode", "project-a", 100],
+                "idx_compression_project_key",
+                true,
+            ),
+            (
+                SESSION_RAW_ADVANCED_SQL,
+                params!["opencode", "project-a", 100, "session-1"],
+                "idx_compression_session",
+                true,
+            ),
+        ] {
+            let plan = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(parameters, |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|detail| detail.starts_with("SEARCH compression_events ")
+                        && detail.contains(index)
+                        && (!tail || detail.contains("rowid>?"))),
+                "{plan:?}"
+            );
+        }
+    }
+
         project_key: &'a str,
         task_id: &'a str,
         original_tokens: u32,
