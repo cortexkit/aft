@@ -2170,8 +2170,9 @@ pub(crate) fn root_bound(ctx: &dyn crate::data_layer::host::IndexHost) {
 
 /// Records changed absolute `paths` under `root`. The checkout scans each
 /// one again, a folder with everything under it, under the same rules as a
-/// build, so this only turns the paths into checkout-relative form.
-fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
+/// build, so this only turns the paths into checkout-relative form. Returns
+/// how many paths lie under `root`.
+fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) -> usize {
     let mut relative_paths = Vec::with_capacity(paths.len());
     for path in paths {
         let canonical_parent = path
@@ -2190,12 +2191,16 @@ fn record(checkout: &Arc<Checkout>, root: &Path, paths: &[PathBuf]) {
         }
         relative_paths.push(relative.into_bytes());
     }
+    if relative_paths.is_empty() {
+        return 0;
+    }
     if let Err(error) = checkout.record_paths(&relative_paths) {
         crate::slog_warn!(
             "data layer could not record changes under {}: {error}",
             checkout.root().display()
         );
     }
+    relative_paths.len()
 }
 
 /// Hears AFT's own edits.
@@ -2216,12 +2221,17 @@ impl WriteIntentListener for EditListener {
         let Some(checkout) = self.checkout.upgrade() else {
             return;
         };
-        match change {
+        let recorded = match change {
             WriteIntent::Paths(paths) => record(&checkout, &self.root, paths),
             // A folder is scanned again whole, under the scan's rules.
             WriteIntent::Directory(path) => {
                 record(&checkout, &self.root, std::slice::from_ref(path))
             }
+        };
+        // Every bound checkout hears every AFT edit. Only the checkout that
+        // holds an edited path moves its deadlines; the others stay idle.
+        if recorded == 0 {
+            return;
         }
         self.settle.note_change();
         self.quiet.changed();
@@ -3093,6 +3103,61 @@ mod tests {
             fixture.handle.fresh_view(Duration::ZERO),
             Fresh::Ready(_)
         ));
+    }
+
+    /// Every bound checkout hears every AFT edit. An edit outside a checkout's
+    /// root must leave its quiet and settle deadlines alone.
+    #[test]
+    fn an_edit_in_another_root_leaves_this_checkouts_timers_idle() {
+        let quiet = Duration::from_secs(120);
+        let fixture = PublicationFixture::new(quiet, quiet);
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = std::fs::canonicalize(elsewhere.path())
+            .unwrap()
+            .join("edited.rs");
+        std::fs::write(&outside, "pub fn elsewhere() {}\n").unwrap();
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+        // A sentinel no clock reading produces.
+        let sentinel = u64::MAX;
+        fixture
+            .handle
+            .work
+            .settle
+            .last_change_ms
+            .store(sentinel, Ordering::Release);
+
+        fixture
+            .handle
+            ._listener
+            .record_change(&WriteIntent::Paths(vec![outside]), WritePhase::After);
+        assert!(!fixture.handle.quiet.armed.load(Ordering::Acquire));
+        assert_eq!(
+            fixture
+                .handle
+                .work
+                .settle
+                .last_change_ms
+                .load(Ordering::Acquire),
+            sentinel
+        );
+
+        // The same listener still arms both for an edit under its own root.
+        let inside = fixture.handle.root().join("src/lib.rs");
+        std::fs::write(&inside, "pub fn edited() {}\n").unwrap();
+        fixture
+            .handle
+            ._listener
+            .record_change(&WriteIntent::Paths(vec![inside]), WritePhase::After);
+        assert!(fixture.handle.quiet.armed.load(Ordering::Acquire));
+        assert_ne!(
+            fixture
+                .handle
+                .work
+                .settle
+                .last_change_ms
+                .load(Ordering::Acquire),
+            sentinel
+        );
     }
 
     #[test]
