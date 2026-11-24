@@ -86,6 +86,16 @@ pub struct StandingReconcileReport {
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub replaced: Vec<String>,
+    /// Configured roots this pass could not reconcile, in configuration order,
+    /// with the error that refused each one. A refused root is left out of
+    /// `active_entries` and admits no standing build; the other roots carry on.
+    pub refused: Vec<StandingRootRefusal>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StandingRootRefusal {
+    pub literal_path: String,
+    pub error: String,
 }
 
 /// The typed result used when a contained path has no selected index kind.
@@ -171,6 +181,11 @@ struct StandingRootsState {
 struct ManagedEntry {
     entry: StandingRootEntry,
     lifecycle: Arc<ArtifactLifecycle>,
+    /// The last reconciliation refused this root (for example its resolved
+    /// path drifted), or could not delete the durable row of a root removed
+    /// from configuration. The entry stays managed so a later pass can retry
+    /// it, but it admits no standing build meanwhile.
+    refused: bool,
 }
 
 struct ArtifactLifecycle {
@@ -243,6 +258,25 @@ impl ArtifactLifecycle {
 
     fn bind_pending(&self) -> bool {
         self.state.lock().bind_pending
+    }
+
+    /// Stop standing work on a root that reconciliation refused: cancel running
+    /// builds and fence their publication, keeping any session bind in place.
+    fn refuse(&self) {
+        let bound = {
+            let state = self.state.lock();
+            state.bind_pending || state.session_bound
+        };
+        self.revoke_and_mint(bound);
+    }
+
+    /// Reopen standing admission once a refused root reconciles again. A root
+    /// that a session took over in the meantime stays with that session; its
+    /// unbind resumes standing work as usual.
+    fn recover_from_refusal(&self) {
+        if !self.bind_pending() {
+            self.resume_unbound();
+        }
     }
 
     fn resume_unbound(&self) {
@@ -346,6 +380,7 @@ impl StandingRoots {
                     added: Vec::new(),
                     removed: Vec::new(),
                     replaced: Vec::new(),
+                    refused: Vec::new(),
                 });
             }
         }
@@ -373,13 +408,13 @@ impl StandingRoots {
         let mut state = self.inner.state.lock();
         state.reconciled_empty = false;
         let previous_first_snapshot = state.observed_first_snapshot;
-        let previous = std::mem::take(&mut state.entries);
-        let mut next = BTreeMap::new();
-        let mut added = Vec::new();
-        let mut removed = Vec::new();
-        let mut replaced = Vec::new();
-
-        for entry in &entries {
+        // The durable steps below run while the current map stays in place.
+        // The map and the lifecycle transitions change only after them, so a
+        // root that is refused (for example its symlink now points elsewhere)
+        // or a failed database step never drops the other roots' entries.
+        let mut refused = Vec::new();
+        let mut accepted = Vec::new();
+        for entry in entries {
             // resolve_entries already captured this live identity. Resolving
             // again would spawn git twice more and could mix two filesystem
             // observations in one durable record.
@@ -395,9 +430,60 @@ impl StandingRoots {
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
             };
-            standing_roots::ensure_standing_root(&mut conn, &record, &entry.indexes)?;
+            match standing_roots::ensure_standing_root(&mut conn, &record, &entry.indexes) {
+                Ok(outcome) => accepted.push((entry, outcome)),
+                Err(error) => refused.push(StandingRootRefusal {
+                    literal_path: entry.literal_path,
+                    error: StandingRootsError::from(error).to_string(),
+                }),
+            }
+        }
+        let configured = |literal_path: &String| {
+            accepted
+                .iter()
+                .any(|(entry, _)| &entry.literal_path == literal_path)
+                || refused
+                    .iter()
+                    .any(|refusal| &refusal.literal_path == literal_path)
+        };
+        let mut removed = Vec::new();
+        let mut removal_failed = Vec::new();
+        for literal_path in state.entries.keys().filter(|path| !configured(path)) {
+            match standing_roots::delete_standing_root(&conn, literal_path) {
+                Ok(()) => removed.push(literal_path.clone()),
+                Err(error) => removal_failed.push(StandingRootRefusal {
+                    literal_path: literal_path.clone(),
+                    error: StandingRootsError::from(error).to_string(),
+                }),
+            }
+        }
 
-            if let Some(old) = previous.get(&entry.literal_path) {
+        // Daemon restart is an observation gap. Startup first reconciles an
+        // empty default before subc has received a RouteBind configuration, so
+        // the first non-empty observed snapshot marks every retained row strict.
+        // A root that was refused went unmaintained too, so its first accepted
+        // pass marks its existing row the same way. Only the transactional
+        // strict-verification clear below can consume either mark.
+        for (entry, outcome) in &accepted {
+            let unobserved = match state.entries.get(&entry.literal_path) {
+                Some(old) => old.refused,
+                None => *outcome == standing_roots::EnsureStandingRoot::Reloaded,
+            };
+            if !previous_first_snapshot || unobserved {
+                mark_kinds_needing_strict_verify(
+                    &mut conn,
+                    &entry.literal_path,
+                    &entry.indexes,
+                )?;
+            }
+        }
+
+        let mut previous = std::mem::take(&mut state.entries);
+        let mut next = BTreeMap::new();
+        let mut added = Vec::new();
+        let mut replaced = Vec::new();
+        for (entry, _) in &accepted {
+            if let Some(old) = previous.remove(&entry.literal_path) {
                 let changed = old.entry.resolved_target != entry.resolved_target
                     || old.entry.resolved_git_toplevel != entry.resolved_git_toplevel
                     || old.entry.scoped_relative_path != entry.scoped_relative_path
@@ -407,12 +493,15 @@ impl StandingRoots {
                     old.lifecycle.revoke_and_mint(false);
                     old.lifecycle.resume_unbound();
                     replaced.push(entry.literal_path.clone());
+                } else if old.refused {
+                    old.lifecycle.recover_from_refusal();
                 }
                 next.insert(
                     entry.literal_path.clone(),
                     ManagedEntry {
                         entry: entry.clone(),
-                        lifecycle: Arc::clone(&old.lifecycle),
+                        lifecycle: old.lifecycle,
+                        refused: false,
                     },
                 );
             } else {
@@ -422,41 +511,42 @@ impl StandingRoots {
                     ManagedEntry {
                         entry: entry.clone(),
                         lifecycle: Arc::new(ArtifactLifecycle::default()),
+                        refused: false,
                     },
                 );
             }
         }
-
-        for (literal_path, old) in &previous {
-            if !next.contains_key(literal_path) {
-                old.lifecycle.revoke_and_mint(false);
-                standing_roots::delete_standing_root(&conn, literal_path)?;
-                removed.push(literal_path.clone());
+        // A refused root keeps its last accepted entry, so removing it from
+        // configuration later still deletes its row and retires its actor. A
+        // removed root whose row could not be deleted stays for a retry.
+        for refusal in refused.iter().chain(&removal_failed) {
+            if let Some(old) = previous.remove(&refusal.literal_path) {
+                if !old.refused {
+                    old.lifecycle.refuse();
+                }
+                next.insert(
+                    refusal.literal_path.clone(),
+                    ManagedEntry {
+                        refused: true,
+                        ..old
+                    },
+                );
             }
         }
-
-        // Daemon restart is an observation gap. Startup first reconciles an
-        // empty default before subc has received a RouteBind configuration, so
-        // the first non-empty observed snapshot marks every retained row strict.
-        // Only the transactional strict-verification clear below can consume it.
-        if !previous_first_snapshot && !entries.is_empty() {
-            for entry in next.values() {
-                mark_kinds_needing_strict_verify(
-                    &mut conn,
-                    &entry.entry.literal_path,
-                    &entry.entry.indexes,
-                )?;
-            }
+        for old in previous.into_values() {
+            old.lifecycle.revoke_and_mint(false);
         }
-        state.observed_first_snapshot |= !entries.is_empty();
-        state.reconciled_empty = entries.is_empty();
+        state.observed_first_snapshot |= !accepted.is_empty();
+        state.reconciled_empty = accepted.is_empty() && refused.is_empty();
         state.entries = next;
+        refused.extend(removal_failed);
 
         Ok(StandingReconcileReport {
-            active_entries: entries,
+            active_entries: accepted.into_iter().map(|(entry, _)| entry).collect(),
             added,
             removed,
             replaced,
+            refused,
         })
     }
 
@@ -478,6 +568,7 @@ impl StandingRoots {
             .lock()
             .entries
             .get(literal_path)
+            .filter(|entry| !entry.refused)
             .and_then(|entry| entry.lifecycle.admit())
     }
 
@@ -1156,8 +1247,11 @@ mod tests {
         roots.reconcile(&snapshot).unwrap();
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
-        let error = roots.reconcile(&snapshot).unwrap_err();
-        assert!(error.to_string().contains("resolved-path-drift"), "{error}");
+        let report = roots.reconcile(&snapshot).unwrap();
+        assert_eq!(report.refused.len(), 1, "{report:?}");
+        let error = &report.refused[0].error;
+        assert!(error.contains("resolved-path-drift"), "{error}");
+        assert!(report.active_entries.is_empty());
         let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
         let recorded = standing_roots::get_standing_root(&conn, link.to_str().unwrap())
             .unwrap()
@@ -1171,6 +1265,97 @@ mod tests {
                 .unwrap()
                 .to_string_lossy()
         );
+    }
+
+    /// One root whose symlink now resolves elsewhere is refused on its own: the
+    /// other root stays managed and admissible, the refused root's running
+    /// build is cancelled, and removing both later deletes both rows.
+    #[cfg(unix)]
+    #[test]
+    fn a_refused_root_leaves_the_other_entries_in_place() {
+        let storage = tempdir().unwrap();
+        let healthy = tempdir().unwrap();
+        let targets = tempdir().unwrap();
+        std::fs::create_dir(targets.path().join("first")).unwrap();
+        std::fs::create_dir(targets.path().join("second")).unwrap();
+        let link = targets.path().join("link");
+        std::os::unix::fs::symlink(targets.path().join("first"), &link).unwrap();
+        let healthy_path = healthy.path().to_string_lossy().into_owned();
+        let link_path = link.to_string_lossy().into_owned();
+        let snapshot = config(
+            storage.path(),
+            vec![
+                root(healthy.path(), vec![IndexKind::Search]),
+                root(&link, vec![IndexKind::Search]),
+            ],
+        );
+        let roots = StandingRoots::default();
+        roots.reconcile(&snapshot).unwrap();
+        roots
+            .record_strict_verification(&link_path, IndexKind::Search)
+            .unwrap();
+        let healthy_build = roots.admit_build(&healthy_path).unwrap();
+        let link_build = roots.admit_build(&link_path).unwrap();
+
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
+        let report = roots.reconcile_background(&snapshot).unwrap();
+        assert_eq!(
+            report
+                .refused
+                .iter()
+                .map(|refusal| refusal.literal_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![link_path.as_str()]
+        );
+        assert_eq!(
+            report
+                .active_entries
+                .iter()
+                .map(|entry| entry.literal_path.as_str())
+                .collect::<Vec<_>>(),
+            vec![healthy_path.as_str()]
+        );
+        assert_eq!(roots.entries().len(), 2, "no entry may be dropped");
+        assert!(!healthy_build.cancellation_requested());
+        assert!(link_build.cancellation_requested());
+        drop((healthy_build, link_build));
+        assert!(roots.admit_build(&healthy_path).is_some());
+        assert!(roots.admit_build(&link_path).is_none());
+
+        // Pointing the link back recovers the refused root.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("first"), &link).unwrap();
+        let report = roots.reconcile_background(&snapshot).unwrap();
+        assert!(report.refused.is_empty(), "{report:?}");
+        let recovered = roots.admit_build(&link_path).unwrap();
+        assert!(!recovered.cancellation_requested());
+        drop(recovered);
+        let conn = crate::db::open(&storage.path().join("aft.db")).unwrap();
+        assert_eq!(
+            standing_roots::needs_strict_verify(&conn, &link_path, IndexKind::Search).unwrap(),
+            Some(true),
+            "a root that went unmaintained must verify strictly again"
+        );
+
+        // Removing both while the link is refused still removes both rows.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(targets.path().join("second"), &link).unwrap();
+        assert_eq!(roots.reconcile(&snapshot).unwrap().refused.len(), 1);
+        let mut removed = roots
+            .reconcile(&config(storage.path(), vec![]))
+            .unwrap()
+            .removed;
+        removed.sort();
+        let mut expected = vec![healthy_path.clone(), link_path.clone()];
+        expected.sort();
+        assert_eq!(removed, expected);
+        assert!(roots.entries().is_empty());
+        for literal_path in [&healthy_path, &link_path] {
+            assert!(standing_roots::get_standing_root(&conn, literal_path)
+                .unwrap()
+                .is_none());
+        }
     }
 
     #[test]

@@ -357,14 +357,18 @@ impl StandingActor {
         ctx.begin_configure_ack_step("snapshot_reconcile");
         // A new bind is an explicit retry; idle maintenance uses the backoff.
         *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
-        if let Err(error) = self.roots.reconcile(&snapshot) {
-            self.record_reconciliation_failure(
-                &snapshot,
-                &error.to_string(),
-                std::time::Instant::now(),
-            );
-            return;
-        }
+        let report = match self.roots.reconcile(&snapshot) {
+            Ok(report) => report,
+            Err(error) => {
+                self.record_reconciliation_failure(
+                    &snapshot,
+                    &error.to_string(),
+                    std::time::Instant::now(),
+                );
+                return;
+            }
+        };
+        self.log_reconciliation_outcome(&report.refused);
         let entries = self.roots.entries();
         // With no standing family there is nothing to revoke. Deriving an
         // otherwise unused session key can spawn Git on a cold root, and must
@@ -520,13 +524,7 @@ impl StandingActor {
             }
         };
         *self.reconciliation_backoff.lock() = ReconciliationBackoff::default();
-        if let Some((previous_error, suppressed_repeats)) =
-            self.reconciliation_failures.lock().record_success()
-        {
-            log::info!(
-                "standing roots reconciliation recovered after suppressing {suppressed_repeats} repeated refusal(s): {previous_error}"
-            );
-        }
+        self.log_reconciliation_outcome(&report.refused);
 
         self.retire_removed_actors(&report.removed);
         let contended = self.resume_entries_without_bound_session(&report.active_entries);
@@ -544,6 +542,32 @@ impl StandingActor {
         now: std::time::Instant,
     ) {
         self.reconciliation_backoff.lock().failed(snapshot, now);
+        self.log_reconciliation_refusal(error);
+    }
+
+    /// Log a reconciliation that completed. Roots it refused are logged like a
+    /// failed pass, with repeats suppressed, but they set no backoff: the
+    /// other roots keep their regular maintenance.
+    fn log_reconciliation_outcome(&self, refused: &[crate::standing_roots::StandingRootRefusal]) {
+        if !refused.is_empty() {
+            let errors = refused
+                .iter()
+                .map(|refusal| refusal.error.as_str())
+                .collect::<Vec<_>>()
+                .join("; ");
+            self.log_reconciliation_refusal(&errors);
+            return;
+        }
+        if let Some((previous_error, suppressed_repeats)) =
+            self.reconciliation_failures.lock().record_success()
+        {
+            log::info!(
+                "standing roots reconciliation recovered after suppressing {suppressed_repeats} repeated refusal(s): {previous_error}"
+            );
+        }
+    }
+
+    fn log_reconciliation_refusal(&self, error: &str) {
         match self.reconciliation_failures.lock().record_failure(error) {
             ReconciliationLogAction::WarnFirst => log::warn!("standing roots reconciliation refused: {error}"),
             ReconciliationLogAction::WarnChanged { previous_error, suppressed_repeats } => log::warn!("standing roots reconciliation refused: {error} ({suppressed_repeats} repeats of previous error suppressed: {previous_error})"),
