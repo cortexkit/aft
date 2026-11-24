@@ -1614,7 +1614,7 @@ pub fn trace_to_symbol_result(
     include_tests: bool,
 ) -> StoreAdapterResult<StoreTraceToSymbolResult> {
     let origin = resolve_symbol_query(store, file, symbol)?;
-    let target_file = to_file.map(|path| relative_file(store, path));
+    let target_file = to_file.map(|path| relative_file(store, path)).transpose()?;
     let effective_max = if max_depth == 0 {
         10
     } else {
@@ -1779,7 +1779,7 @@ pub fn trace_data_result(
     symbol_cache: SharedSymbolCache,
 ) -> StoreAdapterResult<callgraph::TraceDataResult> {
     let origin_path = absolute_file(store, file);
-    let origin_file = relative_file(store, &origin_path);
+    let origin_file = relative_file(store, &origin_path)?;
     let origin_symbol = resolve_symbol_query_with_cache(&origin_path, symbol, &symbol_cache)?;
 
     let mut hops = Vec::new();
@@ -1878,7 +1878,7 @@ fn trace_data_inner(
     depth_limited: &mut bool,
     visited: &mut HashSet<(String, String, String, bool)>,
 ) -> StoreAdapterResult<()> {
-    let rel_file = relative_file(store, file);
+    let rel_file = relative_file(store, file)?;
     let visit_key = (
         rel_file.clone(),
         symbol.to_string(),
@@ -3644,9 +3644,13 @@ fn display_file_for_error(store: &impl CallGraphRead, file: &Path) -> String {
     absolute_file(store, file).display().to_string()
 }
 
-fn relative_file(store: &impl CallGraphRead, file: &Path) -> String {
+fn relative_file(store: &impl CallGraphRead, file: &Path) -> Result<String, AftError> {
     let absolute = absolute_file(store, file);
-    crate::callgraph_store::relative_path(store.project_root(), &absolute)
+    crate::callgraph_store::relative_path(store.project_root(), &absolute).ok_or_else(|| {
+        AftError::FileNotFound {
+            path: absolute.display().to_string(),
+        }
+    })
 }
 
 fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
@@ -3684,7 +3688,7 @@ mod trace_to_tests {
                 plain.join("source.luau"),
                 verbatim.join("source.luau"),
             ] {
-                assert_eq!(relative_file(&store, &file), "source.luau");
+                assert_eq!(relative_file(&store, &file).unwrap(), "source.luau");
             }
         }
     }

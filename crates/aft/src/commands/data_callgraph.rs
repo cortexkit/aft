@@ -83,7 +83,7 @@ fn relative(root: &Path, file: &Path) -> Option<String> {
         canonical(file)
     };
     let relative = absolute.strip_prefix(&root).ok()?;
-    Some(relative.to_str()?.replace('\\', "/"))
+    crate::callgraph_store::facts::utf8_path_key(relative)
 }
 
 /// The reader a call-graph command answers from: the root's checkout in the

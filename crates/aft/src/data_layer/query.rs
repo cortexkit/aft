@@ -486,7 +486,12 @@ impl<S: SliceSource> SliceReader<S> {
 
     fn rel(&self, file_rel: &Path) -> Result<String> {
         let absolute = normalize_file_path(&self.project_root, file_rel)?;
-        Ok(relative_path(&self.project_root, &absolute))
+        relative_path(&self.project_root, &absolute).ok_or_else(|| {
+            AftError::FileNotFound {
+                path: absolute.display().to_string(),
+            }
+            .into()
+        })
     }
 }
 

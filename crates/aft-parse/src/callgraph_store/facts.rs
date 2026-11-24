@@ -114,6 +114,48 @@ pub fn path_bytes(path: &Path) -> Vec<u8> {
 pub fn path_bytes(path: &Path) -> Vec<u8> {
     path.to_string_lossy().replace('\\', "/").into_bytes()
 }
+
+/// The call graph reads UTF-8 store keys. Do not substitute replacement
+/// characters for a path the graph cannot address.
+pub fn utf8_path_key(path: &Path) -> Option<String> {
+    path.to_str()?;
+    String::from_utf8(path_bytes(path)).ok()
+}
+
+pub fn relative_path(project_root: &Path, path: &Path) -> Option<String> {
+    if let Ok(stripped) = path.strip_prefix(project_root) {
+        return utf8_path_key(stripped);
+    }
+    let canon_root = super::canonicalize_path(project_root);
+    let canon_path = super::canonicalize_path(path);
+    utf8_path_key(canon_path.strip_prefix(&canon_root).unwrap_or(&canon_path))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn audit_resolution_does_not_alias_invalid_utf8_path() {
+        use std::os::unix::ffi::OsStrExt;
+        let invalid = Path::new(std::ffi::OsStr::from_bytes(b"src/\xff.rs"));
+        assert_eq!(utf8_path_key(invalid), None);
+        assert_eq!(
+            utf8_path_key(Path::new("src/�.rs")).as_deref(),
+            Some("src/�.rs")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn audit_resolution_windows_separators_use_slash_keys() {
+        assert_eq!(
+            utf8_path_key(Path::new(r"src\lib.rs")).as_deref(),
+            Some("src/lib.rs")
+        );
+    }
+}
 #[cfg(unix)]
 pub fn byte_path(bytes: &[u8]) -> PathBuf {
     use std::os::unix::ffi::OsStrExt;

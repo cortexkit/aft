@@ -25,7 +25,7 @@ fn disk_facts_match_direct_probes_and_directory_walk() {
         let canonical = super::super::relative_path(&root, &canonical);
         assert_eq!(
             disk.canonical(rel.as_bytes()),
-            Some(canonical.into_bytes()),
+            canonical.map(String::into_bytes),
             "{rel}"
         );
     }

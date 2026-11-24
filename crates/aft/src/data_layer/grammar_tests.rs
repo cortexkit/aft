@@ -165,6 +165,36 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
     assert!(text.contains("searchable"));
 }
 
+#[cfg(unix)]
+#[test]
+fn audit_resolution_literal_backslash_and_directory_are_distinct() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    write(&root, r"src\lib.rs", "pub fn literal() {}\n");
+    write(&root, "src/lib.rs", "pub fn nested() {}\n");
+    let root = root.canonicalize().unwrap();
+    let checkout = bind(&root, &dir.path().join("store"));
+    checkout.build().unwrap();
+    let view = checkout.view().unwrap();
+    for (path, symbol) in [(r"src\lib.rs", "literal"), ("src/lib.rs", "nested")] {
+        assert!(crate::commands::data_callgraph::covers(
+            &view,
+            &root.join(path)
+        ));
+        let result = crate::data_layer::callgraph_store_adapter::callers_result(
+            &view.callgraph(),
+            &root.join(path),
+            symbol,
+            1,
+            true,
+        );
+        assert!(
+            result.is_ok(),
+            "failed to find {symbol} in {path}: {result:?}"
+        );
+    }
+}
+
 #[cfg(feature = "wasm-grammars")]
 fn callers(view: &CheckoutView, file: &str) -> Value {
     serde_json::to_value(

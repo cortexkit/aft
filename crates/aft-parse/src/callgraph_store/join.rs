@@ -1157,7 +1157,7 @@ impl ParseBlob {
                     facts,
                 )
                 .and_then(|p| facts.canonical(&p))
-                .map(|p| super::relative_path(facts.root, &p))
+                .and_then(|p| super::relative_path(facts.root, &p))
                 .into_iter()
                 .collect()
             } else if let Some(module) = &raw.module_path {
