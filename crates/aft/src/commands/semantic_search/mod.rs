@@ -1,5 +1,6 @@
 pub mod anchored_lane;
 pub mod blocks;
+mod checkout_gaps;
 pub mod comparator;
 pub mod confidence;
 pub mod data_file;
@@ -138,6 +139,7 @@ use crate::semantic_index::{
     SemanticResult,
 };
 use crate::symbols::{Range, Symbol, SymbolKind};
+use checkout_gaps::CheckoutSemanticGaps;
 
 const DEFAULT_TOP_K: usize = 10;
 
@@ -3275,218 +3277,6 @@ fn auto_regex_literal_fallback_warning(reason: impl AsRef<str>) -> String {
         "Query looked like a regex but failed to compile ({}); searched literally instead. Use grep when explicit regex lane control is required.",
         reason.as_ref()
     )
-}
-
-/// What an index-store semantic answer could not cover, named so an incomplete
-/// answer says which files it is missing instead of looking complete.
-struct CheckoutSemanticGaps {
-    /// Files excluded by grammar availability or parsing policy, with typed
-    /// reasons. They are not waiting for a fill and are not fill failures.
-    skipped: Vec<serde_json::Value>,
-    /// Files whose current content has no vectors yet (awaiting a fill, or
-    /// edited since the last one).
-    pending: Vec<PathBuf>,
-    /// Terminal failures extracting a file's outline or embedding its chunks.
-    failed: Vec<(PathBuf, String)>,
-    /// The watcher could not vouch for membership, so the checkout was
-    /// re-walked and vectors may lag the disk.
-    unvouched: bool,
-    /// The checkout view could not be read at all.
-    unavailable: Option<String>,
-    /// Why the data layer's last fill stopped, while files still wait for
-    /// vectors; it is tried again later. Never set for a views-on answer.
-    fill_failure: Option<String>,
-}
-
-/// How many gap paths the response text names before summarizing the rest.
-const CHECKOUT_SEMANTIC_GAP_NAMES: usize = 5;
-
-impl CheckoutSemanticGaps {
-    fn status(&self) -> &'static str {
-        if self.unavailable.is_some() {
-            "unavailable"
-        } else if self.pending.is_empty()
-            && !self.skipped.iter().any(|gap| {
-                matches!(
-                    gap["state"].as_str(),
-                    Some("not_downloaded" | "downloading" | "network_retry" | "storage_retry")
-                )
-            })
-            && !self.unvouched
-            && self.fill_failure.is_none()
-        {
-            "ready"
-        } else {
-            "refreshing"
-        }
-    }
-
-    /// Pending work and recorded exclusions from data-layer semantic search.
-    fn from_data(meaning: &crate::commands::data_search::DataMeaning) -> Self {
-        let mut gaps = Self::from_coverage(meaning.coverage());
-        gaps.fill_failure = meaning.failure().map(str::to_string);
-        gaps
-    }
-
-    fn from_coverage(coverage: &crate::data_layer::vectors::Coverage) -> Self {
-        let reply = if coverage.skipped_parses.is_empty() {
-            crate::data_layer::grammar::GapReply::default()
-        } else {
-            crate::data_layer::grammar::GapReply::capture()
-        };
-        Self {
-            skipped: coverage
-                .skipped_parses
-                .iter()
-                .filter_map(|(path, reason)| reply.value(reason, path))
-                .collect(),
-            pending: coverage.pending.clone(),
-            failed: coverage.grammar_outline_failures().cloned().collect(),
-            unvouched: false,
-            unavailable: None,
-            fill_failure: None,
-        }
-    }
-
-    fn unavailable(reason: String) -> Self {
-        Self {
-            skipped: Vec::new(),
-            pending: Vec::new(),
-            failed: Vec::new(),
-            unvouched: false,
-            unavailable: Some(reason),
-            fill_failure: None,
-        }
-    }
-
-    fn disclose(
-        &self,
-        project_root: &Path,
-        text: &mut String,
-        extras: &mut serde_json::Map<String, serde_json::Value>,
-    ) {
-        let relative = |paths: &[PathBuf]| {
-            paths
-                .iter()
-                .map(|path| {
-                    project_relative_path(path, project_root)
-                        .display()
-                        .to_string()
-                })
-                .collect::<Vec<_>>()
-        };
-        let pending = relative(&self.pending);
-        let failed = relative(
-            &self
-                .failed
-                .iter()
-                .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
-                .map(|(path, _)| path.clone())
-                .collect::<Vec<_>>(),
-        );
-        let named = |label: &str, paths: &[String]| {
-            let shown = paths
-                .iter()
-                .take(CHECKOUT_SEMANTIC_GAP_NAMES)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join(", ");
-            let more = paths.len().saturating_sub(CHECKOUT_SEMANTIC_GAP_NAMES);
-            if more > 0 {
-                format!(
-                    "semantic: {} file(s) {label}: {shown} (+{more} more)",
-                    paths.len()
-                )
-            } else {
-                format!("semantic: {} file(s) {label}: {shown}", paths.len())
-            }
-        };
-        let mut lines = Vec::new();
-        let skipped = self
-            .skipped
-            .iter()
-            .take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)
-            .map(|gap| {
-                let mut gap = gap.clone();
-                if let Some(path) = gap["path"].as_str() {
-                    gap["path"] =
-                        serde_json::json!(project_relative_path(Path::new(path), project_root));
-                }
-                gap
-            })
-            .collect::<Vec<_>>();
-        for gap in &skipped {
-            lines.push(format!(
-                "{}: {}",
-                gap["path"].as_str().unwrap_or_default(),
-                gap["message"].as_str().unwrap_or_default()
-            ));
-        }
-        let preview =
-            crate::data_layer::surfaces::parse_gap_preview(skipped.len(), self.skipped.len());
-        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&preview) {
-            lines.push(trailer);
-        }
-        if let Some(reason) = &self.unavailable {
-            lines.push(format!("semantic: unavailable: {reason}"));
-        }
-        if !pending.is_empty() {
-            lines.push(named("not yet embedded", &pending));
-        }
-        for (path, (_, reason)) in failed.iter().zip(&self.failed) {
-            lines.push(format!("{path}: {reason}"));
-        }
-        let failed_preview =
-            crate::data_layer::surfaces::parse_gap_preview(failed.len(), self.failed.len());
-        if let Some(trailer) = crate::subc_format::render_envelope_trailer(&failed_preview) {
-            lines.push(trailer);
-        }
-        if self.unvouched {
-            lines.push(
-                "semantic: file membership was re-walked because changes may have been missed; vectors can lag the disk"
-                    .to_string(),
-            );
-        }
-        if let Some(error) = &self.fill_failure {
-            lines.push(format!(
-                "semantic: embedding the waiting files stopped and is retried later: {error}"
-            ));
-        }
-        extras.insert("complete".into(), serde_json::json!(false));
-        let mut gap = serde_json::json!({
-            "pending": pending,
-            "failed": failed,
-            "unvouched": self.unvouched,
-            "unavailable": self.unavailable,
-        });
-        if !failed.is_empty() {
-            gap["failed_files"] = serde_json::json!(self
-                .failed
-                .iter()
-                .zip(&failed)
-                .map(|((_, reason), path)| serde_json::json!({"path":path,"reason":reason}))
-                .collect::<Vec<_>>());
-            gap["failed_files_count"] = serde_json::json!(self.failed.len());
-            gap["failed_files_omitted"] = serde_json::json!(self.failed.len() - failed.len());
-            gap["failed_files_list"] = serde_json::json!(failed_preview);
-        }
-        if !skipped.is_empty() {
-            gap["skipped_files"] = serde_json::json!(skipped);
-            gap["skipped_files_count"] = serde_json::json!(self.skipped.len());
-            let omitted =
-                self.skipped.len() - gap["skipped_files"].as_array().expect("skip preview").len();
-            gap["skipped_files_omitted"] = serde_json::json!(omitted);
-            gap["skipped_files_list"] = serde_json::json!(preview);
-        }
-        if let Some(error) = &self.fill_failure {
-            gap["fill_failure"] = serde_json::json!(error);
-        }
-        extras.insert("semantic_gap".into(), gap);
-        for line in lines {
-            text.push('\n');
-            text.push_str(&line);
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -8591,7 +8381,9 @@ fn data_meaning_search(
     ) {
         Ok(results) => (
             results,
-            (!meaning.complete() || !meaning.coverage().skipped_parses.is_empty())
+            (!meaning.complete()
+                || !meaning.coverage().skipped_parses.is_empty()
+                || meaning.coverage().past_cap > 0)
                 .then(|| CheckoutSemanticGaps::from_data(meaning)),
         ),
         Err(error) => (
@@ -12658,6 +12450,46 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    /// A file past `semantic.max_files` has no vectors, so the search cannot
+    /// find it. Once every admitted file is embedded the reply still names
+    /// that gap instead of reading as complete.
+    #[test]
+    fn files_past_semantic_max_files_are_a_named_gap() {
+        let project = tempfile::tempdir().expect("create project dir");
+        let storage = tempfile::tempdir().expect("create storage dir");
+        std::fs::create_dir_all(project.path().join("src")).unwrap();
+        std::fs::write(
+            project.path().join("src/other.rs"),
+            "pub fn other_symbol() -> u32 { 2 }\n",
+        )
+        .unwrap();
+        let (root, ctx) = data_layer_context(project.path(), storage.path());
+        ctx.update_config(|config| config.semantic.max_files = 1);
+        let _fill = crate::data_layer::meaning::fill_with_constant_vectors_for_test(&root, 2);
+        wait_for_data_semantic(&ctx, |data| {
+            data.serving().is_some_and(|meaning| {
+                meaning.coverage().pending.is_empty() && meaning.coverage().past_cap == 1
+            })
+        });
+
+        // The fill used constant two-dimensional vectors; the query gets
+        // one too, as no embedding model runs in this test.
+        let query = "where is the needle symbol implemented";
+        let response = with_precomputed_query_vector(query, vec![1.0, 0.0], || {
+            response_value(handle_semantic_search(&semantic_request(query, 5), &ctx))
+        });
+        assert_eq!(response["semantic_status"], "ready", "{response}");
+        assert_eq!(response["complete"], false, "{response}");
+        assert_eq!(response["semantic_gap"]["past_cap"], 1, "{response}");
+        let text = response["text"].as_str().expect("text");
+        assert!(
+            text.contains(
+                "semantic: left 1 file(s) past semantic.max_files without vectors; they are not searched"
+            ),
+            "{text}"
+        );
     }
 
     /// A fill whose embedding model cannot load leaves the meaning plane

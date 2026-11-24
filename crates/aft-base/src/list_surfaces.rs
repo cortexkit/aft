@@ -1360,7 +1360,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // response text; every missing file is listed in the JSON `semantic_gap`
     // field, and the text says how many more there are.
     ExclusionEntry {
-        file: "commands/semantic_search/mod.rs",
+        file: "commands/semantic_search/checkout_gaps.rs",
         enclosing_item: "disclose",
         location_or_primitive: "semantic gap note take",
         reason: "summary line naming the first few files a views-on semantic answer is missing, with its own '(+N more)' count; the full list is in the semantic_gap JSON field",
@@ -1739,7 +1739,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "parse-coverage preview; skipped_parses and skipped_parses_omitted retain full counts; parse_gaps_list and its standard trailer disclose the preview cap",
     },
     ExclusionEntry {
-        file: "commands/semantic_search/mod.rs",
+        file: "commands/semantic_search/checkout_gaps.rs",
         enclosing_item: "CheckoutSemanticGaps::disclose",
         location_or_primitive: ".take(crate::data_layer::surfaces::INDEX_GAP_PREVIEW)",
         reason: "semantic Luau coverage previews; skipped_files_count/omitted and failed_files_count/omitted retain full counts; each list envelope and its standard trailer disclose the preview cap",
