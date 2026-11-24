@@ -2148,6 +2148,13 @@ export class SubcTransportPool implements AftTransportPool {
       ].includes(name);
     if (!data || data.success !== true) {
       if (affectsBackground) {
+        // This invalid_request refusal occurs before bash or powershell launches work.
+        if (
+          data?.code === "invalid_request" &&
+          (name === "bash" || name === "powershell") &&
+          typeof args.task_id !== "string"
+        )
+          return;
         if (typeof args.task_id === "string") {
           if (!record.backgroundTasks.has(args.task_id))
             record.backgroundTasks.set(args.task_id, "unknown");

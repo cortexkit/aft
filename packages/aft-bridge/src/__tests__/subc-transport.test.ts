@@ -464,6 +464,37 @@ test("per-match ACK releases only removed watches and preserves sibling wake car
   }
 });
 
+test("a native preflight bash refusal leaves an idle session reapable", async () => {
+  const client = new FakeClient(async (_channel, rawBody) => {
+    if ((rawBody as { name: string }).name === "bash") {
+      return envelope({
+        success: false,
+        code: "invalid_request",
+        message: "'command' is required",
+        text: "",
+      });
+    }
+    return envelope({ success: true, text: "ok", bg_completions: [], pending_matches: [] });
+  });
+  const pool = new SubcTransportPool({
+    connectionFile: "/fake",
+    harness: "pi",
+    connect: async () => client,
+    onBgEventsNudge: () => undefined,
+  });
+  try {
+    pool.observeSessionStart(TEST_PROJECT_ROOT, "fresh");
+    const bridge = pool.getBridge(TEST_PROJECT_ROOT);
+    await bridge.send("bash", { session_id: "fresh" });
+    await bridge.send("read", { session_id: "fresh" });
+    await settleMicrotasks();
+    await pool.reapIdleSessions(Date.now() + 16 * 60_000);
+    expect(pool.__retainedSessionCountsForTests().sessions).toBe(0);
+  } finally {
+    await pool.shutdown();
+  }
+});
+
 test("ambiguous background status pins the carrier until an explicit ACK", async () => {
   let statusFailed = true;
   const client = new FakeClient(async (_channel, rawBody) => {
