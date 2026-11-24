@@ -729,6 +729,19 @@ impl BgTaskRegistry {
             digest,
         ) {
             Ok(preview) => (preview, truncated),
+            Err(RenderedTicketPreviewError::UnmappedEdge(remaining)) if notice && scanned_clean => {
+                raw_ending_notice(
+                    &buffer,
+                    paths,
+                    metadata,
+                    &safe_cache,
+                    secrets,
+                    digest,
+                    remaining,
+                )
+                .map(|preview| (preview, true))
+                .unwrap_or_else(|| withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache))
+            }
             Err(_) => withheld_preview(TRUNCATED_PREVIEW_WITHHELD, cache),
         }
     }
@@ -956,6 +969,76 @@ fn withheld_watch_preview() -> (String, String) {
     )
 }
 
+/// When compression obscures the source of a displayed line, use the two
+/// original stream endings instead. The intact capture must already have been
+/// checked for credential patterns and exact secret values. Include preceding
+/// bytes so a ticket crossing the start of a displayed range can still be masked.
+fn raw_ending_notice(
+    buffer: &BgBuffer,
+    paths: &TaskPaths,
+    metadata: &PersistedTask,
+    cache: &TerminalOutputCache,
+    secrets: &crate::log_redact::SecretValues,
+    digest: &str,
+    mut remaining: usize,
+) -> Option<String> {
+    use crate::log_redact::{redact_ticket_digest_range, ticket_digest_windows, TICKET_HALO_BYTES};
+
+    let exit_ok = metadata.exit_code == Some(0);
+    let width = completion_preview_threshold(exit_ok);
+    let mut mask = |text: &str, mut range: std::ops::Range<usize>| {
+        remaining = remaining.checked_sub(ticket_digest_windows(text))?;
+        let masked = redact_ticket_digest_range(text, &mut range, Some(digest)).ok()?;
+        masked.get(range).map(str::to_owned)
+    };
+    let mut stream_end = |stream| {
+        let text =
+            capture_reads::read_notice_stream_end(buffer, stream, width + TICKET_HALO_BYTES)?;
+        let start = text.ceil_char_boundary(text.len().saturating_sub(width));
+        mask(&text, start..text.len())
+    };
+    let stdout = stream_end(StreamKind::Stdout)?;
+    let stderr = stream_end(StreamKind::Stderr)?;
+    let (stdout, stderr) = (stdout.trim_end(), stderr.trim_end());
+    let final_lines: Vec<_> = [&stdout, &stderr]
+        .into_iter()
+        .filter_map(|text| text.lines().last().map(str::to_owned))
+        .collect();
+    let mut body = combine_streams(stdout, stderr);
+
+    let mut warning = cache.clone();
+    warning.output_preview.clear();
+    append_pipeline_warning(&mut warning, metadata, Some(paths));
+    if !warning.output_preview.is_empty() {
+        let note = secrets.redact(&warning.output_preview);
+        body = combine_streams(body.trim_end(), &mask(&note, 0..note.len())?);
+    }
+    let marker = recovery_marker(cache.recovery.as_ref()?)?;
+    let marker = secrets.redact(&marker);
+    let marker = mask(&marker, 0..marker.len())?;
+    Some(
+        super::super::output::cap_completion_output_preserving(
+            &body,
+            Some(&marker),
+            exit_ok,
+            &final_lines,
+        )
+        .text,
+    )
+}
+
+#[derive(Debug)]
+enum RenderedTicketPreviewError {
+    UnmappedEdge(usize),
+    MaskingUnavailable,
+}
+
+impl From<crate::log_redact::TicketRedactionBudgetExceeded> for RenderedTicketPreviewError {
+    fn from(_: crate::log_redact::TicketRedactionBudgetExceeded) -> Self {
+        Self::MaskingUnavailable
+    }
+}
+
 /// The start and end of the normalized capture that ticket masking locates in
 /// a rendered preview, and whether more of the capture lies past each.
 struct RawSlices<'a> {
@@ -987,14 +1070,14 @@ fn mask_rendered_ticket_preview(
     final_lines: &[String],
     preview: &super::super::output::PiecedText,
     digest: &str,
-) -> Result<String, crate::log_redact::TicketRedactionBudgetExceeded> {
+) -> Result<String, RenderedTicketPreviewError> {
     use super::super::output::CapPiece;
     use crate::log_redact::{
         TicketRedactionBudgetExceeded, TICKET_HALO_BYTES, TICKET_REDACTION_BYTES,
         TICKET_REDACTION_WINDOWS,
     };
     if preview.text.len() > TICKET_REDACTION_BYTES || cache.len() > TICKET_REDACTION_BYTES {
-        return Err(TicketRedactionBudgetExceeded);
+        return Err(RenderedTicketPreviewError::MaskingUnavailable);
     }
     // Locate whole bounded raw head/tail slices in the terminal cache first.
     // A displayed line inside one of them has its raw neighbors at a known
@@ -1034,7 +1117,7 @@ fn mask_rendered_ticket_preview(
             }
         };
         let Some(copied) = cache.get(piece_range.clone()) else {
-            return Err(TicketRedactionBudgetExceeded);
+            return Err(RenderedTicketPreviewError::MaskingUnavailable);
         };
         // Each displayed line is checked at the cache position it was copied
         // from, so an identical line elsewhere never decides its masking.
@@ -1077,7 +1160,7 @@ fn mask_rendered_ticket_preview(
                 let (source, start) = match origin.or(ending_origin) {
                     Some(origin) => origin,
                     None if intact_cache || !edge_hex => (cache, line_start),
-                    None => return Err(TicketRedactionBudgetExceeded),
+                    None => return Err(RenderedTicketPreviewError::UnmappedEdge(remaining)),
                 };
                 let from = crate::compress::generic::floor_char_boundary(
                     source,

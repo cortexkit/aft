@@ -338,12 +338,53 @@ pub(crate) fn read_raw_edges(buffer: &BgBuffer, width: usize) -> Option<RawEdges
             pending.drain(..=newline);
         }
     }
+    let (mut tail, complete) =
+        read_normalized_tail(capture.len(), enough, |start, len| capture.read(start, len))?;
+    if complete {
+        return Some(RawEdges::Whole(tail));
+    }
+    let head_end = crate::compress::generic::ceil_char_boundary(&head, width);
+    head.truncate(head_end);
+    let tail_start =
+        crate::compress::generic::floor_char_boundary(&tail, tail.len().saturating_sub(width));
+    tail.drain(..tail_start);
+    Some(RawEdges::Ends { head, tail })
+}
+
+/// Read a normalized stream ending along with enough preceding bytes to mask
+/// a ticket that crosses the start of the displayed range.
+pub(super) fn read_notice_stream_end(
+    buffer: &BgBuffer,
+    stream: StreamKind,
+    width: usize,
+) -> Option<String> {
+    let len = buffer.stream_len_checked(stream).ok()?;
+    if len > DISK_LIMIT_BYTES {
+        return None;
+    }
+    let (mut tail, _) = read_normalized_tail(len, width, |start, len| {
+        let bytes = buffer.read_stream_bytes(stream, start, len).ok()?;
+        (bytes.len() as u64 == len).then_some(bytes)
+    })?;
+    let start =
+        crate::compress::generic::floor_char_boundary(&tail, tail.len().saturating_sub(width));
+    tail.drain(..start);
+    Some(tail)
+}
+
+/// Read backwards to a newline before normalizing so carriage returns have
+/// the same effect as they do in the whole capture.
+fn read_normalized_tail(
+    mut cursor: u64,
+    width: usize,
+    read: impl Fn(u64, u64) -> Option<Vec<u8>>,
+) -> Option<(String, bool)> {
+    let chunk = scan_chunk_bytes();
     let mut tail = String::new();
-    let mut cursor = capture.len();
     let mut pending: Vec<u8> = Vec::new();
-    while tail.len() <= enough {
+    while tail.len() <= width {
         let start = cursor.saturating_sub(chunk);
-        let mut block = capture.read(start, cursor - start)?;
+        let mut block = read(start, cursor - start)?;
         block.extend_from_slice(&pending);
         pending = block;
         cursor = start;
@@ -358,17 +399,11 @@ pub(crate) fn read_raw_edges(buffer: &BgBuffer, width: usize) -> Option<RawEdges
         };
         let lines = pending.split_off(line_start);
         tail.insert_str(0, &window_text(&lines));
-        if cursor == 0 && pending.is_empty() {
-            // The tail reached the start: it is the whole capture.
-            return Some(RawEdges::Whole(tail));
+        if cursor == 0 {
+            return Some((tail, true));
         }
     }
-    let head_end = crate::compress::generic::ceil_char_boundary(&head, width);
-    head.truncate(head_end);
-    let tail_start =
-        crate::compress::generic::floor_char_boundary(&tail, tail.len().saturating_sub(width));
-    tail.drain(..tail_start);
-    Some(RawEdges::Ends { head, tail })
+    Some((tail, false))
 }
 
 #[cfg(test)]
