@@ -596,7 +596,7 @@ fn check_rows(db: &record::Db, folder: &Path) {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(rows.len(), 14, "{rows:?}");
+    assert_eq!(rows.len(), 17, "{rows:?}");
     for (time, fields) in &rows {
         assert!(*time > 0);
         assert_eq!(fields[0], "b".repeat(32));
@@ -604,12 +604,19 @@ fn check_rows(db: &record::Db, folder: &Path) {
         assert_eq!(fields[4], folder.to_str().unwrap());
     }
     assert_eq!(&rows[0].1[5..], ["read", "refused", "invalid_request"]);
-    assert_eq!(&rows[10].1[5..], ["read", "denied", "remote_access_denied"]);
-    assert_eq!(&rows[11].1[5..], ["read", "saved_grant", "ok"]);
-    assert_eq!(rows[11].1[1], SCOPES[0]);
-    assert_eq!(&rows[12].1[5..], ["read", "saved_grant", "ok"]);
-    assert_eq!(rows[12].1[1], SCOPES[1]);
-    assert_eq!(&rows[13].1[5..], ["read", "replay", "ok"]);
+    for (_, fields) in &rows[2..6] {
+        assert_eq!(fields[1], SCOPES[2]);
+        assert_eq!(
+            &fields[5..],
+            ["read", "refused", "remote_tool_versions_differ"]
+        );
+    }
+    assert_eq!(&rows[13].1[5..], ["read", "denied", "remote_access_denied"]);
+    assert_eq!(&rows[14].1[5..], ["read", "saved_grant", "ok"]);
+    assert_eq!(rows[14].1[1], SCOPES[0]);
+    assert_eq!(&rows[15].1[5..], ["read", "saved_grant", "ok"]);
+    assert_eq!(rows[15].1[1], SCOPES[1]);
+    assert_eq!(&rows[16].1[5..], ["read", "replay", "ok"]);
 }
 
 #[path = "remote_edit_lifetime_tests.rs"]

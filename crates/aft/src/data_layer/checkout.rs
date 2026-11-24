@@ -7583,6 +7583,9 @@ pub fn other() { callee(); }
         let store = tempfile::tempdir().unwrap();
         demo(root.path());
         let layer = Arc::new(DataLayer::new(8 << 20, 2));
+        // The reaper's first scan can lock the slot even before the engine
+        // is idle. Keep it out of this test so only the release below runs.
+        layer.engines.stop();
         let checkout = Checkout::bind(layer, store.path(), family(), root.path()).unwrap();
         checkout.build().unwrap();
         edit(
