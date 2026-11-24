@@ -10,35 +10,22 @@ use serde_json::Value;
 
 use crate::list_cut_item::extract_item_name;
 
-/// Returns the path to `crates/aft/src`.
-fn aft_src_dir() -> PathBuf {
-    crate::test_helpers::manifest_dir().join("src")
-}
-
-fn base_src_dir() -> PathBuf {
-    crate::test_helpers::manifest_dir().join("../aft-base/src")
-}
-
-fn parse_src_dir() -> PathBuf {
-    crate::test_helpers::manifest_dir().join("../aft-parse/src")
-}
-
 /// Recursively collect all `.rs` files under a directory.
 fn collect_rs_files(dir: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    if !dir.exists() {
-        return files;
-    }
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
+    fn walk(dir: &Path, files: &mut Vec<PathBuf>) {
+        for entry in fs::read_dir(dir).unwrap_or_else(|err| panic!("{}: {err}", dir.display())) {
+            let entry = entry.unwrap();
             let path = entry.path();
             if path.is_dir() {
-                files.extend(collect_rs_files(&path));
+                walk(&path, files);
             } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
                 files.push(path);
             }
         }
     }
+    let mut files = Vec::new();
+    walk(dir, &mut files);
+    assert!(!files.is_empty(), "no Rust sources under {}", dir.display());
     files.sort();
     files
 }
@@ -73,29 +60,26 @@ pub(crate) fn find_enclosing_item(lines: &[&str], target_idx: usize) -> String {
 
 /// Scans governed response surfaces and explicitly registered internal bounds.
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
-    let src_dir = aft_src_dir();
-    let engine_dir = crate::test_helpers::manifest_dir().join("../aft-engine/src");
-    let base_dir = base_src_dir();
-    let parse_dir = parse_src_dir();
-    let mut files_to_scan = Vec::new();
-
-    // 1. crates/aft/src/commands/**
-    files_to_scan.extend(collect_rs_files(&src_dir.join("commands")));
+    let manifest = crate::test_helpers::manifest_dir();
+    let tools_dir = manifest.join("../aft-tools/src");
+    let engine_dir = manifest.join("../aft-engine/src");
+    let subc_dir = manifest.join("../aft-subc/src");
+    let base_dir = manifest.join("../aft-base/src");
+    let parse_dir = manifest.join("../aft-parse/src");
+    let mut files_to_scan = collect_rs_files(&tools_dir.join("commands"));
     files_to_scan.extend(collect_rs_files(&engine_dir.join("search_state")));
     files_to_scan.extend(collect_rs_files(&engine_dir.join("search_index")));
     files_to_scan.push(engine_dir.join("data_layer/callgraph_store_adapter.rs"));
     files_to_scan.push(engine_dir.join("bash_background/scoped_tasks.rs"));
-    // 2. dispatch module (run_tool_call.rs)
-    files_to_scan.push(src_dir.join("run_tool_call.rs"));
-    // 3. crates/aft/src/subc_format.rs
-    files_to_scan.push(src_dir.join("subc_format.rs"));
-    files_to_scan.push(src_dir.join("subc/bind_log.rs"));
-    files_to_scan.push(src_dir.join("subc/diagnostics_findings.rs"));
+    files_to_scan.push(tools_dir.join("run_tool_call.rs"));
+    files_to_scan.push(tools_dir.join("subc_format.rs"));
+    files_to_scan.push(subc_dir.join("subc/bind_log.rs"));
+    files_to_scan.push(subc_dir.join("subc/diagnostics_findings.rs"));
     // Remote downloads and the emergency rendered-reply ceiling also cut
     // bytes and must remain registered even though they are not list payloads.
     files_to_scan.push(engine_dir.join("url_fetch.rs"));
-    files_to_scan.push(src_dir.join("response_finalize.rs"));
-    files_to_scan.push(src_dir.join("tool_output.rs"));
+    files_to_scan.push(tools_dir.join("response_finalize.rs"));
+    files_to_scan.push(tools_dir.join("tool_output.rs"));
     files_to_scan.push(engine_dir.join("output_store.rs"));
     files_to_scan.push(engine_dir.join("file_read_exact.rs"));
     files_to_scan.push(engine_dir.join("runtime_drain.rs"));
@@ -104,7 +88,6 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(parse_dir.join("parser/dead_code_facts.rs"));
     files_to_scan.push(engine_dir.join("edit.rs"));
     files_to_scan.push(engine_dir.join("bash_permissions/scan.rs"));
-    // 4. crates/aft-base/src/compress/**
     files_to_scan.extend(collect_rs_files(&base_dir.join("compress")));
 
     let primitives: &[&'static str] = &[
@@ -127,18 +110,12 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let mut discovered = Vec::new();
 
     for file in files_to_scan {
-        let relocated = file
-            .strip_prefix(&src_dir)
-            .ok()
-            .map(|relative| base_dir.join(relative));
-        let file = relocated.filter(|path| path.exists()).unwrap_or(file);
-        if !file.exists() {
-            continue;
-        }
-        let content = fs::read_to_string(&file).unwrap_or_default();
+        let content =
+            fs::read_to_string(&file).unwrap_or_else(|err| panic!("{}: {err}", file.display()));
         let rel_path = registry_file_key(
-            file.strip_prefix(&src_dir)
+            file.strip_prefix(&tools_dir)
                 .or_else(|_| file.strip_prefix(&engine_dir))
+                .or_else(|_| file.strip_prefix(&subc_dir))
                 .or_else(|_| file.strip_prefix(&base_dir))
                 .or_else(|_| file.strip_prefix(&parse_dir))
                 .unwrap_or(&file),

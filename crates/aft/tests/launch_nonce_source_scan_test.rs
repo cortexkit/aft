@@ -9,6 +9,8 @@ const NONCE_NAMES: &[&str] = &[
     "SUBC_LAUNCH_NONCE_ENV",
     "SUBC_LAUNCH_NONCE_ENV_FD",
 ];
+const NONCE_OWNER: &str = "crates/aft-base/src/launch_nonce.rs";
+const CHILD_ENV: &str = "crates/aft-engine/src/agent_child_env.rs";
 
 fn test_only(node: Node<'_>, source: &str) -> bool {
     let mut previous = node.prev_named_sibling();
@@ -21,7 +23,10 @@ fn test_only(node: Node<'_>, source: &str) -> bool {
             break;
         }
         let attr = compact(attribute, source);
-        if attr == "#[cfg(test)]" || attr.starts_with("#[cfg(all(test,") {
+        if attr == "#[cfg(test)]"
+            || attr.starts_with("#[cfg(all(test,")
+            || attr == "#[cfg(any(test,feature=\"test-support\"))]"
+        {
             return true;
         }
         previous = attribute.prev_named_sibling();
@@ -114,9 +119,8 @@ fn test_module_files(node: Node<'_>, source: &str, directory: &Path, files: &mut
 
 #[test]
 fn consumer_identity_is_selected_by_connection_not_production_calls() {
-    let root = crate::test_helpers::manifest_dir().join("src");
-    let mut files = Vec::new();
-    collect(&root, &["rs"], &mut files);
+    let root = crate::test_helpers::manifest_dir().join("../..");
+    let files = aft_rust_sources(&root);
     let sources: Vec<_> = files
         .iter()
         .map(|path| {
@@ -163,6 +167,7 @@ fn consumer_identity_guard_detects_fields_and_excludes_only_test_code() {
         "#[cfg(test)] mod tests {} fn f() { CallOptions { consumer_identity: None }; }",
         "fn f() { with_test_vault_principal(options, principal); }",
         "fn f() { let hook = with_test_vault_principal; }",
+        "#[cfg(any(test, feature = \"production\"))] fn f() { options.consumer_identity = None; }",
     ] {
         let mut lines = Vec::new();
         consumer_identity_fields(rust_tree(source).root_node(), source, &mut lines);
@@ -174,6 +179,7 @@ fn consumer_identity_guard_detects_fields_and_excludes_only_test_code() {
         #[cfg(test)] fn with_test_principal() { options.consumer_identity = None; }
         #[cfg(all(test, unix))] mod tests { fn f() { CallOptions { consumer_identity: None }; } }
         #[cfg(test)] fn with_test_vault_principal() {}
+        #[cfg(any(test, feature = "test-support"))] fn f() { options.consumer_identity = None; }
         fn f() { #[cfg(test)] let options = with_test_vault_principal(options, principal); }
     "#;
     let mut lines = Vec::new();
@@ -380,7 +386,7 @@ fn visit(node: Node<'_>, source: &str, rust: bool, violations: &mut Vec<(usize, 
 fn scan(path: &Path, source: &str) -> Vec<(usize, &'static str)> {
     // Only this exact file owns startup capture and the cached identity. A
     // same-named file in another directory is not an authorized reader.
-    if path == Path::new("crates/aft/src/launch_nonce.rs") {
+    if path == Path::new(NONCE_OWNER) {
         return Vec::new();
     }
     let rust = path.extension().is_some_and(|ext| ext == "rs");
@@ -421,12 +427,44 @@ fn collect(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) {
     }
 }
 
+fn collect_required(dir: &Path, extensions: &[&str], files: &mut Vec<PathBuf>) {
+    let before = files.len();
+    collect(dir, extensions, files);
+    assert!(
+        files.len() > before,
+        "no source files under {}",
+        dir.display()
+    );
+}
+
+fn aft_rust_sources(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for name in [
+        "aft",
+        "aft-base",
+        "aft-db",
+        "aft-engine",
+        "aft-parse",
+        "aft-subc",
+        "aft-tools",
+    ] {
+        collect_required(
+            &root.join("crates").join(name).join("src"),
+            &["rs"],
+            &mut files,
+        );
+    }
+    files
+}
+
 #[test]
 fn launch_nonce_has_only_one_source_reader() {
     let root = crate::test_helpers::manifest_dir().join("../..");
-    let mut files = Vec::new();
-    // src/bin is included by this recursive walk, not scanned twice.
-    collect(&root.join("crates/aft/src"), &["rs"], &mut files);
+    let mut files = aft_rust_sources(&root);
+    assert!(
+        files.contains(&root.join(NONCE_OWNER)),
+        "missing launch nonce owner: {NONCE_OWNER}"
+    );
     for package in fs::read_dir(root.join("packages")).unwrap() {
         let src = package.unwrap().path().join("src");
         if src.is_dir() {
@@ -480,7 +518,7 @@ fn scanner_detects_read_forms() {
 
 #[test]
 fn scanner_allows_only_non_read_uses_and_cache_owner() {
-    let rust = Path::new("crates/aft/src/agent_child_env.rs");
+    let rust = Path::new(CHILD_ENV);
     // agent_child_env.rs and sandbox_spawn.rs deny lists and removal calls
     // are allowed by operation, never by a blanket file exemption.
     let removals = r#"
@@ -496,9 +534,13 @@ fn scrub() {
 mod arbitrary_name { fn fixture() { std::env::var("SUBC_LAUNCH_NONCE"); } }
 "#;
     assert!(scan(rust, removals).is_empty());
-    assert!(scan(Path::new("crates/aft/src/sandbox_spawn.rs"), removals).is_empty());
     assert!(scan(
-        Path::new("crates/aft/src/launch_nonce.rs"),
+        Path::new("crates/aft-engine/src/sandbox_spawn.rs"),
+        removals
+    )
+    .is_empty());
+    assert!(scan(
+        Path::new(NONCE_OWNER),
         "fn f() { subc_os::launch_nonce(); }"
     )
     .is_empty());
@@ -512,8 +554,8 @@ mod arbitrary_name { fn fixture() { std::env::var("SUBC_LAUNCH_NONCE"); } }
     );
     let js = "// process.env.SUBC_LAUNCH_NONCE\nconst example = 'process.env.SUBC_LAUNCH_NONCE'; process.env.SUBC_LAUNCH_NONCE = 'x'; delete Bun.env.SUBC_LAUNCH_NONCE;";
     assert!(scan(Path::new("packages/plugin/src/example.js"), js).is_empty());
-    let root = crate::test_helpers::manifest_dir();
-    let actual = fs::read_to_string(root.join("src/agent_child_env.rs")).unwrap();
+    let root = crate::test_helpers::manifest_dir().join("../..");
+    let actual = fs::read_to_string(root.join(CHILD_ENV)).unwrap();
     assert!(
         scan(rust, &actual).is_empty(),
         "child credential removals must remain allowed"
