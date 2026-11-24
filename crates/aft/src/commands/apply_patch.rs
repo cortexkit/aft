@@ -893,6 +893,15 @@ fn apply_move_update(
     admission: &PatchAdmission,
 ) -> Result<AppliedHunkResult, String> {
     let dest_existed = dest.abs.exists();
+    if dest_existed
+        && !is_symlink_leaf(&resolved.source.abs)
+        && fs::canonicalize(&resolved.source.abs)
+            .ok()
+            .zip(fs::canonicalize(&dest.abs).ok())
+            .is_some_and(|(source, dest)| source == dest)
+    {
+        return Err("move: source and destination are the same file".to_string());
+    }
     let dest_snapshot = if dest_existed {
         Some(
             fs::read_to_string(&dest.abs)
@@ -1460,6 +1469,51 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_only_patch_move_keeps_one_directory_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let source = root.join("Note.txt");
+        let dest = root.join("note.txt");
+        fs::write(&source, "old\n").unwrap();
+        if !dest.exists() {
+            assert!(std::env::var_os("AFT_REQUIRE_CASE_INSENSITIVE_TEST_VOLUME").is_none());
+            return;
+        }
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(temp.path().join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let req = RawRequest {
+            id: "case-only-patch".into(),
+            command: "apply_patch".into(),
+            params: serde_json::json!({"patch_text": "*** Begin Patch\n*** Update File: Note.txt\n*** Move to: note.txt\n@@\n-old\n+new\n*** End Patch"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+        let entries: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            response["success"], false,
+            "{response}; entries: {entries:?}"
+        );
+        assert_eq!(
+            response["failures"][0]["error"],
+            "move: source and destination are the same file"
+        );
+        assert_eq!(entries, [std::ffi::OsString::from("Note.txt")]);
+        assert_eq!(fs::read_to_string(source).unwrap(), "old\n");
+    }
 
     #[cfg(windows)]
     fn short_path(path: &Path) -> PathBuf {
