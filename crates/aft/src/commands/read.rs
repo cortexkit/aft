@@ -1185,13 +1185,20 @@ fn github_read_response(
                 ),
             );
         }
-        let lines_read = completion.content.lines().count();
+        // A page cut at the byte ceiling ends with the truncation notice,
+        // which is not a document line.
+        let lines_read = completion
+            .content
+            .lines()
+            .count()
+            .saturating_sub(usize::from(completion.page_cut_by_size));
         let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
         (
             start_line,
             lines_read,
             actual_end,
-            lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
+            completion.page_cut_by_size
+                || lines_read > 0 && (start_line > 1 || actual_end < completion.total_lines),
         )
     };
     let attachments = if crate::context::call_context::active() {
@@ -1221,7 +1228,7 @@ fn github_read_response(
     let mut data = serde_json::json!({
         "content": completion.content,
         "attachments": attachments,
-        "complete": !truncated,
+        "complete": !truncated && !completion.document_gap,
         "total_lines": completion.total_lines,
         "lines_read": lines_read,
         "start_line": start_line,
@@ -1360,7 +1367,8 @@ pub(crate) fn handle_github_outline(req: &RawRequest, ctx: &AppContext, target: 
             &req.id,
             serde_json::json!({
                 "text": completion.content,
-                "complete": matches!(completion.freshness, crate::github_read::GithubReadFreshness::Fetched),
+                "complete": matches!(completion.freshness, crate::github_read::GithubReadFreshness::Fetched)
+                    && !completion.document_gap,
             }),
         ),
         Err(error) => Response::error(&req.id, error.code(), error.to_string()),
@@ -2850,6 +2858,53 @@ mod tests {
     }
 
     #[test]
+    fn github_read_size_cut_or_fetch_gap_is_never_reported_complete() {
+        let request = RawRequest {
+            id: "github-cut".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "file": "issue://7" }),
+        };
+        let completion = |content: &str, page_cut_by_size, document_gap| GithubReadCompletion {
+            content: content.to_string(),
+            total_lines: 2,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: Vec::new(),
+            document: None,
+            diff_page: None,
+            page_cut_by_size,
+            document_gap,
+        };
+
+        let cut = github_read_response(
+            &request,
+            completion(
+                "line one\n... (output truncated at 50KB, use start_line/end_line to read sections)\n",
+                true,
+                false,
+            ),
+            1,
+        );
+        assert_eq!(cut.data["complete"], false);
+        assert_eq!(cut.data["truncated"], true);
+        assert_eq!(cut.data["lines_read"], 1);
+        assert_eq!(cut.data["end_line"], 1);
+
+        let gap =
+            github_read_response(&request, completion("line one\nline two\n", false, true), 1);
+        assert_eq!(gap.data["complete"], false);
+        assert_eq!(gap.data["lines_read"], 2);
+
+        let whole = github_read_response(
+            &request,
+            completion("line one\nline two\n", false, false),
+            1,
+        );
+        assert_eq!(whole.data["complete"], true);
+    }
+
+    #[test]
     fn github_read_page_past_the_end_is_refused_not_reported_complete() {
         let request = RawRequest {
             id: "github-past-end".to_string(),
@@ -2873,6 +2928,8 @@ mod tests {
             attachments: Vec::new(),
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
 
         let response = github_read_response(&request, completion(3), 3);
@@ -2911,6 +2968,8 @@ mod tests {
                 }],
                 document: None,
                 diff_page: None,
+                page_cut_by_size: false,
+                document_gap: false,
             },
             1,
         );
@@ -2968,6 +3027,8 @@ mod tests {
             attachments: images.clone(),
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
         let legacy = github_read_response(&request, completion(), 1);
         assert!(legacy.success);
@@ -3024,6 +3085,8 @@ mod tests {
             attachments: Vec::new(),
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
         assert!(github_read_response(&request, completion(), 1).success);
         let _budget = crate::context::call_context::enter(true);
@@ -3056,6 +3119,8 @@ mod tests {
             }],
             document: None,
             diff_page: None,
+            page_cut_by_size: false,
+            document_gap: false,
         };
         let _budget = crate::context::call_context::enter(true);
         let _io = crate::bounded_io::enter(Some(crate::bounded_io::Budget::after(

@@ -418,6 +418,8 @@ impl GithubDiff {
                 lines_read: shown,
                 truncated,
             }),
+            page_cut_by_size: false,
+            document_gap: false,
         }
     }
 }

@@ -292,13 +292,17 @@ impl<R> GhCliFetcher<R> {
 
 impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
     fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
-        let json =
-            self.structured_json(&request.working_directory, &gh_view_args(&request.resource))?;
+        let json = self.structured_json(
+            &request.working_directory,
+            &gh_view_args(&request.resource),
+            request.resource.kind.data_label(),
+        )?;
         let mut document = normalize_document(&request.resource, &json)?;
         if request.resource.kind == GithubResourceKind::PullRequest {
             let review_json = self.structured_json(
                 &request.working_directory,
                 &gh_pr_review_comments_args(&request.resource, &document.repository)?,
+                "review comment",
             )?;
             let review_document = normalize_document(&request.resource, &review_json)?;
             document.review_comment_sections = review_document.review_comment_sections;
@@ -307,10 +311,19 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
                 .fetch_review_threads(request, &document.repository)
                 .ok();
         }
-        let timeline_json = self.structured_json(
+        let (stdout, capped) = self.bounded_structured_output(
             &request.working_directory,
             &gh_timeline_args(&request.resource, &document.repository)?,
         )?;
+        let timeline_json = if capped {
+            // `gh` streams the slurped pages as one JSON array, so the pages
+            // that arrived whole before the ceiling are still usable; the
+            // rendered document names the cut.
+            document.timeline_cut_at_bytes = Some(MAX_STRUCTURED_BYTES);
+            Value::Array(complete_leading_array_elements(&stdout))
+        } else {
+            parse_structured_json(&stdout)?
+        };
         document.timeline = normalize_timeline_events(&timeline_json);
         Ok(document)
     }
@@ -324,14 +337,17 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
 }
 
 impl<R: GhCommandRunner> GhCliFetcher<R> {
-    pub(super) fn structured_json(
+    /// Run one structured `gh` command, reading at most
+    /// [`MAX_STRUCTURED_BYTES`] of its output. Returns the output and whether
+    /// it reached that ceiling.
+    fn bounded_structured_output(
         &self,
         working_directory: &std::path::Path,
         args: &[String],
-    ) -> Result<Value, GithubReadError> {
-        let result = self
+    ) -> Result<(Vec<u8>, bool), GithubReadError> {
+        let (result, capped) = self
             .runner
-            .run(working_directory, args)
+            .run_bounded(working_directory, args, MAX_STRUCTURED_BYTES)
             .map_err(|error| match error {
                 GhCommandError::NotFound => GithubReadError::GithubCliMissing,
                 GhCommandError::Other(message) => GithubReadError::FetchFailed(format!(
@@ -339,30 +355,83 @@ impl<R: GhCommandRunner> GhCliFetcher<R> {
                     redact_gh_error(&message)
                 )),
             })?;
-        if !result.success {
+        // A process stopped at the ceiling need not exit successfully; the
+        // caller reports the ceiling instead of a misleading `gh` failure.
+        if !result.success && !capped {
             return Err(GithubReadError::FetchFailed(redact_gh_error(
                 &best_gh_error(&result.stderr, &result.stdout),
             )));
         }
-        let json: Value = serde_json::from_slice(&result.stdout).map_err(|error| {
-            GithubReadError::InvalidStructuredResponse(format!(
-                "GitHub CLI returned invalid structured JSON: {error}"
-            ))
-        })?;
-        if json.get("success").and_then(Value::as_bool) == Some(false) {
-            let underlying = json
-                .get("error")
-                .or_else(|| json.get("message"))
-                .and_then(Value::as_str)
-                .unwrap_or("GitHub declined the resource request");
-            return Err(GithubReadError::FetchFailed(redact_gh_error(underlying)));
-        }
-        if let Some(errors) = json.get("errors") {
-            return Err(GithubReadError::FetchFailed(redact_gh_error(
-                &errors.to_string(),
+        Ok((result.stdout, capped))
+    }
+
+    /// Run a structured `gh` command whose output is one JSON document.
+    /// `data_label` names the data in the error when the output is too large
+    /// to parse ("issue", "pull request", "review comment").
+    pub(super) fn structured_json(
+        &self,
+        working_directory: &std::path::Path,
+        args: &[String],
+        data_label: &str,
+    ) -> Result<Value, GithubReadError> {
+        let (stdout, capped) = self.bounded_structured_output(working_directory, args)?;
+        if capped {
+            return Err(GithubReadError::FetchFailed(format!(
+                "GitHub {data_label} data reached the {MAX_STRUCTURED_BYTES}-byte fetch ceiling; no document returned."
             )));
         }
-        Ok(json)
+        parse_structured_json(&stdout)
+    }
+}
+
+/// Most bytes AFT reads from one structured `gh` command. The read stops here
+/// and `gh` is stopped, so a long-lived issue cannot make AFT buffer and parse
+/// an unbounded response.
+pub const MAX_STRUCTURED_BYTES: usize = 4 * 1024 * 1024;
+
+fn parse_structured_json(stdout: &[u8]) -> Result<Value, GithubReadError> {
+    let json: Value = serde_json::from_slice(stdout).map_err(|error| {
+        GithubReadError::InvalidStructuredResponse(format!(
+            "GitHub CLI returned invalid structured JSON: {error}"
+        ))
+    })?;
+    if json.get("success").and_then(Value::as_bool) == Some(false) {
+        let underlying = json
+            .get("error")
+            .or_else(|| json.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("GitHub declined the resource request");
+        return Err(GithubReadError::FetchFailed(redact_gh_error(underlying)));
+    }
+    if let Some(errors) = json.get("errors") {
+        return Err(GithubReadError::FetchFailed(redact_gh_error(
+            &errors.to_string(),
+        )));
+    }
+    Ok(json)
+}
+
+/// The whole array or object elements at the start of a JSON array whose
+/// text was cut off (`[{...},{...},{..`). The element the cut fell inside is
+/// dropped. Only arrays and objects are kept: a cut scalar such as a number
+/// could still parse, as the wrong value.
+fn complete_leading_array_elements(bytes: &[u8]) -> Vec<Value> {
+    let mut elements = Vec::new();
+    let Some(mut rest) = bytes.trim_ascii_start().strip_prefix(b"[") else {
+        return elements;
+    };
+    loop {
+        rest = rest.trim_ascii_start();
+        let mut values = serde_json::Deserializer::from_slice(rest).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) if value.is_array() || value.is_object() => elements.push(value),
+            _ => return elements,
+        }
+        rest = rest[values.byte_offset()..].trim_ascii_start();
+        match rest.strip_prefix(b",") {
+            Some(after) => rest = after,
+            None => return elements,
+        }
     }
 }
 
@@ -663,6 +732,94 @@ mod tests {
         assert!(short_review_args
             .iter()
             .any(|argument| argument.starts_with("query=query AftReadPullRequestReviewComments")));
+    }
+
+    fn issue_request() -> GithubFetchRequest {
+        GithubFetchRequest {
+            resource: GithubResource {
+                kind: GithubResourceKind::Issue,
+                number: 1,
+                repository: None,
+                comment_selector: None,
+                diff_path: None,
+            },
+            working_directory: PathBuf::from("/fixture"),
+        }
+    }
+
+    fn ok_output(stdout: Vec<u8>) -> Result<GhCommandOutput, GhCommandError> {
+        Ok(GhCommandOutput {
+            success: true,
+            stdout,
+            stderr: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn a_timeline_past_the_fetch_ceiling_keeps_whole_pages_and_names_the_cut() {
+        let event = json!({
+            "event": "labeled",
+            "created_at": "2026-09-03T05:05:00Z",
+            "actor": { "login": "maintainer" },
+            "label": { "name": "bug" },
+            "padding": "p".repeat(500),
+        });
+        let page = serde_json::to_string(&vec![event; 100]).unwrap();
+        // `gh api --paginate --slurp` streams the pages as one JSON array.
+        let pages = 100;
+        let timeline = format!("[{}]", vec![page.as_str(); pages].join(","));
+        assert!(timeline.len() > MAX_STRUCTURED_BYTES);
+        let runner = FixtureRunner::default();
+        *runner.output.lock().unwrap() = vec![
+            ok_output(
+                serde_json::to_vec(&json!({
+                    "number": 1,
+                    "title": "fixture",
+                    "url": "https://github.com/owner/repo/issues/1"
+                }))
+                .unwrap(),
+            ),
+            ok_output(timeline.into_bytes()),
+        ];
+        let document = GhCliFetcher::new(runner).fetch(&issue_request()).unwrap();
+        assert_eq!(document.timeline_cut_at_bytes, Some(MAX_STRUCTURED_BYTES));
+        assert!(document.has_fetch_gap());
+        let kept = document.timeline.len();
+        assert!(kept > 0 && kept < pages * 100 && kept % 100 == 0, "{kept}");
+        assert!(crate::github_read::render_document(&document).contains(
+            "Timeline incomplete: fetched 4194304 bytes, reaching the 4194304-byte ceiling; later events are not shown."
+        ));
+    }
+
+    #[test]
+    fn issue_data_past_the_fetch_ceiling_is_refused_not_parsed() {
+        let runner = FixtureRunner::default();
+        *runner.output.lock().unwrap() = vec![ok_output(
+            serde_json::to_vec(&json!({
+                "number": 1,
+                "title": "fixture",
+                "body": "b".repeat(MAX_STRUCTURED_BYTES),
+                "url": "https://github.com/owner/repo/issues/1"
+            }))
+            .unwrap(),
+        )];
+        let error = GhCliFetcher::new(runner)
+            .fetch(&issue_request())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "GitHub issue data reached the 4194304-byte fetch ceiling; no document returned."
+        );
+    }
+
+    #[test]
+    fn cut_array_text_keeps_only_whole_leading_elements() {
+        assert_eq!(
+            complete_leading_array_elements(b" [[1],{\"a\":2}, [3, 4"),
+            vec![json!([1]), json!({"a": 2})]
+        );
+        assert!(complete_leading_array_elements(b"[12").is_empty());
+        assert!(complete_leading_array_elements(b"{}").is_empty());
     }
 
     #[test]

@@ -101,7 +101,7 @@ pub(super) fn render_document_for_resource(
         render_reviews(&mut output, document, &discussion, resource);
         render_review_comment_sections(&mut output, document, &discussion, resource);
     }
-    render_timeline(&mut output, &discussion);
+    render_timeline(&mut output, &discussion, document.timeline_cut_at_bytes);
 
     output.push_str(&format!(
         "Discussion drill-down: {}/comments/<sel> (for example 3, 3-5, 3,7, or -1).\n\n",
@@ -268,7 +268,11 @@ fn render_review_comment_sections(
     }
 }
 
-fn render_timeline(output: &mut String, discussion: &[DiscussionItem<'_>]) {
+fn render_timeline(
+    output: &mut String,
+    discussion: &[DiscussionItem<'_>],
+    cut_at_bytes: Option<usize>,
+) {
     let events = discussion
         .iter()
         .enumerate()
@@ -286,6 +290,14 @@ fn render_timeline(output: &mut String, discussion: &[DiscussionItem<'_>]) {
             event.created_at.as_deref(),
         );
         render_timeline_event_body(output, event);
+    }
+    if let Some(bytes) = cut_at_bytes {
+        if !rendered_any {
+            output.push_str("\n## Timeline\n\n");
+        }
+        output.push_str(&format!(
+            "Timeline incomplete: fetched {bytes} bytes, reaching the {bytes}-byte ceiling; later events are not shown.\n\n"
+        ));
     }
 }
 

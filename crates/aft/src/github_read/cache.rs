@@ -198,6 +198,12 @@ pub struct GithubReadCompletion {
     /// Live structured data retained for mutation flows that must reuse read ordinals.
     pub document: Option<super::model::GithubDocument>,
     pub diff_page: Option<super::diff::GithubDiffPage>,
+    /// The page stopped at [`MAX_PAGE_BYTES`]; its last line is the
+    /// truncation notice, not document text.
+    pub page_cut_by_size: bool,
+    /// The live fetch left part of the resource out (the rendered text names
+    /// what), so no page of it is complete.
+    pub document_gap: bool,
 }
 
 /// Handle for a fetch or attachment task that is running away from the request
@@ -702,34 +708,67 @@ fn complete(
     document: Option<super::model::GithubDocument>,
 ) -> GithubReadCompletion {
     let total_lines = canonical_text.lines().count();
+    let (content, page_cut_by_size) = select(&canonical_text, selector);
+    let document_gap = document
+        .as_ref()
+        .is_some_and(super::model::GithubDocument::has_fetch_gap);
     GithubReadCompletion {
-        content: apply_selector(&canonical_text, selector),
+        content,
         total_lines,
         freshness,
         attachments,
         document,
         diff_page: None,
+        page_cut_by_size,
+        document_gap,
     }
 }
 
+/// Longest line a page shows whole, and most bytes one page holds: the same
+/// bounds file reads apply (`commands/read.rs`).
+const MAX_LINE_LENGTH: usize = 2000;
+const MAX_PAGE_BYTES: usize = 50 * 1024;
+
 /// Apply selection to the completed canonical render, never to raw GitHub data.
 pub fn apply_selector(canonical_text: &str, selector: GithubReadSelector) -> String {
+    select(canonical_text, selector).0
+}
+
+/// [`apply_selector`], also returning whether a line page stopped at
+/// [`MAX_PAGE_BYTES`].
+fn select(canonical_text: &str, selector: GithubReadSelector) -> (String, bool) {
     match selector {
-        GithubReadSelector::WholeDocument => canonical_text.to_string(),
+        GithubReadSelector::WholeDocument => (canonical_text.to_string(), false),
         GithubReadSelector::LineRange {
             start_line,
             end_line,
             limit,
         } => {
-            let lines: Vec<_> = canonical_text.lines().collect();
-            let start_index = start_line.saturating_sub(1).min(lines.len());
+            let start_index = start_line.saturating_sub(1);
             let requested_end =
                 end_line.unwrap_or_else(|| start_line.saturating_add(limit).saturating_sub(1));
-            let end_index = requested_end.min(lines.len()).max(start_index);
-            let selected = lines[start_index..end_index].join("\n");
-            (!selected.is_empty())
-                .then(|| format!("{selected}\n"))
-                .unwrap_or_default()
+            let mut page = String::new();
+            for line in canonical_text
+                .lines()
+                .skip(start_index)
+                .take(requested_end.saturating_sub(start_index))
+            {
+                let shown = if line.len() > MAX_LINE_LENGTH {
+                    let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
+                    format!("{}... (truncated)\n", &line[..safe_end])
+                } else {
+                    format!("{line}\n")
+                };
+                if page.len().saturating_add(shown.len()) > MAX_PAGE_BYTES {
+                    page.push_str(&format!(
+                        "... (output truncated at {}KB, use start_line/end_line to read sections)\n",
+                        MAX_PAGE_BYTES / 1024
+                    ));
+                    return (page, true);
+                }
+                page.push_str(&shown);
+            }
+            (page, false)
         }
         GithubReadSelector::ByteOffset { offset, limit } => {
             let start = canonical_text.floor_char_boundary(offset.min(canonical_text.len()));
@@ -737,7 +776,7 @@ pub fn apply_selector(canonical_text: &str, selector: GithubReadSelector) -> Str
                 .map(|limit| start.saturating_add(limit).min(canonical_text.len()))
                 .unwrap_or(canonical_text.len());
             let end = canonical_text.floor_char_boundary(requested_end);
-            canonical_text[start..end].to_string()
+            (canonical_text[start..end].to_string(), false)
         }
     }
 }
@@ -881,6 +920,54 @@ mod tests {
     use super::*;
     use crate::github_read::attachments::{DownloadedGithubImage, GithubImageDownloader};
     use crate::github_read::model::{GithubDocument, GithubDocumentKind};
+
+    #[test]
+    fn a_line_page_stops_at_the_file_read_byte_and_line_bounds() {
+        // 100 lines of 1 KB: twice the page ceiling, well under the line limit.
+        let line = "x".repeat(1023);
+        let canonical = format!("{line}\n").repeat(100);
+        let page = GithubReadSelector::LineRange {
+            start_line: 1,
+            end_line: None,
+            limit: 2000,
+        };
+        let (content, cut) = select(&canonical, page.clone());
+        assert!(cut);
+        assert!(content.len() <= MAX_PAGE_BYTES + 100, "{}", content.len());
+        assert!(content.ends_with(
+            "... (output truncated at 50KB, use start_line/end_line to read sections)\n"
+        ));
+        let completion = complete(
+            canonical,
+            page.clone(),
+            GithubReadFreshness::Fetched,
+            Vec::new(),
+            None,
+        );
+        assert!(completion.page_cut_by_size);
+        assert_eq!(completion.total_lines, 100);
+
+        // One 200 KB line (a pasted log) is cut like a long file line.
+        let (content, cut) = select(&format!("{}\n", "y".repeat(200 * 1024)), page);
+        assert!(!cut);
+        assert_eq!(content, format!("{}... (truncated)\n", "y".repeat(2000)));
+    }
+
+    #[test]
+    fn a_line_page_under_the_bounds_is_unchanged() {
+        let canonical = "one\ntwo\nthree\n";
+        let page = |start_line, end_line| GithubReadSelector::LineRange {
+            start_line,
+            end_line,
+            limit: 2000,
+        };
+        assert_eq!(
+            select(canonical, page(1, None)),
+            (canonical.to_string(), false)
+        );
+        assert_eq!(select(canonical, page(2, Some(2))).0, "two\n");
+        assert_eq!(select(canonical, page(4, None)).0, "");
+    }
 
     #[derive(Default)]
     struct MemoryCache(Mutex<Option<GithubReadCacheEntry>>);

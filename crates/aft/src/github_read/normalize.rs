@@ -85,6 +85,7 @@ pub fn normalize_structured_document(
         head_ref_name: None,
         review_decision: None,
         timeline: Vec::new(),
+        timeline_cut_at_bytes: None,
     };
 
     if resource.kind == GithubResourceKind::PullRequest {

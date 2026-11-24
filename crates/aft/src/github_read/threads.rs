@@ -26,7 +26,7 @@ impl<R: GhCommandRunner> GhCliFetcher<R> {
             if let Some(cursor) = &cursor {
                 args.extend(["-f".to_string(), format!("cursor={cursor}")]);
             }
-            let json = self.structured_json(&request.working_directory, &args)?;
+            let json = self.structured_json(&request.working_directory, &args, "review thread")?;
             let connection = json
                 .pointer("/data/repository/pullRequest/reviewThreads")
                 .ok_or_else(invalid_threads)?;
@@ -71,7 +71,8 @@ impl<R: GhCommandRunner> GhCliFetcher<R> {
                         "-f".to_string(),
                         format!("cursor={current}"),
                     ];
-                    let json = self.structured_json(&request.working_directory, &args)?;
+                    let json =
+                        self.structured_json(&request.working_directory, &args, "review thread")?;
                     let comments = json
                         .pointer("/data/node/comments")
                         .ok_or_else(invalid_threads)?;
@@ -191,11 +192,14 @@ mod tests {
     impl GhCommandRunner for FixtureRunner {
         fn run_bounded(
             &self,
-            _: &std::path::Path,
-            _: &[String],
-            _: usize,
+            working_directory: &std::path::Path,
+            args: &[String],
+            byte_cap: usize,
         ) -> Result<(GhCommandOutput, bool), GhCommandError> {
-            panic!("thread fixtures do not fetch diffs")
+            let mut output = self.run(working_directory, args)?;
+            let capped = output.stdout.len() > byte_cap;
+            output.stdout.truncate(byte_cap);
+            Ok((output, capped))
         }
 
         fn run(
