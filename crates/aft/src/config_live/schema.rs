@@ -5,6 +5,7 @@ use serde_json::{json, Value};
 
 mod defaults;
 mod harness;
+mod titles;
 
 const MAP_KEY: &str = "^.+$";
 
@@ -41,7 +42,11 @@ fn annotate_cache_dir(cache_dir: &mut Value) {
         .as_array_mut()
         .expect("cache directory choices")
     {
-        let (description, kind_description) = match branch["properties"]["kind"]["const"].as_str() {
+        let kind = branch["properties"]["kind"]["const"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let (description, kind_description) = match Some(kind.as_str()) {
             Some("default") => (
                 "Use the same cache behavior as omitting this setting.",
                 "Select the default cache behavior.",
@@ -56,33 +61,29 @@ fn annotate_cache_dir(cache_dir: &mut Value) {
             ),
             other => panic!("unknown cache directory choice: {other:?}"),
         };
+        branch["title"] = json!(titles::title(&format!("storage.cache_dir: {kind}"))
+            .expect("cache directory choice title"));
         branch["description"] = json!(description);
         branch["properties"]["kind"]["description"] = json!(kind_description);
         if let Some(path) = branch["properties"].get_mut("path") {
+            path["title"] = json!(titles::title("storage.cache_dir: dir.path").unwrap());
             path["description"] = json!("Existing absolute path to the cache parent; ~ expands.");
         }
     }
 }
 
 fn setup_sections(fields: &mut Value) {
-    for (feature, title, order, recommended) in [
+    for (feature, order, recommended) in [
         (
             "github",
-            "GitHub",
             10,
             json!({"/github/read": true, "/github/shim": false}),
         ),
-        (
-            "remote_exec",
-            "Remote runs",
-            20,
-            json!({"/remote_exec/enabled": true}),
-        ),
+        ("remote_exec", 20, json!({"/remote_exec/enabled": true})),
         // Offer backend selection without recommending a backend. Disabling
         // meaning search is a separate setting under `indexes`.
-        ("semantic", "Meaning search", 30, json!({})),
+        ("semantic", 30, json!({})),
     ] {
-        fields[feature]["title"] = json!(title);
         fields[feature]["x-ck-setup"] =
             json!({"feature": feature, "order": order, "recommended": recommended});
     }
@@ -96,6 +97,9 @@ fn declare(
     harness: bool,
 ) {
     let node = schema.as_object_mut().expect("settings schema node");
+    if let Some(title) = titles::title(path) {
+        node.insert("title".into(), json!(title));
+    }
     let positional_default = node.remove("default");
     let default = if harness {
         None
