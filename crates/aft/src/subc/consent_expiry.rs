@@ -6,7 +6,7 @@ use crate::db::access_grants::ScopeKey;
 use crate::db::TrackedConnection;
 use rusqlite::{params, Connection};
 use serde_json::json;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -286,7 +286,10 @@ pub(super) struct Sweep {
     // Page by rowid so live or failing asks at the front cannot starve the
     // remainder. Wrap at the end to retry rows that were skipped or failed.
     cursor: i64,
-    failed: HashSet<String>,
+    // Remember which pass last saw each failed card, including rows skipped
+    // while a waiter is active. Cards removed elsewhere disappear on wrap.
+    pass: u64,
+    failed: HashMap<String, u64>,
 }
 
 impl Sweep {
@@ -307,6 +310,9 @@ impl Sweep {
         for row in rows {
             if now() >= deadline {
                 return Ok(());
+            }
+            if let Some(pass) = self.failed.get_mut(&row.call_key) {
+                *pass = self.pass;
             }
             let Some(_guard) = begin_withdrawal(&row.key) else {
                 self.cursor = row.rowid;
@@ -344,7 +350,11 @@ impl Sweep {
                     None => Err("Cingulate transport is unavailable".into()),
                 };
                 if let Err(error) = result {
-                    if self.failed.insert(row.call_key.clone()) {
+                    if self
+                        .failed
+                        .insert(row.call_key.clone(), self.pass)
+                        .is_none()
+                    {
                         log::warn!("idle consent.withdraw failed for {id}: {error}");
                     }
                     continue;
@@ -355,8 +365,70 @@ impl Sweep {
         }
         if end {
             self.cursor = 0;
+            self.failed.retain(|_, last_seen| *last_seen == self.pass);
+            self.pass = self.pass.wrapping_add(1);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn daemon_edge_idle_sweep_forgets_failed_withdrawals_for_removed_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(std::sync::Mutex::new(
+            crate::db::open(&dir.path().join("aft.db")).unwrap(),
+        ));
+        let key = AskKey {
+            scope: ScopeKey {
+                owner: "owner".into(),
+                scope_ref: "worker".into(),
+                epoch: 1,
+            },
+            args_hash: "arg".into(),
+        };
+        let permission = super::super::Permission::File(crate::access_policy::AccessGrant {
+            path: dir.path().to_owned(),
+            kind: crate::access_policy::GrantKind::File,
+            operation: crate::access_policy::AccessOperation::Read,
+        });
+        {
+            let conn = db.lock().unwrap();
+            super::super::asks::open_permission(
+                &conn,
+                &key,
+                "call",
+                &json!({}),
+                &json!({}),
+                &permission,
+                1,
+            )
+            .unwrap();
+            super::super::asks::set_elicitation(&conn, &key, "call", "card").unwrap();
+        }
+        let mut sweep = Sweep::default();
+        let now = Instant::now();
+        sweep
+            .run(&db, None, 2, SWEEP_BUDGET, IDLE_MS + 2, || now)
+            .await
+            .unwrap();
+        assert!(
+            sweep.failed.contains_key("call"),
+            "the row's withdrawal failed"
+        );
+
+        discard_card(&db.lock().unwrap(), &key, "call").unwrap();
+        sweep
+            .run(&db, None, 2, SWEEP_BUDGET, IDLE_MS + 2, || now)
+            .await
+            .unwrap();
+        assert!(
+            sweep.failed.is_empty(),
+            "the removed card cannot fail again"
+        );
     }
 }
 
