@@ -105,7 +105,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `BackupStore::status_discovery_entries_for_test` | test-support visibility widened | `aft-edit` | Composed status tests count directory traversal in the real backup store. |
 | `backup::latency::Timer` | visibility widened | `aft-edit` | Keep the existing scoped backup lock timer in the composition adapter. |
 | `backup::latency::time` | visibility widened | `aft-edit` | Record lock wait in the original edit phase accounting. |
-| `ReadHooks::with_mid_read` | test-support visibility widened | `aft-edit` | Keep the engine bridge's exact-read hook. |
+| `ReadHooks::with_mid_read` | test-support visibility widened | `aft-edit` | Keep the exact-read hook available to engine tests. |
 | `format::SubprocessOutcome` | visibility widened | `aft-edit` | Share the same command capture result with inspect, shell, and GitHub callers. |
 | `SubprocessOutcome::stdout` | visibility widened | `aft-edit` | Those callers parse the captured output. |
 | `SubprocessOutcome::stdout_utf8_valid` | visibility widened | `aft-edit` | Consumers reject malformed UTF-8 rather than reading replacement characters. |
