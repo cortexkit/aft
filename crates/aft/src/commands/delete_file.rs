@@ -578,8 +578,8 @@ fn delete_one_or_dir(
         )
         .into());
     }
-    let path = match ctx.validate_write_location(&req.id, Path::new(file)) {
-        Ok(path) => path,
+    let (path, identity) = match ctx.authorize_write_location(&req.id, Path::new(file)) {
+        Ok(paths) => paths,
         Err(resp) => return Err(DeleteError::Refused(resp)),
     };
 
@@ -643,7 +643,7 @@ fn delete_one_or_dir(
                 ),
             ).into());
         }
-        return delete_directory(req, ctx, &path, file, op_id, budget, no_backup);
+        return delete_directory(req, ctx, (&path, &identity), file, op_id, budget, no_backup);
     }
 
     if let Some(reason) = no_backup {
@@ -1187,7 +1187,7 @@ fn socket_warning(path: &str) -> String {
 fn delete_directory(
     req: &RawRequest,
     ctx: &AppContext,
-    path: &Path,
+    (path, identity): (&Path, &Path),
     original: &str,
     op_id: &str,
     budget: &mut RecursiveDeleteBackupBudget,
@@ -1207,7 +1207,15 @@ fn delete_directory(
         )
     })?;
     let policy = ctx.access_policy(&req.id)?;
-    let entry_denial = |entry: &Path| policy.cortexkit_tree_entry_denial(entry);
+    // The walk keeps the caller's spelling for backups and replies. Judge each
+    // child under the authorized root so a symlinked parent or `..` cannot
+    // hide that the child is in CortexKit data.
+    let entry_denial = |entry: &Path| {
+        let child = entry
+            .strip_prefix(path)
+            .expect("entry belongs to the walk root");
+        policy.cortexkit_tree_entry_denial(&identity.join(child))
+    };
     if let Some(reason) = no_backup {
         return delete_directory_without_backups(
             req,

@@ -113,7 +113,7 @@ fn cortexkit_data_file_tools_apply_normal_access_and_keep_exceptions() {
 #[test]
 fn cortexkit_data_recursive_delete_refuses_first_protected_entry_before_mutating() {
     // System-temp trees have an independent SQLite guard, so place the project
-    // outside that tier to exercise the CortexKit data floor in both delete walks.
+    // outside system temp to exercise the data floor with and without backups.
     let parent = crate::test_helpers::manifest_dir().join("../../target/scratch/cortexkit-data");
     fs::create_dir_all(&parent).unwrap();
     for backups in [true, false] {
