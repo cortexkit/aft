@@ -298,8 +298,6 @@ dependencies = [
  "url",
  "vt100",
  "vte",
- "wasmtime",
- "wasmtime-c-api-impl",
  "which",
  "windows-sys 0.61.2",
  "zeroize",

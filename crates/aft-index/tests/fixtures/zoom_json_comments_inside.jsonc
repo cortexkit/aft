@@ -1,0 +1,12 @@
+{
+  // Comments inside the object remain valid JSONC content.
+  "chains": {
+    /* The nested path should still resolve. */
+    "executor": {
+      "entries": [
+        { "model": "small" },
+        { "model": "large" }
+      ]
+    }
+  }
+}

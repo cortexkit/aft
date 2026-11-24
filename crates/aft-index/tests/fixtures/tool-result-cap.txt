@@ -1,0 +1,3 @@
+header
+<long-line prefix>
+[output cut at 50 KB of 64.0 KB; full result saved to <path>; read it with read and a line range]

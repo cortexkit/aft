@@ -1,0 +1,13 @@
+/* Configuration header.
+ * This block comment appears before the JSON object.
+ */
+{
+  "chains": {
+    "executor": {
+      "entries": [
+        { "model": "small" },
+        { "model": "large" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,124 @@
+{
+  "type": "status_changed",
+  "session_id": null,
+  "snapshot": {
+    "version": "0.61.0",
+    "project_root": "/project",
+    "canonical_root": "/project",
+    "cache_role": "main",
+    "degraded": true,
+    "degraded_reasons": [
+      "root_too_broad"
+    ],
+    "message": "project status",
+    "config_error": {
+      "source": "project",
+      "path": "/project/.aftconfig.json",
+      "message": "invalid configured option",
+      "line": 3,
+      "column": 2
+    },
+    "features": {
+      "format_on_edit": true,
+      "validate_on_edit": "syntax",
+      "restrict_to_project_root": true,
+      "search_index": true,
+      "experimental_search_index": true,
+      "semantic_search": true,
+      "experimental_semantic_search": true,
+      "callgraph_store": true
+    },
+    "search_index": {
+      "status": "ready",
+      "files": 6200,
+      "trigrams": 250000
+    },
+    "semantic_index": {
+      "status": "loading",
+      "backend": "onnx",
+      "model": "fixture-model",
+      "stage": "embedding",
+      "files": 6200,
+      "entries_done": 40000,
+      "entries_total": 52000,
+      "refreshing_count": 3,
+      "entries": 52000,
+      "dimension": 384,
+      "error": "retryable error",
+      "reason": "retry pending",
+      "backend_url": "http://127.0.0.1:11434"
+    },
+    "semantic": {
+      "backend": "onnx",
+      "model": "fixture-model"
+    },
+    "semantic_config": {
+      "backend": "onnx",
+      "model": "fixture-model"
+    },
+    "disk": {
+      "storage_dir": "/storage",
+      "trigram_disk_bytes": 6000000,
+      "semantic_disk_bytes": 18000000
+    },
+    "runtime": {
+      "live_watchers": 192,
+      "live_actor_roots": 192,
+      "open_routes": 90
+    },
+    "lsp_servers": 5,
+    "symbol_cache": {
+      "local_entries": 18000,
+      "warm_entries": 2000
+    },
+    "storage_dir": "/storage",
+    "checkpoints_total": 24,
+    "push_details": {
+      "omitted": false,
+      "read": "status"
+    },
+    "compression": {
+      "project": {
+        "events": 100,
+        "original_tokens": 10000,
+        "compressed_tokens": 2000,
+        "savings_tokens": 8000
+      }
+    },
+    "status_bar": {
+      "disabled_categories": [],
+      "errors": 1,
+      "warnings": 2,
+      "todos": 6,
+      "diagnostics": "pending",
+      "diagnostics_gaps": [
+        {
+          "language": "rust",
+          "producer": "rust-analyzer",
+          "root": "/project"
+        }
+      ]
+    },
+    "status_bar_values": {
+      "disabled_categories": [],
+      "errors": 1,
+      "warnings": 2,
+      "todos": 6,
+      "diagnostics": "pending",
+      "diagnostics_gaps": [
+        {
+          "language": "rust",
+          "producer": "rust-analyzer",
+          "root": "/project"
+        }
+      ]
+    },
+    "lsp": {
+      "applicability_by_root": {}
+    },
+    "storage_refusals": [],
+    "storage_refusals_total": 0,
+    "storage_refusals_omitted": 0,
+    "storage_refusals_unattributed": 0
+  }
+}

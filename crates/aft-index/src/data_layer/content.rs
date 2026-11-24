@@ -1083,7 +1083,7 @@ mod tests {
     /// `#[cfg(windows)]` twins and Rust impl methods.
     pub(crate) fn sample_files() -> Vec<std::path::PathBuf> {
         let crate_dir = crate::test_support::manifest_dir();
-        let fixtures = crate_dir.join("../aft/tests/fixtures");
+        let fixtures = crate_dir.join("tests/fixtures");
         let mut files = Vec::new();
         for dir in [fixtures.clone(), fixtures.join("callgraph")] {
             for entry in std::fs::read_dir(dir).unwrap() {
@@ -1097,7 +1097,7 @@ mod tests {
             "../aft-store/src/stat.rs",
             "../aft-store/src/content/mod.rs",
             "../aft-base/src/effective_path.rs",
-            "src/format.rs",
+            "../aft-edit/src/format.rs",
             "../aft-base/src/symbols.rs",
             "src/data_layer/runtime.rs",
             "src/data_layer/content.rs",

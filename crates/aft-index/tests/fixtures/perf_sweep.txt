@@ -1,0 +1,25 @@
+2024-12-31T23:59:59.999Z [aft] WARN before window 999
+2025-01-01T00:00:00.000Z [aft] INFO boundary included
+2025-01-01T00:00:01.000Z [aft] WARN slow tool_call name=read total=100ms queue=10ms exec=90ms
+2025-01-01T00:00:02.000Z [aft] WARN slow tool_call name=read total=200ms queue=20ms exec=180ms
+2025-01-01T00:00:03.000Z [aft] WARN slow tool_call name=search total=301ms queue=21ms exec=280ms total=987ms
+2025-01-01T00:00:04.000Z [aft] WARN slow tool_call name=search total=999ms queue=99ms exec=900ms
+2025-01-01T00:00:05.000Z [aft] WARN slow tool_call name=bash_watch total=90000ms queue=1ms exec=89999ms
+2025-01-01T00:00:06.000Z [aft] WARN slow tool_call name=bash_status total=80000ms queue=1ms exec=79999ms
+2025-01-01T00:00:07.000Z [aft] WARN slow tool_call name=missing no timings
+2025-01-01T00:00:08.000Z [aft] INFO configure prefix slow total=101ms cache_key_resolve=1ms worktree_probe=3ms
+2025-01-01T00:00:09.000Z [aft] INFO configure prefix slow total=102ms cache_key_resolve=2ms worktree_probe=4ms
+2025-01-01T00:00:10.000Z [aft] INFO cold-build slot acquired after 150ms
+2025-01-01T00:00:11.000Z [aft] INFO cold-build slot acquired after 250ms
+2025-01-01T00:00:12.000Z [aft] semantic view fill root=/repo elapsed_ms=123
+2025-01-01T00:00:13.000Z [aft] semantic view fill root=/repo elapsed_ms=124
+2025-01-01T00:00:14.000Z [aft] INFO view_publication root=/repo derived_ms=555
+2025-01-01T00:00:15.000Z [aft] INFO view_publication derived_ms=556
+2025-01-01T00:00:16.000Z [aft] INFO bash_start_deadline refusal
+2025-01-01T00:00:17.000Z [aft] INFO bash_start_deadline bash_start_deadline repeated on same line
+2025-01-01T00:00:18.000Z [aft] WARN [ses_one] repeat 123 root=456
+2025-01-01T00:00:19.000Z [aft] WARN [ses_two] repeat 999 root=001
+2025-01-01T00:00:20.000Z [aft] ERROR daemon failed 123
+2025-01-01T00:00:21.000Z [aft] INFO thread 'worker' panicked at code.rs:5
+2025-01-01T00:00:22.000Z [aft] WARN bash spawned command=' ERROR panicked at' total=1
+2025-01-01T00:00:23.000Z [aft] INFO ordinary line

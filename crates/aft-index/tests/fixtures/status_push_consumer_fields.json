@@ -1,0 +1,13 @@
+[
+  "/version", "/project_root", "/canonical_root", "/cache_role", "/degraded", "/degraded_reasons", "/message", "/config_error", "/lsp_servers", "/storage_dir", "/checkpoints_total",
+  "/features/format_on_edit", "/features/validate_on_edit", "/features/restrict_to_project_root", "/features/search_index", "/features/experimental_search_index", "/features/semantic_search", "/features/experimental_semantic_search", "/features/callgraph_store",
+  "/search_index/status", "/search_index/files", "/search_index/trigrams",
+  "/semantic_index/status", "/semantic_index/backend", "/semantic_index/model", "/semantic_index/stage", "/semantic_index/files", "/semantic_index/entries_done", "/semantic_index/entries_total", "/semantic_index/refreshing_count", "/semantic_index/entries", "/semantic_index/dimension", "/semantic_index/error", "/semantic_index/reason", "/semantic_index/backend_url",
+  "/semantic/backend", "/semantic/model", "/semantic_config/backend", "/semantic_config/model",
+  "/disk/storage_dir", "/disk/trigram_disk_bytes", "/disk/semantic_disk_bytes",
+  "/runtime/live_watchers", "/runtime/live_actor_roots", "/runtime/open_routes",
+  "/symbol_cache/local_entries", "/symbol_cache/warm_entries",
+  "/compression/project/events", "/compression/project/original_tokens", "/compression/project/compressed_tokens", "/compression/project/savings_tokens",
+  "/status_bar/disabled_categories", "/status_bar/errors", "/status_bar/warnings", "/status_bar/todos", "/status_bar/diagnostics", "/status_bar/diagnostics_gaps",
+  "/status_bar_values/disabled_categories", "/status_bar_values/errors", "/status_bar_values/warnings", "/status_bar_values/todos", "/status_bar_values/diagnostics", "/status_bar_values/diagnostics_gaps"
+]

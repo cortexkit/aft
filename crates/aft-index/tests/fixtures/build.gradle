@@ -1,0 +1,19 @@
+plugins {
+    id 'java'
+}
+
+dependencies {
+    implementation 'org.slf4j:slf4j-api:2.0.12'
+}
+
+task smokeTest {
+    doLast {
+        println 'smoke'
+    }
+}
+
+tasks.register('ciCheck') {
+    doLast {
+        println 'ci'
+    }
+}

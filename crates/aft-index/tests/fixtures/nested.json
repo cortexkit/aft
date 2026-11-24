@@ -1,0 +1,25 @@
+{
+  "registration_profile_manifest": {
+    "host_only_allowlist": ["alpha", "beta"],
+    "nested": {
+      "deep": "value"
+    }
+  },
+  "servers": [
+    { "name": "primary", "port": 8080 },
+    { "name": "backup", "port": 9090 }
+  ],
+  "a": {
+    "b": [
+      { "c": "first" },
+      { "c": "second" }
+    ]
+  },
+  "literal.dotted.key": "literal-value",
+  "literal": {
+    "dotted": {
+      "key": "path-value"
+    }
+  },
+  "plain.dotted": "plain-value"
+}

@@ -1,0 +1,12 @@
+// Configuration header — 日本語の説明
+// Leading comments must not hide the document value.
+{
+  "chains": {
+    "executor": {
+      "entries": [
+        { "model": "small" },
+        { "model": "large" }
+      ]
+    }
+  }
+}

@@ -1,0 +1,12 @@
+
+
+{
+  "chains": {
+    "executor": {
+      "entries": [
+        { "model": "small" },
+        { "model": "large" }
+      ]
+    }
+  }
+}

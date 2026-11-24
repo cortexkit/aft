@@ -1,0 +1,12 @@
+Call graph:
+    1163 Thread_23267290: reqwest-internal-sync-runtime
+      1163 thread_start  (in libsystem_pthread.dylib) + 8  [0x183310cec]
+        1163 _pthread_start  (in libsystem_pthread.dylib) + 136  [0x183315d04]
+          1163 ???  (in ck-aft)  load address 0x1041c0000 + 0x1015b74  [0x1051d5b74]
+            1163 ???  (in ck-aft)  load address 0x1041c0000 + 0xf57958  [0x105117958]
+              1163 ???  (in ck-aft)  load address 0x1041c0000 + 0xf04d58  [0x1050c4d58]
+                1163 ???  (in ck-aft)  load address 0x1041c0000 + 0x10bf990  [0x10527f990]
+                  1163 ???  (in ck-aft)  load address 0x1041c0000 + 0x10bee38  [0x10527ee38]
+                    1163 ???  (in ck-aft)  load address 0x1041c0000 + 0x10bf1cc  [0x10527f1cc]
+                      1163 ???  (in ck-aft)  load address 0x1041c0000 + 0x10bf50c  [0x10527f50c]
+                        1163 kevent  (in libsystem_kernel.dylib) + 8  [0x1832d6fcc]
