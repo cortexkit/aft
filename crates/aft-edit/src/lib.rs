@@ -12,13 +12,15 @@ pub mod indent;
 pub mod patch;
 pub mod symbol_diff;
 
+#[cfg(unix)]
+pub(crate) use aft_base::pinned_dir;
 #[cfg(all(test, windows))]
 pub(crate) use aft_base::windows_command;
 pub(crate) use aft_base::{
     bounded_io, config, cross_volume, developer_tools, durability, durable_dir, effective_path,
     environment, error, executor, file_identity, fs_lock, harness, logging, path_identity,
-    pinned_dir, private_storage, process_group, production_storage, project_content, project_walk,
-    protocol, slog_debug, slog_error, slog_info, slog_warn, storage_path, symbols, system_temp,
+    private_storage, process_group, production_storage, project_content, project_walk, protocol,
+    slog_debug, slog_error, slog_info, slog_warn, storage_path, symbols, system_temp,
     task_temp_reads, tool_path, tool_progress, walk_boundary, write_intent,
 };
 #[cfg(test)]
