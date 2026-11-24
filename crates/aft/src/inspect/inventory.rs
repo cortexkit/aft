@@ -61,7 +61,10 @@ mod tests {
         assert!(control
             .tick_tier2_refresh_scheduler_at(std::time::Instant::now(), 0)
             .is_some());
-        assert!(control.inspect_manager().tier2_any_in_flight());
+        // Registered when enqueued; cleared only when its completion drains.
+        let todos = crate::inspect_category::InspectCategory::Todos;
+        let absent = crate::inspect::InspectBuilderState::Absent;
+        assert_ne!(control.inspect_manager().tier2_builder_state(todos), absent);
 
         let ctx = todo_refresh_context(&root);
         let listed = Arc::new(AtomicBool::new(false));
@@ -97,8 +100,9 @@ mod tests {
             unbound_while_listing.load(Ordering::SeqCst),
             "unbinding the root waited for the file listing"
         );
-        assert!(
-            !ctx.inspect_manager().tier2_any_in_flight(),
+        assert_eq!(
+            ctx.inspect_manager().tier2_builder_state(todos),
+            absent,
             "work listed before an unbind was enqueued for the unbound root"
         );
     }
