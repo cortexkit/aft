@@ -3,7 +3,8 @@ use std::time::Instant;
 
 use crate::commands::callgraph_store_adapter::serialized_response_with_view;
 use crate::commands::callgraph_store_adapter::{
-    callers_result, note_callgraph_served, store_error_response,
+    callers_result, disclose_macro_gaps, macro_gap_paths, note_callgraph_served,
+    store_error_response,
 };
 use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
@@ -83,7 +84,11 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let started = Instant::now();
     let include_tests = include_tests_param(req);
-    let outcome = callers_result(&snapshot, &file_path, symbol, depth, include_tests);
+    let outcome =
+        callers_result(&snapshot, &file_path, symbol, depth, include_tests).and_then(|result| {
+            let gaps = macro_gap_paths(&snapshot, &result.file)?;
+            Ok((result, gaps))
+        });
     if let Some(response) =
         crate::commands::data_callgraph::failed_reads(&req.id, "callers", data_view.as_ref())
     {
@@ -92,7 +97,7 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
     let elapsed_ms = started.elapsed().as_millis();
 
     match outcome {
-        Ok(result) => {
+        Ok((result, gaps)) => {
             slog_info!(
                 "callers: '{}' in {} → {} sites in {}ms",
                 result.symbol,
@@ -106,13 +111,15 @@ fn answer_callers(req: &RawRequest, ctx: &AppContext) -> Response {
                 elapsed_ms.min(u64::MAX as u128) as u64,
                 "ok",
             );
-            serialized_response_with_view(
+            let mut response = serialized_response_with_view(
                 &req.id,
                 "callers",
                 &result,
                 data_view.as_ref(),
                 &[&file_path],
-            )
+            );
+            disclose_macro_gaps(&mut response, gaps);
+            response
         }
         Err(error) => {
             slog_warn!(

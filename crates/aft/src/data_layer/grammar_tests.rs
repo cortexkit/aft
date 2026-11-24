@@ -236,6 +236,38 @@ fn audit_resolution_literal_backslash_and_directory_are_distinct() {
     }
 }
 
+#[test]
+fn audit_resolution_macro_mention_overflow_discloses_file_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let target = write(&root, "src/lib.rs", "mod caller;\npub fn dsl_target() {}\n");
+    let mut caller = String::from("pub fn caller() {\n");
+    for n in 0..520 {
+        caller.push_str(&format!("dsl!(distractor_{n} => state);\n"));
+    }
+    caller.push_str("dsl!(dsl_target => state);\n}\n");
+    write(&root, "src/caller.rs", caller);
+    let root = root.canonicalize().unwrap();
+    let ctx = context(&root, &dir.path().join("storage"));
+    let checkout = ctx.data_checkout().unwrap();
+    assert!(matches!(
+        checkout.fresh_view(Duration::from_secs(60)),
+        super::runtime::Fresh::Ready(_)
+    ));
+    let reply = ask(
+        &ctx,
+        "callers",
+        json!({"file": target, "symbol": "dsl_target"}),
+    );
+    assert!(reply.success, "{:?}", reply.data);
+    assert_eq!(reply.data["total_callers"], 0, "{:?}", reply.data);
+    assert_eq!(reply.data["complete"], false, "{:?}", reply.data);
+    assert_eq!(
+        reply.data["gaps"][0]["path"],
+        json!(root.join("src/caller.rs"))
+    );
+}
+
 #[cfg(feature = "wasm-grammars")]
 fn callers(view: &CheckoutView, file: &str) -> Value {
     serde_json::to_value(

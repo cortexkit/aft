@@ -1545,6 +1545,20 @@ fn build_file_data_from_tree_observed<'tree>(
             lang,
             root,
         );
+        if macro_facts.unparsed_mentions_truncated {
+            let name = crate::calls::MACRO_MENTION_OVERFLOW_KEY;
+            macro_mentions_by_symbol
+                .entry(TOP_LEVEL_SYMBOL.into())
+                .or_default()
+                .push(CallSite {
+                    kind: CallSiteKind::Call,
+                    callee_name: name.into(),
+                    full_callee: name.into(),
+                    line: 1,
+                    byte_start: 0,
+                    byte_end: 0,
+                });
+        }
         attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang, root)
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index, nav)

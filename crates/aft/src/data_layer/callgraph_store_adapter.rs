@@ -1045,6 +1045,48 @@ fn unanalyzed_macro_note(
     })
 }
 
+pub(crate) fn macro_gap_paths(
+    store: &impl CallGraphRead,
+    file: &str,
+) -> StoreAdapterResult<Vec<std::path::PathBuf>> {
+    if Path::new(file).extension().and_then(|ext| ext.to_str()) != Some("rs") {
+        return Ok(Vec::new());
+    }
+    let fence = crate::context::confinement::capture();
+    let sites = store.ref_sites_named(
+        MACRO_MENTION_REF_KIND,
+        crate::calls::MACRO_MENTION_OVERFLOW_KEY,
+        super::surfaces::INDEX_GAP_PREVIEW,
+    )?;
+    Ok(sites
+        .into_iter()
+        .map(|site| store.project_root().join(site.file))
+        .filter(|path| fence.admits_walk_entry(path))
+        .collect())
+}
+
+pub(crate) fn disclose_macro_gaps(response: &mut Response, paths: Vec<std::path::PathBuf>) {
+    if !response.success || paths.is_empty() {
+        return;
+    }
+    response.data["complete"] = false.into();
+    let gaps = response
+        .data
+        .as_object_mut()
+        .expect("callers response")
+        .entry("gaps")
+        .or_insert_with(|| serde_json::json!([]));
+    if let Some(gaps) = gaps.as_array_mut() {
+        gaps.extend(paths.into_iter().map(|path| {
+            serde_json::json!({
+                "kind": "macro_mention_overflow",
+                "path": path,
+                "message": "1 file could not be analyzed",
+            })
+        }));
+    }
+}
+
 pub fn call_tree_result(
     store: &impl CallGraphRead,
     file: &Path,
