@@ -641,7 +641,7 @@ use super::*;
 use crate::data_layer::dead_code_snapshot::EntryPoints;
 use aft_store::text::plan_pattern;
 
-fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
+pub(super) fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
     let query = plan_pattern(pattern, false).unwrap();
     view.text_candidates(&query, Scope::All)
         .unwrap()
@@ -650,6 +650,6 @@ fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
         .collect()
 }
 
-fn live_segments(checkout: &Checkout) -> usize {
+pub(super) fn live_segments(checkout: &Checkout) -> usize {
     checkout.store_segments().unwrap()
 }

@@ -122,7 +122,7 @@ pub(crate) struct SourceWork {
     pub(crate) todo_decodes: usize,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn source_work() -> &'static Mutex<HashMap<PathBuf, SourceWork>> {
     static WORK: std::sync::OnceLock<Mutex<HashMap<PathBuf, SourceWork>>> =
         std::sync::OnceLock::new();
@@ -130,7 +130,7 @@ fn source_work() -> &'static Mutex<HashMap<PathBuf, SourceWork>> {
 }
 
 /// What the checkout at `root` did so far (see [`SourceWork`]).
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn source_work_for_test(root: &Path) -> SourceWork {
     source_work()
         .lock()
@@ -140,7 +140,7 @@ pub(crate) fn source_work_for_test(root: &Path) -> SourceWork {
         .unwrap_or_default()
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn note_source_work(root: &Path, note: impl FnOnce(&mut SourceWork)) {
     note(
         source_work()
@@ -151,7 +151,7 @@ fn note_source_work(root: &Path, note: impl FnOnce(&mut SourceWork)) {
     );
 }
 
-#[cfg(not(test))]
+#[cfg(not(any(test, feature = "test-support")))]
 fn note_source_work(_root: &Path, _note: impl FnOnce(&mut SourceWork)) {}
 
 /// The name status gives the data layer's family store when it refuses a
@@ -6364,7 +6364,7 @@ impl Checkout {
 
 #[cfg(test)]
 mod tests {
-    use super::composed_checks::{callers_of, family, write};
+    use super::composed_checks::{callers_of, candidates_for, family, live_segments, write};
     use super::*;
     use aft_store::text::plan_pattern;
 
