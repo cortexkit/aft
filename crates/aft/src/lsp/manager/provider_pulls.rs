@@ -245,9 +245,8 @@ impl LspManager {
             let ProviderPull::Replied(reply) = pull else {
                 unreachable!("pull was waited")
             };
-            let report = reply.and_then(|value| {
-                serde_json::from_value::<DocumentDiagnosticReportResult>(value).map_err(Into::into)
-            });
+            let report = reply
+                .and_then(|value| decode_document_diagnostic_report(value).map_err(Into::into));
             let start = items.len();
             let result_id = match report {
                 Ok(DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(

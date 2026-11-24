@@ -29,7 +29,8 @@ use crate::lsp::document::{
 };
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
-    AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams, AftWorkspaceDiagnosticRequest,
+    decode_document_diagnostic_report, AftDocumentDiagnosticParams, AftWorkspaceDiagnosticParams,
+    AftWorkspaceDiagnosticRequest,
 };
 use crate::lsp::registry::{
     is_config_file_path_with_custom, resolve_server_binary, servers_for_file, ServerDef, ServerKind,
@@ -5008,10 +5009,8 @@ impl LspManager {
             DocumentPullState::Replied(reply) => reply,
             _ => unreachable!("DocumentPull::wait replies"),
         };
-        let report = reply.and_then(|value| {
-            serde_json::from_value::<lsp_types::DocumentDiagnosticReportResult>(value)
-                .map_err(Into::into)
-        });
+        let report =
+            reply.and_then(|value| decode_document_diagnostic_report(value).map_err(Into::into));
         match report {
             Ok(report) => {
                 let report_kind = match &report {

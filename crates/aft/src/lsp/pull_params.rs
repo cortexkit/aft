@@ -1,4 +1,6 @@
+use lsp_types::{DocumentDiagnosticReport, DocumentDiagnosticReportResult};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 /// Parameters for `textDocument/diagnostic` pull requests.
 ///
@@ -33,6 +35,22 @@ impl lsp_types::request::Request for AftDocumentDiagnosticRequest {
     type Params = AftDocumentDiagnosticParams;
     type Result = lsp_types::DocumentDiagnosticReportResult;
     const METHOD: &'static str = "textDocument/diagnostic";
+}
+
+pub(super) fn decode_document_diagnostic_report(
+    value: Value,
+) -> serde_json::Result<DocumentDiagnosticReportResult> {
+    let report = match value.get("kind") {
+        // gopls v0.24.0 leaves the kind empty on full document reports.
+        // Decode the full payload directly so invalid fields can't fall back to a partial.
+        Some(kind) if kind.as_str() == Some("") => {
+            DocumentDiagnosticReport::Full(serde_json::from_value(value)?)
+        }
+        // A tagged response is a final report, not an untagged partial result.
+        Some(_) => serde_json::from_value(value)?,
+        None => return serde_json::from_value(value),
+    };
+    Ok(DocumentDiagnosticReportResult::Report(report))
 }
 
 /// Parameters for `workspace/diagnostic` pull requests.
@@ -70,6 +88,54 @@ impl lsp_types::request::Request for AftWorkspaceDiagnosticRequest {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    fn full_report(body: &str) -> lsp_types::RelatedFullDocumentDiagnosticReport {
+        let reply: Value = serde_json::from_str(body).expect("captured JSON-RPC reply");
+        let DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) =
+            decode_document_diagnostic_report(reply["result"].clone()).expect("decodable result")
+        else {
+            panic!("expected a full document report");
+        };
+        report
+    }
+
+    #[test]
+    fn gopls_broken_file_reply_is_a_full_error_report() {
+        let report = full_report(
+            r#"{"jsonrpc":"2.0","result":{"kind":"","items":[{"range":{"start":{"line":2,"character":17},"end":{"line":2,"character":33}},"severity":1,"code":"IncompatibleAssign","codeDescription":{"href":"https://pkg.go.dev/golang.org/x/tools/internal/typesinternal#IncompatibleAssign"},"source":"compiler","message":"cannot use \"not an integer\" (untyped string constant) as int value in variable declaration"}]},"id":2}"#,
+        );
+        let items = report.full_document_diagnostic_report.items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].severity,
+            Some(lsp_types::DiagnosticSeverity::ERROR)
+        );
+    }
+
+    #[test]
+    fn gopls_clean_file_reply_is_a_full_empty_report() {
+        let report = full_report(r#"{"jsonrpc":"2.0","result":{"kind":"","items":[]},"id":3}"#);
+        assert!(report.full_document_diagnostic_report.items.is_empty());
+    }
+
+    #[test]
+    fn malformed_document_diagnostic_reports_do_not_fall_back_to_partial() {
+        use serde_json::json;
+
+        for value in [
+            json!({"kind":"bogus", "items":[]}),
+            json!({"kind":""}),
+            json!({"kind":"", "items":{}}),
+            json!({"kind":"", "items":[{"message":"missing range"}]}),
+            json!({"kind":"", "items":[], "resultId":42}),
+            json!({"kind":"", "items":[], "relatedDocuments":{"file:///broken.go":{"kind":"full"}}}),
+        ] {
+            assert!(
+                decode_document_diagnostic_report(value.clone()).is_err(),
+                "{value}"
+            );
+        }
+    }
 
     fn text_document_identifier() -> lsp_types::TextDocumentIdentifier {
         lsp_types::TextDocumentIdentifier {
