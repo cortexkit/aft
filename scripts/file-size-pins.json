@@ -1,6 +1,6 @@
 {
   "crates/aft/src/bash_background/registry.rs": {
-    "lines": 18479,
+    "lines": 18477,
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote_tests.rs": {

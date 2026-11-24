@@ -70,6 +70,74 @@ fn an_unreadable_stderr_capture_does_not_stop_stdout_matches() {
 }
 
 #[test]
+fn a_watch_exit_notice_names_a_stream_that_could_not_be_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = dir.path();
+    let (registry, _db, frames) = registry_with_db_and_frames(storage);
+    let task_id = registry
+        .spawn(
+            SpawnPlan::Unsandboxed,
+            &format!(
+                "{}; echo done",
+                crate::test_gate::gate("ready", "sleep 0.01")
+            ),
+            "session".to_string(),
+            storage.to_path_buf(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(60)),
+            None,
+            storage.to_path_buf(),
+            10,
+            true,
+            false,
+            Some(storage.to_path_buf()),
+        )
+        .unwrap();
+    registry
+        .register_watch(
+            task_id.clone(),
+            WatchPattern::Substring("NEVER PRINTED".into()),
+            false,
+        )
+        .unwrap();
+    let task = registry.task_for_session(&task_id, "session").unwrap();
+    fs::remove_file(&task.paths.stderr).unwrap();
+    fs::write(storage.join("ready"), "").unwrap();
+
+    let exit_prefix = format!("task {task_id} exited");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    // The live notice needs a connected session; the saved one does not.
+    let notice = loop {
+        let mut notices = pattern_match_frames(&frames);
+        notices.extend(registry.pending_pattern_matches_for_session("session"));
+        if let Some(frame) = notices
+            .into_iter()
+            .find(|frame| frame.task_id == task_id && frame.context.starts_with(&exit_prefix))
+        {
+            break frame;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the watch never got the task's exit"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    assert!(
+        notice
+            .context
+            .ends_with("\nwatch: stderr could not be read, so it was not checked for the pattern"),
+        "{:?}",
+        notice.context
+    );
+    assert!(
+        !notice.context.contains("watch: stdout"),
+        "{:?}",
+        notice.context
+    );
+}
+
+#[test]
 fn a_restart_between_two_match_writes_loses_neither_match() {
     let dir = tempfile::tempdir().unwrap();
     let storage = dir.path();

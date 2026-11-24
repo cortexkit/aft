@@ -88,6 +88,53 @@ pub(super) fn resumed_cursors(
         .collect()
 }
 
+/// Each scanned task's streams that its latest watch scan could not open,
+/// for the watch's exit notice. Bounded: a full map forgets its entries
+/// rather than grow, which can only drop a note, never invent one.
+static UNREADABLE_STREAMS: std::sync::LazyLock<
+    Mutex<HashMap<String, std::collections::BTreeSet<&'static str>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+const MAX_TASKS_WITH_UNREADABLE_STREAMS: usize = 256;
+
+fn record_stream_readable(task_id: &str, stream: &'static str, readable: bool) {
+    let mut tasks = UNREADABLE_STREAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if readable {
+        if let Some(streams) = tasks.get_mut(task_id) {
+            streams.remove(stream);
+            if streams.is_empty() {
+                tasks.remove(task_id);
+            }
+        }
+        return;
+    }
+    if !tasks.contains_key(task_id) && tasks.len() >= MAX_TASKS_WITH_UNREADABLE_STREAMS {
+        tasks.clear();
+    }
+    tasks.entry(task_id.to_string()).or_default().insert(stream);
+}
+
+/// The lines a watch's exit notice adds for `task_id`'s streams that its
+/// latest scan could not read, so the notice does not suggest the whole
+/// output was checked.
+pub(super) fn unreadable_streams_note(task_id: &str) -> Option<String> {
+    let tasks = UNREADABLE_STREAMS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let streams = tasks.get(task_id)?;
+    Some(
+        streams
+            .iter()
+            .map(|stream| {
+                format!("watch: {stream} could not be read, so it was not checked for the pattern")
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
 impl BgTaskRegistry {
     /// Run a finished task's final watch scan, then its terminal transition,
     /// which routes the exit to watches that never matched. A backlog the scan
@@ -142,18 +189,21 @@ impl BgTaskRegistry {
             Ok(state) => state.metadata.mode.clone(),
             Err(_) => return true,
         };
-        let open = |stream: &str, artifact| {
-            open_task_artifact(&task.paths, artifact)
+        let open = |stream: &'static str, artifact| {
+            let file = open_task_artifact(&task.paths, artifact)
                 .inspect_err(|error| {
                     crate::slog_debug!(
                         "watch scan for {} could not open its {stream} capture: {error}",
                         task.task_id
                     );
                 })
-                .ok()
+                .ok();
+            record_stream_readable(&task.task_id, stream, file.is_some());
+            file
         };
         // A stream that cannot be opened is left out of this scan; the other
-        // stream is still scanned, so its matches are not lost with it.
+        // stream is still scanned, so its matches are not lost with it. The
+        // watch's exit notice names a stream the last scan could not read.
         let mut files: Vec<_> = match mode {
             BgMode::Pipes => vec![
                 ("stdout", open("stdout", TaskArtifact::Stdout)),

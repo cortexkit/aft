@@ -15301,15 +15301,13 @@ impl BgTaskRegistry {
     fn record_bash_watch_exit(&self, completion: &BgCompletion, emit_frame: bool) {
         let status = completion_status_text(&completion.status, completion.exit_code);
         let preview = completion.output_preview.trim_end();
-        let context = if preview.is_empty() {
-            format!("task {} exited ({status})", completion.task_id)
-        } else {
-            format!(
-                "task {} exited ({status})
-{preview}",
-                completion.task_id
-            )
-        };
+        let mut context = format!("task {} exited ({status})", completion.task_id);
+        let unread = watch_scan::unreadable_streams_note(&completion.task_id);
+        for line in [Some(preview), unread.as_deref()].into_iter().flatten() {
+            if !line.is_empty() {
+                context = format!("{context}\n{line}");
+            }
+        }
         let mut frame = BashPatternMatchFrame::task_exit(
             completion.task_id.clone(),
             completion.session_id.clone(),
