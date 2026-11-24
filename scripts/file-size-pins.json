@@ -28,11 +28,11 @@
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft/src/commands/semantic_search/mod.rs": {
-    "lines": 10727,
+    "lines": 10724,
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/semantic_index.rs": {
-    "lines": 10562,
+    "lines": 10503,
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
   "crates/aft-parse/src/parser.rs": {

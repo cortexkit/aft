@@ -8687,7 +8687,8 @@ fn embed_query_for_dimension(
     index_dimension: Option<usize>,
 ) -> Result<Vec<f32>, String> {
     if let Some(query_vector) = precomputed_query_vector(query) {
-        return check_query_dimension(query_vector, index_dimension);
+        check_query_dimension(&query_vector, index_dimension)?;
+        return Ok(query_vector);
     }
     let semantic_config = ctx.config().semantic.clone();
     let query_budget = QueryBudget::from_config(&semantic_config);
@@ -8734,22 +8735,18 @@ fn embed_query_for_dimension(
     let model = model_ref
         .as_mut()
         .ok_or_else(|| "embedding model was not initialized".to_string())?;
-    // Embed through a handle on the installed model rather than under its
-    // mutex: the backend round trip of one query must not hold up another
-    // query whose vector is already cached. The handle keeps the
-    // serialization the backend itself needs (see `share_for_query`).
+    // Cached queries should not wait behind another query's backend round trip.
     let mut query_model = model.share_for_query();
     drop(model_ref);
     let known_dimension = query_model.known_dimension();
-    // Preserve the raw error so the timeout marker injected by
-    // `send_embedding_request` survives — `classify_embed_query_error` reads it
-    // to decide whether the configured query budget fired.
+    // Preserve the backend's timeout marker for `classify_embed_query_error`.
     let query_vector = waits::timed(waits::SearchWait::Embed, || {
         query_model.embed_query_cached(query, query_budget)
     })
     .map_err(|error| format!("failed to embed query: {error}"))?;
-    // A backend that reported its dimension with this query tells the
-    // installed model too, as it did when the query ran on that model.
+    check_query_dimension(&query_vector, index_dimension)
+        .inspect_err(|_| query_model.discard_rejected_query(query, &query_vector))?;
+    // Update the installed model after accepting the backend's dimension.
     if query_model.known_dimension() != known_dimension {
         if let Some(model) = waits::timed(waits::SearchWait::ModelLock, || {
             ctx.semantic_embedding_model().lock()
@@ -8760,13 +8757,13 @@ fn embed_query_for_dimension(
         }
     }
 
-    check_query_dimension(query_vector, index_dimension)
+    Ok(query_vector)
 }
 
 fn check_query_dimension(
-    query_vector: Vec<f32>,
+    query_vector: &[f32],
     index_dimension: Option<usize>,
-) -> Result<Vec<f32>, String> {
+) -> Result<(), String> {
     if let Some(index_dimension) = index_dimension {
         if index_dimension != query_vector.len() {
             return Err(format!(
@@ -8777,7 +8774,7 @@ fn check_query_dimension(
         }
     }
 
-    Ok(query_vector)
+    Ok(())
 }
 
 /// Classified query-embedding failure: the user-facing `detail` line that names
@@ -12016,6 +12013,35 @@ mod tests {
                 assert_eq!(status["semantic_index"]["paused_until_ms"], START + 90_000);
             });
         });
+    }
+
+    #[test]
+    fn query_retries_after_a_cached_embedding_with_the_wrong_dimension() {
+        struct WrongDimensionOnce(Arc<AtomicUsize>);
+        impl crate::semantic_index::LocalEmbeddingProvider for WrongDimensionOnce {
+            fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                let call = self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![if call == 0 {
+                    vec![1.0; 3]
+                } else {
+                    vec![1.0; 2]
+                }])
+            }
+        }
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_context(project.path());
+        let calls = Arc::new(AtomicUsize::new(0));
+        *ctx.semantic_embedding_model().lock() =
+            Some(SemanticEmbeddingModel::from_local_provider_for_test(
+                Box::new(WrongDimensionOnce(calls.clone())),
+                project.path().to_path_buf(),
+            ));
+
+        let query = || embed_query_for_dimension("same query", &ctx, Some(2));
+        assert!(query().unwrap_err().contains("returned 3, index expects 2"));
+        assert_eq!(query().unwrap(), vec![1.0; 2]);
+        assert_eq!(query().unwrap(), vec![1.0; 2]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     #[test]

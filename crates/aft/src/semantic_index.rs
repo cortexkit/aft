@@ -1710,88 +1710,8 @@ impl QueryEmbeddingCache {
     }
 }
 
-struct LocalQueryEmbedRequest {
-    texts: Vec<String>,
-    cache_key: String,
-    response: crossbeam_channel::Sender<Result<Vec<Vec<f32>>, String>>,
-}
-
-struct LocalQueryEmbedWorker {
-    requests: crossbeam_channel::Sender<LocalQueryEmbedRequest>,
-    busy: Arc<AtomicBool>,
-    /// Held by a query from its submission until its reply or its timeout.
-    /// Query embeddings run outside the context's model mutex, so this is
-    /// what still makes a second query wait for the worker instead of being
-    /// refused as busy while an earlier inference it could have waited for
-    /// finishes.
-    submissions: Mutex<()>,
-}
-
-impl LocalQueryEmbedWorker {
-    fn start(
-        model: SharedLocalEmbeddingProvider,
-        query_cache: Arc<Mutex<QueryEmbeddingCache>>,
-    ) -> Result<Self, String> {
-        let (requests, receiver) = crossbeam_channel::unbounded::<LocalQueryEmbedRequest>();
-        let busy = Arc::new(AtomicBool::new(false));
-        let worker_busy = Arc::clone(&busy);
-        std::thread::Builder::new()
-            .name("aft-local-query-embed".to_string())
-            .spawn(move || {
-                while let Ok(request) = receiver.recv() {
-                    let result = model
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .embed(&request.texts)
-                        .map_err(|error| format!("failed to embed batch: {error}"));
-                    if let Ok(vectors) = &result {
-                        if let Some(vector) = vectors.first() {
-                            query_cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(request.cache_key, vector.clone());
-                        }
-                    }
-                    worker_busy.store(false, Ordering::Release);
-                    let _ = request.response.send(result);
-                }
-            })
-            .map_err(|error| format!("failed to start local query embed worker: {error}"))?;
-        Ok(Self {
-            requests,
-            busy,
-            submissions: Mutex::new(()),
-        })
-    }
-
-    fn try_submit(
-        &self,
-        texts: Vec<String>,
-        cache_key: String,
-    ) -> Option<crossbeam_channel::Receiver<Result<Vec<Vec<f32>>, String>>> {
-        if self
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            return None;
-        }
-        let (response, receiver) = crossbeam_channel::bounded(1);
-        if self
-            .requests
-            .send(LocalQueryEmbedRequest {
-                texts,
-                cache_key,
-                response,
-            })
-            .is_err()
-        {
-            self.busy.store(false, Ordering::Release);
-            return None;
-        }
-        Some(receiver)
-    }
-}
+mod query_worker;
+use query_worker::LocalQueryEmbedWorker;
 
 struct LocalEmbeddingEngine {
     model: SharedLocalEmbeddingProvider,
@@ -3644,6 +3564,27 @@ impl SemanticEmbeddingModel {
                 ),
             }
             self.query_instruction_logged = true;
+        }
+    }
+
+    pub(crate) fn discard_rejected_query(&self, query: &str, vector: &[f32]) {
+        let key = query_embedding_text(query, self.query_instruction.as_deref());
+        let mut cache = self
+            .query_embedding_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Another caller may already have replaced the rejected vector.
+        if cache.query_embedding_cache.get(&key).is_some_and(|cached| {
+            cached.len() == vector.len()
+                && cached
+                    .iter()
+                    .zip(vector)
+                    .all(|(left, right)| left.to_bits() == right.to_bits())
+        }) {
+            cache.query_embedding_cache.remove(&key);
+            cache
+                .query_embedding_cache_order
+                .retain(|entry| entry != &key);
         }
     }
 
@@ -10780,6 +10721,28 @@ pub(crate) mod tests {
                 .push(std::thread::current().id());
             Ok(vec![vec![0.25, 0.5, 0.75]; texts.len()])
         }
+    }
+
+    #[test]
+    fn local_query_worker_accepts_another_request_after_provider_panic() {
+        struct PanicOnce(bool);
+        impl LocalEmbeddingProvider for PanicOnce {
+            fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, String> {
+                assert!(!std::mem::take(&mut self.0), "injected provider panic");
+                Ok(vec![vec![1.0, 0.0]])
+            }
+        }
+        let mut model = SemanticEmbeddingModel::from_local_provider_for_test(
+            Box::new(PanicOnce(true)),
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+        );
+        let budget = QueryBudget::from_config(&SemanticBackendConfig::default());
+
+        assert!(model.embed_query_cached("panics", budget).is_err());
+        assert_eq!(
+            model.embed_query_cached("recovers", budget).unwrap(),
+            vec![1.0, 0.0]
+        );
     }
 
     struct SleepingLocalProvider {
