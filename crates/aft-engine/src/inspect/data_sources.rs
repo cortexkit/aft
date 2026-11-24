@@ -18,7 +18,7 @@ use std::time::Instant;
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) use crate::data_layer::bound_checkouts::note_root;
 pub(crate) use crate::data_layer::bound_checkouts::RootKind;
-use crate::data_layer::bound_checkouts::{root_kind, BOUND};
+use crate::data_layer::bound_checkouts::{bound_checkout_roots, newest_bound_checkouts, root_kind};
 use crate::data_layer::runtime::DataCheckout;
 use crate::inspect::job::{canonicalize_normalized, normalize_path, CallgraphSnapshot};
 /// How long a dead-code run waits for recorded edits to reach the call
@@ -263,13 +263,7 @@ pub fn bound_inventory(
     let root = canonicalize_normalized(project_root);
     // Upgraded under the lock, compared after it: comparing resolves each
     // checkout's root on disk.
-    let bound = BOUND
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .rev()
-        .filter_map(Weak::upgrade)
-        .collect::<Vec<_>>();
+    let bound = newest_bound_checkouts();
     let Some(checkout) = bound
         .into_iter()
         .find(|checkout| canonicalize_normalized(checkout.root()) == root)
@@ -378,13 +372,7 @@ fn stored_todos_read(
 ) -> Result<(crate::inspect::scanners::todos::StoredTodos, bool), String> {
     use crate::inspect::scanners::todos::{counted_file_todos, file_todos, FileTodos, StoredTodos};
     let root = canonicalize_normalized(project_root);
-    let bound = BOUND
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .filter_map(Weak::upgrade)
-        .map(|checkout| (canonicalize_normalized(checkout.root()), checkout))
-        .collect::<Vec<_>>();
+    let bound = bound_checkout_roots();
     // The root's own checkout, newest first; or, for a folder of
     // repositories, the checkouts of the repositories in it, and the
     // repositories that have none bound yet.

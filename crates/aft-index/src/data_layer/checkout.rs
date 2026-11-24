@@ -5955,6 +5955,9 @@ impl CheckoutView {
     }
 }
 
+#[doc(hidden)]
+pub use super::todo_counts::{PathTodoCounts, PathTodos, TodoSummary};
+
 /// One entry per path, replaced on edits and reused across publications by
 /// record key. Limits bound both entry overhead and unusually long paths.
 #[derive(Default)]

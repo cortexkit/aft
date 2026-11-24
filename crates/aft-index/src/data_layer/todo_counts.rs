@@ -55,7 +55,7 @@ pub struct TodoSummary {
     #[doc(hidden)]
     pub language: Option<crate::parser::todo_markers::TodoLanguage>,
     #[doc(hidden)]
-    pub counts: Option<super::todo_counts::TodoCounts>,
+    pub counts: Option<TodoCounts>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +71,6 @@ pub enum PathTodoCounts {
 
 impl From<PathTodos> for PathTodoCounts {
     fn from(todos: PathTodos) -> Self {
-        use super::todo_counts::TodoCounts;
         use crate::parser::todo_markers::TodoLanguage;
         match todos {
             PathTodos::Absent => Self::Absent,

@@ -20,7 +20,8 @@ use serde::{Deserialize, Serialize};
 /// An index materializing a file can read. Each names a map or set over the
 /// whole project; a key selects one entry.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub(crate) enum Lookup {
+#[doc(hidden)]
+pub enum Lookup {
     /// A file's exported (and Rust-declared) symbols, by file.
     ExportedSymbolsByFile,
     /// The files exporting a symbol, by symbol.
@@ -83,7 +84,8 @@ thread_local! {
 
 /// Records `index` read at `key` in this thread's innermost recording, if
 /// any.
-pub(crate) fn record(index: Lookup, key: &str) {
+#[doc(hidden)]
+pub fn record(index: Lookup, key: &str) {
     READS.with(|reads| {
         if let Some(frame) = reads.borrow_mut().last_mut() {
             let keys = frame.entry(index).or_default();
@@ -98,14 +100,16 @@ pub(crate) fn record(index: Lookup, key: &str) {
 /// Recordings stack: a thread that waits inside one file's materialization
 /// may run another file's (rayon steals work while it waits), and that
 /// file's reads go to its own recording.
-pub(crate) struct Recording {
+#[doc(hidden)]
+pub struct Recording {
     /// The depth of this recording's frame, to check frames end in order.
     depth: usize,
     finished: bool,
 }
 
 impl Recording {
-    pub(crate) fn start() -> Self {
+    #[doc(hidden)]
+    pub fn start() -> Self {
         let depth = READS.with(|reads| {
             let mut reads = reads.borrow_mut();
             reads.push(Frame::new());
@@ -118,7 +122,8 @@ impl Recording {
     }
 
     /// Every (index, key) read since the recording started, sorted.
-    pub(crate) fn finish(mut self) -> Vec<(Lookup, String)> {
+    #[doc(hidden)]
+    pub fn finish(mut self) -> Vec<(Lookup, String)> {
         self.finished = true;
         let frame = READS.with(|reads| {
             let mut reads = reads.borrow_mut();
@@ -150,13 +155,15 @@ impl Drop for Recording {
 /// An index whose reads are recorded as [`Lookup`] `index`. It offers only
 /// keyed reads, so every read names the entry it depends on.
 #[derive(Debug, Default)]
-pub(crate) struct Tracked<M> {
+#[doc(hidden)]
+pub struct Tracked<M> {
     index: Option<Lookup>,
     map: M,
 }
 
 impl<M> Tracked<M> {
-    pub(crate) fn new(index: Lookup, map: M) -> Self {
+    #[doc(hidden)]
+    pub fn new(index: Lookup, map: M) -> Self {
         Self {
             index: Some(index),
             map,
@@ -165,12 +172,14 @@ impl<M> Tracked<M> {
 
     /// The whole index, for building and comparing it rather than reading
     /// it while materializing a file.
-    pub(crate) fn all(&self) -> &M {
+    #[doc(hidden)]
+    pub fn all(&self) -> &M {
         &self.map
     }
 
     /// Records a read of `key` in this index.
-    pub(crate) fn record_key(&self, key: &str) {
+    #[doc(hidden)]
+    pub fn record_key(&self, key: &str) {
         if let Some(index) = self.index {
             record(index, key);
         }
@@ -178,7 +187,8 @@ impl<M> Tracked<M> {
 
     /// Records a read of `key` as a read of `lookup`, a finer-grained view
     /// of this index, when this index's reads are recorded.
-    pub(crate) fn record_as(&self, lookup: Lookup, key: &str) {
+    #[doc(hidden)]
+    pub fn record_as(&self, lookup: Lookup, key: &str) {
         if self.index.is_some() {
             record(lookup, key);
         }
@@ -186,33 +196,38 @@ impl<M> Tracked<M> {
 }
 
 impl<V> Tracked<BTreeMap<String, V>> {
-    pub(crate) fn get(&self, key: &str) -> Option<&V> {
+    #[doc(hidden)]
+    pub fn get(&self, key: &str) -> Option<&V> {
         self.record_key(key);
         self.map.get(key)
     }
 }
 
 impl Tracked<BTreeSet<String>> {
-    pub(crate) fn contains(&self, key: &str) -> bool {
+    #[doc(hidden)]
+    pub fn contains(&self, key: &str) -> bool {
         self.record_key(key);
         self.map.contains(key)
     }
 }
 
 impl Tracked<&BTreeSet<String>> {
-    pub(crate) fn contains(&self, key: &str) -> bool {
+    #[doc(hidden)]
+    pub fn contains(&self, key: &str) -> bool {
         self.record_key(key);
         self.map.contains(key)
     }
 }
 
 /// The key of a (file, symbol) pair.
-pub(crate) fn pair_key(first: &str, second: &str) -> String {
+#[doc(hidden)]
+pub fn pair_key(first: &str, second: &str) -> String {
     format!("{first}\0{second}")
 }
 
 /// The key of a (file, module path) pair.
-pub(crate) fn path_key(file: &str, path: &[String]) -> String {
+#[doc(hidden)]
+pub fn path_key(file: &str, path: &[String]) -> String {
     let mut key = file.to_string();
     for segment in path {
         key.push('\0');
@@ -223,7 +238,8 @@ pub(crate) fn path_key(file: &str, path: &[String]) -> String {
 
 /// The answer an index gives at a key, as a digest: equal digests mean the
 /// same answer.
-pub(crate) fn digest<T: std::fmt::Debug + ?Sized>(answer: &T) -> u64 {
+#[doc(hidden)]
+pub fn digest<T: std::fmt::Debug + ?Sized>(answer: &T) -> u64 {
     let text = format!("{answer:?}");
     let hash = blake3::hash(text.as_bytes());
     u64::from_le_bytes(hash.as_bytes()[..8].try_into().expect("eight bytes"))

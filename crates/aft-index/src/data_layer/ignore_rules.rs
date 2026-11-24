@@ -16,14 +16,16 @@ struct IgnoreInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct IgnoreInputSnapshot {
+#[doc(hidden)]
+pub struct IgnoreInputSnapshot {
     root: PathBuf,
     inputs: Vec<IgnoreInput>,
     content_hash: blake3::Hash,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum IgnoreRuleChange {
+#[doc(hidden)]
+pub enum IgnoreRuleChange {
     Unchanged,
     AddOnly {
         retired_paths: Vec<PathBuf>,
@@ -39,7 +41,8 @@ pub(crate) enum IgnoreRuleChange {
 }
 
 impl IgnoreInputSnapshot {
-    pub(crate) fn collect(root: PathBuf, git_common_dir: Option<&Path>) -> Self {
+    #[doc(hidden)]
+    pub fn collect(root: PathBuf, git_common_dir: Option<&Path>) -> Self {
         let mut inputs = Vec::new();
         if let Some(global_ignore) = ignore::gitignore::gitconfig_excludes_path() {
             push_input(&mut inputs, global_ignore, root.clone(), false);
@@ -90,7 +93,8 @@ impl IgnoreInputSnapshot {
         }
     }
 
-    pub(crate) fn changed_paths_match_bytes(&self, changed_paths: &[PathBuf]) -> bool {
+    #[doc(hidden)]
+    pub fn changed_paths_match_bytes(&self, changed_paths: &[PathBuf]) -> bool {
         !changed_paths.is_empty()
             && changed_paths.iter().all(|changed_path| {
                 self.inputs
@@ -102,13 +106,15 @@ impl IgnoreInputSnapshot {
             })
     }
 
-    pub(crate) fn has_same_effective_inputs(&self, previous: Option<&Self>) -> bool {
+    #[doc(hidden)]
+    pub fn has_same_effective_inputs(&self, previous: Option<&Self>) -> bool {
         previous.is_some_and(|previous| {
             previous.content_hash == self.content_hash && previous.inputs == self.inputs
         })
     }
 
-    pub(crate) fn classify_against(
+    #[doc(hidden)]
+    pub fn classify_against(
         &self,
         old: Option<&Self>,
         old_matcher: Option<&Gitignore>,

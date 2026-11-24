@@ -197,6 +197,36 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `semantic_index::files_with_changed_content` | visibility widened | `aft-index` | Filter semantic refresh to files with changed content. |
 
 | `data_layer::dead_code_snapshot::EntryPoints` | visibility widened | `aft-index` | Let inspect supply its language entry-point policy. |
+| `data_layer::dead_code_reads::Lookup` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::record` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Recording` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Recording::start` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Recording::finish` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::new` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::all` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::record_key` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::record_as` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::get` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::contains (map)` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::Tracked::contains (set)` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::pair_key` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::path_key` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::dead_code_reads::digest` | visibility widened | `aft-index` | Keep inspect’s existing keyed reads and their invalidation tracking. |
+| `data_layer::ignore_rules::IgnoreInputSnapshot` | visibility widened | `aft-index` | Use the watcher’s ignore-input comparison when composition reloads rules. |
+| `data_layer::ignore_rules::IgnoreRuleChange` | visibility widened | `aft-index` | Use the watcher’s ignore-input comparison when composition reloads rules. |
+| `data_layer::ignore_rules::IgnoreInputSnapshot::collect` | visibility widened | `aft-index` | Use the watcher’s ignore-input comparison when composition reloads rules. |
+| `data_layer::ignore_rules::IgnoreInputSnapshot::changed_paths_match_bytes` | visibility widened | `aft-index` | Use the watcher’s ignore-input comparison when composition reloads rules. |
+| `data_layer::ignore_rules::IgnoreInputSnapshot::has_same_effective_inputs` | visibility widened | `aft-index` | Use the watcher’s ignore-input comparison when composition reloads rules. |
+| `data_layer::ignore_rules::IgnoreInputSnapshot::classify_against` | visibility widened | `aft-index` | Use the watcher’s ignore-input comparison when composition reloads rules. |
+
+| `bound_checkouts::RootKind` | visibility widened | `aft-index` | Let inspect distinguish one checkout, a folder of repositories, and a withheld root. |
+| `bound_checkouts::root_kind` | visibility widened | `aft-index` | Read the root classification recorded by configure. |
+| `bound_checkouts::note_root` | visibility widened | `aft-index` | Configure records the root classification in the index’s registry. |
+| `bound_checkouts::newest_bound_checkouts` | boundary accessor | `aft-index` | Return live checkouts in inventory order without exposing the registry lock. |
+| `bound_checkouts::bound_checkout_roots` | boundary accessor | `aft-index` | Return the resolved roots and checkouts for inspect’s TODO scan. |
+
+| `data_layer::checkout::{PathTodoCounts, PathTodos, TodoSummary}` | compatibility re-exports | `aft-index` | Keep the checkout paths for the TODO projection types in their sibling module. |
 
 ## Visibility widened for cross-crate callers
 
