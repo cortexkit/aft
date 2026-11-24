@@ -333,6 +333,9 @@ aft-base = { path = "../aft-base", version = "0.67.0", features = ["test-support
 aft-db = { path = "../aft-db", version = "0.67.0", features = ["test-support"] }
 aft-parse = { path = "../aft-parse", version = "0.67.0", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
+# The app catalog checker belongs to view tests, not the shipped tool provider.
+cortexkit-occipital-lang = "=0.1.15"
+cortexkit-occipital-registry = "=0.1.8"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.19"
 cortexkit-role-tool-provider = { version = "=0.15.18", features = ["test-vectors"] }
