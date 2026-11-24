@@ -684,7 +684,10 @@ fn read_two_file_head_tail(
     };
     let total_bytes = first_len.saturating_add(second_len);
     if total_bytes <= max_bytes as u64 {
-        let mut read_all = |index: usize, source: &ArtifactSource, file: Option<&mut ValidatedArtifact>, len: u64| {
+        let mut read_all = |index: usize,
+                            source: &ArtifactSource,
+                            file: Option<&mut ValidatedArtifact>,
+                            len: u64| {
             file.map(|file| source.read_range(file, 0, len))
                 .transpose()
                 .unwrap_or_else(|error| {
@@ -700,14 +703,12 @@ fn read_two_file_head_tail(
         let boundary = first_text.len();
         // Like the capped join, never let stderr continue stdout's unfinished
         // last line; a stdout that ends its line needs no separator.
-        let separator = if !first_text.is_empty()
-            && !second_text.is_empty()
-            && !first_text.ends_with('\n')
-        {
-            "\n"
-        } else {
-            ""
-        };
+        let separator =
+            if !first_text.is_empty() && !second_text.is_empty() && !first_text.ends_with('\n') {
+                "\n"
+            } else {
+                ""
+            };
         return (
             BoundedRead {
                 text: format!("{first_text}{separator}{second_text}"),

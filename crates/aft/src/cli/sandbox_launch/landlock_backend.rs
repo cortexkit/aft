@@ -178,7 +178,8 @@ fn session_task_read_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
         readable_task_file_names, validate_task_id, TaskLayout,
     };
     let mut tasks = std::collections::HashMap::<String, (std::time::SystemTime, TaskLayout)>::new();
-    let mut ranked = std::collections::BTreeSet::<(std::cmp::Reverse<std::time::SystemTime>, String)>::new();
+    let mut ranked =
+        std::collections::BTreeSet::<(std::cmp::Reverse<std::time::SystemTime>, String)>::new();
     for entry in std::fs::read_dir(root)
         .map_err(|error| format!("cannot enumerate session task reads: {error}"))?
     {

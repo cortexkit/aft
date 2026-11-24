@@ -3273,8 +3273,7 @@ mod tests {
                 64 * 1024 + 1
             ),
         );
-        let error =
-            probe_gh_shim_binary_with_budget(&binary, Duration::from_secs(60)).unwrap_err();
+        let error = probe_gh_shim_binary_with_budget(&binary, Duration::from_secs(60)).unwrap_err();
         assert!(
             matches!(&error, ShimProbeFailure::Rejected(reason) if reason.contains("exceeds")),
             "{error}"

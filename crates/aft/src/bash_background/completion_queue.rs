@@ -310,7 +310,8 @@ mod tests {
             registry.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
             finished.push(task_id);
         }
-        let waiting = |registry: &BgTaskRegistry| registry.inner.completions.lock().unwrap().overflowed.len();
+        let waiting =
+            |registry: &BgTaskRegistry| registry.inner.completions.lock().unwrap().overflowed.len();
         assert_eq!(waiting(&registry), 50);
         // The registry forgets the first 30 waiting tasks.
         {

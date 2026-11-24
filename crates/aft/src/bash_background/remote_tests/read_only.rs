@@ -37,7 +37,14 @@ fn runon_read_only_note_scans_stderr_once_within_its_budget() {
         persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
     let task = registry.task(&task_id).unwrap();
     task.state.lock().unwrap().metadata.workdir = dir.path().join("package");
-    let stderr = task.state.lock().unwrap().buffer.stderr_path().unwrap().to_path_buf();
+    let stderr = task
+        .state
+        .lock()
+        .unwrap()
+        .buffer
+        .stderr_path()
+        .unwrap()
+        .to_path_buf();
     let take_stderr_scans = crate::bash_background::buffer::take_stderr_scans;
     let record = TerminalRecord::new(id(), Outcome::Exit { code: 1 }, 2, 0, 0)
         .with_ran(Ran::Remote)
@@ -45,9 +52,11 @@ fn runon_read_only_note_scans_stderr_once_within_its_budget() {
         .with_source_read_only(true);
     let verdict = exec::grade(&record);
     let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
-    sink.output(1, OutputStream::Stdout, b"command output\n").unwrap();
+    sink.output(1, OutputStream::Stdout, b"command output\n")
+        .unwrap();
     let noise = "error[E0425]: cannot find value in this scope\n".repeat(6 * 1024 * 1024 / 46);
-    sink.output(2, OutputStream::Stderr, noise.as_bytes()).unwrap();
+    sink.output(2, OutputStream::Stderr, noise.as_bytes())
+        .unwrap();
     sink.terminal(&record, &verdict).unwrap();
     registry.remote_terminal(&task, verdict, None);
     let _ = registry.drain_completions();

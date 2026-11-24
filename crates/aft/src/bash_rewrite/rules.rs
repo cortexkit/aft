@@ -1708,13 +1708,23 @@ mod tests {
             },
         );
         let decide = |command: &str| super::GrepRule.decide(command, "grep-shape", None, &ctx);
-        for command in ["grep needle", "grep -n needle", "grep needle .", "grep -in needle ."] {
+        for command in [
+            "grep needle",
+            "grep -n needle",
+            "grep needle .",
+            "grep -in needle .",
+        ] {
             assert!(
                 !matches!(decide(command), RewriteDecision::Accept(_)),
                 "{command} must stay native"
             );
         }
-        for command in ["grep -r needle", "grep -r needle .", "grep -rn needle .", "grep needle match.txt"] {
+        for command in [
+            "grep -r needle",
+            "grep -r needle .",
+            "grep -rn needle .",
+            "grep needle match.txt",
+        ] {
             assert!(
                 matches!(decide(command), RewriteDecision::Accept(_)),
                 "{command} must be rewritten"

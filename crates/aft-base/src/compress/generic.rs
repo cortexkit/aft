@@ -83,7 +83,10 @@ fn control_string_end(bytes: &[u8], start: usize) -> usize {
 /// bytes (0x20-0x2f) starting at `start`, then one final byte (0x30-0x7e).
 fn designator_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut cursor = start;
-    while bytes.get(cursor).is_some_and(|byte| (0x20..=0x2f).contains(byte)) {
+    while bytes
+        .get(cursor)
+        .is_some_and(|byte| (0x20..=0x2f).contains(byte))
+    {
         cursor += 1;
     }
     if cursor == start {

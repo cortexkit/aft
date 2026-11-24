@@ -9669,7 +9669,8 @@ impl BgTaskRegistry {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
         }
-        push_read_only_note(&mut snapshot.output_preview, cache.read_only_note.as_deref());
+        let note = cache.read_only_note.as_deref();
+        push_read_only_note(&mut snapshot.output_preview, note);
         Some((snapshot, resolved.paths))
     }
 
@@ -12125,55 +12126,56 @@ impl BgTaskRegistry {
             return None;
         }
         let metadata = task.lock_state().ok()?.metadata.clone();
-        let (output_preview, output_truncated, bash_output_list_envelope) = if let Some(saved) =
-            self.saved_completion_preview(&metadata)
-        {
-            (
-                saved.output_preview,
-                saved.output_truncated,
-                saved.bash_output_list_envelope,
-            )
-        } else {
-            let (mut output_preview, output_truncated, cache) = if snapshot.info.mode == BgMode::Pty
-            {
-                (String::new(), false, None)
+        let (output_preview, output_truncated, bash_output_list_envelope) =
+            if let Some(saved) = self.saved_completion_preview(&metadata) {
+                (
+                    saved.output_preview,
+                    saved.output_truncated,
+                    saved.bash_output_list_envelope,
+                )
             } else {
-                let metadata = task.lock_state().ok()?.metadata.clone();
-                self.ensure_terminal_output_cache(task)
-                    .map(|cache| {
-                        let (preview, truncated) = self.completion_preview_for_notice(
-                            &metadata,
-                            &cache,
-                            Some(&task.paths),
-                        );
-                        (preview, truncated, Some(cache))
-                    })
-                    .unwrap_or_else(|| (String::new(), false, None))
-            };
-            if let Ok(state) = task.lock_state() {
-                if let Some(note) = rendered_execution_note(&state.metadata) {
-                    output_preview = format!("{note}\n{output_preview}");
+                let (mut output_preview, output_truncated, cache) =
+                    if snapshot.info.mode == BgMode::Pty {
+                        (String::new(), false, None)
+                    } else {
+                        let metadata = task.lock_state().ok()?.metadata.clone();
+                        self.ensure_terminal_output_cache(task)
+                            .map(|cache| {
+                                let (preview, truncated) = self.completion_preview_for_notice(
+                                    &metadata,
+                                    &cache,
+                                    Some(&task.paths),
+                                );
+                                (preview, truncated, Some(cache))
+                            })
+                            .unwrap_or_else(|| (String::new(), false, None))
+                    };
+                if let Ok(state) = task.lock_state() {
+                    if let Some(note) = rendered_execution_note(&state.metadata) {
+                        output_preview = format!("{note}\n{output_preview}");
+                    }
                 }
-            }
-            let note = cache.as_ref().and_then(|cache| cache.read_only_note.as_deref());
-            push_read_only_note(&mut output_preview, note);
-            self.append_db_hint(&task.task_id, &mut output_preview);
-            let bash_output_list_envelope = cache
-                .as_ref()
-                .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
-            self.mask_completion_text(&task.task_id, &mut output_preview);
-            let saved = self.save_completion_preview(
-                &task.task_id,
-                &output_preview,
-                output_truncated,
-                &bash_output_list_envelope,
-            );
-            (
-                saved.output_preview,
-                saved.output_truncated,
-                saved.bash_output_list_envelope,
-            )
-        };
+                let note = cache
+                    .as_ref()
+                    .and_then(|cache| cache.read_only_note.as_deref());
+                push_read_only_note(&mut output_preview, note);
+                self.append_db_hint(&task.task_id, &mut output_preview);
+                let bash_output_list_envelope = cache
+                    .as_ref()
+                    .and_then(|cache| append_bash_output_envelope(cache, &mut output_preview));
+                self.mask_completion_text(&task.task_id, &mut output_preview);
+                let saved = self.save_completion_preview(
+                    &task.task_id,
+                    &output_preview,
+                    output_truncated,
+                    &bash_output_list_envelope,
+                );
+                (
+                    saved.output_preview,
+                    saved.output_truncated,
+                    saved.bash_output_list_envelope,
+                )
+            };
         Some(BgCompletion {
             changed_files: self.changed_files_report(&metadata.task_id),
             task_id: snapshot.info.task_id,
@@ -18299,8 +18301,6 @@ mod raw_render;
 use raw_render::{render_raw_passthrough, render_structured_output};
 #[path = "read_only_status.rs"]
 mod read_only_status;
-#[cfg(all(test, unix))]
-use read_only_status::append_source_read_only_note;
 use read_only_status::{push_read_only_note, source_read_only_note_for};
 
 #[cfg(all(test, unix))]
@@ -19014,13 +19014,24 @@ mod tests {
         for compressed in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let registry = BgTaskRegistry::default();
-            let (task_id, task) =
-                insert_terminal_piped_task(&registry, &dir, "cmd", "", "warning: kept\n", compressed);
+            let (task_id, task) = insert_terminal_piped_task(
+                &registry,
+                &dir,
+                "cmd",
+                "",
+                "warning: kept\n",
+                compressed,
+            );
             fs::remove_file(&task.paths.stdout).unwrap();
             let status = registry.observed_status(&task_id, "session", 8192).unwrap();
-            assert!(status.output_preview.contains("warning: kept"), "{status:?}");
             assert!(
-                status.output_preview.contains("[stdout could not be read (")
+                status.output_preview.contains("warning: kept"),
+                "{status:?}"
+            );
+            assert!(
+                status
+                    .output_preview
+                    .contains("[stdout could not be read (")
                     && status
                         .output_preview
                         .contains("); the output above may be incomplete]"),
@@ -19028,10 +19039,19 @@ mod tests {
             );
             assert!(status.output_truncated, "compressed={compressed}");
 
-            let (task_id, _) =
-                insert_terminal_piped_task(&registry, &dir, "cmd", "", "warning: kept\n", compressed);
+            let (task_id, _) = insert_terminal_piped_task(
+                &registry,
+                &dir,
+                "cmd",
+                "",
+                "warning: kept\n",
+                compressed,
+            );
             let status = registry.observed_status(&task_id, "session", 8192).unwrap();
-            assert!(!status.output_preview.contains("could not be read"), "{status:?}");
+            assert!(
+                !status.output_preview.contains("could not be read"),
+                "{status:?}"
+            );
             assert!(!status.output_truncated, "compressed={compressed}");
         }
     }
@@ -21577,7 +21597,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let root = fs::canonicalize(dir.path()).unwrap();
         fs::write(root.join("store.db"), b"").unwrap();
-        let (ran, probing, release) = (root.join("ran"), root.join("probing"), root.join("release"));
+        let (ran, probing, release) =
+            (root.join("ran"), root.join("probing"), root.join("release"));
         let sqlite = root.join("sqlite3");
         // The first run is the command (a schema miss); the second is the probe,
         // which announces itself and waits for the test to release it.
@@ -21610,7 +21631,10 @@ mod tests {
                 )
                 .unwrap()
         };
-        let slow = spawn(&format!("'{}' store.db 'SELECT missing FROM tasks'", sqlite.display()));
+        let slow = spawn(&format!(
+            "'{}' store.db 'SELECT missing FROM tasks'",
+            sqlite.display()
+        ));
         // This task ends only once the other task's probe is running.
         let other = spawn(&format!(
             "{}; echo other-done",
@@ -21619,18 +21643,27 @@ mod tests {
         let mut delivered = Vec::new();
         let mut wait_for = |task_id: &str, failure: &str| {
             let deadline = Instant::now() + Duration::from_secs(20);
-            while !delivered.iter().any(|notice: &BgCompletion| notice.task_id == task_id) {
+            while !delivered
+                .iter()
+                .any(|notice: &BgCompletion| notice.task_id == task_id)
+            {
                 assert!(Instant::now() < deadline, "{failure}");
                 delivered.extend(registry.drain_completions());
                 std::thread::sleep(Duration::from_millis(10));
             }
-            delivered.iter().map(|notice| notice.task_id.clone()).collect::<Vec<_>>()
+            delivered
+                .iter()
+                .map(|notice| notice.task_id.clone())
+                .collect::<Vec<_>>()
         };
         let seen = wait_for(&other, "a held probe delayed another task's completion");
         assert!(probing.exists());
         assert!(!seen.contains(&slow), "published before its probe returned");
         fs::write(&release, b"").unwrap();
-        wait_for(&slow, "the probed task never published after its probe returned");
+        wait_for(
+            &slow,
+            "the probed task never published after its probe returned",
+        );
     }
 
     #[test]

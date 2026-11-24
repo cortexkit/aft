@@ -297,7 +297,16 @@ pub(crate) fn cap_completion_output_preserving_pieces(
 ) -> (PiecedText, bool) {
     let (threshold, head, tail) = completion_caps(exit_ok);
     // Completion previews are a short glance; full replies keep failure lines.
-    cap_preserving_pieces(input, threshold, head, tail, marker, final_lines, false, true)
+    cap_preserving_pieces(
+        input,
+        threshold,
+        head,
+        tail,
+        marker,
+        final_lines,
+        false,
+        true,
+    )
 }
 
 /// Reserve the runner's verdict before spending bytes on ordinary head/tail
@@ -1079,7 +1088,10 @@ mod tests {
             (true, COMPLETION_SUCCESS_PREVIEW_BYTES),
             (false, COMPLETION_FAILURE_PREVIEW_BYTES),
         ] {
-            for input in ["z".repeat(48 * 1024), format!("first\n{}", "z".repeat(48 * 1024))] {
+            for input in [
+                "z".repeat(48 * 1024),
+                format!("first\n{}", "z".repeat(48 * 1024)),
+            ] {
                 let capped = cap_completion_output_with_marker(&input, marker, exit_ok);
                 assert!(capped.truncated);
                 assert!(capped.text.contains(marker), "{}", capped.text);
@@ -1090,7 +1102,11 @@ mod tests {
                 );
                 let unmarked = cap_completion_output(&input, exit_ok);
                 assert!(unmarked.truncated);
-                assert!(unmarked.text.len() <= budget + 128, "{} bytes", unmarked.text.len());
+                assert!(
+                    unmarked.text.len() <= budget + 128,
+                    "{} bytes",
+                    unmarked.text.len()
+                );
             }
         }
     }
