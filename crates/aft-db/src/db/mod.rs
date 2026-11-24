@@ -89,8 +89,6 @@ CREATE INDEX IF NOT EXISTS idx_bash_tasks_project_replay
      OR CASE WHEN json_valid(metadata)
              THEN json_type(metadata, '$.completion_delivered') = 'false'
              ELSE 0 END;
-CREATE INDEX IF NOT EXISTS idx_bash_watch_delivery_acks_acknowledged
-  ON bash_watch_delivery_acks(acknowledged_at);
 "#;
 
 const MIGRATION_V14: &str = r#"
@@ -892,7 +890,18 @@ fn run_migrations_supported(conn: &mut Connection, supported: u32) -> Result<u32
 #[rustfmt::skip]
 test_support_visibility! {
 fn ensure_additive_indexes(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute_batch(ADDITIVE_INDEXES)
+    conn.execute_batch(ADDITIVE_INDEXES)?;
+    // The watch ACK table first exists at v24, but older databases can
+    // receive the bash-task indexes without changing their schema version.
+    if conn
+        .prepare("SELECT 1 FROM main.sqlite_master WHERE type = 'table' AND name = 'bash_watch_delivery_acks'")?
+        .exists([])?
+    {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_bash_watch_delivery_acks_acknowledged ON bash_watch_delivery_acks(acknowledged_at)",
+        )?;
+    }
+    Ok(())
 }
 }
 
