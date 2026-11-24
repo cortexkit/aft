@@ -77,7 +77,7 @@ use super::watches::{
     PatternMatch, WatchPattern, WatchRegistry, WATCH_TARGET_ERASED_CONTEXT,
     WATCH_TARGET_ERASED_TEXT, WATCH_TASK_EXIT_TEXT,
 };
-use super::{BgTaskInfo, BgTaskStatus};
+use super::{counted_mutex::CountedMutex, BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
 mod saved_delivery;
@@ -1547,7 +1547,7 @@ pub(crate) struct RegistryInner {
     persisted_gc_storage: Mutex<BTreeSet<PathBuf>>,
     retired_undelivered_completions: AtomicU64,
     /// Watchdog candidates only; terminal history stays in `tasks` for delivery.
-    pub(crate) watchdog_tasks: Mutex<HashMap<String, Arc<BgTask>>>,
+    pub(crate) watchdog_tasks: CountedMutex<HashMap<String, Arc<BgTask>>>,
     #[cfg(test)]
     reclaim_kill_attempts: AtomicUsize,
     #[cfg(test)]
@@ -1655,7 +1655,7 @@ pub(crate) struct RegistryInner {
     /// wake channel or the periodic ticker. Tests assert the mechanism from
     /// this record instead of racing the 500 ms ticker on the wall clock.
     pub(crate) completion_pass_cause: Mutex<HashMap<String, WatchdogPassCause>>,
-    pub(crate) watch_registry: Mutex<WatchRegistry>,
+    pub(crate) watch_registry: CountedMutex<WatchRegistry>,
     persisted_watch_cursors: Mutex<HashMap<String, (u64, u64, u64)>>,
     live_delivery_sessions: Mutex<LiveDelivery>,
     completion_delivery_listener: Mutex<Option<completion_listener::Listener>>,
@@ -2286,7 +2286,7 @@ impl BgTaskRegistry {
                 cleanup_queue: Mutex::new(VecDeque::new()),
                 persisted_gc_storage: Mutex::new(BTreeSet::new()),
                 retired_undelivered_completions: AtomicU64::new(0),
-                watchdog_tasks: Mutex::new(HashMap::new()),
+                watchdog_tasks: CountedMutex::new(HashMap::new()),
                 #[cfg(test)]
                 reclaim_kill_attempts: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -2338,7 +2338,7 @@ impl BgTaskRegistry {
                 wake_rx,
                 terminal_transition: tokio::sync::Notify::new(),
                 completion_pass_cause: Mutex::new(HashMap::new()),
-                watch_registry: Mutex::new(WatchRegistry::default()),
+                watch_registry: CountedMutex::new(WatchRegistry::default()),
                 persisted_watch_cursors: Mutex::new(HashMap::new()),
                 live_delivery_sessions: Mutex::new(LiveDelivery::default()),
                 completion_delivery_listener: Mutex::default(),

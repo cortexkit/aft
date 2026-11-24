@@ -529,6 +529,13 @@ pub(super) fn run_pass(
     awaiting_reader: &mut HashMap<String, Instant>,
 ) {
     let _marker_reads = MarkerReadPass::begin(pass_cause);
+    // With no task to poll and no watch to check there is nothing to do, and
+    // the published sizes say so without taking the database, watch or task
+    // index locks.
+    if registry.inner.watchdog_tasks.count() == 0 && registry.inner.watch_registry.count() == 0 {
+        awaiting_reader.clear();
+        return;
+    }
     registry.evaluate_erased_watch_targets();
     let tasks = registry.running_tasks();
     awaiting_reader.retain(|task_id, _| tasks.iter().any(|task| &task.task_id == task_id));
@@ -643,6 +650,28 @@ fn prefer_pending_wake(selected: WatchdogPassCause, wake_rx: &Receiver<()>) -> W
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A periodic pass over a registry with no watchdog tasks and no watches
+    /// has nothing to do, so it must not take the database, watch or task
+    /// index locks. The test holds all three; a pass that tried to take one
+    /// would never finish.
+    #[test]
+    fn idle_registry_tick_takes_no_watchdog_locks() {
+        let registry = BgTaskRegistry::default();
+        let _pool = registry.inner.db_pool.write().unwrap();
+        let _watches = registry.inner.watch_registry.lock().unwrap();
+        let _tasks = registry.inner.watchdog_tasks.lock().unwrap();
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        let worker = registry.clone();
+        thread::spawn(move || {
+            run_pass(&worker, WatchdogPassCause::Tick, &mut HashMap::new());
+            let _ = done_tx.send(());
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(30)).is_ok(),
+            "an idle pass waited on a watchdog lock"
+        );
+    }
 
     #[test]
     fn cleanup_pass_reports_only_slow_passes_with_phase_durations_and_work() {

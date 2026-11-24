@@ -5,6 +5,7 @@
 pub(crate) mod frames;
 
 pub mod buffer;
+pub(crate) mod counted_mutex;
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
