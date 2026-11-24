@@ -8308,7 +8308,7 @@ mod deferred_terminal_tests {
         let output =
             std::path::PathBuf::from(std::env::var_os("AFT_INSPECT_WALK_PROFILE_OUTPUT").unwrap());
         let requested_scope = std::env::var("AFT_INSPECT_WALK_PROFILE_SCOPE")
-            .unwrap_or_else(|_| "crates/aft/src/inspect".to_string());
+            .unwrap_or_else(|_| "crates/aft-engine/src/inspect".to_string());
         let storage = tempfile::tempdir().unwrap();
         let mut config = crate::config::Config::default();
         config.project_root = Some(root.clone());

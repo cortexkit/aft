@@ -355,7 +355,7 @@ impl PreparedExactCache {
             #[cfg(test)]
             self.preparations
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             crate::search_test_counts::record(|counts| counts.exact_preparations += 1);
             Arc::new(PreparedExactText::new(text))
         });

@@ -539,7 +539,7 @@ impl InspectInventory {
 
     #[doc(hidden)]
     pub fn collect(root: &Path, keep_walking: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let _profile = super::walk_profile::Walk::start("shared_inventory");
         let normalized_root = canonicalize_normalized(root);
         let budget = Arc::new(keep_walking);
@@ -586,12 +586,12 @@ impl InspectInventory {
             let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(root);
             let mut builder = entry_points::manifest_walk_builder(root);
             builder.filter_entry(move |entry| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 super::walk_profile::entry();
                 if !filter_budget() {
                     return false;
                 }
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 crate::callgraph::PROJECT_WALK_ENTRIES.with(|count| count.set(count.get() + 1));
                 let mut state = collected.lock().unwrap();
                 let (source_parent, manifest_parent) = entry

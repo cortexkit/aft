@@ -35,8 +35,12 @@ fn external_search_without_hook_uses_existing_bounded_fallback() {
         reply.data["semantic_status"], "external_unindexed",
         "{reply:?}"
     );
-    assert!(reply.data["text"]
-        .as_str()
-        .unwrap()
-        .contains(&external.join("src/lib.rs").display().to_string()));
+    let expected_path = external.join("src").join("lib.rs");
+    assert!(
+        reply.data["text"]
+            .as_str()
+            .unwrap()
+            .contains(&expected_path.display().to_string()),
+        "{reply:?}"
+    );
 }

@@ -177,7 +177,7 @@ pub(super) fn uncached_entry_point_files_while(
     project_root: &Path,
     keep_walking: impl Fn() -> bool + Send + Sync + 'static,
 ) -> Vec<PathBuf> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let _profile = super::walk_profile::Walk::start("entry_point_walk_files");
     // Skip nested linked worktrees of this repository; the walk root itself
     // is always admitted (depth 0).
@@ -186,7 +186,7 @@ pub(super) fn uncached_entry_point_files_while(
     let filter_budget = std::sync::Arc::clone(&budget);
     let mut builder = manifest_walk_builder(project_root);
     builder.filter_entry(move |entry| {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         super::walk_profile::entry();
         filter_budget() && manifest_walk_entry_is_included(entry, &worktrees)
     });

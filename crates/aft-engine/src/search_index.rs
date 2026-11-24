@@ -376,7 +376,7 @@ impl SearchIndexSnapshot {
             }
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::search_test_counts::record(|counts| counts.candidates_sorted += ranked.len());
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         ranked.truncate(depth);
@@ -423,7 +423,7 @@ impl SearchIndexSnapshot {
                 (score > 0.0).then(|| (entry.path.clone(), score))
             })
             .collect::<Vec<_>>();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::search_test_counts::record(|counts| counts.candidates_sorted += ranked.len());
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         Ok(ranked)
@@ -491,7 +491,7 @@ impl SearchIndexSnapshot {
         candidate_filter: Option<&dyn Fn(&Path) -> bool>,
         scope: &ExactEvidenceScope,
     ) -> std::io::Result<Vec<ExactPassMatch>> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let measured_start = Instant::now();
         let phrase = exact_lane::exact_phrase(query);
         let norm_phrase = exact_lane::normalize_exact_phrase(phrase);
@@ -644,7 +644,7 @@ impl SearchIndexSnapshot {
             }
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::search_test_counts::record(|counts| {
             counts.exact_passes += 1;
             counts.exact_pass_candidates += candidate_count;
@@ -3063,7 +3063,7 @@ pub fn read_request_corpus_file(
                 return RequestCorpusFile::Unindexed;
             }
             let read = files.read(path, |path| {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 crate::search_test_counts::record_file_read_path(path);
                 let file = crate::project_content::open(path)?;
                 let stat = FileStat::of(&file.metadata()?);
@@ -3165,7 +3165,7 @@ fn read_search_corpus_file_with_metadata(
         return SearchCorpusEligibility::Unindexed(metadata);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     crate::search_test_counts::record_file_read_path(path);
     let mut bytes = Vec::new();
     #[cfg(any(test, feature = "test-support"))]
@@ -3428,7 +3428,7 @@ fn lexical_score_from_postings(
     postings_by_trigram: &HashMap<u32, Vec<u32>>,
     file_id: u32,
 ) -> f32 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     crate::search_test_counts::record(|counts| counts.score_evaluations += 1);
     if query_trigrams.is_empty() {
         return 0.0;
@@ -3687,11 +3687,11 @@ where
 {
     let builder = project_walk_builder(search_root);
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     crate::search_test_counts::record(|counts| counts.project_walks += 1);
     let mut files = Vec::new();
     for entry in builder.build().filter_map(|entry| entry.ok()) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         crate::search_test_counts::record(|counts| counts.project_walk_entries += 1);
         if !entry
             .file_type()
@@ -3701,7 +3701,7 @@ where
         }
         let path = entry.into_path();
         if filters.matches(filter_root, &path) && matches_file(&path) {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             crate::search_test_counts::record(|counts| counts.project_walk_files += 1);
             files.push(path);
             if max_files.is_some_and(|limit| files.len() > limit) {

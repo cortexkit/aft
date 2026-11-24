@@ -3173,7 +3173,9 @@ mod tests {
         crate::test_support::manifest_dir()
             .parent()
             .unwrap()
-            .join("aft/tests/fixtures")
+            .join("aft")
+            .join("tests")
+            .join("fixtures")
             .join(name)
     }
 

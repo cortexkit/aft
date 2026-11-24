@@ -318,6 +318,7 @@ fn shells_v1_production_task_store_writers_are_generation_tracked() {
         "src",
         "../aft/src",
         "../aft-tools/src",
+        "../aft-engine/src",
         "../aft-base/src",
         "../aft-db/src",
     ] {

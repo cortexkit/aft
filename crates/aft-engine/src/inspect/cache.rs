@@ -2798,7 +2798,7 @@ fn update_manifest_fingerprint_hash(
     hasher: &mut blake3::Hasher,
     project_root: &Path,
 ) -> Result<(), InspectCacheError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let _profile = super::walk_profile::Walk::start("manifest_hash");
     // Entry-point manifests are normalized snapshots. A bare canonical root is
     // verbatim (`\\?\`) on Windows, so mixing it with those non-verbatim

@@ -229,7 +229,7 @@ pub mod production_storage;
 pub mod project_content;
 pub use aft_base::project_walk;
 pub use aft_base::protocol;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use aft_base::walk_profile;
 #[doc(hidden)]
 pub mod provisional_identity_retry;
@@ -308,7 +308,7 @@ pub mod windows_shell;
 pub use aft_base::worker_jail_canary;
 #[cfg(test)]
 mod gate_hermeticity_tests;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) use aft_base::search_hot_path_measurements as search_test_counts;
 #[cfg(test)]
 pub(crate) use aft_base::test_allocations;

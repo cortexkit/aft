@@ -12,6 +12,7 @@ crates/aft/tests/fixtures/gh_shim/plexus-contract/** text eol=lf
 crates/aft/tests/fixtures/diagnostics-findings-v1/** text eol=lf
 # Binding-discovery vectors and their provenance hashes also pin LF bytes.
 crates/aft/tests/fixtures/gh_shim/plexus-bindings-contract/** text eol=lf
+crates/aft-engine/src/gh_shim_speech/fixtures/plexus-bindings-contract/** text eol=lf
 crates/aft/tests/fixtures/pty_render/*.raw binary
 # Golden render outputs are compared byte-exact against `\n`-joined screen
 # output, so they must stay LF on every platform (Windows autocrlf would
@@ -43,7 +44,7 @@ benchmarks/aft-search/*.bin binary
 benchmarks/aft-search/manifest.sha256 text eol=lf
 # Published exec-remote run-report vectors are pinned by SHA-256 of their
 # exact bytes; line endings must never be converted.
-crates/aft/src/exec_remote/fixtures/reports/** -text
+crates/aft-engine/src/exec_remote/fixtures/reports/** -text
 # Rich-UI canonicalization vectors and templates are digested byte-for-byte:
 # the published manifest's digest is the SHA-256 of the bytes, and the phone
 # refuses the manifest when its own digest disagrees. They are read with
@@ -90,8 +91,8 @@ crates/aft/tests/fixtures/aft-user-commands-v1/** text eol=lf
 # App view templates are served as-is and their canonical bytes are pinned by
 # sha256 in tests and in Occipital's checker, so they must stay LF on every
 # platform (Windows autocrlf would otherwise serve and hash CRLF bytes).
-crates/aft/src/subc/tool_views/*.ui text eol=lf
-crates/aft/src/subc/tool_views/*.json text eol=lf
+crates/aft-subc/src/subc/tool_views/*.ui text eol=lf
+crates/aft-subc/src/subc/tool_views/*.json text eol=lf
 crates/aft/tests/fixtures/tool_views/phone-reader-*/** -text
 crates/aft/tests/fixtures/notice-records/phone-reader-*/** -text
 # The settings schema is compared byte-for-byte with the generated editor

@@ -19,7 +19,7 @@ pub mod oxc_engine;
 pub mod phase_log;
 pub mod scanners;
 pub mod tier2_scheduler;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) mod walk_profile;
 
 pub use cache::{ContributionRecord, InspectCache, InspectCacheError};

@@ -4056,7 +4056,7 @@ pub(crate) fn scope_files(project_root: &Path, scope: &JobScope) -> Vec<PathBuf>
         Ok(inventory) => return in_scope(&inventory),
         Err(miss) => miss,
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let _profile = super::walk_profile::Walk::start("scope_files");
     #[cfg(test)]
     SCOPE_FILE_WALKS.with(|walks| walks.set(walks.get() + 1));

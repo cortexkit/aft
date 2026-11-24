@@ -10,7 +10,9 @@ use std::sync::RwLock;
 use crate::test_support::manifest_dir;
 
 fn assets() -> PathBuf {
-    manifest_dir().join("tests/store_diet")
+    manifest_dir()
+        .with_file_name("aft")
+        .join("tests/store_diet")
 }
 
 fn read_capture(path: impl AsRef<Path>) -> Vec<u8> {

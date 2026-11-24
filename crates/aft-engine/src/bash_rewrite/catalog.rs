@@ -327,7 +327,7 @@ pub fn baseline_source_resolves(source: &str) -> bool {
     // Catalog paths are package-relative. Handler sources stay in the upper
     // package, while the rewrite rules move with this catalog.
     let package = if file.starts_with("src/commands/") {
-        "aft"
+        "aft-tools"
     } else {
         "aft-engine"
     };
