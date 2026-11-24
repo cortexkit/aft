@@ -312,7 +312,7 @@ describe("searchTools", () => {
       expect(externalAsks).toHaveLength(1);
       expect(externalAsks[0]?.patterns).toEqual([path.join(external, "*").replaceAll("\\", "/")]);
       expect(externalAsks[0]?.metadata?.filepath).toBe(external);
-      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${inside} ${external}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toEqual([inside, external]);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -357,7 +357,7 @@ describe("searchTools", () => {
     }
   });
 
-  test("grep searches existing fragments and reports skipped missing paths", async () => {
+  test("grep forwards missing fragments and marks a partial server reply incomplete", async () => {
     const tmpRoot = makeSearchRoot();
     try {
       const project = path.join(tmpRoot, "project");
@@ -379,7 +379,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(toolCallCalls[0]?.rawArgs.path).toBe(src);
+      expect(toolCallCalls[0]?.rawArgs.path).toEqual([src, missing]);
       expect(resultText(output)).toContain("src/hit.ts:1");
       expect(resultText(output)).toContain(`Skipped 1 path not found: ${missing}`);
       expect(bridgeResponse.complete).toBe(false);
@@ -407,7 +407,7 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${src} ${e2e}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toEqual([src, e2e]);
       expect(resultText(output)).toBe("ok");
       expect(resultText(output)).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
@@ -441,7 +441,7 @@ describe("searchTools", () => {
 
       expect(thrown).toBeInstanceOf(Error);
       expect((thrown as Error).message).toBe("path_not_found");
-      expect(toolCallCalls[0]?.rawArgs.path).toBe(`${missingA} ${missingB}`);
+      expect(toolCallCalls[0]?.rawArgs.path).toEqual([`${missingA} ${missingB}`]);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }
@@ -464,10 +464,31 @@ describe("searchTools", () => {
         createMockSdkContext(project),
       );
 
-      expect(toolCallCalls[0]?.rawArgs.path).toBe(fs.realpathSync(spaced));
+      expect(toolCallCalls[0]?.rawArgs.path).toEqual([fs.realpathSync(spaced)]);
       expect(resultText(output)).toBe("ok");
       expect(resultText(output)).not.toContain("Skipped");
       expect(bridgeResponse.complete).toBe(true);
+    } finally {
+      fs.rmSync(tmpRoot, { recursive: true, force: true });
+    }
+  });
+
+  test("grep keeps multiple resolved roots distinct when the project path contains spaces", async () => {
+    const tmpRoot = makeSearchRoot();
+    try {
+      const project = path.join(tmpRoot, "project with spaces");
+      const src = path.join(project, "src");
+      const docs = path.join(project, "docs");
+      fs.mkdirSync(src, { recursive: true });
+      fs.mkdirSync(docs);
+      const { toolCallCalls, tools } = createMockSearchHarness({ disabled_tools: [] }, () => ({
+        success: true,
+        text: "ok",
+      }));
+
+      await tools.grep.execute({ pattern: "needle", path: "src docs" }, createMockSdkContext(project));
+
+      expect(toolCallCalls[0]?.rawArgs.path).toEqual([src, docs]);
     } finally {
       fs.rmSync(tmpRoot, { recursive: true, force: true });
     }

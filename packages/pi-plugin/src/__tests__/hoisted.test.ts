@@ -763,7 +763,7 @@ describe("hoisted tool adapters", () => {
     // forwards it (parity with OpenCode grep, which never exposed it).
     expect(toolArgs(calls[0])).toEqual({
       pattern: "console",
-      path: join(root, "src"),
+      path: [join(root, "src")],
       include: "*.ts,**/*.{tsx,jsx}",
     });
   });
@@ -789,10 +789,10 @@ describe("hoisted tool adapters", () => {
     expect(calls[0].command).toBe("tool_call");
     // When the expanded path equals the home directory itself, stat()
     // succeeds and resolvePathArg returns the absolute form.
-    expect(toolArgs(calls[0])).toEqual({ pattern: "oauth", path: home });
+    expect(toolArgs(calls[0])).toEqual({ pattern: "oauth", path: [home] });
   });
 
-  test("grep searches existing fragments and reports skipped missing paths", async () => {
+  test("grep forwards missing fragments and marks a partial server reply incomplete", async () => {
     const root = await tempRoot();
     await mkdir(join(root, "src"));
     const missing = join(root, "test");
@@ -817,7 +817,7 @@ describe("hoisted tool adapters", () => {
     )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
 
     expect(calls[0].command).toBe("tool_call");
-    expect(toolArgs(calls[0]).path).toBe(join(root, "src"));
+    expect(toolArgs(calls[0]).path).toEqual([join(root, "src"), missing]);
     expect(result.content[0].text).toContain("src/app.ts:1");
     expect(result.content[0].text).toContain(`Skipped 1 path not found: ${missing}`);
     expect(result.details.complete).toBe(false);
@@ -848,7 +848,7 @@ describe("hoisted tool adapters", () => {
     )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
 
     expect(calls[0].command).toBe("tool_call");
-    expect(toolArgs(calls[0]).path).toBe(`${join(root, "src")} ${join(root, "e2e")}`);
+    expect(toolArgs(calls[0]).path).toEqual([join(root, "src"), join(root, "e2e")]);
     expect(result.content[0].text).toBe("ok");
     expect(result.content[0].text).not.toContain("Skipped");
     expect(result.details.complete).toBe(true);
@@ -885,7 +885,7 @@ describe("hoisted tool adapters", () => {
 
     expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toContain("grep: search path does not exist");
-    expect(toolArgs(calls[0]).path).toBe(`${missingA} ${missingB}`);
+    expect(toolArgs(calls[0]).path).toEqual([`${missingA} ${missingB}`]);
   });
 
   test("grep treats an existing single path containing a space as one path", async () => {
@@ -912,7 +912,7 @@ describe("hoisted tool adapters", () => {
     )) as { content: Array<{ text: string }>; details: { complete?: boolean } };
 
     expect(calls[0].command).toBe("tool_call");
-    expect(toolArgs(calls[0]).path).toBe(join(root, "with space"));
+    expect(toolArgs(calls[0]).path).toEqual([join(root, "with space")]);
     expect(result.content[0].text).toBe("ok");
     expect(result.content[0].text).not.toContain("Skipped");
     expect(result.details.complete).toBe(true);

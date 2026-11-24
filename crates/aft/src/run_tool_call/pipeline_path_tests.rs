@@ -106,9 +106,9 @@ fn tool_grep_does_not_drop_missing_roots() {
         )
         .unwrap();
     }
-    let grep = |path| call(&root, "grep", json!({"pattern":"needle","path":path}));
+    let grep = |path: Value| call(&root, "grep", json!({"pattern":"needle","path":path}));
 
-    let missing = grep("first missing");
+    let missing = grep(json!("first missing"));
     assert!(!missing.response.success, "{:?}", missing.response);
     assert_eq!(missing.response.data["code"], "path_not_found");
     assert!(
@@ -119,13 +119,13 @@ fn tool_grep_does_not_drop_missing_roots() {
         missing.text
     );
 
-    let literal = grep("literal name");
+    let literal = grep(json!("literal name"));
     assert!(
         literal.response.success && literal.text.contains("needle literal"),
         "{}",
         literal.text
     );
-    let both = grep("first second");
+    let both = grep(json!("first second"));
     assert!(
         both.response.success
             && both.text.contains("needle one")
@@ -133,4 +133,15 @@ fn tool_grep_does_not_drop_missing_roots() {
         "{}",
         both.text
     );
+
+    let explicit = grep(json!(["literal name", "second"]));
+    assert!(explicit.response.success, "{:?}", explicit.response);
+    assert!(
+        explicit.text.contains("needle literal"),
+        "{}",
+        explicit.text
+    );
+    assert!(explicit.text.contains("needle two"), "{}", explicit.text);
+    let missing = grep(json!(["first", "missing"]));
+    assert_eq!(missing.response.data["code"], "path_not_found");
 }

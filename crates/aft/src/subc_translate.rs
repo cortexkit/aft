@@ -267,6 +267,17 @@ pub(crate) fn normalize_path_arguments(
             normalize_path_alias_pair(&mut map, "toPath", "toFile", false)?;
         }
         "safety" => normalize_path_alias_pair(&mut map, "path", "filePath", false)?,
+        "grep" if map.get("path").is_some_and(Value::is_array) => {
+            let paths = map["path"].as_array().expect("checked by the guard");
+            if paths.is_empty() {
+                return Err(invalid_request(
+                    "grep: 'path' must contain at least one root",
+                ));
+            }
+            for path in paths {
+                path_string(Some(path), "path")?;
+            }
+        }
         "grep" | "search" | "conflicts" => {
             // An empty-string or null `path` on these optional-path tools means
             // the field was not supplied; strip it so it cannot trip the
@@ -1980,12 +1991,28 @@ fn translate_grep(args: Value, project_root: &Path) -> Result<Translated, Transl
     }
     if let Some(path_val) = map_in.get("path") {
         if !is_empty_param(path_val) {
-            if let Some(path_str) = path_val.as_str() {
-                out.insert(
-                    "path".to_string(),
-                    resolve_grep_path_arg(project_root, path_str),
-                );
-            }
+            let path = if let Some(path_str) = path_val.as_str() {
+                resolve_grep_path_arg(project_root, path_str)
+            } else if let Some(paths) = path_val.as_array() {
+                Value::Array(
+                    paths
+                        .iter()
+                        .map(|path| {
+                            let path = path_string(Some(path), "path")?;
+                            Ok(Value::String(
+                                resolve_path_from_project_root(project_root, path)
+                                    .to_string_lossy()
+                                    .into_owned(),
+                            ))
+                        })
+                        .collect::<Result<Vec<_>, TranslateError>>()?,
+                )
+            } else {
+                return Err(invalid_request(
+                    "grep: 'path' must be a string or an array of strings",
+                ));
+            };
+            out.insert("path".to_string(), path);
         }
     }
     // No `max_results`: the grep command sizes its own pages (a 40-line
