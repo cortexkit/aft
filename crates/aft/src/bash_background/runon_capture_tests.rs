@@ -42,25 +42,29 @@ fn start_runon(ctx: &crate::context::AppContext, daemon: &Daemon) -> String {
     response.data["task_id"].as_str().unwrap().into()
 }
 
-fn start_prefix_editor(
+fn start_remote_editor(
     ctx: &crate::context::AppContext,
     daemon: &Daemon,
     workdir: &Path,
 ) -> String {
-    let mut policy = launch(daemon.connection.clone());
-    policy.params.remote_exec.as_mut().unwrap().legacy_commands =
-        Some(serde_json::json!(["touch"]));
-    let response = handle_with_policy(
-        ctx,
-        Some(policy),
-        serde_json::json!({
-            "command": format!("touch .editor-started; {EDIT}"),
-            "workdir": workdir,
-            "compressed": false,
-        }),
-    );
-    assert!(response.success, "{response:?}");
-    response.data["task_id"].as_str().unwrap().into()
+    ctx.bash_background()
+        .spawn_remote(
+            launch(daemon.connection.clone()),
+            SpawnPlan::Unsandboxed,
+            &format!("touch .editor-started; {EDIT}"),
+            resolve_posix_shell(),
+            "session".into(),
+            workdir.into(),
+            HashMap::new(),
+            crate::bash_background::HardKill::After(Duration::from_secs(15)),
+            None,
+            crate::bash_background::task_storage_dir(ctx),
+            crate::bash_background::TaskSlot::Foreground,
+            false,
+            false,
+            ctx.config().project_root.clone(),
+        )
+        .unwrap()
 }
 
 fn start_log_capture(root: &Path) -> RemoteLaunchLogCapture {
@@ -149,7 +153,7 @@ async fn runon_capture_waits_for_foreground_local_fallback() {
     let capture = daemon(Script::CaptureCheckout { gated: false }, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     let ctx = remote_test_context(dir.path());
-    let local = start_prefix_editor(&ctx, &refused, dir.path());
+    let local = start_remote_editor(&ctx, &refused, dir.path());
     refused.wait_for_requests("exec.run", 1).await;
     wait_for("the fallback editor to start", || {
         dir.path().join(".editor-started").exists().then_some(())
@@ -196,7 +200,7 @@ async fn runon_capture_does_not_wait_or_warn_after_fallback_spawn_failure() {
     let ctx = remote_test_context(&root);
     let workdir = root.join("editor");
     fs::create_dir(&workdir).unwrap();
-    let local = start_prefix_editor(&ctx, &refused, &workdir);
+    let local = start_remote_editor(&ctx, &refused, &workdir);
     refused.wait_for_requests("exec.run", 1).await;
     // Leave the checkout intact, but make the local spawn fail in its workdir.
     fs::remove_dir(workdir).unwrap();
