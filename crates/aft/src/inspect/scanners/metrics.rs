@@ -31,7 +31,10 @@ struct CachedFileMetric {
     path: PathBuf,
     language: &'static str,
     loc: usize,
-    skipped_reason: Option<&'static str>,
+    skipped_reason: Option<String>,
+    /// The file disappeared (or is excluded project storage) between the walk
+    /// and this read: it contributes nothing, as the next walk will see it.
+    vanished: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -108,11 +111,11 @@ fn run_metrics_scan_with_memo(
     let per_file = cached_files
         .into_iter()
         .filter_map(|cached| {
+            if cached.vanished {
+                return None;
+            }
             if let Some(reason) = cached.skipped_reason {
-                skipped_files.push((
-                    display_path(&job.project_root, &cached.path),
-                    reason.to_string(),
-                ));
+                skipped_files.push((display_path(&job.project_root, &cached.path), reason));
                 return None;
             }
             Some(FileMetric {
@@ -142,18 +145,31 @@ fn scan_file(path: &Path) -> (Option<FileFreshness>, CachedFileMetric) {
     let metadata = fs::metadata(path).ok();
     let _permit =
         super::source_text::source_scan_permit(metadata.as_ref().map_or(0, fs::Metadata::len));
-    let (bytes, skipped_reason) = read_file_bytes(path);
-    let freshness = metadata
-        .as_ref()
-        .filter(|_| skipped_reason.is_none())
-        .map(|metadata| freshness_from_metadata(metadata, bytes.as_deref()));
-    let loc = bytes.as_deref().map(line_count_bytes).unwrap_or_default();
-
-    let metric = CachedFileMetric {
+    let mut metric = CachedFileMetric {
         path: path.to_path_buf(),
         language: language_key(path),
-        loc,
-        skipped_reason,
+        loc: 0,
+        skipped_reason: None,
+        vanished: false,
+    };
+    // Only a file whose bytes were read is memoised. A skip or a vanished file
+    // is rechecked on the next scan: a permission change alters neither mtime
+    // nor size, so a memoised failure would outlive the fix.
+    let freshness = match read_file_bytes(path) {
+        MetricRead::Bytes(bytes) => {
+            metric.loc = line_count_bytes(&bytes);
+            metadata
+                .as_ref()
+                .map(|metadata| freshness_from_metadata(metadata, Some(&bytes)))
+        }
+        MetricRead::Skipped(reason) => {
+            metric.skipped_reason = Some(reason);
+            None
+        }
+        MetricRead::Vanished => {
+            metric.vanished = true;
+            None
+        }
     };
     (freshness, metric)
 }
@@ -175,16 +191,23 @@ fn freshness_from_metadata(metadata: &fs::Metadata, bytes: Option<&[u8]>) -> Fil
     }
 }
 
-fn read_file_bytes(path: &Path) -> (Option<Vec<u8>>, Option<&'static str>) {
-    use super::source_text::{read_source_bytes, SourceBytes, TOO_LARGE};
+enum MetricRead {
+    Bytes(Vec<u8>),
+    Skipped(String),
+    Vanished,
+}
+
+fn read_file_bytes(path: &Path) -> MetricRead {
+    use super::source_text::{read_source_bytes, unreadable_reason, SourceBytes, TOO_LARGE};
     match read_source_bytes(path) {
         Ok(SourceBytes::Bytes(bytes)) => {
             #[cfg(debug_assertions)]
             bump_file_read_count(path);
-            (Some(bytes), None)
+            MetricRead::Bytes(bytes)
         }
-        Ok(SourceBytes::TooLarge) => (None, Some(TOO_LARGE)),
-        _ => (None, None),
+        Ok(SourceBytes::TooLarge) => MetricRead::Skipped(TOO_LARGE.to_string()),
+        Ok(SourceBytes::Vanished) => MetricRead::Vanished,
+        Err(error) => MetricRead::Skipped(unreadable_reason(&error)),
     }
 }
 
@@ -404,6 +427,59 @@ mod tests {
             9,
             "waiting does not finish more files"
         );
+    }
+
+    #[test]
+    fn metrics_vanished_files_are_not_counted() {
+        let project = tempfile::tempdir().unwrap();
+        let present = project.path().join("present.rs");
+        fs::write(&present, "fn present() {}\n").unwrap();
+        let gone = project.path().join("gone.rs");
+        let job = metrics_job(project.path(), vec![present.clone(), gone]);
+        let success = run_metrics_scan_with_memo(&job, &Tier1FileMemo::default())
+            .outcome
+            .unwrap();
+        assert_eq!(success.scanned_files, vec![present]);
+        assert_eq!(success.aggregate["files"], 1);
+        assert!(success.aggregate.get("skipped_files").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn metrics_unreadable_file_is_a_named_gap_and_is_not_memoised() {
+        let project = tempfile::tempdir().unwrap();
+        let readable = project.path().join("readable.rs");
+        fs::write(&readable, "fn readable() {}\n").unwrap();
+        // A FIFO fails the source read with an error other than NotFound,
+        // even for a privileged user, so it stands in for an unreadable file.
+        let unreadable = project.path().join("unreadable.rs");
+        crate::bounded_io::tests::fifo(&unreadable);
+        let job = metrics_job(project.path(), vec![readable.clone(), unreadable.clone()]);
+        let memo = Tier1FileMemo::default();
+
+        let success = run_metrics_scan_with_memo(&job, &memo).outcome.unwrap();
+        assert_eq!(success.scanned_files, vec![readable.clone()]);
+        assert_eq!(success.aggregate["files"], 1);
+        assert_eq!(success.aggregate["loc"], 1);
+        assert_eq!(success.aggregate["complete"], false);
+        let rows = success.aggregate["skipped_files"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["file"], "unreadable.rs");
+        assert!(
+            rows[0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("could not be read: ")),
+            "{rows:?}"
+        );
+
+        // The failure was not memoised: once the file reads, the same memo
+        // counts its lines.
+        fs::remove_file(&unreadable).unwrap();
+        fs::write(&unreadable, "a\nb\nc\n").unwrap();
+        let success = run_metrics_scan_with_memo(&job, &memo).outcome.unwrap();
+        assert_eq!(success.aggregate["files"], 2);
+        assert_eq!(success.aggregate["loc"], 4);
+        assert!(success.aggregate.get("skipped_files").is_none());
     }
 
     #[test]
