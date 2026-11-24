@@ -394,12 +394,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "handle_directory",
+                predicate_name: "handle_directory_entries",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "handle_directory",
+                predicate_name: "handle_directory_entries",
             },
         ],
     },

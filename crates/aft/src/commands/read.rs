@@ -2609,15 +2609,6 @@ fn handle_streaming_range_read(
 
 /// Handle directory listing.
 fn handle_directory(req: &RawRequest, path: &Path) -> Response {
-    // This server-owned field lets transparent bash rewrites preserve `ls`
-    // visibility. Direct read calls omit it and retain the existing show-all default.
-    let include_hidden = req
-        .params
-        .get("include_hidden")
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
-    let mut entries: Vec<String> = Vec::new();
-
     let read_dir = match fs::read_dir(path) {
         Ok(rd) => rd,
         Err(e) => {
@@ -2628,28 +2619,63 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
             );
         }
     };
+    handle_directory_entries(
+        req,
+        read_dir.map(|entry| {
+            entry.map(|entry| {
+                (entry.path(), entry.file_name(), move || {
+                    entry.file_type().map(|ty| ty.is_dir())
+                })
+            })
+        }),
+    )
+}
+
+fn handle_directory_entries<F: FnOnce() -> std::io::Result<bool>>(
+    req: &RawRequest,
+    read_dir: impl Iterator<Item = std::io::Result<(PathBuf, std::ffi::OsString, F)>>,
+) -> Response {
+    // When Bash translates an `ls` call into a read, carry over its hidden-file
+    // setting. Direct read calls omit this server-owned field and show all entries.
+    let include_hidden = req
+        .params
+        .get("include_hidden")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let mut entries: Vec<String> = Vec::new();
 
     let mut examined = 0;
     let mut enumeration_cut = false;
+    let mut enumeration_errors = 0;
+    let mut type_errors = 0;
+    let mut first_error = None;
     for entry_result in read_dir.take(MAX_DIRECTORY_SCAN + 1) {
         examined += 1;
         if examined > MAX_DIRECTORY_SCAN {
             enumeration_cut = true;
             break;
         }
-        let entry = match entry_result {
+        let (path, name, is_dir) = match entry_result {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(error) => {
+                enumeration_errors += 1;
+                first_error.get_or_insert(error);
+                continue;
+            }
         };
-        if crate::watcher_backend::flush::is_marker_path(&entry.path()) {
+        if crate::watcher_backend::flush::is_marker_path(&path) {
             continue;
         }
 
-        let name = entry.file_name().to_string_lossy().to_string();
+        let name = name.to_string_lossy().into_owned();
         if !include_hidden && name.starts_with('.') {
             continue;
         }
-        let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+        let is_dir = is_dir().unwrap_or_else(|error| {
+            type_errors += 1;
+            first_error.get_or_insert(error);
+            false
+        });
 
         if is_dir {
             entries.push(format!("{}/", name));
@@ -2689,10 +2715,11 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
     let skip = start.saturating_sub(1).min(total as u64) as usize;
     entries = entries.into_iter().skip(skip).take(count).collect();
     let shown = entries.len();
-    let truncated = enumeration_cut || shown < total;
+    let enumeration_incomplete = enumeration_cut || enumeration_errors > 0;
+    let truncated = enumeration_incomplete || type_errors > 0 || shown < total;
     let envelope =
-        crate::list_surfaces::read::build_directory_envelope(shown, total, enumeration_cut);
-    let offset_note = (start > total as u64 && !enumeration_cut && start > 1)
+        crate::list_surfaces::read::build_directory_envelope(shown, total, enumeration_incomplete);
+    let offset_note = (start > total as u64 && !enumeration_incomplete && start > 1)
         .then(|| format!("offset past end: offset {start} exceeds {total} entries"));
     // Put the offset-past-end note before the trailer so the final line keeps its standard format.
     let mut trailer_text = offset_note.clone().unwrap_or_default();
@@ -2717,10 +2744,15 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
         "truncated": truncated,
         "total_entries": total,
         "entries_shown": shown,
-        "total_entries_exact": !enumeration_cut,
+        "total_entries_exact": !enumeration_incomplete,
         "entries_examined": examined,
         "enumeration_gap": enumeration_cut.then_some("directory entry budget; narrow: subdirectory"),
     });
+    if let Some(error) = first_error {
+        data["enumeration_gap"] = format!("read: failed to read directory: {error}").into();
+        data["enumeration_errors"] = enumeration_errors.into();
+        data["type_errors"] = type_errors.into();
+    }
     if let Some(note) = offset_note {
         data["offset_note"] = note.into();
     }
@@ -2732,6 +2764,34 @@ fn handle_directory(req: &RawRequest, path: &Path) -> Response {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn edit_review_gpt_9_directory_listing_discloses_item_and_type_errors() {
+        use std::io;
+
+        let req =
+            serde_json::from_value(serde_json::json!({"id":"gaps", "command":"read"})).unwrap();
+        let failed_type = || Err(io::Error::other("type lookup failed"));
+        let directory = || Ok(true);
+        for item_gap in [false, true] {
+            let mut items: Vec<io::Result<(_, _, fn() -> io::Result<bool>)>> = vec![
+                Ok(("/healthy".into(), "healthy".into(), directory)),
+                Ok(("/unknown".into(), "unknown".into(), failed_type)),
+            ];
+            if item_gap {
+                items.push(Err(io::Error::other("enumeration failed")));
+            }
+            let response = super::handle_directory_entries(&req, items.into_iter());
+            assert!(response.success, "{response:?}");
+            assert_eq!(response.data["complete"], false);
+            assert_eq!(response.data["truncated"], true);
+            assert_eq!(response.data["total_entries_exact"], !item_gap);
+            assert_eq!(response.data["type_errors"], 1);
+            assert_eq!(response.data["enumeration_errors"], usize::from(item_gap));
+            assert_eq!(response.data["entries"][0], "healthy/");
+            assert_eq!(response.data["entries"][1], "unknown");
+        }
+    }
+
     #[test]
     fn bash_flush_markers_are_not_directory_entries() {
         let root = tempfile::tempdir().unwrap();

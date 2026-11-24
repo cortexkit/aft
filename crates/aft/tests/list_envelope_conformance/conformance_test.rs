@@ -456,7 +456,7 @@ fn producer_bounds_resolve_to_their_real_surfaces_or_internal_exclusions() {
             "collect_outline_files_breadth_first_with_device_lookup",
             "payload.files",
         ),
-        ("commands/read.rs", "handle_directory", "payload.entries"),
+        ("commands/read.rs", "handle_directory_entries", "payload.entries"),
         (
             "commands/semantic_search/exact_lane.rs",
             "execute_fallback_mode",
