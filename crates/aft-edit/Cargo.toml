@@ -57,6 +57,7 @@ windows-sys = { version = "0.61", features = [
 aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
 aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
 aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }
+cortexkit-role-agent-data = { version = "=0.3.3", features = ["test-vectors"] }
 filetime = "0.2"
 tempfile = "3"
 tree-sitter-python = "0.25"
