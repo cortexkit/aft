@@ -263,7 +263,8 @@ describe("runGithubAutoInstall", () => {
       },
       fakeFetch,
     );
-    expect(result.installingBinaries).toContain("clangd");
+    // The install is grace-blocked, so it must never be reported as in flight.
+    expect(result.installingBinaries).not.toContain("clangd");
     await result.installsComplete;
     expect(result.installsStarted).toBe(0);
     const clangdSkip = result.skipped.find((s) => s.id === "clangd");

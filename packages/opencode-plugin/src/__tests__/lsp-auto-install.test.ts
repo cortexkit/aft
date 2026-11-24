@@ -172,7 +172,9 @@ describe("runAutoInstall", () => {
     expect(tsSkipped).toBeUndefined();
     // Install should have started.
     expect(result.installsStarted).toBeGreaterThan(0);
-    expect(result.installingBinaries).toContain("typescript-language-server");
+    // In-flight reporting stays empty: the start decision is made later, after
+    // grace, probe and lock checks, and may still skip the install.
+    expect(result.installingBinaries).not.toContain("typescript-language-server");
   });
 
   test("project-relevance: package.json root marker wins without walking", async () => {
@@ -244,6 +246,9 @@ describe("runAutoInstall", () => {
     // and then read again to see the final post-decrement count for skipped servers.
     await result.installsComplete;
     expect(result.installsStarted).toBe(0);
+    // Nothing installs, so the binary must not be reported as in flight: that
+    // list suppresses the missing-binary warning for the rest of the process.
+    expect(result.installingBinaries).not.toContain("typescript-language-server");
     const tsSkip = result.skipped.find((s) => s.id === "typescript");
     expect(tsSkip).toBeDefined();
     expect(tsSkip?.reason).toContain("grace");

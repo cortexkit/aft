@@ -700,6 +700,9 @@ export function runAutoInstall(
   const cachedBinDirs: string[] = [];
   const skipped: Array<{ id: string; reason: string }> = [];
   const installPromises: Promise<void>[] = [];
+  // Start decisions happen asynchronously after grace/probe/lock checks. Keep
+  // this synchronous return empty so `lsp_inflight_installs` never suppresses
+  // missing-binary warnings for installs that may be skipped before spawning.
   const installingBinaries: string[] = [];
   let installsStarted = 0;
   let projectExtensions: Set<string> | null = null;
@@ -743,7 +746,6 @@ export function runAutoInstall(
     //
     // Tests await `installsComplete` to assert outcomes.
     installsStarted += 1;
-    installingBinaries.push(spec.binary);
     const controller = new AbortController();
     const promise = ensureServerInstalled(spec, config, fetchImpl, controller.signal).then(
       (outcome) => {

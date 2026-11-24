@@ -34,7 +34,9 @@ const githubInstaller = createGithubInstaller({
   writeVersionCheck,
   hasRootMarker,
   relevantExtensionsInProject,
-  reportInstallingBinaries: true,
+  // As in the Pi plugin: whether an install starts is decided later, after
+  // grace, probe and lock checks, so nothing is reported as in flight.
+  reportInstallingBinaries: false,
 });
 
 export const {
