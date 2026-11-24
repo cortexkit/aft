@@ -87,6 +87,10 @@ impl Drop for Fixture {
     }
 }
 fn fixture(tool: &str, name: &str) -> Fixture {
+    fixture_with_pin(tool, name, None)
+}
+
+fn fixture_with_pin(tool: &str, name: &str, pin: Option<String>) -> Fixture {
     TEST_SINK.with(|sink| {
         sink.replace(Some(Vec::new()));
     });
@@ -101,7 +105,7 @@ fn fixture(tool: &str, name: &str) -> Fixture {
     }
     let mut call = subc_protocol::tool_call::ToolCallRequest::new(tool, json!({}));
     call.call_key = Some(name.into());
-    call.schema_pin = Some(
+    call.schema_pin = Some(pin.unwrap_or_else(|| {
         crate::subc::tool_views::SHIPPED
             .keys()
             .find(|pin| {
@@ -112,8 +116,8 @@ fn fixture(tool: &str, name: &str) -> Fixture {
                 }
             })
             .unwrap()
-            .clone(),
-    );
+            .clone()
+    }));
     let key_value = crate::subc::tool_provider::LedgerEdge::key(&route, name);
     register(&key_value, &route, &call);
     let capture = CALLS.lock().unwrap()[&key(&key_value)].clone();
@@ -197,6 +201,47 @@ fn bash_tail_foreground_publishes_after_record_and_detail_only_when_nonempty() {
             assert_eq!(writes.len(), 2);
         }
     }
+}
+
+#[test]
+fn display_versioned_bash_pin_publishes_the_legacy_rich_record_and_tail() {
+    use cortexkit_role_tool_provider::call::SchemaPin;
+
+    let bash = crate::subc::tool_provider::versions::current_pin_tools()
+        .find(|tool| tool.name == "bash")
+        .unwrap();
+    let legacy = SchemaPin::new(&bash.name, &bash.schema_digest, bash.semantics)
+        .encode()
+        .unwrap();
+    let versioned = bash.schema_pin().encode().unwrap();
+    let run = |name, pin: String| {
+        let f = fixture_with_pin("bash", name, Some(pin.clone()));
+        let _active = enter(Some(&f.key));
+        let mut display = current_task().unwrap();
+        let mut metadata = task();
+        metadata.status = BgTaskStatus::Completed;
+        metadata.exit_code = Some(0);
+        metadata.display = Some(display.clone());
+        let mut bodies = bash_bodies(&metadata, Some(3), Some(("ok\n".into(), "".into())));
+        bodies.tail = bash_tail(&metadata, "ok\n", "", &|text| Some(text.into()));
+        bash_reply(&mut display, bodies, false);
+        f.capture.lock().unwrap().processing_ms = 12;
+        reply(&f.key, false, false, None);
+        publications()
+            .into_iter()
+            .map(|publication| {
+                assert_eq!(publication.identity.schema_pin, pin);
+                (publication.kind, publication.body)
+            })
+            .collect::<Vec<_>>()
+    };
+    let legacy = run("display-legacy-bash", legacy);
+    let versioned = run("display-versioned-bash", versioned);
+    assert_eq!(versioned, legacy);
+    assert_eq!(versioned[0].0, DisplayKind::Record);
+    assert_eq!(versioned[1].0, DisplayKind::Detail);
+    assert_eq!(versioned[2].0, DisplayKind::Completion);
+    assert_eq!(versioned[2].1["tail"], json!([{"text":"ok"}]));
 }
 
 #[test]

@@ -56,16 +56,22 @@ impl TaskSink {
     }
 }
 
-pub(super) fn output_limit_reason(
+pub(super) fn with_output_limit_reason(
     metadata: &PersistedTask,
     status: &BgTaskStatus,
+    reason: Option<String>,
 ) -> Option<String> {
-    (*status == BgTaskStatus::Killed
-        && metadata
-            .remote
-            .as_ref()
-            .is_some_and(|remote| remote.output_limit_dropped_bytes > 0))
-    .then(|| OUTPUT_LIMIT_REASON.to_string())
+    if !metadata
+        .remote
+        .as_ref()
+        .is_some_and(|remote| remote.output_limit_dropped_bytes > 0)
+    {
+        return reason;
+    }
+    match (status, reason) {
+        (BgTaskStatus::Killed, _) | (_, None) => Some(OUTPUT_LIMIT_REASON.into()),
+        (_, Some(reason)) => Some(format!("{reason}\n{OUTPUT_LIMIT_REASON}")),
+    }
 }
 
 impl BgTaskRegistry {

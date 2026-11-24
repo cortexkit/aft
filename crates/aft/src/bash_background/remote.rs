@@ -1827,7 +1827,7 @@ pub(super) fn terminal_metadata_from_proof(metadata: &mut PersistedTask) -> Opti
     let reason = remote_oom_kill(metadata)
         .map(|oom| oom.message())
         .or(reason);
-    let reason = source_cancel::output_limit_reason(metadata, &status).or(reason);
+    let reason = source_cancel::with_output_limit_reason(metadata, &status, reason);
     metadata.mark_terminal(status, code, reason);
     Some(())
 }
@@ -4761,7 +4761,7 @@ impl BgTaskRegistry {
             {
                 reason = state.metadata.status_reason.clone();
             }
-            reason = source_cancel::output_limit_reason(&state.metadata, &status).or(reason);
+            reason = source_cancel::with_output_limit_reason(&state.metadata, &status, reason);
             let status_label = format!("{status:?}");
             state.metadata.mark_terminal(status, code, reason.clone());
             // Remote execution has no local shell wrapper to write markers.

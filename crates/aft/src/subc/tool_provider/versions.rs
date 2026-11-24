@@ -50,6 +50,31 @@ static SHIPPED: LazyLock<BTreeMap<String, u64>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("shipped_pins.json")).expect("shipped tool pin history")
 });
 
+pub(in crate::subc) fn shipped_major(pin: &str) -> Option<u64> {
+    SHIPPED.get(pin).copied()
+}
+
+/// Current schemas across presets, including schemas offered only on some routes.
+pub(in crate::subc) fn current_pin_tools() -> impl Iterator<Item = &'static CatalogTool> {
+    let head = [
+        &super::RUNNER_HEAD_TOOLS.hashline_edit,
+        &super::RUNNER_HEAD_TOOLS.bash_watch,
+    ];
+    CatalogPreset::ALL
+        .into_iter()
+        .flat_map(served_tools)
+        .chain(head)
+        .flat_map(|tool| {
+            [
+                Some(&tool.catalog),
+                tool.with_ref.as_ref(),
+                tool.with_runon.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+        })
+}
+
 #[cfg(feature = "test-hooks")]
 static VERSION_PROBE: LazyLock<Option<bool>> =
     LazyLock::new(
@@ -141,8 +166,8 @@ pub(super) fn admit_pin(
                     && call.name == "edit"
                     && pin.schema_digest
                         == super::RUNNER_HEAD_TOOLS.hashline_edit.catalog.schema_digest);
-            match SHIPPED.get(encoded).filter(|_| !other_grammar) {
-                Some(&major) => major,
+            match shipped_major(encoded).filter(|_| !other_grammar) {
+                Some(major) => major,
                 None => {
                     return Err(legacy_refusal(
                         pin,

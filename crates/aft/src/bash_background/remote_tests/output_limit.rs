@@ -55,6 +55,41 @@ async fn output_limit_caps_remote_capture_and_requests_one_cancel() {
 }
 
 #[test]
+fn output_limit_remote_exit_zero_keeps_its_result_and_discloses_dropped_output() {
+    use crate::bash_background::buffer::{limit_for_test, OUTPUT_LIMIT_REASON};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (registry, task_id, paths) =
+        persist_accepted_with_snapshot(dir.path(), dir.path().join("unused"), "printf remote");
+    let task = registry.task(&task_id).unwrap();
+    let _limit = limit_for_test(task.paths.session_dir.clone(), 4);
+    let mut sink = TaskSink::new(&registry, task.clone()).unwrap();
+    sink.output(1, OutputStream::Stdout, b"a").unwrap();
+    sink.output(2, OutputStream::Stdout, b"oversized").unwrap();
+    let remote = read_task(&paths.json).unwrap().remote.unwrap();
+    assert_eq!(remote.output_limit_dropped_bytes, 9);
+    assert!(remote.cancel_requested);
+    assert_eq!(fs::read(&paths.stdout).unwrap(), b"a");
+
+    // The runner exited before it received the cancellation request.
+    let record = TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 2, 0, 0);
+    let verdict = exec::grade(&record);
+    sink.terminal(&record, &verdict).unwrap();
+    drop(sink);
+
+    let mut recovered = read_task(&paths.json).unwrap();
+    terminal_metadata_from_proof(&mut recovered).unwrap();
+    registry.remote_terminal(&task, verdict, None);
+    let saved = read_task(&paths.json).unwrap();
+    for metadata in [&recovered, &saved] {
+        assert_eq!(metadata.status, BgTaskStatus::Completed);
+        assert_eq!(metadata.exit_code, Some(0));
+        assert_eq!(metadata.status_reason.as_deref(), Some(OUTPUT_LIMIT_REASON));
+    }
+    assert!(saved.execution_note.unwrap().contains(OUTPUT_LIMIT_REASON));
+}
+
+#[test]
 fn output_limit_remote_replay_does_not_write_or_recount_dropped_records() {
     use crate::bash_background::buffer::limit_for_test;
 

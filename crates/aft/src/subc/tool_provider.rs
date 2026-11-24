@@ -8,8 +8,10 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use cortexkit_role_tool_provider::call::SchemaPin;
 use cortexkit_role_tool_provider::{
-    call::{check_versioned_call, SchemaPin},
+    call::check_versioned_call,
     catalog::{
         check_model_param, composition_digest, schema_digest, session_capabilities,
         system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
@@ -7254,6 +7256,51 @@ pub(in crate::subc) mod route_tests {
     /// The last dispatched request's command, session and parameters.
     static LAST_DISPATCH: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
     static EXCHANGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn tool_views_answers_current_versioned_bash_and_file_tool_pins() {
+        use cortexkit_role_tool_provider::views::{ViewManifest, ViewsReply, ViewsRequest};
+
+        let tools: Vec<_> = tools_for_session(CatalogPreset::Head, &[], false, true, false)
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "bash" | "edit" | "write" | "apply_patch"
+                )
+            })
+            .collect();
+        assert_eq!(tools.len(), 4);
+        let pins: Vec<_> = tools
+            .iter()
+            .map(|tool| tool.schema_pin().encode().unwrap())
+            .collect();
+        let frame = exchange(
+            json!({"op":"tool.views","pins":pins}),
+            RouteRole::ToolProviderV1,
+            "versioned-views",
+            vec![],
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        let answer: Value = serde_json::from_slice(&frame.body).unwrap();
+        let reply: ViewsReply = serde_json::from_value(answer.clone()).unwrap();
+        reply
+            .validate_for(&ViewsRequest::new(pins.clone()))
+            .unwrap();
+        for (tool, pin) in tools.iter().zip(pins) {
+            assert!(pin.starts_with("tp2:"));
+            let manifest: ViewManifest =
+                serde_json::from_value(answer["views"][&pin].clone()).unwrap();
+            assert!(manifest.check_pin(&pin).unwrap());
+            let legacy_pin = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+                .encode()
+                .unwrap();
+            let legacy_view = super::super::tool_views::view(&legacy_pin).unwrap();
+            assert_eq!(manifest.record_schema, legacy_view.record_schema);
+            assert_eq!(manifest.template, legacy_view.template);
+        }
+    }
 
     #[tokio::test]
     async fn tool_views_every_shipped_pin_remains_servable_on_the_real_handler() {

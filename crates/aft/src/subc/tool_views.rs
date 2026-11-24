@@ -1,13 +1,13 @@
-//! View templates answered through `tool.views`, keyed by the exact schema pin
-//! (the hash of one tool definition) each was served for. Once served, a pin
-//! stays here even after the catalog moves to a newer definition, so a
-//! transcript's older calls can still be drawn.
-use std::collections::BTreeMap;
+//! View templates answered through `tool.views`. Legacy pins keep their exact
+//! views; versioned pins resolve to current or shipped tool definitions so
+//! transcripts can still draw calls made against an older schema.
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use cortexkit_role_tool_provider::{
-    call::SchemaPin,
-    views::{ViewEntry, ViewManifest, ViewsReply, ViewsRequest},
+    call::{SchemaPin, ToolMajorPin},
+    catalog::{CatalogTool, ToolVersion},
+    views::{ViewEntry, ViewManifest, ViewTool, ViewsReply, ViewsRequest},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -15,6 +15,7 @@ use subc_protocol::ErrorBody;
 
 pub(super) mod current;
 use super::rich_ui::notices;
+use super::tool_provider::versions;
 
 pub(crate) const BASH_SEMANTICS: u64 = 3;
 
@@ -59,23 +60,94 @@ pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|
 pub(crate) fn has_bash_tail(pin: &str) -> bool {
     SHIPPED
         .get(pin)
+        .or_else(|| versioned_source(pin).map(|(entry, ..)| entry))
         .is_some_and(|entry| entry.tool.name == "bash" && entry.tool.semantics == BASH_SEMANTICS)
 }
 
 pub(crate) fn view(pin: &str) -> Option<ViewManifest> {
-    let shipped = SHIPPED.get(pin)?;
-    let digest =
-        cortexkit_role_tool_provider::catalog::schema_digest(&shipped.tool.input_schema).ok()?;
-    let catalog = cortexkit_role_tool_provider::catalog::CatalogTool::new(
-        shipped.tool.name.clone(),
-        digest,
-        shipped.tool.semantics,
-        shipped.tool.input_schema.clone(),
+    if let Some(shipped) = SHIPPED.get(pin) {
+        return Some(shipped.history.last()?.clone().with_tool(ViewTool::new(
+            &shipped.tool.name,
+            shipped.tool.input_schema.clone(),
+            shipped.tool.semantics,
+        )));
+    }
+    let (shipped, schema, major) = versioned_source(pin)?;
+    // Minor and patch are catalog metadata, not part of a view's identity.
+    let tool = ViewTool::new_versioned(
+        &shipped.tool.name,
+        schema.clone(),
+        ToolVersion::new(major, 0, 0),
     );
-    Some(shipped.history.last()?.clone().with_tool(
-        cortexkit_role_tool_provider::views::ViewTool::from(&catalog),
-    ))
+    Some(shipped.history.last()?.clone().with_tool(tool))
 }
+
+fn versioned_source(encoded: &str) -> Option<(&'static Shipped, &'static Value, u64)> {
+    let pin = ToolMajorPin::parse(encoded).ok()?;
+    let (entry, schema) = versioned_source_for(&pin, versions::current_pin_tools())?;
+    Some((entry, schema, pin.major))
+}
+
+fn versioned_source_for<'a>(
+    pin: &ToolMajorPin,
+    current: impl Iterator<Item = &'a CatalogTool>,
+) -> Option<(&'static Shipped, &'a Value)> {
+    let mut current = current
+        .filter(|tool| {
+            tool.name == pin.tool
+                && tool
+                    .version
+                    .is_some_and(|version| version.major == pin.major)
+        })
+        .peekable();
+    current.peek()?;
+
+    if let Some(tool) = current.find(|tool| tool.schema_digest == pin.schema_digest) {
+        let legacy = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+            .encode()
+            .ok()?;
+        let entry = SHIPPED.get(&legacy).or_else(|| {
+            // A current schema variant (such as hashline edit) can use the
+            // same record template without having had its own legacy view.
+            SHIPPED
+                .values()
+                .filter(|entry| entry.tool.name == tool.name)
+                .max_by_key(|entry| entry.tool.semantics)
+        })?;
+        return Some((entry, &tool.input_schema));
+    }
+
+    let entry = SHIPPED
+        .iter()
+        .filter(|(encoded, entry)| {
+            entry.tool.name == pin.tool
+                && versions::shipped_major(encoded) == Some(pin.major)
+                && SchemaPin::parse(encoded)
+                    .is_ok_and(|legacy| legacy.schema_digest == pin.schema_digest)
+        })
+        .map(|(_, entry)| entry)
+        .max_by_key(|entry| entry.tool.semantics)?;
+    Some((entry, &entry.tool.input_schema))
+}
+
+static VERSIONED_VIEW_PINS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+    let current = versions::current_pin_tools().filter_map(|tool| {
+        SHIPPED
+            .values()
+            .any(|entry| entry.tool.name == tool.name)
+            .then(|| tool.schema_pin().encode().expect("current view pin"))
+    });
+    let historical = SHIPPED.keys().filter_map(|encoded| {
+        let major = versions::shipped_major(encoded)?;
+        let legacy = SchemaPin::parse(encoded).expect("shipped view pin");
+        let pin = ToolMajorPin::new(legacy.tool, legacy.schema_digest, major)
+            .encode()
+            .expect("versioned view pin");
+        versioned_source(&pin)?;
+        Some(pin)
+    });
+    current.chain(historical).collect()
+});
 
 pub(crate) fn answer(body: Value) -> Result<Value, ErrorBody> {
     let request: ViewsRequest = serde_json::from_value(body).map_err(|_| {
@@ -106,6 +178,7 @@ pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
     SHIPPED
         .keys()
         .chain(notice_view_pins())
+        .chain(VERSIONED_VIEW_PINS.iter())
         .map(|pin| {
             let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
             (
@@ -134,6 +207,45 @@ mod tests {
                     .unwrap();
             assert_eq!(format!("{:x}", Sha256::digest(canonical)), digest, "{slot}");
         }
+    }
+
+    #[test]
+    fn versioned_views_select_shipped_history_but_refuse_unknown_digests_and_majors() {
+        let legacy =
+            "tp1:apply_patch:fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548:1";
+        let old = SchemaPin::parse(legacy).unwrap();
+        let pin = ToolMajorPin::new(&old.tool, &old.schema_digest, 1);
+        let schema = json!({"type":"object", "properties":{"different": {"type":"string"}}});
+        let newer = CatalogTool::new(&old.tool, schema_digest(&schema).unwrap(), 1, schema)
+            .with_version(ToolVersion::new(1, 1, 0));
+        assert_ne!(newer.schema_digest, pin.schema_digest);
+        let (entry, schema) = versioned_source_for(&pin, std::iter::once(&newer)).unwrap();
+        assert!(std::ptr::eq(entry, &SHIPPED[legacy]));
+        assert_eq!(*schema, SHIPPED[legacy].tool.input_schema);
+
+        let unknown_digest = ToolMajorPin::new(&old.tool, "0".repeat(64), 1)
+            .encode()
+            .unwrap();
+        let unknown_major = ToolMajorPin::new(&old.tool, &old.schema_digest, 99)
+            .encode()
+            .unwrap();
+        let response = answer(json!({"pins":[unknown_digest,unknown_major]})).unwrap();
+        assert_eq!(response["views"][&unknown_digest], "unknown");
+        assert_eq!(response["views"][&unknown_major], "unknown");
+    }
+
+    #[test]
+    fn versioned_views_include_the_current_hashline_edit_schema() {
+        let hashline = versions::current_pin_tools()
+            .find(|tool| {
+                tool.name == "edit" && tool.input_schema["properties"].get("patch").is_some()
+            })
+            .unwrap();
+        let pin = hashline.schema_pin().encode().unwrap();
+        assert!(VERSIONED_VIEW_PINS.contains(&pin));
+        let view = view(&pin).unwrap();
+        assert!(view.check_pin(&pin).unwrap());
+        assert_eq!(view.tool.unwrap().input_schema, hashline.input_schema);
     }
 
     #[test]
