@@ -662,7 +662,7 @@ class RealQueryRunnerTests(unittest.TestCase):
 
     def test_page_size_matches_product_search_schema_maximum(self) -> None:
         root = Path(__file__).resolve().parents[2]
-        schema_path = root / "crates/aft/src/subc_tool_schemas.json"
+        schema_path = root / "crates/aft-subc/src/subc_tool_schemas.json"
         maximum = json.loads(schema_path.read_text())["search"]["properties"]["topK"]["maximum"]
         self.assertEqual(
             PAGE_SIZE,
