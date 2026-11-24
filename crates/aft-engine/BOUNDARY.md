@@ -48,7 +48,8 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `watcher_backend::counters::WatcherCounters` | stays in composition | `aft-engine` | Owns live flush and shell-journal handles; add the consumer port when separating `aft-index`. |
 | `root_cache::{WriterLease, ArtifactAccess}` | stays in composition | `aft-engine` | Owns acquisition, filesystem policy and the process lease registry. |
 | `test_env`, `subc_fake` and shared `test_storage` primitives | existing test-support helpers | `aft-base` | Lower tests share hermetic environment, daemon fakes and test-storage checks. |
-| `fake_lsp_test_helper` and `test_storage` context adapter | stays in composition | `aft-engine` | No moved lower test needs the fake language server or builds an `AppContext`. |
+| `fake_lsp_test_helper` and its `binary_cache` module | test-support helper | `aft-engine` | Engine LSP tests own this helper; its feature-compiled inputs stay in the engine package. |
+| `test_storage` context adapter | stays in composition | `aft-engine` | Test `AppContext` constructors use private temporary directories instead of the live database root. |
 | `tests/fixtures/root_identity_upgrade/cases.json` | test fixture | `aft-db` | Keep the facade copy byte-identical until final composition cleanup can remove it after its last reader is gone. |
 
 ## Visibility widened for cross-crate callers
@@ -131,3 +132,4 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `memory::profile::admitted` | visibility widened | `aft-base` | Engine builds pin the lower admission profile. |
 | `path_filters::to_glob_path` | visibility widened | `aft-db` | The engine search code retains the identical path operation. |
 | `root_identity::key::git_command_for_test` | test-support visibility widened | `aft-db` | The engine and lower identity tests share hermetic Git setup. |
+| `fake_lsp_test_helper` | test-support visibility widened | `aft-engine` | Expose the helper to opt-in test consumers, not production crate builds. |

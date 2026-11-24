@@ -326,15 +326,16 @@ pub(crate) use aft_base::test_read_denial;
 #[cfg(test)]
 pub(crate) use aft_base::test_support;
 // The fake LSP builder also compiles in integration tests under this helper name.
-#[cfg(test)]
-use test_support as test_helpers;
+#[cfg(any(test, feature = "test-support"))]
+use aft_base::test_support as test_helpers;
 
 #[cfg(all(test, target_os = "macos"))]
 mod disk_write_hunt;
 
-#[cfg(test)]
-#[path = "../tests/helpers/fake_lsp.rs"]
-pub(crate) mod fake_lsp_test_helper;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[path = "test_fixtures/fake_lsp.rs"]
+pub mod fake_lsp_test_helper;
 pub(crate) use aft_base::persistence_gate;
 
 #[cfg(feature = "test-support")]
