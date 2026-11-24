@@ -663,15 +663,62 @@ fn names_refused_key(text: &str) -> bool {
 }
 
 /// Exclusive, cross-process right to rewrite one config file, held as a lock
-/// file next to it and removed on drop.
+/// file next to it and removed on drop. The file holds a value unique to this
+/// holder, so neither a stale-lock removal nor this holder's drop can delete a
+/// lock that another process took in the meantime.
 struct MigrationLock {
     path: PathBuf,
+    nonce: String,
 }
 
 impl Drop for MigrationLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if std::fs::read(&self.path).is_ok_and(|held| held == self.nonce.as_bytes()) {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
+}
+
+fn migration_lock_nonce() -> String {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    let sequence = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}:{now}:{sequence}", std::process::id())
+}
+
+/// The lock's contents and age when it is older than the stale limit.
+fn stale_lock(path: &Path) -> Option<Vec<u8>> {
+    let age = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()?
+        .elapsed()
+        .ok()?;
+    (age > MIGRATION_LOCK_STALE).then(|| std::fs::read(path).ok())?
+}
+
+/// Remove the stale lock this loader inspected, and only that one. Another
+/// loader may have replaced it with a fresh lock since the inspection, so move
+/// whatever is there aside first (an atomic step), then delete it only if it is
+/// still the stale lock; otherwise put the fresh lock back.
+fn remove_stale_lock(path: &Path, seen: &[u8], nonce: &str) {
+    let mut aside = path.as_os_str().to_owned();
+    aside.push(format!(".{nonce}.stale"));
+    let aside = PathBuf::from(aside);
+    if std::fs::rename(path, &aside).is_err() {
+        return;
+    }
+    if stale_lock(&aside).is_some_and(|held| held == seen) {
+        let _ = std::fs::remove_file(&aside);
+        return;
+    }
+    // A link never replaces a lock taken after the move; that holder keeps it.
+    if let Err(error) = std::fs::hard_link(&aside, path) {
+        log::warn!("config migration lock could not be restored: {error}");
+    }
+    let _ = std::fs::remove_file(&aside);
 }
 
 enum LockAttempt {
@@ -688,21 +735,30 @@ fn acquire_migration_lock(target: &Path) -> LockAttempt {
         .unwrap_or_else(|| "aft.jsonc".to_string());
     let path = target.with_file_name(format!(".{name}.migrate.lock"));
     let deadline = std::time::Instant::now() + MIGRATION_LOCK_WAIT;
+    let nonce = migration_lock_nonce();
     loop {
         match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => return LockAttempt::Acquired(MigrationLock { path }),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let stale = std::fs::metadata(&path)
-                    .and_then(|metadata| metadata.modified())
-                    .ok()
-                    .and_then(|modified| modified.elapsed().ok())
-                    .is_some_and(|age| age > MIGRATION_LOCK_STALE);
-                if stale {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(nonce.as_bytes()) {
+                    drop(file);
                     let _ = std::fs::remove_file(&path);
+                    return LockAttempt::Failed(error);
+                }
+                return LockAttempt::Acquired(MigrationLock { path, nonce });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(seen) = stale_lock(&path) {
+                    #[cfg(test)]
+                    tests::STALE_LOCK_OBSERVED.with(|hook| {
+                        if let Some(hook) = hook.borrow_mut().as_mut() {
+                            hook();
+                        }
+                    });
+                    remove_stale_lock(&path, &seen, &nonce);
                     continue;
                 }
                 if std::time::Instant::now() >= deadline {

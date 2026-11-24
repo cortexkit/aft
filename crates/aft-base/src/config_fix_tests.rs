@@ -1418,3 +1418,55 @@ fn settings_shapes_rewrite_user_with_backup_and_project_with_notice() {
         );
     }
 }
+
+thread_local! {
+    /// Runs on this thread after it finds a stale migration lock and before it
+    /// removes that lock, so a test can let another process act in between.
+    pub(super) static STALE_LOCK_OBSERVED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[test]
+fn stale_migration_lock_removal_cannot_take_a_fresh_lock() {
+    use std::time::{Duration, SystemTime};
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("aft.jsonc");
+    let lock = dir.path().join(".aft.jsonc.migrate.lock");
+    let stale = std::fs::File::create(&lock).unwrap();
+    stale
+        .set_modified(SystemTime::now() - MIGRATION_LOCK_STALE - Duration::from_secs(60))
+        .unwrap();
+    drop(stale);
+    let (observed_tx, observed_rx) = std::sync::mpsc::channel::<()>();
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+    // The late loader decides the lock is stale, then waits while the first
+    // loader removes it and takes a fresh lock.
+    let late = {
+        let target = target.clone();
+        std::thread::spawn(move || {
+            let mut once = Some((observed_tx, go_rx));
+            STALE_LOCK_OBSERVED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    if let Some((observed, go)) = once.take() {
+                        observed.send(()).unwrap();
+                        go.recv().unwrap();
+                    }
+                }))
+            });
+            acquire_migration_lock(&target)
+        })
+    };
+    observed_rx.recv().unwrap();
+    let first = acquire_migration_lock(&target);
+    assert!(matches!(first, LockAttempt::Acquired(_)));
+    go_tx.send(()).unwrap();
+    let second = late.join().unwrap();
+    assert!(
+        matches!(second, LockAttempt::Busy),
+        "a second loader took the lock the first one holds"
+    );
+    assert!(lock.exists(), "the first loader's lock was removed");
+    drop(second);
+    drop(first);
+    assert!(!lock.exists(), "the holder's lock is released on drop");
+}
