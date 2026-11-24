@@ -1070,12 +1070,12 @@ jobs:
       # Cargo's local registry overlay, without needing unpublished siblings on
       # crates.io. Stable Cargo >=1.90 supports this selection mode.
       - name: Rehearse crates.io publishing
-        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-edit -p aft-index -p aft-engine -p aft-tools -p aft-subc -p agent-file-tools
+        run: cargo publish --dry-run --locked --allow-dirty -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-edit -p aft-index -p aft-inspect -p aft-engine -p aft-tools -p aft-subc -p agent-file-tools
 
       # Cargo can discard the dry-run staging archives after verification.
       # Keep a package copy for inspection without compiling the crates again.
       - name: Materialize crate archives for inspection
-        run: cargo package --locked --allow-dirty --no-verify -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-edit -p aft-index -p aft-engine -p aft-tools -p aft-subc -p agent-file-tools
+        run: cargo package --locked --allow-dirty --no-verify -p aft-tokenizer -p aft-secret-rules -p aft-store -p aft-base -p aft-db -p aft-parse -p aft-edit -p aft-index -p aft-inspect -p aft-engine -p aft-tools -p aft-subc -p agent-file-tools
 
       # Mirrors the inline 10 MiB check in scripts/release.sh (crates.io package
       # sizes). A publish dry run does not enforce the registry's upload limit.
@@ -1094,7 +1094,7 @@ jobs:
           crate_dir = Path(metadata["target_directory"]) / "package"
           # Check both top-level archives and any copies in Cargo's staging folders.
           crates = sorted(crate_dir.rglob("*.crate"))
-          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-edit", "aft-index", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools"}
+          expected = {"aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools"}
           filenames = {crate.name for crate in crates}
           found = {
               package["name"] for package in metadata["packages"]

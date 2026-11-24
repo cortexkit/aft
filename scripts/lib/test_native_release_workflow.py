@@ -32,7 +32,7 @@ COVERED = {
 }
 PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")
 TAG_PUBLISH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
-RELEASE_CRATES = ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-edit", "aft-index", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools")
+RELEASE_CRATES = ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools")
 REHEARSAL_VERSION = "0.63.5-rehearsal.1.1"
 
 
@@ -384,7 +384,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 manifest = fixture / "packages" / package / "package.json"
                 manifest.parent.mkdir(parents=True)
                 manifest.write_text(json.dumps({"version": "0.65.0"}))
-            crates = ("aft", "aft-base", "aft-db", "aft-edit", "aft-engine", "aft-index", "aft-parse", "aft-store", "aft-subc", "aft-tokenizer", "aft-tools", "secret-rules")
+            crates = ("aft", "aft-base", "aft-db", "aft-edit", "aft-engine", "aft-index", "aft-inspect", "aft-parse", "aft-store", "aft-subc", "aft-tokenizer", "aft-tools", "secret-rules")
             for crate in crates:
                 manifest = fixture / "crates" / crate / "Cargo.toml"
                 manifest.parent.mkdir(parents=True)
@@ -400,6 +400,9 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 f"crates/aft-engine/Cargo.toml:\n  aft-edit dep version: {current} → {version}",
                 f"crates/aft-index/Cargo.toml:\n  version: {current} → {version}",
                 f"crates/aft-engine/Cargo.toml:\n  aft-index dep version: {current} → {version}",
+                f"crates/aft-inspect/Cargo.toml:\n  version: {current} → {version}",
+                f"crates/aft-inspect/Cargo.toml:\n  aft-index dep version: {current} → {version}",
+                f"crates/aft-engine/Cargo.toml:\n  aft-inspect dep version: {current} → {version}",
                 f"crates/aft-engine/Cargo.toml:\n  version: {current} → {version}",
                 f"crates/aft-engine/Cargo.toml:\n  aft-base dep version: {current} → {version}",
                 f"crates/aft-tools/Cargo.toml:\n  version: {current} → {version}",
@@ -594,7 +597,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "must require aft-engine =" + re.escape(REHEARSAL_VERSION)):
                     exec(script, {})
                 write_rehearsal_crate(upper)
-                for name in ("agent-file-tools", "aft-parse", "aft-edit", "aft-index", "aft-engine", "aft-tools", "aft-subc"):
+                for name in ("agent-file-tools", "aft-parse", "aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc"):
                     archive = next(file for file in files if file.name.startswith(name + "-"))
                     for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
                         with self.subTest(package=name, size=size):

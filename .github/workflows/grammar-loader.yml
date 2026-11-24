@@ -128,9 +128,10 @@ jobs:
           if [[ "$RUNNER_OS" != macOS ]]; then
             export AFT_S4_NO_LUAU_PARITY=luau-ci
           fi
-          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-index -p aft-tools --lib -- luau_s)
+          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-index -p aft-inspect -p aft-tools --lib -- luau_s)
           listing="$(cargo test "${args[@]}" --list)"
           [[ "$listing" == *"luau::tests::luau_s3_symbols_and_content_record_use_the_builtin_extraction_path: test"* ]] || { echo 'missing aft-index Luau extraction tests' >&2; exit 1; }
+          [[ "$listing" == *"inspect::scanners::complexity::luau_s3_complexity_spec_scores_the_fixture: test"* ]] || { echo 'missing aft-inspect Luau complexity test' >&2; exit 1; }
           [[ "$listing" == *"commands::grammar_tests::luau_s4_round4_non_luau_failures_preserve_main_search_contract: test"* ]] || { echo 'missing aft-tools Luau extraction tests' >&2; exit 1; }
           cargo test "${args[@]}"
       # The no-Luau parity half needs a second debug build of aft-index without
@@ -202,7 +203,7 @@ jobs:
 
       - name: ARM64 compile with Pulley
         run: |
-          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-index --features test-hooks --tests --target aarch64-pc-windows-msvc
+          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-index -p aft-inspect --features test-hooks --tests --target aarch64-pc-windows-msvc
           cargo tree --features wasm-grammars --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path
