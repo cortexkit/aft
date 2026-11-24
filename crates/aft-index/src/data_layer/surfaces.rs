@@ -563,7 +563,8 @@ pub fn report(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
     report_inner(ctx, false)
 }
 
-pub(crate) fn report_for_push(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
+#[doc(hidden)]
+pub fn report_for_push(ctx: &dyn IndexHost) -> Option<DataStoreReport> {
     report_inner(ctx, true)
 }
 
@@ -604,7 +605,8 @@ fn report_inner(ctx: &dyn IndexHost, cached_only: bool) -> Option<DataStoreRepor
 /// The family-store file a newer build wrote that `ctx`'s checkout refused
 /// at its last bind, build or refresh, without binding it; `None` when the
 /// data layer is off or nothing was refused.
-pub(crate) fn storage_refusal(ctx: &dyn IndexHost) -> Option<NewerFormat> {
+#[doc(hidden)]
+pub fn storage_refusal(ctx: &dyn IndexHost) -> Option<NewerFormat> {
     match ctx.probe_data_checkout()? {
         DataCheckoutProbe::BindFailed(error) => error.refusal().cloned(),
         DataCheckoutProbe::Bound(checkout) => checkout.last_failure()?.refusal,
@@ -614,13 +616,15 @@ pub(crate) fn storage_refusal(ctx: &dyn IndexHost) -> Option<NewerFormat> {
 
 /// The degraded reason status gives a refused family store, in the form
 /// today's stores give theirs: `storage_requires_newer_reader:index_store`.
-pub(crate) fn refusal_reason() -> String {
+#[doc(hidden)]
+pub fn refusal_reason() -> String {
     format!("{}:{INDEX_STORE}", crate::persisted_format::CODE)
 }
 
 /// The `storage_refusals` entry status gives a refused family-store file,
 /// shaped as today's stores' entries.
-pub(crate) fn refusal_json(refusal: &NewerFormat) -> Value {
+#[doc(hidden)]
+pub fn refusal_json(refusal: &NewerFormat) -> Value {
     json!({
         "code": crate::persisted_format::CODE,
         "store": INDEX_STORE,
@@ -1201,7 +1205,8 @@ impl DiskMeasurement {
 /// cache every checkout shares is counted once for the process
 /// ([`block_cache_estimate`]).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct DataLayerMemory {
+#[doc(hidden)]
+pub struct DataLayerMemory {
     pub(crate) shared: MemoryEstimate,
     pub(crate) text: u64,
     pub(crate) callgraph: u64,
@@ -1300,13 +1305,15 @@ impl DataLayerMemory {
 /// The data layer's memory for `ctx`'s root (see [`DataLayerMemory`]);
 /// `None` when the data layer is off. Never binds the checkout and never
 /// waits for a lock.
-pub(crate) fn memory_estimate(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
+#[doc(hidden)]
+pub fn memory_estimate(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
     memory_estimate_with(ctx, false)
 }
 
 /// Health reuses dirty figures for up to thirty seconds. Explicit censuses use
 /// [`memory_estimate`] instead, so completed edits are observable immediately.
-pub(crate) fn memory_estimate_for_rollup(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
+#[doc(hidden)]
+pub fn memory_estimate_for_rollup(ctx: &dyn IndexHost) -> Option<DataLayerMemory> {
     memory_estimate_with(ctx, true)
 }
 
@@ -1495,16 +1502,19 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
 /// and failures, and `disk` its family store. The `views` object and the
 /// old call-graph store's refresh queue (`callgraph_refresh`) are dropped:
 /// neither describes what these planes answer from.
-pub(crate) fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
+#[doc(hidden)]
+pub fn apply_to_status(payload: &mut Value, report: &DataStoreReport) {
     apply_to_status_inner(payload, report, false)
 }
 
-pub(crate) fn apply_to_status_push(payload: &mut Value, report: &DataStoreReport) {
+#[doc(hidden)]
+pub fn apply_to_status_push(payload: &mut Value, report: &DataStoreReport) {
     apply_to_status_inner(payload, report, true)
 }
 
 /// Operator reads return the last measurement while a coalesced sampler refreshes it.
-pub(crate) fn apply_to_status_operator(payload: &mut Value, report: &DataStoreReport) {
+#[doc(hidden)]
+pub fn apply_to_status_operator(payload: &mut Value, report: &DataStoreReport) {
     apply_to_status_inner(payload, report, true)
 }
 

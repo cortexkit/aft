@@ -285,7 +285,8 @@ fn child_texts(
 /// indexes are still building. Explicit files and
 /// roots outside the parent folder keep the ordinary executor, which reads
 /// them directly. The runtime supplies the parent session's published view.
-pub(crate) fn grep_fan_out(
+#[doc(hidden)]
+pub fn grep_fan_out(
     ctx: &impl IndexHost,
     session: &dyn ParentView,
     pattern: &CompiledPattern,
@@ -469,7 +470,8 @@ pub struct GlobFanOut {
 /// The parent session's glob: each root is answered from the warm trigram
 /// snapshots of the children it overlaps, walking children whose indexes are
 /// still building. The runtime supplies the session view.
-pub(crate) fn glob_fan_out(
+#[doc(hidden)]
+pub fn glob_fan_out(
     ctx: &impl IndexHost,
     session: &dyn ParentView,
     search_roots: &[PathBuf],

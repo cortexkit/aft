@@ -7,7 +7,8 @@ use serde::{Deserialize, Serialize};
 
 /// Resolves the liveness roots among a snapshot's files. Inspect supplies the
 /// inventory and manifest policy; the index owns only the resulting paths.
-pub(crate) trait EntryPoints {
+#[doc(hidden)]
+pub trait EntryPoints {
     fn resolve(&self, root: &Path, files: &[PathBuf]) -> BTreeSet<PathBuf>;
 }
 
@@ -109,9 +110,12 @@ pub struct CallgraphExport {
     pub line: u32,
 }
 
-pub(crate) const DISPATCHED_CALLEE_SEPARATOR: char = '\u{1f}';
-pub(crate) const CALLGRAPH_PROVENANCE_TREESITTER: &str = "treesitter";
-pub(crate) const CALLGRAPH_PROVENANCE_REEXPORT: &str = "reexport";
+#[doc(hidden)]
+pub const DISPATCHED_CALLEE_SEPARATOR: char = '\u{1f}';
+#[doc(hidden)]
+pub const CALLGRAPH_PROVENANCE_TREESITTER: &str = "treesitter";
+#[doc(hidden)]
+pub const CALLGRAPH_PROVENANCE_REEXPORT: &str = "reexport";
 
 fn default_callgraph_outbound_provenance() -> String {
     CALLGRAPH_PROVENANCE_TREESITTER.to_string()
@@ -156,4 +160,5 @@ aft_store::heap_bytes_of_fields!(CallgraphOutboundCall {
     provenance,
 });
 
-pub(crate) const DEFAULT_EXPORT_MARKER_KIND: &str = "default_export";
+#[doc(hidden)]
+pub const DEFAULT_EXPORT_MARKER_KIND: &str = "default_export";

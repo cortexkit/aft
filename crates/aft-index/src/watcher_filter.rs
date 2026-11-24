@@ -316,7 +316,8 @@ fn watcher_path_has_infra_component(path: &Path) -> bool {
     })
 }
 
-pub(crate) fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool {
+#[doc(hidden)]
+pub fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool {
     let absolute = root.join(path);
     // Only component matching is root-relative. Filesystem type checks must
     // use the project path, never a relative path interpreted against daemon cwd.
@@ -438,7 +439,8 @@ pub(crate) fn watcher_directory_is_ignored_by_matcher(
     watcher_path_is_ignored_by_matcher_with_kind(matcher, path, root, true)
 }
 
-pub(crate) fn watcher_path_is_ignored_by_matcher_with_kind(
+#[doc(hidden)]
+pub fn watcher_path_is_ignored_by_matcher_with_kind(
     matcher: &SharedGitignore,
     path: &Path,
     root: &Path,
@@ -453,7 +455,8 @@ pub(crate) fn watcher_path_is_ignored_by_matcher_with_kind(
     })
 }
 
-pub(crate) fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
+#[doc(hidden)]
+pub fn queued_path_is_ignored_by_matcher(matcher: &SharedGitignore, path: &Path) -> bool {
     // The raw filter deliberately admits HEAD/ref metadata as control events.
     // Retirement must not turn those already-admitted events into infra skips.
     if path.components().any(|part| part.as_os_str() == ".git") {
@@ -1029,7 +1032,8 @@ fn exclusion_manifest_is_file(path: &Path) -> bool {
 /// Classify every component before probing descendants: lstat of a deep path
 /// alone would still follow a symlink in one of its parent components.
 #[derive(Clone)]
-pub(crate) struct WatcherWalkBoundary {
+#[doc(hidden)]
+pub struct WatcherWalkBoundary {
     root: PathBuf,
     device: Option<u64>,
 }
@@ -2363,7 +2367,8 @@ pub fn load_watcher_observations(
     counters.set_observed_exclusion_prefixes(prefixes);
 }
 
-pub(crate) fn persist_watcher_observations(
+#[doc(hidden)]
+pub fn persist_watcher_observations(
     root: &Path,
     counters: &crate::watcher_backend::counters::WatcherCounters,
     db: Option<&Arc<Mutex<crate::db::TrackedConnection>>>,

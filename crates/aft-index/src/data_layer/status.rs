@@ -6,7 +6,8 @@ use serde::Serialize;
 /// Degraded reason recorded while a project's checkout view fails to load.
 /// Cleared by the next successful load; the history counts are kept.
 /// Rendered as-is by status surfaces, like the other degraded reasons.
-pub(crate) const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
+#[doc(hidden)]
+pub const VIEW_LOAD_DEGRADED_REASON: &str = "view_load_failed";
 
 /// Add reporting guidance only when a view-load failure becomes an agent reply.
 /// Busy loads and measured disk-reserve refusals are expected conditions,
@@ -28,7 +29,8 @@ pub fn view_load_error_response(id: &str, message: String) -> crate::protocol::R
 
 /// Error-level log throttle: one line per project and plane per minute.
 /// Repeats inside the window are counted and reported on the next emission.
-pub(crate) const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
+#[doc(hidden)]
+pub const VIEW_LOAD_LOG_INTERVAL: Duration = Duration::from_secs(60);
 
 /// The most recent checkout view load failure of a project. Planes are the
 /// query planes a failed load serves: `trigram` for the lexical view behind
@@ -54,7 +56,8 @@ pub struct ViewLoadFailure {
 /// Bucket a view load error into a stable short cause. I/O failures already
 /// name their path and operation; verification and manifest problems name
 /// what mismatches or is missing; the full text stays in the recorded error.
-pub(crate) fn view_load_cause(error: &str) -> &'static str {
+#[doc(hidden)]
+pub fn view_load_cause(error: &str) -> &'static str {
     let error = error.to_lowercase();
     if error.contains("busy") {
         "busy"

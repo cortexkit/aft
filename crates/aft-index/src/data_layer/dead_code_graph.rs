@@ -117,7 +117,8 @@ impl aft_store::heap::HeapBytes for ViewCallGraph {
 }
 
 /// Reads a call graph's parsed files on demand.
-pub(crate) trait CallGraphFiles: Sync {
+#[doc(hidden)]
+pub trait CallGraphFiles: Sync {
     /// Every parsed file, in path order.
     fn paths(&self) -> Vec<String>;
     /// Whether `path` is a parsed file.
@@ -415,7 +416,8 @@ struct FileCell {
 /// from symbols alone. A file's symbols are read from its parse when first
 /// asked for, so a rollup that reads only a few files (a patched one) parses
 /// only those.
-pub(crate) struct DeadCodeGraph<'f> {
+#[doc(hidden)]
+pub struct DeadCodeGraph<'f> {
     root: PathBuf,
     source: &'f dyn CallGraphFiles,
     /// Every parsed file, with its symbols once read.
@@ -499,7 +501,8 @@ pub(crate) struct FileProjection {
 
 /// The call-site information that affects liveness and its finding labels.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum SeedClass {
+#[doc(hidden)]
+pub enum SeedClass {
     Production,
     TestFile,
     TestLine(u32),

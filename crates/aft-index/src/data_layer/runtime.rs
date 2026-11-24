@@ -43,7 +43,8 @@ fn layer() -> Arc<DataLayer> {
     }))
 }
 
-pub(crate) fn memory_profile_changed() {
+#[doc(hidden)]
+pub fn memory_profile_changed() {
     if let Some(layer) = LAYER.get() {
         layer.apply_memory_profile(crate::memory::profile::current_effective().value.profile());
     }
@@ -2114,11 +2115,8 @@ pub(crate) fn block_cache_memory() -> Option<(aft_store::cache::CacheStats, Opti
 ///
 /// When Git could not tell the repository's identity, or the family store
 /// cannot be opened.
-pub(crate) fn bind_foreground(
-    root: &Path,
-    storage: &Path,
-    planes: Planes,
-) -> Result<Checkout, DataError> {
+#[doc(hidden)]
+pub fn bind_foreground(root: &Path, storage: &Path, planes: Planes) -> Result<Checkout, DataError> {
     let family = family_of(root)?;
     let family_dir = storage.join("data").join(family.digest().to_string());
     Checkout::bind_planes(layer(), &family_dir, family, root, planes)
@@ -2128,7 +2126,8 @@ pub(crate) fn bind_foreground(
 /// shared by every checkout of one repository) of the repository at `root`:
 /// binding a checkout of a repository with none would make one. `false` when
 /// Git could not tell the repository's identity.
-pub(crate) fn has_family_store(root: &Path, storage: &Path) -> bool {
+#[doc(hidden)]
+pub fn has_family_store(root: &Path, storage: &Path) -> bool {
     family_of(root).is_ok_and(|family| {
         storage
             .join("data")

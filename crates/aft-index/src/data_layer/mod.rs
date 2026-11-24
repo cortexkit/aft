@@ -22,7 +22,8 @@ pub(crate) mod graph_rows;
 #[doc(hidden)]
 pub mod graph_store;
 pub mod host;
-pub(crate) mod ignore_rules;
+#[doc(hidden)]
+pub mod ignore_rules;
 pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
@@ -74,11 +75,13 @@ pub mod todo_counts;
 pub mod trace_measure;
 pub mod vectors;
 
-pub(crate) mod bound_checkouts;
+#[doc(hidden)]
+pub mod bound_checkouts;
 #[doc(hidden)]
 pub mod meaning_query;
 #[doc(hidden)]
 pub mod text_scope;
 
-pub(crate) mod dead_code_reads;
+#[doc(hidden)]
+pub mod dead_code_reads;
 pub mod dead_code_snapshot;

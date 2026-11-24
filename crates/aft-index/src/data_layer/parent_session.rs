@@ -116,14 +116,16 @@ fn views() -> &'static Mutex<HashMap<PathBuf, Weak<dyn ParentView>>> {
     VIEWS.get_or_init(Default::default)
 }
 
-pub(crate) fn publish(session: Arc<dyn ParentView>) {
+#[doc(hidden)]
+pub fn publish(session: Arc<dyn ParentView>) {
     views()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .insert(session.root().to_path_buf(), Arc::downgrade(&session));
 }
 
-pub(crate) fn withdraw(session: &dyn ParentView) {
+#[doc(hidden)]
+pub fn withdraw(session: &dyn ParentView) {
     let mut views = views()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

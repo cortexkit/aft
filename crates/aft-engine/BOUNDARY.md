@@ -154,6 +154,50 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `BashChanges` | compatibility wrapper | `aft-engine` | Type the sink as the same Bash journal used by shell capture. |
 | `BashChanges::get_or_init` | compatibility wrapper | `aft-engine` | Leave repeated initialization idempotent for inspect and shell callers. |
 
+| `watcher_filter::config_events::is_config_file_name` | visibility widened | `aft-index` | Use the watcher’s filename rule when installing configuration watches. |
+| `data_layer::status::view_load_cause` | visibility widened | `aft-index` | Classify view load failures consistently in status and parent search. |
+| `data_layer::status::VIEW_LOAD_DEGRADED_REASON` | visibility widened | `aft-index` | Keep the status reason used for degraded view loads. |
+| `data_layer::status::VIEW_LOAD_LOG_INTERVAL` | visibility widened | `aft-index` | Keep the retry log throttle in composition and parent search. |
+| `data_layer::ignore_rules` | visibility widened | `aft-index` | Let composition update the checkout’s ignore rules. |
+| `data_layer::dead_code_reads` | visibility widened | `aft-index` | Let inspect read source for the dead-code projection. |
+| `data_layer::bound_checkouts` | visibility widened | `aft-index` | Let inspect look up the root’s already-bound checkout. |
+| `data_layer::dead_code_snapshot::CALLGRAPH_PROVENANCE_REEXPORT` | visibility widened | `aft-index` | Use the same re-export labels in the dead-code scan. |
+| `data_layer::dead_code_snapshot::CALLGRAPH_PROVENANCE_TREESITTER` | visibility widened | `aft-index` | Use the same parser provenance in the dead-code scan. |
+| `data_layer::dead_code_snapshot::DISPATCHED_CALLEE_SEPARATOR` | visibility widened | `aft-index` | Interpret dispatched callee records with the same separator. |
+| `data_layer::dead_code_snapshot::DEFAULT_EXPORT_MARKER_KIND` | visibility widened | `aft-index` | Recognize the stored default-export marker in inspect. |
+| `data_layer::dead_code_graph::CallGraphFiles` | visibility widened | `aft-index` | Let inspect provide the files used by graph section analysis. |
+| `data_layer::dead_code_graph::DeadCodeGraph` | visibility widened | `aft-index` | Use the existing graph model in inspect’s dead-code analysis. |
+| `data_layer::dead_code_graph::SeedClass` | visibility widened | `aft-index` | Keep inspect’s identification of graph entry points. |
+| `data_layer::checkout::GraphIdentity` | visibility widened | `aft-index` | Let inspect compare live and published graph identity. |
+| `data_layer::checkout::PathTodos` | visibility widened | `aft-index` | Use the existing stored TODO-marker states in inspect. |
+| `data_layer::checkout::PathTodoCounts` | visibility widened | `aft-index` | Use the existing stored TODO-count states in inspect. |
+| `data_layer::checkout::ViewGraphFiles` | visibility widened | `aft-index` | Let inspect traverse the same checkout snapshot. |
+| `watcher_filter::watcher_path_is_infra_skip_under` | visibility widened | `aft-index` | Apply the watcher’s infrastructure exclusion while draining events. |
+| `watcher_filter::watcher_path_is_ignored_by_matcher_with_kind` | visibility widened | `aft-index` | Use the watcher’s path filter when recording changes during a Bash command. |
+| `watcher_filter::queued_path_is_ignored_by_matcher` | visibility widened | `aft-index` | Apply the same ignore rules to queued events in composition. |
+| `watcher_filter::WatcherWalkBoundary` | visibility widened | `aft-index` | Apply the watcher’s nested-root boundary when walking parent scopes. |
+| `watcher_filter::persist_watcher_observations` | visibility widened | `aft-index` | Persist observations when composition drains the watcher. |
+| `data_layer::surfaces::memory_estimate` | visibility widened | `aft-index` | Report index memory on the root’s memory surface. |
+| `data_layer::surfaces::DataLayerMemory` | visibility widened | `aft-index` | Carry computed index memory to the root status report. |
+| `data_layer::surfaces::memory_estimate_for_rollup` | visibility widened | `aft-index` | Use the index’s rollup without repeating per-root accounting. |
+| `data_layer::surfaces::storage_refusal` | visibility widened | `aft-index` | Report the same storage refusal in index and push status. |
+| `data_layer::surfaces::refusal_reason` | visibility widened | `aft-index` | Share the stored-format refusal wording across status surfaces. |
+| `data_layer::surfaces::refusal_json` | visibility widened | `aft-index` | Share the structured stored-format refusal across status surfaces. |
+| `data_layer::surfaces::report_for_push` | visibility widened | `aft-index` | Build push status from the same index report. |
+| `data_layer::surfaces::apply_to_status_operator` | visibility widened | `aft-index` | Preserve the operator-specific status projection. |
+| `data_layer::surfaces::apply_to_status_push` | visibility widened | `aft-index` | Preserve the push-specific status projection. |
+| `data_layer::surfaces::apply_to_status` | visibility widened | `aft-index` | Preserve the public status projection. |
+| `data_layer::runtime::memory_profile_changed` | visibility widened | `aft-index` | Refresh index admission after the engine publishes a memory profile. |
+| `data_layer::runtime::has_family_store` | visibility widened | `aft-index` | Check for an existing external parent store without binding it. |
+| `data_layer::runtime::bind_foreground` | visibility widened | `aft-index` | Bind the external parent store through the existing index path. |
+| `data_layer::parent_session::publish` | visibility widened | `aft-index` | Publish the composed parent view to the index session registry. |
+| `data_layer::parent_session::withdraw` | visibility widened | `aft-index` | Remove the same parent view when its composed session ends. |
+| `data_layer::parent_query::grep_fan_out` | visibility widened | `aft-index` | Use the index’s parent grep query from composition. |
+| `data_layer::parent_query::glob_fan_out` | visibility widened | `aft-index` | Use the index’s parent glob query from composition. |
+| `semantic_index::files_with_changed_content` | visibility widened | `aft-index` | Filter semantic refresh to files with changed content. |
+
+| `data_layer::dead_code_snapshot::EntryPoints` | visibility widened | `aft-index` | Let inspect supply its language entry-point policy. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

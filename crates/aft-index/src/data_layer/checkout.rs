@@ -4547,7 +4547,8 @@ impl CheckoutView {
 /// A view's call graph read file by file: the publication's stored records
 /// and fragments, with each file resolved since the publication answered
 /// from memory and each file it no longer parses left out.
-pub(crate) struct ViewGraphFiles<'v> {
+#[doc(hidden)]
+pub struct ViewGraphFiles<'v> {
     published: &'v StoredSlices,
     refreshed: Option<&'v Refreshed>,
     /// The checkout's paths the call graph was resolved over.
@@ -4559,7 +4560,8 @@ pub(crate) struct ViewGraphFiles<'v> {
 /// and its resolution's fragment key when the publication's fragment is
 /// current, else a digest of the resolution's bytes.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub(crate) struct GraphIdentity {
+#[doc(hidden)]
+pub struct GraphIdentity {
     pub(crate) record: String,
     pub(crate) fragment: Option<String>,
     pub(crate) digest: Option<String>,
@@ -5955,7 +5957,8 @@ impl CheckoutView {
 
 /// One file's TODO markers as a checkout holds them, for the TODO count.
 #[derive(Debug)]
-pub(crate) enum PathTodos {
+#[doc(hidden)]
+pub enum PathTodos {
     /// The path is not one of the view's files.
     Absent,
     /// Larger than the count reads.
@@ -5984,7 +5987,8 @@ pub struct TodoSummary {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) enum PathTodoCounts {
+#[doc(hidden)]
+pub enum PathTodoCounts {
     Recorded(Option<TodoSummary>),
     Absent,
     TooLarge,

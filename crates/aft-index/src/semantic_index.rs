@@ -5163,9 +5163,8 @@ pub(crate) fn indexed_file_content_unchanged(path: &Path, recorded: &FileFreshne
 
 /// Of `(path, recorded record)` pairs, the paths whose vectors must be masked
 /// and re-embedded: no record, deleted, or content different from the record.
-pub(crate) fn files_with_changed_content(
-    recorded: Vec<(PathBuf, Option<FileFreshness>)>,
-) -> Vec<PathBuf> {
+#[doc(hidden)]
+pub fn files_with_changed_content(recorded: Vec<(PathBuf, Option<FileFreshness>)>) -> Vec<PathBuf> {
     recorded
         .into_iter()
         .filter(|(path, record)| {

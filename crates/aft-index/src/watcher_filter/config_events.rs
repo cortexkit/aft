@@ -92,7 +92,8 @@ pub fn is_project_config_event_path(root: &Path, path: &Path) -> bool {
     dir_root == root || std::fs::canonicalize(dir_root).is_ok_and(|resolved| resolved == root)
 }
 
-pub(crate) fn is_config_file_name(path: &Path) -> bool {
+#[doc(hidden)]
+pub fn is_config_file_name(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with("aft.json") || name.starts_with(".aft.json"))
