@@ -263,6 +263,27 @@ pub fn analyze_files_with_cache(
     options: AnalyzeOptions,
     cache: &mut OxcFactsCache,
 ) -> Result<OxcEngineResult, String> {
+    let collected = collect_facts_with_cache(project_root, files, &options, cache);
+    Ok(analyze_collected_facts(collected, options))
+}
+
+/// Per-file facts read through an [`OxcFactsCache`], before any cross-file
+/// work. Holding the cache is needed only to produce these; module resolution
+/// and verdicts ([`analyze_collected_facts`]) run without it.
+pub(crate) struct CollectedFacts {
+    project_root: PathBuf,
+    facts: Vec<FileFacts>,
+    cache_stats: OxcFactsCacheStats,
+    errors: Vec<OxcEngineError>,
+    skipped_outside_root: Vec<PathBuf>,
+}
+
+pub(crate) fn collect_facts_with_cache(
+    project_root: &Path,
+    files: &[PathBuf],
+    options: &AnalyzeOptions,
+    cache: &mut OxcFactsCache,
+) -> CollectedFacts {
     // De-verbatim the canonical root (Windows \\?\ form) so strip_prefix
     // against normalize_path-built module paths keeps working.
     let project_root = fs::canonicalize(project_root)
@@ -301,14 +322,27 @@ pub fn analyze_files_with_cache(
         }
     }
 
-    Ok(analyze_preparsed_facts(
+    CollectedFacts {
         project_root,
         facts,
-        options,
         cache_stats,
         errors,
         skipped_outside_root,
-    ))
+    }
+}
+
+pub(crate) fn analyze_collected_facts(
+    collected: CollectedFacts,
+    options: AnalyzeOptions,
+) -> OxcEngineResult {
+    analyze_preparsed_facts(
+        collected.project_root,
+        collected.facts,
+        options,
+        collected.cache_stats,
+        collected.errors,
+        collected.skipped_outside_root,
+    )
 }
 
 pub(crate) fn analyze_file_facts(
@@ -339,6 +373,9 @@ thread_local! {
     /// `analyze_file_facts` calls made on this thread.
     pub(crate) static ANALYZE_FILE_FACTS_CALLS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    /// Runs once on this thread when cross-file analysis starts.
+    pub(crate) static CROSS_FILE_ANALYSIS_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn analyze_preparsed_facts(
@@ -349,6 +386,10 @@ fn analyze_preparsed_facts(
     mut errors: Vec<OxcEngineError>,
     skipped_outside_root: Vec<PathBuf>,
 ) -> OxcEngineResult {
+    #[cfg(test)]
+    if let Some(hook) = CROSS_FILE_ANALYSIS_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     // Preserve dense FileId indexing when unreadable files were skipped or facts
     // were reconstructed from contribution records.
     for (idx, fact) in facts.iter_mut().enumerate() {

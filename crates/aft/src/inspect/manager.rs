@@ -22,9 +22,9 @@ use super::job::{
 };
 use super::oxc_engine::LivenessVerdict;
 use super::oxc_engine::{
-    analyze_file_facts, analyze_files_with_cache, normalize_input_path, AnalyzeOptions,
-    DynamicImportFact, ExportFact, FileFacts, FileId, ImportFact, OxcEngineResult, OxcFactsCache,
-    ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
+    analyze_collected_facts, analyze_file_facts, collect_facts_with_cache, normalize_input_path,
+    AnalyzeOptions, DynamicImportFact, ExportFact, FileFacts, FileId, ImportFact, OxcEngineResult,
+    OxcFactsCache, ReExportFact, FACTS_FORMAT_VERSION, OXC_PROVENANCE,
 };
 use crate::cache_freshness::{self, FileFreshness, FreshnessVerdict};
 use crate::callgraph_store::{
@@ -2236,17 +2236,19 @@ impl InspectManager {
             entry_reachability: job.category == InspectCategory::DeadCode,
         };
 
-        let mut cache = self
-            .oxc_facts_cache
-            .lock()
-            .map_err(|_| "inspect oxc facts cache lock poisoned".to_string())?;
-        let _files = self
-            .file_progress
-            .get(&job.category)
-            .map(|progress| progress.enter());
-        analyze_files_with_cache(&job.project_root, files, options, &mut cache)
-            .map(Some)
-            .map_err(|message| format!("oxc analyze failed: {message}"))
+        // The cache lock covers reading per-file facts, not the graph work.
+        let collected = {
+            let mut cache = self
+                .oxc_facts_cache
+                .lock()
+                .map_err(|_| "inspect oxc facts cache lock poisoned".to_string())?;
+            let _files = self
+                .file_progress
+                .get(&job.category)
+                .map(|progress| progress.enter());
+            collect_facts_with_cache(&job.project_root, files, &options, &mut cache)
+        };
+        Ok(Some(analyze_collected_facts(collected, options)))
     }
 
     fn scan_with_file_progress(
@@ -7891,6 +7893,35 @@ export function bannerUnused() {}
             callgraph_writer: true,
             callgraph_snapshot: None,
         }
+    }
+
+    /// Module resolution and verdicts can wait on the filesystem. They run
+    /// after the facts cache is released, so another category scanning the
+    /// same root can read cached facts meanwhile.
+    #[test]
+    fn oxc_graph_work_runs_without_the_facts_cache_lock() {
+        let (_dir, root, paths) = generated_unused_exports_fixture();
+        let job = unused_exports_job(&root, paths);
+        let manager = Arc::new(InspectManager::new());
+        let hook_manager = Arc::clone(&manager);
+        let cache_free = Arc::new(Mutex::new(None));
+        let hook_cache_free = Arc::clone(&cache_free);
+        super::super::oxc_engine::CROSS_FILE_ANALYSIS_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                let free = hook_manager.oxc_facts_cache.try_lock().is_ok();
+                *hook_cache_free.lock().unwrap() = Some(free);
+            }));
+        });
+        let result = manager
+            .oxc_result_for_scan(&job, &job.scope_files, &[])
+            .expect("oxc scan succeeds")
+            .expect("unused exports uses oxc");
+        assert!(!result.facts.is_empty());
+        assert_eq!(
+            *cache_free.lock().unwrap(),
+            Some(true),
+            "cross-file analysis ran while holding the facts cache lock"
+        );
     }
 
     #[test]
