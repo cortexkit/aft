@@ -97,11 +97,11 @@ mod tests {
         let mut reply = serde_json::json!({});
         write.append_lsp_diagnostics_to(&mut reply);
         assert_eq!(serde_json::to_string(&reply).unwrap(), concat!(
-            "{\"lsp_complete\":false,\"lsp_diagnostics\":[{\"code\":\"example-code\",",
-            "\"column\":3,\"end_column\":7,\"end_line\":2,\"file\":\"file.ts\",\"line\":2,",
-            "\"message\":\"example\",\"severity\":\"warning\",\"source\":null}],",
-            "\"lsp_exited_servers\":[\"typescript-native\"],\"lsp_pending_servers\":[\"typescript\"],",
-            "\"lsp_status\":\"diagnostics unknown (server not responding)\",\"rolled_back\":false}"
+                "{\"rolled_back\":false,\"lsp_diagnostics\":[{\"file\":\"file.ts\",\"line\":2,",
+                "\"column\":3,\"end_line\":2,\"end_column\":7,\"severity\":\"warning\",",
+                "\"message\":\"example\",\"code\":\"example-code\",\"source\":null}],",
+                "\"lsp_complete\":false,\"lsp_status\":\"diagnostics unknown (server not responding)\",",
+                "\"lsp_pending_servers\":[\"typescript\"],\"lsp_exited_servers\":[\"typescript-native\"]}"
         ));
     }
 }
