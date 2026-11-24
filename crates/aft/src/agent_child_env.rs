@@ -702,6 +702,7 @@ pub fn scrub_inherited_process_markers() {
     }
     std::env::remove_var(GIT_CO_AUTHOR_ENV);
     std::env::remove_var(GH_SHIM_BINARY_ENV);
+    std::env::remove_var(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV);
     let original: HashMap<String, OsString> = std::env::vars_os()
         .filter_map(|(key, value)| {
             key.into_string()
@@ -857,6 +858,10 @@ pub fn inject(
     // what a parent injected so this process's children reflect THIS gate.
     // Only self-identifying values are removed - user-owned GIT_CONFIG_* is
     // untouched unless it provably points at an AFT-generated hooks dir.
+    // The enable marker must describe this daemon's resolved config, never an
+    // outer daemon's, so it is dropped here and set again below only when this
+    // child gets the shim on its PATH.
+    environment.remove(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV);
     if !gh_enabled {
         if let Some(stale_shims) = environment.remove(GH_SHIMS_DIR_ENV) {
             if let Some(inherited) = environment.get("PATH").map(OsString::from) {
@@ -918,6 +923,10 @@ pub fn inject(
         environment.insert(
             GH_SHIMS_DIR_ENV.to_string(),
             shims_dir.to_string_lossy().into_owned(),
+        );
+        environment.insert(
+            crate::gh_shim_paths::GH_SHIM_ENABLED_ENV.to_string(),
+            "1".to_string(),
         );
     }
 
@@ -2126,6 +2135,28 @@ mod tests {
         let once = environment.clone();
         inject(&config, storage.path(), &mut environment, None).unwrap();
         assert_eq!(environment, once);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn enable_marker_follows_the_resolved_shim_setting() {
+        let storage = tempfile::tempdir().unwrap();
+        let binary = storage.path().join("aft");
+        write_self_reporting_shim(&binary);
+        let marker = crate::gh_shim_paths::GH_SHIM_ENABLED_ENV;
+        let mut config = Config::default();
+        config.github.shim = true;
+        config.gh_shim.binary_path = Some(binary);
+        config.git.co_author = "off".to_owned();
+        let mut environment = HashMap::from([("PATH".to_owned(), "/usr/bin".to_owned())]);
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert_eq!(environment.get(marker).map(String::as_str), Some("1"));
+
+        // An outer daemon's marker must not survive into a child whose own
+        // resolved config keeps the shim off its PATH.
+        config.github.shim = false;
+        inject(&config, storage.path(), &mut environment, None).unwrap();
+        assert!(!environment.contains_key(marker));
     }
 
     #[cfg(unix)]

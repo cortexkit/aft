@@ -32,6 +32,7 @@ use subc_protocol::manifest::ProviderRole;
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
 use subc_protocol::{BindIdentity, RouteTarget};
 
+mod enable_gate;
 mod manifest_guard;
 pub(crate) mod manifest_sync;
 mod manifest_wire;
@@ -1464,7 +1465,7 @@ impl WriteTarget {
 /// True when the user turned the shim off (`github.shim: false`), the same
 /// operator hard-off the rung determination honours.
 fn shim_disabled_by_operator() -> bool {
-    gh_shim_enabled_from_config_doc(read_user_config_doc().as_deref().unwrap_or("")) == Some(false)
+    enable_gate::shim_switched_off(read_user_config_doc().as_deref())
 }
 
 /// The write in `args` when no signed binding covers what it targets.
@@ -1881,7 +1882,7 @@ where
 {
     // With the shim turned off, or no manifest installed, writes already run
     // as the operator through the real `gh`, so its own answer is the true one.
-    if gh_shim_enabled_from_config_doc(config_doc.unwrap_or("")) == Some(false) {
+    if enable_gate::shim_switched_off(config_doc) {
         return AuthStatusAnswer::PassThrough;
     }
     let manifest = resolve_manifest(paths, now);
@@ -2950,7 +2951,7 @@ fn determine_rung_for_target(
     // disabled shim performs no governance-daemon or catalog traffic. Explicit
     // operator intent beats manifest governance; this in-memory bit is deliberately
     // not inferred from the diagnostic reason string later in dispatch.
-    if gh_shim_enabled_from_config_doc(config_doc.unwrap_or("")) == Some(false) {
+    if enable_gate::shim_switched_off(config_doc) {
         return RungDetermination::r1(now, R1Reason::DisabledByConfig);
     }
 
@@ -3139,28 +3140,6 @@ fn connection_file_from_user_config(config_path: &Path) -> Option<PathBuf> {
 fn read_user_config_doc() -> Option<String> {
     let config_path = crate::subc_config::cortexkit_user_config_path()?;
     fs::read_to_string(config_path).ok()
-}
-
-/// Read the effective `github.enabled && github.shim` gate from user config.
-/// The deprecated `gh_shim.enabled` alias remains a fallback for one minor.
-fn gh_shim_enabled_from_config_doc(doc: &str) -> Option<bool> {
-    let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(doc)).ok()?;
-    let github = value.get("github");
-    let master = github
-        .and_then(|config| config.get("enabled"))
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let shim = github
-        .and_then(|config| config.get("shim"))
-        .and_then(Value::as_bool)
-        .or_else(|| {
-            value
-                .get("gh_shim")
-                .and_then(|config| config.get("enabled"))
-                .and_then(Value::as_bool)
-        })
-        .unwrap_or(true);
-    Some(master && shim)
 }
 
 fn connection_file_from_config_doc(doc: &str) -> Option<PathBuf> {
@@ -7878,8 +7857,7 @@ fn build_self_report(paths: &StatePaths, full_audit: bool) -> SelfReport {
     // When the operator hard-off is set, the shim is byte-transparent passthrough
     // and never probes the daemon or catalog, so the status report reflects that
     // disabled determination instead of whatever stale rung/manifest cache exists.
-    let disabled = gh_shim_enabled_from_config_doc(read_user_config_doc().as_deref().unwrap_or(""))
-        == Some(false);
+    let disabled = enable_gate::shim_switched_off(read_user_config_doc().as_deref());
     let (cached_manifest, last_rung) = if disabled {
         (disabled_manifest_report(), disabled_last_rung_report())
     } else {
@@ -9185,6 +9163,59 @@ mod tests {
                 .map(String::as_str),
             Some("unreachable")
         );
+    }
+
+    #[test]
+    fn launch_marker_keeps_a_harness_enabled_shim_governed_over_a_top_level_off() {
+        // The daemon resolved `github.shim: true` for an OpenCode child through
+        // the harness override and marked the child. The file's top-level off
+        // must not turn that shim into operator pass-through. The marker lives
+        // in the process environment, so the check runs in a fresh process.
+        const CHILD: &str = "AFT_TEST_GH_SHIM_LAUNCH_MARKER_CHILD";
+        let doc = serde_json::json!({
+            "github": { "shim": false },
+            "harnesses": { "opencode": { "github": { "shim": true } } },
+            "subc": { "connection_file": "/nonexistent/connection.json" }
+        })
+        .to_string();
+        if std::env::var_os(CHILD).is_some() {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = StatePaths::from_root(directory.path().to_path_buf());
+            let record = determine_rung_from_doc(
+                &paths,
+                Path::new("/cwd"),
+                1,
+                std::time::Instant::now() + TEST_DISCOVERY_DEADLINE,
+                Some(&doc),
+            );
+            assert_eq!(
+                record
+                    .record
+                    .inputs
+                    .get("connection_file")
+                    .map(String::as_str),
+                Some("unreachable")
+            );
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gh_shim::tests::launch_marker_keeps_a_harness_enabled_shim_governed_over_a_top_level_off",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(enable_gate::TEST_HONOUR_MARKER_ENV, "1")
+            .env(crate::gh_shim_paths::GH_SHIM_ENABLED_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "launch-marker child failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
     }
 
     #[test]
