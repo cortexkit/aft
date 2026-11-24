@@ -301,9 +301,8 @@ fn cut_below_floor_stops_without_retrying_error_floor() {
 
 #[test]
 fn door_stream_refusal_table_matches_published_contract() {
-    let doc = include_str!(
-        "../../../aft/tests/fixtures/agent_data/session-door-stream-refusals-6ca43ec0.md"
-    );
+    let doc =
+        include_str!("../../tests/fixtures/agent_data/session-door-stream-refusals-6ca43ec0.md");
     let mut expected = Vec::new();
     for line in doc.lines().filter(|line| line.starts_with("| `")) {
         let cells: Vec<_> = line.split('|').map(str::trim).collect();

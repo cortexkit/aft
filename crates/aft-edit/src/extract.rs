@@ -56,7 +56,7 @@ mod tests {
 
     fn fixture_path(name: &str) -> PathBuf {
         PathBuf::from(crate::test_support::manifest_dir())
-            .join("../aft/tests/fixtures/extract_function")
+            .join("tests/fixtures/extract_function")
             .join(name)
     }
 
@@ -706,7 +706,7 @@ mod audit11_regressions {
             ..Default::default()
         };
         crate::edit::write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             &generated,
             &config,
@@ -757,7 +757,7 @@ mod audit11_regressions {
             ..Default::default()
         };
         crate::edit::write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             &generated,
             &config,
@@ -780,7 +780,7 @@ mod audit11_regressions {
             let dir = tempfile::tempdir().unwrap();
             let path = dir.path().join("out.txt");
             let config = crate::config::Config { format_on_edit: false, ..Default::default() };
-            crate::edit::write_format_validate(&crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(), &path, &generated, &config, &serde_json::json!({})).unwrap();
+            crate::edit::write_format_validate(&crate::edit::test_launcher::Unconfined, &path, &generated, &config, &serde_json::json!({})).unwrap();
             assert_eq!(std::fs::read(path).unwrap(), expected.as_bytes());
         }
     }

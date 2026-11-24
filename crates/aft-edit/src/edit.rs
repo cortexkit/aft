@@ -12,7 +12,7 @@ pub fn register_file_reporter(reporter: FileReporter) {
     let _ = FILE_REPORTER.set(reporter);
 }
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn file_reporter_registered() -> bool {
+pub fn file_reporter_registered() -> bool {
     FILE_REPORTER.get().is_some()
 }
 #[doc(hidden)]
@@ -37,10 +37,20 @@ pub mod delete_tree_win;
 pub mod remote_links;
 
 use crate::config::Config;
-use crate::context::AppContext;
 use crate::error::AftError;
 use crate::format;
 use crate::parser::{detect_language, parse_source_with_cached_parser, FileParser, LangId};
+use ports::{BackupSnapshots, SnapshotRequest};
+
+#[doc(hidden)]
+pub mod ports;
+
+#[cfg(test)]
+pub(crate) mod test_launcher;
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 
 #[cfg(windows)]
 mod windows_replace;
@@ -1416,7 +1426,7 @@ pub fn read_edit_bytes(path: &Path) -> std::io::Result<(std::sync::Arc<[u8]>, Ed
 
 #[doc(hidden)]
 pub fn auto_backup_observed(
-    ctx: &AppContext,
+    backup: &dyn BackupSnapshots,
     session: &str,
     path: &Path,
     description: &str,
@@ -1429,19 +1439,16 @@ pub fn auto_backup_observed(
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
     let started = std::time::Instant::now();
     crate::backup::latency::take();
-    let mut store = {
-        let _wait = crate::backup::latency::time(crate::backup::latency::Part::StoreLock);
-        ctx.backup().lock()
-    };
-    // Recheck after waiting for the backup store. Never replace the observed
-    // baseline with a newer file: that would bless a stale edit's undo data.
-    observation.expected.check(path)?;
-    let result = if let Some(capture) = observation.capture.as_ref() {
-        store.snapshot_with_op_from_capture(session, path, description, op_id, capture)
-    } else {
-        store.snapshot_with_op(session, path, description, op_id)
-    };
-    drop(store);
+    let result = backup.snapshot_observed(
+        SnapshotRequest {
+            session,
+            path,
+            description,
+            op_id,
+            capture: observation.capture.as_ref(),
+        },
+        &|| observation.expected.check(path),
+    )?;
     log_slow_backup(started, path);
     result
 }
@@ -1852,7 +1859,7 @@ fn diff_info_from_counts(
 ///
 /// Drops the RefCell borrow before returning (D029).
 pub fn auto_backup(
-    ctx: &AppContext,
+    backup: &dyn BackupSnapshots,
     session: &str,
     path: &Path,
     description: &str,
@@ -1864,13 +1871,13 @@ pub fn auto_backup(
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
     let started = std::time::Instant::now();
     crate::backup::latency::take();
-    let backup_id = {
-        let mut store = {
-            let _wait = crate::backup::latency::time(crate::backup::latency::Part::StoreLock);
-            ctx.backup().lock()
-        };
-        store.snapshot_with_op(session, path, description, op_id)
-    }; // borrow dropped here
+    let backup_id = backup.snapshot(SnapshotRequest {
+        session,
+        path,
+        description,
+        op_id,
+        capture: None,
+    });
     log_slow_backup(started, path);
     let backup_id = backup_id?;
     Ok(backup_id)
@@ -1879,15 +1886,12 @@ pub fn auto_backup(
 /// Attach the stable reason when an automatic snapshot for this mutation was skipped.
 pub fn attach_backup_skipped_reason(
     result: &mut serde_json::Value,
-    ctx: &AppContext,
+    backup: &dyn BackupSnapshots,
     session: &str,
     op_id: &str,
     path: Option<&Path>,
 ) {
-    let reason = ctx
-        .backup()
-        .lock()
-        .skipped_reason_for_operation(session, op_id, path);
+    let reason = backup.skipped_reason(session, op_id, path);
     if let (Some(object), Some(reason)) = (result.as_object_mut(), reason) {
         object.insert(
             "backup_skipped_reason".to_string(),
@@ -1900,7 +1904,7 @@ pub fn attach_backup_skipped_reason(
 /// creating the operation's rollback checkpoint.
 #[doc(hidden)]
 pub fn auto_backup_from_capture(
-    ctx: &AppContext,
+    backup: &dyn BackupSnapshots,
     session: &str,
     path: &Path,
     description: &str,
@@ -1910,13 +1914,13 @@ pub fn auto_backup_from_capture(
     let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Backup);
     let started = std::time::Instant::now();
     crate::backup::latency::take();
-    let backup_id = {
-        let mut store = {
-            let _wait = crate::backup::latency::time(crate::backup::latency::Part::StoreLock);
-            ctx.backup().lock()
-        };
-        store.snapshot_with_op_from_capture(session, path, description, op_id, capture)
-    };
+    let backup_id = backup.snapshot(SnapshotRequest {
+        session,
+        path,
+        description,
+        op_id,
+        capture: Some(capture),
+    });
     log_slow_backup(started, path);
     let backup_id = backup_id?;
     Ok(backup_id)
@@ -2065,7 +2069,7 @@ pub struct WriteResult {
     /// was a fire-and-forget notify (no wait). `Some(outcome)` always
     /// reports diagnostics from servers that proved freshness against the
     /// post-edit document version.
-    pub lsp_outcome: Option<crate::lsp::manager::PostEditWaitOutcome>,
+    pub lsp_outcome: Option<std::sync::Arc<dyn ports::PostWriteDiagnostics + Send + Sync>>,
     /// Post-format excerpt when the formatter reflowed the applied edit.
     pub reformatted_excerpt: Option<ReformattedExcerpt>,
     pub final_text: Option<ObservedFinalText>,
@@ -2127,7 +2131,7 @@ impl WriteResult {
         let Some(outcome) = self.lsp_outcome.as_ref() else {
             return;
         };
-
+        outcome.append_to(result);
     }
 
     /// Add file-write warnings to the reply's `warnings` array, keeping any
@@ -2818,7 +2822,7 @@ mod tests {
                 ..Config::default()
             };
             let mut result = write_format_validate(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 &path,
                 updated,
                 &config,
@@ -2842,8 +2846,7 @@ mod tests {
     /// at `set -u`; inside it, the complete statements of lines 6-18 are
     /// followed by the bare `while` and `[` tokens of line 19, where the parse
     /// got stuck.
-    const BASH_GRAMMAR_GAP_FIXTURE: &str =
-        include_str!("../../aft/tests/fixtures/aft-window-6deceda4.sh");
+    const BASH_GRAMMAR_GAP_FIXTURE: &str = include_str!("../tests/fixtures/aft-window-6deceda4.sh");
 
     #[test]
     fn syntax_error_line_points_at_stuck_token_not_recovery_wrapper() {
@@ -2912,7 +2915,7 @@ mod tests {
         let path = Path::new("new.ts");
         // ERROR node on line 3 (later lines are broken too).
         let check = check_created_file_syntax(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             path,
             "const a = 1;\nconst b = 2;\nfunction broken( {{\nconst c = ;\n",
         );
@@ -2920,21 +2923,21 @@ mod tests {
         assert_eq!(check.first_error_line, Some(3));
         // A MISSING node (unclosed call) also counts.
         let missing = check_created_file_syntax(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             path,
             "const a = 1;\nfoo(1\n",
         );
         assert_eq!(missing.valid, Some(false));
         assert!(missing.first_error_line.is_some_and(|line| line >= 2));
         let valid = check_created_file_syntax(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             path,
             "const a = 1;\n",
         );
         assert_eq!(valid.valid, Some(true));
         assert_eq!(valid.first_error_line, None);
         let unsupported = check_created_file_syntax(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             Path::new("notes.unknownext"),
             "{{",
         );
@@ -2950,7 +2953,7 @@ mod tests {
     fn created_python_file_reports_indentation_error_line() {
         let path = Path::new("new.py");
         let broken = "def g():\n    if True:\n        return 2\n            y = 5\n    return 3\n";
-        let policy = crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test();
+        let policy = crate::edit::test_launcher::Unconfined;
         let check = check_created_file_syntax(&policy, path, broken);
         assert_eq!(check.valid, Some(false));
         assert_eq!(check.skipped_reason, None);
@@ -2973,7 +2976,7 @@ mod tests {
         let path = temp.path().join("new.ts");
         let broken = "const a = 1;\n\nfunction {\n";
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             broken,
             &config,
@@ -2990,7 +2993,7 @@ mod tests {
         let existing = temp.path().join("existing.ts");
         std::fs::write(&existing, "const a = 1;\n").unwrap();
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &existing,
             broken,
             &config,
@@ -3137,7 +3140,7 @@ mod tests {
         std::fs::write(&path, "const value = 1;\n").unwrap();
         let (source, observation) = read_edit_source(&path).unwrap();
         let mut result = write_format_validate_observed(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "function {",
             &Config::default(),
@@ -3155,7 +3158,7 @@ mod tests {
         // A stale valid source must not cause rollback against a now-invalid file.
         std::fs::write(&path, "function { external-invalid").unwrap();
         let error = write_format_validate_observed(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "function { new-invalid",
             &Config::default(),
@@ -3198,7 +3201,7 @@ mod tests {
         WRITE_PIPELINE_READS.with(|count| count.set(0));
         crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.set(0));
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             &updated,
             &config,
@@ -3213,7 +3216,7 @@ mod tests {
             + crate::parser::work_counters::TREE_SOURCE_READS.with(|count| count.get());
         assert_eq!(reads, 2, "shared write pipeline content reads");
         let invalid = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "function {",
             &config,
@@ -3249,7 +3252,7 @@ func decode(data: Data) throws {
         };
 
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             updated,
             &config,
@@ -3281,7 +3284,7 @@ func decode(data: Data) throws {
         };
 
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             updated,
             &config,
@@ -3518,7 +3521,7 @@ mod audit11_regressions {
         };
         let updated = "\u{feff}let x = 2;\r\n";
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             updated,
             &config,
@@ -3535,7 +3538,7 @@ mod audit11_regressions {
         let held_updated = std::fs::File::open(&path).unwrap();
         let inode = held_updated.metadata().unwrap().ino();
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "function {",
             &config,
@@ -3619,7 +3622,7 @@ mod source_write_access_tests {
         let before = acl_of(&path).expect("ACL stored");
 
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -3683,7 +3686,7 @@ mod source_write_access_tests {
             "{before:?}"
         );
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -3723,7 +3726,7 @@ mod source_write_access_tests {
         assert_eq!(acl_of(&path), None);
 
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -3803,7 +3806,7 @@ mod source_write_access_tests {
         assert_eq!(acl_of(&path), None);
 
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -3835,7 +3838,7 @@ mod source_write_access_tests {
         std::fs::hard_link(&path, &other_name).unwrap();
         let inode = std::fs::metadata(&path).unwrap().ino();
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -3878,7 +3881,7 @@ mod source_write_access_tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         std::os::unix::fs::chown(&path, None, Some(group)).unwrap();
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -4023,7 +4026,7 @@ mod in_place_write_tests {
             .join(format!(".aft-source-{}-notes.txt.orig", "0".repeat(32)));
         std::fs::write(&leftover, "saved\n").unwrap();
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),
@@ -4062,7 +4065,7 @@ mod in_place_write_tests {
         }
         std::fs::hard_link(&path, &other_name).unwrap();
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "echo new\n",
             &plain_config(),
@@ -4127,7 +4130,7 @@ mod in_place_write_tests {
             "{before}"
         );
         write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             "new\n",
             &plain_config(),

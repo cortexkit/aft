@@ -312,7 +312,7 @@ fn first_display_path(
         })
 }
 
-pub(crate) fn build_display_metadata(
+pub fn build_display_metadata(
     display_files: &[DisplayFileBytes],
     project_root: Option<&Path>,
 ) -> (String, Vec<Value>, DiffBudget) {

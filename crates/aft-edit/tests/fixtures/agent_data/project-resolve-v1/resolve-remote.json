@@ -1,0 +1,10 @@
+[
+  {"request":{"method":"resolve_remote","params":{"owner":"example-org","repo":"widgets"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","projectId":"pj-widgets","root":"/fixture/widgets-checkout","status":"found"}}},
+  {"request":{"method":"resolve_remote","params":{"owner":"example-org","repo":"missing"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","status":"none"}}},
+  {"request":{"method":"resolve_remote","params":{"owner":"example-org","repo":"shared"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","projectIds":["pj-shared-one","pj-shared-two"],"status":"ambiguous"}}},
+  {"request":{"method":"resolve_remote","params":{"owner":"EXAMPLE-ORG","repo":"WiDgEtS"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","projectId":"pj-widgets","root":"/fixture/widgets-checkout","status":"found"}}},
+  {"request":{"method":"resolve_remote","params":{"owner":"example-org","repo":"hidden"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","projectId":"pj-unreadable","root":"/fixture/unreadable-config-checkout","status":"found"}}},
+  {"request":{"method":"resolve_remote","params":{"owner":"example-org","repo":"hidden"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","status":"none"}}},
+  {"request":{"method":"resolve_remote","params":{"owner":"example-org","repo":"widgets"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":8,"incarnation":"0123456789abcdef","projectId":"pj-widgets","root":"/fixture/widgets-checkout","status":"found"}}},
+  {"request":{"method":"resolve_remote","params":{}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"code":"invalid_params","detail":null,"message":"missing field `owner`"}}
+]

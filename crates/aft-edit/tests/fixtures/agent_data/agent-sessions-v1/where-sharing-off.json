@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"agent.where","params":{"agent_id":"agent_0000000000000105"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"cut_id":null,"epoch":0,"holder":null,"holder_name":null,"known":true,"read_at_ms":null,"stale":false,"status":"unclaimed"}}}
+]

@@ -678,13 +678,15 @@ static CAPTURE_READ_COUNTS: LazyLock<Mutex<HashMap<PathBuf, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reset_capture_read_count(path: &Path) {
+#[doc(hidden)]
+pub fn reset_capture_read_count(path: &Path) {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     CAPTURE_READ_COUNTS.lock().unwrap().remove(&key);
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn capture_read_count(path: &Path) -> usize {
+#[doc(hidden)]
+pub fn capture_read_count(path: &Path) -> usize {
     let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     CAPTURE_READ_COUNTS
         .lock()
@@ -1253,7 +1255,8 @@ impl BackupStore {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn resident_entry_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn resident_entry_count(&self) -> usize {
         self.entries
             .values()
             .flat_map(HashMap::values)
@@ -1262,22 +1265,26 @@ impl BackupStore {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn fail_next_disk_write_for_tests(&mut self) {
+    #[doc(hidden)]
+    pub fn fail_next_disk_write_for_tests(&mut self) {
         self.fail_next_disk_write = true;
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn release_after_next_snapshot_for_tests(&mut self) {
+    #[doc(hidden)]
+    pub fn release_after_next_snapshot_for_tests(&mut self) {
         self.release_after_next_snapshot = true;
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_discovery_entry_limit_for_tests(&mut self, limit: usize) {
+    #[doc(hidden)]
+    pub fn set_discovery_entry_limit_for_tests(&mut self, limit: usize) {
         self.discovery_entry_limit = limit;
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn expire_discovery_for_tests(&mut self) {
+    #[doc(hidden)]
+    pub fn expire_discovery_for_tests(&mut self) {
         self.discovery_deadline_override = Some(Instant::now());
     }
 
@@ -1286,7 +1293,8 @@ impl BackupStore {
         self.enforce_temp_path_policy = true;
     }
 
-    pub(crate) fn uses_db_pool(&self, conn: &Arc<Mutex<TrackedConnection>>) -> bool {
+    #[doc(hidden)]
+    pub fn uses_db_pool(&self, conn: &Arc<Mutex<TrackedConnection>>) -> bool {
         self.db_pool
             .read()
             .is_ok_and(|slot| slot.as_ref().is_some_and(|pool| Arc::ptr_eq(pool, conn)))
@@ -1562,7 +1570,8 @@ impl BackupStore {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn disk_io_count_for_tests(&self) -> u64 {
+    #[doc(hidden)]
+    pub fn disk_io_count_for_tests(&self) -> u64 {
         self.disk_io_count.load(Ordering::SeqCst)
     }
 

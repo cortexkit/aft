@@ -1,4 +1,21 @@
 mod cases {
+    use crate::config::Config;
+    use crate::context::AppContext;
+    use crate::edit::{auto_backup_observed, read_edit_source};
+    #[cfg(unix)]
+    use crate::format::{
+        auto_format, clear_tool_cache, ruff_probe_refused_for_test, validate_full,
+        validate_full_batch,
+    };
+    #[cfg(unix)]
+    use std::{fs, process::Command};
+
+    #[cfg(unix)]
+    fn tool_cache_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|error| error.into_inner())
+    }
+
     #[cfg(unix)]
     #[test]
     fn ruff_policy_refusal_does_not_poison_another_sessions_version_cache() {
@@ -111,10 +128,10 @@ mod cases {
         );
         let batch = validate_full_batch(&policy, &[path], &config);
         assert_eq!(batch.files[0].skipped_reason.as_deref(), Some("error"));
-        assert_eq!(
-            ruff_format_available(&policy, config.project_root.as_deref()),
-            RuffAvailability::Refused
-        );
+        assert!(ruff_probe_refused_for_test(
+            &policy,
+            config.project_root.as_deref()
+        ));
         assert!(
             !marker.exists(),
             "a refused launch must not run any project tool"
@@ -125,6 +142,7 @@ mod cases {
     #[test]
     fn swiftc_parse_cannot_bypass_the_supplied_tool_policy() {
         use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
+        use aft_edit::edit::test_support::swift::{run_swiftc_for_test, ParseOutcome, TUPLE};
         let root = tempfile::tempdir().unwrap();
         let marker = root.path().join("parsed");
         let compiler = root.path().join("swiftc");
@@ -153,7 +171,7 @@ mod cases {
             SpawnPlan::refused_for_test("sandbox_unavailable"),
             || ToolLaunchPolicy::resolve(&ctx),
         );
-        let outcome = run_swiftc(&policy, &compiler, TUPLE);
+        let outcome = run_swiftc_for_test(&policy, &compiler, TUPLE);
         assert!(
             matches!(&outcome, ParseOutcome::Unavailable(reason) if reason.starts_with("sandbox_unavailable")),
             "{outcome:?}"
@@ -188,4 +206,40 @@ mod cases {
         assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
     }
 
+    #[test]
+    fn observed_snapshot_rechecks_after_waiting_for_backup_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("observed.txt");
+        std::fs::write(&path, "original\n").unwrap();
+        let (_, observation) = read_edit_source(&path).unwrap();
+        let ctx = AppContext::new(Box::new(crate::language::StubProvider), Config::default());
+
+        std::thread::scope(|scope| {
+            let store = ctx.backup().lock();
+            let (ready, waiting) = std::sync::mpsc::sync_channel(0);
+            let ctx = &ctx;
+            let path = &path;
+            let backup = scope.spawn(move || {
+                crate::edit::BEFORE_OBSERVED_STORE_LOCK.with(|slot| {
+                    slot.set(Some(Box::new(move || ready.send(()).unwrap())));
+                });
+                auto_backup_observed(ctx, "session", path, "before edit", None, &observation)
+            });
+
+            // The observation passed the first check while this thread still
+            // holds the backup store. Replace the live file before releasing it.
+            waiting.recv().unwrap();
+            let replacement = temp.path().join("replacement.txt");
+            std::fs::write(&replacement, "external\n").unwrap();
+            std::fs::rename(replacement, path).unwrap();
+            drop(store);
+
+            assert_eq!(
+                backup.join().unwrap().unwrap_err().code(),
+                "file_changed_since_read"
+            );
+            assert!(ctx.backup().lock().history("session", path).is_empty());
+            assert_eq!(std::fs::read(path).unwrap(), b"external\n");
+        });
+    }
 }

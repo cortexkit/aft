@@ -1,0 +1,5 @@
+[
+  {"request":{"method":"resolve_project_id","params":{"projectId":"pj-resolve-root"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":4,"gone":false,"incarnation":"0123456789abcdef","projectId":"pj-resolve-root","via":"current"}}},
+  {"request":{"method":"resolve_project_id","params":{"projectId":"pj-implicit1-7ab786a2c46b23ec"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":4,"gone":false,"incarnation":"0123456789abcdef","projectId":"pj-alias-target","via":"alias"}}},
+  {"request":{"method":"resolve_project_id","params":{"projectId":"pj-no-such-project"}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":4,"gone":true,"incarnation":"0123456789abcdef","projectId":"pj-no-such-project","via":"gone"}}}
+]

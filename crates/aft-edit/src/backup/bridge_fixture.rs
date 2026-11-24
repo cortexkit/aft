@@ -1,9 +1,15 @@
 use super::*;
 
 impl BackupStore {
+    #[doc(hidden)]
+    pub fn discard_paths_for_tests(&self) -> &Vec<PathBuf> {
+        &self.discard_paths_for_tests
+    }
+
     /// Record one more directory as created by the newest entry for `key`, to
     /// test that undo authorizes every directory it would remove.
-    pub(crate) fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
+    #[doc(hidden)]
+    pub fn add_created_dir_for_test(&mut self, session: &str, key: &Path, dir: PathBuf) {
         let entry = self
             .entries
             .get_mut(session)
@@ -15,7 +21,8 @@ impl BackupStore {
 
     /// Move a session's backups to a different key, to test how undo treats a
     /// key it did not write itself.
-    pub(crate) fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
+    #[doc(hidden)]
+    pub fn rekey_for_test(&mut self, session: &str, from: &Path, to: PathBuf) {
         let files = self.entries.get_mut(session).expect("session has backups");
         let stack = files.remove(from).expect("key has backups");
         files.insert(to, stack);
@@ -23,7 +30,8 @@ impl BackupStore {
 }
 
 impl BackupStore {
-    pub(crate) fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf> {
+    #[doc(hidden)]
+    pub fn history_meta_path_for_test(&self, session: &str, path: &Path) -> Option<PathBuf> {
         Some(
             self.session_dir(session)?
                 .join(Self::path_hash(&canonicalize_key(path)))
@@ -31,13 +39,15 @@ impl BackupStore {
         )
     }
 
-    pub(crate) fn history_content_reads_for_test(&self) -> u64 {
+    #[doc(hidden)]
+    pub fn history_content_reads_for_test(&self) -> u64 {
         self.history_content_reads.load(Ordering::Relaxed)
     }
 }
 #[cfg(feature = "test-support")]
 impl super::BackupStore {
-    pub(crate) fn new_for_unit_test() -> Self {
+    #[doc(hidden)]
+    pub fn new_for_unit_test() -> Self {
         Self {
             enforce_temp_path_policy: false,
             ..Self::new()

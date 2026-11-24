@@ -446,7 +446,8 @@ impl CheckpointStore {
     /// A store in the state `new()` leaves it before configure (durable
     /// checkpoints under `<storage>/unbound/checkpoints`), but with `<storage>`
     /// a test-owned directory instead of the process-wide cache.
-    pub(crate) fn unbound_in_for_test(storage_dir: &Path) -> Self {
+    #[doc(hidden)]
+    pub fn unbound_in_for_test(storage_dir: &Path) -> Self {
         let lock_path = storage_dir
             .join("checkpoints")
             .join("test-project")
@@ -458,7 +459,8 @@ impl CheckpointStore {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn lock_path_for_test(&self) -> &Path {
+    #[doc(hidden)]
+    pub fn lock_path_for_test(&self) -> &Path {
         &self.lock_path
     }
 
@@ -466,7 +468,8 @@ impl CheckpointStore {
     /// isolation instead of mutating the process-global `AFT_CACHE_DIR` env
     /// var, which races parallel lib tests that resolve storage paths.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_lock_path_for_test(&mut self, lock_path: PathBuf) {
+    #[doc(hidden)]
+    pub fn set_lock_path_for_test(&mut self, lock_path: PathBuf) {
         self.storage_dir = lock_path.parent().map(Path::to_path_buf);
         self.storage_harness = Some("test".to_string());
         self.lock_path = lock_path;

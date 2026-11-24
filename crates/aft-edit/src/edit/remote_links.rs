@@ -17,7 +17,7 @@ pub fn refused(path: &Path) -> io::Error {
 
 #[doc(hidden)]
 pub fn check_open(file: &File, path: &Path) -> io::Result<()> {
-    if crate::context::confinement::remote_mutation() {
+    if aft_db::read_fence::remote_mutation() {
         check_count(crate::file_identity::link_count(file)?, path)?;
     }
     Ok(())
@@ -32,7 +32,7 @@ pub(crate) fn check_count(links: u64, path: &Path) -> io::Result<()> {
 
 #[doc(hidden)]
 pub fn check_path(path: &Path) -> io::Result<()> {
-    if !crate::context::confinement::remote_mutation() {
+    if !aft_db::read_fence::remote_mutation() {
         return Ok(());
     }
     let metadata = match std::fs::symlink_metadata(path) {
@@ -76,7 +76,7 @@ pub fn check_path(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn check_at(dir: std::os::fd::RawFd, name: &std::ffi::CStr, path: &Path) -> io::Result<()> {
-    if !crate::context::confinement::remote_mutation() {
+    if !aft_db::read_fence::remote_mutation() {
         return Ok(());
     }
     let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -99,7 +99,7 @@ pub fn check_at(dir: std::os::fd::RawFd, name: &std::ffi::CStr, path: &Path) -> 
 #[doc(hidden)]
 pub fn unlink(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
-    if crate::context::confinement::remote_mutation() {
+    if aft_db::read_fence::remote_mutation() {
         let (dir, name) = pin_parent(path)?;
         check_at(dir.as_raw_fd(), &name, path)?;
         // SAFETY: the pinned directory and single-component C string are live.
@@ -109,7 +109,7 @@ pub fn unlink(path: &Path) -> io::Result<()> {
         return Ok(());
     }
     #[cfg(windows)]
-    if crate::context::confinement::remote_mutation() {
+    if aft_db::read_fence::remote_mutation() {
         use super::delete_tree_win::{dispose, location, open_entry};
         let file = open_entry(path)?;
         if location(&file)? != crate::policy_path::policy_path(path) {
@@ -138,7 +138,7 @@ pub fn pin_parent(path: &Path) -> io::Result<(crate::pinned_dir::PinnedDir, std:
 /// never truncate an unchecked descriptor when restoring a remote edit.
 #[doc(hidden)]
 pub fn restore(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    if crate::context::confinement::remote_mutation() {
+    if aft_db::read_fence::remote_mutation() {
         return super::atomic_write_source(path, bytes).map(|_| ());
     }
     std::fs::write(path, bytes)
@@ -156,7 +156,7 @@ mod tests {
         let alias = dir.path().join("alias");
         fs::write(&target, b"original").unwrap();
         fs::hard_link(&target, &alias).unwrap();
-        let result = crate::context::confinement::with_remote_mutation(true, || unlink(&alias));
+        let result = aft_db::read_fence::with_remote_mutation(true, || unlink(&alias));
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
         assert_eq!(fs::read(&target).unwrap(), b"original");
         assert_eq!(fs::read(&alias).unwrap(), b"original");
@@ -169,7 +169,7 @@ mod tests {
         let alias = dir.path().join("alias");
         fs::write(&target, b"original").unwrap();
         fs::hard_link(&target, &alias).unwrap();
-        let error = crate::context::confinement::with_remote_mutation(true, || {
+        let error = aft_db::read_fence::with_remote_mutation(true, || {
             super::super::write_source_in_place(
                 &target,
                 &fs::metadata(&target).unwrap(),
@@ -190,10 +190,8 @@ mod tests {
         fs::write(&target, b"new name").unwrap();
         // The displayed path is now single-link, but the opened inode is not.
         assert!(
-            crate::context::confinement::with_remote_mutation(true, || check_open(
-                &opened, &target
-            ))
-            .is_err()
+            aft_db::read_fence::with_remote_mutation(true, || check_open(&opened, &target))
+                .is_err()
         );
         assert_eq!(
             super::super::atomic_write_source(&alias, b"local contents")

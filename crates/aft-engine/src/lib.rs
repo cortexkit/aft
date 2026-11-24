@@ -56,15 +56,15 @@ pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
 pub mod access_policy;
 pub mod agent_child_env;
 pub(crate) use aft_base::agent_commands;
-pub mod agent_data;
 pub use aft_base::alert_records;
+pub use aft_edit::agent_data;
 pub mod alert_state;
 // The `aft` binary installs its allocator; the library sets the operation
 // labels it attributes allocations to.
 pub use aft_base::alloc_trace;
 pub use aft_parse::ast_grep_hints;
 pub mod ast_grep_lang;
-pub mod backup;
+pub use aft_edit::backup;
 pub mod bash_background;
 #[doc(hidden)]
 pub mod bash_changed_files;
@@ -87,10 +87,10 @@ pub mod callgraph;
 pub use aft_parse::callgraph_extractor;
 pub mod callgraph_store;
 pub mod calls;
-pub mod checkpoint;
 pub(crate) use aft_base::clock;
 pub use aft_base::cold_build_limiter;
 pub use aft_base::compress;
+pub use aft_edit::checkpoint;
 #[cfg(test)]
 mod compress_boundary_tests;
 #[cfg(test)]
@@ -112,6 +112,9 @@ pub use aft_base::disk_floor;
 pub(crate) use aft_base::durability;
 pub(crate) use aft_base::durable_dir;
 pub mod edit;
+#[cfg(test)]
+mod edit_composed_tests;
+mod edit_lsp;
 pub use aft_base::effective_path;
 pub mod engram_catalog;
 #[doc(hidden)]
@@ -123,15 +126,15 @@ pub mod exec_remote;
 #[cfg(test)]
 use aft_base::executable_cache;
 pub mod executor;
-pub mod extract;
 pub use aft_base::feature_config;
+pub use aft_edit::extract;
 pub mod feature_status;
 pub(crate) use aft_base::file_identity;
 pub mod file_kind;
-#[doc(hidden)]
-pub mod file_read_exact;
 pub use aft_base::fleet_status;
-pub mod format;
+#[doc(hidden)]
+pub use aft_edit::file_read_exact;
+pub use aft_edit::format;
 pub mod fs_lock;
 pub use aft_parse::fuzzy_match;
 pub mod gh_shim;
@@ -159,10 +162,9 @@ pub mod grammar;
 pub mod grep_executor;
 pub use aft_base::harness;
 pub use aft_base::harness_partition_guard;
-pub mod hashline;
 pub use aft_base::host_tool_names;
-pub mod imports;
-pub mod indent;
+pub use aft_edit::hashline;
+pub use aft_edit::{imports, indent};
 pub mod inspect;
 pub use aft_base::inspect_category;
 #[doc(hidden)]
@@ -208,7 +210,7 @@ pub mod output_store;
 pub mod page_collect;
 pub mod parent_search;
 pub mod parser;
-pub mod patch;
+pub use aft_edit::patch;
 pub mod path_identity;
 pub use aft_base::pattern_compile;
 pub use aft_base::pending_response;
@@ -274,8 +276,8 @@ pub use aft_base::subc_config;
 #[cfg(test)]
 #[path = "../tests/helpers/subc_fake.rs"]
 mod subc_fake;
-pub mod symbol_diff;
 pub use aft_base::symbols;
+pub use aft_edit::symbol_diff;
 pub mod synapse_embed;
 pub(crate) use aft_base::system_temp;
 pub(crate) use aft_base::task_temp_reads;

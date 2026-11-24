@@ -118,7 +118,7 @@ mod audit11_regressions {
             ..Default::default()
         };
         crate::edit::write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             &generated,
             &config,

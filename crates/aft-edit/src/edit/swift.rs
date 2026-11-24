@@ -225,10 +225,7 @@ pub(super) fn available() -> bool {
             return false;
         }
         // Warm up the compiler under the same generous guard as the native tests.
-        let outcome = parse(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            "",
-        );
+        let outcome = parse(&crate::edit::test_launcher::Unconfined, "");
         assert!(
             matches!(outcome, ParseOutcome::Exited(Some(0))),
             "discovered swiftc failed to parse empty input: {outcome:?}"
@@ -272,6 +269,15 @@ pub fn parse_with_lookup(
         LookupOutcome::TimedOut => ParseOutcome::TimedOut,
         LookupOutcome::Unavailable(reason) => ParseOutcome::Unavailable(reason),
     }
+}
+
+#[cfg(all(unix, feature = "test-support"))]
+pub fn run_swiftc_for_test(
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
+    path: &Path,
+    source: &str,
+) -> ParseOutcome {
+    run_swiftc(tool_policy, path, source)
 }
 
 fn run_swiftc(
@@ -413,7 +419,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     source,
                     &Config {
@@ -463,7 +469,7 @@ mod tests {
                 assert_eq!(validate_syntax_str(BROKEN, &path), Some(false));
 
                 let first = write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     TUPLE,
                     &config,
@@ -476,7 +482,7 @@ mod tests {
                 assert_eq!(*calls.borrow(), [TUPLE]);
 
                 let mut second = write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     BROKEN,
                     &config,
@@ -529,7 +535,7 @@ mod tests {
                     let path = temp.path().join("broken.swift");
                     std::fs::write(&path, BROKEN).unwrap();
                     let result = write_format_validate(
-                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                        &crate::edit::test_launcher::Unconfined,
                         &path,
                         &updated,
                         &Config {
@@ -570,7 +576,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     TUPLE,
                     &Config {
@@ -622,7 +628,7 @@ mod tests {
                     let path = temp.path().join("tuple.swift");
                     std::fs::write(&path, TUPLE).unwrap();
                     let result = write_format_validate(
-                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                        &crate::edit::test_launcher::Unconfined,
                         &path,
                         &updated,
                         &Config {
@@ -665,7 +671,7 @@ mod tests {
                     let path = temp.path().join("new.swift");
                     assert_eq!(validate_syntax_str(TUPLE, &path), Some(false));
                     let result = write_format_validate(
-                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                        &crate::edit::test_launcher::Unconfined,
                         &path,
                         TUPLE,
                         &Config {
@@ -813,7 +819,7 @@ mod tests {
                 let updated = "let value = 2\n";
                 assert_eq!(validate_syntax_str(updated, &path), Some(true));
                 let result = write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     updated,
                     &Config {
@@ -875,7 +881,7 @@ mod tests {
                 let path = temp.path().join("bad.ts");
                 std::fs::write(&path, "const value = 1;\n").unwrap();
                 let result = write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     "function {",
                     &Config {
@@ -913,7 +919,7 @@ mod tests {
                     let mut original_valid = was_valid;
                     assert_eq!(
                         confirm_if_needed(
-                            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                            &crate::edit::test_launcher::Unconfined,
                             Path::new("test.swift"),
                             TUPLE,
                             Some(TUPLE),
@@ -948,7 +954,7 @@ mod tests {
                 let mut original_valid = None;
                 assert_eq!(
                     confirm_if_needed(
-                        &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                        &crate::edit::test_launcher::Unconfined,
                         Path::new("test.swift"),
                         TUPLE,
                         Some(TUPLE),
@@ -975,7 +981,7 @@ mod tests {
                 ..Config::default()
             };
             let first = write_format_validate(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 &path,
                 TUPLE,
                 &config,
@@ -986,7 +992,7 @@ mod tests {
             assert_eq!(first.syntax_valid, Some(true));
             assert_eq!(std::fs::read_to_string(&path).unwrap(), TUPLE);
             let second = write_format_validate(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 &path,
                 BROKEN,
                 &config,
@@ -1007,7 +1013,7 @@ mod tests {
     fn swift_parser_native_created_file_is_valid() {
         let Some(()) = with_native_swiftc(|| {
             let check = crate::edit::check_created_file_syntax(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 Path::new("new.swift"),
                 TUPLE,
             );
@@ -1031,7 +1037,7 @@ mod tests {
         let path = temp.path().join("tuple.swift");
         std::fs::write(&path, ORIGINAL).unwrap();
         let result = write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             &path,
             TUPLE,
             &Config {
@@ -1053,7 +1059,7 @@ mod tests {
             let path = temp.path().join("broken.swift");
             std::fs::write(&path, ORIGINAL).unwrap();
             let result = write_format_validate(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 &path,
                 BROKEN,
                 &Config {
@@ -1078,7 +1084,7 @@ mod tests {
         let Some(()) = with_native_swiftc(|| {
             assert!(matches!(
                 parse(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     "import AFTModuleThatDoesNotExist\n_ = undefinedName\n"
                 ),
                 ParseOutcome::Exited(Some(0))
@@ -1195,7 +1201,7 @@ mod tests {
             }),
             || {
                 write_format_validate(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                    &crate::edit::test_launcher::Unconfined,
                     &path,
                     &TUPLE.repeat(4_096),
                     &Config {

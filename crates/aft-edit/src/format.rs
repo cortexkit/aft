@@ -622,6 +622,15 @@ pub fn tool_available_for_missing_warning(tool: &str, project_root: Option<&Path
     resolve_tool_uncached(tool, project_root).is_some()
 }
 
+#[cfg(all(unix, feature = "test-support"))]
+#[doc(hidden)]
+pub fn ruff_probe_refused_for_test(
+    policy: &dyn crate::edit::tool_launcher::ToolLauncher,
+    project_root: Option<&Path>,
+) -> bool {
+    ruff_format_available(policy, project_root) == RuffAvailability::Refused
+}
+
 fn ruff_format_available(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     project_root: Option<&Path>,
@@ -1635,7 +1644,7 @@ pub fn auto_format(
     path: &Path,
     config: &Config,
 ) -> (bool, Option<String>) {
-    if crate::context::confinement::remote_mutation() {
+    if aft_db::read_fence::remote_mutation() {
         return (false, Some("sandbox_unavailable".into()));
     }
     // Check if formatting is disabled via plugin config
@@ -2716,7 +2725,7 @@ pub fn validate_full(
     path: &Path,
     config: &Config,
 ) -> (Vec<ValidationError>, Option<String>) {
-    if crate::context::confinement::remote_mutation() {
+    if aft_db::read_fence::remote_mutation() {
         return (Vec::new(), Some("sandbox_unavailable".into()));
     }
     let lang = match detect_language(path) {
@@ -3005,11 +3014,8 @@ mod tests {
             ..Config::default()
         };
 
-        let (formatted, reason) = auto_format(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &path,
-            &config,
-        );
+        let (formatted, reason) =
+            auto_format(&crate::edit::test_launcher::Unconfined, &path, &config);
         assert!(!formatted);
         assert_eq!(reason.as_deref(), Some("formatter_version_check_timeout"));
     }
@@ -3108,11 +3114,8 @@ mod tests {
             counting_checker(dir.path(), "pyright", "", 0);
             let paths = ["one.ts", "two.ts", "one.ts", "one.py", "two.py"]
                 .map(|path| dir.path().join(path));
-            let validation = validate_full_batch(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-                &paths,
-                &config,
-            );
+            let validation =
+                validate_full_batch(&crate::edit::test_launcher::Unconfined, &paths, &config);
             assert_eq!(validation.files.len(), 4);
             assert!(validation
                 .files
@@ -3157,11 +3160,8 @@ mod tests {
                     ..Config::default()
                 };
                 let paths = ["one/main.go", "two/main.go"].map(|path| dir.path().join(path));
-                let validation = validate_full_batch(
-                    &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-                    &paths,
-                    &config,
-                );
+                let validation =
+                    validate_full_batch(&crate::edit::test_launcher::Unconfined, &paths, &config);
                 assert!(validation
                     .files
                     .iter()
@@ -3191,11 +3191,8 @@ mod tests {
             ..Config::default()
         };
         let paths = ["one.ts", "two.ts", "notes.txt", "one.py"].map(|path| dir.path().join(path));
-        let validation = validate_full_batch(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &paths,
-            &config,
-        );
+        let validation =
+            validate_full_batch(&crate::edit::test_launcher::Unconfined, &paths, &config);
         for path in &paths[..2] {
             let mut entry = serde_json::json!({});
             validation.append_to(path, &mut entry);
@@ -3227,11 +3224,8 @@ mod tests {
             checker: [("typescript".to_string(), "tsc".to_string())].into(),
             ..Config::default()
         };
-        let validation = validate_full_batch(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &paths,
-            &config,
-        );
+        let validation =
+            validate_full_batch(&crate::edit::test_launcher::Unconfined, &paths, &config);
         assert_eq!(validation.files[0].errors.len(), 1);
         assert_eq!(validation.files[0].errors[0].file, "one.ts");
         assert!(validation.files[1].errors.is_empty());
@@ -3292,7 +3286,7 @@ mod tests {
         let before = FULL_POLL_SLEEPS.with(|count| count.get());
         for _ in 0..5 {
             let result = run_external_tool(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 "sh",
                 &["-c", "echo done"],
                 None,
@@ -3310,7 +3304,7 @@ mod tests {
     fn run_external_tool_waits_for_exit_after_pipes_close() {
         let started = Instant::now();
         let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             "sh",
             &["-c", "exec >&- 2>&-; sleep 0.3; exit 0"],
             None,
@@ -3324,7 +3318,7 @@ mod tests {
     #[test]
     fn run_external_tool_not_found() {
         let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             "__nonexistent_tool_xyz__",
             &[],
             None,
@@ -3349,7 +3343,7 @@ mod tests {
         let workdir = tempfile::tempdir().unwrap();
         let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
             run_external_tool(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 "/bin/sh",
                 &["-c", "pwd"],
                 Some(workdir.path()),
@@ -3367,7 +3361,7 @@ mod tests {
 
         let (result, forks) = crate::effective_path::fork_counter::forks_during(|| {
             run_external_tool_capture(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 "/bin/sh",
                 &["-c", "exit 3"],
                 Some(workdir.path()),
@@ -3455,7 +3449,7 @@ mod tests {
         let pid_file = workdir.path().join("grandchild.pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
         let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             "/bin/sh",
             &["-c", &script],
             None,
@@ -3510,13 +3504,8 @@ mod tests {
         } else {
             ("sleep", &["60"])
         };
-        let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            tool,
-            args,
-            None,
-            1,
-        );
+        let result =
+            run_external_tool(&crate::edit::test_launcher::Unconfined, tool, args, None, 1);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Timeout { tool, timeout_secs } => {
@@ -3535,13 +3524,8 @@ mod tests {
         } else {
             ("echo", &["hello"])
         };
-        let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            tool,
-            args,
-            None,
-            5,
-        );
+        let result =
+            run_external_tool(&crate::edit::test_launcher::Unconfined, tool, args, None, 5);
         assert!(result.is_ok());
         let res = result.unwrap();
         assert_eq!(res.exit_code, 0);
@@ -3556,7 +3540,7 @@ mod tests {
         std::fs::write(&shim, "@echo off\r\necho %~1\r\n").unwrap();
 
         let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             shim.to_str().unwrap(),
             &["--stdin-filepath"],
             None,
@@ -3572,7 +3556,7 @@ mod tests {
     fn format_helper_handles_large_stderr_without_deadlock() {
         let start = Instant::now();
         let result = run_external_tool_capture(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             "sh",
             &[
                 "-c",
@@ -3600,13 +3584,8 @@ mod tests {
         } else {
             ("false", &[])
         };
-        let result = run_external_tool(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            tool,
-            args,
-            None,
-            5,
-        );
+        let result =
+            run_external_tool(&crate::edit::test_launcher::Unconfined, tool, args, None, 5);
         assert!(result.is_err());
         match result.unwrap_err() {
             FormatError::Failed { tool, .. } => {
@@ -3628,11 +3607,8 @@ mod tests {
             format_on_edit: true,
             ..Config::default()
         };
-        let (formatted, reason) = auto_format(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &path,
-            &config,
-        );
+        let (formatted, reason) =
+            auto_format(&crate::edit::test_launcher::Unconfined, &path, &config);
         assert!(!formatted);
         assert_eq!(reason.as_deref(), Some("unsupported_language"));
     }
@@ -3881,11 +3857,8 @@ mod tests {
             formatter_timeout_secs: 120,
             ..Config::default()
         };
-        let (formatted, reason) = auto_format(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &path,
-            &config,
-        );
+        let (formatted, reason) =
+            auto_format(&crate::edit::test_launcher::Unconfined, &path, &config);
         // Name the skip reason on failure: this has failed on loaded Windows
         // runners with no way to tell a rustfmt timeout from a resolve miss.
         assert!(
@@ -4048,11 +4021,8 @@ mod tests {
         fs::write(&path, "hello").unwrap();
 
         let config = Config::default();
-        let (errors, reason) = validate_full(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &path,
-            &config,
-        );
+        let (errors, reason) =
+            validate_full(&crate::edit::test_launcher::Unconfined, &path, &config);
         assert!(errors.is_empty());
         assert_eq!(reason.as_deref(), Some("unsupported_language"));
     }
@@ -4193,11 +4163,8 @@ mod tests {
             .checker
             .insert("typescript".to_string(), "tsgo".to_string());
 
-        let (errors, reason) = validate_full(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            &path,
-            &config,
-        );
+        let (errors, reason) =
+            validate_full(&crate::edit::test_launcher::Unconfined, &path, &config);
         assert_eq!(reason, None);
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0].line, 1);
@@ -4213,13 +4180,8 @@ mod tests {
         } else {
             ("false", &[])
         };
-        let result = run_external_tool_capture(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
-            tool,
-            args,
-            None,
-            5,
-        );
+        let result =
+            run_external_tool_capture(&crate::edit::test_launcher::Unconfined, tool, args, None, 5);
         assert!(result.is_ok(), "capture should not error on non-zero exit");
         assert_eq!(result.unwrap().exit_code, 1);
     }
@@ -4228,7 +4190,7 @@ mod tests {
     #[test]
     fn run_external_tool_capture_preserves_lossy_utf8() {
         let outcome = run_external_tool_capture(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             "/bin/sh",
             &["-c", r#"printf '{"VALUE":"\377"}'"#],
             None,
@@ -4243,7 +4205,7 @@ mod tests {
     #[test]
     fn run_external_tool_capture_not_found() {
         let result = run_external_tool_capture(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &crate::edit::test_launcher::Unconfined,
             "__nonexistent_xyz__",
             &[],
             None,
@@ -4526,7 +4488,7 @@ C:\repo\other.go:1:1: other file
 
         assert_eq!(
             ruff_format_available(
-                &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+                &crate::edit::test_launcher::Unconfined,
                 config.project_root.as_deref()
             ),
             RuffAvailability::Unavailable

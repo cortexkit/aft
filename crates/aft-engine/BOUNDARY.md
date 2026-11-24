@@ -52,6 +52,50 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `test_storage` context adapter | stays in composition | `aft-engine` | Test `AppContext` constructors use private temporary directories instead of the live database root. |
 | `tests/fixtures/root_identity_upgrade/cases.json` | test fixture | `aft-db` | Keep the facade copy byte-identical until final composition cleanup can remove it after its last reader is gone. |
 
+## Edit area
+
+| Item | Kind | Owning crate | Reason |
+|---|---|---|---|
+| `agent_data`, `backup`, `checkpoint`, `edit`, `extract`, `file_read_exact`, `format`, `hashline`, `imports`, `indent`, `patch`, `symbol_diff` | modules moved down | `aft-edit` | Keep edit and recovery policy together below composition. |
+| `agent_data`, `backup`, `checkpoint`, `edit`, `extract`, `file_read_exact`, `format`, `hashline`, `imports`, `indent`, `patch`, `symbol_diff` | compatibility re-exports | `aft-engine` | Keep the paths callers use before and after the split. |
+| `edit::ports::PostWriteDiagnostics` | port | `aft-edit` | Render the inspect outcome's reply fields without a dependency on LSP. |
+| `impl PostWriteDiagnostics for PostEditWaitOutcome` | adapter | `aft-engine` | Render the existing wire fields from the concrete outcome. |
+| `AppContext::lsp_post_write` | compatibility adapter | `aft-engine` | Return an owned result port where edit replies consume it; LSP wait and alert paths still use the concrete outcome. |
+| `edit::ports::BackupSnapshots` | port | `aft-edit` | Request snapshots and skip reasons without holding the store lock across the boundary. |
+| `edit::ports::SnapshotRequest` | port request | `aft-edit` | Carry the original snapshot arguments and an optional captured file together. |
+| `edit::ports::SnapshotResult` | port result | `aft-edit` | Report whether a snapshot was taken, independently of the observation check. |
+| `impl BackupSnapshots for AppContext` | adapter | `aft-engine` | Recheck the admitted file under the store lock before creating its backup. |
+| `edit::auto_backup` | compatibility wrapper | `aft-engine` | Adapt the existing context argument to the snapshot port. |
+| `edit::auto_backup_observed` | compatibility wrapper | `aft-engine` | Adapt the existing context argument without changing edit admission. |
+| `edit::auto_backup_from_capture` | compatibility wrapper | `aft-engine` | Adapt the existing context argument without taking a new capture. |
+| `edit::attach_backup_skipped_reason` | compatibility wrapper | `aft-engine` | Resolve the same skip reason through the snapshot port. |
+| `edit::tool_launcher::run_prepared` | visibility widened | `aft-edit` | The engine supplies the unchanged launch policy to the edit pipeline. |
+| `edit::test_launcher::Unconfined` | test-only helper | `aft-edit` | Prepare the same unconfined launch for area tests without a shell dependency. |
+| `edit::test_support::swift::run_swiftc_for_test` | test-support driver | `aft-edit` | Exercise the real launch policy against the Swift syntax checker in composition. |
+| `format::ruff_probe_refused_for_test` | test-support driver | `aft-edit` | Observe the formatter's exact refusal classification in composition. |
+| `edit::test_support::{bash, swift}` | test-support adapters | `aft-edit` | Keep Bash and Swift fixtures available through the engine test bridge. |
+| `edit::test_support::{diff_budget_remaining, set_diff_budget_remaining, diff_budget_omitted, BoundedDiffText}` | test-support adapters | `aft-edit` | Retain the old engine test bridge without exposing edit counters in production. |
+| `edit::file_reporter_registered` | test-support visibility widened | `aft-edit` | The engine bridge verifies that the file reporter is wired. |
+| `hashline::integration::build_display_metadata` | test-support visibility widened | `aft-edit` | Retain the existing engine bridge's display renderer. |
+| `backup::reset_capture_read_count` | test-support visibility widened | `aft-edit` | Retain the engine bridge's capture-read accounting. |
+| `backup::capture_read_count` | test-support visibility widened | `aft-edit` | Retain the engine bridge's capture-read accounting. |
+| `BackupStore::resident_entry_count` | test-support visibility widened | `aft-edit` | Retain the engine bridge's residency checks. |
+| `BackupStore::fail_next_disk_write_for_tests` | test-support visibility widened | `aft-edit` | Retain the engine bridge's backup failure injection. |
+| `BackupStore::release_after_next_snapshot_for_tests` | test-support visibility widened | `aft-edit` | Retain the engine bridge's snapshot release hook. |
+| `BackupStore::set_discovery_entry_limit_for_tests` | test-support visibility widened | `aft-edit` | Retain the engine bridge's discovery bounds checks. |
+| `BackupStore::expire_discovery_for_tests` | test-support visibility widened | `aft-edit` | Retain the engine bridge's discovery expiry checks. |
+| `BackupStore::uses_db_pool` | test-support visibility widened | `aft-edit` | Assert the store shares the composed context's connection. |
+| `BackupStore::disk_io_count_for_tests` | test-support visibility widened | `aft-edit` | Retain the engine bridge's disk I/O accounting. |
+| `BackupStore::discard_paths_for_tests` | test-support adapter | `aft-edit` | Inspect cleanup through the engine bridge without making the field public. |
+| `BackupStore::add_created_dir_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for undo authorization. |
+| `BackupStore::rekey_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for undo authorization. |
+| `BackupStore::history_meta_path_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for durable backup metadata. |
+| `BackupStore::history_content_reads_for_test` | test-support visibility widened | `aft-edit` | Retain the engine bridge's history content accounting. |
+| `BackupStore::new_for_unit_test` | test-support visibility widened | `aft-edit` | Keep explicit temporary backup policy for engine unit tests. |
+| `CheckpointStore::unbound_in_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for explicit checkpoint stores. |
+| `CheckpointStore::lock_path_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for checkpoint lock contention. |
+| `CheckpointStore::set_lock_path_for_test` | test-support visibility widened | `aft-edit` | Retain engine bridge fixtures for checkpoint lock contention. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

@@ -1,0 +1,13 @@
+{
+  "packages": [
+    {"id": "aft-edit", "name": "aft-edit"},
+    {"id": "aft-inspect", "name": "aft-inspect"}
+  ],
+  "workspace_members": ["aft-edit", "aft-inspect"],
+  "resolve": {"nodes": [
+    {"id": "aft-edit", "deps": [
+      {"pkg": "aft-inspect", "dep_kinds": [{"kind": "dev", "target": null}]}
+    ]},
+    {"id": "aft-inspect", "deps": []}
+  ]}
+}

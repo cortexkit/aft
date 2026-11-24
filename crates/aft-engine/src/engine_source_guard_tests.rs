@@ -257,6 +257,7 @@ fn constructs_context(node: Node<'_>, source: &str, aliases: &[&str]) -> bool {
 #[derive(Clone, Copy)]
 enum Scan {
     Engine,
+    Area,
     UpperRegistration,
 }
 
@@ -362,7 +363,7 @@ impl Guard {
             } else {
                 if let Some((included, expands)) = included_rust(child, source) {
                     let file = path.parent().unwrap().join(included);
-                    let upper = matches!(self.scan, Scan::Engine)
+                    let upper = matches!(self.scan, Scan::Engine | Scan::Area)
                         && file
                             .canonicalize()
                             .is_ok_and(|file| self.upper_files.contains(&file));
@@ -373,7 +374,7 @@ impl Guard {
                     }
                 }
                 match self.scan {
-                    Scan::Engine => self.check(child, path, source),
+                    Scan::Engine | Scan::Area => self.check(child, path, source),
                     Scan::UpperRegistration if child_scope.test => {
                         self.check_registration(child, path, source, &aliases);
                     }
@@ -442,6 +443,21 @@ impl Guard {
     }
 
     fn check(&mut self, node: Node<'_>, path: &Path, source: &str) {
+        if matches!(self.scan, Scan::Area)
+            && matches!(
+                node.kind(),
+                "identifier" | "type_identifier" | "field_identifier"
+            )
+        {
+            let name = text(node, source);
+            if matches!(
+                name.strip_prefix("r#").unwrap_or(name),
+                "aft_engine" | "AppContext"
+            ) {
+                self.report(node, path, source);
+                return;
+            }
+        }
         let found = match node.kind() {
             "use_declaration" => use_paths(
                 node.child_by_field_name("argument").unwrap(),
@@ -504,10 +520,43 @@ fn production_engine_sources_do_not_reach_the_upper_crate() {
         "the helper builds one context"
     );
 
-    let mut guard = Guard::new(&root, Scan::Engine);
-    guard.upper_files = registration.upper_files;
-    guard.file(&root.join("lib.rs"), &root, scope, &[]);
-    assert!(guard.findings.is_empty(), "{}", guard.findings.join("\n"));
+    let edit = crates.join("aft-edit/src");
+    for (source, scan) in [(root, Scan::Engine), (edit, Scan::Area)] {
+        let mut guard = Guard::new(&source, scan);
+        guard.upper_files.clone_from(&registration.upper_files);
+        guard.file(&source.join("lib.rs"), &source, scope, &[]);
+        assert!(guard.findings.is_empty(), "{}", guard.findings.join("\n"));
+    }
+}
+
+#[test]
+fn area_source_guard_rejects_engine_paths_and_context_in_tests() {
+    let root = Path::new("src");
+    let mut guard = Guard::new(root, Scan::Area);
+    guard.source(
+        &root.join("lib.rs"),
+        root,
+        Scope::default(),
+        r#"
+            #[cfg(test)]
+            fn crossing() {
+                use aft_engine::backup::BackupStore;
+                let _: r#AppContext;
+                let _ = crate::commands::run;
+                let _ = "aft_engine::AppContext";
+            }
+        "#,
+        &[],
+    );
+    assert_eq!(guard.findings.len(), 3, "{:?}", guard.findings);
+    for (finding, expected) in
+        guard
+            .findings
+            .iter()
+            .zip(["aft_engine", "AppContext", "commands::run"])
+    {
+        assert!(finding.contains(expected), "{finding}");
+    }
 }
 
 #[test]

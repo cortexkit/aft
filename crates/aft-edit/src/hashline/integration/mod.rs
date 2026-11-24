@@ -12,7 +12,7 @@ mod schema;
 mod transport;
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) use transport::build_display_metadata;
+pub use transport::build_display_metadata;
 
 pub use binding::{
     effective_for_capture, BindingGuard, BindingHandle, BindingRegistry, DowngradeWarning,

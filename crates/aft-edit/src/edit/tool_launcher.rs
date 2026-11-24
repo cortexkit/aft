@@ -159,7 +159,8 @@ mod utf8_capture_tests {
 }
 
 /// Execute only after the caller has prepared the command under its launch policy.
-pub(crate) fn run_prepared(mut prepared: Command, mut command: ToolCommand) -> ToolOutcome {
+#[doc(hidden)]
+pub fn run_prepared(mut prepared: Command, mut command: ToolCommand) -> ToolOutcome {
     if let ToolTimeout::AfterPreparation(duration) = command.timeout {
         command.timeout = ToolTimeout::Deadline(Instant::now() + duration);
     }

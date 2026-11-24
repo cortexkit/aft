@@ -1,0 +1,3 @@
+[
+  {"request":{"method":"enumerate","params":{}},"principal":{"kind":"reserved","moduleId":"phone"},"reply":{"result":{"generation":2,"incarnation":"0123456789abcdef","projects":[{"implicit":false,"name":"Editor","projectId":"pj-dashboard-editor","refKind":"local","rootRecords":[],"roots":[],"workspaceId":"ws-dashboard"},{"implicit":false,"name":"Terminal","projectId":"pj-dashboard-terminal","refKind":"local","rootRecords":[],"roots":[],"workspaceId":"ws-dashboard"}],"workspaces":[{"name":"ws-dashboard","root":null,"workspaceId":"ws-dashboard"}]}}}
+]

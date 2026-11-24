@@ -75,19 +75,7 @@ pub fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
     crate::search_index::bounded_grep_line_text_bytes(line)
 }
 
-pub mod edit_bash {
-    pub use crate::edit::bash::{
-        find_bash, reported_line, run_bash, with_runner, CheckOutcome, Runner, CHECK_TIMEOUT,
-        SYNTAX_ERROR_STATUS,
-    };
-}
-
-pub mod edit_swift {
-    pub use crate::edit::swift::{
-        cached_lookup, parse_outcome, parse_with_lookup, run_command, with_runner, LookupOutcome,
-        ParseOutcome, Runner, BROKEN, TUPLE,
-    };
-}
+pub use aft_edit::edit::test_support::{bash as edit_bash, swift as edit_swift};
 
 pub mod executor_test_support {
     pub use crate::executor::test_support::test_executor;
@@ -103,38 +91,9 @@ pub fn build_display_metadata(
     crate::hashline::integration::build_display_metadata(display_files, project_root)
 }
 
-pub fn diff_budget_remaining(budget: &crate::edit::DiffBudget) -> usize {
-    budget.remaining
-}
-
-pub fn set_diff_budget_remaining(budget: &mut crate::edit::DiffBudget, remaining: usize) {
-    budget.remaining = remaining;
-}
-
-pub fn diff_budget_omitted(budget: &crate::edit::DiffBudget) -> bool {
-    budget.omitted
-}
-
-pub struct BoundedDiffText(crate::edit::BoundedDiffText);
-
-impl BoundedDiffText {
-    pub fn new(limit: usize) -> Self {
-        Self(crate::edit::BoundedDiffText {
-            text: String::new(),
-            limit,
-        })
-    }
-
-    pub fn text(&self) -> &String {
-        &self.0.text
-    }
-}
-
-impl std::fmt::Write for BoundedDiffText {
-    fn write_str(&mut self, text: &str) -> std::fmt::Result {
-        std::fmt::Write::write_str(&mut self.0, text)
-    }
-}
+pub use aft_edit::edit::test_support::{
+    diff_budget_omitted, diff_budget_remaining, set_diff_budget_remaining, BoundedDiffText,
+};
 
 pub mod watcher;
 
@@ -341,7 +300,7 @@ impl BackupStoreTest for crate::backup::BackupStore {
     }
 
     fn discard_paths_for_tests(&self) -> &Vec<PathBuf> {
-        &self.discard_paths_for_tests
+        self.discard_paths_for_tests()
     }
 
     fn disk_io_count_for_tests(&self) -> u64 {

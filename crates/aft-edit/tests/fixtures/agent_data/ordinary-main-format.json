@@ -1,0 +1,92 @@
+{
+  "source_revision": "be659c9fb8f3876dddc9c93acb06bcbb7b141309",
+  "backup": {
+    "stack_meta": {
+      "schema_version": 5,
+      "format_version": "v2",
+      "session_id": "compat-session",
+      "path": "/fixture/repo/file.bin",
+      "count": 1,
+      "entries": [{
+        "backup_id": "backup-fixture",
+        "timestamp": 0,
+        "order": "1",
+        "description": "ordinary snapshot",
+        "op_id": "compat-op",
+        "kind": "content",
+        "content_path": "bak_1_backup-fixture.bak",
+        "mode": 33184,
+        "link_target": null,
+        "created_dirs": [],
+        "hardlink_detached": false,
+        "external_change_before": false,
+        "external_change_checkpoint": null,
+        "link_to": null
+      }]
+    },
+    "session_meta": {"schema_version": 5, "session_id": "compat-session", "last_accessed": 0},
+    "post_state": {"backup-fixture": "content:a58f646029cf6283815a7be8e958528f1803bea871e6a8f5700f6364a081c46f"},
+    "restore_meta": {
+      "version": 2,
+      "mode": 33184,
+      "link_target": null,
+      "created_dirs": [],
+      "post_state": "content:a58f646029cf6283815a7be8e958528f1803bea871e6a8f5700f6364a081c46f",
+      "external_change_before": false,
+      "external_change_checkpoint": null,
+      "link_to": null,
+      "hardlink_detached": false
+    },
+    "decoded_disk": {
+      "backup_id": "backup-fixture",
+      "content_bytes": [102,105,120,116,117,114,101,45,0,255,45,98,101,102,111,114,101,10],
+      "timestamp": 0,
+      "order": "1",
+      "description": "ordinary snapshot",
+      "op_id": "compat-op",
+      "kind": "content",
+      "mode": 33184,
+      "link_target": null,
+      "created_dirs": [],
+      "post_state": "content:a58f646029cf6283815a7be8e958528f1803bea871e6a8f5700f6364a081c46f",
+      "external_change_before": false,
+      "external_change_checkpoint": null,
+      "link_to": null,
+      "hardlink_detached": false
+    },
+    "decoded_db_row": {
+      "backup_id": "backup-fixture",
+      "content_bytes": [102,105,120,116,117,114,101,45,0,255,45,98,101,102,111,114,101,10],
+      "timestamp": 0,
+      "order": "1",
+      "description": "ordinary snapshot",
+      "op_id": "compat-op",
+      "kind": "content",
+      "mode": 33184,
+      "link_target": null,
+      "created_dirs": [],
+      "post_state": "content:a58f646029cf6283815a7be8e958528f1803bea871e6a8f5700f6364a081c46f",
+      "external_change_before": false,
+      "external_change_checkpoint": null,
+      "link_to": null,
+      "hardlink_detached": false
+    }
+  },
+  "checkpoint": {
+    "meta": {
+      "schema_version": 1,
+      "session_id": "compat-session",
+      "name": "ordinary",
+      "created_at": 0,
+      "created_order": 1,
+      "files": [{"original_path":"/fixture/repo/file.bin","blob":"file_1_0_0.blob","kind":"regular","mode":33184,"target_is_dir":false}]
+    },
+    "decoded": {
+      "name": "ordinary",
+      "created_at": 0,
+      "created_order": 1,
+      "pending_purge_count": 0,
+      "files": [{"path":"/fixture/repo/file.bin","kind":"regular","mode":33184,"content_bytes":[102,105,120,116,117,114,101,45,0,255,45,98,101,102,111,114,101,10]}]
+    }
+  }
+}

@@ -42,3 +42,66 @@ impl crate::edit::ports::PostWriteDiagnostics for crate::lsp::manager::PostEditW
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::edit::WriteResult;
+    use crate::lsp::diagnostics::{DiagnosticSeverity, StoredDiagnostic};
+    use crate::lsp::manager::PostEditWaitOutcome;
+    use crate::lsp::registry::ServerKind;
+    use crate::lsp::roots::ServerKey;
+    use std::sync::Arc;
+
+    #[test]
+    fn populated_edit_diagnostics_keep_the_existing_wire_shape() {
+        let pending = ServerKey {
+            kind: ServerKind::TypeScript(None),
+            root: "root".into(),
+        };
+        let outcome = PostEditWaitOutcome {
+            diagnostics: vec![StoredDiagnostic {
+                file: "file.ts".into(),
+                line: 2,
+                column: 3,
+                end_line: 2,
+                end_column: 7,
+                severity: DiagnosticSeverity::Warning,
+                message: "example".into(),
+                code: Some("example-code".into()),
+                source: None,
+            }],
+            pending_servers: vec![pending.clone()],
+            unresponsive_servers: vec![pending],
+            exited_servers: vec![ServerKey {
+                kind: ServerKind::TypeScriptNative("tsc".into()),
+                root: "root".into(),
+            }],
+            ..Default::default()
+        };
+        let write = WriteResult {
+            markdown_table_advisory: None,
+            syntax_valid: None,
+            syntax_skipped_reason: None,
+            syntax_error_line: None,
+            formatted: false,
+            format_skipped_reason: None,
+            validate_requested: false,
+            validation_errors: Vec::new(),
+            validate_skipped_reason: None,
+            rolled_back: false,
+            lsp_outcome: Some(Arc::new(outcome)),
+            reformatted_excerpt: None,
+            final_text: None,
+            write_warnings: Vec::new(),
+        };
+        let mut reply = serde_json::json!({});
+        write.append_lsp_diagnostics_to(&mut reply);
+        assert_eq!(serde_json::to_string(&reply).unwrap(), concat!(
+            "{\"lsp_complete\":false,\"lsp_diagnostics\":[{\"code\":\"example-code\",",
+            "\"column\":3,\"end_column\":7,\"end_line\":2,\"file\":\"file.ts\",\"line\":2,",
+            "\"message\":\"example\",\"severity\":\"warning\",\"source\":null}],",
+            "\"lsp_exited_servers\":[\"typescript-native\"],\"lsp_pending_servers\":[\"typescript\"],",
+            "\"lsp_status\":\"diagnostics unknown (server not responding)\",\"rolled_back\":false}"
+        ));
+    }
+}

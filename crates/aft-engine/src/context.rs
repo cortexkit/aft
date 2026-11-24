@@ -3252,13 +3252,13 @@ impl AppContext {
             }
         }
         let bash_compress_enabled = config.experimental_bash_compress;
-        #[cfg(feature = "test-support")]
+        #[cfg(any(test, feature = "test-support"))]
         let backup = if app.has_isolated_test_storage() {
             BackupStore::new_for_unit_test()
         } else {
             BackupStore::new()
         };
-        #[cfg(not(feature = "test-support"))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let backup = BackupStore::new();
         let watcher_counters = config
             .project_root
@@ -9600,7 +9600,7 @@ impl AppContext {
         file_path: &Path,
         content: &str,
         params: &serde_json::Value,
-    ) -> Option<crate::lsp::manager::PostEditWaitOutcome> {
+    ) -> Option<Arc<dyn crate::edit::ports::PostWriteDiagnostics + Send + Sync>> {
         let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Lsp);
         let wants_diagnostics = params
             .get("diagnostics")
@@ -9633,7 +9633,13 @@ impl AppContext {
             .min(10_000); // Cap at 10 seconds to prevent hangs from adversarial input
 
         if let Some(file_paths) = Self::multi_file_write_paths(params) {
-            return self.lsp_post_multi_file_write(file_path, content, &file_paths, params);
+            return self
+                .lsp_post_multi_file_write(file_path, content, &file_paths, params)
+                .map(
+                    |outcome| -> Arc<dyn crate::edit::ports::PostWriteDiagnostics + Send + Sync> {
+                        Arc::new(outcome)
+                    },
+                );
         }
 
         if let Some(config_events) = Self::watched_file_events_from_params(params, &custom_markers)
@@ -9641,11 +9647,11 @@ impl AppContext {
             self.notify_watched_config_events(&config_events);
         }
 
-        Some(self.lsp_notify_and_collect_diagnostics(
+        Some(Arc::new(self.lsp_notify_and_collect_diagnostics(
             file_path,
             content,
             std::time::Duration::from_millis(wait_ms),
-        ))
+        )))
     }
 
     fn resolved_path_restriction_root(&self, root: &Path) -> PathBuf {

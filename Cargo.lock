@@ -111,11 +111,48 @@ dependencies = [
 ]
 
 [[package]]
+name = "aft-edit"
+version = "0.66.0"
+dependencies = [
+ "aft-base",
+ "aft-db",
+ "aft-parse",
+ "aft-store",
+ "base64 0.22.1",
+ "blake3",
+ "content_inspector",
+ "cortexkit-agent-identity",
+ "cortexkit-paths",
+ "cortexkit-project-identity",
+ "cortexkit-role-agent-data",
+ "filetime",
+ "getrandom 0.3.4",
+ "libc",
+ "log",
+ "parking_lot",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "subc-protocol",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tree-sitter",
+ "tree-sitter-python",
+ "which",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "aft-engine"
 version = "0.66.0"
 dependencies = [
  "aft-base",
  "aft-db",
+ "aft-edit",
  "aft-parse",
  "aft-secret-rules",
  "aft-store",

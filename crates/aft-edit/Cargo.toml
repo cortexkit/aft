@@ -1,0 +1,61 @@
+[package]
+name = "aft-edit"
+version = "0.66.0"
+edition = "2021"
+description = "File editing, formatting, and recovery for Agent Foundational Toolkit"
+license = "MIT"
+repository = "https://github.com/cortexkit/aft"
+rust-version.workspace = true
+exclude = ["tests/", "examples/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
+autotests = false
+
+[features]
+test-support = ["aft-base/test-support", "aft-db/test-support", "aft-parse/test-support", "dep:tempfile"]
+test-hooks = []
+
+[dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0" }
+aft-db = { path = "../aft-db", version = "0.66.0" }
+aft-parse = { path = "../aft-parse", version = "0.66.0" }
+aft-store = { path = "../aft-store", version = "0.66.0" }
+base64 = "0.22"
+blake3 = "1"
+content_inspector = "0.2.4"
+cortexkit-agent-identity = "=0.1.1"
+cortexkit-paths = "0.1"
+cortexkit-project-identity = "=0.1.5"
+cortexkit-role-agent-data = "=0.3.3"
+getrandom = "0.3"
+libc = "0.2"
+log = "0.4"
+parking_lot = "0.12"
+regex = "1"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = { version = "0.10", features = ["compress"] }
+similar = "2"
+subc-protocol = "=0.37.4"
+tempfile = { version = "3.27.0", optional = true }
+tokio = { version = "1", features = ["rt"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tree-sitter = "=0.26.7"
+which = "7"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+] }
+
+[dev-dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
+aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }
+filetime = "0.2"
+tempfile = "3"
+tree-sitter-python = "0.25"

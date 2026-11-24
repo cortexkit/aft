@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 
 fn fixture() -> Value {
     let captured: Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/agent_data/ordinary-main-format.json"
+        "../../tests/fixtures/agent_data/ordinary-main-format.json"
     ))
     .unwrap();
     #[cfg(not(unix))]
