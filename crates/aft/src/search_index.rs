@@ -30,7 +30,9 @@ use crate::root_identity::key::{artifact_cache_key_for_build, canonicalize_or_no
 use crate::search_state::request_files::{Fetched, FileStat, RequestFile, RequestFiles};
 
 pub mod exact_lane;
+mod indexed_glob;
 pub use crate::search_state::memo;
+pub(crate) use indexed_glob::IndexedGlobMatcher;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactPassMatch {
@@ -2234,27 +2236,8 @@ impl SearchIndexSnapshot {
         search_root: &Path,
         sort_by_mtime: bool,
     ) -> (Vec<PathBuf>, bool, usize) {
-        let filters = match build_path_filters(&[pattern.to_string()], &[]) {
-            Ok(filters) => filters,
-            Err(_) => return (Vec::new(), false, 0),
-        };
-        // Indexed entries carry the project root's spelling as configured,
-        // which on Windows can differ from the canonical form in ways
-        // normalize_path does not reconcile (8.3 short names such as
-        // RUNNER~1 against runneradmin). Containment is therefore checked
-        // against both the root as passed and its canonical form, and the
-        // pattern is matched relative to whichever root contained the entry.
-        let raw_root = search_root.to_path_buf();
-        let canonical_root = canonicalize_for_search_membership(search_root);
-        let file_scope = search_root.is_file();
-        let containing_root = |path: &Path| -> Option<&Path> {
-            if is_within_search_root(&raw_root, path) {
-                Some(raw_root.as_path())
-            } else if is_within_search_root(&canonical_root, path) {
-                Some(canonical_root.as_path())
-            } else {
-                None
-            }
+        let Some(matcher) = IndexedGlobMatcher::new(pattern, search_root) else {
+            return (Vec::new(), false, 0);
         };
         let entries_visited = self.files.len();
         let mut scope_has_files = false;
@@ -2262,26 +2245,8 @@ impl SearchIndexSnapshot {
             .files
             .iter()
             .inspect(|_| crate::run_tool_call::progress::report())
-            .filter(|file| !file.path.as_os_str().is_empty())
-            .filter_map(|file| {
-                let root = containing_root(&file.path)?;
-                Some((file, root))
-            })
-            // Match the glob pattern relative to the search root, not the
-            // project root. When a caller passes `{path: "src", pattern:
-            // "a.rs"}`, the pattern must match `a.rs` (the path relative to
-            // `src`), not `src/a.rs` (the path relative to the project root).
-            .filter(|(file, root)| {
-                // A file scope must match its basename, not the empty path
-                // relative to itself. Containment above still excludes siblings.
-                let filter_root = if file_scope {
-                    root.parent().unwrap_or(root)
-                } else {
-                    root
-                };
-                filters.matches(filter_root, &file.path)
-            })
-            .map(|(file, _)| {
+            .filter(|file| matcher.matches(&file.path))
+            .map(|file| {
                 scope_has_files = true;
                 (file.path.clone(), file.modified)
             })
@@ -4003,6 +3968,10 @@ pub(crate) fn path_missing_on_disk(path: &Path) -> bool {
 /// index is badly out of date.
 pub(crate) const MISSING_ON_DISK_REFILL_BUDGET: usize = 256;
 
+pub(crate) fn presence_stat_budget(limit: usize) -> usize {
+    limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET)
+}
+
 /// Result of checking a ranked list against the disk, see
 /// [`take_present_on_disk`].
 #[derive(Debug)]
@@ -4048,7 +4017,7 @@ pub(crate) fn take_present_on_disk_with_admission<T, E>(
     surface: &str,
     mut admit: impl FnMut(&T) -> Result<bool, E>,
 ) -> Result<(PresentOnDisk<T>, usize), E> {
-    let stat_budget = limit.saturating_add(MISSING_ON_DISK_REFILL_BUDGET);
+    let stat_budget = presence_stat_budget(limit);
     let mut present = Vec::new();
     let mut dropped = 0usize;
     let mut rejected = 0usize;
@@ -4757,7 +4726,7 @@ fn path_modified_time(path: &Path) -> Option<SystemTime> {
         .ok()
 }
 
-fn normalized_display_sort_key(project_root: Option<&Path>, path: &Path) -> String {
+pub(crate) fn normalized_display_sort_key(project_root: Option<&Path>, path: &Path) -> String {
     let display_path = project_root
         .and_then(|root| path.strip_prefix(root).ok())
         .unwrap_or(path);

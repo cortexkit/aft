@@ -3,12 +3,10 @@
 //! When the process runs the data layer and the root's view has a ready text
 //! plane, grep and glob list the checkout's files from the view instead of
 //! from today's trigram index. Only where the files come from changes: grep
-//! takes its candidates from [`CheckoutView::text_candidates`] and glob lists
-//! the view's paths, and both then run today's indexed search over those
-//! files. They do it by projecting the files into a [`SearchIndexSnapshot`]
-//! that holds no postings, so the snapshot treats every file as unindexed
-//! and reads, matches, filters, orders and bounds them exactly as an
-//! answer from today's index does.
+//! takes its candidates from [`CheckoutView::text_candidates`] and projects them
+//! into a [`SearchIndexSnapshot`] that verifies each candidate on disk. Glob
+//! uses the view's paths and modification times; its single-checkout page
+//! needs only the rows that its presence check could examine.
 //!
 //! A path changed since the publication is listed as it is on disk now:
 //! with its current modification time when it is a file, and not at all
@@ -179,6 +177,13 @@ impl ViewScope {
                 self.entry(&path, size, modified)
             });
         Ok(self.snapshot(files))
+    }
+
+    /// Every file in scope with its modification time, without a search snapshot.
+    pub(crate) fn listing_rows(&self) -> impl Iterator<Item = (PathBuf, SystemTime)> + '_ {
+        self.files().filter_map(|(path, _, modified)| {
+            absolute(self.view.root(), path).map(|path| (path, modified))
+        })
     }
 
     /// Every file in scope, as a snapshot for glob to list.

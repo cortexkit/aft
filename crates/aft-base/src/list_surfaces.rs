@@ -349,12 +349,12 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
             ReasonEntry {
                 reason: Reason::Walk,
                 kind: ReasonKind::Bounding,
-                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, glob_from_view, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_truncated, skipped_foreign_mounts",
+                predicate_name: "GlobDiscovery, handle_glob, handle_glob_inner, fallback_glob, glob_root, glob_from_view, discover_glob_root, named_ignored_glob_walk_stops_at_cap_and_deadline, walk_failed, walk_truncated, skipped_foreign_mounts",
             },
             ReasonEntry {
                 reason: Reason::Cap,
                 kind: ReasonKind::Selecting,
-                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DIRECTORY_SECTIONS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
+                predicate_name: "DEFAULT_MAX_RESULTS, MAX_DIRECTORY_SECTIONS, MAX_DISPLAY_DIRECTORIES, MAX_DISPLAY_FILES_PER_DIRECTORY, handle_glob, handle_glob_inner, bounded_indexed_glob, presence_stat_budget, account_for_unretained_glob_candidates, format_glob_text, format_glob_output, format_glob_selected, rendered_glob_file_count",
             },
         ],
     },
@@ -1190,6 +1190,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "diagnostic changed-path previews and sequential diff line pages integrate their list envelope trailers into content through the authorized NDJSON text builder",
     },
     ExclusionEntry {
+        file: "commands/glob.rs",
+        enclosing_item: "glob_root_files_for_test, review_search_glob_lower_bound_only_counts_checked_files, review_search_indexed_glob_retains_only_the_page_and_refill_window",
+        location_or_primitive: "DEFAULT_MAX_RESULTS",
+        reason: "test-only fixtures and assertions reuse the production page size; they do not cut a reply list",
+    },
+    ExclusionEntry {
         file: "grep_executor.rs",
         enclosing_item: "diagnose_scope_counts, diagnose_scope_counts_unbounded, bounded_fallback_walk_files_with_limits_target, walk_files_unbounded, walk_each_file_unbounded",
         location_or_primitive: "MAX_FALLBACK_WALK_FILES / FALLBACK_WALK_BUDGET",
@@ -1657,7 +1663,7 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     // results page is the search surface's, registered under its cap reason.
     ExclusionEntry {
         file: "commands/semantic_search/external_exact.rs",
-        enclosing_item: "sweep_after_metadata",
+        enclosing_item: "SweepOutcome, sweep_after_metadata",
         location_or_primitive: "fallback_walk_limit / skipped_foreign_mounts",
         reason: "bounds the internal corpus, not the displayed hit list; the sweep reports incomplete coverage and an unknown total after a file limit, deadline or skipped mount",
     },
