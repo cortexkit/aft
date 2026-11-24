@@ -41,6 +41,8 @@ const FIRST_SLICE: &str = "A1-seam-comparator-descriptor";
 const B_OWNED_EXACT: &[&str] = &[
     "crates/aft-base/src/query_shape.rs",
     "crates/aft/src/semantic_index.rs",
+    "crates/aft/src/semantic_index/query_worker.rs",
+    "crates/aft/src/semantic_index/root_state.rs",
     "benchmarks/aft-search/fixtures.json",
     "benchmarks/aft-search/real-query-manifest.json",
     "benchmarks/aft-search/real-query-baseline.json",
