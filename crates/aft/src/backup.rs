@@ -1,5 +1,4 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, RwLock};
@@ -6305,17 +6304,15 @@ fn restore_regular_file(
     {
         std::fs::remove_file(path)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(content_bytes)?;
-    set_file_mode(path, mode)?;
-    // Do not pop the undo stack while restored bytes exist only in page cache.
-    // Keep the writer handle through mode restoration: reopening for write
-    // would fail if the backup's original permissions were read-only.
-    crate::durability::sync_file(&file, path)
+    for warning in crate::edit::atomic_write_source(path, content_bytes)?.warnings {
+        crate::slog_warn!("undo restore {}: {warning}", path.display());
+    }
+    if mode.is_some() {
+        let file = std::fs::OpenOptions::new().write(true).open(path)?;
+        set_file_mode(path, mode)?;
+        crate::durability::sync_file(&file, path)?;
+    }
+    Ok(())
 }
 
 fn restore_symlink(path: &Path, target: &Path) -> std::io::Result<()> {

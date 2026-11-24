@@ -2325,6 +2325,8 @@ fn restore_paths_atomically(
         {
             if current.matches(stored) {
                 unchanged.push(path.clone());
+                crate::tool_progress::report();
+                continue;
             }
         }
         pre_restore_snapshot.insert(path.clone(), current);
@@ -2333,7 +2335,10 @@ fn restore_paths_atomically(
 
     let mut restored_paths: Vec<PathBuf> = Vec::new();
     let mut created_dirs: Vec<PathBuf> = Vec::new();
-    for path in paths {
+    for path in paths
+        .iter()
+        .filter(|path| pre_restore_snapshot.contains_key(*path))
+    {
         let snapshot =
             checkpoint
                 .file_contents
@@ -2412,10 +2417,15 @@ fn write_restored_file(
                     message: format!("failed to replace symlink with regular file: {error}"),
                 })?;
             }
-            fs::write(path, bytes).map_err(|error| AftError::IoError {
-                path: path.display().to_string(),
-                message: format!("failed to restore checkpoint file contents: {error}"),
+            let write = crate::edit::atomic_write_source(path, bytes).map_err(|error| {
+                AftError::IoError {
+                    path: path.display().to_string(),
+                    message: format!("failed to restore checkpoint file contents: {error}"),
+                }
             })?;
+            for warning in write.warnings {
+                crate::slog_warn!("checkpoint restore {}: {warning}", path.display());
+            }
             restore_checkpoint_permissions(path, snapshot).map_err(|error| AftError::IoError {
                 path: path.display().to_string(),
                 message: format!("failed to restore checkpoint file permissions: {error}"),
