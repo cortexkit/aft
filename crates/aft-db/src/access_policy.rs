@@ -937,7 +937,7 @@ impl AccessPolicy {
             match floor.rule {
                 FloorRule::AftStorage => return aft_storage_denial_message(original.display()),
                 FloorRule::CortexkitModuleData => {
-                    return format!("AFT never changes files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon to remove or change '{}'.", original.display());
+                    return format!("AFT's file tools never open files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon about '{}'.", original.display());
                 }
                 FloorRule::CortexkitModuleState => {
                     // The state-folder name comes from the resolved path, even through an alias.
@@ -1471,7 +1471,7 @@ mod tests {
         let mut config = Config::default();
         config.sandbox.read_deny.push(home.join("denied"));
         let policy = AccessPolicy::from_config(&config, &storage, vec![], &home);
-        let data_denial = "AFT never changes files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon to remove or change '<path>'.";
+        let data_denial = "AFT's file tools never open files in the CortexKit data folder (~/.local/share/cortexkit/), because modules keep live databases there. Ask the owner of the CortexKit daemon about '<path>'.";
         for (relative, expected) in [
             (".local/share/cortexkit/synapse/memory.db", data_denial),
             (".local/share/cortexkit/aiproxy-commit-backup", data_denial),

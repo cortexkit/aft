@@ -1956,9 +1956,15 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
                 "{\"value\":\"shell\"}\n"
             );
         }
-        for relative in [
-            ".local/share/cortexkit/other-module/x.jsonc",
-            ".local/state/cortexkit/other-module/x.jsonc",
+        for (relative, refusal) in [
+            (
+                ".local/share/cortexkit/other-module/x.jsonc",
+                "never open files in the CortexKit data folder",
+            ),
+            (
+                ".local/state/cortexkit/other-module/x.jsonc",
+                "other-module module's state folder",
+            ),
         ] {
             let path = jail.home.join(relative);
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -1972,10 +1978,7 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
             ] {
                 let reply = jail.tool_reply_on_channel(channel, tool, args).await;
                 assert_eq!(reply["isError"], true, "{session}: {reply}");
-                assert!(
-                    reply.to_string().contains("other-module module's"),
-                    "{reply}"
-                );
+                assert!(reply.to_string().contains(refusal), "{reply}");
                 assert_eq!(std::fs::read_to_string(&path).unwrap(), "private");
             }
         }
