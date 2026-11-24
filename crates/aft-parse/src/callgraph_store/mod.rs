@@ -53,7 +53,6 @@ pub const MACRO_BODY_CALL_REF_KIND: &str = "macro_body_call";
 /// parsed as Rust. Never resolved into an edge.
 pub const MACRO_MENTION_REF_KIND: &str = "macro_mention";
 pub const TOP_LEVEL_SYMBOL: &str = "<top-level>";
-const JS_TS_EXTENSIONS: &[&str] = &["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
 /// Work counters for measurement tests: source parses by the store and
 /// resolution-config reads (`package.json`, `tsconfig.json`, `Cargo.toml`).
@@ -4776,7 +4775,7 @@ fn module_dependencies_with_memo(
     }
     if module_path.starts_with('.') {
         let base = caller_dir.join(module_path);
-        for candidate in relative_module_candidates(&base) {
+        for candidate in callgraph::relative_module_candidates(&base) {
             deps.insert(relative_path(project_root, &candidate));
         }
     }
@@ -4950,21 +4949,6 @@ fn rust_push_module_dependency_candidate(
             deps.push(candidate);
         }
     }
-}
-
-fn relative_module_candidates(base: &Path) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if base.extension().is_some() {
-        candidates.push(base.to_path_buf());
-        return candidates;
-    }
-    for ext in JS_TS_EXTENSIONS {
-        candidates.push(base.with_extension(ext));
-    }
-    for ext in JS_TS_EXTENSIONS {
-        candidates.push(base.join(format!("index.{ext}")));
-    }
-    candidates
 }
 
 fn import_local_names(import: &ImportStatement) -> Vec<String> {

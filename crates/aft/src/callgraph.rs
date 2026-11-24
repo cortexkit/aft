@@ -1316,6 +1316,26 @@ function helperB() {}
     }
 
     #[test]
+    fn audit_resolution_dotted_typescript_import_keeps_its_stem() {
+        let directory = tempfile::tempdir().unwrap();
+        let service = directory.path().join("user.service.ts");
+        std::fs::write(&service, "").unwrap();
+        let service = service.canonicalize().unwrap();
+        assert_eq!(
+            resolve_module_path(directory.path(), "./user.service"),
+            Some(service.clone())
+        );
+        std::fs::write(directory.path().join("user.ts"), "").unwrap();
+        for specifier in ["./user.service", "./user.service.js"] {
+            assert_eq!(
+                resolve_module_path(directory.path(), specifier),
+                Some(service.clone()),
+                "{specifier}"
+            );
+        }
+    }
+
+    #[test]
     fn extract_parameters_typescript() {
         let params = extract_parameters(
             "function processData(input: string, count: number): void",

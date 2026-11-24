@@ -2223,29 +2223,42 @@ fn resolve_relative_module_path(
 }
 
 fn resolve_file_like_path(base: &Path, facts: &FactPaths<'_>) -> Option<PathBuf> {
-    let base = base.to_path_buf();
+    file_like_candidates(base)
+        .find(|candidate| facts.is_file(candidate))
+        .map(|candidate| facts.canonical(&candidate).unwrap_or(candidate))
+        .or_else(|| {
+            facts
+                .is_dir(base)
+                .then(|| find_index_file(base, facts))
+                .flatten()
+        })
+}
 
-    // Try exact path first
-    if facts.is_file(&base) {
-        return Some(facts.canonical(&base).unwrap_or(base));
-    }
+fn file_like_candidates(base: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    let runtime_extension = matches!(
+        base.extension().and_then(|extension| extension.to_str()),
+        Some("js" | "jsx" | "mjs" | "cjs")
+    );
+    let appended = JS_TS_EXTENSIONS.iter().map(move |extension| {
+        let mut path = base.as_os_str().to_os_string();
+        path.push(".");
+        path.push(extension);
+        PathBuf::from(path)
+    });
+    // A dot in a stem is literal (`user.service`), but a written JavaScript
+    // extension can name its source file (`user.service.js` -> `user.service.ts`).
+    let replaced = JS_TS_EXTENSIONS
+        .iter()
+        .filter(move |_| runtime_extension)
+        .map(move |extension| base.with_extension(extension));
+    std::iter::once(base.to_path_buf())
+        .chain(appended)
+        .chain(replaced)
+}
 
-    // Try common extensions, including ESM/CJS TypeScript pairs used by workspaces.
-    for ext in JS_TS_EXTENSIONS {
-        let with_ext = base.with_extension(ext);
-        if facts.is_file(&with_ext) {
-            return Some(facts.canonical(&with_ext).unwrap_or(with_ext));
-        }
-    }
-
-    // Try as directory with index file
-    if facts.is_dir(&base) {
-        if let Some(index) = find_index_file(&base, facts) {
-            return Some(index);
-        }
-    }
-
-    None
+/// Include nonexistent candidate paths so adding a target updates existing importers.
+pub(crate) fn relative_module_candidates(base: &Path) -> impl Iterator<Item = PathBuf> + '_ {
+    file_like_candidates(base).chain(JS_TS_INDEX_FILES.iter().map(move |name| base.join(name)))
 }
 
 fn resolve_workspace_module_path(
