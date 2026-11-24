@@ -307,6 +307,16 @@ pub(crate) struct Scope(Option<Arc<Capture>>);
 pub struct SharedCallDeadline(Arc<Mutex<Option<Instant>>>);
 
 impl SharedCallDeadline {
+    /// Keep the test reader's `lock().unwrap()` call without returning a guard.
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub fn lock(&self) -> Result<Option<Instant>, &'static str> {
+        self.0
+            .lock()
+            .map(|value| *value)
+            .map_err(|_| "poisoned reply deadline")
+    }
+
     pub(crate) fn limit(&self, deadline: Instant) {
         let mut current = self
             .0

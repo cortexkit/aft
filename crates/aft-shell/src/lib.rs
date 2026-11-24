@@ -36,21 +36,20 @@ pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
 #[cfg(all(test, unix))]
 use aft_base::executable_cache;
 
-#[cfg(unix)]
-use aft_base::posix_spawn;
 #[cfg(all(test, unix))]
 use aft_base::test_gate;
 #[cfg(windows)]
 use aft_base::windows_command;
 use aft_base::{
     agent_commands, alloc_trace, atomic_replace, bash_env, bounded_io, compress, config,
-    cross_volume, developer_tools, effective_path, environment, file_identity, file_kind,
-    fleet_status, gh_shim_paths, git_revision, harness, host_tool_names, list_envelope,
-    list_surfaces, lock_diagnostics, log_ctx, log_redact, memory, pinned_dir, pinned_executable,
-    policy_path, privacy_spawn, private_storage, process_identity, process_spawn, project_content,
-    protocol, secret, shell_format, storage_path, system_temp, task_temp_reads, tool_call_result,
-    windows_path, worker_jail_canary,
+    cross_volume, effective_path, environment, file_identity, fleet_status, gh_shim_paths,
+    git_revision, harness, host_tool_names, list_envelope, list_surfaces, lock_diagnostics,
+    log_ctx, log_redact, memory, pinned_dir, pinned_executable, policy_path, privacy_spawn,
+    private_storage, process_identity, process_spawn, project_content, protocol, secret,
+    shell_format, storage_path, system_temp, task_temp_reads, tool_call_result, windows_path,
 };
+#[cfg(unix)]
+use aft_base::{developer_tools, file_kind, posix_spawn, worker_jail_canary};
 #[cfg(test)]
 use aft_base::{durability, test_support, walk_boundary};
 #[cfg(any(test, feature = "test-support"))]
@@ -58,14 +57,17 @@ use aft_base::{logging, test_env};
 #[cfg(test)]
 use aft_db::reader_floor;
 use aft_db::{
-    access_policy, db, fs_lock, path_identity, persisted_format, production_storage, root_cache,
-    root_identity, sandbox_profile, write_ledger,
+    access_policy, db, fs_lock, path_identity, persisted_format, production_storage,
+    sandbox_profile, write_ledger,
 };
+#[cfg(unix)]
+use aft_db::{root_cache, root_identity};
 use aft_edit::{backup, edit, file_read_exact, format};
 #[cfg(unix)]
-use aft_github::gh_shim_worker_endpoints;
-use aft_github::{gh_shim, gh_shim_relay, gh_shim_speech};
+use aft_github::{gh_shim, gh_shim_worker_endpoints};
+use aft_github::{gh_shim_relay, gh_shim_speech};
 use aft_index::{watcher_backend, watcher_filter};
+#[cfg(unix)]
 use aft_inspect::{inspect, lsp};
 
 use bash_background::gh_ticket as gh_shim_ticket;

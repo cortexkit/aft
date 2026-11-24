@@ -244,7 +244,7 @@ impl BgTaskRegistry {
         memory_limit_mib: Option<u64>,
         task_id: &str,
     ) -> Result<Option<super::super::memory_limit::Monitor>, String> {
-        #[cfg(any(test, feature = "test-support"))]
+        #[cfg(all(unix, any(test, feature = "test-support")))]
         if let Some(gate) = MEMORY_PREPARE_GATE_FOR_TEST.with(|slot| slot.borrow_mut().take()) {
             gate();
         }

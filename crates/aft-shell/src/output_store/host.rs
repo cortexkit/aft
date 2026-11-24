@@ -8,3 +8,17 @@ pub trait OutputStoreHost: PinnedConfig + TaskRegistryAccess {
     fn harness_opt(&self) -> Option<Harness>;
     fn output_files_arc(&self) -> Arc<super::OutputFiles>;
 }
+
+impl<T: OutputStoreHost + ?Sized> OutputStoreHost for Arc<T> {
+    fn storage_dir(&self) -> PathBuf {
+        (**self).storage_dir()
+    }
+
+    fn harness_opt(&self) -> Option<Harness> {
+        (**self).harness_opt()
+    }
+
+    fn output_files_arc(&self) -> Arc<super::OutputFiles> {
+        (**self).output_files_arc()
+    }
+}

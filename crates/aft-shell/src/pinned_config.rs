@@ -6,3 +6,9 @@ use std::sync::Arc;
 pub trait PinnedConfig {
     fn config(&self) -> Arc<Config>;
 }
+
+impl<T: PinnedConfig + ?Sized> PinnedConfig for Arc<T> {
+    fn config(&self) -> Arc<Config> {
+        (**self).config()
+    }
+}
