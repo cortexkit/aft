@@ -462,6 +462,18 @@ fn candidate_completion(read_completed: bool) -> CandidateCompletion {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static EXCERPT_LINES_VISITED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn excerpt_lines(source: &str) -> impl Iterator<Item = &str> {
+    let lines = source.lines();
+    #[cfg(test)]
+    let lines = lines.inspect(|_| EXCERPT_LINES_VISITED.with(|count| count.set(count.get() + 1)));
+    lines
+}
+
 fn candidate_text_checked(
     project_root: &Path,
     result: &CandidateResult,
@@ -502,11 +514,10 @@ fn candidate_text_checked(
     // Stored ranges address raw bytes; decoding and newline normalization
     // must happen after slicing, including when earlier bytes are invalid UTF-8.
     let source = String::from_utf8_lossy(selected).replace("\r\n", "\n");
-    let (line, name, body): (usize, String, Vec<&str>) = match result.symbol_range {
+    let (line, name, first) = match result.symbol_range {
         Some(_) => {
-            let lines = source.lines().collect::<Vec<_>>();
-            let name = declared_name(&lines).unwrap_or_else(|| file_stem(&result.path));
-            (raw_line, name, lines)
+            let name = declared_name(source.lines()).unwrap_or_else(|| file_stem(&result.path));
+            (raw_line, name, 0)
         }
         None => {
             // Match against the same raw bytes used for the body, preserving
@@ -534,11 +545,7 @@ fn candidate_text_checked(
             let first = matched.map_or(0, |line| line.saturating_sub(FILE_CONTEXT_LINES_ABOVE));
             let name =
                 matched_identifier(prose, &source).unwrap_or_else(|| file_stem(&result.path));
-            (
-                matched.unwrap_or(0),
-                name,
-                source.lines().skip(first).collect(),
-            )
+            (matched.unwrap_or(0), name, first)
         }
     };
     let mut text = format!(
@@ -546,7 +553,7 @@ fn candidate_text_checked(
         display_path(project_root, &result.path),
         line + 1
     );
-    for line in body {
+    for line in excerpt_lines(&source).skip(first) {
         let line = line.trim_end();
         if line.trim().is_empty() {
             continue;
@@ -603,7 +610,7 @@ fn streamed_candidate_text_checked(
                     for line in source.lines() {
                         if is_code_line(line.trim()) {
                             saw_code = true;
-                            name = declared_name(&[line]);
+                            name = declared_name(std::iter::once(line));
                             break;
                         }
                     }
@@ -729,7 +736,7 @@ fn file_stem(path: &Path) -> String {
 /// declaration keyword on its first line of code (attributes, decorators and
 /// comments are skipped), or else the first identifier on that line that is
 /// not a modifier or keyword.
-fn declared_name(lines: &[&str]) -> Option<String> {
+fn declared_name<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
     static DECLARATION: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
             r"\b(?:fn|struct|enum|trait|union|type|mod|const|static|class|interface|function|def|func|let|var|macro_rules!)\s+([A-Za-z_$][A-Za-z0-9_$]*)",
@@ -760,8 +767,8 @@ fn declared_name(lines: &[&str]) -> Option<String> {
         "readonly",
     ];
     let code = lines
-        .iter()
-        .map(|line| line.trim())
+        .into_iter()
+        .map(str::trim)
         .find(|line| is_code_line(line))?;
     if let Some(captures) = DECLARATION.captures(code) {
         return Some(bounded_name(&captures[1]));

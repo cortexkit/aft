@@ -189,6 +189,36 @@ fn attention_batches_respect_the_budget_and_keep_order() {
 // ---- candidate text ------------------------------------------------------
 
 #[test]
+fn candidate_excerpt_does_not_visit_the_tail_after_the_budget() {
+    let project = tempfile::tempdir().unwrap();
+    let file = project.path().join("excerpt.rs");
+    let short = format!("fn excerpt() {{ /* {} */ }}\r\nsecond\r\n", "é".repeat(700));
+    let long = format!("{short}{}", "unused\r\n".repeat(2_000));
+    for symbol in [false, true] {
+        let render = |source: &str| {
+            std::fs::write(&file, source).unwrap();
+            let range =
+                symbol.then(|| super::super::comparator::SymbolOffsetRange::new(0, source.len()));
+            let candidate = CandidateResult::new_exact(
+                file.clone(),
+                range,
+                super::super::evidence_descriptor::EvidenceDescriptor::for_e1(1, true, false),
+            );
+            EXCERPT_LINES_VISITED.with(|count| count.set(0));
+            let text = candidate_text(project.path(), &candidate, "excerpt");
+            (text, EXCERPT_LINES_VISITED.with(|count| count.get()))
+        };
+        let (expected, _) = render(&short);
+        let (actual, visited) = render(&long);
+        assert_eq!(actual, expected);
+        assert!(
+            visited <= 2,
+            "visited {visited} excerpt lines (symbol={symbol})"
+        );
+    }
+}
+
+#[test]
 fn candidate_text_is_bounded_relative_and_repeatable() {
     let project = tempfile::tempdir().unwrap();
     let file = project.path().join("src/long.rs");
