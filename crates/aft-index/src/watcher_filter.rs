@@ -206,7 +206,8 @@ pub enum WatcherDispatchEvent {
     Error(String),
 }
 
-pub(crate) fn watcher_event_is_content_only(kind: &notify::EventKind) -> bool {
+#[doc(hidden)]
+pub fn watcher_event_is_content_only(kind: &notify::EventKind) -> bool {
     // Modify(Any), renames and backend-specific metadata events do not prove
     // that the path already existed. Only explicit data modifications qualify.
     matches!(
@@ -706,7 +707,8 @@ pub struct WatcherExclusionPaths {
     feature = "test-support"
 ))]
 impl WatcherExclusionPaths {
-    pub(crate) fn new(root: &Path, exclusions: &[WatcherExclusion]) -> Self {
+    #[doc(hidden)]
+    pub fn new(root: &Path, exclusions: &[WatcherExclusion]) -> Self {
         #[cfg(not(any(target_os = "macos", target_os = "linux", test)))]
         let _ = root;
         let mut state = Self {
@@ -741,7 +743,8 @@ impl WatcherExclusionPaths {
     // Only the Linux and macOS watcher backends, plus tests on all platforms,
     // read the combined exclusion list.
     #[cfg(any(unix, test, feature = "test-support"))]
-    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+    #[doc(hidden)]
+    pub fn paths(&self) -> Vec<PathBuf> {
         self.lasting
             .iter()
             .map(|entry| entry.path.clone())
@@ -1054,7 +1057,7 @@ enum ExclusionPathKind {
 }
 
 fn exclusion_device(path: &Path, metadata: &fs::Metadata) -> Option<u64> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     if EXCLUSION_TEST_DEVICE.with(|device| device.borrow().as_deref() == Some(path)) {
         return Some(u64::MAX);
     }
@@ -1191,7 +1194,8 @@ fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
 #[doc(hidden)]
 pub struct WatcherExclusionPlan {
     /// Exclusions to install, best first.
-    pub(crate) selected: Vec<WatcherExclusion>,
+    #[doc(hidden)]
+    pub selected: Vec<WatcherExclusion>,
     /// The next candidates that lost a slot to the cap, best first. Named in
     /// the overflow log so a flood specimen shows what the cap left watched.
     pub(crate) dropped: Vec<WatcherExclusion>,
@@ -1284,7 +1288,8 @@ pub enum WatcherExclusionUpdate {
 impl WatcherExclusionRetry {
     /// Install completed plans, or remove stale exclusions when a new matcher
     /// cannot be planned yet. Retrying the full plan keeps its own budget.
-    pub(crate) fn replacement(
+    #[doc(hidden)]
+    pub fn replacement(
         &mut self,
         root: &Path,
         generation: u64,
@@ -1327,7 +1332,8 @@ impl WatcherExclusionRetry {
         }
     }
 
-    pub(crate) fn attempt(
+    #[doc(hidden)]
+    pub fn attempt(
         &mut self,
         root: &Path,
         generation: u64,
@@ -1476,7 +1482,12 @@ thread_local! {
     static EXCLUSION_TEST_STAT_PATHS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
     static WATCHER_TEST_ROOT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static EXCLUSION_TEST_CLASSIFICATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    pub(crate) static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(any(test, feature = "test-support"))]
+thread_local! {
+    #[doc(hidden)]
+    pub static EXCLUSION_TEST_DEVICE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Git metadata is an exclusion boundary, never a tree to enumerate.
@@ -1726,8 +1737,9 @@ fn run_bounded_exclusion_planner<T: Send + 'static>(
 }
 
 /// The selected exclusions of [`derive_watcher_exclusion_plan`].
-#[cfg(test)]
-pub(crate) fn derive_excluded_subtrees(
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn derive_excluded_subtrees(
     root: &Path,
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
@@ -3510,7 +3522,7 @@ fn note_watcher_intake_for_test(path: &Path) {
 
 fn emit_watcher_overflow_log(line: String) {
     crate::slog_warn!("{line}");
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     WATCHER_OVERFLOW_LOGS_FOR_TEST
         .get_or_init(|| Mutex::new(Vec::new()))
         .lock()
@@ -3518,11 +3530,12 @@ fn emit_watcher_overflow_log(line: String) {
         .push(line);
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 static WATCHER_OVERFLOW_LOGS_FOR_TEST: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
 
-#[cfg(test)]
-pub(crate) fn take_watcher_overflow_logs_for_test() -> Vec<String> {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn take_watcher_overflow_logs_for_test() -> Vec<String> {
     std::mem::take(
         &mut *WATCHER_OVERFLOW_LOGS_FOR_TEST
             .get_or_init(|| Mutex::new(Vec::new()))

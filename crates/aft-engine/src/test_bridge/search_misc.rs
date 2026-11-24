@@ -404,7 +404,7 @@ pub trait ConfigReloadSignalTestExt {
 
 impl ConfigReloadSignalTestExt for crate::watcher_filter::config_events::ConfigReloadSignal {
     fn due_at_ms(&self) -> &std::sync::atomic::AtomicU64 {
-        &self.due_at_ms
+        self.due_at_ms_for_test()
     }
 }
 

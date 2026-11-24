@@ -336,12 +336,14 @@ fn meaning_gap(
 impl ChildCheckouts {
     /// Puts `checkout` in place as the bound checkout of `child`, so a test
     /// can give one child a state of its choosing.
-    pub(crate) fn insert_for_test(&self, parent: &Path, child: &Path, checkout: Arc<DataCheckout>) {
+    #[doc(hidden)]
+    pub fn insert_for_test(&self, parent: &Path, child: &Path, checkout: Arc<DataCheckout>) {
         *self.slot(parent, child).lock() = Some(checkout);
     }
 
     /// The child checkouts bound so far.
-    pub(crate) fn bound_for_test(&self) -> Vec<Arc<DataCheckout>> {
+    #[doc(hidden)]
+    pub fn bound_for_test(&self) -> Vec<Arc<DataCheckout>> {
         self.bound()
     }
 }

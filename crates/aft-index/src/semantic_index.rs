@@ -1503,7 +1503,8 @@ impl SemanticIndexFingerprint {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
+    #[doc(hidden)]
+    pub fn for_config_dimension(config: &SemanticBackendConfig, dimension: usize) -> Self {
         Self::from_config(config, dimension)
     }
 
@@ -3142,7 +3143,8 @@ impl SemanticEmbeddingModel {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn from_local_provider_for_test(
+    #[doc(hidden)]
+    pub fn from_local_provider_for_test(
         provider: Box<dyn LocalEmbeddingProvider>,
         project_root: PathBuf,
     ) -> Self {
@@ -5208,7 +5210,7 @@ pub struct SemanticIndex {
     last_append_read_bytes: Arc<AtomicUsize>,
     /// Rows rejected by the backend even after bounded body shrinking.
     skipped_rows: SkippedEmbeddingRows,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     removal_retain_passes: usize,
 }
 
@@ -5234,7 +5236,7 @@ impl Clone for SemanticIndex {
             persistence: Arc::clone(&self.persistence),
             last_append_read_bytes: Arc::clone(&self.last_append_read_bytes),
             skipped_rows: self.skipped_rows.clone(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             removal_retain_passes: self.removal_retain_passes,
         };
         // A view's overlay index is only ever read through an `Arc`. A clone
@@ -5650,7 +5652,7 @@ impl SemanticIndex {
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             skipped_rows: SkippedEmbeddingRows::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             removal_retain_passes: 0,
         }
     }
@@ -6340,7 +6342,7 @@ impl SemanticIndex {
                 persistence: Arc::new(Mutex::new(None)),
                 last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
                 skipped_rows: SkippedEmbeddingRows::default(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-support"))]
                 removal_retain_passes: 0,
             });
         }
@@ -6514,7 +6516,7 @@ impl SemanticIndex {
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             skipped_rows,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             removal_retain_passes: 0,
         })
     }
@@ -7547,7 +7549,7 @@ impl SemanticIndex {
         metadata_files: &[PathBuf],
         mut removed: impl FnMut(&mut EmbeddingEntry),
     ) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         {
             self.removal_retain_passes += 1;
         }
@@ -7820,15 +7822,17 @@ impl SemanticIndex {
         self.remove_indexed_file_keys(&invalidated, &metadata_keys);
     }
 
-    #[cfg(test)]
-    pub(crate) fn removal_retain_passes_for_test(&self) -> usize {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn removal_retain_passes_for_test(&self) -> usize {
         self.removal_retain_passes
     }
 
     /// Every entry as `(absolute file, symbol name, vector)`, sorted, so a test
     /// can check that vectors survived an operation bit-for-bit.
-    #[cfg(test)]
-    pub(crate) fn entry_vectors_for_test(&self) -> Vec<(PathBuf, String, Vec<f32>)> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn entry_vectors_for_test(&self) -> Vec<(PathBuf, String, Vec<f32>)> {
         let mut rows = self
             .live_entries()
             .map(|(path, entry)| {
@@ -9594,7 +9598,7 @@ impl SemanticIndex {
             persistence: Arc::new(Mutex::new(None)),
             last_append_read_bytes: Arc::new(AtomicUsize::new(0)),
             skipped_rows,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             removal_retain_passes: 0,
         };
         if index.fingerprint.is_some() && !header_languages_resolved {

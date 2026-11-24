@@ -89,7 +89,8 @@ impl RequestFile {
 
     /// Bytes read outside any request's set (no request is running), in the
     /// same shape so callers handle both cases alike.
-    pub(crate) fn unshared(bytes: Vec<u8>, stat: Option<FileStat>) -> Self {
+    #[doc(hidden)]
+    pub fn unshared(bytes: Vec<u8>, stat: Option<FileStat>) -> Self {
         Self::new(bytes, stat)
     }
 
@@ -426,7 +427,8 @@ pub struct Guard {
 
 #[cfg(any(test, feature = "test-support"))]
 impl Guard {
-    pub(crate) fn files(&self) -> &Arc<RequestFiles> {
+    #[doc(hidden)]
+    pub fn files(&self) -> &Arc<RequestFiles> {
         &self.files
     }
 }

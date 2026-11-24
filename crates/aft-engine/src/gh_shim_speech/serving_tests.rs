@@ -1,6 +1,7 @@
 use super::*;
 #[allow(unused_imports)]
 pub(crate) use aft_base::cache_location::speech_serving_tests::*;
+use std::sync::Arc;
 
 // speech_serving_tests::probe re-execs this exact test name in its caller's harness.
 #[test]

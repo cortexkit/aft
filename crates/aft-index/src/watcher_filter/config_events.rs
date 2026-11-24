@@ -27,6 +27,12 @@ pub struct ConfigReloadSignal {
 }
 
 impl ConfigReloadSignal {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn due_at_ms_for_test(&self) -> &AtomicU64 {
+        &self.due_at_ms
+    }
+
     /// Ask for a reload once the debounce window has passed quietly.
     pub fn request(&self) {
         self.request_after(CONFIG_RELOAD_DEBOUNCE);

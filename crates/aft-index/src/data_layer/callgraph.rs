@@ -988,7 +988,8 @@ pub struct FileResolution {
     /// names.
     pub(crate) dispatch: Option<DispatchTypeTargets>,
     /// Pass 4: the method-call sites kept, in site order.
-    pub(crate) sites: Vec<SiteResolution>,
+    #[doc(hidden)]
+    pub sites: Vec<SiteResolution>,
     /// Pass 4: the dependency keys its site resolutions read.
     pub(crate) site_dependencies: BTreeSet<String>,
 }

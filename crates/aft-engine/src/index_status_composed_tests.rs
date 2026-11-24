@@ -425,4 +425,5 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::context::AppContext;
+use crate::data_layer::status::SemanticFillHealth;
 use crate::data_layer::surfaces::{fixtures::*, *};

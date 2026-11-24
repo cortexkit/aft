@@ -14,8 +14,10 @@ pub struct WatcherOverflowPrefix {
 
 #[derive(Debug, Clone)]
 pub struct WatcherBackendExclusions {
-    pub(crate) matcher_generation: u64,
-    pub(crate) paths: Vec<PathBuf>,
+    #[doc(hidden)]
+    pub matcher_generation: u64,
+    #[doc(hidden)]
+    pub paths: Vec<PathBuf>,
     /// The next candidates that lost a slot to the exclusion cap, best first.
     /// Carried beside the installed set so the overflow log can say what the
     /// cap left watched.
@@ -37,7 +39,8 @@ impl Default for WatcherBackendExclusions {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct WatcherExclusionPlanningSnapshot {
     pub(crate) matcher_generation: u64,
-    pub(crate) attempts: u32,
+    #[doc(hidden)]
+    pub attempts: u32,
     pub(crate) attempt_limit: u32,
     pub(crate) status: &'static str,
     pub(crate) last_failure: Option<&'static str>,
@@ -48,12 +51,15 @@ pub struct WatcherExclusionPlanningSnapshot {
 pub struct WatcherCountersSnapshot {
     /// None on backends that do not plan exclusions. The exhausted retry budget
     /// and last planning failure remain visible without further filesystem events.
-    pub(crate) exclusion_planning: Option<WatcherExclusionPlanningSnapshot>,
+    #[doc(hidden)]
+    pub exclusion_planning: Option<WatcherExclusionPlanningSnapshot>,
     /// Successful native stream allocations over this root's process lifetime,
     /// including its auxiliary paths and config-file fallback watch.
     pub(crate) fsevents_stream_creations_total: u64,
-    pub(crate) raw_events_total: u64,
-    pub(crate) raw_events_since_last_rescan: u64,
+    #[doc(hidden)]
+    pub raw_events_total: u64,
+    #[doc(hidden)]
+    pub raw_events_since_last_rescan: u64,
     pub(crate) invalidating_events_total: u64,
     pub(crate) invalidating_events_since_last_rescan: u64,
     pub(crate) paths_after_gitignore_total: u64,
@@ -66,19 +72,27 @@ pub struct WatcherCountersSnapshot {
     pub(crate) directory_subtree_walks_total: u64,
     pub(crate) directory_empty_total: u64,
     pub(crate) directory_walk_fallbacks_total: u64,
-    pub(crate) overflows_total: u64,
+    #[doc(hidden)]
+    pub overflows_total: u64,
     /// Event loss remains actionable until a complete rescan covers it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub(crate) loss_unrecovered: bool,
+    #[doc(hidden)]
+    pub loss_unrecovered: bool,
     pub(crate) watch_lost_races_total: u64,
-    pub(crate) overflows_during_rescan: u64,
+    #[doc(hidden)]
+    pub overflows_during_rescan: u64,
     pub(crate) last_overflow_prefixes: Vec<WatcherOverflowPrefix>,
     pub(crate) rescans_buffer_overflow_total: u64,
-    pub(crate) rescans_kernel_dropped_total: u64,
-    pub(crate) rescans_user_dropped_total: u64,
-    pub(crate) rescans_unknown_total: u64,
-    pub(crate) last_rescan_at_ms: Option<u64>,
-    pub(crate) last_rescan_cost_ms: Option<u64>,
+    #[doc(hidden)]
+    pub rescans_kernel_dropped_total: u64,
+    #[doc(hidden)]
+    pub rescans_user_dropped_total: u64,
+    #[doc(hidden)]
+    pub rescans_unknown_total: u64,
+    #[doc(hidden)]
+    pub last_rescan_at_ms: Option<u64>,
+    #[doc(hidden)]
+    pub last_rescan_cost_ms: Option<u64>,
     pub(crate) last_rescan_rss_delta_bytes: Option<i64>,
 }
 
@@ -175,7 +189,8 @@ impl WatcherCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn directory_arrival_guard(&self) -> DirectoryArrivalGuard<'_> {
+    #[doc(hidden)]
+    pub fn directory_arrival_guard(&self) -> DirectoryArrivalGuard<'_> {
         self.directory_arrivals_in_flight
             .fetch_add(1, Ordering::AcqRel);
         DirectoryArrivalGuard(self)
@@ -195,7 +210,8 @@ impl WatcherCounters {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_directory_files_queued(&self) {
+    #[doc(hidden)]
+    pub fn note_directory_files_queued(&self) {
         self.directory_files_unflushed
             .store(true, Ordering::Release);
     }
@@ -212,7 +228,8 @@ impl WatcherCounters {
             || self.dispatch_backlog() > 0
     }
 
-    pub(crate) fn note_overflow_ignore_relevance(&self, relevant: bool) {
+    #[doc(hidden)]
+    pub fn note_overflow_ignore_relevance(&self, relevant: bool) {
         self.overflow_ignore_evidence
             .fetch_or(if relevant { 3 } else { 1 }, Ordering::AcqRel);
     }
@@ -224,25 +241,29 @@ impl WatcherCounters {
         self.overflow_ignore_evidence.swap(0, Ordering::AcqRel) != 1
     }
     #[cfg(any(target_os = "macos", test, feature = "test-support"))]
-    pub(crate) fn note_fsevents_stream_creation(&self) {
+    #[doc(hidden)]
+    pub fn note_fsevents_stream_creation(&self) {
         self.fsevents_stream_creations_total
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_raw_event(&self) {
+    #[doc(hidden)]
+    pub fn note_raw_event(&self) {
         self.raw_events_total.fetch_add(1, Ordering::Relaxed);
         self.raw_events_since_last_rescan
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_invalidating_event(&self) {
+    #[doc(hidden)]
+    pub fn note_invalidating_event(&self) {
         self.invalidating_events_total
             .fetch_add(1, Ordering::Relaxed);
         self.invalidating_events_since_last_rescan
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_paths_after_gitignore(&self, count: usize) {
+    #[doc(hidden)]
+    pub fn note_paths_after_gitignore(&self, count: usize) {
         let count = count as u64;
         self.paths_after_gitignore_total
             .fetch_add(count, Ordering::Relaxed);
@@ -250,7 +271,8 @@ impl WatcherCounters {
             .fetch_add(count, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_paths_dispatched(&self, count: usize) {
+    #[doc(hidden)]
+    pub fn note_paths_dispatched(&self, count: usize) {
         let count = count as u64;
         self.paths_dispatched_total
             .fetch_add(count, Ordering::Relaxed);
@@ -261,7 +283,8 @@ impl WatcherCounters {
     /// Record changed files the watcher thread holds in its flush window.
     /// Only files the call graph indexes are kept: a call-graph answer is the
     /// only reader, and other files cannot change one.
-    pub(crate) fn note_unflushed_paths<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) {
+    #[doc(hidden)]
+    pub fn note_unflushed_paths<'a>(&self, paths: impl IntoIterator<Item = &'a PathBuf>) {
         let mut unflushed = self
             .unflushed_source_paths
             .lock()
@@ -288,7 +311,8 @@ impl WatcherCounters {
 
     /// The flush window ended: its files are in the dispatch channel (or were
     /// filtered out), where the watcher drain accounts for them.
-    pub(crate) fn clear_unflushed_paths(&self) {
+    #[doc(hidden)]
+    pub fn clear_unflushed_paths(&self) {
         self.unflushed_source_paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -307,7 +331,8 @@ impl WatcherCounters {
 
     /// Record how many events the watcher thread holds for a full dispatch
     /// channel.
-    pub(crate) fn set_dispatch_backlog(&self, events: usize) {
+    #[doc(hidden)]
+    pub fn set_dispatch_backlog(&self, events: usize) {
         self.dispatch_backlog_events
             .store(events, Ordering::Release);
     }
@@ -322,7 +347,8 @@ impl WatcherCounters {
         self.watch_lost_races_total.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn note_overflow(
+    #[doc(hidden)]
+    pub fn note_overflow(
         &self,
         reason: crate::watcher_filter::RescanReason,
         prefixes: Vec<WatcherOverflowPrefix>,
@@ -384,8 +410,9 @@ impl WatcherCounters {
         None
     }
 
-    #[cfg(test)]
-    pub(crate) fn rescan_in_progress(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn rescan_in_progress(&self) -> bool {
         self.loss_recovery
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -433,14 +460,16 @@ impl WatcherCounters {
         test,
         feature = "test-support"
     ))]
-    pub(crate) fn set_exclusion_planning(&self, snapshot: WatcherExclusionPlanningSnapshot) {
+    #[doc(hidden)]
+    pub fn set_exclusion_planning(&self, snapshot: WatcherExclusionPlanningSnapshot) {
         *self
             .exclusion_planning
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(snapshot);
     }
 
-    pub(crate) fn backend_exclusions(&self) -> WatcherBackendExclusions {
+    #[doc(hidden)]
+    pub fn backend_exclusions(&self) -> WatcherBackendExclusions {
         self.backend_exclusions
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

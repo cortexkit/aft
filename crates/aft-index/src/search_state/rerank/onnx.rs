@@ -510,7 +510,8 @@ pub fn shared_onnx_reranker_in(
 /// Local paths of one model's files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelFiles {
-    pub(crate) model: PathBuf,
+    #[doc(hidden)]
+    pub model: PathBuf,
     /// External weight files loaded beside the graph.
     pub(crate) extras: Vec<PathBuf>,
     pub(crate) tokenizer: PathBuf,
@@ -701,14 +702,19 @@ pub struct SessionTuning {
     /// threads doing the work, and measured on gte-reranker-modernbert-base it
     /// about doubled the CPU time of a call (18 s against 8.5 s for 20
     /// candidates) without making it faster. So it is off.
-    pub(crate) intra_op_spinning: bool,
-    pub(crate) memory_pattern: bool,
+    #[doc(hidden)]
+    pub intra_op_spinning: bool,
+    #[doc(hidden)]
+    pub memory_pattern: bool,
     /// Use ONNX Runtime's CPU memory arena (it keeps freed blocks for reuse).
-    pub(crate) cpu_arena: bool,
+    #[doc(hidden)]
+    pub cpu_arena: bool,
     /// Ask the arena to release its unused blocks at the end of every run.
-    pub(crate) arena_shrinkage: bool,
+    #[doc(hidden)]
+    pub arena_shrinkage: bool,
     /// Largest `batch × tokens²` one inference may use.
-    pub(crate) attention_units: usize,
+    #[doc(hidden)]
+    pub attention_units: usize,
     /// Run the graph through Core ML (Apple GPU / Neural Engine) with these
     /// compute units; `None` is the CPU provider alone. Only the hardware
     /// experiment test sets it.

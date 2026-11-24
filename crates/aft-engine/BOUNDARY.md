@@ -451,6 +451,118 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `outline::tables::Tables` | visibility widened | `aft-index` | Reach the actual shared outline table when checking its memory. |
 | `outline::tables::TableStats` | visibility widened | `aft-index` | Read the table’s existing memory statistics through the test bridge. |
 | `outline::tables::Tables::stats` | visibility widened | `aft-index` | Preserve the outline cache byte observation. |
+| `watcher_filter::watcher_event_is_content_only` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_filter::new` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_filter::paths` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_filter::attempt` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_filter::replacement` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_filter::derive_excluded_subtrees` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_filter::take_watcher_overflow_logs_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `local_embed::embedding_cache_dir` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::meaning::STARTING_STAGE` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::meaning::refresh_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::flush::observe` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::set_dispatch_backlog` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::directory_arrival_guard` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_directory_files_queued` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::clear_unflushed_paths` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_overflow_ignore_relevance` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_overflow` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_raw_event` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_unflushed_paths` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::rescan_in_progress` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::set_exclusion_planning` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_fsevents_stream_creation` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_invalidating_event` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_paths_after_gitignore` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::note_paths_dispatched` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `watcher_backend::counters::backend_exclusions` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::open` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::disk_measurement` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::filling` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::checkout_arc_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::refresh_meaning_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::pause_meaning_summary_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::wait_for_memory_profile_idle_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::runtime::note_outcome_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::checkout::dead_code_snapshot_shared` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::checkout::source_work_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::checkout::todo_count_memo_stats_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::checkout::outline_symbols` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::checkout::parse_gaps_identity` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::parent_query::discovery_scope` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `semantic_index::for_config_dimension` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `semantic_index::from_local_provider_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `semantic_index::removal_retain_passes_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `semantic_index::entry_vectors_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `search_state::rerank::slot::with_constructor` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `search_state::rerank::slot::set_constructor_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `search_state::request_files::files` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `search_state::request_files::unshared` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `search_index::file_entries` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `search_index::has_file_in_scope` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::vectors::status_member_builds_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::surfaces::status_disk_walks_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::ignore_rules::ignore_rules_fixture` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::parent::insert_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `data_layer::parent::bound_for_test` | visibility widened | `aft-index` | Retain the existing index observation or driver used by composition tests. |
+| `FileResolution::sites` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::rescans_unknown_total` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::last_rescan_at_ms` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::loss_unrecovered` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::overflows_total` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::overflows_during_rescan` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::raw_events_total` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::raw_events_since_last_rescan` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::rescans_kernel_dropped_total` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::rescans_user_dropped_total` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::last_rescan_cost_ms` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherCountersSnapshot::exclusion_planning` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherBackendExclusions::matcher_generation` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherBackendExclusions::paths` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherExclusionPlanningSnapshot::attempts` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `DataLayerMemory::shared` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `DataStoreReport::files` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `DataStoreReport::pending_edits` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Prewarm::cached` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Prewarm::loaded` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Prewarm::left` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Prewarm::stopped` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `StoredOutline::symbols` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `TableStats::bytes` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `WatcherExclusionPlan::selected` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `RerankSettings::backend` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `RerankSettings::model` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `BuildInputs::search` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `BuildInputs::semantic` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `BuildInputs::cache_unavailable` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `FixturePack::scores` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `FixturePack::fingerprint` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `FixturePack::text_policy` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `ModelFiles::model` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `SessionTuning::intra_op_spinning` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `SessionTuning::memory_pattern` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `SessionTuning::cpu_arena` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `SessionTuning::arena_shrinkage` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `SessionTuning::attention_units` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Daemon::path` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Daemon::counts` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Counts::opens` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Counts::closes` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Counts::active` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+| `Counts::queries` | visibility widened | `aft-index` | Keep the same recorded field available to the engine’s test or bridge. |
+
+| `watcher_backend::ProjectWatcher` | visibility widened | `aft-index` | Preserve the native watcher type used by composition and its tests. |
+| `WatcherExclusionPlanningSnapshot::new` | moved test-support constructor | `aft-index` | Keep the bridge’s fixture constructor on the original type. |
+| `WatcherOverflowPrefix::new` | moved test-support constructor | `aft-index` | Create the original watcher prefix fixture without exposing constructor fields. |
+| `ConfigReloadSignal::due_at_ms_for_test` | test-support accessor | `aft-index` | Preserve the test bridge’s clock observation without exposing the field in release builds. |
+| `watcher_filter::EXCLUSION_TEST_DEVICE` | test-support visibility widened | `aft-index` | Allow composition tests to supply the same simulated mount boundary. |
+| `SourceWork` | visibility widened | `aft-index` | Preserve the measured checkout work used in composed tests. |
+| `SourceWork::todo_decodes` | visibility widened | `aft-index` | Assert that the composed TODO scan only decodes changed records. |
+| `checkout::composed_checks::canonical_graph_path` | test-support driver | `aft-index` | Compare inspect’s lazy resolution with the stored graph’s original path resolution. |
+| `ignore_rules_fixture::write` | test-support visibility widened | `aft-index` | Build the same source and ignore files in each composed consumer test. |
+| `ignore_rules_fixture::relative_set` | test-support visibility widened | `aft-index` | Compare results using the same relative file names. |
+| `ignore_rules_fixture::assert_honours_ignore_rules` | test-support visibility widened | `aft-index` | Keep the same inclusion and exclusion assertions across consumers. |
 
 ## Visibility widened for cross-crate callers
 

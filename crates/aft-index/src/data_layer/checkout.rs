@@ -105,7 +105,8 @@ fn scan_paths(
 /// graph, for tests of work that must do neither. Only tests keep count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) struct SourceWork {
+#[doc(hidden)]
+pub struct SourceWork {
     /// Passes over the files: a scan reads every file whose stat does not
     /// prove its recorded content, and a build's scan parses what it reads.
     pub(crate) scans: usize,
@@ -119,7 +120,8 @@ pub(crate) struct SourceWork {
     /// kept, since nothing is let go before then.
     pub(crate) decoded_parses: usize,
     pub(crate) decoded_resolutions: usize,
-    pub(crate) todo_decodes: usize,
+    #[doc(hidden)]
+    pub todo_decodes: usize,
 }
 
 #[cfg(any(test, feature = "test-support"))]
@@ -131,7 +133,8 @@ fn source_work() -> &'static Mutex<HashMap<PathBuf, SourceWork>> {
 
 /// What the checkout at `root` did so far (see [`SourceWork`]).
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn source_work_for_test(root: &Path) -> SourceWork {
+#[doc(hidden)]
+pub fn source_work_for_test(root: &Path) -> SourceWork {
     source_work()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -4069,7 +4072,8 @@ impl CheckoutView {
 
     /// Parsing can record a gap without changing text or publishing. Meaning
     /// coverage caches must distinguish those views too.
-    pub(crate) fn parse_gaps_identity(&self) -> Digest128 {
+    #[doc(hidden)]
+    pub fn parse_gaps_identity(&self) -> Digest128 {
         let mut hash = blake3::Hasher::new_derive_key("AFT checkout parse coverage");
         for (path, reason) in self.current_state().skipped_parses() {
             hash.update(&(path.len() as u64).to_le_bytes());
@@ -4315,7 +4319,8 @@ impl CheckoutView {
     /// # Errors
     ///
     /// When a stored parse cannot be read.
-    pub(crate) fn dead_code_snapshot_shared(
+    #[doc(hidden)]
+    pub fn dead_code_snapshot_shared(
         &self,
         entry_points: &dyn super::dead_code_snapshot::EntryPoints,
     ) -> Result<Arc<crate::data_layer::dead_code_snapshot::CallgraphSnapshot>, DataError> {
@@ -5938,7 +5943,8 @@ impl CheckoutView {
     /// # Errors
     ///
     /// When the record cannot be read.
-    pub(crate) fn outline_symbols(
+    #[doc(hidden)]
+    pub fn outline_symbols(
         &self,
         path: &[u8],
     ) -> Result<Option<super::outline::StoredOutline>, DataError> {
@@ -6011,8 +6017,9 @@ impl TodoCountMemo {
 }
 
 impl Checkout {
-    #[cfg(all(test, target_os = "linux"))]
-    pub(crate) fn todo_count_memo_stats_for_test(&self) -> (usize, usize) {
+    #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
+    #[doc(hidden)]
+    pub fn todo_count_memo_stats_for_test(&self) -> (usize, usize) {
         use aft_store::heap::HeapBytes as _;
         let memo = self.todo_counts.lock().unwrap();
         (

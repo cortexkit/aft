@@ -21,3 +21,4 @@ impl WatcherOverflowPrefix {
         Self { prefix, count }
     }
 }
+use super::counters::{WatcherExclusionPlanningSnapshot, WatcherOverflowPrefix};

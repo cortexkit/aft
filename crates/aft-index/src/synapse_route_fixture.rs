@@ -10,10 +10,14 @@ const FAKE_DAEMON_VERSION: &str = "0.39.0";
 
 #[derive(Default)]
 pub struct Counts {
-    pub(crate) opens: usize,
-    pub(crate) closes: usize,
-    pub(crate) active: usize,
-    pub(crate) queries: usize,
+    #[doc(hidden)]
+    pub opens: usize,
+    #[doc(hidden)]
+    pub closes: usize,
+    #[doc(hidden)]
+    pub active: usize,
+    #[doc(hidden)]
+    pub queries: usize,
     pub(crate) connections: usize,
     /// Connections the fake has accepted and not yet seen close.
     pub(crate) live: usize,
@@ -21,8 +25,10 @@ pub struct Counts {
 
 pub struct Daemon {
     _directory: tempfile::TempDir,
-    pub(crate) path: PathBuf,
-    pub(crate) counts: Arc<(Mutex<Counts>, Condvar)>,
+    #[doc(hidden)]
+    pub path: PathBuf,
+    #[doc(hidden)]
+    pub counts: Arc<(Mutex<Counts>, Condvar)>,
     stop: tokio::sync::oneshot::Sender<()>,
     server: std::thread::JoinHandle<()>,
     pub(super) release: tokio::sync::watch::Sender<bool>,

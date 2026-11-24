@@ -29,13 +29,16 @@ pub(crate) const MAX_BUILD_BACKOFF: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct BuildInputs {
-    pub(crate) search: SearchConfig,
+    #[doc(hidden)]
+    pub search: SearchConfig,
     /// The embedding connection settings; the Synapse reranker reuses them.
-    pub(crate) semantic: SemanticBackendConfig,
+    #[doc(hidden)]
+    pub semantic: SemanticBackendConfig,
     /// True when the process serves requests for the SubC daemon (the shared
     /// multi-project host); the Synapse reranker is reachable only then.
     pub(crate) under_subc: bool,
-    pub(crate) cache_unavailable: bool,
+    #[doc(hidden)]
+    pub cache_unavailable: bool,
     pub(crate) cache_lease: Option<Arc<aft_db::root_cache::CacheLease>>,
     pub(crate) cache_epoch: u64,
 }
@@ -101,7 +104,8 @@ impl Default for BackendSlot {
 }
 
 impl BackendSlot {
-    pub(crate) fn with_constructor(constructor: Constructor) -> Self {
+    #[doc(hidden)]
+    pub fn with_constructor(constructor: Constructor) -> Self {
         Self {
             state: Arc::new(Mutex::new(SlotState {
                 generation: 0,
@@ -114,7 +118,8 @@ impl BackendSlot {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_constructor_for_test(&self, constructor: Constructor, backoff: Duration) {
+    #[doc(hidden)]
+    pub fn set_constructor_for_test(&self, constructor: Constructor, backoff: Duration) {
         *lock(&self.constructor) = constructor;
         *lock(&self.backoff) = backoff;
     }

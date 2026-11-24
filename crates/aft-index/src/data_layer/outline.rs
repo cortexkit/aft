@@ -36,7 +36,8 @@ use crate::parser::{SharedSymbolCache, SymbolCache};
 pub struct StoredOutline {
     /// The content the symbols were extracted from.
     pub(crate) content: ContentKey,
-    pub(crate) symbols: Vec<OutlineSymbol>,
+    #[doc(hidden)]
+    pub symbols: Vec<OutlineSymbol>,
 }
 
 /// What one prewarm did with the checkout's files.
@@ -44,14 +45,18 @@ pub struct StoredOutline {
 #[doc(hidden)]
 pub struct Prewarm {
     /// Already in the cache for the file's current modification time.
-    pub(crate) cached: u64,
+    #[doc(hidden)]
+    pub cached: u64,
     /// Filled from their records.
-    pub(crate) loaded: u64,
+    #[doc(hidden)]
+    pub loaded: u64,
     /// Left for an ordinary parse: changed since the publication or on disk,
     /// unreadable, or with no outline in their record.
-    pub(crate) left: u64,
+    #[doc(hidden)]
+    pub left: u64,
     /// The prewarm stopped before it visited every file.
-    pub(crate) stopped: bool,
+    #[doc(hidden)]
+    pub stopped: bool,
 }
 
 /// What became of one file.

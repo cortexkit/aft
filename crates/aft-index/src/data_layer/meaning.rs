@@ -36,7 +36,8 @@ const FILES_PER_ROUND: usize = 256;
 /// The stage a meaning plane reports before its first fill round has
 /// learned the model's identity, which needs the model loaded (and, for a
 /// remote backend, asked for its vector length).
-pub(crate) const STARTING_STAGE: &str = "loading_embedding_model";
+#[doc(hidden)]
+pub const STARTING_STAGE: &str = "loading_embedding_model";
 
 /// The stage a meaning plane reports while it fills and has nothing to
 /// serve yet.
@@ -335,8 +336,9 @@ impl Meaning {
         self.state_inner(view, true)
     }
 
-    #[cfg(test)]
-    pub(crate) fn refresh_for_test(&self, view: Option<&CheckoutView>) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn refresh_for_test(&self, view: Option<&CheckoutView>) {
         *lock(&self.refreshed_at) = None;
         self.refresh_read_only();
         self.state(view);

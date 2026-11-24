@@ -174,14 +174,16 @@ pub struct DataStoreReport {
     #[doc(hidden)]
     pub callgraph: PlaneReport,
     /// Paths of the checkout as last published; `None` before anything is.
-    pub(crate) files: Option<usize>,
+    #[doc(hidden)]
+    pub files: Option<usize>,
     /// While the text plane is building over a publication: paths whose
     /// text it has indexed.
     pub(crate) indexed_files: Option<usize>,
     /// Edits recorded since the publication that the call graph has not
     /// resolved yet. The graph answers meanwhile; an exact reader waits for
     /// them.
-    pub(crate) pending_edits: usize,
+    #[doc(hidden)]
+    pub pending_edits: usize,
     /// Files in a parsed language that the call graph does not cover,
     /// because extracting them failed.
     pub(crate) unparsed_files: usize,
@@ -1126,7 +1128,7 @@ impl DiskMeasurement {
             DISK_ENTRY_CAP,
             Instant::now() + DISK_WALK_BUDGET,
         )?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STATUS_DISK_WALKS.with(|count| count.set(count.get() + 1));
         if let Some(reason) = usage.stop {
             log::warn!(
@@ -1153,7 +1155,8 @@ impl DiskMeasurement {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct DataLayerMemory {
-    pub(crate) shared: MemoryEstimate,
+    #[doc(hidden)]
+    pub shared: MemoryEstimate,
     pub(crate) text: u64,
     pub(crate) callgraph: u64,
     pub(crate) meaning: u64,
@@ -2304,13 +2307,14 @@ pub(crate) mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static STATUS_DISK_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn status_disk_walks_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn status_disk_walks_for_test() -> usize {
     STATUS_DISK_WALKS.with(|count| count.replace(0))
 }
 

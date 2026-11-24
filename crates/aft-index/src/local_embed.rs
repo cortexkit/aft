@@ -721,7 +721,8 @@ fn resolve_model_files(cache_dir: Option<&Path>) -> Result<(PathBuf, PathBuf), S
 /// `<storage>/semantic/models`. Keep the same env + default so existing
 /// downloads are reused; an absolute `XDG_CACHE_HOME` outranks the `~/.cache`
 /// default.
-pub(crate) fn embedding_cache_dir() -> Result<PathBuf, String> {
+#[doc(hidden)]
+pub fn embedding_cache_dir() -> Result<PathBuf, String> {
     embedding_cache_dir_from(
         |name| crate::environment::non_empty_os_var(name),
         std::env::home_dir().as_deref(),

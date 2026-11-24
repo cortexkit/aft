@@ -118,7 +118,8 @@ pub struct TableStats {
     /// Tables some symbol cache, or this one for later binds, holds.
     pub(crate) tables: u64,
     /// Their estimated bytes, with the bookkeeping that lists them.
-    pub(crate) bytes: u64,
+    #[doc(hidden)]
+    pub bytes: u64,
     /// The bytes of tables held for later binds.
     pub(crate) kept_bytes: u64,
     pub(crate) budget_bytes: u64,

@@ -1432,7 +1432,8 @@ impl Drop for DataCheckout {
 impl DataCheckout {
     /// [`Self::open_planes`] with every plane.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn open(
+    #[doc(hidden)]
+    pub fn open(
         root: &Path,
         storage: &Path,
         executor: Option<RootMaintenanceExecutor>,
@@ -1634,8 +1635,9 @@ impl DataCheckout {
         &self.work.checkout
     }
 
-    #[cfg(test)]
-    pub(crate) fn checkout_arc_for_test(&self) -> Arc<Checkout> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn checkout_arc_for_test(&self) -> Arc<Checkout> {
         Arc::clone(&self.work.checkout)
     }
 
@@ -1653,7 +1655,8 @@ impl DataCheckout {
     /// ready view before its background build ends.
     /// Profiles must wait before applying the edits that populate an engine.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn wait_for_memory_profile_idle_for_test(&self) {
+    #[doc(hidden)]
+    pub fn wait_for_memory_profile_idle_for_test(&self) {
         let deadline = Instant::now() + Duration::from_secs(300);
         // Read the task count first: observing its release publishes the flags
         // set by the build's follow-up work before `running` is checked.
@@ -2158,11 +2161,8 @@ impl DataCheckout {
     /// Records an outcome as a build or refresh of this checkout would, for
     /// a test of what status reports for it.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn note_outcome_for_test<T>(
-        &self,
-        stage: &'static str,
-        result: &Result<T, DataError>,
-    ) {
+    #[doc(hidden)]
+    pub fn note_outcome_for_test<T>(&self, stage: &'static str, result: &Result<T, DataError>) {
         self.work.checkout.note_outcome(stage, result);
     }
 
@@ -2179,7 +2179,8 @@ impl DataCheckout {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(notify);
     }
 
-    pub(crate) fn disk_measurement(&self) -> &Arc<super::surfaces::DiskMeasurement> {
+    #[doc(hidden)]
+    pub fn disk_measurement(&self) -> &Arc<super::surfaces::DiskMeasurement> {
         &self.disk_measurement
     }
 
@@ -2245,13 +2246,15 @@ impl DataCheckout {
         self.work.meaning.cached_state(self.view().as_ref())
     }
 
-    #[cfg(test)]
-    pub(crate) fn refresh_meaning_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn refresh_meaning_for_test(&self) {
         self.work.meaning.refresh_for_test(self.view().as_ref());
     }
 
-    #[cfg(test)]
-    pub(crate) fn pause_meaning_summary_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pause_meaning_summary_for_test(&self) {
         *self.work.status_summary_paused.lock().unwrap() = true;
     }
 
@@ -2277,7 +2280,8 @@ impl DataCheckout {
     }
 
     /// Whether a fill round is queued or running.
-    pub(crate) fn filling(&self) -> bool {
+    #[doc(hidden)]
+    pub fn filling(&self) -> bool {
         self.work.filling.load(Ordering::Acquire)
     }
 

@@ -653,3 +653,11 @@ pub(super) fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> 
 pub(super) fn live_segments(checkout: &Checkout) -> usize {
     checkout.store_segments().unwrap()
 }
+#[doc(hidden)]
+pub fn canonical_graph_path(root: &Path, path: &str) -> PathBuf {
+    crate::data_layer::dead_code::Paths {
+        root,
+        cache: HashMap::new(),
+    }
+    .resolve(path)
+}

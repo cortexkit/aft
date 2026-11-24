@@ -1505,11 +1505,10 @@ mod tests {
             "src/shared.rs",
             "src/../src/lib.rs",
         ]) {
-            let canonical = crate::data_layer::dead_code::Paths {
-                root: view.root(),
-                cache: std::collections::HashMap::new(),
-            }
-            .resolve(path);
+            let canonical = crate::data_layer::checkout::composed_checks::canonical_graph_path(
+                view.root(),
+                path,
+            );
             assert_eq!(graph.resolve(path), canonical, "{path}");
         }
         assert!(graph.resolves_lexically("src/real/inner.rs"));

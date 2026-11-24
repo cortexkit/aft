@@ -49,9 +49,12 @@ pub struct PackScore {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FixturePack {
     pub(crate) version: u32,
-    pub(crate) fingerprint: PackFingerprint,
-    pub(crate) text_policy: String,
-    pub(crate) scores: Vec<PackScore>,
+    #[doc(hidden)]
+    pub fingerprint: PackFingerprint,
+    #[doc(hidden)]
+    pub text_policy: String,
+    #[doc(hidden)]
+    pub scores: Vec<PackScore>,
 }
 
 impl FixturePack {

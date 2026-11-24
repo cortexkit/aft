@@ -231,7 +231,8 @@ impl FlushControl {
 
     /// Called on the raw intake, after preceding changes entered the journal.
     /// Marker creation/removal never becomes a user file change.
-    pub(crate) fn observe(&self, event: &Event) -> bool {
+    #[doc(hidden)]
+    pub fn observe(&self, event: &Event) -> bool {
         // A control filename must never hide a native overflow notification.
         if event.need_rescan() {
             return false;

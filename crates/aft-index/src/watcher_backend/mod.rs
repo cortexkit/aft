@@ -9,6 +9,9 @@ pub mod counters;
 #[doc(hidden)]
 pub mod flush;
 
+#[cfg(any(test, feature = "test-support"))]
+mod test_constructors;
+
 // Directories inotify could not watch when it started. Recursive-handle
 // backends (FSEvents, Windows) watch the whole tree with one handle and have
 // no per-directory gaps.
@@ -119,13 +122,16 @@ mod notification_buffer {
 #[cfg(target_os = "macos")]
 pub(crate) use fsevents::DirectoryWatcher;
 #[cfg(target_os = "macos")]
-pub(crate) use fsevents::ProjectWatcher;
+#[doc(hidden)]
+pub use fsevents::ProjectWatcher;
 #[cfg(target_os = "linux")]
-pub(crate) use inotify::ProjectWatcher;
+#[doc(hidden)]
+pub use inotify::ProjectWatcher;
 #[cfg(windows)]
 pub(crate) use windows::DirectoryWatcher;
 #[cfg(windows)]
-pub(crate) use windows::ProjectWatcher;
+#[doc(hidden)]
+pub use windows::ProjectWatcher;
 
 /// Whether the backend compiled into this binary inherits an exclusion down
 /// the subtree below it.

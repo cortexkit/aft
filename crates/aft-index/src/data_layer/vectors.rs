@@ -633,7 +633,7 @@ impl Members {
     }
 
     fn build(view: &CheckoutView, loaded: &Loaded, max_files: usize) -> Result<Self, DataError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         STATUS_MEMBER_BUILDS.with(|count| count.set(count.get() + 1));
         let index = loaded.shared.as_ref().map(SharedVectorIndex::index);
         let surveyed = survey(view, loaded, index.as_ref(), max_files)?;
@@ -3809,12 +3809,13 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static STATUS_MEMBER_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
-pub(crate) fn status_member_builds_for_test() -> usize {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn status_member_builds_for_test() -> usize {
     STATUS_MEMBER_BUILDS.with(|count| count.replace(0))
 }

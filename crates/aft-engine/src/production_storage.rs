@@ -1,9 +1,10 @@
+#[cfg(test)]
+pub(crate) use aft_base::production_storage::CODE;
 pub use aft_db::production_storage::*;
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aft_base::production_storage::CODE;
 
     #[cfg(debug_assertions)]
     #[test]

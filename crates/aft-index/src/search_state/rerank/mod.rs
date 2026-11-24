@@ -152,8 +152,10 @@ impl RerankBackend for NoopRerankBackend {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct RerankSettings {
-    pub(crate) backend: RerankBackendKind,
-    pub(crate) model: Option<String>,
+    #[doc(hidden)]
+    pub backend: RerankBackendKind,
+    #[doc(hidden)]
+    pub model: Option<String>,
     pub top_n: usize,
     pub timeout: Duration,
 }

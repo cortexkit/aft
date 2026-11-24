@@ -451,8 +451,9 @@ fn matcher_ignores(matcher: Option<&Gitignore>, path: &Path) -> bool {
 /// A project tree whose `.gitignore` files hide part of it, written either as
 /// a plain folder or as a git work tree, so each project walker can be checked
 /// for the same file set in both.
-#[cfg(test)]
-pub(crate) mod ignore_rules_fixture {
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod ignore_rules_fixture {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
@@ -476,7 +477,8 @@ pub(crate) mod ignore_rules_fixture {
     /// Write the fixture under `root`. With `git`, `root` also gets a `.git`
     /// directory, which is what makes the `ignore` crate treat it as a
     /// repository.
-    pub(crate) fn write(root: &Path, git: bool) {
+    #[doc(hidden)]
+    pub fn write(root: &Path, git: bool) {
         let source = format!("fn marker() {{ {NEEDLE}(); }}\n");
         let mut files = vec![
             (".gitignore", "vendor/deps/\n*.log\n".to_string()),
@@ -497,7 +499,8 @@ pub(crate) mod ignore_rules_fixture {
 
     /// Root-relative, `/`-separated paths, for comparing walks of the plain
     /// and the git copy of the fixture.
-    pub(crate) fn relative_set<'a>(
+    #[doc(hidden)]
+    pub fn relative_set<'a>(
         root: &Path,
         paths: impl IntoIterator<Item = &'a PathBuf>,
     ) -> BTreeSet<String> {
@@ -513,7 +516,8 @@ pub(crate) mod ignore_rules_fixture {
     }
 
     /// Assert a walk's file set holds every visible source and no ignored file.
-    pub(crate) fn assert_honours_ignore_rules(walked: &BTreeSet<String>, label: &str) {
+    #[doc(hidden)]
+    pub fn assert_honours_ignore_rules(walked: &BTreeSet<String>, label: &str) {
         for ignored in IGNORED {
             assert!(
                 !walked.contains(*ignored),
