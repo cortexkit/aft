@@ -9972,13 +9972,14 @@ impl AppContext {
             let identity = self.check_path_access(req_id, path, &rooted, None, None, true, true)?;
             return Ok((rooted, identity));
         };
-        let normalized = normalize_path(&path_for_resolution);
-        let Some(file_name) = normalized.file_name() else {
+        let Some(file_name) = path_for_resolution.file_name() else {
             let location = self.validate_path(req_id, path)?;
             let identity = crate::policy_path::policy_path(&location);
             return Ok((location, identity));
         };
-        let parent = normalized.parent().unwrap_or_else(|| Path::new(""));
+        let parent = path_for_resolution
+            .parent()
+            .unwrap_or_else(|| Path::new(""));
         let id = req_id.to_string();
         let original = path.to_path_buf();
         let resolved_parent = crate::bounded_io::run(parent, None, move |parent| {
@@ -9997,7 +9998,7 @@ impl AppContext {
                 error.to_string(),
             )
         })??;
-        let resolved = normalize_path(&resolved_parent.join(file_name));
+        let resolved = resolved_parent.join(file_name);
 
         let identity = self.check_path_access(req_id, path, &resolved, None, None, true, true)?;
         Ok((resolved, identity))
@@ -10167,16 +10168,15 @@ impl AppContext {
         };
 
         // Resolve the path (follow symlinks, normalize ..). If canonicalization
-        // fails (e.g. path does not exist or traverses a broken symlink), inspect
-        // every existing component with lstat before falling back lexically so a
-        // broken in-root symlink cannot be used to write outside project_root.
+        // fails, inspect existing components without following symlinks first.
+        // Then resolve the nearest existing ancestor without letting a broken
+        // symlink escape the project root.
         let resolve = |req_id: &str, path: &Path, resolved_root: &Path, raw_root: &Path| {
             match std::fs::canonicalize(path) {
                 Ok(resolved) => Ok(resolved),
                 Err(_) => {
-                    let normalized = normalize_path(path);
-                    reject_escaping_symlink(req_id, path, &normalized, resolved_root, raw_root)?;
-                    Ok(resolve_with_existing_ancestors(&normalized))
+                    reject_escaping_symlink(req_id, path, path, resolved_root, raw_root)?;
+                    Ok(resolve_with_existing_ancestors(path))
                 }
             }
         };

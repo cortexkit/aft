@@ -10,6 +10,8 @@ use crate::protocol::{RawRequest, Response};
 mod backup_bookkeeping_tests;
 #[cfg(test)]
 mod outline_wait_probe;
+#[cfg(test)]
+mod pipeline_path_tests;
 pub(crate) use crate::clock::ThreadCpuSample;
 pub(crate) use crate::tool_progress as progress;
 
