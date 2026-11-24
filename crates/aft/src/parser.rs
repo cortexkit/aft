@@ -437,6 +437,27 @@ mod tests {
     }
 
     #[test]
+    fn review_gpt7_python_import_duplicate_requires_the_requested_binding() {
+        let request = crate::imports::ImportRequest::legacy("pkg", &[], None, None, false);
+        for (source, expected) in [
+            ("import pkg as p\n", false),
+            ("import pkg\n", true),
+            ("import pkg as pkg\n", true),
+            ("import other, pkg\n", true),
+            ("from pkg import *\n", false),
+        ] {
+            let tree =
+                parse_source_with_parser(Path::new("imports.py"), source, LangId::Python).unwrap();
+            let block = crate::imports::parse_imports(source, &tree, LangId::Python);
+            assert_eq!(
+                crate::imports::is_duplicate_import_request(LangId::Python, &block, &request),
+                expected,
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn h_header_missing_nodes_count_as_errors_and_keep_c_when_all_fail() {
         let source = "int missing_semicolon(void)";
         let old_c = parse_source_with_parser(Path::new("missing.c"), source, LangId::C).unwrap();
