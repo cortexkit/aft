@@ -1,6 +1,5 @@
 pub mod bash_hints;
 pub mod catalog;
-pub mod differential;
 pub mod footer;
 mod host;
 #[doc(hidden)]

@@ -6,7 +6,7 @@ fn job_id() -> Uuid {
 }
 
 #[test]
-fn accepted_021_vector_and_single_locked_contract_are_pinned() {
+fn accepted_021_vector_is_pinned() {
     use sha2::{Digest, Sha256};
     let canonical = include_bytes!("fixtures/frames/accepted.jcs");
     assert_eq!(
@@ -33,7 +33,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
     // and the additive 0.2.2 run-report vectors are rendered by the remote
     // bash tests (see `fixtures/SOURCE.md`).
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
-        "../../../aft/tests/fixtures/exec-remote/published-v0.2.0.json"
+        "../../fixtures/exec-remote/published-v0.2.0.json"
     ))
     .unwrap();
     let mut cases = Vec::new();

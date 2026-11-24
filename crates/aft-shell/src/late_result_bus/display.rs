@@ -246,10 +246,8 @@ mod tests {
     }
     #[test]
     fn display_event_matches_role_wire_vector_without_reader_suffix() {
-        let vector: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/display-reads.json"
-        ))
-        .unwrap();
+        let vector: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/display-reads.json")).unwrap();
         let names = cortexkit_bus_naming::AccountNames::derive("box_test").unwrap();
         assert_eq!(DISPLAY_RECORD_READY_EVENT, vector["event"]["name"]);
         assert_eq!(DISPLAY_RECORD_READY_VERSION, vector["event"]["version"]);

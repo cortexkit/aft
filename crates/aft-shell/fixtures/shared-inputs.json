@@ -1,0 +1,22 @@
+{
+  "crates/aft-shell/fixtures/bash/synapse-cargo-test/command.sh": "crates/aft/tests/fixtures/bash/synapse-cargo-test/command.sh",
+  "crates/aft-shell/fixtures/bash/synapse-cargo-test/exit": "crates/aft/tests/fixtures/bash/synapse-cargo-test/exit",
+  "crates/aft-shell/fixtures/bash/synapse-cargo-test/stderr": "crates/aft/tests/fixtures/bash/synapse-cargo-test/stderr",
+  "crates/aft-shell/fixtures/bash/synapse-cargo-test/stdout": "crates/aft/tests/fixtures/bash/synapse-cargo-test/stdout",
+  "crates/aft-shell/fixtures/bash/synapse-cargo-test/verdict.txt": "crates/aft/tests/fixtures/bash/synapse-cargo-test/verdict.txt",
+  "crates/aft-shell/fixtures/card_settled_v1/aft.aft.body.json": "crates/aft/tests/fixtures/card_settled_v1/aft.aft.body.json",
+  "crates/aft-shell/fixtures/card_settled_v1/aft.aft.headers.json": "crates/aft/tests/fixtures/card_settled_v1/aft.aft.headers.json",
+  "crates/aft-shell/fixtures/card_settled_v1/aft.aft.subject.txt": "crates/aft/tests/fixtures/card_settled_v1/aft.aft.subject.txt",
+  "crates/aft-shell/fixtures/display-reads.json": "crates/aft/tests/fixtures/display-reads.json",
+  "crates/aft-shell/fixtures/exec-remote/published-v0.2.0.json": "crates/aft/tests/fixtures/exec-remote/published-v0.2.0.json",
+  "crates/aft-shell/fixtures/gh_shim/v20-manifest.json": "crates/aft/tests/fixtures/gh_shim/v20-manifest.json",
+  "crates/aft-shell/fixtures/log_redaction_cases.json": "crates/aft/tests/fixtures/log_redaction_cases.json",
+  "crates/aft-shell/fixtures/opencode/each-line-terminal-frame.json": "packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json",
+  "crates/aft-shell/fixtures/status-kv/SHA256SUMS": "test-vectors/aft-status-kv-v1/SHA256SUMS",
+  "crates/aft-shell/fixtures/status-kv/ascii.json": "test-vectors/aft-status-kv-v1/ascii.json",
+  "crates/aft-shell/fixtures/status-kv/ascii.key": "test-vectors/aft-status-kv-v1/ascii.key",
+  "crates/aft-shell/fixtures/status-kv/punctuation.json": "test-vectors/aft-status-kv-v1/punctuation.json",
+  "crates/aft-shell/fixtures/status-kv/punctuation.key": "test-vectors/aft-status-kv-v1/punctuation.key",
+  "crates/aft-shell/fixtures/status-kv/unicode.json": "test-vectors/aft-status-kv-v1/unicode.json",
+  "crates/aft-shell/fixtures/status-kv/unicode.key": "test-vectors/aft-status-kv-v1/unicode.key"
+}

@@ -5,6 +5,8 @@
 //! for differential tests. Once a request is accepted, its handler response is
 //! returned directly; native bash is never run as a recovery path.
 
+pub mod catalog;
+pub mod differential;
 pub mod dispatch;
 pub use aft_shell::bash_rewrite::*;
 

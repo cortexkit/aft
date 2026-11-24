@@ -1,0 +1,285 @@
+
+running 7 tests
+test neon_convert::tests::test_empty_slices ... ok
+test neon_convert::tests::test_exact_4_element_alignment ... ok
+test neon_convert::tests::test_f32_to_f16_remainder ... ok
+test neon_convert::tests::test_f16_to_f32_remainder ... ok
+test neon_convert::tests::test_special_float_values ... ok
+test neon_convert::tests::test_f32_to_f16_roundtrip ... ok
+test neon_convert::tests::test_large_array ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 58 tests
+test boundary::tests::cancellation_applies_when_no_deadline_expired ... ok
+test boundary::tests::cancellation_recorded_after_boundary_is_ignored ... ok
+test boundary::tests::cancellation_wins_over_deadline_when_both_pending ... ok
+test boundary::tests::progress_with_no_controls_is_accepted ... ok
+test boundary::tests::deadline_at_exact_boundary_is_expired ... ok
+test boundary::tests::terminal_completion_wins_over_cancel_and_deadline ... ok
+test boundary::tests::worker_reported_cancelled_finish_is_cancellation ... ok
+test error::tests::fallback_eligibility_is_exactly_the_six_pre_dispatch_refusals ... ok
+test error::tests::stable_ids_are_the_documented_wire_literals ... ok
+test error::tests::deadline_and_cancel_use_literal_wire_binding_ids ... ok
+test identity::tests::canonical_identity_is_the_documented_decode_lane ... ok
+test identity::tests::quarantine_key_storage_id_is_stable ... ok
+test identity::tests::production_n_is_restricted_to_the_committed_set ... ok
+test ownership::tests::manifest_covers_every_documented_fault_site ... ok
+test budget::tests::second_crash_exhausts_and_quarantines ... ok
+test budget::tests::save_failure_surfaces_and_marks_the_key_unpersisted ... ok
+test budget::tests::first_crash_leaves_one_unit_and_permits_redispatch ... ok
+test ownership::tests::destroy_all_frees_everything_without_double_free ... ok
+test budget::tests::classifications_are_recorded_in_order ... ok
+test ownership::tests::clean_lifecycle_is_safe ... ok
+test ownership::tests::invalid_free_is_detected ... ok
+test ownership::tests::double_free_is_detected ... ok
+test ownership::tests::use_after_free_is_detected ... ok
+test budget::tests::a_later_successful_save_clears_the_unpersisted_mark ... ok
+test budget::tests::retry_persist_clears_the_mark_only_when_the_save_succeeds ... ok
+test protocol::tests::constraint_first_mismatched_field_is_precise ... ok
+test protocol::tests::finish_reasons_are_the_documented_four ... ok
+test identity::tests::runtime_digest_is_stable_and_scheduler_sensitive ... ok
+test protocol::tests::constraint_bytes_round_trip_through_base64 ... ok
+test protocol::tests::envelope_round_trips_and_rejects_foreign_protocol ... ok
+test streaming::tests::abort_preflights_retention_at_the_committed_prefix ... ok
+test protocol::tests::sidecar_bank_installation_round_trips_and_denies_unknown_fields ... ok
+test protocol::tests::owned_transport_round_trips_and_rejects_unknown_fields ... ok
+test streaming::tests::progress_is_ordered_idempotent_and_has_one_terminal ... ok
+test streaming::tests::gap_fails_closed_after_worker_death_and_refuses_continuation ... ok
+test streaming::tests::forget_session_drops_only_that_sessions_records ... ok
+test protocol::tests::start_and_constraint_reject_unknown_wire_fields ... ok
+test streaming::tests::terminal_identity_and_grammar_chain_are_not_relaxed ... ok
+test streaming::tests::retention_refusal_reclaims_resources_in_one_supervision_cycle ... ok
+test streaming::tests::terminal_status_recovers_lost_delivery_with_its_committed_count ... ok
+test streaming::tests::worker_death_emits_failed_terminal_when_ordered_history_is_provable ... ok
+test supervisor::tests::budget_persistence_failure_fails_closed_until_a_save_succeeds ... ok
+test budget::tests::budget_state_persists_across_store_reopens ... ok
+test supervisor::tests::clean_single_quantum_completion_succeeds ... ok
+test supervisor::tests::crash_then_clean_redispatch_preserves_generation_id ... ok
+test supervisor::tests::crash_while_sending_start_is_charged_and_redispatched ... ok
+test supervisor::tests::pending_bank_source_does_not_install_or_delay_a_continue ... ok
+test supervisor::tests::protocol_transport_error_returns_typed_failure_without_a_strike ... ok
+test supervisor::tests::quarantined_key_is_refused_before_dispatch ... ok
+test supervisor::tests::second_crash_is_terminal_and_quarantines ... ok
+test supervisor::tests::ready_bank_installs_after_progress_before_continue ... ok
+test supervisor::tests::timeout_is_terminal_and_not_redispatched ... ok
+test validation::tests::clean_start_authorizes_min_n_max_tokens ... ok
+test validation::tests::constraint_mismatches_map_to_constraint_version_mismatch ... ok
+test validation::tests::non_greedy_sampling_is_unsupported ... ok
+test validation::tests::runtime_identity_mismatches_map_to_runtime_config_mismatch ... ok
+test validation::tests::structural_faults_map_to_protocol_mismatch ... ok
+test wire_error_bindings::tests::bindings_are_literal_not_symbolic ... ok
+
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 12 tests
+test fixture_lfm2_conv_cache_ffi_site_is_safe ... ok
+test fixture_timeout_cleanup_teardown_is_safe ... ok
+test fixture_ownership_transfer_across_ffi_is_safe ... ok
+test fixture_allocation_site_is_safe ... ok
+test fixture_manifest_revision_and_fault_site_coverage ... ok
+test fixture_generation_site_is_safe ... ok
+test fixture_partial_initialization_teardown_is_safe ... ok
+test fixture_cancellation_teardown_is_safe ... ok
+test fixture_shutdown_site_is_safe ... ok
+test fixture_worker_death_destroys_all_resident_state ... ok
+test fixture_unload_site_is_safe ... ok
+test fixture_every_fault_site_has_a_clean_lifecycle ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 30 tests
+test fixture_cancellation_beats_deadline_at_non_terminal_boundary ... ok
+test fixture_first_quantum_authorizes_min_n_max_tokens ... ok
+test fixture_cancellation_uses_literal_wire_error_and_no_budget ... ok
+test fixture_deadline_cleanup_uses_literal_wire_error_and_no_budget ... ok
+test fixture_failed_cancellation_at_cancel_boundary_charges_and_kills ... ok
+test fixture_non_advancing_committed_count_is_protocol_fatal ... ok
+test fixture_crash_redispatch_barred_by_cancellation_returns_cancelled ... ok
+test fixture_failed_cancellation_exhausting_budget_quarantines ... ok
+test fixture_multi_quantum_progress_sequence_trace ... ok
+test fixture_failed_cancellation_at_deadline_boundary_charges_and_kills ... ok
+test fixture_crash_redispatch_barred_by_deadline_returns_deadline ... ok
+test fixture_malformed_wire_frame_is_protocol_mismatch ... ok
+test fixture_at_most_one_redispatch ... ok
+test fixture_remaining_budget_truncates_continuation ... ok
+test fixture_constraint_mismatch_is_dedicated_for_every_field ... ok
+test fixture_repeated_sequence_is_protocol_fatal ... ok
+test fixture_protocol_mismatch_is_dedicated_for_frame_structure ... ok
+test fixture_crash_redispatch_restarts_at_token_zero_and_resets_sequence ... ok
+test fixture_every_finish_reason_is_accepted ... ok
+test fixture_replacement_startup_failure_is_terminal ... ok
+test fixture_runtime_config_mismatch_is_dedicated ... ok
+test fixture_sampling_mismatch_is_dedicated ... ok
+test fixture_skipped_sequence_is_protocol_fatal ... ok
+test fixture_stale_session_frame_is_rejected ... ok
+test fixture_stop_controls_are_omitted_from_generated_ids ... ok
+test fixture_terminal_completion_beats_deadline_and_cancellation ... ok
+test fixture_timeout_charges_once_and_is_terminal ... ok
+test fixture_timeout_with_single_strike_policy_quarantines ... ok
+test fixture_unknown_generation_id_is_protocol_fatal ... ok
+test fixture_wire_bindings_are_literal_not_symbolic ... ok
+
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+running 89 tests
+test lfm2::tests::causal_conv_uses_unflipped_cross_correlation_taps ... ok
+test json_constraint::tests::token_mask_can_set_invalid_logits_to_negative_infinity ... ok
+test json_constraint::tests::number_literals_are_bounded_to_keep_generation_progressing ... ok
+test lfm2::tests::rope_uses_half_split_pairs ... ok
+test json_constraint::tests::schema_rejects_keywords_on_the_wrong_type ... ok
+test lfm2_audio::tests::per_feature_normalization_has_zero_mean_and_unit_sample_variance ... ok
+test lfm2_audio::tests::relative_positions_run_from_positive_to_negative ... ok
+test json_constraint::tests::optional_whitespace_is_suppressed_but_string_whitespace_is_preserved ... ok
+test json_constraint::tests::string_escapes_and_surrogate_pairs_are_incremental ... ok
+test json_constraint::tests::eos_is_gated_until_the_root_value_is_complete ... ok
+test json_constraint::tests::split_utf8_tokens_require_valid_continuations ... ok
+test cpu_backend::tests::hand_kernel_tracks_f16_reference_across_vector_tails ... ok
+test lfm2::tests::weight_registry_addresses_the_active_lfm2_storage ... ok
+test lfm2_decode_metal_step::tests::conv_step_matches_cpu_on_real_lfm2_1_2b_conv_weights ... ignored
+test lfm2_decode_metal_step::tests::f16_weight_rounding_policy_probe ... ignored
+test lfm2_decode_metal_step::tests::hybrid_step_engine_is_deterministic ... ignored
+test lfm2_decode_metal_step::tests::hybrid_step_engine_matches_pinned_fixture_within_certified_near_tie ... ignored
+test lfm2_decode_metal_step::tests::hybrid_step_localize_divergence ... ignored
+test lfm2_decode_metal_step::tests::hybrid_step_timing_probe ... ignored
+test lfm2_decode_metal_step::tests::q8_hybrid_step_engine_is_deterministic ... ignored
+test lfm2_decode_metal_step::tests::q8_hybrid_step_engine_matches_pinned_fixture_within_certified_near_tie ... ignored
+test lfm2_decode_metal_step::tests::q8_hybrid_step_logit_error_probe ... ignored
+test lfm2_decode_metal_step::tests::q8_hybrid_step_timing_probe ... ignored
+test lfm2_decode_metal_step::tests::q8_weight_oracle_probe ... ignored
+test lfm2_decode::tests::incremental_hidden_states_match_full_prefill ... ok
+test json_constraint::tests::schema_validator_matches_the_parser_subset ... ok
+test modernbert::tests::local_mask_uses_inclusive_half_window_and_padding ... ok
+test modernbert::tests::modernbert_400_chunk_parity_gate ... ignored, requires MODERNBERT_PARITY_VECTORS and MODERNBERT_REFERENCE_VECTORS
+test modernbert::tests::modernbert_f16_static_feeds_survive_multiple_calls ... ignored, requires MODERNBERT_F16_MODEL and a Metal device
+test lfm2_audio::tests::audio_family_detection_does_not_capture_plain_lfm2 ... ok
+test modernbert::tests::modernbert_rerank_matches_transformers_reference_fixture_on_cpu ... ignored, requires MODERNBERT_RERANK_MODEL
+test modernbert::tests::modernbert_rerank_static_feeds_survive_multiple_calls ... ignored, requires MODERNBERT_RERANK_MODEL and a Metal device
+test json_constraint::tests::required_keys_are_order_independent_and_enums_are_exact ... ok
+test json_constraint::tests::token_can_straddle_multiple_json_boundaries ... ok
+test modernbert::tests::modernbert_layer_pattern_starts_with_global_attention ... ok
+test json_constraint::tests::schema_key_escape_prefixes_cannot_enter_a_dead_end ... ok
+test lfm2_audio::tests::slaney_filter_has_nonzero_triangles ... ok
+test modernbert::tests::rope_preserves_values_at_position_zero ... ok
+test quant::tests::q8_0_bytes_match_the_gguf_block_layout ... ok
+test modernbert::tests::parity_gate_asserts_both_certification_thresholds ... ok
+test json_constraint::tests::byte_level_reverse_mapping_preserves_all_bytes ... ok
+test quant::tests::q8_0_round_trip_has_block_scale_error_bound ... ok
+test quant::tests::q8_0_zero_block_is_canonical ... ok
+test qwen3::tests::last_pool_ignores_padding_and_normalizes ... ok
+test qwen3::tests::per_head_rms_norm_uses_head_dim_weights ... ok
+test cpu_backend::tests::faer_matches_platform_for_transposed_rhs ... ok
+test qwen3_decode::metal_step::tests::batched_verify_forced_rejection_preserves_continuation_f16 ... ignored
+test qwen3_decode::metal_step::tests::batched_verify_forced_rejection_preserves_continuation_q8 ... ignored
+test lfm2::tests::legacy_config_synthesizes_the_checkpoint_layer_layout_and_ff_width ... ok
+test qwen3::tests::rope_rotates_both_halves_with_qwen_layout ... ok
+test qwen3_decode::metal_step::tests::batched_verify_is_deterministic_f16 ... ignored
+test qwen3_decode::metal_step::tests::batched_verify_is_deterministic_q8 ... ignored
+test lfm2::tests::rope_theta_defaults_when_absent_from_config ... ok
+test qwen3_decode::metal_step::tests::batched_verify_logits_are_byte_identical_to_sequential_f16 ... ignored
+test qwen3_decode::metal_step::tests::batched_verify_logits_are_byte_identical_to_sequential_q8 ... ignored
+test qwen3_decode::metal_step::tests::batched_verify_timing_probe ... ignored
+test lfm2_decode_metal_step::tests::conv_cache_write_round_trips ... FAILED
+test lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference ... FAILED
+test lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic ... FAILED
+test qwen3_decode::tests::chained_generation_truncates_at_stop_token_like_per_token ... ok
+test qwen3_decode::tests::constraint_masks_invalid_logits_before_the_token_tap ... ok
+test qwen3_decode::tests::greedy_argmax_uses_lowest_token_id_for_exact_ties ... ok
+test qwen3_decode::tests::paused_state_resumes_to_uninterrupted_tokens ... ok
+test lfm2_decode::tests::cached_decode_matches_full_reprefill_for_hybrid_layers ... ok
+test qwen3_decode::tests::splice_matches_prefilling_the_concatenated_sequence ... ok
+test qwen3_decode::tests::token_stream_tap_observes_before_commit_without_changing_tokens ... ok
+test stt_bias::tests::capitalize_handles_empty_and_unicode_inputs ... ok
+test qwen3_decode::tests::speculative_forced_rejection_rolls_back_and_preserves_full_continuation ... ok
+test qwen3_decode::tests::chained_generation_matches_per_token_generation ... ok
+test qwen3_decode::tests::speculative_self_draft_accepts_every_token_and_matches_target_only ... ok
+test stt_bias::tests::trie_bonus_is_additive_and_leaves_other_logits_untouched ... ok
+test stt_bias::tests::trie_boosts_starts_and_recent_continuations_only ... ok
+test tests::bucket_batcher_maps_to_covering_shapes_and_pads_tail_rows ... ok
+test tests::bucket_policy_is_bounded_stable_and_capped_at_max_length ... ok
+test tests::graph_cache_digest_includes_graph_family_and_builder_revision ... ok
+test tests::package_cache_identity_includes_shape_policy ... ok
+test tests::package_cache_uses_one_path_per_shape ... ok
+test tests::qwen3_decode_package_paths_are_distinct ... ok
+test tests::qwen3_parity_gate_enforces_certification_thresholds ... ok
+test tests::rerank_gate_uses_pearson_and_tie_aware_top1 ... ok
+test qwen3_decode::tests::quantized_regions_address_complete_q8_0_blocks ... ok
+test qwen3_decode::tests::addressable_weight_regions_are_byte_identical_across_loads ... ok
+test tests::serving_execution_defaults_to_explicit_and_lazy_is_opt_in ... ok
+test lfm2::tests::metal_depthwise_primitive_matches_cpu ... ok
+test tests::metal_provider_matches_cpu_for_transposed_rhs_storage ... ok
+test tests::metal_provider_matches_cpu_for_row_major_rhs ... ok
+test tests::metal_provider_matches_cpu_for_tiny_encoder_block ... ok
+test lfm2::tests::metal_f16_static_rhs_cache_distinguishes_weights ... ok
+test tests::metal_provider_f16_tracks_cpu_for_tiny_encoder_block ... ok
+
+failures:
+
+---- lfm2_decode_metal_step::tests::conv_cache_write_round_trips stdout ----
+
+thread 'lfm2_decode_metal_step::tests::conv_cache_write_round_trips' (152849554) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:838:14:
+engine: LFM2 Metal step metallib is missing beside /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
+
+---- lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference stdout ----
+
+thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference' (152849555) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:759:14:
+engine: LFM2 Metal step metallib is missing beside /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic stdout ----
+
+thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic' (152849556) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:801:22:
+engine: LFM2 Metal step metallib is missing beside /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/deps/spike_unified_rt-8633ea13f51809ac and at /Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/target/debug/build/spike-unified-rt-abde76e27ca0467e/out/lfm2_decode_metal_step.metallib
+
+
+failures:
+    lfm2_decode_metal_step::tests::conv_cache_write_round_trips
+    lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference
+    lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic
+
+test result: FAILED. 64 passed; 3 failed; 22 ignored; 0 measured; 0 filtered out; finished in 0.13s
+

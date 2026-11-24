@@ -157,6 +157,8 @@ pub mod bash_background {
 }
 
 pub mod sandbox_spawn {
+    #[cfg(target_os = "linux")]
+    pub use crate::sandbox_spawn::grant_fixture::linux_profile_for_scope_test;
     #[cfg(unix)]
     pub use crate::sandbox_spawn::grant_fixture::relaxed_profile_for_test;
     #[cfg(unix)]

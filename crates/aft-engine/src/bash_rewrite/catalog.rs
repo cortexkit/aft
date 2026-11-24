@@ -1,5 +1,7 @@
 pub use aft_shell::bash_rewrite::catalog::*;
-
+use std::fs;
+#[cfg(not(test))]
+use std::path::PathBuf;
 
 #[cfg(not(test))]
 fn manifest_dir() -> PathBuf {
@@ -25,9 +27,9 @@ pub fn baseline_source_resolves(source: &str) -> bool {
     // Catalog paths are package-relative. Handler sources stay in the upper
     // package, while the rewrite rules move with this catalog.
     let package = if file.starts_with("src/commands/") {
-        "aft"
+        "aft-tools"
     } else {
-        "aft-engine"
+        "aft-shell"
     };
     let path = manifest_dir.join("..").join(package).join(file);
     path.is_file()
@@ -57,7 +59,6 @@ pub fn validate_catalog() -> Result<(), String> {
     }
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

@@ -1,0 +1,13 @@
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out (8 empty test targets)
+test result: ok. 58 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 30 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test lfm2_decode_metal_step::tests::conv_cache_write_round_trips ... FAILED
+test lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference ... FAILED
+test lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic ... FAILED
+thread 'lfm2_decode_metal_step::tests::conv_cache_write_round_trips' (152849554) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:838:14:
+thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_bit_exact_vs_cpu_reference' (152849555) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:759:14:
+thread 'lfm2_decode_metal_step::tests::conv_step_kernel_is_deterministic' (152849556) panicked at bench/spikes/unified-rt/src/lfm2_decode_metal_step.rs:801:22:
+test result: FAILED. 64 passed; 3 failed; 22 ignored; 0 measured; 0 filtered out; finished in 0.13s
+error: test failed, to rerun pass `-p spike-unified-rt --bin spike-unified-rt`

@@ -1106,10 +1106,8 @@ fn installed_worker_manifest() -> crate::test_env::GhShimStateGuard {
     use ring::signature::Ed25519KeyPair;
     let state = crate::test_env::gh_shim_state_guard();
     let root = PathBuf::from(std::env::var_os(STATE_ENV).unwrap());
-    let mut manifest: Value = serde_json::from_str(include_str!(
-        "../../aft/tests/fixtures/gh_shim/v20-manifest.json"
-    ))
-    .unwrap();
+    let mut manifest: Value =
+        serde_json::from_str(include_str!("../fixtures/gh_shim/v20-manifest.json")).unwrap();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

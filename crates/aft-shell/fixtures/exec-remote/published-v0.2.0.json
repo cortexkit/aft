@@ -1,0 +1,174 @@
+{
+  "outcomes": {
+    "bundle_rejected": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"bundle_rejected\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "c07af34612da71b86cbee4f72502e2e033cb0453f2d5e98e7ba47c708aaae5a8"
+    },
+    "cancelled": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"type\":\"cancelled\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "093e6fca75d10b5dbc03da5b75e49cfb4603ee27a76b088fff735b8990878978"
+    },
+    "crate-local-unknown-killed": {
+      "jcs": "{\"request\":{\"command\":\"true\",\"cwd\":\"/workspace/task\",\"env\":{},\"repository_root\":\"/src/repo\",\"siblings\":[],\"workspace_key\":\"/workspace/task\"},\"stream\":[{\"bundle_bytes\":0,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"killed\":\"future_kill\",\"outcome\":{\"signal\":9,\"type\":\"signal\"},\"queue_wait_ms\":0,\"ran\":\"remote\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":[]}]}",
+      "sha256": "0ca20eb27cc71e2f7a075c1f04d8a5ad99090d21bcb979684ab20de24cf89148"
+    },
+    "crate-local-unknown-outcome": {
+      "jcs": "{\"request\":{\"command\":\"true\",\"cwd\":\"/workspace/task\",\"env\":{},\"repository_root\":\"/src/repo\",\"siblings\":[],\"workspace_key\":\"/workspace/task\"},\"stream\":[{\"bundle_bytes\":0,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"type\":\"future_outcome\"},\"queue_wait_ms\":0,\"ran\":\"remote\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":[]}]}",
+      "sha256": "2e5c1522a12374b1602d177007e77a74f9d6715b5c4bb4ee6e764e6ef47ad1bc"
+    },
+    "crate-local-unknown-output-stream": {
+      "jcs": "{\"request\":{\"command\":\"true\",\"cwd\":\"/workspace/task\",\"env\":{},\"repository_root\":\"/src/repo\",\"siblings\":[],\"workspace_key\":\"/workspace/task\"},\"stream\":[{\"bytes\":\"4g==\",\"seq\":7,\"stream\":\"future_stream\",\"type\":\"output\"},{\"bundle_bytes\":0,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"code\":0,\"type\":\"exit\"},\"queue_wait_ms\":0,\"ran\":\"remote\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":[]}]}",
+      "sha256": "847b1b70779eedc04fd0bf0c9b8e4f0597fafadfbf9a3c87557c8cf4164b831c"
+    },
+    "crate-local-unknown-ran": {
+      "jcs": "{\"request\":{\"command\":\"true\",\"cwd\":\"/workspace/task\",\"env\":{},\"repository_root\":\"/src/repo\",\"siblings\":[],\"workspace_key\":\"/workspace/task\"},\"stream\":[{\"bundle_bytes\":0,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"type\":\"outcome_unknown\"},\"queue_wait_ms\":0,\"ran\":\"future_location\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "a4f6773a2783415c6f5604025cc2ac9bcbb31f29a6dc34f62700a1b52d59d08b"
+    },
+    "crate-local-unknown-refusal": {
+      "jcs": "{\"request\":{\"command\":\"true\",\"cwd\":\"/workspace/task\",\"env\":{},\"repository_root\":\"/src/repo\",\"siblings\":[],\"workspace_key\":\"/workspace/task\"},\"stream\":[{\"bundle_bytes\":0,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"future_refusal\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":0,\"ran\":\"none\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "0a0a33ae1ec710c822d30aed47050fdb64aad9804dc517687021296d3bfb8f5a"
+    },
+    "crate-local-unknown-stream-record": {
+      "jcs": "{\"request\":{\"command\":\"true\",\"cwd\":\"/workspace/task\",\"env\":{},\"repository_root\":\"/src/repo\",\"siblings\":[],\"workspace_key\":\"/workspace/task\"},\"stream\":[{\"seq\":7,\"type\":\"future_record\"},{\"bundle_bytes\":0,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"code\":0,\"type\":\"exit\"},\"queue_wait_ms\":0,\"ran\":\"remote\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":[]}]}",
+      "sha256": "db8c5ea09d6608ef51dfd9732e8fb294356df6945c795626ab4ae14846df0f73"
+    },
+    "exit-nonzero": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"code\":100,\"type\":\"exit\"},\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "0d019d5fe5ad7cfa3a5192d7edaf36192a22195dec282d7739be09da62cc626c"
+    },
+    "exit": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"code\":0,\"type\":\"exit\"},\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "ee593b3133c6f421b447103f459c404cfb65022654d39674e20f4ca2c383db25"
+    },
+    "history_expired": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"type\":\"history_expired\"},\"queue_wait_ms\":25,\"ran\":null,\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "eda4786db9bb2987e632d9943c1bd2569d83edba2feff9a5253e2c29e09f6560"
+    },
+    "killed-cancel": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"killed\":\"cancel\",\"outcome\":{\"signal\":9,\"type\":\"signal\"},\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "a3e2cdbac49e77f03586409722e83e4930f2ef5b5486a7421db0e4597e1b7cb8"
+    },
+    "killed-deadline": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"killed\":\"deadline\",\"outcome\":{\"signal\":9,\"type\":\"signal\"},\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "84ca445b5dc7aa3090b908c345648652f86a000e0c26250ba81a4ce5ad1763f1"
+    },
+    "outcome_unknown-queued": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"type\":\"outcome_unknown\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "f1ffa4a09137b4b97e11867f065e6663d82aa9c36c5f3f4ebdeb43661694207e"
+    },
+    "outcome_unknown": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"type\":\"outcome_unknown\"},\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "6c2f55f5e897e62cf103104a1f7011f2e26476b083a2a6f9857fd945262e5ad7"
+    },
+    "pipestatus": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"code\":1,\"type\":\"exit\"},\"pipestatus\":[0,1],\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "5bf730172e2360ce5ade6542dc3ba2469928777255338b1728282cb00b1534a5"
+    },
+    "queue_wait_exceeded": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"queue_wait_exceeded\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "51c6c840ccc598fb7f6e10625dd529b2d47397d262c03e7fc0346557bd3c1341"
+    },
+    "runner_full": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"runner_full\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "e58052cc2f8f96b5716da3a7c42c5e87734cef9974913012dcba2306254e28f5"
+    },
+    "runner_version_mismatch": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"runner_version_mismatch\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "2b99f6e5fa4d904b04cfa768c35cbbf621d0c034852cedd20e7795ae4b69767b"
+    },
+    "signal": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"signal\":15,\"type\":\"signal\"},\"queue_wait_ms\":25,\"ran\":\"remote\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":125,\"workspace_changes\":[\"result.txt\"]}]}",
+      "sha256": "267962fe7b80bfca5a607c621847842c83f574b6a457ee065503aafbeed9af74"
+    },
+    "snapshot_failed": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"snapshot_failed\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "cb7dd5a1a9c61216b17e48cad8fc61841d004598c0ac7b7c1766b2585226648e"
+    },
+    "transfer_interrupted": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"transfer_interrupted\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "3590d638cc568f9b90230d8991b6d00689078b24d93a728a67158104c1ce9629"
+    },
+    "tree_hash_mismatch": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"tree_hash_mismatch\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "6633e3e1185aed76eeb927472e23350abe0c843bacf131b6f8485fc9dae4c1f1"
+    },
+    "unreachable": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"unreachable\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "a109b6d2da42add3cbf61f70d586de90680ca9336f63f96956084f9bd84685c6"
+    },
+    "workspace_key_rejected": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"workspace_key_rejected\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":null,\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "22a6d493b740887aa8d7bf2c406aeb346304bd81a7cc55cfe077a4bba8abeec5"
+    },
+    "workspace_setup_failed": {
+      "jcs": "{\"request\":{\"command\":\"cargo nextest run -p prefrontal-core-store\",\"cwd\":\"/Users/example/worktrees/task\",\"env\":{\"RUST_BACKTRACE\":\"1\"},\"queue_wait_limit_s\":300,\"repository_root\":\"/Users/example/src/prefrontal\",\"siblings\":[\"/Users/example/src/commons\"],\"timeout\":60,\"weight_hint\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},\"stream\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"queue_position\":1,\"type\":\"accepted\"},{\"bundle_bytes\":29,\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"outcome\":{\"reason\":\"workspace_setup_failed\",\"type\":\"refused_before_start\"},\"queue_wait_ms\":25,\"ran\":\"none\",\"tree_hash\":\"3333333333333333333333333333333333333333\",\"type\":\"terminal\",\"wall_ms\":0,\"workspace_changes\":null}]}",
+      "sha256": "5d2a7f0a7dcd8d14232a7d1cafb9c36f0eec7f0199260f346fc4c74413067980"
+    }
+  },
+  "replies": {
+    "cancel": {
+      "jcs": "{\"job_id\":\"0192a64a-1234-7000-8000-000000000003\"}",
+      "sha256": "d37c6e965ba738d6a3d201ee9622cc4a26016b0e38d7476cd868fa1580af1ef5"
+    },
+    "crate-local-unknown-prepare-outcome": {
+      "jcs": "{\"outcome\":{\"type\":\"future_prepare\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000001\"}",
+      "sha256": "3e4e05645517e251feb7d75c3622852a99c6dcf957f0a2c3baf417b97d4ae704"
+    },
+    "crate-local-unknown-rebuild-result": {
+      "jcs": "{\"queue_depth\":0,\"repositories\":[{\"last_rebuild_result\":\"future_result\",\"published_commit\":null,\"repository_root\":\"/src/repo\",\"warm_target_age_s\":null}],\"running_jobs\":[],\"rustc_version\":\"rustc 1.90.0\",\"server_reachable\":true}",
+      "sha256": "9870186e6778856d12aa3202eeff1fbd07f31b4336743823f199115abf53c239"
+    },
+    "drop-existing": {
+      "jcs": "{\"cancelled_jobs\":[\"0192a64a-1234-7000-8000-000000000001\"],\"dropped\":true}",
+      "sha256": "c8a471101f5dd556435c9d1930a69ca28593f3e7cd01313103f2fa1facf14b72"
+    },
+    "drop-missing": {
+      "jcs": "{\"cancelled_jobs\":[],\"dropped\":false}",
+      "sha256": "e224bdacc7b07fb696945152b6085badcea182c5bc975c835a41f22505c1d189"
+    },
+    "prepare-bundle_rejected": {
+      "jcs": "{\"outcome\":{\"reason\":\"bundle_rejected\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "6e9ae7da5a025709e82c26d14b79a58d56ed020608717b9ccc667887c1aac043"
+    },
+    "prepare-prepared": {
+      "jcs": "{\"outcome\":{\"type\":\"prepared\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "7b83bcec755eb7b681a51a670ab19488f9fed45b6b81970b0166728f7e407b56"
+    },
+    "prepare-runner_version_mismatch": {
+      "jcs": "{\"outcome\":{\"reason\":\"runner_version_mismatch\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "cac8ec39ba595c9d1bdc1510652ee478f2df17d894ae9adc50420bf189053dda"
+    },
+    "prepare-snapshot_failed": {
+      "jcs": "{\"outcome\":{\"reason\":\"snapshot_failed\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "da57b4fa38a21d1a651dd40197398ca2257e799288d739e965d69b6f85f18258"
+    },
+    "prepare-transfer_interrupted": {
+      "jcs": "{\"outcome\":{\"reason\":\"transfer_interrupted\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "562f728e3a6ba0dd8835de31b6ef5dca54600fc70fab0c87c65a15991d915419"
+    },
+    "prepare-unreachable": {
+      "jcs": "{\"outcome\":{\"reason\":\"unreachable\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "52c52ee61699ca71f782f506cb44ffb446ec8282165f94b906edee1db8a18d9c"
+    },
+    "prepare-workspace_key_rejected": {
+      "jcs": "{\"outcome\":{\"reason\":\"workspace_key_rejected\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "5776d2467bf06f48cc1cfb7cc8474931b48ed15edfdec7b74913a92242336d54"
+    },
+    "prepare-workspace_setup_failed": {
+      "jcs": "{\"outcome\":{\"reason\":\"workspace_setup_failed\",\"type\":\"refused_before_start\"},\"transfer_id\":\"0192a64a-1234-7000-8000-000000000002\"}",
+      "sha256": "bfde63250f2516a5f49b61f298773506bf54d5e7e039df9bec08301f6fc3e1a5"
+    },
+    "status-cold": {
+      "jcs": "{\"queue_depth\":0,\"repositories\":[{\"last_rebuild_result\":null,\"published_commit\":null,\"repository_root\":\"/Users/example/src/prefrontal\",\"warm_target_age_s\":null}],\"running_jobs\":[],\"rustc_version\":\"rustc 1.90.0 (1159e78c4 2025-09-14)\",\"server_reachable\":true}",
+      "sha256": "14f5ba58124081ad72154f80338a2bb0f6042253b8fc7950a08ba0cdf21a50ef"
+    },
+    "status-unreachable": {
+      "jcs": "{\"queue_depth\":0,\"repositories\":[],\"running_jobs\":[],\"rustc_version\":\"\",\"server_reachable\":false}",
+      "sha256": "d3589772e38b10ca414e1177f70c76fd69badccb7acb42965086d993a9c59d9e"
+    },
+    "status": {
+      "jcs": "{\"queue_depth\":2,\"repositories\":[{\"last_rebuild_result\":\"building\",\"published_commit\":\"1111111111111111111111111111111111111111\",\"repository_root\":\"/Users/example/src/prefrontal\",\"warm_target_age_s\":90},{\"last_rebuild_result\":\"ok\",\"published_commit\":\"4444444444444444444444444444444444444444\",\"repository_root\":\"/Users/example/src/commons\",\"warm_target_age_s\":120},{\"last_rebuild_result\":\"failed\",\"published_commit\":\"2222222222222222222222222222222222222222\",\"repository_root\":\"/Users/example/src/claustrum\",\"warm_target_age_s\":180}],\"running_jobs\":[{\"job_id\":\"0192a64a-1234-7000-8000-000000000001\",\"weight\":16,\"workspace_key\":\"/Users/example/worktrees/task\"},{\"job_id\":\"0192a64a-1234-7000-8000-000000000002\",\"weight\":4,\"workspace_key\":\"base:/Users/example/src/prefrontal\"}],\"rustc_version\":\"rustc 1.90.0 (1159e78c4 2025-09-14)\",\"server_reachable\":true}",
+      "sha256": "6a716e3634d177ed3bf7f3e9ca56781ebdb0f665b2d960005c13f631ea4060fa"
+    }
+  }
+}

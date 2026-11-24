@@ -1,0 +1,651 @@
+{
+  "artifact_id": "gh-routing-manifest",
+  "manifest_version": 20,
+  "schema_floor": 1,
+  "issued_at_unix_secs": 1792326320,
+  "detectors": {
+    "wrapper_config_dirs": [
+      "~/.config/gh-alfonso-*/"
+    ],
+    "credential_env_names": [
+      "GH_TOKEN",
+      "GITHUB_TOKEN",
+      "GH_ENTERPRISE_TOKEN"
+    ]
+  },
+  "tiers": {
+    "governed": [
+      {
+        "tuple": "issue comment",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr comment",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr review",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "issue reaction",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "issue close",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Speech tier (operator-ruled 2026-09-02, CKCRED co-signed): closing a thread is reversible, creates no authority, lands no code. Evidence: fleet bots publicly listing fixed-but-open issues because close refused at admin; 30+ operator-bypass closes misattributed in ten days. --reason completed|not_planned is REQUIRED (distinct public statements); optional --comment rides as the body. Holder replies carry GitHub's returned state/state_reason verbatim; a failed comment after a successful state change is the partial outcome state_applied_comment_failed, never masked."
+      },
+      {
+        "tuple": "issue reopen",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Speech tier, the inverse of issue close; declared together so a close is always reversible by the same seat."
+      },
+      {
+        "tuple": "pr close",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Speech tier, same argument as issue close. In-row exclusion: --delete-branch / -d is refused by the shim before routing (gh_shim_destructive_flag) and no delete-branch field exists on the wire; branch deletion stays undeclared. pr merge stays admin."
+      },
+      {
+        "tuple": "pr reopen",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Speech tier, the inverse of pr close; declared together because a PR's reopen is only CONDITIONALLY reversible (the head lives in the contributor's fork and can vanish) - specimen: a PR stuck closed-and-unmerged because reopen was unclassified under v11."
+      },
+      {
+        "tuple": "issue create",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "issue edit",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr create",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Speech tier, the same authority class as issue create: opening a pull request proposes a change under the bot identity and lands nothing. Merging stays on the admin pr merge row. The head branch must be in the target repository; cross-repository (owner:branch) heads are refused."
+      },
+      {
+        "tuple": "pr ready",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      }
+    ],
+    "admin": [
+      {
+        "tuple": "pr merge",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "release create",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "release edit",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "release upload",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "repo edit",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Repo-lifecycle administration (visibility flips in public-flip ceremonies). Admin tier: refused for agents with GH_SHIM_BYPASS=operator named as remedy, so ceremonies are operator-executed by design. Declared as an argv tuple because v1 api_rules are GET-only (SEAM audit deferral): an api-form DELETE/PATCH row would be signed bytes the classifier cannot honor."
+      },
+      {
+        "tuple": "run delete",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Actions-run deletion via gh's native verb (use `gh run delete`, not raw `api -X DELETE`, which stays unclassified). Admin tier for the same operator-executed-ceremony reason as `repo edit`; the refusal is loud on the FIRST attempt so a 309-run loop fails once, legibly, before the loop spends the ceremony window."
+      },
+      {
+        "tuple": "run rerun",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "Administration: operator identity under the explicit audited bypass, never governed bot speech - a rerun has no public attribution surface, and granting speech Apps actions:write would widen the compromise surface. `run cancel` is deliberately undeclared beside this row: destructive and rare, the bypass must not enable it by accident."
+      },
+      {
+        "tuple": "workflow run",
+        "platform": [
+          "macos",
+          "linux"
+        ],
+        "reasoning": "CI dispatch for bound seats (E2E chaos-foundation gate). Admin tier, not governed: a workflow dispatch has no public attribution surface, so bot identity buys nothing - while granting speech Apps actions:write would let a stolen mint run arbitrary code. Operator identity via GH_SHIM_BYPASS=operator; authority is the agent's per the authority-vs-identity erratum."
+      },
+      {
+        "tuple": "pr edit",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "label create",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "run cancel",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "repo rename",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "repo create",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "workflow disable",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "workflow enable",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      }
+    ],
+    "mechanical": [
+      {
+        "tuple": "issue view",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "issue list",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr view",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr list",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr diff",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "pr checks",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "run view",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "run list",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "repo clone",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      },
+      {
+        "tuple": "repo view",
+        "platform": [
+          "macos",
+          "linux"
+        ]
+      }
+    ]
+  },
+  "api_rules": [
+    {
+      "method": "GET",
+      "path_glob": "**",
+      "tier": "mechanical",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path_glob": "/repos/*/*/branches/*/protection",
+      "tier": "admin",
+      "platform": [
+        "macos",
+        "linux"
+      ],
+      "rationale": "branch protection is a repository setting; operator identity, audited bypass"
+    },
+    {
+      "method": "DELETE",
+      "path_glob": "/repos/*/*/branches/*/protection",
+      "tier": "admin",
+      "platform": [
+        "macos",
+        "linux"
+      ],
+      "rationale": "branch protection is a repository setting; operator identity, audited bypass"
+    },
+    {
+      "method": "PATCH",
+      "path_glob": "/repos/*/*/issues/comments/*",
+      "tier": "governed",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path_glob": "/repos/*/*/private-vulnerability-reporting",
+      "tier": "admin",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "method": "DELETE",
+      "path_glob": "/repos/*/*/private-vulnerability-reporting",
+      "tier": "admin",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    }
+  ],
+  "canonicalization": {
+    "issue comment": {
+      "argv_forms": [
+        "target-and-body"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "body"
+      ]
+    },
+    "pr comment": {
+      "argv_forms": [
+        "target-and-body"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "body"
+      ]
+    },
+    "pr review": {
+      "argv_forms": [
+        "target-and-body"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "body"
+      ]
+    },
+    "issue reaction": {
+      "argv_forms": [
+        "target-and-reaction"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "reaction"
+      ]
+    },
+    "issue close": {
+      "argv_forms": [
+        "target-and-state"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "comment"
+      ]
+    },
+    "issue reopen": {
+      "argv_forms": [
+        "target-and-state"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "comment"
+      ]
+    },
+    "pr close": {
+      "argv_forms": [
+        "target-and-state"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "comment"
+      ]
+    },
+    "pr reopen": {
+      "argv_forms": [
+        "target-and-state"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "comment"
+      ]
+    },
+    "issue create": {
+      "argv_forms": [
+        "fields-only"
+      ],
+      "target_fields": [],
+      "body_fields": [
+        "title",
+        "body",
+        "labels"
+      ]
+    },
+    "issue edit": {
+      "argv_forms": [
+        "target-and-fields"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "title",
+        "body",
+        "add_labels",
+        "remove_labels",
+        "add_assignees",
+        "remove_assignees"
+      ]
+    },
+    "pr create": {
+      "argv_forms": [
+        "fields-only"
+      ],
+      "target_fields": [],
+      "body_fields": [
+        "title",
+        "body",
+        "base",
+        "head",
+        "draft"
+      ]
+    },
+    "pr ready": {
+      "argv_forms": [
+        "target-and-state"
+      ],
+      "target_fields": [
+        "number"
+      ],
+      "body_fields": [
+        "undo"
+      ]
+    }
+  },
+  "repository_sections": {},
+  "bindings": {
+    "cortexkit/aft": "agent_ab64ea0873bbee0c",
+    "cortexkit/alfonso-desktop": "agent_16013c86",
+    "cortexkit/alfonso-ios": "agent_fcd30f86aefd4fd9",
+    "cortexkit/alfonso-tui": "agent_b54b7f85f177ca5d",
+    "cortexkit/anthropic-auth": "agent_74a1517f3695e9b1",
+    "cortexkit/antigravity-auth": "agent_87f64a79b52bf905",
+    "cortexkit/astrocyte": "agent_5acf4ca3cb0138c4",
+    "cortexkit/avatar": "agent_6f5aa47e4c5ad277",
+    "cortexkit/broca": "agent_65e9fe998e14b47d",
+    "cortexkit/callosum": "agent_26399f830c6eb22a",
+    "cortexkit/cerebellum": "agent_b1a9c546c33b84c9",
+    "cortexkit/commons": "agent_2bfd6927602f7977",
+    "cortexkit/cortexkit-account": "agent_2bfd6927602f7977",
+    "cortexkit/cortexkit-e2e": "agent_d444250e2d503c07",
+    "cortexkit/engram": "agent_ad4b5a2aa78261f4",
+    "cortexkit/entorhinal": "agent_fef99bdc81d3110f",
+    "cortexkit/fusiform": "agent_ce8142a135f2ba63",
+    "cortexkit/insula": "agent_2fd02cfeb9c0484f",
+    "cortexkit/magic-context": "agent_b613e5cf2ee55b8c",
+    "cortexkit/openai-auth": "agent_0f4d7713e64e7cc4",
+    "cortexkit/plexus": "agent_309edd5e94fbb2fe",
+    "cortexkit/prefrontal": "agent_fff43bb5f4bea20b",
+    "cortexkit/subconscious": "agent_2bfd6927602f7977",
+    "cortexkit/synapse": "agent_80d5db38cd991ef1",
+    "cortexkit/thalamus": "agent_62d6b770df582b4a",
+    "cortexkit/wernicke": "agent_20dabecd80549388",
+    "cortexkit/claustrum": "agent_847ef2a2861e98ec",
+    "cortexkit/basal": "agent_12eb4c0c42cecdb5",
+    "cortexkit/common-auth": "agent_0f4d7713e64e7cc4"
+  },
+  "worker_reads": [
+    {
+      "tuple": "api",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "run list",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "run view",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "pr list",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "pr view",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "pr diff",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "pr files",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "pr checks",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "issue list",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "issue view",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "issue comments",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "workflow list",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "workflow view",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "release list",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "release view",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "repo view",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "search code",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    },
+    {
+      "tuple": "search issues",
+      "platform": [
+        "macos",
+        "linux"
+      ]
+    }
+  ]
+}

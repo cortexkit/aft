@@ -18,7 +18,8 @@ fn exec_remote_published_vectors_use_one_locked_contract() {
     // offline mode, so unit tests embed the corpus rather than requiring those
     // packages in the caller's Cargo cache. Keep the singleton version fence
     // explicit when updating the dependency.
-    let lock: toml::Value = toml::from_str(include_str!("../../../../Cargo.lock")).unwrap();
+    let lock = crate::test_support::manifest_dir().join("../../Cargo.lock");
+    let lock: toml::Value = std::fs::read_to_string(lock).unwrap().parse().unwrap();
     let versions = lock["package"]
         .as_array()
         .unwrap()

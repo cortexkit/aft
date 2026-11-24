@@ -183,9 +183,8 @@ fn native_sandbox_predicate_controls_spawn_and_rewrite() {
 use crate::context::AppContext;
 use crate::sandbox_profile::SandboxProfile;
 use crate::sandbox_spawn::*;
-use aft_shell::test_bridge::{SpawnPlanTestExt as _, ToolLaunchPolicyTestExt as _};
+use aft_shell::test_bridge::ToolLaunchPolicyTestExt as _;
 use std::{
-    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},

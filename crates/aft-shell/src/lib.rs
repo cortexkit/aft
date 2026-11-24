@@ -67,8 +67,6 @@ use aft_github::gh_shim_worker_endpoints;
 use aft_github::{gh_shim, gh_shim_relay, gh_shim_speech};
 use aft_index::{watcher_backend, watcher_filter};
 use aft_inspect::{inspect, lsp};
-#[cfg(test)]
-use aft_parse::parser;
 
 use bash_background::gh_ticket as gh_shim_ticket;
 

@@ -139,12 +139,9 @@ fn bus_send_state_decoder_ignores_state_and_accepts_no_identity() {
 
 #[test]
 fn bus_card_settled_cingulate_vectors_pin_subject_body_and_headers() {
-    const BODY: &[u8] =
-        include_bytes!("../../../../aft/tests/fixtures/card_settled_v1/aft.aft.body.json");
-    const HEADERS: &[u8] =
-        include_bytes!("../../../../aft/tests/fixtures/card_settled_v1/aft.aft.headers.json");
-    const SUBJECT: &str =
-        include_str!("../../../../aft/tests/fixtures/card_settled_v1/aft.aft.subject.txt");
+    const BODY: &[u8] = include_bytes!("../../../fixtures/card_settled_v1/aft.aft.body.json");
+    const HEADERS: &[u8] = include_bytes!("../../../fixtures/card_settled_v1/aft.aft.headers.json");
+    const SUBJECT: &str = include_str!("../../../fixtures/card_settled_v1/aft.aft.subject.txt");
     let names = cortexkit_bus_naming::AccountNames::derive("box_example").unwrap();
     let parsed = names.parse_event_subject(SUBJECT).unwrap();
     assert_eq!(parsed.module, "cingulate");

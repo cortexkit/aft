@@ -3,7 +3,7 @@ use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
 use crate::context::AppContext;
 use crate::db::access_grants::{self as grants, ScopeKey};
 use aft_shell::test_bridge::sandbox_spawn::relaxed_profile_for_test;
-use std::{path::Path, sync::Arc};
+use std::sync::Arc;
 
 #[test]
 fn granted_checkout_controls_join_relaxed_denies() {
@@ -256,7 +256,7 @@ fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
         #[cfg(target_os = "linux")]
         {
             let linux =
-                compute_linux_profile(strict, &home, &[], &[], &mut SecureReadDirectoryLister)
+                aft_shell::test_bridge::sandbox_spawn::linux_profile_for_scope_test(strict, &home)
                     .unwrap();
             assert!(linux.writable_roots.contains(&granted));
             assert!(linux.read_allow.contains(&granted));

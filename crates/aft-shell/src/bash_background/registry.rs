@@ -23158,10 +23158,10 @@ mod tests {
 
     fn synapse_agent_text() -> (String, String) {
         let text = cargo_verdict_agent_text(
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/command.sh").trim(),
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stdout"),
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stderr"),
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/exit")
+            include_str!("../../fixtures/bash/synapse-cargo-test/command.sh").trim(),
+            include_str!("../../fixtures/bash/synapse-cargo-test/stdout"),
+            include_str!("../../fixtures/bash/synapse-cargo-test/stderr"),
+            include_str!("../../fixtures/bash/synapse-cargo-test/exit")
                 .trim()
                 .parse()
                 .unwrap(),
@@ -23239,12 +23239,12 @@ mod tests {
         // the instruction must not depend on being the stream's final line.
         let stderr = format!(
             "{}{}wrapper finished\n",
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stderr"),
+            include_str!("../../fixtures/bash/synapse-cargo-test/stderr"),
             cargo_verdict_noise("post-test progress", 4000)
         );
         let (foreground, completion) = cargo_verdict_agent_text(
             "cargo fmt --all --check && cargo test --workspace",
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stdout"),
+            include_str!("../../fixtures/bash/synapse-cargo-test/stdout"),
             &stderr,
             101,
         );
@@ -23317,11 +23317,11 @@ mod tests {
 
     #[test]
     fn cargo_verdict_fixture_layer_diagnosis() {
-        let stdout = include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stdout");
-        let stderr = include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/stderr");
+        let stdout = include_str!("../../fixtures/bash/synapse-cargo-test/stdout");
+        let stderr = include_str!("../../fixtures/bash/synapse-cargo-test/stderr");
         let merged = combine_streams(stdout, stderr);
         let compressed = crate::compress::compress_with_registry_exit_code(
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/command.sh").trim(),
+            include_str!("../../fixtures/bash/synapse-cargo-test/command.sh").trim(),
             &merged,
             Some(101),
             &crate::compress::toml_filter::FilterRegistry::default(),
@@ -23407,9 +23407,7 @@ mod tests {
         // The context budget depends on the platform's absolute capture-path
         // length. Golden the complete verdict block in the final visible text,
         // while the neighboring tests assert each line class independently.
-        let golden =
-            include_str!("../../../aft/tests/fixtures/bash/synapse-cargo-test/verdict.txt")
-                .trim_end();
+        let golden = include_str!("../../fixtures/bash/synapse-cargo-test/verdict.txt").trim_end();
         for text in [foreground, completion] {
             let body = text.rsplit_once("\nshown ").expect("bash cap trailer").0;
             assert!(
@@ -27817,10 +27815,8 @@ mod tests {
                 problems.push(format!("mangled: {line}"));
             }
         }
-        let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../aft/tests/fixtures/log_redaction_cases.json"
-        ))
-        .unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../fixtures/log_redaction_cases.json")).unwrap();
         let command_logs = fixture["command_logs"].as_array().unwrap();
         assert!(!command_logs.is_empty());
         for case in command_logs {
@@ -30816,7 +30812,7 @@ mod tests {
         // update the fixture to the new live frame printed below.
         let live = serde_json::to_value(&each_line_terminal_frame()).unwrap();
         let pinned: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../../packages/opencode-plugin/src/__tests__/fixtures/each-line-terminal-frame.json"
+            "../../fixtures/opencode/each-line-terminal-frame.json"
         ))
         .unwrap();
         assert_eq!(live, pinned);

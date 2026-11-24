@@ -166,7 +166,7 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
                 "exit 0"
             },
             false,
-            Some(launch(daemon.connection.clone())),
+            Some(launch(daemon.connection().clone())),
         )
     };
     assert!(submitted.success, "{submitted:?}");
@@ -202,7 +202,7 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
         spawn_memory_request(&ctx, "memory-fallback-b", None)
     };
     assert!(newer.success, "{newer:?}");
-    daemon.acceptance_gate.notify_one();
+    daemon.acceptance_gate().notify_one();
     let done = terminal(ctx.bash_background(), &task_id).await;
     if attach_error.is_some() {
         assert_eq!(done.info.status, BgTaskStatus::Failed, "{done:?}");

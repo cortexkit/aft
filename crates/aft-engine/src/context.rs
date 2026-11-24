@@ -2,6 +2,16 @@ pub use crate::secret::call_context;
 #[doc(hidden)]
 pub use aft_base::policy_path::canonicalize_lenient;
 
+#[cfg(test)]
+thread_local! {
+    static DB_CATALOG_REFRESHES_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn db_catalog_refreshes_for_test() -> usize {
+    DB_CATALOG_REFRESHES_FOR_TEST.get()
+}
+
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
 pub use crate::data_layer::status::view_load_error_response;
 pub use crate::data_layer::status::EmbeddingBackendHealthSnapshot;
@@ -2375,6 +2385,8 @@ impl App {
             // the next restart. Describe the storage root again now that it
             // has one.
             if let Some(storage_root) = path.parent() {
+                #[cfg(test)]
+                DB_CATALOG_REFRESHES_FOR_TEST.with(|count| count.set(count.get() + 1));
                 crate::engram_catalog::refresh_catalog(storage_root);
             }
         }

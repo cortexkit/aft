@@ -4,10 +4,6 @@
 //! differential corpus a closed vocabulary. The corpus can therefore name the
 //! behavior it covers without depending on Rust type names or log messages.
 
-use std::fs;
-#[cfg(not(test))]
-use std::path::PathBuf;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControlRole {
     Accept,
@@ -303,11 +299,9 @@ pub fn semantic_dimension_exists(id: &str) -> bool {
     SEMANTIC_DIMENSIONS.contains(&id)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
 
     #[test]
     fn reserved_control_roles_are_stable() {

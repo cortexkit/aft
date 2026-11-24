@@ -1,5 +1,13 @@
 use super::*;
 
+#[cfg(all(target_os = "linux", feature = "test-support"))]
+pub fn linux_profile_for_scope_test(
+    strict: SandboxProfile,
+    home: &Path,
+) -> Result<SandboxProfile, String> {
+    compute_linux_profile(strict, home, &[], &[], &mut SecureReadDirectoryLister)
+}
+
 #[cfg(feature = "test-support")]
 pub fn relaxed_profile_for_test(
     host: &dyn SandboxHost,

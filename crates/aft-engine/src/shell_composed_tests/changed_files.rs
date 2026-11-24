@@ -134,7 +134,7 @@ use crate::bash_changed_files::{self, BudgetGuard};
 use crate::config::BashChangedFiles;
 use aft_shell::bash_changed_files::test_fixture::{event, repo, NOT_SHOWN_TEXT, OVERFLOW_TEXT};
 use aft_shell::test_bridge::SpawnReceiptTestExt as _;
-use notify::event::{CreateKind, ModifyKind};
+use notify::event::CreateKind;
 use std::path::PathBuf;
 use std::{
     sync::Arc,

@@ -8,3 +8,4 @@ mod memory;
 mod sandbox_policy;
 #[cfg(target_os = "linux")]
 mod task_scope;
+mod workspace_contract;

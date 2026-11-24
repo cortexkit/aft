@@ -1,0 +1,434 @@
+   Compiling serde_core v1.0.228
+   Compiling libc v0.2.186
+   Compiling serde v1.0.228
+   Compiling proc-macro2 v1.0.106
+   Compiling num-traits v0.2.19
+   Compiling regex-automata v0.4.14
+   Compiling futures-io v0.3.32
+   Compiling portable-atomic v1.13.1
+   Compiling stable_deref_trait v1.2.1
+   Compiling cfg_aliases v0.2.1
+   Compiling quote v1.0.46
+   Compiling scopeguard v1.2.0
+   Compiling parking_lot_core v0.9.12
+   Compiling object v0.37.3
+   Compiling parking v2.2.1
+prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+   Compiling convert_case v0.10.0
+   Compiling syn v2.0.118
+   Compiling lock_api v0.4.14
+   Compiling jobserver v0.1.34
+   Compiling serde_json v1.0.150
+   Compiling getrandom v0.4.3
+   Compiling regex v1.12.4
+   Compiling bitflags v2.13.0
+   Compiling winnow v1.0.3
+   Compiling cc v1.2.65
+   Compiling unicode-xid v0.2.6
+   Compiling gimli v0.32.3
+   Compiling synapse-core v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-core)
+   Compiling hashbrown v0.16.1
+   Compiling rustix v1.1.4
+   Compiling system-configuration v0.7.0
+   Compiling security-framework v3.7.0
+   Compiling toml_parser v1.1.2+spec-1.1.0
+   Compiling darling_core v0.20.11
+   Compiling onig_sys v69.9.3
+   Compiling serde_derive v1.0.228
+   Compiling zerocopy-derive v0.8.52
+   Compiling bytemuck_derive v1.10.2
+   Compiling thiserror-impl v2.0.18
+   Compiling tracing-attributes v0.1.31
+   Compiling thiserror-impl v1.0.69
+   Compiling monostate-impl v0.1.18
+   Compiling synstructure v0.13.2
+   Compiling tokio-macros v2.7.0
+   Compiling futures-macro v0.3.32
+   Compiling darling_macro v0.20.11
+   Compiling zerocopy v0.8.52
+   Compiling bytemuck v1.25.0
+   Compiling thiserror v2.0.18
+   Compiling tracing v0.1.44
+   Compiling monostate v0.1.18
+   Compiling thiserror v1.0.69
+   Compiling zerofrom-derive v0.1.7
+   Compiling yoke-derive v0.8.2
+   Compiling darling v0.20.11
+   Compiling tokio v1.52.3
+   Compiling smallvec v1.15.2
+   Compiling onig v6.5.3
+   Compiling compact_str v0.9.1
+   Compiling dary_heap v0.3.9
+   Compiling spm_precompiled v0.1.4
+   Compiling ring v0.17.14
+   Compiling ppv-lite86 v0.2.21
+   Compiling ahash v0.8.12
+   Compiling zerofrom v0.1.8
+   Compiling derive_builder_core v0.20.2
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling indicatif v0.17.11
+   Compiling futures-util v0.3.32
+   Compiling zerovec-derive v0.11.3
+   Compiling displaydoc v0.2.6
+   Compiling rand_chacha v0.9.0
+   Compiling tempfile v3.27.0
+   Compiling yoke v0.8.3
+   Compiling subc-os v0.1.4
+   Compiling derive_builder_macro v0.20.2
+   Compiling rustls v0.23.41
+   Compiling serde_urlencoded v0.7.1
+   Compiling tokio-util v0.7.18
+   Compiling tower v0.5.3
+   Compiling num-complex v0.4.6
+   Compiling rand v0.9.4
+   Compiling native-tls v0.2.18
+   Compiling clap_derive v4.6.1
+   Compiling zerovec v0.11.6
+   Compiling zerotrie v0.2.4
+   Compiling derive_builder v0.20.2
+   Compiling half v2.7.1
+   Compiling derive-new v0.7.0
+   Compiling rustls-webpki v0.103.13
+   Compiling h2 v0.4.15
+   Compiling addr2line v0.25.1
+   Compiling tokio-native-tls v0.3.1
+   Compiling derive_more-impl v2.1.1
+   Compiling rand_distr v0.5.1
+   Compiling rustc-demangle v0.1.27
+   Compiling tinystr v0.8.3
+   Compiling tokenizers v0.21.4
+   Compiling potential_utf v0.1.5
+   Compiling clap v4.6.1
+   Compiling prettyplease v0.2.37
+   Compiling toml_writer v1.1.1+spec-1.1.0
+   Compiling icu_locale_core v2.2.0
+   Compiling darling_core v0.21.3
+   Compiling icu_collections v2.2.0
+   Compiling libloading v0.8.9
+   Compiling web-time v1.1.0
+   Compiling hyper v1.10.1
+   Compiling embassy-futures v0.1.2
+   Compiling oneshot v0.2.1
+   Compiling icu_provider v2.2.0
+   Compiling rand v0.10.2
+   Compiling hyper-util v0.1.20
+   Compiling tokio-rustls v0.26.4
+   Compiling darling_macro v0.21.3
+   Compiling icu_properties v2.2.0
+   Compiling icu_normalizer v2.2.0
+   Compiling serde_spanned v1.1.1
+   Compiling toml_datetime v1.1.1+spec-1.1.0
+   Compiling cubecl-common v0.10.0
+   Compiling nom v8.0.0
+   Compiling darling v0.21.3
+   Compiling hyper-rustls v0.27.9
+   Compiling hyper-tls v0.6.0
+   Compiling futures-core v0.3.32
+   Compiling backtrace v0.3.76
+   Compiling idna_adapter v1.2.2
+   Compiling toml v1.1.2+spec-1.1.0
+   Compiling spin v0.10.0
+   Compiling parking_lot v0.12.5
+   Compiling derive_more v2.1.1
+   Compiling enumset_derive v0.15.0
+   Compiling objc2-core-foundation v0.3.2
+   Compiling block2 v0.6.2
+   Compiling futures-lite v2.6.1
+   Compiling idna v1.1.0
+   Compiling serde_bytes v0.11.19
+   Compiling safetensors v0.6.2
+   Compiling rustc-hash v2.1.3
+   Compiling num-integer v0.1.46
+   Compiling reborrow v0.5.5
+   Compiling tynm v0.2.0
+   Compiling dispatch2 v0.3.1
+   Compiling float8 v0.7.0
+   Compiling dyn-stack-macros v0.1.3
+   Compiling url v2.5.8
+   Compiling objc2-foundation v0.3.2
+   Compiling enum-as-inner v0.6.1
+   Compiling synapse-engine-owned v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-owned)
+   Compiling darling_core v0.23.0
+   Compiling foreign-types-macros v0.2.3
+   Compiling foldhash v0.1.5
+   Compiling core-graphics-types v0.1.3
+   Compiling subc-protocol v0.29.0
+   Compiling tower-http v0.6.11
+   Compiling hashbrown v0.15.5
+   Compiling foreign-types v0.5.0
+   Compiling concurrent-queue v2.5.0
+   Compiling reqwest v0.12.28
+   Compiling darling_macro v0.23.0
+   Compiling aho-corasick v1.1.4
+warning: synapse-engine-owned@0.0.0: Metal developer tools unavailable; the embedded Metal step metallibs are empty and the owned decode engines will refuse to start
+   Compiling seq-macro v0.3.6
+   Compiling metal v0.29.0
+   Compiling event-listener v5.4.1
+   Compiling darling v0.23.0
+   Compiling sanitize-filename v0.6.0
+   Compiling naga v29.0.4
+   Compiling xxhash-rust v0.8.16
+   Compiling float4 v0.2.0
+   Compiling bit-vec v0.9.1
+   Compiling ash v0.38.0+1.3.281
+   Compiling subc-transport v0.10.0
+   Compiling cubecl-macros-internal v0.10.0
+   Compiling event-listener-strategy v0.5.4
+   Compiling subc-control v0.28.0
+   Compiling enumset v1.1.13
+   Compiling variadics_please v1.1.0
+   Compiling bit-set v0.9.1
+   Compiling spirv v0.4.0+sdk-1.4.341.0
+   Compiling syn v3.0.6
+   Compiling cubecl-runtime v0.10.0
+   Compiling codespan-reporting v0.13.1
+   Compiling arrayvec v0.7.8
+   Compiling objc2-metal v0.3.2
+   Compiling raw-window-handle v0.6.2
+   Compiling rustc-hash v1.1.0
+   Compiling cubecl-macros v0.10.0
+   Compiling float-ord v0.3.2
+   Compiling same-file v1.0.6
+   Compiling hexf-parse v0.2.1
+   Compiling libsqlite3-sys v0.30.1
+   Compiling wgpu-types v29.0.4
+   Compiling async-channel v2.5.0
+   Compiling cubecl-ir v0.10.0
+   Compiling cubecl-zspace v0.10.0
+   Compiling walkdir v2.5.0
+   Compiling gpu-descriptor-types v0.2.0
+   Compiling async-trait v0.1.92
+   Compiling wgpu-hal v29.0.4
+   Compiling md5 v0.8.0
+   Compiling inflections v1.1.1
+   Compiling presser v0.3.1
+   Compiling owned-decode-worker v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-owned/owned-decode-worker)
+   Compiling gpu-descriptor v0.3.2
+   Compiling objc2-quartz-core v0.3.2
+   Compiling subc-client-rs v0.26.1
+   Compiling num-bigint v0.4.7
+   Compiling hashbrown v0.14.5
+   Compiling cortexkit-store-types v0.2.2
+   Compiling ordered-float v5.3.0
+   Compiling raw-window-metal v1.1.0
+   Compiling matchers v0.2.0
+   Compiling profiling v1.0.18
+   Compiling wgpu-naga-bridge v29.0.4
+   Compiling gpu-allocator v0.28.0
+   Compiling renderdoc-sys v1.1.0
+   Compiling num-rational v0.4.2
+   Compiling cubecl-core v0.10.0
+   Compiling hashlink v0.9.1
+   Compiling num-iter v0.1.45
+   Compiling tracing-subscriber v0.3.23
+   Compiling chrono v0.4.45
+   Compiling wgpu-core v29.0.4
+   Compiling litrs v1.0.0
+   Compiling fixedbitset v0.5.7
+   Compiling type-map v0.5.1
+   Compiling wgpu v29.0.4
+   Compiling rusqlite v0.32.1
+   Compiling num v0.4.3
+   Compiling pulp v0.22.3
+   Compiling document-features v0.2.12
+   Compiling cortexkit-log v0.3.3
+   Compiling petgraph v0.8.3
+   Compiling stable-vec v0.4.2
+   Compiling synapse-module v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-module)
+   Compiling either v1.16.0
+   Compiling cpufeatures v0.2.17
+   Compiling cortexkit-store v0.2.0
+   Compiling cubecl-wgpu v0.10.0
+   Compiling digest v0.10.7
+   Compiling pulp-wasm-simd-flag v0.1.1
+   Compiling cubecl v0.10.0
+   Compiling cubecl-std v0.10.0
+   Compiling wgpu-core-deps-apple v29.0.4
+   Compiling dyn-stack v0.13.2
+   Compiling glob v0.3.3
+   Compiling sysctl v0.6.0
+   Compiling sha2 v0.10.9
+   Compiling raw-cpuid v11.6.0
+   Compiling errno v0.3.14
+   Compiling clang-sys v1.8.1
+   Compiling synapse-bench v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/harness)
+   Compiling cubecl-opt v0.10.0
+   Compiling nom v7.1.3
+   Compiling colored v3.1.1
+   Compiling bindgen v0.72.1
+   Compiling itertools v0.13.0
+   Compiling shlex v1.3.0
+   Compiling unty v0.0.4
+   Compiling cubecl-cpp v0.10.0
+   Compiling cexpr v0.6.0
+   Compiling nano-gemm-codegen v0.1.0
+   Compiling find_cuda_helper v0.2.0
+   Compiling cmake v0.1.58
+   Compiling rand_distr v0.6.0
+   Compiling burn-derive v0.21.0
+   Compiling burn-std v0.21.0
+   Compiling fs4 v1.1.0
+   Compiling subc-uptime v0.1.1
+   Compiling subc-jsonc v0.1.1
+   Compiling memmap2 v0.9.11
+   Compiling data-encoding v2.11.0
+   Compiling uuid v1.23.4
+   Compiling burn-backend v0.21.0
+   Compiling subc-daemon v0.31.0
+   Compiling llama-cpp-sys-2 v0.1.151
+   Compiling pulp v0.21.5
+   Compiling safetensors v0.7.0
+   Compiling rustix v0.38.44
+   Compiling enumflags2_derive v0.7.12
+   Compiling protobuf v3.7.2
+   Compiling llama-cpp-2 v0.1.151
+   Compiling enumflags2 v0.7.12
+   Compiling cubek-std v0.2.0
+   Compiling burn-tensor v0.21.0
+   Compiling gemm-common v0.19.0
+   Compiling tokenizers v0.22.2
+   Compiling protobuf-support v3.7.2
+   Compiling rmp v0.8.15
+   Compiling ciborium-io v0.2.2
+   Compiling home v0.5.12
+   Compiling bincode v2.0.1
+   Compiling synapse-engine-cuda v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-engine-cuda)
+   Compiling synapse-parity v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/parity)
+   Compiling rmp-serde v1.3.1
+   Compiling ureq-proto v0.6.0
+   Compiling which v4.4.2
+   Compiling httparse v1.10.1
+   Compiling indicatif v0.18.6
+   Compiling gemm-f32 v0.19.0
+   Compiling cubek-matmul v0.2.0
+   Compiling gemm-common v0.18.2
+   Compiling burn-core v0.21.0
+   Compiling ureq v3.3.0
+   Compiling security-framework-sys v2.17.0
+   Compiling core-foundation v0.10.1
+   Compiling synapse-worker-vulkan v0.1.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-vulkan)
+   Compiling protobuf-parse v3.7.2
+   Compiling nano-gemm-core v0.1.0
+   Compiling base64ct v1.8.3
+   Compiling syn v1.0.109
+   Compiling gemm-f16 v0.19.0
+   Compiling hf-hub v0.5.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-f64 v0.19.0
+   Compiling gemm-c32 v0.19.0
+   Compiling protobuf-codegen v3.7.2
+   Compiling pem-rfc7468 v1.0.0
+   Compiling rustls-pki-types v1.15.0
+   Compiling http v1.4.2
+   Compiling prettyplease v0.1.25
+   Compiling cubek-attention v0.2.0
+   Compiling cubek-convolution v0.2.0
+   Compiling gemm v0.19.0
+   Compiling onnx-ir v0.21.0
+   Compiling der v0.8.0
+   Compiling webpki-root-certs v1.0.8
+   Compiling ciborium-ll v0.2.2
+   Compiling burn-ir v0.21.0
+   Compiling cubek-reduce v0.2.0
+   Compiling cubek-quant v0.2.0
+   Compiling cubek-random v0.2.0
+   Compiling cubek-fft v0.2.0
+   Compiling nano-gemm-f64 v0.1.0
+   Compiling nano-gemm-c64 v0.1.0
+   Compiling nano-gemm-c32 v0.1.0
+   Compiling nano-gemm-f32 v0.1.0
+   Compiling objc2-io-surface v0.3.2
+   Compiling strum_macros v0.28.0
+   Compiling socks v0.3.4
+   Compiling synapse-worker-cuda v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-cuda)
+   Compiling textdistance v1.1.1
+   Compiling burn-fusion v0.21.0
+   Compiling cubek v0.2.0
+   Compiling ciborium v0.2.2
+   Compiling burn-nn v0.21.0
+   Compiling burn-optim v0.21.0
+   Compiling burn-flex v0.21.0
+   Compiling strum v0.28.0
+   Compiling hashbrown v0.13.2
+   Compiling onnx-ir-derive v0.21.0
+   Compiling equator-macro v0.2.1
+   Compiling matrixmultiply v0.3.10
+   Compiling hmac-sha256 v1.1.14
+   Compiling typed-path v0.12.3
+   Compiling synapse-worker-llama v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-llama)
+   Compiling synapse-rig v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/rig)
+   Compiling lzma-rust2 v0.15.8
+   Compiling text_placeholder v0.5.1
+   Compiling equator v0.2.2
+   Compiling burn-store v0.21.0
+   Compiling burn-cubecl-fusion v0.21.0
+   Compiling rust-format v0.3.4
+   Compiling ane v0.1.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane-direct/vendor/ane)
+   Compiling ort-sys v2.0.0-rc.11
+   Compiling zip v7.2.0
+   Compiling gemm-f32 v0.18.2
+   Compiling gemm-c32 v0.18.2
+   Compiling gemm-f64 v0.18.2
+   Compiling gemm-c64 v0.18.2
+   Compiling qd v0.7.7
+   Compiling synapse-worker-ane-direct v0.1.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane-direct)
+   Compiling candle-metal-kernels v0.10.2
+   Compiling equator-macro v0.4.2
+   Compiling burn v0.21.0
+   Compiling faer-macros v0.21.0
+   Compiling rawpointer v0.2.1
+   Compiling generativity v1.2.1
+   Compiling bit-vec v0.8.0
+   Compiling strength_reduce v0.2.4
+   Compiling gemm v0.18.2
+   Compiling nano-gemm v0.1.3
+   Compiling burn-cubecl v0.21.0
+   Compiling candle-core v0.10.2
+   Compiling equator v0.4.2
+   Compiling burn-onnx v0.21.0
+   Compiling lane-llama-inproc v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama-inproc)
+   Compiling faer-traits v0.22.1
+   Compiling bit-set v0.8.0
+   Compiling transpose v0.2.3
+   Compiling primal-check v0.3.4
+   Compiling spike-unified-rt v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/spikes/unified-rt)
+   Compiling ndarray v0.17.2
+   Compiling faer v0.22.6
+   Compiling fancy-regex v0.17.0
+   Compiling rustfft v6.4.1
+   Compiling serde_plain v1.0.2
+warning: spike-unified-rt@0.0.0: Metal developer tools unavailable; Metal step metallib will be built by a macOS toolchain
+   Compiling libloading v0.9.0
+   Compiling candle-nn v0.10.2
+   Compiling lane-burn v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/burn)
+   Compiling burn-wgpu v0.21.0
+   Compiling hound v3.5.1
+   Compiling synapse-worker-ane v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-ane)
+prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+   Compiling ort v2.0.0-rc.11
+prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+   Compiling candle-transformers v0.10.2
+prefrontal-build-slot: waiting for a compile slot (6 slots, all busy; queued behind other worktrees' builds). This is not a hang.
+   Compiling lane-ort-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/ort-embed)
+   Compiling synapse-worker-decode v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-worker-decode)
+   Compiling lane-candle-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/candle-embed)
+   Compiling lane-llama v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/llama)
+   Compiling lane-wrap-embed v0.0.0 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/bench/lanes/wrap-embed)
+   Compiling synapse-opctl v0.1.0-alpha.2 (/Users/developer01/.local/share/cortexkit/alfonso/worktrees/07d868436e96de13/bg_dispatch_f7e861d6979a41fb1a6993d1/crates/synapse-opctl)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 10m 00s
+warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running unittests src/lib.rs (target/debug/deps/ane-187c25c9ee3aa8bd)
+     Running unittests src/main.rs (target/debug/deps/lane_burn-a7dbe2f04f692c64)
+     Running unittests src/main.rs (target/debug/deps/lane_candle_embed-c1746166a0ad53d4)
+     Running unittests src/main.rs (target/debug/deps/lane_llama-3b1db8f719cebc6c)
+     Running unittests src/lib.rs (target/debug/deps/lane_llama_inproc-dc23307cd3132888)
+     Running unittests src/main.rs (target/debug/deps/lane_llama_inproc-f9972241158d4d41)
+     Running unittests src/bin/latency.rs (target/debug/deps/latency-78072a54be231578)
+     Running unittests src/main.rs (target/debug/deps/lane_ort_embed-1aa7aa5dba1eddf1)
+     Running unittests src/main.rs (target/debug/deps/lane_wrap_embed-0007e6723999e1cd)
+     Running unittests src/lib.rs (target/debug/deps/owned_decode_worker-f2b338e0f908554c)
+     Running tests/ownership_fixtures.rs (target/debug/deps/ownership_fixtures-cc72bad6b5b9ab3c)
+     Running tests/protocol_fixtures.rs (target/debug/deps/protocol_fixtures-2e5d83914483b7c7)
+     Running unittests src/main.rs (target/debug/deps/spike_unified_rt-8633ea13f51809ac)
+error: test failed, to rerun pass `-p spike-unified-rt --bin spike-unified-rt`

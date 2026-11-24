@@ -108,8 +108,6 @@ pub mod db;
 pub use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
 pub use aft_base::disk_floor;
-#[cfg(test)]
-pub(crate) use aft_base::durability;
 pub mod edit;
 #[cfg(test)]
 mod edit_composed_tests;

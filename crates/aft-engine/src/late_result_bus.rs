@@ -46,8 +46,13 @@ mod tests {
         let catalog = storage.join(crate::engram_catalog::CATALOG_FILENAME);
         assert!(!database.path.exists());
         assert!(!catalog.exists());
+        let refreshes_before = crate::context::db_catalog_refreshes_for_test();
 
         assert_eq!(scan_from_start_for_test(&database), Ok(0));
+        assert_eq!(
+            crate::context::db_catalog_refreshes_for_test(),
+            refreshes_before + 1
+        );
         let contents: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&catalog).unwrap()).unwrap();
         assert!(contents["entries"]
@@ -60,6 +65,10 @@ mod tests {
         // an unchanged storage root. Removing the catalog makes a refresh visible.
         std::fs::remove_file(&catalog).unwrap();
         assert_eq!(scan_from_start_for_test(&database), Ok(0));
+        assert_eq!(
+            crate::context::db_catalog_refreshes_for_test(),
+            refreshes_before + 1
+        );
         assert!(!catalog.exists());
     }
 }

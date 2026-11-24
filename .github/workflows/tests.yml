@@ -151,6 +151,7 @@ jobs:
         run: |
           python3 crates/aft-engine/checks/dependency-direction.py
           python3 crates/aft-engine/checks/github-fixture-copies.py
+          python3 crates/aft-engine/checks/shell-fixture-copies.py
           for fixture in crates/aft-engine/checks/fixtures/*.json; do
             case "${fixture##*/}" in
               base-to-engine-dev.json) path="aft-base -> aft-engine" ;;

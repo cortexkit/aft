@@ -2611,6 +2611,7 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let tools_dir = manifest_path("../aft-tools/src");
     let engine_dir = manifest_path("../aft-engine/src");
+    let shell_dir = manifest_path("../aft-shell/src");
     let index_dir = manifest_path("../aft-index/src");
     let edit_dir = manifest_path("../aft-edit/src");
     let subc_dir = manifest_path("../aft-subc/src");
@@ -2620,19 +2621,19 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     paths.extend(collect_rs_files(&index_dir.join("search_state")));
     paths.extend(collect_rs_files(&index_dir.join("search_index")));
     paths.push(index_dir.join("data_layer/callgraph_store_adapter.rs"));
-    paths.push(engine_dir.join("bash_background/scoped_tasks.rs"));
-    paths.push(engine_dir.join("bash_changed_files.rs"));
+    paths.push(shell_dir.join("bash_background/scoped_tasks.rs"));
+    paths.push(shell_dir.join("bash_changed_files.rs"));
     paths.push(tools_dir.join("run_tool_call.rs"));
     paths.push(tools_dir.join("subc_format.rs"));
     paths.push(tools_dir.join("tool_output.rs"));
-    paths.push(engine_dir.join("output_store.rs"));
+    paths.push(shell_dir.join("output_store.rs"));
     paths.push(edit_dir.join("file_read_exact.rs"));
     paths.push(subc_dir.join("subc/bind_log.rs"));
     paths.push(subc_dir.join("subc/diagnostics_findings.rs"));
     paths.push(engine_dir.join("runtime_drain.rs"));
     paths.push(parse_dir.join("parser/todo_markers.rs"));
     paths.push(parse_dir.join("parser/dead_code_facts.rs"));
-    paths.push(engine_dir.join("bash_permissions/scan.rs"));
+    paths.push(shell_dir.join("bash_permissions/scan.rs"));
     paths.extend(collect_rs_files(&base_dir.join("compress")));
     let primitives = [
         "budget.exhausted()",
