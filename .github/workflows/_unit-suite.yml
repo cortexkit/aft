@@ -504,7 +504,8 @@ jobs:
   worker-gh-read-landlock:
     name: Worker GitHub reads (required Landlock)
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    # The Ubuntu 24.04 runner kernel meets the required Landlock ABI v3 floor.
+    runs-on: ubuntu-24.04
     timeout-minutes: 35
     env:
       AFT_REQUIRE_LANDLOCK: "1"
@@ -573,7 +574,7 @@ jobs:
   sandbox-landlock-probes:
     name: Sandbox real-kernel Landlock probes
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5

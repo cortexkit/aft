@@ -209,6 +209,13 @@ class LightPREventGateTests(unittest.TestCase):
         self.assertEqual(job["if"], "${{ github.event_name != 'pull_request' }}")
         self.assertEqual(str(job["env"]["AFT_REQUIRE_LANDLOCK"]), "1")
 
+    def test_required_landlock_jobs_stay_on_ubuntu_24_04(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        jobs = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))["jobs"]
+        for job_id in ("worker-gh-read-landlock", "sandbox-landlock-probes"):
+            with self.subTest(job=job_id):
+                self.assertEqual(jobs[job_id]["runs-on"], "ubuntu-24.04")
+
     def test_pr_exclusion_is_an_event_warning_not_a_dead_train_ref_gate(self) -> None:
         self.assertEqual(workflow_gates.classify("${{ github.event_name != 'pull_request' }}"), "warn")
 
