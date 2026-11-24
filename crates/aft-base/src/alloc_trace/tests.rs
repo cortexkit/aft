@@ -102,12 +102,24 @@ fn event_lines_name_size_label_thread_and_root() {
         "large allocation 512 MiB realloc from 256 MiB thread=aft-subc-runtime op=frame_encode root=aft"
     );
 
+    let mut crossed = ring::Event::new(EventKind::BurstCrossed);
+    crossed.label = Label::INDEX_BUILD.0;
+    crossed.size = 640 << 20;
+    assert_eq!(
+        report::format_event(&crossed),
+        "allocation burst: op=index_build accounted 640 MiB crossed 512 MiB \
+         (upper bound: allocations under the label minus same-thread frees, not memory held)"
+    );
+
     let mut ended = ring::Event::new(EventKind::BurstEnded);
     ended.label = Label::MEANING_FILL.0;
     ended.size = 3 << 30;
     ended.duration_ns = 2_500_000_000;
     assert_eq!(
         report::format_event(&ended),
-        "allocation burst ended: op=meaning_fill peak 3072 MiB over 2.5s, live 0.0 MiB now"
+        "allocation burst ended: op=meaning_fill peak 3072 MiB over 2.5s, accounted 0.0 MiB now \
+         (upper bound: allocations under the label minus same-thread frees, not memory held; \
+         burst duration runs from threshold crossing to dropping below half the threshold \
+         or label reset, not operation time)"
     );
 }
