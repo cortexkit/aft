@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 /// component (the store falls back to the raw spelling for those, which
 /// `relative_path` keeps as an absolute out-of-root key), and `..` traversal
 /// through a non-directory (realpath ENOTDIR).
-pub(crate) fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
+#[doc(hidden)]
+pub fn canonicalize_lenient(path: &Path) -> Option<PathBuf> {
     use std::path::Component;
     if let Ok(canonical) = std::fs::canonicalize(path) {
         return Some(canonical);

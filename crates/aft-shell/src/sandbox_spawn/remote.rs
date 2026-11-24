@@ -1,6 +1,7 @@
 //! Remote shells inherit neither the normal shell profile nor its environment.
 
-use crate::{context::AppContext, tool_call_result::ToolCallResult};
+use super::SandboxHost;
+use crate::tool_call_result::ToolCallResult;
 use std::{
     path::{Path, PathBuf},
     time::Duration,
@@ -55,7 +56,7 @@ pub(crate) use unix::Start as StartForTest;
 
 #[cfg(all(target_os = "linux", feature = "test-hooks"))]
 pub async fn run_for_test(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     folder: &Path,
     launcher: &Path,
     command: String,
@@ -76,7 +77,7 @@ pub async fn run_for_test(
 
 #[cfg(not(target_os = "linux"))]
 #[doc(hidden)]
-pub fn prepare(_: &AppContext, _: &Path, _: PathBuf, _: String) -> Result<Start, String> {
+pub fn prepare(_: &dyn SandboxHost, _: &Path, _: PathBuf, _: String) -> Result<Start, String> {
     Err("no remote shell sandbox backend".into())
 }
 

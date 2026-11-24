@@ -54,11 +54,11 @@ pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
 // still require a configured context, and each invariant needs local review.
 
 pub mod access_policy;
-pub mod agent_child_env;
 pub(crate) use aft_base::agent_commands;
 pub use aft_base::alert_records;
 pub use aft_edit::agent_data;
 pub use aft_inspect::alert_state;
+pub use aft_shell::agent_child_env;
 // The `aft` binary installs its allocator; the library sets the operation
 // labels it attributes allocations to.
 pub use aft_base::alloc_trace;
@@ -68,19 +68,19 @@ pub use aft_edit::backup;
 pub mod bash_background;
 #[doc(hidden)]
 pub mod bash_changed_files;
+pub(crate) use aft_base::bash_env;
 #[cfg(unix)]
 #[doc(hidden)]
-pub mod bash_db_hints;
-pub(crate) use aft_base::bash_env;
-pub mod bash_parse;
-pub mod bash_permissions;
+pub use aft_shell::bash_db_hints;
+pub use aft_shell::bash_parse;
+pub use aft_shell::bash_permissions;
 pub mod bash_rewrite;
-#[doc(hidden)]
-pub mod blocking_wait;
 pub use aft_base::atomic_replace;
 pub(crate) use aft_base::bounded_io;
 pub use aft_base::build_state;
 pub use aft_db::build_breaker;
+#[doc(hidden)]
+pub use aft_shell::blocking_wait;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
@@ -102,6 +102,7 @@ pub mod config_live;
 pub use aft_base::config_resolve;
 pub use aft_base::config_sources;
 pub mod context;
+mod context_shell_host;
 pub(crate) use aft_base::cross_volume;
 pub mod data_layer;
 #[doc(hidden)]
@@ -122,9 +123,9 @@ pub use aft_base::environment;
 #[cfg(test)]
 mod engine_source_guard_tests;
 pub use aft_base::error;
-pub mod exec_remote;
 #[cfg(all(test, unix))]
 use aft_base::executable_cache;
+pub use aft_shell::exec_remote;
 pub mod executor;
 pub use aft_base::feature_config;
 pub(crate) use aft_base::file_identity;
@@ -147,8 +148,6 @@ pub use aft_parse::fuzzy_match;
 #[doc(hidden)]
 pub mod gh_shim_speech;
 pub mod gh_shim_ticket;
-#[doc(hidden)]
-pub mod gh_shim_worker_broker;
 pub use aft_base::git_head;
 #[cfg(all(test, unix))]
 pub(crate) use aft_base::git_probe;
@@ -157,6 +156,8 @@ pub(crate) use aft_base::git_revision;
 #[doc(hidden)]
 pub use aft_github::gh_shim_worker_endpoints;
 pub use aft_index::git_index_reader;
+#[doc(hidden)]
+pub use aft_shell::gh_shim_worker_broker;
 #[doc(hidden)]
 pub mod git_root_resolution;
 pub(crate) use aft_base::github_address;
@@ -215,7 +216,7 @@ pub use aft_index::ort_pin;
 #[doc(hidden)]
 pub mod os_metadata;
 #[doc(hidden)]
-pub mod output_store;
+pub use aft_shell::output_store;
 #[doc(hidden)]
 pub mod page_collect;
 pub mod parent_search;
@@ -262,13 +263,13 @@ pub use aft_index::search_b2;
 pub use aft_index::search_index;
 pub use aft_index::search_state;
 pub mod secret;
-pub mod secret_proxy;
 pub use aft_index::semantic_admission;
 pub use aft_index::semantic_index;
+pub use aft_shell::secret_proxy;
 pub mod setup_plan;
-#[doc(hidden)]
-pub mod shell_env_provider;
 pub use aft_base::shell_format;
+#[doc(hidden)]
+pub use aft_shell::shell_env_provider;
 pub mod standing_roots;
 #[doc(hidden)]
 pub mod status_push;
@@ -311,8 +312,8 @@ pub mod write_ledger;
 #[allow(unused_imports)]
 pub(crate) use aft_base::windows_command;
 pub use aft_base::windows_path;
-pub mod windows_shell;
 pub use aft_base::worker_jail_canary;
+pub use aft_shell::windows_shell;
 #[cfg(test)]
 mod gate_hermeticity_tests;
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]

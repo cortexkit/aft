@@ -51,7 +51,7 @@ fn run_with(
     handler(request, ctx)
 }
 
-pub(super) fn run(request: &RawRequest, ctx: &AppContext) -> Response {
+pub(crate) fn run(request: &RawRequest, ctx: &AppContext) -> Response {
     run_with(HANDLERS.get(), request, ctx)
 }
 

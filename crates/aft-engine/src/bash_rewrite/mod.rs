@@ -5,19 +5,8 @@
 //! for differential tests. Once a request is accepted, its handler response is
 //! returned directly; native bash is never run as a recovery path.
 
-#[doc(hidden)]
-pub mod bash_hints;
-pub mod catalog;
-pub mod differential;
 pub mod dispatch;
-pub mod footer;
-#[doc(hidden)]
-pub mod notices;
-pub mod observation;
-pub use crate::bash_parse as parser;
-pub mod rules;
-
-use serde_json::Value;
+pub use aft_shell::bash_rewrite::*;
 
 use crate::context::AppContext;
 use crate::protocol::Response;

@@ -49,7 +49,7 @@ pub struct Start {
 }
 
 pub fn prepare(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     folder: &Path,
     workdir: PathBuf,
     command: String,
@@ -59,7 +59,7 @@ pub fn prepare(
 }
 
 pub(crate) fn prepare_with_launcher(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     folder: &Path,
     workdir: PathBuf,
     command: String,

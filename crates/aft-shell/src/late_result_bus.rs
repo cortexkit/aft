@@ -23,8 +23,11 @@ use serde::Serialize;
 use subc_client_rs::{ConnectionState, ConsumerOptions, SubcConsumer};
 use tokio::sync::{oneshot, Notify};
 
-use crate::context::App;
 use crate::db::call_ledger::{Key, LATE_RESULTS_PAGE_MAX, UNACKED_RESULTS_MAX};
+
+mod database;
+#[doc(hidden)]
+pub use database::LedgerDatabase;
 
 #[doc(hidden)]
 pub mod display;
@@ -166,7 +169,10 @@ impl Drop for Worker {
 /// Start after the provider has attached to the daemon. Neither the frame loop
 /// nor a request executor runs credential issuance, database scans or publishes.
 #[doc(hidden)]
-pub fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Option<Worker> {
+pub fn start(
+    database: Arc<dyn LedgerDatabase + Send + Sync>,
+    connection: PathBuf,
+) -> Option<Worker> {
     status::initialize();
     let (stop, stopped) = oneshot::channel();
     let thread = std::thread::Builder::new()
@@ -181,7 +187,7 @@ pub fn start(app: Arc<App>, connection: PathBuf, database: PathBuf) -> Option<Wo
             };
             runtime.block_on(async {
                 tokio::select! {
-                    _ = run(app, connection, database, stopped) => {},
+                    _ = run(database, connection, stopped) => {},
                     _ = readers::sweep_cards() => {},
                 }
             });
@@ -198,7 +204,11 @@ fn backoff(delay: Duration) -> Duration {
     (delay * 2).min(MAX_BACKOFF)
 }
 
-async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: oneshot::Receiver<()>) {
+async fn run(
+    database: Arc<dyn LedgerDatabase + Send + Sync>,
+    path: PathBuf,
+    mut stopped: oneshot::Receiver<()>,
+) {
     let mut delay = Duration::from_secs(1);
     let consumer = loop {
         let result = tokio::select! {
@@ -227,7 +237,7 @@ async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: onesh
     });
     tokio::select! {
         _ = &mut stopped => {},
-        _ = drive(app, database, consumer.clone(), daemon_connected.clone()) => {},
+        _ = drive(database, consumer.clone(), daemon_connected.clone()) => {},
         _ = display::watch_reader(consumer.clone(), daemon_connected) => {},
     }
     // Bound transport cleanup even if the daemon or NATS stopped responding.
@@ -237,8 +247,7 @@ async fn run(app: Arc<App>, path: PathBuf, database: PathBuf, mut stopped: onesh
 }
 
 async fn drive(
-    app: Arc<App>,
-    database: PathBuf,
+    database: Arc<dyn LedgerDatabase + Send + Sync>,
     consumer: Arc<SubcConsumer>,
     daemon_connected: Arc<AtomicBool>,
 ) {
@@ -297,20 +306,9 @@ async fn drive(
         let mut publisher = RealPublisher(client);
         let due = state.due();
         if !due.is_empty() {
-            let app = app.clone();
             let database = database.clone();
-            let retained = tokio::task::spawn_blocking(move || {
-                let db = app.open_db(&database).map_err(|_| "bus_ledger_open")?;
-                let conn = db.try_lock().map_err(|_| "bus_ledger_busy")?;
-                due.into_iter()
-                    .map(|notice| {
-                        let retained =
-                            is_retained(&conn, &notice).map_err(|_| "bus_ledger_read")?;
-                        Ok((notice, retained))
-                    })
-                    .collect::<Result<Vec<_>, &'static str>>()
-            })
-            .await;
+            let retained =
+                tokio::task::spawn_blocking(move || read_retained(database.as_ref(), due)).await;
             match retained {
                 Ok(Ok(retained)) => state.retry(&mut publisher, retained).await,
                 // Name the step that failed (open, busy or read); a join
@@ -331,15 +329,11 @@ async fn drive(
         }
         let capacity = state.capacity();
         if scan_pending && capacity > 0 {
-            let app = app.clone();
             let database = database.clone();
             let position = state.position.clone();
-            let batch = tokio::task::spawn_blocking(move || {
-                let db = app.open_db(&database).map_err(|_| "bus_ledger_open")?;
-                let conn = db.try_lock().map_err(|_| "bus_ledger_busy")?;
-                read_batch(&conn, &position, capacity).map_err(|_| "bus_ledger_read")
-            })
-            .await;
+            let batch =
+                tokio::task::spawn_blocking(move || scan(database.as_ref(), &position, capacity))
+                    .await;
             match batch {
                 Ok(Ok(batch)) => {
                     scan_pending = state.deliver(&mut publisher, batch).await;
@@ -460,6 +454,22 @@ fn notice(row: &rusqlite::Row<'_>) -> rusqlite::Result<Option<Notice>> {
     }))
 }
 
+fn scan(
+    database: &dyn LedgerDatabase,
+    position: &Position,
+    capacity: usize,
+) -> Result<Batch, &'static str> {
+    database::read(database, |conn| {
+        read_batch(conn, position, capacity).map_err(|_| "bus_ledger_read")
+    })
+}
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn scan_from_start_for_test(database: &dyn LedgerDatabase) -> Result<usize, &'static str> {
+    scan(database, &Position::default(), SCAN_BATCH).map(|batch| batch.visited)
+}
+
 fn read_batch(conn: &Connection, position: &Position, capacity: usize) -> rusqlite::Result<Batch> {
     match position {
         Position::Start => {
@@ -569,6 +579,20 @@ fn replay(
         seq: if batch.visited == limit { last } else { 0 },
     };
     Ok(batch)
+}
+
+fn read_retained(
+    database: &dyn LedgerDatabase,
+    due: Vec<Notice>,
+) -> Result<Vec<(Notice, bool)>, &'static str> {
+    database::read(database, |conn| {
+        due.into_iter()
+            .map(|notice| {
+                let retained = is_retained(conn, &notice).map_err(|_| "bus_ledger_read")?;
+                Ok((notice, retained))
+            })
+            .collect()
+    })
 }
 
 fn is_retained(conn: &Connection, notice: &Notice) -> rusqlite::Result<bool> {

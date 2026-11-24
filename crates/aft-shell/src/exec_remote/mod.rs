@@ -10,6 +10,8 @@ pub mod policy;
 pub(crate) mod read_only_note;
 mod reply;
 mod request;
+mod sibling_read_policy;
+pub use sibling_read_policy::SiblingReadPolicy;
 mod stream;
 pub(crate) use client::LaunchTimings;
 #[cfg(unix)]

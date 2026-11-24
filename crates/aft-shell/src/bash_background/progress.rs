@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::persistence::TaskArtifact;
 use super::BgTaskRegistry;
-use crate::context::AppContext;
+use crate::bash_background::TaskRegistryAccess;
 use crate::protocol::{ProgressFrame, ProgressKind};
 
 const INTERVAL: Duration = Duration::from_millis(250);
@@ -139,7 +139,12 @@ pub struct BashProgressPump {
 
 impl BashProgressPump {
     #[doc(hidden)]
-    pub fn new(ctx: &AppContext, task_id: String, session_id: String, request_id: String) -> Self {
+    pub fn new(
+        ctx: &dyn TaskRegistryAccess,
+        task_id: String,
+        session_id: String,
+        request_id: String,
+    ) -> Self {
         let registry = ctx.bash_background().clone();
         let (tick, ticks) = mpsc::sync_channel(1);
         let (results, ready) = mpsc::sync_channel(1);

@@ -36,7 +36,10 @@ pub trait RewriteRule: Send + Sync {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> RewriteDecision;
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response;
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response;
 }
+use super::RewriteHost;
+use crate::protocol::Response;
+use serde_json::Value;

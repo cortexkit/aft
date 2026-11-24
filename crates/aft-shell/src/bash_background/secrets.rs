@@ -10,9 +10,9 @@ use std::sync::Arc;
 #[cfg(unix)]
 use std::sync::Mutex;
 
-#[cfg(unix)]
-use crate::context::AppContext;
 use crate::protocol::Response;
+#[cfg(unix)]
+use crate::sandbox_spawn::SandboxHost;
 #[cfg(unix)]
 use crate::sandbox_spawn::SpawnPlan;
 #[cfg(unix)]
@@ -75,8 +75,8 @@ pub fn vault() -> Arc<dyn SecretVault> {
 #[doc(hidden)]
 pub fn refusal(id: &str, labels: &[String], code: &str, message: &str) -> Response {
     let vault = vault();
-    let scope = crate::context::call_context::current_secret_audit_scope()
-        .map(|scope| scope.to_scope_ref());
+    let scope =
+        crate::secret::call_context::current_secret_audit_scope().map(|scope| scope.to_scope_ref());
     for label in labels {
         let mut record = secret_rules::audit::AuditRecordV1::new(
             crate::secret::now_ms(),
@@ -113,7 +113,7 @@ impl Drop for Preflight {
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn preflight(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     session: &str,
     pty: bool,
     background: bool,
@@ -248,7 +248,7 @@ pub fn authorize(
     if env_conflicts(env) {
         return Err(refusal(id, labels, "secrets_env_conflict", ENV_CONFLICT));
     }
-    let (scopes, _) = crate::context::call_context::current_call_scopes().map_err(|reason| {
+    let (scopes, _) = crate::secret::call_context::current_call_scopes().map_err(|reason| {
         outcome_response(
             id,
             labels,
@@ -262,7 +262,7 @@ pub fn authorize(
         scopes.authorization.clone(),
         scopes.lifetime.clone(),
         labels.to_vec(),
-        crate::context::call_context::current_secret_consent_context(),
+        crate::secret::call_context::current_secret_consent_context(),
         {
             #[cfg(any(test, feature = "test-support"))]
             {

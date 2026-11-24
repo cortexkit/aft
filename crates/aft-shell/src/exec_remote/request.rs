@@ -68,7 +68,7 @@ impl FrozenParams {
     #[doc(hidden)]
     pub fn validate_siblings(
         &mut self,
-        ctx: &crate::context::AppContext,
+        ctx: &dyn super::SiblingReadPolicy,
         request_id: &str,
         session_id: &str,
         preflight_grants: &[crate::access_policy::AccessGrant],
@@ -84,28 +84,29 @@ impl FrozenParams {
                 }
                 let path =
                     crate::bounded_io::canonicalize(given).map_err(|_| not_checkout_root())?;
-                let path =
-                    match ctx.validate_read_path_without_approval(request_id, session_id, &path) {
-                        Ok(path) => path,
-                        // An unreadable grant store is not evidence that the
-                        // session lacks a grant. Preserve the file tool's error,
-                        // even when an unsaved preflight grant covers the path.
-                        Err(response) if read_policy_unavailable(&response) => {
-                            return Err(SiblingValidationError::Unavailable(response));
-                        }
-                        Err(_) if preflight_covers(preflight_grants, &path) => path,
-                        Err(_) => {
-                            // A confined session keeps link targets outside its
-                            // root private, so the refusal names the sibling as
-                            // the plan gave it.
-                            let shown = if crate::context::confinement::for_request(request_id) {
-                                given.to_path_buf()
-                            } else {
-                                crate::path_identity::normalize_path(&path)
-                            };
-                            return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown).into());
-                        }
-                    };
+                let path = match ctx
+                    .validate_read_path_without_approval(request_id, session_id, &path)
+                {
+                    Ok(path) => path,
+                    // An unreadable grant store is not evidence that the
+                    // session lacks a grant. Preserve the file tool's error,
+                    // even when an unsaved preflight grant covers the path.
+                    Err(response) if read_policy_unavailable(&response) => {
+                        return Err(SiblingValidationError::Unavailable(response));
+                    }
+                    Err(_) if preflight_covers(preflight_grants, &path) => path,
+                    Err(_) => {
+                        // A confined session keeps link targets outside its
+                        // root private, so the refusal names the sibling as
+                        // the plan gave it.
+                        let shown = if aft_index::data_layer::read_fence::for_request(request_id) {
+                            given.to_path_buf()
+                        } else {
+                            crate::path_identity::normalize_path(&path)
+                        };
+                        return Err(sibling_refusal(SiblingRefusal::NotReadable, &shown).into());
+                    }
+                };
                 let marker = crate::bounded_io::metadata(&path.join(".git"))
                     .map_err(|_| not_checkout_root())?;
                 if !marker.is_dir() && !marker.is_file() {

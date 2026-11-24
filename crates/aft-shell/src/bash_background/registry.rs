@@ -37,12 +37,12 @@ use crate::compress::caps::DropClass;
 #[cfg(unix)]
 use crate::compress::single_top_level_pipeline;
 use crate::compress::CompressionResult;
-use crate::context::SharedProgressSender;
 use crate::db::compression_events::CompressionAggregateCache;
 use crate::harness::Harness;
 use crate::list_envelope::ListEnvelope;
 use crate::protocol::{BashCompletedFrame, BashLongRunningFrame, BashPatternMatchFrame, PushFrame};
 use crate::sandbox_spawn::SpawnPlan;
+use aft_base::progress_sender::SharedProgressSender;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -1599,7 +1599,7 @@ pub(crate) struct RegistryInner {
     project_replay_batch_claimed: AtomicBool,
     #[cfg(any(test, feature = "test-support"))]
     project_replay_scan_budget_for_test: Mutex<Option<(usize, Duration)>>,
-    /// Output compression callback. Set by `AppContext` after construction.
+    /// Output compression callback. Set by the context after construction.
     /// Takes (command, raw_output, exit_code) and returns compressed text. Called from
     /// the watchdog thread when a task reaches a terminal state and from
     /// `bash_status`/`list` snapshot reads. When `None`, output is returned
@@ -2914,7 +2914,7 @@ impl BgTaskRegistry {
     }
 
     /// Install the output-compression callback. Called by `main.rs` after
-    /// `AppContext` is constructed so that snapshot/completion paths can
+    /// the context is constructed so that snapshot/completion paths can
     /// invoke `compress::compress_with_registry` without holding a context
     /// reference. When called multiple times, the latest installation wins.
     pub fn set_compressor<F>(&self, compressor: F)
@@ -22561,7 +22561,7 @@ mod tests {
     fn failed_spawn_immediately_pushes_completion_to_its_session() {
         let frames = Arc::new(Mutex::new(Vec::<crate::protocol::PushFrame>::new()));
         let frames_for_sender = Arc::clone(&frames);
-        let progress_sender: crate::context::SharedProgressSender =
+        let progress_sender: aft_base::progress_sender::SharedProgressSender =
             Arc::new(Mutex::new(Some(Arc::new(Box::new(move |frame| {
                 frames_for_sender.lock().unwrap().push(frame);
             })))));
@@ -22863,7 +22863,7 @@ mod tests {
     ) -> (String, String) {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
-        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+        let sender: aft_base::progress_sender::ProgressSender = Arc::new(Box::new(move |frame| {
             captured.lock().unwrap().push(frame);
         }));
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
@@ -22948,7 +22948,7 @@ mod tests {
     ) -> (String, String) {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
-        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+        let sender: aft_base::progress_sender::ProgressSender = Arc::new(Box::new(move |frame| {
             captured.lock().unwrap().push(frame);
         }));
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(Some(sender))));
@@ -23959,7 +23959,7 @@ mod tests {
     fn register_watch_on_terminal_task_scans_existing_output() {
         let frames = Arc::new(Mutex::new(Vec::new()));
         let captured = Arc::clone(&frames);
-        let sender: crate::context::ProgressSender = Arc::new(Box::new(move |frame| {
+        let sender: aft_base::progress_sender::ProgressSender = Arc::new(Box::new(move |frame| {
             captured.lock().unwrap().push(frame);
         })
             as Box<dyn Fn(PushFrame) + Send + Sync>);

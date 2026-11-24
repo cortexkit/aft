@@ -9,8 +9,8 @@ const GREP_FOOTER_FRESHNESS_WINDOW: Duration = Duration::from_secs(60);
 use crate::bash_rewrite::footer::grep_search_hint;
 use crate::bash_rewrite::notices::{self as notice_templates, Notice, Target};
 use crate::bash_rewrite::parser::{parse, ParsedCommand};
+use crate::bash_rewrite::RewriteHost;
 use crate::bash_rewrite::{RewriteRequest, RewriteRule};
-use crate::context::AppContext;
 use crate::protocol::{RawRequest, Response};
 
 pub struct GrepRule;
@@ -25,14 +25,15 @@ pub struct LsRule;
 
 // Dispatch shares one immutable parse across built-in rules. The public
 // RewriteRule interface still parses standalone decisions for library callers.
-pub(super) trait ParsedRewriteRule: RewriteRule {
+#[doc(hidden)]
+pub trait ParsedRewriteRule: RewriteRule {
     fn decide_parsed(
         &self,
         parsed: Option<&ParsedCommand>,
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision;
 }
 
@@ -46,15 +47,15 @@ impl RewriteRule for GrepRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
-        let response = crate::bash_rewrite::dispatch::run(&tool_request("grep", request, ctx), ctx);
+        let response = ctx.run_rewritten(&tool_request("grep", request, ctx));
         grep_footer_response(response, request, ctx, path)
     }
 }
@@ -66,7 +67,7 @@ impl ParsedRewriteRule for GrepRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = grep_request_from_parsed(parsed, "grep") else {
             return decline("grep", "grep.decline", "unsupported grep shape");
@@ -102,15 +103,15 @@ impl RewriteRule for RgRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         let path = request.params.get("path").and_then(Value::as_str);
-        let response = crate::bash_rewrite::dispatch::run(&tool_request("grep", request, ctx), ctx);
+        let response = ctx.run_rewritten(&tool_request("grep", request, ctx));
         grep_footer_response(response, request, ctx, path)
     }
 }
@@ -122,7 +123,7 @@ impl ParsedRewriteRule for RgRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = grep_request_from_parsed(parsed, "rg") else {
             return decline("rg", "rg.decline", "unsupported rg shape");
@@ -158,15 +159,15 @@ impl RewriteRule for FindRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("glob", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("glob", request, ctx)),
             "glob",
             request,
         )
@@ -180,7 +181,7 @@ impl ParsedRewriteRule for FindRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = find_request_from_parsed(parsed) else {
             return decline("find", "find.decline", "unsupported find shape");
@@ -223,15 +224,15 @@ impl RewriteRule for CatRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("read", request, ctx)),
             "read",
             request,
         )
@@ -245,7 +246,7 @@ impl ParsedRewriteRule for CatRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = cat_read_request_from_parsed(parsed) else {
             return decline("cat", "cat.decline", "unsupported cat shape");
@@ -282,15 +283,15 @@ impl RewriteRule for HeadRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("read", request, ctx)),
             "read",
             request,
         )
@@ -304,7 +305,7 @@ impl ParsedRewriteRule for HeadRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = head_tail_read_request_from_parsed(parsed, "head") else {
             return decline("head", "head.decline", "unsupported head shape");
@@ -346,15 +347,15 @@ impl RewriteRule for TailRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("read", request, ctx)),
             "read",
             request,
         )
@@ -368,7 +369,7 @@ impl ParsedRewriteRule for TailRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(mut params) = head_tail_read_request_from_parsed(parsed, "tail") else {
             return decline("tail", "tail.decline", "unsupported tail shape");
@@ -419,15 +420,15 @@ impl RewriteRule for CatAppendRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("edit_match", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("edit_match", request, ctx)),
             "edit",
             request,
         )
@@ -441,7 +442,7 @@ impl ParsedRewriteRule for CatAppendRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = append_request_from_parsed(parsed) else {
             return decline(
@@ -483,15 +484,15 @@ impl RewriteRule for SedRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("read", request, ctx)),
             "read",
             request,
         )
@@ -505,7 +506,7 @@ impl ParsedRewriteRule for SedRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = sed_request_from_parsed(parsed) else {
             return decline("sed", "sed.decline", "unsupported sed shape");
@@ -543,15 +544,15 @@ impl RewriteRule for LsRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let parsed = parse(command);
         self.decide_parsed(parsed.as_ref(), command, request_id, session_id, ctx)
     }
 
-    fn execute(&self, request: &RewriteRequest, ctx: &AppContext) -> Response {
+    fn execute(&self, request: &RewriteRequest, ctx: &dyn RewriteHost) -> Response {
         call_and_footer(
-            crate::bash_rewrite::dispatch::run(&tool_request("read", request, ctx), ctx),
+            ctx.run_rewritten(&tool_request("read", request, ctx)),
             "read",
             request,
         )
@@ -565,7 +566,7 @@ impl ParsedRewriteRule for LsRule {
         command: &str,
         request_id: &str,
         session_id: Option<&str>,
-        ctx: &AppContext,
+        ctx: &dyn RewriteHost,
     ) -> crate::bash_rewrite::RewriteDecision {
         let Some(params) = ls_request_from_parsed(parsed, ctx) else {
             return decline("ls", "ls.decline", "unsupported ls shape or target");
@@ -628,7 +629,7 @@ fn decline(
     })
 }
 
-fn tool_request(tool: &str, request: &RewriteRequest, ctx: &AppContext) -> RawRequest {
+fn tool_request(tool: &str, request: &RewriteRequest, ctx: &dyn RewriteHost) -> RawRequest {
     let mut params = request.params.clone();
     let root = grep_project_root(ctx);
     if matches!(tool, "read" | "edit_match") {
@@ -700,7 +701,7 @@ fn call_and_footer(
 fn grep_footer_response(
     mut response: Response,
     request: &RewriteRequest,
-    ctx: &AppContext,
+    ctx: &dyn RewriteHost,
     path: Option<&str>,
 ) -> Response {
     let output = response_output(&response.data);
@@ -730,7 +731,7 @@ pub(crate) fn append_decided_footer(response: &mut Response, footer: &str) {
     }
 }
 
-fn grep_project_root(ctx: &AppContext) -> std::path::PathBuf {
+fn grep_project_root(ctx: &dyn RewriteHost) -> std::path::PathBuf {
     let configured = ctx
         .config()
         .project_root
@@ -739,7 +740,8 @@ fn grep_project_root(ctx: &AppContext) -> std::path::PathBuf {
     std::fs::canonicalize(&configured).unwrap_or(configured)
 }
 
-pub(crate) fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool {
+#[doc(hidden)]
+pub fn should_suppress_grep_footer(path: Option<&str>, project_root: &Path) -> bool {
     let Some(path) = path else {
         return false;
     };
@@ -816,7 +818,7 @@ fn response_output(data: &Value) -> String {
     serde_json::to_string_pretty(data).unwrap_or_else(|_| data.to_string())
 }
 
-fn path_candidate(ctx: &AppContext, path: &str) -> PathBuf {
+fn path_candidate(ctx: &dyn RewriteHost, path: &str) -> PathBuf {
     let candidate = Path::new(path);
     if candidate.is_absolute() {
         candidate.to_path_buf()
@@ -825,13 +827,13 @@ fn path_candidate(ctx: &AppContext, path: &str) -> PathBuf {
     }
 }
 
-fn resolved_path_candidate(ctx: &AppContext, path: &str) -> PathBuf {
+fn resolved_path_candidate(ctx: &dyn RewriteHost, path: &str) -> PathBuf {
     let candidate = path_candidate(ctx, path);
     std::fs::canonicalize(&candidate).unwrap_or(candidate)
 }
 
 fn decline_cat_read(
-    ctx: &AppContext,
+    ctx: &dyn RewriteHost,
     path: &str,
     predicate: &'static str,
 ) -> crate::bash_rewrite::RewriteDecision {
@@ -853,7 +855,7 @@ fn decline_cat_read(
     )
 }
 
-fn path_is_safe(ctx: &AppContext, path: &str, require_existing: bool) -> bool {
+fn path_is_safe(ctx: &dyn RewriteHost, path: &str, require_existing: bool) -> bool {
     let root = grep_project_root(ctx);
     let candidate = path_candidate(ctx, path);
     if require_existing && !candidate.exists() {
@@ -863,7 +865,7 @@ fn path_is_safe(ctx: &AppContext, path: &str, require_existing: bool) -> bool {
     resolved.starts_with(&root)
 }
 
-fn read_shape_is_faithful(ctx: &AppContext, path: &str) -> bool {
+fn read_shape_is_faithful(ctx: &dyn RewriteHost, path: &str) -> bool {
     let candidate = path_candidate(ctx, path);
     let Ok(metadata) = std::fs::metadata(&candidate) else {
         return false;
@@ -880,19 +882,20 @@ fn read_shape_is_faithful(ctx: &AppContext, path: &str) -> bool {
     text.lines().all(|line| line.len() <= 2_000)
 }
 
-fn effective_hashline_session(ctx: &AppContext, session_id: Option<&str>) -> bool {
-    let root = ctx
-        .canonical_cache_root_opt()
-        .unwrap_or_else(|| grep_project_root(ctx));
-    ctx.hashline_bindings()
-        .capture(
-            root,
-            session_id.unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-        )
-        .is_some_and(|binding| binding.effective())
+fn effective_hashline_session(ctx: &dyn RewriteHost, session_id: Option<&str>) -> bool {
+    let root = ctx.cache_root().unwrap_or_else(|| grep_project_root(ctx));
+    ctx.hashline_effective(
+        root,
+        session_id.unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
+    )
 }
 
-fn head_tail_shape_is_faithful(ctx: &AppContext, path: &str, lines: usize, tail: bool) -> bool {
+fn head_tail_shape_is_faithful(
+    ctx: &dyn RewriteHost,
+    path: &str,
+    lines: usize,
+    tail: bool,
+) -> bool {
     let root = grep_project_root(ctx);
     let candidate = if Path::new(path).is_absolute() {
         Path::new(path).to_path_buf()
@@ -944,7 +947,7 @@ fn text_file_line_count(path: &Path) -> Option<usize> {
     )
 }
 
-fn resolve_tail_start_range(ctx: &AppContext, path: &str, params: &mut Value) -> bool {
+fn resolve_tail_start_range(ctx: &dyn RewriteHost, path: &str, params: &mut Value) -> bool {
     let Some(requested_start) = params.get("start_line").and_then(Value::as_u64) else {
         return false;
     };
@@ -965,7 +968,7 @@ fn resolve_tail_start_range(ctx: &AppContext, path: &str, params: &mut Value) ->
     true
 }
 
-fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
+fn append_path_is_safe(ctx: &dyn RewriteHost, path: &str) -> bool {
     let root = grep_project_root(ctx);
     let candidate = if Path::new(path).is_absolute() {
         Path::new(path).to_path_buf()
@@ -990,7 +993,8 @@ fn append_path_is_safe(ctx: &AppContext, path: &str) -> bool {
     }
 }
 
-pub(crate) fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
+#[doc(hidden)]
+pub fn grep_basic_regex_has_dialect_conflict(pattern: &str) -> bool {
     // Basic grep treats these characters as literals unless escaped, while the
     // AFT regex engine gives them extended-regex meanings. BRE also treats `^`
     // and `$` as anchors only at the beginning and end of the whole pattern.
@@ -1062,7 +1066,7 @@ fn grep_request_from_parsed(parsed: Option<&ParsedCommand>, binary: &str) -> Opt
     Some(params)
 }
 
-fn find_shape_is_faithful(ctx: &AppContext, params: &Value) -> bool {
+fn find_shape_is_faithful(ctx: &dyn RewriteHost, params: &Value) -> bool {
     let Some(pattern) = params.get("pattern").and_then(Value::as_str) else {
         return false;
     };
@@ -1092,11 +1096,7 @@ fn find_shape_is_faithful(ctx: &AppContext, params: &Value) -> bool {
     };
     let relative_root = search_root.strip_prefix(&project_root).ok();
     if relative_root.is_some_and(path_has_glob_skipped_directory)
-        || ctx.gitignore().is_some_and(|matcher| {
-            matcher
-                .matched_path_or_any_parents(&search_root, true)
-                .is_ignore()
-        })
+        || ctx.ignores_directory(&search_root)
     {
         return false;
     }
@@ -1111,16 +1111,13 @@ fn find_shape_is_faithful(ctx: &AppContext, params: &Value) -> bool {
     if glob_params.get("path").is_none() {
         glob_params["path"] = Value::String(project_root.display().to_string());
     }
-    let response = crate::bash_rewrite::dispatch::run(
-        &RawRequest {
-            id: "bash-rewrite-find-faithfulness".to_string(),
-            command: "glob".to_string(),
-            lsp_hints: None,
-            session_id: None,
-            params: glob_params,
-        },
-        ctx,
-    );
+    let response = ctx.run_rewritten(&RawRequest {
+        id: "bash-rewrite-find-faithfulness".to_string(),
+        command: "glob".to_string(),
+        lsp_hints: None,
+        session_id: None,
+        params: glob_params,
+    });
     if !response.success
         || response.data.get("complete").and_then(Value::as_bool) != Some(true)
         || response.data.get("truncated").and_then(Value::as_bool) != Some(false)
@@ -1347,7 +1344,7 @@ fn sed_request_from_parsed(parsed: Option<&ParsedCommand>) -> Option<Value> {
     }))
 }
 
-fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> Option<Value> {
+fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &dyn RewriteHost) -> Option<Value> {
     let parsed = parsed?;
     if parsed.appends_to.is_some() || parsed.heredoc.is_some() || parsed.args.first()? != "ls" {
         return None;
@@ -1415,16 +1412,22 @@ fn ls_request_from_parsed(parsed: Option<&ParsedCommand>, ctx: &AppContext) -> O
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn grep_request(command: &str, binary: &str) -> Option<Value> {
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn grep_request(command: &str, binary: &str) -> Option<Value> {
     grep_request_from_parsed(parse(command).as_ref(), binary)
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn find_request(command: &str) -> Option<Value> {
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn find_request(command: &str) -> Option<Value> {
     find_request_from_parsed(parse(command).as_ref())
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn ls_request(command: &str, ctx: &AppContext) -> Option<Value> {
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn ls_request(command: &str, ctx: &dyn RewriteHost) -> Option<Value> {
     ls_request_from_parsed(parse(command).as_ref(), ctx)
 }

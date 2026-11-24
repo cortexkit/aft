@@ -56,6 +56,15 @@ fn database() -> (tempfile::TempDir, crate::db::lifecycle::TrackedConnection) {
     (dir, db)
 }
 
+impl LedgerDatabase for aft_db::db::TrackedConnection {
+    fn with_aft_db(
+        &self,
+        read: &mut dyn FnMut(&Self) -> Result<(), &'static str>,
+    ) -> Result<(), &'static str> {
+        read(self)
+    }
+}
+
 #[tokio::test]
 async fn prefrontal_rename_bus_preserves_custody_and_reader_subjects() {
     let (_dir, conn) = database();
@@ -109,7 +118,7 @@ fn prefrontal_rename_aft_subscriptions_do_not_filter_on_head_identity() {
 }
 
 async fn drain(
-    conn: &Connection,
+    conn: &dyn LedgerDatabase,
     state: &mut DeliveryState,
     publisher: &mut RecordingPublisher,
 ) -> usize {
@@ -119,7 +128,7 @@ async fn drain(
         if capacity == 0 {
             break;
         }
-        let batch = read_batch(conn, &state.position, capacity).unwrap();
+        let batch = scan(conn, &state.position, capacity).unwrap();
         visited += batch.visited;
         if !state.deliver(publisher, batch).await {
             break;
@@ -129,18 +138,11 @@ async fn drain(
 }
 
 async fn retry_due(
-    conn: &Connection,
+    conn: &dyn LedgerDatabase,
     state: &mut DeliveryState,
     publisher: &mut RecordingPublisher,
 ) {
-    let retained = state
-        .due()
-        .into_iter()
-        .map(|notice| {
-            let retained = is_retained(conn, &notice).unwrap();
-            (notice, retained)
-        })
-        .collect();
+    let retained = read_retained(conn, state.due()).unwrap();
     state.retry(publisher, retained).await;
 }
 

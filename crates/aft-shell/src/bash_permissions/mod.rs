@@ -11,7 +11,8 @@ pub mod synthetic_load;
 #[cfg(unix)]
 pub(crate) mod writes;
 
-use crate::context::AppContext;
+mod host;
+pub use host::PermissionScanHost;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,7 +37,7 @@ pub enum PermissionKind {
 }
 
 /// Scan a bash command and return the list of permission asks needed.
-pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
+pub fn scan(command: &str, ctx: &dyn PermissionScanHost) -> Vec<PermissionAsk> {
     scan::scan(command, ctx)
 }
 

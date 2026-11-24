@@ -58,7 +58,8 @@ fn git_comparison_path(path: &Path) -> PathBuf {
     // Git and the watcher can use different filesystem aliases for the same
     // path. Resolve comparison copies, including missing leaves, without
     // changing stored paths or the descriptor checks used to authorize reads.
-    let resolved = crate::context::canonicalize_lenient(path).unwrap_or_else(|| path.to_path_buf());
+    let resolved =
+        crate::policy_path::canonicalize_lenient(path).unwrap_or_else(|| path.to_path_buf());
     comparison_path(&resolved).into_owned()
 }
 
@@ -88,7 +89,8 @@ struct JournalState {
 impl Journal {
     /// Raw watcher intake precedes batch filtering, so reports must apply the
     /// same exclusions before retaining paths in their own event history.
-    pub(crate) fn event_for_root(
+    #[doc(hidden)]
+    pub fn event_for_root(
         &self,
         event: &notify::Event,
         root: &Path,
@@ -146,7 +148,8 @@ impl Journal {
                 .push_back((sequence, path.clone(), event.kind.is_create(), directory));
         }
     }
-    pub(crate) fn gap(&self) {
+    #[doc(hidden)]
+    pub fn gap(&self) {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -183,7 +186,8 @@ fn report_body_bytes(files: &[ChangedFile]) -> usize {
 }
 
 #[derive(Debug)]
-pub(crate) struct Capture {
+#[doc(hidden)]
+pub struct Capture {
     root: PathBuf,
     journal: Arc<Journal>,
     sequence: u64,
@@ -294,13 +298,28 @@ fn git_bytes(directory: &Path, args: &[&str], deadline: Instant, limit: usize) -
     crate::git_revision::bounded_git_bytes(directory, args, deadline, limit)
 }
 pub(crate) struct Scope(Option<Arc<Capture>>);
-pub(crate) type SharedCallDeadline = Arc<Mutex<Option<Instant>>>;
+#[doc(hidden)]
+#[derive(Clone, Debug, Default)]
+pub struct SharedCallDeadline(Arc<Mutex<Option<Instant>>>);
+
+impl SharedCallDeadline {
+    pub(crate) fn limit(&self, deadline: Instant) {
+        let mut current = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A completed foreground reply clears its deadline permanently.
+        if let Some(current) = current.as_mut() {
+            *current = (*current).min(deadline);
+        }
+    }
+}
 #[doc(hidden)]
 pub struct BudgetGuard(SharedCallDeadline);
 impl BudgetGuard {
     #[doc(hidden)]
     pub fn new(deadline: Instant) -> Self {
-        Self(Arc::new(Mutex::new(Some(deadline))))
+        Self(SharedCallDeadline(Arc::new(Mutex::new(Some(deadline)))))
     }
     #[doc(hidden)]
     pub fn shared(&self) -> SharedCallDeadline {
@@ -310,6 +329,7 @@ impl BudgetGuard {
     pub fn clear(&self) {
         *self
             .0
+             .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
@@ -332,7 +352,8 @@ pub(crate) fn current() -> Option<Arc<Capture>> {
 }
 
 impl Capture {
-    fn begin(
+    #[doc(hidden)]
+    pub fn begin(
         root: PathBuf,
         journal: Arc<Journal>,
         mode: BashChangedFiles,
@@ -361,7 +382,7 @@ impl Capture {
             mode,
             watcher_active,
             flush: None,
-            call_deadline: Arc::new(Mutex::new(None)),
+            call_deadline: SharedCallDeadline::default(),
             git,
             read_policy: None,
             end: OnceLock::new(),
@@ -372,6 +393,21 @@ impl Capture {
             render_time_for_test: MAX_RENDER_TIME,
         })
     }
+    #[doc(hidden)]
+    pub fn setup_for_spawn(
+        &mut self,
+        access: Option<crate::access_policy::AccessPolicy>,
+        profile: Option<&crate::sandbox_profile::SandboxProfile>,
+        flush: Arc<crate::watcher_backend::flush::FlushControl>,
+        deadline: Option<SharedCallDeadline>,
+    ) {
+        self.read_policy = access.map(|access| ReadPolicy::new(access, profile));
+        self.flush = Some(flush);
+        if let Some(deadline) = deadline {
+            self.call_deadline = deadline;
+        }
+    }
+
     pub(crate) fn finish(&self) -> &Report {
         self.report.get_or_init(|| {
             let started = Instant::now();
@@ -381,6 +417,7 @@ impl Capture {
             let render_time = self.render_time_for_test;
             let deadline = self
                 .call_deadline
+                .0
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .map_or(started + render_time, |call| {
@@ -400,6 +437,7 @@ impl Capture {
     pub(crate) fn budget(self: &Arc<Self>, deadline: Option<Instant>) -> BudgetGuard {
         *self
             .call_deadline
+            .0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = deadline;
         BudgetGuard(self.call_deadline.clone())

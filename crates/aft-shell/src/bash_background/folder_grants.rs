@@ -105,7 +105,7 @@ pub(crate) fn run_after_record_hook() {
 /// command, so revoking cannot narrow it) or without a scope with saved
 /// grants.
 pub(crate) fn for_plan(
-    ctx: &crate::context::AppContext,
+    ctx: &dyn crate::sandbox_spawn::SandboxHost,
     plan: &crate::sandbox_spawn::SpawnPlan,
 ) -> Option<TaskFolderGrants> {
     let scope = crate::access_policy::current_scope()?;
@@ -212,7 +212,8 @@ impl BgTaskRegistry {
     /// spawn reply nor a restart replay waits out its signal grace period.
     /// Without a database to ask, or when the lookup fails, the command keeps
     /// running: nothing shows its grant was revoked.
-    pub(crate) fn stop_if_folder_grant_revoked(
+    #[doc(hidden)]
+    pub fn stop_if_folder_grant_revoked(
         &self,
         task_id: &str,
         session_id: &str,

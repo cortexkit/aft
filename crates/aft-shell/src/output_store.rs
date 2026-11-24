@@ -8,12 +8,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
-use crate::context::AppContext;
+mod host;
 use crate::file_identity::FileIdentity;
+pub use host::OutputStoreHost;
 
 pub const SAVED_FILE_LIMIT: usize = 64 * 1024 * 1024;
 
-fn harness_root(ctx: &AppContext) -> PathBuf {
+fn harness_root(ctx: &dyn OutputStoreHost) -> PathBuf {
     let routed = crate::bash_background::task_storage_dir(ctx);
     if routed == ctx.storage_dir() {
         ctx.harness_opt()
@@ -39,7 +40,7 @@ pub struct OutputFiles {
     pub(crate) canonicalizations: std::sync::atomic::AtomicUsize,
 }
 
-/// A deferred daemon (subc) tool reply can be sent after its AppContext is evicted.
+/// A deferred daemon (subc) tool reply can be sent after its context is evicted.
 /// Capture only the private output store and task registry needed to save it,
 /// without retaining the project's indexes or other runtime state.
 #[doc(hidden)]
@@ -61,7 +62,7 @@ impl std::fmt::Debug for OutputScope {
 
 impl OutputScope {
     #[doc(hidden)]
-    pub fn new(ctx: &AppContext, session: &str, harness: Option<&str>) -> Self {
+    pub fn new(ctx: &dyn OutputStoreHost, session: &str, harness: Option<&str>) -> Self {
         let storage = ctx.storage_dir();
         let harness_root = harness
             .and_then(|h| h.parse::<crate::harness::Harness>().ok())
@@ -97,13 +98,14 @@ impl OutputScope {
 }
 
 impl OutputFiles {
-    pub(crate) fn shared() -> std::sync::Arc<Self> {
+    #[doc(hidden)]
+    pub fn shared() -> std::sync::Arc<Self> {
         let files = std::sync::Arc::new(Self::default());
         stores().lock().push(std::sync::Arc::downgrade(&files));
         files
     }
 
-    fn session_dir(ctx: &AppContext, session: &str) -> PathBuf {
+    fn session_dir(ctx: &dyn OutputStoreHost, session: &str) -> PathBuf {
         harness_root(ctx)
             .join("tool-results")
             .join(crate::backup::hash_session(session))
@@ -186,11 +188,12 @@ impl OutputFiles {
             .map(|artifact| artifact.session.clone())
     }
 
-    /// Re-register a saved result after the project's AppContext was evicted
+    /// Re-register a saved result after the project's context was evicted
     /// and rebuilt, which empties the in-memory table. Only generated names in
     /// the exact session folder qualify: a folder-prefix grant would expose
     /// other private stores or another session's results.
-    pub(crate) fn restore(&self, ctx: &AppContext, session: &str, path: &Path) {
+    #[doc(hidden)]
+    pub fn restore(&self, ctx: &dyn OutputStoreHost, session: &str, path: &Path) {
         if !generated_name(path) {
             return;
         }
@@ -230,7 +233,8 @@ impl OutputFiles {
         }
     }
 
-    pub(crate) fn is_result_path(&self, ctx: &AppContext, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn is_result_path(&self, ctx: &dyn OutputStoreHost, path: &Path) -> bool {
         if !generated_name(path) {
             return false;
         }
@@ -241,7 +245,7 @@ impl OutputFiles {
             .is_ok_and(|relative| relative.components().count() == 2)
     }
 
-    fn canonical_root(&self, ctx: &AppContext) -> Option<PathBuf> {
+    fn canonical_root(&self, ctx: &dyn OutputStoreHost) -> Option<PathBuf> {
         let root = harness_root(ctx).join("tool-results");
         let mut roots = self.roots.lock();
         if let Some(canonical) = roots.get(&root) {

@@ -431,7 +431,7 @@ pub(crate) fn sweep_preflight_layouts_on_startup() {
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn host_preflight(
-    ctx: &crate::context::AppContext,
+    ctx: &dyn crate::sandbox_spawn::SandboxHost,
     cwd: &Path,
     environment: &mut HashMap<String, String>,
 ) -> (Option<String>, Option<std::sync::Arc<PreflightLayout>>) {

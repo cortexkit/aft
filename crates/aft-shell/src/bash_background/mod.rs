@@ -9,6 +9,10 @@ pub mod buffer;
 mod exit_observer;
 mod gc_cursor;
 mod gc_memo;
+#[doc(hidden)]
+pub mod gh_ticket;
+mod host;
+pub use host::{SpawnHost, TaskRegistryAccess};
 mod memory_limit;
 #[cfg(feature = "test-support")]
 pub(crate) use memory_limit::MemoryPolicy as MemoryPolicyForTest;
@@ -38,7 +42,7 @@ pub(crate) mod windows_waiter;
 pub mod worker_thread;
 
 use crate::bash_permissions::PermissionAsk;
-use crate::context::AppContext;
+use crate::pinned_config::PinnedConfig;
 use crate::protocol::Response;
 #[cfg(unix)]
 use crate::sandbox_spawn::native_sandbox_enforced;
@@ -279,14 +283,7 @@ impl SpawnReceipt {
     #[doc(hidden)]
     pub fn limit_changed_files_deadline(&self, deadline: std::time::Instant) {
         if let Some(shared) = self.changed_files_deadline.get() {
-            let mut bound = shared
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            // None means the foreground reply no longer needs this deadline;
-            // late spawn completion must not reactivate it.
-            if let Some(current) = bound.as_mut() {
-                *current = (*current).min(deadline);
-            }
+            shared.limit(deadline);
         }
     }
     #[cfg(any(test, feature = "test-support"))]
@@ -459,8 +456,8 @@ pub fn with_spawn_receipt<T>(receipt: std::sync::Arc<SpawnReceipt>, run: impl Fn
     let _restore = Restore(previous);
     run()
 }
-pub(crate) fn changed_files_deadline_for_spawn(
-) -> Option<crate::bash_changed_files::SharedCallDeadline> {
+#[doc(hidden)]
+pub fn changed_files_deadline_for_spawn() -> Option<crate::bash_changed_files::SharedCallDeadline> {
     CURRENT_SPAWN_RECEIPT.with(|slot| {
         slot.borrow()
             .as_ref()?
@@ -1195,7 +1192,7 @@ pub fn spawn_with_secrets(
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
     hard_kill: HardKill,
-    ctx: &AppContext,
+    ctx: &dyn SpawnHost,
     require_background_flag: bool,
     notify_on_completion: bool,
     compressed: bool,
@@ -1531,9 +1528,9 @@ pub fn spawn_with_secrets(
     // released its registry, so load it again before the task can finish.
     ctx.reload_released_filter_registry();
     enter_runon_phase("changed_files_baseline");
-    let _changed_files =
-        crate::bash_changed_files::Capture::start_for_spawn(ctx, request_id, &spawn_plan)
-            .map(|capture| crate::bash_changed_files::scope(Some(capture)));
+    let _changed_files = ctx
+        .start_changed_files(request_id, &spawn_plan)
+        .map(|capture| crate::bash_changed_files::scope(Some(capture)));
     #[cfg(unix)]
     ctx.bash_background()
         .set_db_schema_hints(ctx.config().bash.db_schema_hints);
@@ -1629,8 +1626,7 @@ pub fn spawn_with_secrets(
             // registered after the scan was missed, so check the grants again
             // now that it is registered.
             if recorded_folder_grants.is_some() {
-                ctx.bash_background()
-                    .stop_if_folder_grant_revoked(&task_id, session_id, ctx.db());
+                ctx.check_spawn_folder_revocation(&task_id, session_id);
             }
             ctx.bash_background().bind_start_view(&task_id, start_view);
             gh_shim_ticket.bind_task(&task_id);
@@ -1696,7 +1692,7 @@ pub(crate) fn spawn(
     workdir: Option<PathBuf>,
     env: Option<HashMap<String, String>>,
     hard_kill: HardKill,
-    ctx: &AppContext,
+    ctx: &dyn SpawnHost,
     require_background_flag: bool,
     notify_on_completion: bool,
     compressed: bool,
@@ -1834,7 +1830,7 @@ pub(crate) fn successful_spawn_response(
     session_id: &str,
     task_id: &str,
     pty: bool,
-    ctx: &AppContext,
+    ctx: &dyn SpawnHost,
 ) -> Response {
     // Remote launch replies use running as an internal handoff to the capture
     // and foreground wait paths. Those paths publish acceptance or terminal
@@ -1865,7 +1861,7 @@ pub fn route_harness() -> Option<crate::harness::Harness> {
 }
 
 #[doc(hidden)]
-pub fn task_storage_dir(ctx: &AppContext) -> PathBuf {
+pub fn task_storage_dir(ctx: &dyn PinnedConfig) -> PathBuf {
     let config = ctx.config();
     let root = storage_dir(config.storage_dir.as_deref());
     route_harness()

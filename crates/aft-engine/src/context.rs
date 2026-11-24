@@ -1,4 +1,5 @@
 pub use crate::secret::call_context;
+pub(crate) use aft_base::policy_path::canonicalize_lenient;
 
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
 pub use crate::data_layer::status::view_load_error_response;
@@ -352,7 +353,6 @@ thread_local! {
     /// `AppContext::ignore_walks_on_current_thread_for_test`.
     static IGNORE_WALKS_ON_THREAD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
-
 
 /// Numeric projection for consumers that still require the legacy status-bar
 /// shape. It is derived from [`StatusBarCountValues`], which preserves whether
@@ -2889,7 +2889,7 @@ pub struct AppContext {
     bash_background: BgTaskRegistry,
     output_files: Arc<crate::output_store::OutputFiles>,
     #[cfg(unix)]
-    escalation_grants: Arc<parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>>,
+    escalation_grants: Arc<aft_shell::sandbox_spawn::EscalationGrantState>,
     /// Thread-safe registry of TOML output filters. Lazy-built on first
     /// access; populated atomically via `RwLock`. Shared between command
     /// handlers (which use it through `filter_registry()` -> read guard) and
@@ -3342,9 +3342,7 @@ impl AppContext {
             bash_background,
             output_files: crate::output_store::OutputFiles::shared(),
             #[cfg(unix)]
-            escalation_grants: Arc::new(parking_lot::Mutex::new(
-                crate::sandbox_spawn::EscalationGrantStore::default(),
-            )),
+            escalation_grants: Arc::default(),
             filter_registry: Arc::new(std::sync::RwLock::new(
                 crate::compress::toml_filter::FilterRegistry::default(),
             )),
@@ -5207,18 +5205,8 @@ impl AppContext {
     }
 
     #[cfg(unix)]
-    pub(crate) fn escalation_grants(
-        &self,
-    ) -> &parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore> {
+    pub(crate) fn escalation_grants(&self) -> &Arc<aft_shell::sandbox_spawn::EscalationGrantState> {
         &self.escalation_grants
-    }
-
-    #[cfg(unix)]
-    /// The expiry timer must not keep a project's grant store alive after unbind.
-    pub(crate) fn escalation_grant_owner(
-        &self,
-    ) -> std::sync::Weak<parking_lot::Mutex<crate::sandbox_spawn::EscalationGrantStore>> {
-        Arc::downgrade(&self.escalation_grants)
     }
 
     pub fn drain_bg_completions(&self) -> Vec<BgCompletion> {

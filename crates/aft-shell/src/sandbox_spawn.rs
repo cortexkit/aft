@@ -50,10 +50,11 @@ use std::time::{Duration, Instant};
 use portable_pty::CommandBuilder;
 
 use crate::config::SandboxMode;
-use crate::context::AppContext;
+mod host;
 #[cfg(unix)]
 use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
+pub use host::*;
 
 #[cfg(unix)]
 mod build_slots;
@@ -162,14 +163,14 @@ pub struct ProviderApprovalSnapshot {
 }
 
 #[cfg(unix)]
-pub fn save_provider_approval(ctx: &AppContext, id: &str, snapshot: ProviderApprovalSnapshot) {
+pub fn save_provider_approval(ctx: &dyn SandboxHost, id: &str, snapshot: ProviderApprovalSnapshot) {
     let mut store = ctx.escalation_grants().lock();
     if let Some(grant) = store.grants.get_mut(id) {
         grant.provider_snapshot = Some(snapshot);
     }
     if !store.provider_timer_running {
         store.provider_timer_running = true;
-        let owner = ctx.escalation_grant_owner();
+        let owner = Arc::downgrade(ctx.escalation_grants());
         std::thread::spawn(move || provider_grant_expiry_timer(owner));
     }
 }
@@ -177,7 +178,7 @@ pub fn save_provider_approval(ctx: &AppContext, id: &str, snapshot: ProviderAppr
 #[cfg(unix)]
 // A cancelled approval prompt sends no denial event. Expire its frozen state
 // without requiring a later request; a weak owner never keeps a context alive.
-fn provider_grant_expiry_timer(owner: std::sync::Weak<parking_lot::Mutex<EscalationGrantStore>>) {
+fn provider_grant_expiry_timer(owner: std::sync::Weak<EscalationGrantState>) {
     loop {
         let next = {
             let Some(owner) = owner.upgrade() else {
@@ -208,7 +209,7 @@ fn provider_grant_expiry_timer(owner: std::sync::Weak<parking_lot::Mutex<Escalat
 
 #[cfg(unix)]
 pub fn frozen_provider_approval(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     id: &str,
     principal: &AuthenticatedPrincipal,
     input: &HashMap<String, String>,
@@ -228,6 +229,8 @@ pub fn frozen_provider_approval(
 #[cfg(unix)]
 #[path = "sandbox_spawn/escalation_grant_type.rs"]
 pub(crate) mod escalation_grant_type;
+#[cfg(unix)]
+pub use escalation_grant_type::EscalationGrantState;
 #[cfg(unix)]
 pub(crate) use escalation_grant_type::EscalationGrantStore;
 
@@ -513,7 +516,8 @@ impl SpawnPlan {
         }
         Vec::new()
     }
-    pub(crate) fn changed_files_read_profile(&self) -> Option<&SandboxProfile> {
+    #[doc(hidden)]
+    pub fn changed_files_read_profile(&self) -> Option<&SandboxProfile> {
         match self.policy() {
             Self::Launcher { profile, .. } => Some(profile),
             _ => None,
@@ -802,7 +806,10 @@ pub fn worker_jail_active() -> bool {
     WORKER_JAIL.with(std::cell::Cell::get)
 }
 
-pub fn effective_sandbox_mode(ctx: &AppContext, principal: &AuthenticatedPrincipal) -> SandboxMode {
+pub fn effective_sandbox_mode(
+    ctx: &dyn SandboxHost,
+    principal: &AuthenticatedPrincipal,
+) -> SandboxMode {
     if principal_requires_strict(principal) {
         return SandboxMode::Strict;
     }
@@ -823,7 +830,7 @@ pub fn principal_requires_strict(principal: &AuthenticatedPrincipal) -> bool {
 }
 
 /// Resolve the role and authenticated principal before choosing the launcher.
-pub fn sandbox_required(ctx: &AppContext) -> bool {
+pub fn sandbox_required(ctx: &dyn SandboxHost) -> bool {
     effective_sandbox_mode(ctx, &current_authenticated_principal()) != SandboxMode::Off
         || (cfg!(unix) && worker_jail_active())
 }
@@ -867,7 +874,7 @@ pub fn approved_payload_environment(
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 pub fn mint_host_escalation_grant(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     command: &[u8],
     root: &Path,
@@ -894,7 +901,7 @@ pub fn mint_host_escalation_grant(
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 fn mint_host_escalation_grant_at(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     command: &[u8],
     root: &Path,
@@ -1002,7 +1009,7 @@ fn check_escalation_grant(
 
 #[cfg(unix)]
 fn consume_host_escalation_grant_at(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     attempt: &HostEscalationAttempt,
     now: Instant,
@@ -1443,12 +1450,12 @@ fn hex_bytes(bytes: &[u8]) -> String {
 ///
 /// Process spawning and in-process bash rewriting share this check so neither
 /// confinement nor the worker environment can be bypassed by a rewrite.
-pub fn native_sandbox_enforced(ctx: &AppContext, principal: &AuthenticatedPrincipal) -> bool {
+pub fn native_sandbox_enforced(ctx: &dyn SandboxHost, principal: &AuthenticatedPrincipal) -> bool {
     cfg!(unix)
         && (effective_sandbox_mode(ctx, principal) != SandboxMode::Off || worker_jail_active())
 }
 
-pub fn unsupported_platform_sandbox_refusal(ctx: &AppContext) -> Option<SpawnPlan> {
+pub fn unsupported_platform_sandbox_refusal(ctx: &dyn SandboxHost) -> Option<SpawnPlan> {
     unsupported_profile_sandbox_refusal(effective_sandbox_mode(
         ctx,
         &current_authenticated_principal(),
@@ -1492,7 +1499,7 @@ fn platform_sandbox_plan(
 /// capture files. The native builder grants a fresh private temp directory
 /// beneath it; capture files themselves use pre-opened descriptors.
 pub fn resolve_sandbox_spawn(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,
@@ -1511,7 +1518,7 @@ pub fn resolve_sandbox_spawn(
 }
 
 fn resolve_sandbox_spawn_with_mode(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,
@@ -1672,7 +1679,7 @@ fn resolve_sandbox_spawn_with_mode(
 
 #[cfg(unix)]
 fn sandbox_setup_refusal(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     cause: impl std::fmt::Display,
 ) -> SpawnPlan {
@@ -1711,7 +1718,7 @@ fn escalation_refused(refusal: EscalationRefusal) -> SpawnPlan {
 
 #[cfg(unix)]
 fn build_native_profile(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     task_bundle_dir: &Path,
     mode: SandboxMode,
@@ -2124,7 +2131,7 @@ fn verify_worker_gh_fence(profile: &SandboxProfile) -> Result<(), String> {
 /// or services a build will need. Each backend reports which denies it enforces.
 #[cfg(unix)]
 fn build_relaxed_profile(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     home: &Path,
     roots: &[PathBuf],
     git_policies: &[GitPolicy],
@@ -5832,7 +5839,7 @@ pub(crate) fn cleanup_task_temp_dir(path: &Path) -> std::io::Result<()> {
 }
 
 fn note_test_observation(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,
@@ -5898,7 +5905,7 @@ fn observation_key(project_root: &Path) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn native_launcher_path(ctx: &AppContext) -> std::io::Result<PathBuf> {
+fn native_launcher_path(ctx: &dyn SandboxHost) -> std::io::Result<PathBuf> {
     #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
     if let Some(launchers) = TEST_LAUNCHERS.get() {
         if let Some(root) = ctx.config().project_root.as_deref() {
@@ -6652,7 +6659,7 @@ fn command_argv_for_plan(
 pub struct ToolLaunchPolicy<'ctx> {
     /// The context a deferred policy is resolved against; `None` when the
     /// policy was resolved up front.
-    ctx: Option<&'ctx AppContext>,
+    ctx: Option<&'ctx dyn SandboxHost>,
     request: std::rc::Rc<RequestToolLaunch>,
 }
 
@@ -6688,7 +6695,7 @@ impl Drop for ResolvedToolLaunch {
 }
 
 impl ResolvedToolLaunch {
-    fn resolve(ctx: &AppContext) -> Self {
+    fn resolve(ctx: &dyn SandboxHost) -> Self {
         let principal = current_authenticated_principal();
         let mode = effective_sandbox_mode(ctx, &principal);
         let mut environment = HashMap::new();
@@ -6746,9 +6753,11 @@ mod edit_tool_launcher;
 
 impl<'ctx> ToolLaunchPolicy<'ctx> {
     /// The inherited external-tool policy, or one resolved for this request.
-    pub fn for_request(ctx: &'ctx AppContext) -> Self {
+    pub fn for_request(ctx: &'ctx dyn SandboxHost) -> Self {
         match CURRENT_TOOL_POLICY.with(|slot| slot.borrow().clone()) {
-            _ if crate::context::confinement::remote_mutation() => Self::remote_edit_refusal(),
+            _ if aft_index::data_layer::read_fence::remote_mutation() => {
+                Self::remote_edit_refusal()
+            }
             Some(request) => Self {
                 ctx: Some(ctx),
                 request,
@@ -6772,7 +6781,7 @@ impl<'ctx> ToolLaunchPolicy<'ctx> {
     }
 
     /// Resolve the policy now for the current principal and worker-jail scope.
-    pub(crate) fn resolve(ctx: &AppContext) -> ToolLaunchPolicy<'static> {
+    pub(crate) fn resolve(ctx: &dyn SandboxHost) -> ToolLaunchPolicy<'static> {
         ToolLaunchPolicy {
             ctx: None,
             request: std::rc::Rc::new(RequestToolLaunch::resolved(ResolvedToolLaunch::resolve(
@@ -10162,10 +10171,6 @@ pub(crate) mod git_policy_cache_tests {
     }
 }
 
-#[cfg(all(test, unix))]
-#[path = "sandbox_scope_grants_tests.rs"]
-mod scope_grant_tests;
-
 #[cfg(test)]
 mod policy_tests {
     use super::*;
@@ -11415,7 +11420,7 @@ mod policy_tests {
 
     #[cfg(unix)]
     fn mint_test_grant(
-        ctx: &AppContext,
+        ctx: &dyn SandboxHost,
         principal: &AuthenticatedPrincipal,
         project: &Path,
         command: &[u8],
@@ -11694,7 +11699,7 @@ mod policy_tests {
     }
 
     #[cfg(unix)]
-    fn grant_task_paths(ctx: &AppContext, grant_id: &str) -> (PathBuf, String) {
+    fn grant_task_paths(ctx: &dyn SandboxHost, grant_id: &str) -> (PathBuf, String) {
         let store = ctx.escalation_grants().lock();
         let grant = store.grants.get(grant_id).unwrap();
         (grant.session_dir.clone(), grant.task_id.clone())

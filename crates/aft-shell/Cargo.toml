@@ -1,0 +1,96 @@
+[package]
+name = "aft-shell"
+version = "0.66.0"
+edition = "2021"
+description = "Shell execution and background tasks for Agent Foundational Toolkit"
+license = "MIT"
+repository = "https://github.com/cortexkit/aft"
+rust-version.workspace = true
+exclude = ["tests/", "examples/", "src/**/*_tests.rs", "src/**/tests.rs", "src/**/tests/"]
+autotests = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)', 'cfg(aft_fake_lsp_helper)'] }
+
+[features]
+test-support = ["aft-base/test-support", "aft-db/test-support", "aft-edit/test-support", "aft-github/test-support", "aft-index/test-support", "aft-inspect/test-support", "aft-parse/test-support", "dep:tempfile", "dep:filetime"]
+test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-index/test-timing-hooks", "aft-inspect/test-timing-hooks", "aft-parse/test-timing-hooks"]
+test-hooks = ["aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-edit/test-hooks", "aft-edit/test-support", "aft-github/test-hooks", "aft-github/test-support", "aft-index/test-hooks", "aft-index/test-support", "aft-inspect/test-hooks", "aft-inspect/test-support", "aft-parse/test-hooks", "aft-parse/test-support"]
+
+[dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0" }
+aft-db = { path = "../aft-db", version = "0.66.0" }
+aft-edit = { path = "../aft-edit", version = "0.66.0" }
+aft-github = { path = "../aft-github", version = "0.66.0" }
+aft-index = { path = "../aft-index", version = "0.66.0" }
+aft-inspect = { path = "../aft-inspect", version = "0.66.0" }
+aft-parse = { path = "../aft-parse", version = "0.66.0" }
+aft-store = { path = "../aft-store", version = "0.66.0" }
+aft-tokenizer = { path = "../aft-tokenizer", version = "0.66.0" }
+secret-rules = { path = "../secret-rules", version = "0.66.0", package = "aft-secret-rules" }
+async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
+base64 = "0.22"
+blake3 = "1"
+bytes = "1"
+cortexkit-bus-client = "=0.1.10"
+cortexkit-bus-naming = "=0.4.6"
+cortexkit-exec-remote-types = "=0.2.22"
+cortexkit-role-llm-runner = "=0.8.53"
+cortexkit-role-tool-display = "=0.1.12"
+cortexkit-role-tool-provider = "=0.15.12"
+crossbeam-channel = "0.5"
+filetime = { version = "0.2.29", optional = true }
+getrandom = "0.3"
+glob = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }
+libc = "0.2"
+log = "0.4"
+notify = "8"
+parking_lot = "0.12"
+portable-pty = "0.9"
+rcgen = "0.13"
+regex = "1"
+ring = "0.17"
+rusqlite = { version = "0.32", features = ["bundled", "backup", "trace", "functions"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+sha2 = { version = "0.10", features = ["compress"] }
+similar = "2"
+subc-client-rs = "=0.41.4"
+subc-os = { version = "=0.1.42", features = ["tokio"] }
+subc-protocol = "=0.37.4"
+subc-transport = "=0.18.0"
+tempfile = { version = "3.27.0", optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "macros"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+tree-sitter = "=0.26.7"
+tree-sitter-bash = "0.25"
+which = "7"
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_ProcessStatus",
+] }
+
+[dev-dependencies]
+aft-base = { path = "../aft-base", version = "0.66.0", features = ["test-support"] }
+aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
+aft-github = { path = "../aft-github", version = "0.66.0", features = ["test-support"] }
+aft-inspect = { path = "../aft-inspect", version = "0.66.0", features = ["test-support"] }
+cortexkit-role-tool-provider = { version = "=0.15.12", features = ["test-vectors"] }
+cortexkit-test-support = "=0.1.14"
+filetime = "0.2"
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }

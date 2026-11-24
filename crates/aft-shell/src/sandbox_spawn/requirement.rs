@@ -90,7 +90,7 @@ impl SandboxRequirement {
 }
 
 pub(crate) fn resolve_command_sandbox_spawn(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,

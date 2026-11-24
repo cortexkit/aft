@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::context::AppContext;
+use super::PermissionScanHost;
 
 use super::{arity, PermissionAsk, PermissionKind};
 
@@ -31,7 +31,7 @@ struct Part {
     text: String,
 }
 
-pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
+pub fn scan(command: &str, ctx: &dyn PermissionScanHost) -> Vec<PermissionAsk> {
     #[cfg(windows)]
     {
         let _ = (command, ctx);
@@ -53,7 +53,11 @@ pub fn scan(command: &str, ctx: &AppContext) -> Vec<PermissionAsk> {
     }
 }
 
-pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<PermissionAsk> {
+pub fn scan_with_cwd(
+    command: &str,
+    ctx: &dyn PermissionScanHost,
+    cwd: &Path,
+) -> Vec<PermissionAsk> {
     let Some(project_root) = ctx.config().project_root.clone() else {
         return Vec::new();
     };
@@ -66,7 +70,7 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
 ///
 /// Ownership is decided by
 /// [`crate::bash_background::BgTaskRegistry::is_session_owned_artifact_path`],
-/// the same exact check `AppContext::validate_read_path` uses: the canonical
+/// the same exact check the file read policy uses: the canonical
 /// path must equal a registered artifact of a task owned by this session.
 /// There is no `bash-tasks` prefix rule, so other sessions' artifacts and
 /// unregistered files next to an artifact still ask. The exemption covers
@@ -74,7 +78,7 @@ pub fn scan_with_cwd(command: &str, ctx: &AppContext, cwd: &Path) -> Vec<Permiss
 /// out-of-root path in the command still produces its own ask.
 pub fn scan_with_cwd_for_session(
     command: &str,
-    ctx: &AppContext,
+    ctx: &dyn PermissionScanHost,
     cwd: &Path,
     session_id: &str,
 ) -> Vec<PermissionAsk> {

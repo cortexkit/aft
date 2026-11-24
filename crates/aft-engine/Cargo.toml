@@ -18,12 +18,12 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(aft_views_lazy_benchmark)'
 wasm-grammars = ["tree-sitter/wasm", "aft-index/wasm-grammars", "aft-inspect/wasm-grammars", "aft-parse/wasm-grammars"]
 # Offline call-graph measurements only; never enabled by production builds.
 callgraph-shape-census = ["aft-base/callgraph-shape-census", "aft-index/callgraph-shape-census", "aft-parse/callgraph-shape-census"]
-test-support = ["aft-base/test-support", "aft-db/test-support", "aft-edit/test-support", "aft-github/test-support", "aft-index/test-support", "aft-inspect/test-support", "aft-parse/test-support", "dep:tempfile", "dep:filetime"]
+test-support = ["aft-base/test-support", "aft-db/test-support", "aft-edit/test-support", "aft-github/test-support", "aft-index/test-support", "aft-inspect/test-support", "aft-parse/test-support", "aft-shell/test-support", "dep:tempfile", "dep:filetime"]
 # Explicit opt-in for cross-process timing controls used by integration tests.
-test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-index/test-timing-hooks", "aft-inspect/test-timing-hooks", "aft-parse/test-timing-hooks"]
+test-timing-hooks = ["aft-base/test-timing-hooks", "aft-db/test-timing-hooks", "aft-index/test-timing-hooks", "aft-inspect/test-timing-hooks", "aft-parse/test-timing-hooks", "aft-shell/test-timing-hooks"]
 # Opt-in integration hooks for native re-exec and deterministic conformance inputs;
 # never enable these hooks in production builds.
-test-hooks = ["aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-edit/test-hooks", "aft-edit/test-support", "aft-github/test-hooks", "aft-github/test-support", "aft-index/test-hooks", "aft-index/test-support", "aft-inspect/test-hooks", "aft-inspect/test-support", "aft-parse/test-hooks", "aft-parse/test-support"]
+test-hooks = ["aft-base/test-hooks", "aft-base/test-support", "aft-db/test-hooks", "aft-db/test-support", "aft-edit/test-hooks", "aft-edit/test-support", "aft-github/test-hooks", "aft-github/test-support", "aft-index/test-hooks", "aft-index/test-support", "aft-inspect/test-hooks", "aft-inspect/test-support", "aft-parse/test-hooks", "aft-parse/test-support", "aft-shell/test-hooks", "aft-shell/test-support"]
 # Compiles the test-only secret vault (V5). Nothing in the product reads it:
 # a release profile must never enable it, and
 # `scripts/check-secret-test-fake.sh` fails CI when one does.
@@ -38,6 +38,7 @@ aft-github = { path = "../aft-github", version = "0.66.0" }
 aft-index = { path = "../aft-index", version = "0.66.0" }
 aft-inspect = { path = "../aft-inspect", version = "0.66.0" }
 aft-parse = { path = "../aft-parse", version = "0.66.0" }
+aft-shell = { path = "../aft-shell", version = "0.66.0" }
 aft-store = { path = "../aft-store", version = "0.66.0" }
 log = "0.4"
 env_logger = "0.11"
@@ -242,6 +243,7 @@ aft-github = { path = "../aft-github", version = "0.66.0", features = ["test-sup
 aft-index = { path = "../aft-index", version = "0.66.0", features = ["test-support"] }
 aft-inspect = { path = "../aft-inspect", version = "0.66.0", features = ["test-support"] }
 aft-parse = { path = "../aft-parse", version = "0.66.0", features = ["test-support"] }
+aft-shell = { path = "../aft-shell", version = "0.66.0", features = ["test-support"] }
 cortexkit-test-support = "=0.1.14"
 graphql-parser = "0.4.1"
 cortexkit-role-tool-provider-conformance = "=0.15.13"
