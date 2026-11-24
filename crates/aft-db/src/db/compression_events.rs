@@ -1250,7 +1250,7 @@ pub fn maybe_spawn_retention(
     }
 }
 
-/// One bounded pass of the retention sweeps that only delete expired rows.
+/// One bounded pass of the retention sweeps that delete expired or excess rows.
 pub(crate) fn run_write_chores(db: &std::sync::Mutex<crate::db::TrackedConnection>, now_ms: i64) {
     let budget = crate::db::maintenance_busy_budget(RETENTION_MUTATION_BUSY_WAIT);
     let report = |what: &str, outcome: Result<(), crate::db::MaintenanceWriteError>| match outcome {
