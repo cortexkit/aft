@@ -646,6 +646,7 @@ fn workspace_reply(
     reply: serde_json::Value,
 ) -> WorkspacePullReply {
     WorkspacePullReply {
+        watched_epoch: None,
         reply: Ok(reply),
         previous_result_ids: manager
             .diagnostics
@@ -1109,6 +1110,129 @@ fn review_opus9_pulls_all_matching_dynamic_providers_with_their_own_result_ids()
     assert!(!manager
         .diagnostics
         .has_fresh_report_for_server_file(&key, &file));
+}
+
+#[test]
+fn review_opus8_watched_overflow_invalidates_existing_reports() {
+    use crate::lsp::pending_changes::PENDING_LSP_WATCHED_CAP;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let biome = ServerKey {
+        kind: ServerKind::Biome,
+        root: root.join("web"),
+    };
+    let rust = ServerKey {
+        kind: ServerKind::Rust,
+        root: root.join("rust"),
+    };
+    for key in [&biome, &rust] {
+        std::fs::create_dir(&key.root).unwrap();
+    }
+    let biome_file = biome.root.join("index.ts");
+    let rust_file = rust.root.join("lib.rs");
+    std::fs::write(&biome_file, "export const n = 1;\n").unwrap();
+    std::fs::write(&rust_file, "pub const N: usize = 1;\n").unwrap();
+    std::fs::write(biome.root.join("biome.json"), "{}").unwrap();
+    let mut manager = LspManager::new();
+    let mut old_biome =
+        lifecycle_fake_client_with_env(&manager, &biome, [("AFT_FAKE_LSP_HOLD_HOVER", "1")]);
+    let old_biome_instance = old_biome.instance;
+    let rust_client = lifecycle_fake_client(&manager, &rust);
+    let rust_instance = rust_client.instance;
+    let held = old_biome
+        .start_request::<lsp_types::request::HoverRequest>(idle_hover_params(&biome_file))
+        .unwrap();
+    manager.clients.insert(biome.clone(), old_biome);
+    manager.clients.insert(rust.clone(), rust_client);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let event = manager.event_rx.recv_deadline(deadline).unwrap();
+        if matches!(&event.event, LspEvent::Notification { method, .. } if method == "custom/hoverHeld")
+        {
+            break;
+        }
+        manager.handle_event(&event).ok();
+    }
+    manager
+        .diagnostics
+        .publish(biome.clone(), biome_file.clone(), Vec::new());
+    manager
+        .diagnostics
+        .publish(rust.clone(), rust_file.clone(), Vec::new());
+    let slot = manager.pending_change_slot();
+    let events = |dropped: PathBuf| {
+        (0..PENDING_LSP_WATCHED_CAP)
+            .map(|index| {
+                (
+                    biome.root.join(format!("{index}.ts")),
+                    FileChangeType::CREATED,
+                )
+            })
+            .chain(std::iter::once((dropped, FileChangeType::CREATED)))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        slot.queue_watched_for_test(&events(biome.root.join("overflow.ts"))),
+        PENDING_LSP_WATCHED_CAP
+    );
+    manager.deliver_pending_watched_backlog();
+    assert!(!manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&biome, &biome_file));
+    assert!(manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&rust, &rust_file));
+    assert_eq!(manager.clients[&biome].instance, old_biome_instance);
+    let client = manager.clients.get_mut(&biome).unwrap();
+    assert!(matches!(
+        client.start_request::<lsp_types::request::HoverRequest>(idle_hover_params(&biome_file)),
+        Err(LspError::ServerNotReady(_))
+    ));
+    client
+        .send_notification::<lsp_types::notification::DidChangeConfiguration>(
+            lsp_types::DidChangeConfigurationParams {
+                settings: json!({}),
+            },
+        )
+        .unwrap();
+    held.wait(Duration::from_secs(5)).unwrap();
+    manager.deliver_pending_watched_backlog();
+    assert!(!manager.clients.contains_key(&biome));
+
+    manager.override_binary(
+        ServerKind::Biome,
+        crate::fake_lsp_test_helper::fake_server_binary(),
+    );
+    let config = Config {
+        project_root: Some(root.clone()),
+        ..Default::default()
+    };
+    let _ = settled_lsp(&mut manager, |manager| {
+        manager.ensure_server_for_file(&biome_file, &config)
+    });
+    assert_ne!(manager.clients[&biome].instance, old_biome_instance);
+
+    assert_eq!(
+        slot.queue_watched_for_test(&events(root.join("unknown.ts"))),
+        PENDING_LSP_WATCHED_CAP
+    );
+    manager.deliver_pending_watched_backlog();
+    assert!(!manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&rust, &rust_file));
+    assert!(!manager.clients.contains_key(&biome));
+    assert_eq!(manager.clients[&rust].instance, rust_instance);
+    manager
+        .clients
+        .get_mut(&rust)
+        .unwrap()
+        .send_request::<lsp_types::request::HoverRequest>(idle_hover_params(&rust_file))
+        .unwrap();
+    let drained = manager.drain_events();
+    assert_eq!(drained.events.iter().filter(|event| {
+        matches!(event, LspEvent::Notification { method, .. } if method == "custom/reloadWorkspace")
+    }).count(), 1);
 }
 
 fn reject_fixture_writes(client: &mut LspClient, file: &Path) {

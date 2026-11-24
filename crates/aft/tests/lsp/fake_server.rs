@@ -624,6 +624,7 @@ pub(crate) fn main() -> io::Result<()> {
     let mut analysis_opens = 0usize;
     let dynamic_pull = std::env::var_os("AFT_FAKE_LSP_DYNAMIC_PULL").is_some();
     let mut hover_burst_sent = false;
+    let mut held_hover = None;
     let mut client_dynamic_pull = false;
     let mut client_disables_pull = false;
     let mut diagnostic_registered = false;
@@ -1051,6 +1052,11 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    if std::env::var_os("AFT_FAKE_LSP_HOLD_HOVER").is_some() {
+                        held_hover = Some(id);
+                        write_notification(&mut writer, &Notification::new("custom/hoverHeld", None))?;
+                        continue;
+                    }
                     if let Ok(count) = std::env::var("AFT_FAKE_LSP_HOVER_EVENT_BURST") {
                         let uri = document_uri(&params);
                         for _ in 0..count.parse::<usize>().unwrap() {
@@ -1486,6 +1492,9 @@ pub(crate) fn main() -> io::Result<()> {
                 }
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
+                "workspace/didChangeConfiguration" if held_hover.is_some() => {
+                    write_response(&mut writer, held_hover.take().unwrap(), Value::Null)?;
+                }
                 "initialized" => {
                     if std::env::var_os("AFT_FAKE_LSP_MULTIPLE_PULL").is_some() && client_dynamic_pull {
                         let registrations = [("types", Value::Null), ("lint", Value::Null),

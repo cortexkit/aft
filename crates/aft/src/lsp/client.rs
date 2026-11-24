@@ -1026,6 +1026,8 @@ pub struct LspClient {
     child: Child,
     child_process: super::child_registry::TrackedProcess,
     _event_ingress: Option<super::event_ingress::EventIngressLease>,
+    watched_stale: bool,
+    pub(super) watched_epoch: u64,
     // Held until the child exits or Drop kills/reaps it, including failed handshakes.
     _rust_analyzer_permit: Option<RustAnalyzerPermit>,
     // Drop runs after the process group has been killed and reaped.
@@ -1483,6 +1485,8 @@ impl LspClient {
             child,
             child_process,
             _event_ingress: event_ingress,
+            watched_stale: false,
+            watched_epoch: 0,
             child_pid,
             writer,
             pending,
@@ -1825,7 +1829,8 @@ impl LspClient {
     /// Whether this server is still analyzing: Rust uses workspace/check state;
     /// enabled background-analysis producers use their work-done progress.
     pub fn diagnostics_are_provisional(&self) -> bool {
-        self.is_unresponsive()
+        self.watched_stale
+            || self.is_unresponsive()
             || (self.uses_analysis_progress()
                 && if self.uses_document_pull(None) {
                     self.analysis_progress.running()
@@ -2423,6 +2428,9 @@ impl LspClient {
     where
         P: serde::Serialize,
     {
+        if self.watched_stale && method != "shutdown" {
+            return Err(LspError::ServerNotReady("server not found".into()));
+        }
         self.ensure_can_send()?;
 
         let id = RequestId::Int(self.next_id.fetch_add(1, Ordering::Relaxed));
@@ -2449,6 +2457,14 @@ impl LspClient {
             writer: self.writer.clone(),
             received_before_request,
         })
+    }
+
+    pub(super) fn mark_watched_stale(&mut self) {
+        self.watched_stale = true;
+    }
+
+    pub(super) fn watched_stale(&self) -> bool {
+        self.watched_stale
     }
 
     /// Clone the installed writer and rust-analyzer check-begin counter for

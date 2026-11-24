@@ -228,24 +228,18 @@ fn accepted_empty_lsp_snapshot_is_distinct_from_absent_producer() {
 
 #[test]
 fn post_edit_acceptance_keeps_clean_snapshot_and_omits_unversioned_report() {
-    use aft::lsp::diagnostics::DiagnosticEntry;
+    use aft::lsp::diagnostics::DiagnosticsStore;
     use aft::lsp::manager::{LspManager, PreEditSnapshot};
 
     let server = ServerKey {
         kind: ServerKind::Rust,
         root: PathBuf::from("/alert-fixture/project"),
     };
-    let fresh_clean = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: Vec::new(),
-        epoch: 2,
-        result_id: None,
-        version: Some(1),
-        stale: false,
-        provisional: false,
-        from_document_pull: false,
-    };
+    let mut store = DiagnosticsStore::new();
+    let file = server.root.join("lib.rs");
+    store.publish_full(server.clone(), file.clone(), Vec::new(), None, Some(0));
+    store.publish_full(server.clone(), file.clone(), Vec::new(), None, Some(1));
+    let fresh_clean = store.entries_for_file(&file)[0].1.clone();
     let accepted = LspManager::post_edit_outcome_for_entry_for_test(
         server.clone(),
         &fresh_clean,
@@ -259,12 +253,8 @@ fn post_edit_acceptance_keeps_clean_snapshot_and_omits_unversioned_report() {
     assert!(accepted.accepted_snapshots[0].is_empty());
     assert!(accepted.pending_servers.is_empty());
 
-    let unversioned = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        version: None,
-        ..fresh_clean
-    };
+    let mut unversioned = fresh_clean;
+    unversioned.version = None;
     let rejected = LspManager::post_edit_outcome_for_entry_for_test(
         server,
         &unversioned,

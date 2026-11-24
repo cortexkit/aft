@@ -8,7 +8,7 @@
 //! else resynced the file. They are now merged into one per-context backlog
 //! that a single helper thread delivers as soon as the lock frees.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -17,6 +17,8 @@ use lsp_types::FileChangeType;
 use crate::config::Config;
 use crate::lsp::manager::{start_servers_for_file_unlocked, LspManager, WatchedFileStamps};
 
+use super::event_ingress::EventIngress;
+
 /// How many distinct documents may wait for the manager lock. Past this the
 /// backlog stops listing documents and instead resyncs every open document
 /// whose file changed on disk when it is delivered (see
@@ -24,19 +26,65 @@ use crate::lsp::manager::{start_servers_for_file_unlocked, LspManager, WatchedFi
 pub const PENDING_LSP_DOCUMENTS_CAP: usize = 1_024;
 
 /// How many distinct watched-file events may wait for the manager lock.
-/// Further events are logged and dropped.
+/// Dropped events are counted against their affected server instances.
 pub const PENDING_LSP_WATCHED_CAP: usize = 1_024;
 
 /// The per-context slot holding changes queued for the LSP manager. `Some`
 /// exactly while the one helper thread delivering it exists.
-pub type PendingLspChangeSlot = Arc<parking_lot::Mutex<Option<PendingLspChanges>>>;
+pub type PendingLspChangeSlot = Arc<PendingLspChangeQueue>;
+
+pub struct PendingLspChangeQueue {
+    queue: parking_lot::Mutex<Option<PendingLspChanges>>,
+    ingress: EventIngress,
+}
+
+impl PendingLspChangeQueue {
+    pub(super) fn new(ingress: EventIngress) -> PendingLspChangeSlot {
+        Arc::new(Self {
+            queue: parking_lot::Mutex::new(None),
+            ingress,
+        })
+    }
+
+    pub(crate) fn has_worker(&self) -> bool {
+        self.queue.lock().is_some()
+    }
+
+    pub(super) fn deliver_watched(&self, lsp: &mut LspManager) {
+        let extracted = self
+            .queue
+            .lock()
+            .as_mut()
+            .map(PendingLspChanges::take_watched);
+        if let Some(changes) = extracted {
+            changes.apply_watched(lsp);
+        } else {
+            lsp.recover_watched_overflows();
+        }
+    }
+
+    pub(super) fn new_backlog(&self) -> PendingLspChanges {
+        PendingLspChanges {
+            ingress: Some(self.ingress.clone()),
+            ..Default::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn queue_watched_for_test(&self, events: &[(PathBuf, FileChangeType)]) -> usize {
+        let mut queue = self.queue.lock();
+        let backlog = queue.get_or_insert_with(|| self.new_backlog());
+        backlog.queue_mutation_watched(events, &WatchedFileStamps::new());
+        backlog.watched.len()
+    }
+}
 
 /// Changes merged across callers until the LSP manager lock is free.
 ///
 /// Documents are deduplicated by path and carry no contents: the file is read
 /// when the change is delivered, so the servers get its latest contents even
 /// when several edits queued meanwhile.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct PendingLspChanges {
     documents: Vec<PathBuf>,
     seen: HashSet<PathBuf>,
@@ -45,6 +93,8 @@ pub struct PendingLspChanges {
     start_servers: HashSet<PathBuf>,
     /// Watched-file events, one per path, the latest kind winning.
     watched: Vec<(PathBuf, FileChangeType)>,
+    watched_index: HashMap<PathBuf, usize>,
+    ingress: Option<EventIngress>,
     /// Mutation events must match each server's registered file globs and kinds;
     /// configuration notifications otherwise retain their existing send behavior.
     mutation_watched: HashSet<PathBuf>,
@@ -78,16 +128,14 @@ impl PendingLspChanges {
     /// Queue watched-file events, including source-file creation and deletion.
     pub(crate) fn queue_watched(&mut self, events: &[(PathBuf, FileChangeType)]) {
         for (path, typ) in events {
-            if let Some(existing) = self.watched.iter_mut().find(|(known, _)| known == path) {
-                existing.1 = *typ;
+            if let Some(index) = self.watched_index.get(path) {
+                self.watched[*index].1 = *typ;
             } else if self.watched.len() < PENDING_LSP_WATCHED_CAP {
+                self.watched_index.insert(path.clone(), self.watched.len());
                 self.watched.push((path.clone(), *typ));
-            } else {
-                crate::slog_warn!(
-                    "dropping queued watched-file event for {}: {} events already wait for the LSP manager",
-                    path.display(),
-                    PENDING_LSP_WATCHED_CAP
-                );
+            } else if let Some(ingress) = &self.ingress {
+                let resolved = super::manager::resolve_for_lsp_uri(path);
+                ingress.record_watched_drop(path, &resolved);
             }
         }
     }
@@ -98,8 +146,8 @@ impl PendingLspChanges {
         stamps: &WatchedFileStamps,
     ) {
         self.queue_watched(events);
-        for (path, _) in &self.watched {
-            if events.iter().any(|(event_path, _)| event_path == path) {
+        for (path, _) in events {
+            if self.watched_index.contains_key(path) {
                 if let Some(stamp) = stamps.get(path) {
                     self.watched_stamps.insert(path.clone(), *stamp);
                 } else {
@@ -115,13 +163,11 @@ impl PendingLspChanges {
         stamps: &WatchedFileStamps,
     ) {
         self.queue_watched_with_stamps(events, stamps);
-        self.mutation_watched
-            .extend(self.watched.iter().filter_map(|(path, _)| {
-                events
-                    .iter()
-                    .any(|(event_path, _)| event_path == path)
-                    .then(|| path.clone())
-            }));
+        self.mutation_watched.extend(
+            events.iter().filter_map(|(path, _)| {
+                self.watched_index.contains_key(path).then(|| path.clone())
+            }),
+        );
     }
 
     fn set_config(&mut self, config: Arc<Config>) {
@@ -142,7 +188,19 @@ impl PendingLspChanges {
 
     /// Deliver the backlog: configuration events first (as an edit does),
     /// then each document's current contents.
-    pub(crate) fn apply(self, lsp: &mut LspManager) {
+    fn take_watched(&mut self) -> Self {
+        self.watched_index.clear();
+        Self {
+            watched: std::mem::take(&mut self.watched),
+            mutation_watched: std::mem::take(&mut self.mutation_watched),
+            watched_stamps: std::mem::take(&mut self.watched_stamps),
+            config: self.config.clone(),
+            ..Default::default()
+        }
+    }
+
+    fn apply_watched(self, lsp: &mut LspManager) {
+        lsp.recover_watched_overflows();
         let config = self.config.unwrap_or_default();
         let (mutations, watched): (Vec<_>, Vec<_>) = self
             .watched
@@ -161,6 +219,11 @@ impl PendingLspChanges {
                 crate::slog_warn!("queued watched-file sync error: {error}");
             }
         }
+    }
+
+    pub(crate) fn apply(mut self, lsp: &mut LspManager) {
+        self.take_watched().apply_watched(lsp);
+        let config = self.config.unwrap_or_default();
         for path in &self.documents {
             // A file deleted meanwhile has nothing to send; the watcher
             // reports the deletion.
@@ -203,7 +266,7 @@ pub fn send_or_queue_lsp_change(
     queue: impl FnOnce(&mut PendingLspChanges),
 ) -> LspChangeDelivery {
     {
-        let mut pending = slot.lock();
+        let mut pending = slot.queue.lock();
         if let Some(backlog) = pending.as_mut() {
             queue(backlog);
             backlog.set_config(config);
@@ -226,13 +289,13 @@ pub(crate) fn queue_lsp_change(
     config: Arc<Config>,
     queue: impl FnOnce(&mut PendingLspChanges),
 ) -> LspChangeDelivery {
-    let mut pending = slot.lock();
+    let mut pending = slot.queue.lock();
     if let Some(backlog) = pending.as_mut() {
         queue(backlog);
         backlog.set_config(config);
         return LspChangeDelivery::Queued;
     }
-    let mut backlog = PendingLspChanges::default();
+    let mut backlog = slot.new_backlog();
     queue(&mut backlog);
     backlog.set_config(config);
     *pending = Some(backlog);
@@ -244,7 +307,7 @@ pub(crate) fn queue_lsp_change(
         .spawn(move || run_pending_change_helper(&manager, &helper_slot))
     {
         // Free the slot so a later change can try again.
-        slot.lock().take();
+        slot.queue.lock().take();
         crate::slog_warn!("could not queue a document change for the LSP servers: {error}");
     }
     LspChangeDelivery::Queued
@@ -262,7 +325,11 @@ pub(crate) fn run_pending_change_helper(
 ) {
     loop {
         let backlog = {
-            let mut pending = slot.lock();
+            // Keep watched changes available to a diagnostic reader that
+            // acquires the manager before this helper does.
+            let mut manager = manager.lock();
+            manager.deliver_pending_watched_backlog();
+            let mut pending = slot.queue.lock();
             let Some(backlog) = pending.as_mut() else {
                 return;
             };
@@ -271,8 +338,11 @@ pub(crate) fn run_pending_change_helper(
                 return;
             }
             let config = backlog.config.clone();
-            let taken = std::mem::take(backlog);
+            let taken = std::mem::replace(backlog, slot.new_backlog());
             backlog.config = config;
+            let mut taken = taken;
+            drop(pending);
+            taken.take_watched().apply_watched(&mut manager);
             taken
         };
         let config = backlog.config.clone().unwrap_or_default();

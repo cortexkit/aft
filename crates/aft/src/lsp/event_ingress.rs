@@ -21,6 +21,7 @@ struct Control {
     last_dropped: u64,
     overflowed: bool,
     exit: Option<ReceivedLspEvent>,
+    watched_dropped: usize,
 }
 
 pub(super) struct EventIngressLease {
@@ -59,6 +60,7 @@ impl EventIngress {
                 last_dropped: 0,
                 overflowed: false,
                 exit: None,
+                watched_dropped: 0,
             },
         );
         EventIngressLease {
@@ -134,7 +136,41 @@ impl EventIngress {
             .any(|control| control.overflowed || control.exit.is_some())
     }
 
-    #[cfg(all(test, unix))]
+    pub(super) fn record_watched_drop(&self, raw: &std::path::Path, resolved: &std::path::Path) {
+        let mut controls = self.controls.lock();
+        let in_scope = |control: &Control| {
+            raw.starts_with(&control.key.root) || resolved.starts_with(&control.key.root)
+        };
+        let any_matches = controls.values().any(in_scope);
+        for control in controls.values_mut() {
+            // If no workspace claims the path, we cannot prove any server's
+            // watch coverage is unaffected (for example a relative glob base).
+            if !any_matches || in_scope(control) {
+                control.watched_dropped = control.watched_dropped.saturating_add(1);
+            }
+        }
+    }
+
+    pub(super) fn take_watched_overflows(
+        &self,
+        live: impl Fn(&ServerKey, ServerInstanceId) -> bool,
+    ) -> Vec<(ServerKey, ServerInstanceId, usize)> {
+        self.controls
+            .lock()
+            .iter_mut()
+            .filter_map(|(&instance, control)| {
+                (control.watched_dropped != 0 && live(&control.key, instance)).then(|| {
+                    (
+                        control.key.clone(),
+                        instance,
+                        std::mem::take(&mut control.watched_dropped),
+                    )
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
     pub(super) fn exit_pending_for_test(&self, id: ServerInstanceId) -> bool {
         self.controls
             .lock()

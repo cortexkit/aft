@@ -1698,7 +1698,7 @@ fn record_blocking_inspect_observations(
     let batch = match AcceptedObservationBatch::from_diagnostic_snapshots(
         req.session(),
         &snapshot.project_root,
-        accepted_snapshots,
+        ctx.current_lsp_observations(accepted_snapshots),
     ) {
         Ok(batch) => batch,
         Err(error) => {

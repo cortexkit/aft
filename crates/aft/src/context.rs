@@ -3305,6 +3305,7 @@ pub fn callgraph_cold_build_spawn_count_for_test() -> usize {
     CALLGRAPH_COLD_BUILD_SPAWN_COUNT.load(Ordering::SeqCst)
 }
 
+mod lsp_access;
 #[path = "context/runtime_handles.rs"]
 mod runtime_handles;
 mod watcher_matcher;
@@ -3422,6 +3423,7 @@ impl AppContext {
             .map(|provider| provider.symbol_cache())
             .unwrap_or_else(|| Arc::new(std::sync::RwLock::new(SymbolCache::new())));
         let mut lsp_manager = LspManager::new();
+        let lsp_pending_change_slot = lsp_manager.pending_change_slot();
         lsp_manager.set_server_capacity(Arc::clone(&app.lsp_capacity));
         lsp_manager.set_child_registry(app.lsp_child_registry());
         lsp_manager.set_search_paths(config.lsp_paths_extra.clone());
@@ -3533,7 +3535,7 @@ impl AppContext {
             lsp_watcher_forward_pause: Arc::default(),
             #[cfg(test)]
             lsp_classified_watcher_forwards: Default::default(),
-            lsp_pending_change_slot: Default::default(),
+            lsp_pending_change_slot,
             configure_generation: Arc::new(AtomicU64::new(0)),
             configure_content_generation: Arc::new(AtomicU64::new(0)),
             subc_lifecycle,
@@ -3634,9 +3636,9 @@ impl AppContext {
             .clone();
         let tsconfig_generation = self.tsconfig_membership.lock().generation();
         let lsp = if wait_for_manager {
-            self.lsp_manager.lock()
+            self.lsp()
         } else {
-            self.lsp_manager.try_lock()?
+            self.try_lsp()?
         };
         let diagnostics_generation = lsp.diagnostics_generation();
         let (authoritative, producer_gaps) = lsp.project_diagnostics_authority();
@@ -8939,36 +8941,6 @@ impl AppContext {
         self.lsp_manager.lock().shutdown_all();
     }
 
-    /// Access the LSP manager.
-    pub fn lsp(&self) -> parking_lot::MutexGuard<'_, LspManager> {
-        self.lsp_manager.lock()
-    }
-
-    /// Keep Cargo-driven rust-analyzer checks off for this root from the first
-    /// worker call on (see [`LspManager::disable_rust_cargo_for_worker`]).
-    ///
-    /// Every worker tool call asks for this, so the flag is read without the
-    /// manager lock first: once it is set the call returns at once instead of
-    /// waiting behind a language-server start or a diagnostics request that
-    /// holds the lock. After one call sets the flag, later calls never take
-    /// the lock; only calls racing that first one may still contend for it.
-    pub fn disable_rust_cargo_for_worker(&self) {
-        if self
-            .lsp_rust_worker_policy
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return;
-        }
-        self.lsp_manager.lock().disable_rust_cargo_for_worker();
-    }
-
-    /// The LSP manager if no other thread holds it right now. For callers on
-    /// the subc frame loop, which must not wait behind a server start or a
-    /// diagnostics request.
-    pub fn try_lsp(&self) -> Option<parking_lot::MutexGuard<'_, LspManager>> {
-        self.lsp_manager.try_lock()
-    }
-
     /// Start one inspect producer, holding the LSP manager lock only to
     /// reserve the server and to publish it; the spawn and `initialize`
     /// handshake run unlocked (see
@@ -9027,7 +8999,7 @@ impl AppContext {
     /// the LSP manager.
     #[doc(hidden)]
     pub fn lsp_pending_changes_for_test(&self) -> bool {
-        self.lsp_pending_change_slot.lock().is_some()
+        self.lsp_pending_change_slot.has_worker()
     }
 
     /// Forward paths the project file watcher saw change to the language

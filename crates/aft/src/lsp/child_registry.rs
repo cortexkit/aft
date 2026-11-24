@@ -231,7 +231,7 @@ impl LspChildRegistry {
     /// Leave a tracked PID visible to the reaper after its client disappears.
     /// This is primarily a crash/leak backstop: normal client teardown kills and
     /// untracks its child immediately, while a failed teardown remains observable.
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn mark_client_gone(&self, pid: u32) {
         if let Ok(mut children) = self.inner.lock() {
             if let Some(child) = children.get_mut(&pid) {

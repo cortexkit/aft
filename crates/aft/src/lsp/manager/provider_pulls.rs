@@ -72,6 +72,7 @@ impl LspManager {
         uri: &lsp_types::Uri,
         deadline: Option<Instant>,
     ) -> DocumentPull {
+        self.deliver_pending_watched_backlog();
         let canonical_path = canonical_path.to_path_buf();
         self.background_pull_pending
             .remove(&(key.clone(), canonical_path.clone()));
@@ -86,7 +87,7 @@ impl LspManager {
                 .get(&key)
                 .and_then(|store| store.entry(&canonical_path))
                 .cloned(),
-            server_pid: self.clients.get(&key).map(LspClient::child_pid),
+            watched_epoch: self.watched_epoch(&key),
             previous_report: self
                 .diagnostics
                 .entries_for_file(&canonical_path)
@@ -218,7 +219,7 @@ impl LspManager {
         let Some(client) = self
             .clients
             .get(key)
-            .filter(|client| client.instance == pulls.instance)
+            .filter(|client| client.instance == pulls.instance && !client.watched_stale())
         else {
             return failed("document_changed_while_pulling");
         };

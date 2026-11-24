@@ -11,6 +11,10 @@ impl LspManager {
     pub fn has_pending_events(&self) -> bool {
         !self.event_rx.is_empty()
             || self.event_tx.pending()
+            || self
+                .clients
+                .values()
+                .any(|client| client.watched_stale() && !client.has_pending_requests())
             || !self.pending_diagnostic_observations.is_empty()
             || !self.ready_startup_events.is_empty()
             || (!self.is_quiesced()
@@ -54,7 +58,9 @@ impl LspManager {
             if !preserve_pull_observations {
                 if let Some(delivery) = self.ready_startup_events.pop_front() {
                     processed += 1;
-                    if self.event_tx.predates_overflow(&delivery.event) {
+                    if self.event_tx.predates_overflow(&delivery.event)
+                        || self.watched_stale_event(&delivery.event)
+                    {
                         continue;
                     }
                     diagnostics_changed |= delivery.published.is_some();

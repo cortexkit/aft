@@ -95,6 +95,8 @@ mod event_drain;
 mod memory;
 mod provider_pulls;
 mod shutdown;
+mod watched_overflow;
+mod workspace_pulls;
 use memory::DiagnosticMergeCache;
 
 fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
@@ -597,7 +599,7 @@ pub(crate) struct DocumentPull {
     canonical_path: PathBuf,
     document_version: Option<i32>,
     document_snapshot: Option<DocumentEntry>,
-    server_pid: Option<u32>,
+    watched_epoch: Option<(ServerInstanceId, u64)>,
     previous_report: Option<DiagnosticEntry>,
     /// The pull itself opened the document in this server (it was not open
     /// for an edit or an earlier query).
@@ -925,12 +927,14 @@ pub struct PullWorkspaceResult {
 /// A workspace request keeps the exact result IDs sent to the server because
 /// another push or pull can replace the live cache while the lock is released.
 pub(crate) struct PendingWorkspacePull {
+    watched_epoch: (ServerInstanceId, u64),
     request: crate::lsp::client::PendingLspRequest,
     previous_result_ids: HashMap<PathBuf, String>,
 }
 
 /// The reply retains its request's cache identities through the unlocked wait.
 pub(crate) struct WorkspacePullReply {
+    watched_epoch: Option<(ServerInstanceId, u64)>,
     reply: Result<serde_json::Value, LspError>,
     previous_result_ids: HashMap<PathBuf, String>,
 }
@@ -938,6 +942,7 @@ pub(crate) struct WorkspacePullReply {
 impl PendingWorkspacePull {
     fn wait(self, timeout: Duration) -> WorkspacePullReply {
         WorkspacePullReply {
+            watched_epoch: Some(self.watched_epoch),
             reply: self.request.wait(timeout),
             previous_result_ids: self.previous_result_ids,
         }
@@ -1106,6 +1111,8 @@ pub struct LspManager {
     event_tx: EventIngress,
     event_rx: Receiver<ReceivedLspEvent>,
     ingress_rx: Receiver<()>,
+    pending_change_slot: super::pending_changes::PendingLspChangeSlot,
+    delivering_watched_changes: bool,
     /// One-slot wake channels for post-edit waits that released the manager
     /// mutex. Drains notify them after handling an event, so a waiter cannot
     /// sleep through a diagnostics update consumed by another drain path.
@@ -1416,6 +1423,8 @@ pub(crate) fn format_retry_delay(delay: Duration) -> String {
 impl LspManager {
     pub fn new() -> Self {
         let (event_tx, event_rx, ingress_rx) = EventIngress::new();
+        let pending_change_slot =
+            super::pending_changes::PendingLspChangeQueue::new(event_tx.clone());
         Self {
             capacity: Arc::default(),
             capacity_slots: HashMap::new(),
@@ -1445,6 +1454,8 @@ impl LspManager {
             event_tx,
             event_rx,
             ingress_rx,
+            pending_change_slot,
+            delivering_watched_changes: false,
             post_edit_waiters: HashMap::new(),
             next_post_edit_waiter_id: 0,
             binary_overrides: HashMap::new(),
@@ -2222,6 +2233,7 @@ impl LspManager {
     /// Publish each completed startup phase under the manager lock. Notification
     /// replay uses a cloned writer on its own worker, never this lock.
     fn publish_completed_starts(&mut self) {
+        self.deliver_pending_watched_backlog();
         let keys: Vec<_> = self.starting.keys().cloned().collect();
         for key in keys {
             let Some(reservation) = self.starting.get(&key) else {
@@ -4489,6 +4501,8 @@ impl LspManager {
         wait: &mut PostEditDiagnosticsWait,
         event: Option<ReceivedLspEvent>,
     ) -> bool {
+        self.deliver_pending_watched_backlog();
+        self.apply_ingress_overflows();
         if let Some(event) = event {
             let _ = self.handle_event(&event);
         }
@@ -4552,6 +4566,8 @@ impl LspManager {
         &mut self,
         mut wait: PostEditDiagnosticsWait,
     ) -> PostEditWaitOutcome {
+        self.deliver_pending_watched_backlog();
+        self.apply_ingress_overflows();
         self.post_edit_waiters.remove(&wait.waiter_id);
         wait.fresh.retain(|key, diagnostics| {
             self.diagnostics
@@ -4605,6 +4621,9 @@ impl LspManager {
             })
             .collect();
         let mut outcome = Self::post_edit_outcome(wait.expected_versions, wait.fresh, wait.exited);
+        for snapshot in &mut outcome.accepted_snapshots {
+            snapshot.watched_epoch = self.watched_epoch(&snapshot.server_key);
+        }
         outcome.unresponsive_servers = unresponsive_servers;
         outcome
     }
@@ -4918,6 +4937,7 @@ impl LspManager {
         file: &Path,
         deadline: Instant,
     ) -> Result<super::typescript_diagnostics::TypescriptDiagnosticsRequest, LspError> {
+        self.deliver_pending_watched_backlog();
         if self.starting.contains_key(key) {
             return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
         }
@@ -4950,11 +4970,12 @@ impl LspManager {
         ([u8; 32], Vec<StoredDiagnostic>),
         super::typescript_diagnostics::CertificationFailure,
     > {
-        let current = self.documents.get(&reply.key).is_some_and(|store| {
-            reply.version.is_some()
-                && store.version(&reply.file) == reply.version
-                && !store.is_stale_on_disk(&reply.file)
-        });
+        let current = self.watched_epoch(&reply.key) == Some(reply.watched_epoch)
+            && self.documents.get(&reply.key).is_some_and(|store| {
+                reply.version.is_some()
+                    && store.version(&reply.file) == reply.version
+                    && !store.is_stale_on_disk(&reply.file)
+            });
         if !current {
             return Err(super::typescript_diagnostics::CertificationFailure::DocumentChanged);
         }
@@ -4971,13 +4992,14 @@ impl LspManager {
     /// [`Self::begin_document_pull`] and return its outcome. A pull that was
     /// not waited for yet is waited for here, with the manager locked.
     pub(crate) fn finish_document_pull(&mut self, pull: DocumentPull) -> PullFileOutcome {
+        self.deliver_pending_watched_backlog();
         let pull = pull.wait();
         let DocumentPull {
             key,
             canonical_path,
             document_version,
             document_snapshot,
-            server_pid,
+            watched_epoch,
             previous_report,
             state,
             ..
@@ -4985,7 +5007,8 @@ impl LspManager {
         if let DocumentPullState::Done(outcome) = state {
             return outcome;
         }
-        if self.clients.get(&key).map(LspClient::child_pid) != server_pid
+        if self.clients.get(&key).is_some_and(LspClient::watched_stale)
+            || self.watched_epoch(&key) != watched_epoch
             || self
                 .documents
                 .get(&key)
@@ -5059,6 +5082,11 @@ impl LspManager {
                     let drained = self.drain_events_inner(usize::MAX, true);
                     self.pending_diagnostic_observations
                         .extend(drained.accepted_snapshots);
+                    if self.watched_epoch(&key) != watched_epoch {
+                        return PullFileOutcome::RequestFailed {
+                            reason: "document_changed_while_pulling".into(),
+                        };
+                    }
                 }
                 self.ingest_document_report(
                     &key,
@@ -5098,215 +5126,6 @@ impl LspManager {
                 }
             }
         }
-    }
-
-    /// Issue a `workspace/diagnostic` request to a specific server. Cancels
-    /// internally if `timeout` elapses before the server responds. Cached
-    /// entries from the response are stored so directory-mode queries pick
-    /// them up. Waits with `self` borrowed; callers holding the manager lock
-    /// should use [`pull_workspace_diagnostics_unlocked`].
-    pub fn pull_workspace_diagnostics(
-        &mut self,
-        server_key: &ServerKey,
-        timeout: Option<std::time::Duration>,
-    ) -> Result<PullWorkspaceResult, LspError> {
-        let timeout = timeout.unwrap_or(Self::PULL_WORKSPACE_TIMEOUT);
-        match self.begin_workspace_pull(server_key)? {
-            None => Ok(unsupported_workspace_pull(server_key)),
-            Some(request) => {
-                let reply = request.wait(timeout);
-                self.finish_workspace_pull(server_key, reply)
-            }
-        }
-    }
-
-    /// Send a `workspace/diagnostic` request; `None` when the server does not
-    /// support it.
-    pub(crate) fn begin_workspace_pull(
-        &mut self,
-        server_key: &ServerKey,
-    ) -> Result<Option<PendingWorkspacePull>, LspError> {
-        if self.starting.contains_key(server_key) {
-            return Err(LspError::ServerNotReady(START_IN_PROGRESS_REASON.into()));
-        }
-        let supports_workspace = self
-            .clients
-            .get(server_key)
-            .and_then(|c| c.diagnostic_capabilities())
-            .is_some_and(|caps| caps.workspace_diagnostics);
-        if !supports_workspace {
-            return Ok(None);
-        }
-
-        let identifier = self
-            .clients
-            .get(server_key)
-            .and_then(|c| c.diagnostic_capabilities())
-            .and_then(|caps| caps.identifier.clone());
-
-        // Report the result ids of current reports so the server can answer
-        // "unchanged" for those files instead of resending every report;
-        // an unchanged item leaves the stored report as it is.
-        let previous_result_ids: Vec<_> = self
-            .diagnostics
-            .result_ids_for_server(server_key)
-            .into_iter()
-            .filter_map(|(file, value)| {
-                Some(lsp_types::PreviousResultId {
-                    uri: uri_for_path(&file).ok()?,
-                    value,
-                })
-            })
-            .collect();
-        let sent_result_ids = previous_result_ids
-            .iter()
-            .filter_map(|previous| Some((uri_to_path(&previous.uri)?, previous.value.clone())))
-            .collect();
-        let params = AftWorkspaceDiagnosticParams {
-            identifier,
-            previous_result_ids,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-
-        self.clients
-            .get_mut(server_key)
-            .ok_or_else(|| LspError::ServerNotReady("server not found".into()))?
-            .start_request::<AftWorkspaceDiagnosticRequest>(params)
-            .map(|request| {
-                Some(PendingWorkspacePull {
-                    request,
-                    previous_result_ids: sent_result_ids,
-                })
-            })
-    }
-
-    /// Store the reply to a request sent by [`Self::begin_workspace_pull`].
-    pub(crate) fn finish_workspace_pull(
-        &mut self,
-        server_key: &ServerKey,
-        reply: WorkspacePullReply,
-    ) -> Result<PullWorkspaceResult, LspError> {
-        let WorkspacePullReply {
-            reply,
-            previous_result_ids,
-        } = reply;
-        let result = match reply.and_then(|value| {
-            serde_json::from_value::<lsp_types::WorkspaceDiagnosticReportResult>(value)
-                .map_err(Into::into)
-        }) {
-            Ok(result) => result,
-            Err(LspError::Timeout(_)) => {
-                return Ok(PullWorkspaceResult {
-                    server_key: server_key.clone(),
-                    files_reported: Vec::new(),
-                    complete: false,
-                    cancelled: true,
-                    supports_workspace: true,
-                });
-            }
-            Err(err) => {
-                if let Some(result) = self.cache_post_initialize_exit(server_key, &err) {
-                    return Err(LspError::ServerNotReady(server_attempt_result_reason(
-                        &result,
-                    )));
-                }
-                return Err(err);
-            }
-        };
-
-        // Extract the items list. Partial responses are not a complete
-        // workspace view, but the partial payload can still contain useful
-        // document reports; ingest those while surfacing complete=false.
-        let (items, mut complete) = match result {
-            lsp_types::WorkspaceDiagnosticReportResult::Report(report) => (report.items, true),
-            lsp_types::WorkspaceDiagnosticReportResult::Partial(partial) => (partial.items, false),
-        };
-
-        // Workspace and document pulls share version/authority rules. Only a
-        // document request completes the per-document analysis wait below.
-        let mut files_reported = Vec::with_capacity(items.len());
-        for item in items {
-            let (uri, version, report) = match item {
-                lsp_types::WorkspaceDocumentDiagnosticReport::Full(full) => (
-                    full.uri,
-                    full.version,
-                    lsp_types::DocumentDiagnosticReportKind::Full(
-                        full.full_document_diagnostic_report,
-                    ),
-                ),
-                lsp_types::WorkspaceDocumentDiagnosticReport::Unchanged(unchanged) => (
-                    unchanged.uri,
-                    unchanged.version,
-                    lsp_types::DocumentDiagnosticReportKind::Unchanged(
-                        unchanged.unchanged_document_diagnostic_report,
-                    ),
-                ),
-            };
-            if let Some(file) = uri_to_path(&uri) {
-                let previous = self
-                    .diagnostics
-                    .entries_for_file(&file)
-                    .into_iter()
-                    .find(|(stored, _)| **stored == *server_key)
-                    .map(|(_, entry)| entry.clone());
-                if matches!(
-                    &report,
-                    lsp_types::DocumentDiagnosticReportKind::Unchanged(_)
-                ) && !previous_result_ids.get(&file).is_some_and(|sent| {
-                    previous.as_ref().and_then(|entry| entry.result_id.as_ref()) == Some(sent)
-                }) {
-                    // An unchanged verdict concerns the report sent with the
-                    // request, not a replacement published while it was in flight.
-                    complete = false;
-                    continue;
-                }
-                self.ingest_document_report_kind(
-                    server_key,
-                    &file,
-                    version.and_then(|version| i32::try_from(version).ok()),
-                    previous,
-                    false,
-                    report,
-                );
-                files_reported.push(file);
-            }
-        }
-
-        Ok(PullWorkspaceResult {
-            server_key: server_key.clone(),
-            files_reported,
-            complete,
-            cancelled: false,
-            supports_workspace: true,
-        })
-    }
-
-    fn cache_post_initialize_exit(
-        &mut self,
-        key: &ServerKey,
-        err: &LspError,
-    ) -> Option<ServerAttemptResult> {
-        let binary = self
-            .server_binaries
-            .get(key)
-            .cloned()
-            .unwrap_or_else(|| key.kind.id_str().to_string());
-        let (instance, report) = {
-            let client = self.clients.get_mut(key)?;
-            let status = client.wait_for_exit(Duration::from_millis(100))?;
-            (
-                client.instance,
-                client.exit_report(client.phase(), Some(status), false),
-            )
-        };
-        let reason = format_post_initialize_exit_reason(&binary, &report, err);
-        let durability = exit_durability(&reason, &report.stderr_tail);
-        let result = ServerAttemptResult::SpawnFailed { binary, reason };
-        self.clients.remove(key);
-        self.remember_exit_report(instance, report);
-        self.forget_server_state(Some(key));
-        Some(self.record_failed_spawn(key, result, durability))
     }
 
     /// Store the result of a per-file pull request and return a structured
@@ -6287,11 +6106,11 @@ impl LspManager {
             .into_iter()
             .find_map(|(stored_key, entry)| (stored_key == server_key).then_some(entry))?;
 
-        Some(AcceptedDiagnosticSnapshot::new(
+        Some(self.stamp_watched_epoch(AcceptedDiagnosticSnapshot::new(
             server_key.clone(),
             document_version,
             entry.diagnostics.clone(),
-        ))
+        )))
     }
 
     fn live_publish_drop_reason(&self, key: &ServerKey, file: &Path) -> Option<&'static str> {
@@ -6398,7 +6217,7 @@ impl LspManager {
     /// only the exit report that receipt was meant to log.
     fn admit_event(&mut self, receipt: &ReceivedLspEvent) -> bool {
         if self.accept_event_instance(&receipt.event, receipt.instance) {
-            return !self.event_tx.predates_overflow(receipt);
+            return !self.event_tx.predates_overflow(receipt) && !self.watched_stale_event(receipt);
         }
         self.consume_pending_exit_report(receipt);
         false
@@ -6442,6 +6261,7 @@ impl LspManager {
     /// `Ok(None)` covers both a deferred startup event and one that stored
     /// no publish.
     fn handle_event(&mut self, receipt: &ReceivedLspEvent) -> Result<Option<PathBuf>, ()> {
+        self.deliver_pending_watched_backlog();
         self.apply_ingress_overflows();
         if !self.admit_event(receipt) {
             return Err(());
@@ -8025,7 +7845,7 @@ fn canonicalize_for_lsp(file_path: &Path) -> Result<PathBuf, LspError> {
         .map_err(LspError::from)
 }
 
-fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
+pub(super) fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     // Same normalized form as canonicalize_for_lsp and the client roots;
     // see the comment there.
     if let Ok(path) = std::fs::canonicalize(file_path) {
