@@ -15,7 +15,7 @@ mod speech;
 pub use speech::*;
 
 mod fixture_paths;
-pub use fixture_paths::*;
+pub use fixture_paths::{bash_background, bash_rewrite};
 use std::path::Path;
 
 pub use aft_shell::test_bridge::*;

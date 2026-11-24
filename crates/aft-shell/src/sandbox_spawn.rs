@@ -50,7 +50,11 @@ use std::time::{Duration, Instant};
 use portable_pty::CommandBuilder;
 
 use crate::config::SandboxMode;
+#[cfg(all(unix, any(test, feature = "test-support")))]
+pub(crate) mod grant_fixture;
 mod host;
+#[cfg(test)]
+pub(crate) mod policy_fixture;
 #[cfg(unix)]
 use crate::sandbox_profile::resolved_env_deny_paths;
 use crate::sandbox_profile::SandboxProfile;
@@ -10173,42 +10177,13 @@ pub(crate) mod git_policy_cache_tests {
 
 #[cfg(test)]
 mod policy_tests {
+    use super::policy_fixture::SandboxFixture;
     use super::*;
 
     #[cfg(unix)]
-    fn provider_layout_grant(ttl: Duration) -> (AppContext, String, PathBuf) {
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config::default(),
-        );
-        let layout = crate::shell_env_provider::PreflightLayout::create().unwrap();
-        let path = layout.path().to_path_buf();
-        let id = "esc_provider_layout".to_owned();
-        ctx.escalation_grants().inner_lock().grants.insert(
-            id.clone(),
-            EscalationGrant {
-                principal: AuthenticatedPrincipal::FirstParty,
-                root: PathBuf::from("/provider-root"),
-                digest: blake3::hash(b"unused payload"),
-                expires_at: Instant::now() + ttl,
-                consumed: false,
-                refused: false,
-                payload_reclaimed: false,
-                session_dir: path.join("nonexistent-session"),
-                task_id: "nonexistent-task".into(),
-                provider_snapshot: None,
-            },
-        );
-        save_provider_approval(
-            &ctx,
-            &id,
-            ProviderApprovalSnapshot {
-                input: HashMap::new(),
-                environment: ChildEnvironment::new(),
-                failure: None,
-                preflight_layout: Some(layout),
-            },
-        );
+    fn provider_layout_grant(ttl: Duration) -> (SandboxFixture, String, PathBuf) {
+        let ctx = SandboxFixture::new(crate::config::Config::default());
+        let (id, path) = super::grant_fixture::create(&ctx, ttl);
         (ctx, id, path)
     }
 
@@ -10275,21 +10250,8 @@ mod policy_tests {
         assert!(bound.is_ok(), "cannot bind {}: {bound:?}", socket.display());
     }
 
-    fn context(project_root: PathBuf) -> AppContext {
-        AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project_root),
-                sandbox: crate::config::SandboxConfig {
-                    profile: crate::config::SandboxRoles {
-                        head: SandboxMode::Strict,
-                        worker: SandboxMode::Strict,
-                    },
-                    ..crate::config::SandboxConfig::default()
-                },
-                ..crate::config::Config::default()
-            },
-        )
+    fn context(project_root: PathBuf) -> SandboxFixture {
+        SandboxFixture::strict(project_root)
     }
 
     #[test]
@@ -10630,7 +10592,6 @@ mod policy_tests {
             .unwrap_err()
             .contains("host escalation"));
     }
-
 
     #[test]
     fn sandbox_profile_roles_and_unverified_routes_resolve_before_spawning() {
@@ -11180,7 +11141,6 @@ mod policy_tests {
         )));
         assert!(message.ends_with("select sandbox.profile off to disable native sandboxing"));
     }
-
 
     #[test]
     fn untrusted_principal_forces_strict_even_when_profiles_are_off() {

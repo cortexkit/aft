@@ -1,14 +1,13 @@
 use std::path::Path;
 
-use crate::context::AppContext;
-use crate::output_store::OutputFiles;
+use crate::output_store::{OutputFiles, OutputStoreHost};
 
 pub trait OutputFilesTest {
     fn file_count(&self) -> usize;
     fn files_are_empty(&self) -> bool;
     fn canonicalizations(&self) -> usize;
-    fn restore(&self, ctx: &AppContext, session: &str, path: &Path);
-    fn is_result_path(&self, ctx: &AppContext, path: &Path) -> bool;
+    fn restore(&self, ctx: &dyn OutputStoreHost, session: &str, path: &Path);
+    fn is_result_path(&self, ctx: &dyn OutputStoreHost, path: &Path) -> bool;
     fn owner(&self, path: &Path) -> Option<String>;
 }
 
@@ -23,10 +22,10 @@ impl OutputFilesTest for OutputFiles {
         self.canonicalizations
             .load(std::sync::atomic::Ordering::Relaxed)
     }
-    fn restore(&self, ctx: &AppContext, session: &str, path: &Path) {
+    fn restore(&self, ctx: &dyn OutputStoreHost, session: &str, path: &Path) {
         self.restore(ctx, session, path);
     }
-    fn is_result_path(&self, ctx: &AppContext, path: &Path) -> bool {
+    fn is_result_path(&self, ctx: &dyn OutputStoreHost, path: &Path) -> bool {
         self.is_result_path(ctx, path)
     }
     fn owner(&self, path: &Path) -> Option<String> {

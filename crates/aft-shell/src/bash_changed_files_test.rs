@@ -1,3 +1,4 @@
+use super::test_fixture::{event, git, repo};
 use super::*;
 use notify::event::{CreateKind, ModifyKind, RemoveKind};
 use std::process::Command;
@@ -498,7 +499,7 @@ struct NativeWatcher {
     watcher: Option<crate::watcher_backend::ProjectWatcher>,
     stop: Arc<std::sync::atomic::AtomicBool>,
     join: Option<std::thread::JoinHandle<()>>,
-    counters: Arc<crate::context::WatcherCounters>,
+    counters: Arc<crate::watcher_backend::counters::WatcherCounters>,
     journal: Arc<Journal>,
     markers: Arc<Mutex<Vec<PathBuf>>>,
     generated: Arc<std::sync::atomic::AtomicUsize>,
@@ -511,10 +512,8 @@ impl NativeWatcher {
     fn new(root: &Path, watch_git: bool) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         let root = root.canonicalize().unwrap();
-        let counters = crate::context::watcher_counters_for_root(&root);
-        let journal = crate::context::WatcherCountersHandle::new(counters.clone())
-            .bash_changes
-            .get_or_init(|| Arc::new(Journal::default()));
+        let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
+        let journal = Arc::new(Journal::default());
         let mut ignores = ignore::gitignore::GitignoreBuilder::new(&root);
         ignores.add_line(None, "/target/").unwrap();
         if root.join(".gitignore").is_file() {
@@ -854,7 +853,7 @@ fn bash_changed_files_flush_markers_are_excluded_from_project_walks() {
     assert!(!crate::project_content::is_excluded(
         &root.path().join(".aft-flush-not-private")
     ));
-    let paths = crate::search_index::project_walk_builder(root.path())
+    let paths = aft_index::search_index::project_walk_builder(root.path())
         .build()
         .filter_map(Result::ok)
         .map(|entry| entry.path().to_path_buf())
@@ -917,7 +916,6 @@ fn bash_changed_files_flush_native_no_false_complete_during_50k_activity() {
         assert_eq!(report.incomplete, vec![NOT_CAUGHT_UP], "{report:?}");
     }
 }
-
 
 #[test]
 #[ignore = "manual render deadline timing; run cargo test -p agent-file-tools --lib -- bash_changed_files_diff_rendering_respects_reply_deadline --ignored --nocapture --test-threads=1"]
@@ -1246,7 +1244,6 @@ fn bash_changed_files_diff_respects_configured_and_credential_read_floors() {
         .unwrap()
         .contains("SECRET_MUST_NOT_APPEAR"));
 }
-
 
 #[cfg(windows)]
 #[test]

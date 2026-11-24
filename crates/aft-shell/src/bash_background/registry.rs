@@ -80,6 +80,7 @@ use super::watches::{
 use super::{BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
+mod composition;
 mod saved_delivery;
 use saved_delivery::list_delivery_gaps;
 mod live_delivery;
@@ -2660,7 +2661,8 @@ impl BgTaskRegistry {
             .is_ok_and(|mut sessions| sessions.insert(session_id.to_string()))
     }
 
-    pub(crate) fn compression_aggregate_cache(&self) -> Arc<CompressionAggregateCache> {
+    #[doc(hidden)]
+    pub fn compression_aggregate_cache(&self) -> Arc<CompressionAggregateCache> {
         Arc::clone(&self.inner.compression_aggregates)
     }
 
@@ -13465,7 +13467,8 @@ impl BgTaskRegistry {
     /// finished. A finished task's output can be compressed again later (a
     /// render that has to be redone, or a completion re-masked for changed
     /// secrets), so its root keeps what that compression needs.
-    pub(crate) fn has_task_records(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_task_records(&self) -> bool {
         self.inner
             .tasks
             .lock()
@@ -13475,7 +13478,8 @@ impl BgTaskRegistry {
 
     /// [`Self::has_task_records`] without waiting: `None` when the task map
     /// is locked.
-    pub(crate) fn try_has_task_records(&self) -> Option<bool> {
+    #[doc(hidden)]
+    pub fn try_has_task_records(&self) -> Option<bool> {
         match self.inner.tasks.try_lock() {
             Ok(tasks) => Some(!tasks.is_empty()),
             Err(std::sync::TryLockError::WouldBlock) => None,
@@ -15676,7 +15680,8 @@ impl BgTaskRegistry {
 
     /// Count background task PIDs that are still alive without keeping registry
     /// locks across the OS liveness probes used by the lifecycle health rollup.
-    pub(crate) fn detached_live_process_count(&self) -> usize {
+    #[doc(hidden)]
+    pub fn detached_live_process_count(&self) -> usize {
         let Some(pids) = self.inner.tasks.try_lock().ok().map(|tasks| {
             tasks
                 .values()

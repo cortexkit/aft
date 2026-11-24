@@ -5,8 +5,11 @@ use crate::bash_background::{
 };
 use crate::context::{App, AppContext};
 use aft_inspect::inspect::compatibility_test::InspectManagerTest as _;
+use aft_shell::test_bridge::BgTaskRegistryTestExt as _;
+#[cfg(test)]
+use std::path::PathBuf;
 use std::{
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex, MutexGuard, OnceLock},
 };
 

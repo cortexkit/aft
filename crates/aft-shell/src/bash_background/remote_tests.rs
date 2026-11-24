@@ -723,19 +723,14 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     ensure_git_fixture(project.path());
-    let ctx = crate::context::AppContext::new(
-        Box::new(crate::parser::TreeSitterProvider::new()),
-        crate::config::Config {
-            project_root: Some(project.path().into()),
-            storage_dir: Some(storage.path().into()),
-            bash: crate::config::BashConfig {
-                changed_files: crate::config::BashChangedFiles::List,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+    let tasks = registry();
+    let journal = Arc::new(crate::bash_changed_files::Journal::default());
+    let capture = crate::bash_changed_files::Capture::begin(
+        project.path().canonicalize().unwrap(),
+        journal.clone(),
+        crate::config::BashChangedFiles::List,
+        false,
     );
-    let capture = crate::bash_changed_files::Capture::start(&ctx).unwrap();
     let mut launch = launch(daemon.connection.clone());
     launch.explicit_runon = !fallback;
     // Only the local fallback shell creates local.txt. The explicit remote
@@ -755,7 +750,7 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     );
     let task_id = {
         let _capture = crate::bash_changed_files::scope(Some(capture.clone()));
-        ctx.bash_background()
+        tasks
             .spawn_remote(
                 launch,
                 SpawnPlan::Unsandboxed,
@@ -787,17 +782,17 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     }
     // Inject a file-create event into the project's changed-files tracker while
     // the remote stream or fallback shell is held open, independently of OS delivery timing.
-    ctx.watcher_counters().bash_changes.get().unwrap().event(
+    journal.event(
         &notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
             .add_path(project.path().canonicalize().unwrap().join("local.txt")),
     );
     std::fs::write(storage.path().join("release"), "").unwrap();
     daemon.output_gate.notify_one();
     daemon.completion_gate.notify_one();
-    let done = terminal(ctx.bash_background(), &task_id).await;
+    let done = terminal(&tasks, &task_id).await;
     assert_eq!(done.exit_code, Some(0), "{done:?}");
     let completion = wait_for("completion must retain its local change report", || {
-        ctx.bash_background()
+        tasks
             .drain_completions_for_session(Some("session"))
             .into_iter()
             .find(|completion| completion.task_id == task_id)
@@ -813,7 +808,7 @@ async fn assert_new_remote_changed_files(fallback: bool) {
     );
     assert!(serde_json::to_value(&completion).unwrap()["_bash_changed_files"].is_object());
 
-    let task = ctx.bash_background().task(&task_id).unwrap();
+    let task = tasks.task(&task_id).unwrap();
     let metadata = task.state.lock().unwrap().metadata.clone();
     let replay = registry();
     let _capture = crate::bash_changed_files::scope(Some(capture));
@@ -4382,8 +4377,8 @@ async fn exec_remote_bash_restart_refusal_uses_original_launch_plan() {
         );
     }
     drop(original);
-    let ctx = restarted_context(dir.path());
-    let restarted = ctx.bash_background();
+    ensure_git_fixture(dir.path());
+    let restarted = &registry();
     restarted.replay_session(dir.path(), "session").unwrap();
     let done = terminal(restarted, &task_id).await;
     assert_eq!(fs::read(&paths.stdout).unwrap(), b"host-proof");
@@ -4520,8 +4515,8 @@ async fn exec_remote_bash_restart_snapshot_tampering_refuses_without_run() {
             value["policy"] = serde_json::json!("Unsandboxed");
             fs::write(&snapshot, serde_json::to_vec(&value).unwrap()).unwrap();
         }
-        let ctx = restarted_context(dir.path());
-        let restarted = ctx.bash_background();
+        ensure_git_fixture(dir.path());
+        let restarted = &registry();
         restarted.replay_session(dir.path(), "session").unwrap();
         let done = terminal(restarted, &task_id).await;
         assert_eq!(done.info.status, BgTaskStatus::Failed);
@@ -5450,13 +5445,13 @@ async fn runon_keeps_a_forwarded_configured_name_and_a_per_call_name() {
     let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
     let dir = tempfile::tempdir().unwrap();
     ensure_git_fixture(dir.path());
-    let ctx = Arc::new(restarted_context(dir.path()));
+    let tasks = registry();
     let mut policy = launch(daemon.connection.clone());
     policy.explicit_runon = true;
     // `TZ` is configured and forwarded; `OTHER` is configured but not
     // forwarded, so it is not in the request map at all.
     policy.configured_env_names = vec!["TZ".to_string(), "OTHER".to_string()];
-    ctx.bash_background()
+    tasks
         .spawn_remote(
             policy,
             SpawnPlan::Unsandboxed,

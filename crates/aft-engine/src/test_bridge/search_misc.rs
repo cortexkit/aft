@@ -226,7 +226,7 @@ pub fn keep_request_file(
     guard.files().keep_read(path, bytes, stat)
 }
 
-pub mod output;
+pub use aft_shell::test_bridge::output_files as output;
 pub mod search;
 pub mod edit {
     pub fn file_reporter_registered() -> bool {

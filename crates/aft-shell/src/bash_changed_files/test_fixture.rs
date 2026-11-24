@@ -1,4 +1,7 @@
-fn git(root: &Path, args: &[&str]) {
+use super::*;
+use std::process::Command;
+
+pub fn git(root: &Path, args: &[&str]) {
     assert!(Command::new("git")
         .arg("-C")
         .arg(root)
@@ -7,7 +10,7 @@ fn git(root: &Path, args: &[&str]) {
         .unwrap()
         .success());
 }
-fn repo() -> tempfile::TempDir {
+pub fn repo() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     git(root.path(), &["init", "-q"]);
     git(
@@ -21,6 +24,22 @@ fn repo() -> tempfile::TempDir {
     git(root.path(), &["commit", "-qm", "initial"]);
     root
 }
-fn event(journal: &Journal, root: &Path, name: &str, kind: notify::EventKind) {
+pub fn event(journal: &Journal, root: &Path, name: &str, kind: notify::EventKind) {
     journal.event(&notify::Event::new(kind).add_path(root.join(name)));
+}
+
+pub const OVERFLOW_TEXT: &str = OVERFLOW;
+
+impl Capture {
+    pub fn journal_for_test(&self) -> &Arc<Journal> {
+        &self.journal
+    }
+
+    pub fn deadline_for_test(&self) -> Option<Instant> {
+        *self.call_deadline.0.lock().unwrap()
+    }
+
+    pub fn report_for_test(&self) -> &Report {
+        self.finish()
+    }
 }

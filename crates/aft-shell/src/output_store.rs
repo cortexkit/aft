@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::Mutex;
 
+mod composition;
 mod host;
 use crate::file_identity::FileIdentity;
 pub use host::OutputStoreHost;
@@ -192,8 +193,7 @@ impl OutputFiles {
     /// and rebuilt, which empties the in-memory table. Only generated names in
     /// the exact session folder qualify: a folder-prefix grant would expose
     /// other private stores or another session's results.
-    #[doc(hidden)]
-    pub fn restore(&self, ctx: &dyn OutputStoreHost, session: &str, path: &Path) {
+    pub(crate) fn restore(&self, ctx: &dyn OutputStoreHost, session: &str, path: &Path) {
         if !generated_name(path) {
             return;
         }
@@ -233,8 +233,7 @@ impl OutputFiles {
         }
     }
 
-    #[doc(hidden)]
-    pub fn is_result_path(&self, ctx: &dyn OutputStoreHost, path: &Path) -> bool {
+    pub(crate) fn is_result_path(&self, ctx: &dyn OutputStoreHost, path: &Path) -> bool {
         if !generated_name(path) {
             return false;
         }

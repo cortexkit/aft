@@ -156,6 +156,8 @@ pub use fixture_paths::*;
 #[path = "test_bridge/display_data.rs"]
 pub mod bus;
 
+pub mod output_files;
+
 #[cfg(unix)]
 #[doc(hidden)]
 pub mod folder_grants {
@@ -350,6 +352,6 @@ pub fn cleanup_expired(
     crate::output_store::cleanup_expired(harness, retention)
 }
 
-pub fn seal_spawn(metadata: &persistence::PersistedTask) {
+pub fn seal_speech_spawn_for_test(metadata: &persistence::PersistedTask) {
     crate::gh_shim_ticket::seal_spawn(metadata);
 }

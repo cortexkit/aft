@@ -1,5 +1,6 @@
 pub use crate::secret::call_context;
-pub(crate) use aft_base::policy_path::canonicalize_lenient;
+#[doc(hidden)]
+pub use aft_base::policy_path::canonicalize_lenient;
 
 pub use crate::callgraph_store::access::CallgraphStoreAccess;
 pub use crate::data_layer::status::view_load_error_response;
@@ -5369,7 +5370,7 @@ impl AppContext {
                 backup.set_db_pool(shared.clone());
             }
         }
-        if !self.bash_background.uses_db_pool(&shared) {
+        if !self.bash_background.shares_db_pool(&shared) {
             self.bash_background.set_db_pool(shared);
         }
         true
@@ -8331,7 +8332,7 @@ impl AppContext {
         if self.inspect_manager.tier2_any_in_flight() {
             return Some(ArtifactEvictionBlocker::InspectTier2);
         }
-        if !self.bash_background.running_tasks().is_empty() {
+        if self.bash_background.has_running_tasks() {
             return Some(ArtifactEvictionBlocker::BashRunning);
         }
         if !self.pending_tier2_paths.lock().is_empty()
@@ -8445,7 +8446,7 @@ impl AppContext {
             Some(root) => self
                 .bash_background
                 .try_has_reclaimable_tasks_for_root(root),
-            None => self.bash_background.try_has_running_tasks(),
+            None => self.bash_background.try_any_running_tasks(),
         };
         match bash_busy {
             None => return Some(Blocker::LockContended),
@@ -9705,7 +9706,7 @@ impl AppContext {
         allow_approval: bool,
     ) -> Result<std::path::PathBuf, crate::protocol::Response> {
         self.output_files
-            .restore(self, session_id, &self.resolve_relative_path(path));
+            .restore_for_policy(self, session_id, &self.resolve_relative_path(path));
         let result = self.validate_path_with_artifact_session(
             req_id,
             path,
@@ -9962,7 +9963,7 @@ impl AppContext {
             return Ok(());
         };
         let owned_artifact = artifact_session.is_some_and(|session| {
-            self.output_files.owner(path).as_deref() == Some(session)
+            self.output_files.owner_for_policy(path).as_deref() == Some(session)
                 || self
                     .bash_background
                     .is_session_owned_artifact_path(session, path)
@@ -10496,8 +10497,9 @@ impl AppContext {
         } else {
             identify(resolved.to_path_buf())
         };
-        let owned_tool_output = artifact_session
-            .is_some_and(|session| self.output_files.owner(&identity).as_deref() == Some(session));
+        let owned_tool_output = artifact_session.is_some_and(|session| {
+            self.output_files.owner_for_policy(&identity).as_deref() == Some(session)
+        });
         if crate::context::confinement::for_request(req_id)
             && self.request_force_restrict(req_id)
             && !owned_tool_output
@@ -10528,7 +10530,7 @@ impl AppContext {
                     .bash_background
                     .is_readable_task_path(session, &identity)
         });
-        if self.output_files.is_result_path(self, &identity)
+        if self.output_files.result_path_for_policy(self, &identity)
             && (operation != AccessOperation::Read || !owned_tool_output)
         {
             return Err(crate::protocol::Response::error(

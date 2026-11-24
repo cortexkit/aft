@@ -8,6 +8,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_fixture;
+
 pub(crate) const MAX_EVENTS: usize = 8192;
 pub(crate) const MAX_FILES: usize = 40;
 pub(crate) const MAX_DIFF_LINES: usize = 200;

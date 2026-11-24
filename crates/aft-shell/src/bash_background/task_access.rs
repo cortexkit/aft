@@ -500,7 +500,8 @@ impl BgTaskRegistry {
     /// The read-only exception is identity-checked per bundle, never per file.
     /// Bash's separate output-file exception remains exact-file-only: permission
     /// to inspect a task folder must not let a shell command enter that folder.
-    pub(crate) fn is_readable_task_path(&self, session: &str, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn is_readable_task_path(&self, session: &str, path: &Path) -> bool {
         if !safe_task_entry(path) {
             return false;
         }

@@ -49,15 +49,12 @@ async fn remote_local_fallback_has_no_broker(
     profile.mode = mode;
     let launcher = std::fs::canonicalize("/bin/sh").unwrap();
     let plan = crate::sandbox_spawn::SpawnPlan::launcher_for_test(profile, launcher);
-    let ctx = crate::context::AppContext::new(
-        Box::new(crate::parser::TreeSitterProvider::new()),
-        crate::config::Config {
-            project_root: Some(project.path().to_owned()),
-            storage_dir: Some(storage.path().to_owned()),
-            experimental_bash_background: true,
-            ..Default::default()
-        },
-    );
+    let ctx = crate::sandbox_spawn::policy_fixture::SandboxFixture::new(crate::config::Config {
+        project_root: Some(project.path().to_owned()),
+        storage_dir: Some(storage.path().to_owned()),
+        experimental_bash_background: true,
+        ..Default::default()
+    });
     ctx.update_config(|config| config.sandbox.profile.worker = mode);
     let command="test -z \"${AFT_GH_READ_SOCKET+x}\" && test -z \"${AFT_GH_READ_CAPABILITY_FILE+x}\" && test -z \"${AFT_GH_SHIM_TICKET+x}\" && printf FALLBACK_WITHOUT_BROKER";
     let launch_once = || {

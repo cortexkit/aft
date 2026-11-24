@@ -6,7 +6,7 @@ fn bash_changed_files_off_does_no_probes_or_watcher_registration() {
     let ctx =
         crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
     assert_eq!(ctx.config().bash.changed_files, BashChangedFiles::Off);
-    assert!(Capture::start(&ctx).is_none());
+    assert!(bash_changed_files::start(&ctx).is_none());
     assert!(ctx.watcher_counters().bash_changes.get().is_none());
 }
 
@@ -22,10 +22,10 @@ fn bash_changed_files_watcher_slot_keeps_the_capture_journal_after_one_context_d
     };
     let first = make_context();
     let second = make_context();
-    let capture = Capture::start(&first).unwrap();
+    let capture = bash_changed_files::start(&first).unwrap();
     let counters = second.index_watcher_counters();
     let second_journal = second.watcher_counters().bash_changes.get().unwrap();
-    assert!(Arc::ptr_eq(&capture.journal, &second_journal));
+    assert!(Arc::ptr_eq(capture.journal_for_test(), &second_journal));
 
     drop(first);
     let sink = counters.bash_changes().get().unwrap();
@@ -34,10 +34,10 @@ fn bash_changed_files_watcher_slot_keeps_the_capture_journal_after_one_context_d
         .add_path(project.join("after-first-context.txt"));
     sink.event_for_root(&event, &project, &matcher);
     sink.gap();
-    let report = capture.finish();
+    let report = capture.report_for_test();
     assert_eq!(report.files.len(), 1);
     assert_eq!(report.files[0].path, "after-first-context.txt");
-    assert!(report.text.contains(OVERFLOW));
+    assert!(report.text.contains(OVERFLOW_TEXT));
 }
 
 #[test]
@@ -55,21 +55,22 @@ fn bash_changed_files_flush_inherits_reply_budget_before_spawn_and_clears_on_han
     ));
     receipt.bind_changed_files_deadline(budget.shared());
     let capture = crate::bash_background::with_spawn_receipt(receipt.clone(), || {
-        Capture::start(&ctx).unwrap()
+        bash_changed_files::start(&ctx).unwrap()
     });
-    assert_eq!(*capture.call_deadline.lock().unwrap(), Some(deadline));
+    assert_eq!(capture.deadline_for_test(), Some(deadline));
     receipt.limit_changed_files_deadline(deadline + Duration::from_secs(1));
-    assert_eq!(*capture.call_deadline.lock().unwrap(), Some(deadline));
+    assert_eq!(capture.deadline_for_test(), Some(deadline));
     drop(budget);
-    assert!(capture.call_deadline.lock().unwrap().is_none());
+    assert!(capture.deadline_for_test().is_none());
     receipt.limit_changed_files_deadline(deadline);
     assert!(
-        capture.call_deadline.lock().unwrap().is_none(),
+        capture.deadline_for_test().is_none(),
         "handoff cannot revive a caller budget"
     );
-    let late =
-        crate::bash_background::with_spawn_receipt(receipt, || Capture::start(&ctx).unwrap());
-    assert!(late.call_deadline.lock().unwrap().is_none());
+    let late = crate::bash_background::with_spawn_receipt(receipt, || {
+        bash_changed_files::start(&ctx).unwrap()
+    });
+    assert!(late.deadline_for_test().is_none());
 }
 
 #[test]
@@ -102,7 +103,7 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
         launcher_path: PathBuf::from("unused-test-launcher"),
         task_launcher: None,
     };
-    let capture = Capture::start_for_spawn(&ctx, "read-floor-test", &plan).unwrap();
+    let capture = bash_changed_files::start_for_spawn(&ctx, "read-floor-test", &plan).unwrap();
     std::fs::write(
         root.path().join("credential-prefix.toml"),
         "PREFIX_SECRET_MUST_NOT_APPEAR\n",
@@ -110,13 +111,13 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
     .unwrap();
     for name in ["environment-secret.txt", "credential-prefix.toml"] {
         event(
-            &capture.journal,
+            capture.journal_for_test(),
             &capture.root,
             name,
             notify::EventKind::Create(CreateKind::File),
         );
     }
-    let report = capture.finish();
+    let report = capture.report_for_test();
     assert_eq!(report.files.len(), 2);
     assert!(
         report
@@ -129,3 +130,12 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
         .unwrap()
         .contains("SECRET_MUST_NOT_APPEAR"));
 }
+use crate::bash_changed_files::{self, BudgetGuard};
+use crate::config::BashChangedFiles;
+use aft_shell::bash_changed_files::test_fixture::{event, repo, OVERFLOW_TEXT};
+use aft_shell::test_bridge::SpawnReceiptTestExt as _;
+use notify::event::{CreateKind, ModifyKind};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};

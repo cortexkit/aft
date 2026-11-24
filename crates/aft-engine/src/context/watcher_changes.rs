@@ -9,6 +9,7 @@ use crate::watcher_backend::counters::WatcherCounters;
 #[path = "inspect_diagnostics_host.rs"]
 mod inspect_diagnostics_host;
 
+#[derive(Debug)]
 struct JournalSink(Arc<Journal>);
 
 impl WatcherChangeSink for JournalSink {

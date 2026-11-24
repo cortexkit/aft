@@ -157,6 +157,13 @@ pub mod bash_background {
 }
 
 pub mod sandbox_spawn {
+    #[cfg(unix)]
+    pub fn provider_layout_grant_for_test(
+        host: &dyn crate::sandbox_spawn::SandboxHost,
+        ttl: std::time::Duration,
+    ) -> (String, std::path::PathBuf) {
+        crate::sandbox_spawn::grant_fixture::create(host, ttl)
+    }
     #[cfg(target_os = "macos")]
     pub use super::super::sandbox::probe_command_for_plan;
     #[cfg(unix)]

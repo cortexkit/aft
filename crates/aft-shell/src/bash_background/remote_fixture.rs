@@ -1,6 +1,6 @@
 use super::seams::*;
 use super::*;
-use crate::bash_background::persistence::{read_task, write_task};
+use crate::bash_background::persistence::read_task;
 use crate::exec_remote::wire_fixture::{id, Script};
 
 pub const READ_ONLY_NOTE: &str = "note: the build server keeps tracked files read-only during a job, so the write to src/x.rs was refused (Operation not permitted). Edit files on this machine; the job's copy is discarded.";
@@ -1389,4 +1389,36 @@ pub async fn runon_restart_accept_fixture(
     // replacement must recover from disk rather than share the old task.
     registry.detach();
     task_id
+}
+
+#[cfg(test)]
+pub(super) async fn runon_restart_reattach_drain_child() {
+    use crate::{config::Config, pinned_config::PinnedConfig};
+
+    struct RunnerStorage(Arc<Config>);
+    impl PinnedConfig for RunnerStorage {
+        fn config(&self) -> Arc<Config> {
+            self.0.clone()
+        }
+    }
+
+    let Some(root) = std::env::var_os("AFT_RUNON_RESTART_FIXTURE") else {
+        return;
+    };
+    let root = PathBuf::from(root);
+    let project = root.join("project");
+    let harness = crate::harness::Harness::Runner;
+    let tasks = registry();
+    tasks.set_harness(harness);
+    let config = RunnerStorage(Arc::new(Config {
+        project_root: Some(project.clone()),
+        storage_dir: Some(root.join("storage")),
+        harness: Some(harness),
+        experimental_bash_background: true,
+        ..Default::default()
+    }));
+    let storage = crate::bash_background::task_storage_dir(&config);
+    let connection = PathBuf::from(std::env::var_os("AFT_RUNON_RESTART_CONNECTION").unwrap());
+    let task_id = runon_restart_accept_fixture(&tasks, project, storage, connection).await;
+    fs::write(root.join("task-id"), task_id).unwrap();
 }

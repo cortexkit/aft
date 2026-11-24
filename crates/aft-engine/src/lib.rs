@@ -54,7 +54,6 @@ pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
 // still require a configured context, and each invariant needs local review.
 
 pub mod access_policy;
-pub(crate) use aft_base::agent_commands;
 pub use aft_base::alert_records;
 pub use aft_edit::agent_data;
 pub use aft_inspect::alert_state;
@@ -68,7 +67,6 @@ pub use aft_edit::backup;
 pub mod bash_background;
 #[doc(hidden)]
 pub mod bash_changed_files;
-pub(crate) use aft_base::bash_env;
 #[cfg(unix)]
 #[doc(hidden)]
 pub use aft_shell::bash_db_hints;
@@ -103,7 +101,6 @@ pub use aft_base::config_resolve;
 pub use aft_base::config_sources;
 pub mod context;
 mod context_shell_host;
-pub(crate) use aft_base::cross_volume;
 pub mod data_layer;
 #[doc(hidden)]
 pub mod database_open;
@@ -192,7 +189,6 @@ pub mod lifecycle_census;
 pub use aft_base::list_envelope;
 pub use aft_base::list_surfaces;
 pub mod live_db_files;
-pub(crate) use aft_base::lock_diagnostics;
 pub use aft_base::log_ctx;
 pub use aft_base::log_redact;
 pub use aft_index::local_embed;
@@ -226,17 +222,14 @@ pub use aft_base::pending_response;
 pub use aft_db::path_identity;
 pub use aft_edit::patch;
 pub mod persisted_format;
-pub(crate) use aft_base::pinned_dir;
 pub mod pinned_executable;
 pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
 pub(crate) use aft_base::posix_spawn;
-use aft_base::privacy_spawn;
 #[doc(hidden)]
 pub use aft_base::private_storage;
 pub use aft_base::process_identity;
 pub use aft_base::process_io;
-pub(crate) use aft_base::process_spawn;
 #[doc(hidden)]
 pub mod production_storage;
 #[doc(hidden)]
@@ -280,8 +273,6 @@ pub use aft_base::storage_path;
 mod storage_permissions_tests;
 pub use aft_base::subc_config;
 pub use aft_base::symbols;
-pub(crate) use aft_base::system_temp;
-pub(crate) use aft_base::task_temp_reads;
 pub use aft_base::task_watch_lines;
 pub use aft_base::task_watches;
 pub use aft_edit::symbol_diff;
@@ -299,8 +290,6 @@ pub use aft_base::tool_path;
 use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
-#[cfg(test)]
-pub(crate) use aft_base::walk_boundary;
 pub use aft_base::write_counters;
 pub use aft_index::url_fetch;
 pub use aft_index::watcher;
