@@ -7,7 +7,18 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 fn open_regular(path: &Path) -> std::io::Result<std::fs::File> {
-    if !std::fs::metadata(path)?.is_file() {
+    let metadata = std::fs::metadata(path)?;
+    if metadata.is_dir() {
+        // Preserve the OS error that reading a directory returned before the
+        // regular-file check, without opening a path that could now be a FIFO.
+        #[cfg(unix)]
+        return Err(std::io::Error::from_raw_os_error(libc::EISDIR));
+        #[cfg(windows)]
+        return Err(std::io::Error::from_raw_os_error(
+            windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED as i32,
+        ));
+    }
+    if !metadata.is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "not a regular file",
