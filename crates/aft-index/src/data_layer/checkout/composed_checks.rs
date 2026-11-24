@@ -1,4 +1,3 @@
-
 pub fn memory_figure_read_side_allocations_advance_the_checkout_epoch(
     entry_points: &dyn EntryPoints,
 ) {
@@ -641,3 +640,16 @@ pub fn a_checkout_that_stopped_publishing_is_folded_on_its_behalf(entry_points: 
 use super::*;
 use crate::data_layer::dead_code_snapshot::EntryPoints;
 use aft_store::text::plan_pattern;
+
+fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
+    let query = plan_pattern(pattern, false).unwrap();
+    view.text_candidates(&query, Scope::All)
+        .unwrap()
+        .into_iter()
+        .map(|path| String::from_utf8(path).unwrap())
+        .collect()
+}
+
+fn live_segments(checkout: &Checkout) -> usize {
+    checkout.store_segments().unwrap()
+}

@@ -6677,15 +6677,6 @@ mod tests {
         missing
     }
 
-    fn candidates_for(view: &CheckoutView, pattern: &str) -> Vec<String> {
-        let query = plan_pattern(pattern, false).unwrap();
-        view.text_candidates(&query, Scope::All)
-            .unwrap()
-            .into_iter()
-            .map(|path| String::from_utf8(path).unwrap())
-            .collect()
-    }
-
     /// A small Rust crate whose `caller` calls `util::callee`.
     /// The census measures what a checkout holds rather than guessing it:
     /// walking a copy of its state, a decoded call-graph slice and a decoded
@@ -7841,10 +7832,6 @@ pub fn other() { callee(); }
     }
 
     /// The live segments of the family store at `checkout`'s.
-    fn live_segments(checkout: &Checkout) -> usize {
-        checkout.store_segments().unwrap()
-    }
-
     /// A checkout that keeps editing the same file publishes each round of
     /// changes in a segment of its own, which replaces everything the one
     /// before held. That one is read by nothing and leaves the store with a
