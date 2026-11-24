@@ -1304,6 +1304,18 @@ function helperB() {}
     // --- extract_parameters ---
 
     #[test]
+    fn audit_resolution_nested_callback_keeps_later_parameters() {
+        assert_eq!(
+            extract_parameters("fn run(cb: fn(i32) -> i32, count: i32)", LangId::Rust),
+            ["cb", "count"]
+        );
+        assert_eq!(
+            extract_parameters(r#"def run(text=") ,", count=0):"#, LangId::Python),
+            ["text", "count"]
+        );
+    }
+
+    #[test]
     fn extract_parameters_typescript() {
         let params = extract_parameters(
             "function processData(input: string, count: number): void",

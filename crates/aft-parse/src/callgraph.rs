@@ -953,18 +953,7 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
         Some(i) => i + 1,
         None => return Vec::new(),
     };
-    let end = match signature[start..].find(')') {
-        Some(i) => start + i,
-        None => return Vec::new(),
-    };
-
-    let params_str = &signature[start..end].trim();
-    if params_str.is_empty() {
-        return Vec::new();
-    }
-
-    // Split on commas, respecting nested generics/brackets
-    let parts = split_params(params_str);
+    let parts = split_params(&signature[start..], lang);
 
     let mut result = Vec::new();
     for part in parts {
@@ -1002,35 +991,54 @@ pub fn extract_parameters(signature: &str, lang: LangId) -> Vec<String> {
     result
 }
 
-/// Split parameter string on commas, respecting nested brackets/generics.
-fn split_params(s: &str) -> Vec<String> {
+/// Split after the opening `(`, stopping at its matching `)`.
+fn split_params(s: &str, lang: LangId) -> Vec<&str> {
     let mut parts = Vec::new();
-    let mut current = String::new();
-    let mut depth = 0i32;
-
-    for ch in s.chars() {
+    let mut start = 0;
+    let mut parens = 0usize;
+    let mut brackets = 0usize;
+    let mut angles = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, ch) in s.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == delimiter {
+                quote = None;
+            }
+            continue;
+        }
         match ch {
-            '<' | '[' | '{' | '(' => {
-                depth += 1;
-                current.push(ch);
+            '"' | '`' => quote = Some(ch),
+            '\'' if lang != LangId::Rust || rust_char_literal_follows(&s[i + 1..]) => {
+                quote = Some(ch)
             }
-            '>' | ']' | '}' | ')' => {
-                depth -= 1;
-                current.push(ch);
+            '(' => parens += 1,
+            ')' if parens == 0 => {
+                parts.push(&s[start..i]);
+                return parts;
             }
-            ',' if depth == 0 => {
-                parts.push(current.clone());
-                current.clear();
+            ')' => parens -= 1,
+            '[' | '{' => brackets += 1,
+            ']' | '}' => brackets = brackets.saturating_sub(1),
+            '<' if !matches!(lang, LangId::Python | LangId::JavaScript) => angles += 1,
+            '>' if !s[..i].ends_with(['-', '=']) => angles = angles.saturating_sub(1),
+            ',' if parens == 0 && brackets == 0 && angles == 0 => {
+                parts.push(&s[start..i]);
+                start = i + 1;
             }
-            _ => {
-                current.push(ch);
-            }
+            _ => {}
         }
     }
-    if !current.is_empty() {
-        parts.push(current);
-    }
-    parts
+    Vec::new()
+}
+
+fn rust_char_literal_follows(after_quote: &str) -> bool {
+    // Rust lifetimes also start with an apostrophe but have no closing one.
+    after_quote.starts_with('\\') || after_quote.chars().nth(1) == Some('\'')
 }
 
 /// Extract the parameter name from a single parameter declaration.
