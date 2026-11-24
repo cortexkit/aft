@@ -4322,7 +4322,8 @@ impl CheckoutView {
     /// # Errors
     ///
     /// When a stored parse cannot be read.
-    pub(crate) fn dead_code_snapshot_in(
+    #[doc(hidden)]
+    pub fn dead_code_snapshot_in(
         &self,
         section_dir: Option<PathBuf>,
         entry_points: &dyn super::dead_code_snapshot::EntryPoints,
@@ -4354,7 +4355,8 @@ impl CheckoutView {
     /// Drops the dead-code snapshot this view's call graph keeps for later
     /// requests (see [`Self::dead_code_snapshot_in`]); the next request
     /// builds it again. True when one was held.
-    pub(crate) fn release_dead_code_snapshot(&self) -> bool {
+    #[doc(hidden)]
+    pub fn release_dead_code_snapshot(&self) -> bool {
         self.dead_code_memo().release()
     }
 
@@ -4393,7 +4395,8 @@ impl CheckoutView {
     /// # Errors
     ///
     /// When a record or fragment cannot be read.
-    pub(crate) fn rows_dead_code_snapshot(
+    #[doc(hidden)]
+    pub fn rows_dead_code_snapshot(
         &self,
         entry_points: &dyn super::dead_code_snapshot::EntryPoints,
     ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
@@ -4445,7 +4448,8 @@ impl CheckoutView {
     /// The call graph dead code reads, file by file: the publication, with
     /// what was resolved since replacing what it stored, read on demand
     /// rather than all at once (see `dead_code_graph`).
-    pub(crate) fn dead_code_files(&self) -> ViewGraphFiles<'_> {
+    #[doc(hidden)]
+    pub fn dead_code_files(&self) -> ViewGraphFiles<'_> {
         ViewGraphFiles {
             published: &self.published.graph,
             refreshed: self.refreshed.as_deref(),
@@ -4562,15 +4566,19 @@ pub struct ViewGraphFiles<'v> {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[doc(hidden)]
 pub struct GraphIdentity {
-    pub(crate) record: String,
-    pub(crate) fragment: Option<String>,
-    pub(crate) digest: Option<String>,
+    #[doc(hidden)]
+    pub record: String,
+    #[doc(hidden)]
+    pub fragment: Option<String>,
+    #[doc(hidden)]
+    pub digest: Option<String>,
 }
 
 impl ViewGraphFiles<'_> {
     /// `path`'s identity in this view; `None` when the view does not parse
     /// it.
-    pub(crate) fn identity(&self, path: &str) -> Option<GraphIdentity> {
+    #[doc(hidden)]
+    pub fn identity(&self, path: &str) -> Option<GraphIdentity> {
         if let Some(refreshed) = self.refreshed {
             if refreshed.removed.contains(path) {
                 return None;
@@ -4597,7 +4605,8 @@ impl ViewGraphFiles<'_> {
     /// # Errors
     ///
     /// When the fragment cannot be read.
-    pub(crate) fn published_identity(&self, path: &str) -> Result<Option<GraphIdentity>, String> {
+    #[doc(hidden)]
+    pub fn published_identity(&self, path: &str) -> Result<Option<GraphIdentity>, String> {
         let Some((record, fragment)) = self.published.identity_of(path) else {
             return Ok(None);
         };
@@ -6008,7 +6017,8 @@ impl Checkout {
     /// unextracted records are not memoized, since publication can repair them
     /// without changing the content key. Overlay hits still verify that the
     /// live change belongs to this view, as `todo_markers` does.
-    pub(crate) fn todo_counts(
+    #[doc(hidden)]
+    pub fn todo_counts(
         &self,
         view: &CheckoutView,
         paths: &[Vec<u8>],
@@ -6096,7 +6106,8 @@ impl Checkout {
     /// # Errors
     ///
     /// When a record cannot be read.
-    pub(crate) fn todo_markers(
+    #[doc(hidden)]
+    pub fn todo_markers(
         &self,
         view: &CheckoutView,
         paths: &[Vec<u8>],

@@ -1070,7 +1070,8 @@ impl WatcherWalkBoundary {
         &self.root
     }
 
-    pub(crate) fn for_root(root: &Path) -> Option<Self> {
+    #[doc(hidden)]
+    pub fn for_root(root: &Path) -> Option<Self> {
         let metadata = watcher_boundary_metadata(root).ok()?;
         if !metadata.is_dir() {
             return None;
@@ -1157,7 +1158,8 @@ impl WatcherWalkBoundary {
         (ExclusionPathKind::LocalDirectory, None)
     }
 
-    pub(crate) fn allows_directory(&self, path: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn allows_directory(&self, path: &Path) -> bool {
         self.kind(path) == ExclusionPathKind::LocalDirectory
     }
 }

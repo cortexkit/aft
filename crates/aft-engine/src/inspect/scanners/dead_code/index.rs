@@ -154,22 +154,31 @@ impl<V> Index<V> {
     }
 }
 
-impl<V> Tracked<Index<V>> {
-    pub(crate) fn get(&self, key: &str) -> Option<&V> {
+pub(super) trait TrackedIndex<V> {
+    fn get(&self, key: &str) -> Option<&V>;
+    fn contains_key(&self, key: &str) -> bool;
+}
+
+impl<V> TrackedIndex<V> for Tracked<Index<V>> {
+    fn get(&self, key: &str) -> Option<&V> {
         self.record_key(key);
         self.all().peek(key)
     }
 
-    pub(crate) fn contains_key(&self, key: &str) -> bool {
+    fn contains_key(&self, key: &str) -> bool {
         self.get(key).is_some()
     }
 }
 
-impl Tracked<Index<BTreeSet<String>>> {
+pub(super) trait TrackedPairIndex {
     /// Whether `pair`'s second string is in the set its first string keys,
     /// recorded as a read of the pair: for an index of (file, symbol) pairs
     /// held as each file's symbols.
-    pub(crate) fn contains_pair(&self, pair: &(String, String)) -> bool {
+    fn contains_pair(&self, pair: &(String, String)) -> bool;
+}
+
+impl TrackedPairIndex for Tracked<Index<BTreeSet<String>>> {
+    fn contains_pair(&self, pair: &(String, String)) -> bool {
         self.record_key(&super::reads::pair_key(&pair.0, &pair.1));
         self.all()
             .peek(&pair.0)

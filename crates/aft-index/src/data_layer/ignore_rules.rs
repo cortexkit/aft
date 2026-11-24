@@ -154,7 +154,8 @@ impl IgnoreInputSnapshot {
         }
     }
 
-    pub(crate) fn build_matcher(&self) -> Option<Arc<Gitignore>> {
+    #[doc(hidden)]
+    pub fn build_matcher(&self) -> Option<Arc<Gitignore>> {
         let mut builder = GitignoreBuilder::new(&self.root);
         for input in &self.inputs {
             let contents = match std::str::from_utf8(&input.bytes) {

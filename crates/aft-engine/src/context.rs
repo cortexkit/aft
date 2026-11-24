@@ -7138,11 +7138,7 @@ impl AppContext {
     }
 
     pub(crate) fn record_checkout_pending_watcher_gap(&self) {
-        if self
-            .watcher_counters()
-            .checkout_watcher_gap_pending
-            .swap(false, Ordering::AcqRel)
-        {}
+        self.watcher_counters().take_checkout_watcher_gap();
     }
 
     pub(crate) fn install_callgraph_executor(

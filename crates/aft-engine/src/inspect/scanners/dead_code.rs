@@ -40,7 +40,7 @@ pub(crate) mod kept;
 pub(crate) use crate::data_layer::dead_code_reads as reads;
 pub(crate) mod section;
 
-use index::Index;
+use index::{Index, TrackedIndex, TrackedPairIndex};
 use reads::{Lookup, Tracked};
 
 pub(crate) const DEAD_CODE_FACTS_FORMAT_VERSION: u32 = 11;
@@ -1224,10 +1224,14 @@ fn file_rust_items(contribution: &DeadCodeContribution) -> Option<Vec<RustApiIte
         .map(|facts| facts.items.clone())
 }
 
-impl Tracked<Index<Vec<RustApiItem>>> {
+trait TrackedRustItems {
     /// The items of the Rust file `file` named `name`, recorded as a read of
     /// that name only, so an edit to the file's other items leaves the
     /// answer, and every file that asked for it, alone.
+    fn items_named(&self, file: &str, name: &str) -> Vec<RustApiItem>;
+}
+
+impl TrackedRustItems for Tracked<Index<Vec<RustApiItem>>> {
     fn items_named(&self, file: &str, name: &str) -> Vec<RustApiItem> {
         self.record_as(Lookup::RustItemsNamed, &reads::pair_key(file, name));
         self.all()

@@ -5732,7 +5732,8 @@ impl SemanticIndex {
 
     /// Cheap counters that move whenever the walk in [`Self::estimated_memory`]
     /// would most likely give a different answer, read without walking.
-    pub(crate) fn memory_shape(&self) -> [u64; 9] {
+    #[doc(hidden)]
+    pub fn memory_shape(&self) -> [u64; 9] {
         [
             self.entries.len() as u64,
             self.entries.as_ptr() as usize as u64,

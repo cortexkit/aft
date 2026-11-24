@@ -59,7 +59,8 @@ impl ViewCallGraph {
     }
 
     /// The view's call graph, read file by file.
-    pub(crate) fn files(&self) -> super::checkout::ViewGraphFiles<'_> {
+    #[doc(hidden)]
+    pub fn files(&self) -> super::checkout::ViewGraphFiles<'_> {
         self.view.dead_code_files()
     }
 
@@ -70,7 +71,8 @@ impl ViewCallGraph {
     /// # Errors
     ///
     /// When a file's parse cannot be read.
-    pub(crate) fn exported_symbols_of(
+    #[doc(hidden)]
+    pub fn exported_symbols_of(
         &self,
         root: &Path,
         files: &[PathBuf],
@@ -98,7 +100,8 @@ impl ViewCallGraph {
 
     /// The folder dead-code graphs of this view's family are kept in;
     /// `None` keeps nothing.
-    pub(crate) fn section_dir(&self) -> Option<&Path> {
+    #[doc(hidden)]
+    pub fn section_dir(&self) -> Option<&Path> {
         self.section_dir.as_deref()
     }
 }
@@ -567,7 +570,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// # Errors
     ///
     /// When a file's parse cannot be read.
-    pub(crate) fn open(root: &Path, source: &'f dyn CallGraphFiles) -> Result<Self, String> {
+    #[doc(hidden)]
+    pub fn open(root: &Path, source: &'f dyn CallGraphFiles) -> Result<Self, String> {
         use rayon::prelude::*;
         let graph = Self::open_lazy(root, source);
         let carry = crate::alloc_trace::carry();
@@ -586,7 +590,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// callees' full symbols would otherwise stay in memory for the whole
     /// rollup; off for one that projects every file, which reads every file
     /// in full anyway and would otherwise read most files twice.
-    pub(crate) fn compact_targets(&self, compact: bool) {
+    #[doc(hidden)]
+    pub fn compact_targets(&self, compact: bool) {
         self.compact_targets
             .store(compact, std::sync::atomic::Ordering::Relaxed);
     }
@@ -594,7 +599,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// A graph of `source`'s files that reads each file's symbols when first
     /// asked for. A parse that cannot be read leaves the file without
     /// symbols and is reported by [`Self::failure`].
-    pub(crate) fn open_lazy(root: &Path, source: &'f dyn CallGraphFiles) -> Self {
+    #[doc(hidden)]
+    pub fn open_lazy(root: &Path, source: &'f dyn CallGraphFiles) -> Self {
         Self {
             root: root.to_path_buf(),
             source,
@@ -612,7 +618,8 @@ impl<'f> DeadCodeGraph<'f> {
     }
 
     /// The first parse that could not be read, if any.
-    pub(crate) fn failure(&self) -> Option<String> {
+    #[doc(hidden)]
+    pub fn failure(&self) -> Option<String> {
         self.failure.lock().clone()
     }
 
@@ -638,24 +645,28 @@ impl<'f> DeadCodeGraph<'f> {
     }
 
     /// The checkout's root.
-    pub(crate) fn root(&self) -> &Path {
+    #[doc(hidden)]
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
     /// Every parsed file, in path order (store paths, relative to the root).
-    pub(crate) fn file_paths(&self) -> impl Iterator<Item = &str> {
+    #[doc(hidden)]
+    pub fn file_paths(&self) -> impl Iterator<Item = &str> {
         self.files.keys().map(String::as_str)
     }
 
     /// Whether [`Self::resolve`] makes `store_path` canonical without asking
     /// the file system (see [`resolve_store_path`]).
-    pub(crate) fn resolves_lexically(&self, store_path: &str) -> bool {
+    #[doc(hidden)]
+    pub fn resolves_lexically(&self, store_path: &str) -> bool {
         resolves_lexically(self.source, store_path)
     }
 
     /// `store_path` made absolute and canonical, as the snapshot names files
     /// (see [`resolve_store_path`]).
-    pub(crate) fn resolve(&self, store_path: &str) -> PathBuf {
+    #[doc(hidden)]
+    pub fn resolve(&self, store_path: &str) -> PathBuf {
         if let Some(path) = self.paths.lock().get(store_path) {
             return path.clone();
         }
@@ -670,7 +681,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// The exported symbols of `path`, in the snapshot's order for that
     /// file: by line, name, kind and node id, a default export after the
     /// plain export of the same node.
-    pub(crate) fn exported_symbols(&self, path: &str) -> Vec<CallgraphExport> {
+    #[doc(hidden)]
+    pub fn exported_symbols(&self, path: &str) -> Vec<CallgraphExport> {
         let Some(file) = self.indexed(path) else {
             return Vec::new();
         };
@@ -679,7 +691,8 @@ impl<'f> DeadCodeGraph<'f> {
 
     /// Every file's exported symbols, in the snapshot's order: by resolved
     /// file, then as [`Self::exported_symbols`] orders one file's.
-    pub(crate) fn all_exported_symbols(&self) -> Vec<CallgraphExport> {
+    #[doc(hidden)]
+    pub fn all_exported_symbols(&self) -> Vec<CallgraphExport> {
         let mut exports = self
             .files
             .keys()
@@ -692,7 +705,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// The symbols of `path` that keep themselves alive by their own marks
     /// (the snapshot's `entry_point_symbols` for the file, before the
     /// members unknown receivers keep alive are added).
-    pub(crate) fn own_entry_point_symbols(&self, path: &str) -> BTreeSet<String> {
+    #[doc(hidden)]
+    pub fn own_entry_point_symbols(&self, path: &str) -> BTreeSet<String> {
         let mut roots = BTreeSet::new();
         let Some(file) = self.indexed(path) else {
             return roots;
@@ -735,7 +749,8 @@ impl<'f> DeadCodeGraph<'f> {
 
     /// Every Go package folder's files, in path order. The first call reads
     /// every file's language, unless [`Self::seed_go_packages`] gave them.
-    pub(crate) fn go_packages(&self) -> &BTreeMap<PathBuf, Vec<String>> {
+    #[doc(hidden)]
+    pub fn go_packages(&self) -> &BTreeMap<PathBuf, Vec<String>> {
         self.go_packages.get_or_init(|| {
             let mut go_packages = BTreeMap::<PathBuf, Vec<String>>::new();
             for path in self.files.keys() {
@@ -759,7 +774,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// `kept` Go packages (of an earlier view) brought up to this graph for
     /// the `changed` files, whose languages are read; every other file is
     /// taken to be where `kept` has it. The result is also this graph's.
-    pub(crate) fn patch_go_packages(
+    #[doc(hidden)]
+    pub fn patch_go_packages(
         &self,
         mut kept: BTreeMap<PathBuf, Vec<String>>,
         changed: &BTreeSet<String>,
@@ -830,10 +846,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// # Errors
     ///
     /// When its resolution cannot be read.
-    pub(crate) fn unknown_live(
-        &self,
-        path: &str,
-    ) -> Result<Vec<(PathBuf, String, SeedClass)>, String> {
+    #[doc(hidden)]
+    pub fn unknown_live(&self, path: &str) -> Result<Vec<(PathBuf, String, SeedClass)>, String> {
         if self.indexed(path).is_none() {
             return Ok(Vec::new());
         }
@@ -871,7 +885,8 @@ impl<'f> DeadCodeGraph<'f> {
     /// # Errors
     ///
     /// When its parse or resolution cannot be read.
-    pub(crate) fn project_file(
+    #[doc(hidden)]
+    pub fn project_file(
         &self,
         path: &str,
         classify: &dyn Fn(u32) -> SeedClass,

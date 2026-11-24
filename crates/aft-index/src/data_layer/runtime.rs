@@ -1447,7 +1447,8 @@ impl DataCheckout {
     ///
     /// When Git could not tell the repository's identity, or the family
     /// store cannot be opened.
-    pub(crate) fn open_planes(
+    #[doc(hidden)]
+    pub fn open_planes(
         root: &Path,
         storage: &Path,
         executor: Option<RootMaintenanceExecutor>,
@@ -1613,7 +1614,8 @@ impl DataCheckout {
     }
 
     #[must_use]
-    pub(crate) fn root(&self) -> &Path {
+    #[doc(hidden)]
+    pub fn root(&self) -> &Path {
         self.work.checkout.root()
     }
 
@@ -1673,19 +1675,22 @@ impl DataCheckout {
 
     /// Runs the checkout's background work on `executor` from now on: the
     /// root's executor installed after the checkout was bound.
-    pub(crate) fn set_executor(&self, executor: RootMaintenanceExecutor) {
+    #[doc(hidden)]
+    pub fn set_executor(&self, executor: RootMaintenanceExecutor) {
         *self.work.runner.executor.lock() = Some(executor);
     }
 
     /// Compares the checkout's files with its state and records what
     /// changed, for a watcher that lost events (see [`Work::start_rescan`]).
-    pub(crate) fn rescan(&self) {
+    #[doc(hidden)]
+    pub fn rescan(&self) {
         self.work.start_rescan(false);
     }
 
     /// Updates automatic maintenance when bound routes change. A non-worker
     /// route starts a quiet window for edits left pending by worker-only routes.
-    pub(crate) fn set_background_refresh(&self, allowed: bool) {
+    #[doc(hidden)]
+    pub fn set_background_refresh(&self, allowed: bool) {
         if self.work.background_refresh.swap(allowed, Ordering::AcqRel) == allowed {
             return;
         }
@@ -1700,7 +1705,8 @@ impl DataCheckout {
     }
 
     /// Records the watcher's changed `paths` (absolute).
-    pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
+    #[doc(hidden)]
+    pub fn note_paths(&self, paths: &[PathBuf]) {
         let root = std::fs::canonicalize(self.root()).unwrap_or_else(|_| self.root().to_path_buf());
         record(&self.work.checkout, &root, paths);
         self.work.settle.note_change();
@@ -2160,7 +2166,8 @@ impl DataCheckout {
     /// Calls `notify` whenever a build, call-graph refresh or meaning fill
     /// round of this checkout ends, so status pushes follow the data layer.
     /// Replaces any earlier listener.
-    pub(crate) fn on_status_change(&self, notify: StatusListener) {
+    #[doc(hidden)]
+    pub fn on_status_change(&self, notify: StatusListener) {
         self.disk_measurement.on_change(&notify);
         *self
             .work
@@ -2179,7 +2186,8 @@ impl DataCheckout {
     /// asks this on every status change, so a TODO count that came back
     /// pending while the store built is taken again once the store has
     /// published, and only once per such change.
-    pub(crate) fn take_todos_readable(&self) -> bool {
+    #[doc(hidden)]
+    pub fn take_todos_readable(&self) -> bool {
         let readable = !self.work.checkout.status().building
             && self
                 .view()
@@ -2252,7 +2260,8 @@ impl DataCheckout {
     /// # Errors
     ///
     /// When the plane cannot be made.
-    pub(crate) fn read_meaning_only(
+    #[doc(hidden)]
+    pub fn read_meaning_only(
         &self,
         config: &crate::config::SemanticBackendConfig,
         fingerprint: &crate::semantic_index::SemanticIndexFingerprint,

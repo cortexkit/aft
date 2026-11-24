@@ -122,7 +122,8 @@ impl BackendSlot {
     /// being built. Returns at once: the build runs on its own thread. The one
     /// exception is the benchmark fixture pack, which is loaded before this
     /// returns so the first benchmark search already has it.
-    pub(crate) fn reconcile(&self, inputs: BuildInputs) {
+    #[doc(hidden)]
+    pub fn reconcile(&self, inputs: BuildInputs) {
         let mut state = lock(&self.state);
         if state.inputs.as_ref() == Some(&inputs) {
             return;

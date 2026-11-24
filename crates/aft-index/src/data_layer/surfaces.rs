@@ -167,7 +167,8 @@ pub struct DataStoreReport {
     pub(crate) skipped_folders: usize,
     pub(crate) skipped_folder_note: Option<String>,
     pub text: PlaneReport,
-    pub(crate) callgraph: PlaneReport,
+    #[doc(hidden)]
+    pub callgraph: PlaneReport,
     /// Paths of the checkout as last published; `None` before anything is.
     pub(crate) files: Option<usize>,
     /// While the text plane is building over a publication: paths whose
@@ -185,7 +186,8 @@ pub struct DataStoreReport {
     pub(crate) failure: Option<DataFailure>,
     /// The family-store file a newer build wrote, when the last bind, build
     /// or refresh refused it; status lists it among its storage refusals.
-    pub(crate) refusal: Option<NewerFormat>,
+    #[doc(hidden)]
+    pub refusal: Option<NewerFormat>,
     /// The family store's folder, for its disk use.
     pub(crate) family_dir: Option<PathBuf>,
     disk_measurement: Option<Arc<DiskMeasurement>>,
@@ -193,7 +195,8 @@ pub struct DataStoreReport {
     /// `semantic_index`. `None` while semantic search is off for the
     /// checkout, or before anything gave it the root's semantic
     /// configuration; today's index then reports.
-    pub(crate) meaning: Option<MeaningReport>,
+    #[doc(hidden)]
+    pub meaning: Option<MeaningReport>,
 }
 
 impl DataStoreReport {
@@ -236,7 +239,8 @@ impl DataStoreReport {
     }
 
     /// The `data_store` object of status and of each root's health.
-    pub(crate) fn health(&self) -> DataStoreHealth {
+    #[doc(hidden)]
+    pub fn health(&self) -> DataStoreHealth {
         let plane_reason = [&self.text, &self.callgraph]
             .into_iter()
             .find(|plane| plane.reason.is_some());
@@ -1260,7 +1264,8 @@ impl DataLayerMemory {
     /// `callgraph` and `semantic` planes, each with its share named
     /// `data_layer_bytes`, and returns the root's `data_layer` plane: what
     /// the planes share.
-    pub(crate) fn fold_into(
+    #[doc(hidden)]
+    pub fn fold_into(
         self,
         search: &mut MemoryEstimate,
         callgraph: &mut MemoryEstimate,

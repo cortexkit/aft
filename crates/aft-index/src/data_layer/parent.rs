@@ -56,7 +56,8 @@ impl ChildCheckouts {
     /// Drops every child checkout unless they belong to `parent`: the
     /// parent folder the context is bound to now, or `None` when it is
     /// bound to anything else.
-    pub(crate) fn keep_only(&self, parent: Option<&Path>) {
+    #[doc(hidden)]
+    pub fn keep_only(&self, parent: Option<&Path>) {
         let mut inner = self.inner.lock();
         if inner.parent.as_deref() != parent {
             inner.slots.clear();
@@ -94,7 +95,8 @@ impl ChildCheckouts {
     /// Records the watcher's changed `paths` (absolute) in the child that
     /// holds each one. Child repositories never nest: discovery does not
     /// look inside one.
-    pub(crate) fn note_paths(&self, paths: &[PathBuf]) {
+    #[doc(hidden)]
+    pub fn note_paths(&self, paths: &[PathBuf]) {
         for checkout in self.bound() {
             let held = paths
                 .iter()
@@ -109,7 +111,8 @@ impl ChildCheckouts {
 
     /// Has every bound child compare its files with its state again, after
     /// the parent's watcher lost events.
-    pub(crate) fn rescan(&self) {
+    #[doc(hidden)]
+    pub fn rescan(&self) {
         for checkout in self.bound() {
             checkout.rescan();
         }
@@ -117,7 +120,8 @@ impl ChildCheckouts {
 
     /// Runs the children's background work on `executor` from now on: the
     /// parent root's executor, installed after some children were bound.
-    pub(crate) fn set_executor(&self, executor: &RootMaintenanceExecutor) {
+    #[doc(hidden)]
+    pub fn set_executor(&self, executor: &RootMaintenanceExecutor) {
         for checkout in self.bound() {
             checkout.set_executor(executor.clone());
         }

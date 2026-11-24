@@ -222,7 +222,8 @@ pub struct EmbeddingBackendHealthSnapshot {
     pub available: bool,
     pub last_error: Option<String>,
     pub since_ms: Option<u64>,
-    pub(crate) next_retry_ms: Option<u64>,
+    #[doc(hidden)]
+    pub next_retry_ms: Option<u64>,
     pub paused_until_ms: Option<u64>,
     /// Why the backend refused requests for now, when `paused_until_ms` is set.
     pub pause_cause: Option<crate::synapse_embed::PauseCause>,

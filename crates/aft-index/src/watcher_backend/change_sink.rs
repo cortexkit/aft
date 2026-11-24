@@ -38,4 +38,10 @@ impl super::counters::WatcherCounters {
     pub fn bash_changes(&self) -> &WatcherChanges {
         &self.bash_changes
     }
+
+    #[doc(hidden)]
+    pub fn take_checkout_watcher_gap(&self) -> bool {
+        self.checkout_watcher_gap_pending
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+    }
 }

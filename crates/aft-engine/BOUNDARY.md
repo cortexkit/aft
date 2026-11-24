@@ -227,6 +227,73 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `bound_checkouts::bound_checkout_roots` | boundary accessor | `aft-index` | Return the resolved roots and checkouts for inspect’s TODO scan. |
 
 | `data_layer::checkout::{PathTodoCounts, PathTodos, TodoSummary}` | compatibility re-exports | `aft-index` | Keep the checkout paths for the TODO projection types in their sibling module. |
+| `data_layer::runtime::root` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::open_planes` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::set_background_refresh` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::on_status_change` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::take_todos_readable` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::note_paths` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::rescan` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::set_executor` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::runtime::read_meaning_only` | visibility widened | `aft-index` | Keep composition’s checkout and maintenance lifecycle unchanged. |
+| `data_layer::surfaces::health` | visibility widened | `aft-index` | Keep projection and accounting on the existing index report. |
+| `data_layer::surfaces::fold_into` | visibility widened | `aft-index` | Keep projection and accounting on the existing index report. |
+| `data_layer::ignore_rules::build_matcher` | visibility widened | `aft-index` | Build the same matcher when composition reloads ignore rules. |
+| `watcher_backend::counters::query_delivery_pending` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `watcher_backend::counters::unflushed_paths` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `watcher_backend::counters::start_rescan` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `watcher_backend::counters::take_overflow_ignore_relevance` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `watcher_backend::counters::begin_rescan` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `watcher_backend::counters::finish_rescan` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `watcher_backend::counters::finish_rescan_walk` | visibility widened | `aft-index` | Keep composition’s watcher drain on the existing event and rescan state. |
+| `data_layer::parent::keep_only` | visibility widened | `aft-index` | Keep composed parent sessions on the same index lifecycle. |
+| `data_layer::parent::note_paths` | visibility widened | `aft-index` | Keep composed parent sessions on the same index lifecycle. |
+| `data_layer::parent::rescan` | visibility widened | `aft-index` | Keep composed parent sessions on the same index lifecycle. |
+| `data_layer::parent::set_executor` | visibility widened | `aft-index` | Keep composed parent sessions on the same index lifecycle. |
+| `search_state::rerank::slot::reconcile` | visibility widened | `aft-index` | Keep composition on the existing search state and memory observations. |
+| `search_state::memo::try_clear_idle` | visibility widened | `aft-index` | Keep composition on the existing search state and memory observations. |
+| `semantic_index::memory_shape` | visibility widened | `aft-index` | Keep composition on the existing search state and memory observations. |
+| `data_layer::dead_code_graph::files` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::open` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::root` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::file_paths` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::resolve` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::resolves_lexically` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::unknown_live` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::project_file` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::own_entry_point_symbols` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::open_lazy` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::section_dir` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::all_exported_symbols` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::exported_symbols` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::compact_targets` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::failure` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::go_packages` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::patch_go_packages` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::dead_code_graph::exported_symbols_of` | visibility widened | `aft-index` | Keep inspect’s existing access to the graph data it analyzes. |
+| `data_layer::checkout::identity` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::published_identity` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::release_dead_code_snapshot` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::dead_code_snapshot_in` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::todo_markers` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::todo_counts` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::rows_dead_code_snapshot` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `data_layer::checkout::dead_code_files` | visibility widened | `aft-index` | Read the same checkout snapshot and stored records from inspect. |
+| `watcher_filter::for_root` | visibility widened | `aft-index` | Keep parent walks within the watcher’s directory boundary. |
+| `watcher_filter::allows_directory` | visibility widened | `aft-index` | Keep parent walks within the watcher’s directory boundary. |
+| `data_layer::parent_session::new` | visibility widened | `aft-index` | Keep composed parent sessions on the same index lifecycle. |
+
+| `inspect::scanners::dead_code::index::TrackedIndex` | private extension trait | `aft-engine` | Keep keyed reads with the inspect-owned index type while recording them in the shared tracker. |
+| `inspect::scanners::dead_code::index::TrackedPairIndex` | private extension trait | `aft-engine` | Keep inspect’s tracked lookup of a file and symbol together. |
+| `inspect::scanners::dead_code::TrackedRustItems` | private extension trait | `aft-engine` | Keep inspect’s tracked lookup of a named Rust item. |
+| `WatcherCounters::take_checkout_watcher_gap` | boundary accessor | `aft-index` | Consume the pending gap without exposing the atomic flag. |
+| `EmbeddingBackendHealthSnapshot::next_retry_ms` | visibility widened | `aft-index` | Keep the backend retry time in composed status. |
+| `DataStoreReport::callgraph` | visibility widened | `aft-index` | Compose call-graph status from the existing plane observation. |
+| `DataStoreReport::meaning` | visibility widened | `aft-index` | Compose semantic health from the existing meaning plane. |
+| `DataStoreReport::refusal` | visibility widened | `aft-index` | Keep reporting the exact stored-format refusal. |
+| `GraphIdentity::record` | visibility widened | `aft-index` | Compare the stored record identity used for dead-code reuse. |
+| `GraphIdentity::fragment` | visibility widened | `aft-index` | Compare the stored fragment identity used for dead-code reuse. |
+| `GraphIdentity::digest` | visibility widened | `aft-index` | Compare the stored graph digest used for dead-code reuse. |
 
 ## Visibility widened for cross-crate callers
 

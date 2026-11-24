@@ -1158,7 +1158,8 @@ impl ExactMemoStore {
     }
 
     /// Idle reaping never waits for a verifier or a reader holding a cache lock.
-    pub(crate) fn try_clear_idle(&self) -> bool {
+    #[doc(hidden)]
+    pub fn try_clear_idle(&self) -> bool {
         let Some(admission) = self.in_flight.try_lock() else {
             return false;
         };

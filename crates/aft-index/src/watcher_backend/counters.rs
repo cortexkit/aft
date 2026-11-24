@@ -204,7 +204,8 @@ impl WatcherCounters {
             .store(false, Ordering::Release);
     }
 
-    pub(crate) fn query_delivery_pending(&self) -> bool {
+    #[doc(hidden)]
+    pub fn query_delivery_pending(&self) -> bool {
         self.directory_arrivals_in_flight.load(Ordering::Acquire) > 0
             || self.directory_files_unflushed.load(Ordering::Acquire)
             || self.dispatch_backlog() > 0
@@ -215,7 +216,8 @@ impl WatcherCounters {
             .fetch_or(if relevant { 3 } else { 1 }, Ordering::AcqRel);
     }
 
-    pub(crate) fn take_overflow_ignore_relevance(&self) -> bool {
+    #[doc(hidden)]
+    pub fn take_overflow_ignore_relevance(&self) -> bool {
         // No path evidence (including synthetic rescans) is conservative: lost
         // events could include a changed ignore file.
         self.overflow_ignore_evidence.swap(0, Ordering::AcqRel) != 1
@@ -294,7 +296,8 @@ impl WatcherCounters {
         self.clear_directory_files_queued();
     }
 
-    pub(crate) fn unflushed_paths(&self) -> BTreeSet<PathBuf> {
+    #[doc(hidden)]
+    pub fn unflushed_paths(&self) -> BTreeSet<PathBuf> {
         self.unflushed_source_paths
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -348,7 +351,8 @@ impl WatcherCounters {
         true
     }
 
-    pub(crate) fn start_rescan(&self) {
+    #[doc(hidden)]
+    pub fn start_rescan(&self) {
         let mut recovery = self
             .loss_recovery
             .lock()
@@ -358,7 +362,8 @@ impl WatcherCounters {
         }
     }
 
-    pub(crate) fn finish_rescan_walk(&self) -> Option<crate::watcher_filter::RescanReason> {
+    #[doc(hidden)]
+    pub fn finish_rescan_walk(&self) -> Option<crate::watcher_filter::RescanReason> {
         let mut recovery = self
             .loss_recovery
             .lock()
@@ -441,7 +446,8 @@ impl WatcherCounters {
             .clone()
     }
 
-    pub(crate) fn begin_rescan(
+    #[doc(hidden)]
+    pub fn begin_rescan(
         &self,
         reason: crate::watcher_filter::RescanReason,
     ) -> WatcherRescanInterval {
@@ -475,7 +481,8 @@ impl WatcherCounters {
         WatcherRescanInterval { raw_events }
     }
 
-    pub(crate) fn finish_rescan(&self, cost_ms: u64, rss_delta_bytes: Option<i64>) {
+    #[doc(hidden)]
+    pub fn finish_rescan(&self, cost_ms: u64, rss_delta_bytes: Option<i64>) {
         self.last_rescan_cost_ms.store(cost_ms, Ordering::Relaxed);
         if let Some(delta) = rss_delta_bytes {
             self.last_rescan_rss_delta_bytes

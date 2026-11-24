@@ -83,7 +83,8 @@ pub struct Child {
 }
 
 impl Child {
-    pub(crate) fn new(parent: &Path, root: PathBuf) -> Self {
+    #[doc(hidden)]
+    pub fn new(parent: &Path, root: PathBuf) -> Self {
         let relative = root
             .strip_prefix(parent)
             .map(Path::to_path_buf)
