@@ -278,9 +278,6 @@ pub use aft_base::storage_path;
 #[cfg(all(test, unix))]
 mod storage_permissions_tests;
 pub use aft_base::subc_config;
-#[cfg(test)]
-#[path = "../tests/helpers/subc_fake.rs"]
-mod subc_fake;
 pub use aft_base::symbols;
 pub(crate) use aft_base::system_temp;
 pub(crate) use aft_base::task_temp_reads;

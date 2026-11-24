@@ -39,6 +39,10 @@ impl PendingTicket {
         ))
     }
 
+    pub fn value(&self) -> Option<&str> {
+        self.0.value()
+    }
+
     pub fn bind_task(self, task_id: &str) {
         self.0.bind_task(task_id);
     }

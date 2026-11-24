@@ -26174,7 +26174,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn cancel_commits_before_process_is_signalled() {
-        use crate::gh_shim_speech::model::{AuthorityRecord, LaunchAuthority};
+        use aft_github::gh_shim_speech::test_bridge::AuthorityRecord;
+
+        use crate::gh_shim_speech::model::LaunchAuthority;
         let registry = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("aft.db");

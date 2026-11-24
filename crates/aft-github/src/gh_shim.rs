@@ -30,7 +30,16 @@ use subc_client_rs::{CallOptions, CloseRouteOptions, ConsumerOptions, SubcConsum
 use subc_protocol::manifest::ProviderRole;
 
 use crate::db::github_read_cache::{invalidate_github_read_cache_resource, GithubReadResourceKind};
+
+#[path = "gh_shim/user_config.rs"]
+mod user_config;
 use subc_protocol::{BindIdentity, RouteTarget};
+pub use user_config::configured_connection_file;
+#[cfg(test)]
+use user_config::configured_connection_file_from;
+use user_config::{
+    connection_file_from_config_doc, gh_shim_enabled_from_config_doc, read_user_config_doc,
+};
 
 mod manifest_guard;
 pub mod manifest_sync;

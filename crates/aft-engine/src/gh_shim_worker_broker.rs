@@ -25,6 +25,10 @@ use tokio::sync::{watch, Semaphore};
 use crate::gh_shim_relay::{self as relay, RelayReply};
 use crate::gh_shim_relay::{GhRelay, ScopeStamp};
 
+#[cfg(all(unix, test))]
+use aft_github::gh_shim_worker_broker::test_wire::{
+    failure_text, read_reply, write_frame, MAX_RESPONSE,
+};
 pub use aft_github::gh_shim_worker_broker::*;
 
 #[cfg(unix)]

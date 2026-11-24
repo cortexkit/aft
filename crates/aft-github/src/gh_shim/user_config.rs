@@ -1,9 +1,11 @@
+use super::*;
+
 pub fn configured_connection_file() -> Option<PathBuf> {
     connection_file_from_user_config(&crate::subc_config::cortexkit_user_config_path()?)
 }
 
 #[cfg(test)]
-fn configured_connection_file_from(
+pub(super) fn configured_connection_file_from(
     xdg_config_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Option<PathBuf> {
@@ -32,14 +34,14 @@ fn connection_file_from_user_config(config_path: &Path) -> Option<PathBuf> {
 /// Read the raw user-tier `aft.jsonc` document for the shim's config gates.
 /// `None` means the config file was absent or unreadable, which the rung
 /// determination treats as "no user config" (structural rungs decide).
-fn read_user_config_doc() -> Option<String> {
+pub(super) fn read_user_config_doc() -> Option<String> {
     let config_path = crate::subc_config::cortexkit_user_config_path()?;
     fs::read_to_string(config_path).ok()
 }
 
 /// Read the effective `github.enabled && github.shim` gate from user config.
 /// The deprecated `gh_shim.enabled` alias remains a fallback for one minor.
-fn gh_shim_enabled_from_config_doc(doc: &str) -> Option<bool> {
+pub(super) fn gh_shim_enabled_from_config_doc(doc: &str) -> Option<bool> {
     let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(doc)).ok()?;
     let github = value.get("github");
     let master = github
@@ -59,7 +61,7 @@ fn gh_shim_enabled_from_config_doc(doc: &str) -> Option<bool> {
     Some(master && shim)
 }
 
-fn connection_file_from_config_doc(doc: &str) -> Option<PathBuf> {
+pub(super) fn connection_file_from_config_doc(doc: &str) -> Option<PathBuf> {
     let value: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(doc)).ok()?;
     let raw = value.get("subc")?.get("connection_file")?.as_str()?.trim();
     let path = PathBuf::from(raw);

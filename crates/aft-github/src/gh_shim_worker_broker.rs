@@ -31,13 +31,11 @@ pub const CHILD_KEYS: [&str; 5] = [
 #[doc(hidden)]
 pub const MAX_FRAME: usize = 65_536;
 #[cfg(unix)]
-#[doc(hidden)]
-pub const MAX_RESPONSE: usize = 2_097_152;
+const MAX_RESPONSE: usize = 2_097_152;
 // A UTF-8 body byte can expand to six JSON bytes (for example, NUL becomes
 // \u0000). Leave one request frame for the typed result's metadata and wrapper.
 #[cfg(unix)]
-#[doc(hidden)]
-pub const MAX_ENCODED_RESPONSE: usize =
+const MAX_ENCODED_RESPONSE: usize =
     crate::gh_shim::read_contract::MAX_REPLY_BYTES as usize * 6 + MAX_FRAME;
 
 #[cfg(unix)]
@@ -45,8 +43,7 @@ pub const MAX_ENCODED_RESPONSE: usize =
 pub const CALL_DEADLINE: Duration = Duration::from_secs(20);
 
 // Keep overload and transport failures actionable at every lookup/read boundary.
-#[doc(hidden)]
-pub fn failure_text(code: &str) -> String {
+pub(crate) fn failure_text(code: &str) -> String {
     match code {
         "broker_busy" => "gh read refused: too many gh commands are running at once in this shell. Retry in 1 second, or run fewer in parallel.",
         "request_rate_exceeded" => "gh read refused: more than 30 gh reads in one second. Retry in 1 second.",
@@ -171,8 +168,7 @@ pub async fn write_reply<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 #[cfg(unix)]
-#[doc(hidden)]
-pub async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Value, String> {
+async fn read_reply<R: tokio::io::AsyncRead + Unpin>(reader: &mut R) -> Result<Value, String> {
     let bytes = read_frame(reader, MAX_RESPONSE)
         .await
         .map_err(|error| format!("worker read broker reply failed: {error}"))?;
@@ -218,8 +214,7 @@ pub async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
 }
 
 #[cfg(unix)]
-#[doc(hidden)]
-pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+pub(crate) async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     bytes: &[u8],
 ) -> std::io::Result<()> {
@@ -230,8 +225,7 @@ pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
 /// Client discovery never opens user configuration or a general connection file.
 /// In worker mode, absent paths are an error rather than a discovery fallback.
 #[derive(Clone, Debug)]
-#[doc(hidden)]
-pub enum ClientError {
+pub(crate) enum ClientError {
     #[cfg(not(unix))]
     UnsupportedPlatform(&'static str),
     #[cfg(unix)]
@@ -249,15 +243,14 @@ impl std::fmt::Display for ClientError {
     }
 }
 
-#[doc(hidden)]
-pub struct Client {
+pub(crate) struct Client {
     #[cfg(unix)]
     socket: PathBuf,
     #[cfg(unix)]
     capability_file: PathBuf,
 }
 impl Client {
-    pub fn from_process() -> Result<Self, ClientError> {
+    pub(crate) fn from_process() -> Result<Self, ClientError> {
         #[cfg(not(unix))]
         return Err(ClientError::UnsupportedPlatform(std::env::consts::OS));
         #[cfg(unix)]
@@ -288,8 +281,11 @@ mod windows_tests {
     }
 }
 
-#[doc(hidden)]
-pub fn request(client: &Client, operation: Operation, budget: Duration) -> Result<Value, String> {
+pub(crate) fn request(
+    client: &Client,
+    operation: Operation,
+    budget: Duration,
+) -> Result<Value, String> {
     #[cfg(not(unix))]
     {
         let _ = (client, operation, budget);
@@ -374,5 +370,34 @@ pub fn request(client: &Client, operation: Operation, budget: Duration) -> Resul
             .await
             .map_err(|_| failure_text("broker_timeout"))?
         })
+    }
+}
+
+#[cfg(all(test, unix))]
+#[path = "gh_shim_worker_broker_client_tests.rs"]
+mod tests;
+
+#[cfg(all(unix, feature = "test-support"))]
+#[doc(hidden)]
+pub mod test_wire {
+    use serde_json::Value;
+
+    pub const MAX_RESPONSE: usize = super::MAX_RESPONSE;
+
+    pub fn failure_text(code: &str) -> String {
+        super::failure_text(code)
+    }
+
+    pub async fn read_reply<R: tokio::io::AsyncRead + Unpin>(
+        reader: &mut R,
+    ) -> Result<Value, String> {
+        super::read_reply(reader).await
+    }
+
+    pub async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
+        writer: &mut W,
+        bytes: &[u8],
+    ) -> std::io::Result<()> {
+        super::write_frame(writer, bytes).await
     }
 }
