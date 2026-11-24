@@ -60,3 +60,10 @@ use aft_shell::test_bridge::{
     BgTaskRegistryTestExt as _, BgTaskTestExt as _,
 };
 use std::{collections::HashMap, path::PathBuf, time::Duration};
+
+#[test]
+fn task_scope_standalone_fallback_restart_context_is_not_daemon() {
+    let root = tempfile::tempdir().unwrap();
+    let ctx = crate::shell_test_fixtures::remote::restarted_context(root.path());
+    assert!(!ctx.is_daemon_mode());
+}

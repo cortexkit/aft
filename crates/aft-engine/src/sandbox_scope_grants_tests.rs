@@ -1,6 +1,9 @@
 use super::*;
 use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+use crate::context::AppContext;
 use crate::db::access_grants::{self as grants, ScopeKey};
+use aft_shell::test_bridge::sandbox_spawn::relaxed_profile_for_test;
+use std::{path::Path, sync::Arc};
 
 #[test]
 fn granted_checkout_controls_join_relaxed_denies() {
@@ -49,16 +52,9 @@ fn granted_checkout_controls_join_relaxed_denies() {
     .unwrap();
     ctx.set_db(Arc::new(std::sync::Mutex::new(conn)));
     crate::access_policy::with_scope(Some(scope), || {
-        let profile = build_relaxed_profile(
-            &ctx,
-            &home,
-            &[root.clone()],
-            &[resolve_git_policy(&root).unwrap()],
-            &store,
-            &task_io,
-            &temp,
-        )
-        .unwrap();
+        let profile =
+            relaxed_profile_for_test(&ctx, &home, &[root.clone()], &root, &store, &task_io, &temp)
+                .unwrap();
         for path in [
             ".git/hooks",
             ".git/config",
@@ -72,7 +68,6 @@ fn granted_checkout_controls_join_relaxed_denies() {
         }
     });
 }
-
 
 #[test]
 fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
@@ -176,11 +171,11 @@ fn worker_scope_grants_reach_both_shell_profiles_without_widening() {
                 usize::from(!jailed || cfg!(target_os = "macos")),
                 || {
                     with_worker_jail(jailed, || {
-                        build_relaxed_profile(
+                        relaxed_profile_for_test(
                             &ctx,
                             &home,
                             &[root.clone()],
-                            &[resolve_git_policy(&root).unwrap()],
+                            &root,
                             &store,
                             &task_io,
                             &temp,

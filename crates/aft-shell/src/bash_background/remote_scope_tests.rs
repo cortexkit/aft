@@ -214,16 +214,15 @@ async fn task_scope_standalone_fallback_never_starts_systemd_run() {
                 .set_launcher_for_test(root.join("systemd-run"));
             if restarted {
                 drop(original);
-                let ctx = restarted_context(&dir);
-                ctx.bash_background()
+                ensure_git_fixture(&dir);
+                let restored = registry();
+                restored.configure_task_scope_runtime(false, Duration::from_secs(86400));
+                restored
                     .inner
                     .task_scopes
                     .set_launcher_for_test(root.join("systemd-run"));
-                assert!(!ctx.is_daemon_mode());
-                ctx.bash_background()
-                    .replay_session(&dir, "session")
-                    .unwrap();
-                let done = terminal(ctx.bash_background(), &task_id).await;
+                restored.replay_session(&dir, "session").unwrap();
+                let done = terminal(&restored, &task_id).await;
                 assert_eq!(done.exit_code, Some(0));
             } else {
                 let task = original.task(&task_id).unwrap();

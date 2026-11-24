@@ -29,8 +29,12 @@ pub fn event(journal: &Journal, root: &Path, name: &str, kind: notify::EventKind
 }
 
 pub const OVERFLOW_TEXT: &str = OVERFLOW;
+pub const NOT_SHOWN_TEXT: &str = NOT_SHOWN;
 
 impl Capture {
+    pub fn root_for_test(&self) -> &Path {
+        &self.root
+    }
     pub fn journal_for_test(&self) -> &Arc<Journal> {
         &self.journal
     }

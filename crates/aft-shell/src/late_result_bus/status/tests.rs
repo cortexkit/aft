@@ -1,3 +1,4 @@
+use super::test_writer::RecordingWriter;
 use super::*;
 use aft_base::runner_status_state::Sessions;
 use sha2::{Digest, Sha256};
@@ -8,14 +9,12 @@ thread_local! {
     pub(super) static VALUE_RENDERS: Cell<usize> = const { Cell::new(0) };
 }
 
-
 fn session(start: u64) -> Sessions {
     let mut sessions = Sessions::new(start);
     sessions.bound(1, "runner:session/one");
     assert!(sessions.publish("runner:session/one", "[AFT E0 W1 | T2]"));
     sessions
 }
-
 
 #[test]
 fn status_kv_key_is_lowercase_hex_of_utf8() {

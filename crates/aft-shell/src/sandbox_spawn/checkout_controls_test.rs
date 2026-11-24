@@ -23,3 +23,4 @@ fn checkout_control_denies_preserve_nested_and_non_repository_root_semantics() {
         assert!(denies.contains(&path.join(".git/config")));
     }
 }
+use super::*;

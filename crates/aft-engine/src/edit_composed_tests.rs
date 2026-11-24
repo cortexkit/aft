@@ -8,6 +8,8 @@ mod cases {
         ruff_probe_refused_for_test, validate_full,
     };
     #[cfg(unix)]
+    use aft_shell::test_bridge::{SpawnPlanTestExt as _, ToolLaunchPolicyTestExt as _};
+    #[cfg(unix)]
     use std::{fs, process::Command};
 
     #[cfg(unix)]

@@ -2,6 +2,9 @@ use super::*;
 use crate::bash_background::persistence::{task_paths, write_task};
 use std::io::Write;
 
+#[path = "memory_test_fixture.rs"]
+pub mod memory;
+
 #[cfg(unix)]
 pub mod remote {
     pub use super::super::remote::{fixture::*, seams::*};

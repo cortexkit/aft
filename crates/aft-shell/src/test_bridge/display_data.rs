@@ -28,6 +28,8 @@ pub mod late_result_bus {
     }
 
     pub mod status {
+        pub use crate::late_result_bus::status::test_writer::put_session;
+
         pub fn test_value(session: &str) -> Option<serde_json::Value> {
             crate::late_result_bus::status::test_value(session)
         }

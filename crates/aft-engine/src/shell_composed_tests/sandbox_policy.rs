@@ -1,4 +1,3 @@
-
 #[cfg(unix)]
 fn assert_scoped_profile_grants(profile: &SandboxProfile, write: &Path, read: &Path) {
     assert!(
@@ -164,7 +163,7 @@ fn native_sandbox_predicate_controls_spawn_and_rewrite() {
         matches!(&sandboxed, SpawnPlan::Launcher { .. }),
         "native sandbox must use the launcher: {sandboxed:?}"
     );
-    sandboxed.cleanup_unspawned();
+    aft_shell::test_bridge::cleanup_unspawned(&sandboxed);
 
     ctx.update_config(|config| config.sandbox.profile.head = crate::config::SandboxMode::Off);
     assert!(!native_sandbox_enforced(&ctx, &principal));

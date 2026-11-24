@@ -13,7 +13,7 @@ async fn status_kv_publishes_exact_segment_even_when_holder_refuses() {
     let request = wire_rx.try_recv().unwrap();
     assert_eq!(request.session(), session);
     assert_eq!(
-        status::tests::put_session(session).await["segment"],
+        aft_shell::test_bridge::bus::late_result_bus::status::put_session(session).await["segment"],
         request.body()["text"]
     );
     let identity = FleetRouteIdentity::from(&request);
@@ -53,7 +53,7 @@ async fn status_kv_publishes_exact_segment_even_when_holder_refuses() {
         session,
         "[AFT E0 W0 | T3]",
     );
-    let value = status::tests::put_session(session).await;
+    let value = aft_shell::test_bridge::bus::late_result_bus::status::put_session(session).await;
     assert_eq!(value["segment"], "[AFT E0 W0 | T3]");
     assert_eq!(value["generation"].as_u64().unwrap(), before + 1);
     status::route_unbound(1, session);

@@ -38,7 +38,7 @@ mod tests {
         });
         register_listener(&listener);
         crate::edit::write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &<crate::sandbox_spawn::ToolLaunchPolicy as aft_shell::test_bridge::ToolLaunchPolicyTestExt>::unconfined_for_test(),
             &path,
             "new",
             &crate::config::Config::default(),
@@ -83,7 +83,7 @@ mod tests {
         drop(listener);
         drop(guard);
         crate::edit::write_format_validate(
-            &crate::sandbox_spawn::ToolLaunchPolicy::unconfined_for_test(),
+            &<crate::sandbox_spawn::ToolLaunchPolicy as aft_shell::test_bridge::ToolLaunchPolicyTestExt>::unconfined_for_test(),
             &path,
             "again",
             &crate::config::Config::default(),

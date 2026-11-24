@@ -494,7 +494,6 @@ async fn exec_remote_bash_refusal_runs_local_with_disclosure() {
     }
 }
 
-
 #[tokio::test]
 async fn memory_limit_replayed_fallback_keeps_saved_cap() {
     assert_replayed_fallback_cap(None).await;

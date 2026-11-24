@@ -112,7 +112,7 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
     for name in ["environment-secret.txt", "credential-prefix.toml"] {
         event(
             capture.journal_for_test(),
-            &capture.root,
+            capture.root_for_test(),
             name,
             notify::EventKind::Create(CreateKind::File),
         );
@@ -123,7 +123,7 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
         report
             .files
             .iter()
-            .all(|file| file.diff.is_none() && file.reason.as_deref() == Some(NOT_SHOWN)),
+            .all(|file| file.diff.is_none() && file.reason.as_deref() == Some(NOT_SHOWN_TEXT)),
         "{report:?}"
     );
     assert!(!serde_json::to_string(report)
@@ -132,9 +132,10 @@ fn bash_changed_files_diff_inherits_shell_launch_read_denies() {
 }
 use crate::bash_changed_files::{self, BudgetGuard};
 use crate::config::BashChangedFiles;
-use aft_shell::bash_changed_files::test_fixture::{event, repo, OVERFLOW_TEXT};
+use aft_shell::bash_changed_files::test_fixture::{event, repo, NOT_SHOWN_TEXT, OVERFLOW_TEXT};
 use aft_shell::test_bridge::SpawnReceiptTestExt as _;
 use notify::event::{CreateKind, ModifyKind};
+use std::path::PathBuf;
 use std::{
     sync::Arc,
     time::{Duration, Instant},

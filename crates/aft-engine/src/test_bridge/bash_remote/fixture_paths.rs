@@ -1,4 +1,5 @@
 pub mod bash_background {
+    pub use crate::bash_background::spawn;
     pub use aft_shell::test_bridge::bash_background::*;
     #[cfg(unix)]
     pub mod push_projection_fixture {

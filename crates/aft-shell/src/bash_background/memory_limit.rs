@@ -11,7 +11,7 @@ const LINUX_WATCHER_KIND: &str =
 #[cfg(unix)]
 const PID_BUDGET: usize = 4096;
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 #[derive(Clone)]
 struct AttachFault {
     path: std::path::PathBuf,
@@ -19,12 +19,12 @@ struct AttachFault {
     attempts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 thread_local! {
     static THREAD_ATTACH_FAULT: std::cell::RefCell<Option<AttachFault>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 fn task_attach_faults() -> &'static std::sync::Mutex<std::collections::HashMap<String, AttachFault>>
 {
     static FAULTS: std::sync::OnceLock<
@@ -33,7 +33,7 @@ fn task_attach_faults() -> &'static std::sync::Mutex<std::collections::HashMap<S
     FAULTS.get_or_init(Default::default)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub(super) struct AttachFaultGuard {
     task: Option<String>,
     previous: Option<AttachFault>,
@@ -41,8 +41,9 @@ pub(super) struct AttachFaultGuard {
     _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 impl AttachFaultGuard {
+    #[cfg(test)]
     pub(super) fn for_thread(path: std::path::PathBuf, errno: i32) -> Self {
         std::fs::create_dir(&path).unwrap();
         let attempts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -86,7 +87,7 @@ impl AttachFaultGuard {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 impl Drop for AttachFaultGuard {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
@@ -97,7 +98,7 @@ impl Drop for AttachFaultGuard {
     }
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 fn attach_fault_candidate(task: &str) -> Option<std::path::PathBuf> {
     task_attach_faults()
         .lock()
@@ -108,7 +109,7 @@ fn attach_fault_candidate(task: &str) -> Option<std::path::PathBuf> {
         .map(|fault| fault.path)
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 fn attach_fault_error(path: &std::path::Path) -> Option<std::io::Error> {
     task_attach_faults()
         .lock()
@@ -132,7 +133,7 @@ fn attach_fault_error(path: &std::path::Path) -> Option<std::io::Error> {
         })
 }
 
-#[cfg(all(test, target_os = "linux"))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub(super) fn sampling_available_for_test() -> bool {
     static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *AVAILABLE.get_or_init(|| {
@@ -504,7 +505,7 @@ mod linux {
         mib: u64,
         task_id: &str,
     ) -> (Option<PathBuf>, Option<std::process::Child>) {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(path) = super::attach_fault_candidate(task_id) {
             return (Some(path), None);
         }
@@ -598,7 +599,7 @@ mod linux {
     }
 
     pub(super) fn attach(path: &Path, pid: u32) -> std::io::Result<()> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(error) = super::attach_fault_error(path) {
             return Err(error);
         }

@@ -73,7 +73,7 @@ pub fn maybe_spawn_retention(
     compression_events::maybe_spawn_retention(db, guard(registries.as_deref()));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn prune_retention_sweep_observed(
     db: &Arc<Mutex<TrackedConnection>>,
@@ -84,7 +84,7 @@ pub fn prune_retention_sweep_observed(
     compression_events::prune_retention_sweep_observed(db, now_ms, &guard(registries), observe)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn prune_retention_once_observed(
     db: &Arc<Mutex<TrackedConnection>>,

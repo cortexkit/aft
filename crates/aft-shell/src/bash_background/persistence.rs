@@ -3199,7 +3199,9 @@ mod tests {
             });
 
             assert!(
-                error.to_string().contains(crate::production_storage::CODE),
+                error
+                    .to_string()
+                    .contains(aft_base::production_storage::CODE),
                 "protected task write was not refused: {error}"
             );
             assert_eq!(

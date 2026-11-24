@@ -6,6 +6,7 @@ use std::{path::PathBuf, sync::Arc};
 
 pub(crate) struct SandboxFixture {
     config: parking_lot::RwLock<Arc<Config>>,
+    tasks: crate::bash_background::BgTaskRegistry,
     _temporary_storage: tempfile::TempDir,
     #[cfg(unix)]
     grants: Arc<super::EscalationGrantState>,
@@ -19,6 +20,7 @@ impl SandboxFixture {
             .get_or_insert_with(|| storage.path().to_path_buf());
         Self {
             config: parking_lot::RwLock::new(Arc::new(config)),
+            tasks: crate::bash_background::BgTaskRegistry::default(),
             _temporary_storage: storage,
             #[cfg(unix)]
             grants: Arc::default(),
@@ -42,6 +44,31 @@ impl SandboxFixture {
     pub(crate) fn update_config(&self, update: impl FnOnce(&mut Config)) {
         update(Arc::make_mut(&mut self.config.write()));
     }
+}
+
+impl crate::bash_background::TaskRegistryAccess for SandboxFixture {
+    fn bash_background(&self) -> &crate::bash_background::BgTaskRegistry {
+        &self.tasks
+    }
+}
+
+impl crate::bash_background::SpawnHost for SandboxFixture {
+    fn is_daemon_mode(&self) -> bool {
+        false
+    }
+    fn reload_released_filter_registry(&self) {}
+    fn start_changed_files(
+        &self,
+        _: &str,
+        _: &super::SpawnPlan,
+    ) -> Option<Arc<crate::bash_changed_files::Capture>> {
+        assert_eq!(
+            self.config().bash.changed_files,
+            crate::config::BashChangedFiles::Off
+        );
+        None
+    }
+    fn check_spawn_folder_revocation(&self, _: &str, _: &str) {}
 }
 
 impl PinnedConfig for SandboxFixture {

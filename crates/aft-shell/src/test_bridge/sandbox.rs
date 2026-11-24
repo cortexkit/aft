@@ -10,6 +10,21 @@ use std::{collections::HashMap, path::PathBuf};
 
 pub type ChildEnvironment = sandbox_spawn::ChildEnvironment;
 
+pub fn cleanup_unspawned(plan: &SpawnPlan) {
+    plan.cleanup_unspawned();
+}
+
+pub fn pty_command_for_plan(
+    plan: &SpawnPlan,
+    program: &std::ffi::OsStr,
+    args: &[std::ffi::OsString],
+    task_marker: &Path,
+    workdir: &Path,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(portable_pty::CommandBuilder, Option<std::fs::File>), String> {
+    sandbox_spawn::pty_command_for_plan(plan, program, args, task_marker, workdir, env)
+}
+
 pub fn resolve_command_sandbox_spawn(
     ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,

@@ -4,8 +4,7 @@ const ALLOCATOR: &str =
     "bash_background::registry::memory_limit_tests::memory_limit_allocator_child";
 
 #[cfg(unix)]
-pub(super) const MEMORY_PRESSURE_COMMAND: &str = "python3 -c 'import time; allocation = bytearray(b\"x\" * (192 * 1024 * 1024)); time.sleep(20)'";
-
+pub(super) use super::test_support::memory::MEMORY_PRESSURE_COMMAND;
 
 #[test]
 fn memory_limit_allocator_child() {
@@ -816,11 +815,7 @@ fn memory_limit_linux_kernel_stops_group() {
     allocate_past_cap(false, false, true, true, None);
 }
 
-pub(super) fn report_memory_runtime_skip(name: &str, reason: &str) {
-    use std::io::Write;
-    // Bypass libtest's passing-test capture so capability skips remain visible in CI.
-    writeln!(std::io::stderr().lock(), "SKIP {name}: {reason}").unwrap();
-}
+pub(super) use super::test_support::memory::report_memory_runtime_skip;
 
 #[cfg(target_os = "linux")]
 #[test]

@@ -1,3 +1,24 @@
+use crate::bash_background::{
+    persistence::resolve_task_layout, spawn, BashShell, BgTaskStatus, HardKill, RemoteLaunch,
+};
+use crate::shell_test_fixtures::remote::{ensure_git_fixture, launch, terminal};
+use aft_shell::bash_background::registry::test_support::memory::{
+    persisted_cap, with_prepare_gate, MEMORY_PRESSURE_COMMAND,
+};
+#[cfg(target_os = "linux")]
+use aft_shell::bash_background::registry::test_support::memory::{
+    report_memory_runtime_skip, sampling_available_for_test, AttachFaultGuard,
+};
+use aft_shell::test_bridge::{
+    remote_wire::{daemon, Script},
+    restore_local_launch, BgTaskTestExt as _,
+};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
+
 #[cfg(unix)]
 pub(super) fn memory_request_context(
     project: &Path,
@@ -19,7 +40,7 @@ pub(super) fn memory_request_context(
 pub(super) fn spawn_memory_request(
     ctx: &crate::context::AppContext,
     request_id: &str,
-    remote: Option<super::super::RemoteLaunch>,
+    remote: Option<RemoteLaunch>,
 ) -> crate::protocol::Response {
     spawn_memory_command(ctx, request_id, "exit 0", false, remote)
 }
@@ -30,17 +51,17 @@ pub(super) fn spawn_memory_command(
     request_id: &str,
     command: &str,
     pty: bool,
-    remote: Option<super::super::RemoteLaunch>,
+    remote: Option<RemoteLaunch>,
 ) -> crate::protocol::Response {
-    super::super::spawn(
+    spawn(
         request_id,
         "session",
         command,
-        super::super::BashShell::Bash,
+        BashShell::Bash,
         PathBuf::from("/bin/sh"),
         None,
         None,
-        super::super::HardKill::After(Duration::from_secs(30)),
+        HardKill::After(Duration::from_secs(30)),
         ctx,
         false,
         false,
@@ -68,7 +89,7 @@ fn memory_limit_interleaved_requests_keep_admitted_caps_across_reload() {
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let request_a = std::thread::spawn(move || {
             let _pin = a_ctx.pin_config_to(original);
-            with_memory_prepare_gate_for_test(
+            with_prepare_gate(
                 move || {
                     entered_tx.send(()).unwrap();
                     release_rx.recv_timeout(Duration::from_secs(15)).unwrap();
@@ -91,14 +112,10 @@ fn memory_limit_interleaved_requests_keep_admitted_caps_across_reload() {
         let cap_for = |response: &crate::protocol::Response| {
             let task = ctx
                 .bash_background()
-                .task_for_test(response.data["task_id"].as_str().unwrap())
+                .test_task(response.data["task_id"].as_str().unwrap())
                 .unwrap();
             let state = task.lock_state().unwrap();
-            state
-                .metadata
-                .memory_policy
-                .as_ref()
-                .map(|policy| policy.mib)
+            persisted_cap(state.metadata())
         };
         assert_eq!(
             cap_for(&request_a),
@@ -126,10 +143,8 @@ async fn memory_limit_attach_eperm_delayed_fallback_after_reload_enforces_watche
 
 async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
     #[cfg(target_os = "linux")]
-    if attach_error.is_some()
-        && !crate::bash_background::memory_limit::sampling_available_for_test()
-    {
-        super::super::memory_limit_tests::report_memory_runtime_skip(
+    if attach_error.is_some() && !sampling_available_for_test() {
+        report_memory_runtime_skip(
             "memory_limit_attach_eperm_delayed_fallback_after_reload_enforces_watcher",
             "RSS sampling is unavailable for the forced fallback",
         );
@@ -139,18 +154,14 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
     let project = tempfile::tempdir().unwrap();
     let storage = tempfile::tempdir().unwrap();
     ensure_git_fixture(project.path());
-    let ctx = super::super::memory_limit_tests::memory_request_context(
-        project.path(),
-        storage.path(),
-        Some(64),
-    );
+    let ctx = memory_request_context(project.path(), storage.path(), Some(64));
     let submitted = {
         let _pin = ctx.pin_config();
-        super::super::memory_limit_tests::spawn_memory_command(
+        spawn_memory_command(
             &ctx,
             "memory-fallback-a",
             if attach_error.is_some() {
-                super::super::memory_limit_tests::MEMORY_PRESSURE_COMMAND
+                MEMORY_PRESSURE_COMMAND
             } else {
                 "exit 0"
             },
@@ -162,19 +173,15 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
     let task_id = submitted.data["task_id"].as_str().unwrap().to_owned();
     #[cfg(target_os = "linux")]
     let attach_fault = attach_error.map(|errno| {
-        crate::bash_background::memory_limit::AttachFaultGuard::for_task(
-            task_id.clone(),
-            storage.path().join("denied-cgroup"),
-            errno,
-        )
+        AttachFaultGuard::for_task(task_id.clone(), storage.path().join("denied-cgroup"), errno)
     });
     let (saved_layout, saved_digest) = {
-        let task = ctx.bash_background().task(&task_id).unwrap();
+        let task = ctx.bash_background().test_task(&task_id).unwrap();
         let digest = task
-            .state
+            .test_state()
             .lock()
             .unwrap()
-            .metadata
+            .metadata()
             .remote
             .as_ref()
             .unwrap()
@@ -182,7 +189,7 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
             .clone()
             .unwrap();
         (
-            resolve_task_layout(&task.paths.session_dir, &task_id).unwrap(),
+            resolve_task_layout(&task.paths().session_dir, &task_id).unwrap(),
             digest,
         )
     };
@@ -192,7 +199,7 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
     ctx.set_config(reloaded);
     let newer = {
         let _pin = ctx.pin_config();
-        super::super::memory_limit_tests::spawn_memory_request(&ctx, "memory-fallback-b", None)
+        spawn_memory_request(&ctx, "memory-fallback-b", None)
     };
     assert!(newer.success, "{newer:?}");
     daemon.acceptance_gate.notify_one();
@@ -220,21 +227,16 @@ async fn assert_delayed_fallback_cap(attach_error: Option<i32>) {
         assert_eq!(fault.attempts(), 1);
         assert!(!storage.path().join("denied-cgroup").exists());
     }
-    let task = ctx.bash_background().task(&task_id).unwrap();
-    let state = task.state.lock().unwrap();
-    assert!(state.metadata.local_fallback_started);
+    let task = ctx.bash_background().test_task(&task_id).unwrap();
+    let state = task.test_state().lock().unwrap();
+    assert!(state.metadata().local_fallback_started);
     assert_eq!(
-        state
-            .metadata
-            .memory_policy
-            .as_ref()
-            .map(|policy| policy.mib),
+        persisted_cap(state.metadata()),
         Some(64),
         "fallback lost the cap from its submitted request"
     );
     drop(state);
-    let (_, _, _, _, saved_cap, _) =
-        crate::sandbox_spawn::restore_local_launch(&saved_layout, &saved_digest).unwrap();
+    let (_, _, _, _, saved_cap, _) = restore_local_launch(&saved_layout, &saved_digest).unwrap();
     assert_eq!(
         saved_cap,
         Some(64),

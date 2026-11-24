@@ -252,12 +252,12 @@ pub mod remote;
 pub mod return_files;
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
-#[cfg(test)]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 thread_local! {
     static MEMORY_PREPARE_GATE_FOR_TEST: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(all(test, unix))]
+#[cfg(all(unix, any(test, feature = "test-support")))]
 fn with_memory_prepare_gate_for_test<R>(
     gate: impl FnOnce() + 'static,
     run: impl FnOnce() -> R,

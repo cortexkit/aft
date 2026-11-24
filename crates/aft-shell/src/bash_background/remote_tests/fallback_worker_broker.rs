@@ -114,3 +114,4 @@ async fn remote_local_fallback_has_no_broker(
     assert!(!temp.join(".gh-read-capability").exists());
     assert!(!temp.with_file_name("000000000001.gh-read.sock").exists());
 }
+use crate::bash_background::TaskRegistryAccess as _;

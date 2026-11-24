@@ -1,6 +1,27 @@
 use super::*;
 
 #[cfg(feature = "test-support")]
+pub fn relaxed_profile_for_test(
+    host: &dyn SandboxHost,
+    home: &Path,
+    roots: &[PathBuf],
+    checkout: &Path,
+    storage: &Path,
+    task: &Path,
+    temp: &Path,
+) -> Result<SandboxProfile, String> {
+    build_relaxed_profile(
+        host,
+        home,
+        roots,
+        &[resolve_git_policy(checkout)?],
+        storage,
+        task,
+        temp,
+    )
+}
+
+#[cfg(feature = "test-support")]
 impl ToolLaunchPolicy<'_> {
     #[doc(hidden)]
     pub fn plan_for_test(&self) -> &SpawnPlan {

@@ -1409,7 +1409,7 @@ pub(super) async fn runon_restart_reattach_drain_child() {
     let project = root.join("project");
     let harness = crate::harness::Harness::Runner;
     let tasks = registry();
-    tasks.set_harness(harness);
+    tasks.set_harness(harness.clone());
     let config = RunnerStorage(Arc::new(Config {
         project_root: Some(project.clone()),
         storage_dir: Some(root.join("storage")),

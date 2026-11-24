@@ -95,5 +95,6 @@ aft-inspect = { path = "../aft-inspect", version = "0.66.0", features = ["test-s
 cortexkit-role-tool-provider = { version = "=0.15.12", features = ["test-vectors"] }
 cortexkit-test-support = "=0.1.14"
 filetime = "0.2"
+ignore = "0.4"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }

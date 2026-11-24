@@ -158,6 +158,8 @@ pub mod bash_background {
 
 pub mod sandbox_spawn {
     #[cfg(unix)]
+    pub use crate::sandbox_spawn::grant_fixture::relaxed_profile_for_test;
+    #[cfg(unix)]
     pub fn provider_layout_grant_for_test(
         host: &dyn crate::sandbox_spawn::SandboxHost,
         ttl: std::time::Duration,

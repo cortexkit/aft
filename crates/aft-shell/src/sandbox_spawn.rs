@@ -50,6 +50,8 @@ use std::time::{Duration, Instant};
 use portable_pty::CommandBuilder;
 
 use crate::config::SandboxMode;
+#[cfg(all(test, unix))]
+mod checkout_controls_test;
 #[cfg(all(unix, any(test, feature = "test-support")))]
 pub(crate) mod grant_fixture;
 mod host;

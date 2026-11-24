@@ -248,5 +248,7 @@ pub(crate) fn test_value(session: &str) -> Option<serde_json::Value> {
         .map(|segment| serde_json::from_slice(&encode(&segment.text, segment.generation)).unwrap())
 }
 
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod test_writer;
 #[cfg(test)]
 pub(crate) mod tests;
