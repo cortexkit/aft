@@ -8131,19 +8131,6 @@ impl AppContext {
         &self.watcher
     }
 
-    pub fn watcher_counters(&self) -> WatcherCountersHandle {
-        WatcherCountersHandle::new(self.index_watcher_counters())
-    }
-
-    pub(crate) fn index_watcher_counters(&self) -> Arc<WatcherCounters> {
-        Arc::clone(
-            &self
-                .watcher_counters
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    }
-
     /// Access the pre-filtered watcher event receiver.
     pub fn watcher_rx(
         &self,
