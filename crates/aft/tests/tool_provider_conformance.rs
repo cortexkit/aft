@@ -36,6 +36,8 @@ use tokio::{
 
 #[path = "helpers/aft_binary.rs"]
 mod aft_binary;
+#[path = "tool_provider_conformance/versions.rs"]
+mod versions;
 
 fn legacy_fixtures_path() -> std::path::PathBuf {
     crate::test_helpers::manifest_dir().join("tests/fixtures/tool_provider_legacy_replies.json")
@@ -423,6 +425,7 @@ fn result_probes() -> Vec<CallSpec> {
 /// no preset, which AFT serves as `head`).
 struct Subject {
     preset: Option<&'static str>,
+    versioned: bool,
     /// Launches the provider under test with the main-thread stack Windows
     /// gives it, instead of this host's.
     one_mib_main_stack: bool,
@@ -439,6 +442,7 @@ impl Subject {
     fn new(preset: Option<&'static str>) -> Self {
         Self {
             preset,
+            versioned: false,
             one_mib_main_stack: false,
             project: Mutex::new(None),
             served_tools: Mutex::new(None),
@@ -993,6 +997,10 @@ impl Harness for Subject {
         command.env(
             "AFT_TEST_CONFORMANCE_RESPONSE_ID",
             serde_json::to_string(&result_probes()).unwrap(),
+        );
+        command.env(
+            "AFT_TEST_CONFORMANCE_TOOL_VERSIONS",
+            if self.versioned { "1" } else { "0" },
         );
         if !self.capture_live_status {
             let snapshot = legacy_fixtures()["status_snapshot"].clone();
@@ -3530,6 +3538,12 @@ impl ToolRoute for Route {
 }
 #[async_trait]
 impl ToolProviderSubject for Subject {
+    fn tool_version_fixture(
+        &self,
+    ) -> Option<cortexkit_role_tool_provider_conformance::ToolVersionFixture> {
+        self.versioned.then(versions::fixture)
+    }
+
     /// A preset that serves `bash` declares the held-call, late-result,
     /// cancellation and scope cases; `approval_execution` also needs the kill
     /// hook, which only a `test-timing-hooks` build has. The reader serves no
@@ -4348,11 +4362,12 @@ async fn conformance_inventory(subject: Subject) {
     let inventory = &fixtures["slice_b"]["presets"][subject.preset.unwrap_or("head")][build];
     let expected =
         |field: &str| serde_json::from_value::<BTreeSet<String>>(inventory[field].clone()).unwrap();
-    let (expected_enabled, expected_skipped, expected_inapplicable) = (
+    let (expected_enabled, mut expected_skipped, expected_inapplicable) = (
         expected("enabled_cases"),
         expected("skipped_cases"),
         expected("inapplicable_cases"),
     );
+    expected_skipped.extend(versions::CASES.map(str::to_owned));
     // Case IDs are pinned from the conformance crate: the inventory names
     // every case the crate runs, each exactly once.
     let every: BTreeSet<String> = CASES.iter().map(|case| case.name.to_string()).collect();

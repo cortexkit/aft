@@ -4,6 +4,8 @@ use crate::data_layer::refresh_probe;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+#[cfg(all(test, target_os = "linux"))]
+mod reuse_measure;
 #[cfg(test)]
 mod tests;
 
@@ -25,6 +27,7 @@ pub(crate) struct RefreshCounts {
 pub(super) struct RefreshWork<'a> {
     guard: Option<&'a RefreshMemory>,
     stats: UpdateStats,
+    stored: StoredRecords,
 }
 
 impl fmt::Display for RefreshWork<'_> {
@@ -81,7 +84,9 @@ impl Checkout {
             Some(&self.root),
         );
         checkpoint()?;
-        let result = self.refresh_inner(by_build, guard);
+        let result = self.refresh_inner(by_build, guard, || {
+            self.family_records().unwrap_or_default()
+        });
         self.touch_memory();
         self.note_outcome("refresh", &result);
         result
@@ -91,6 +96,7 @@ impl Checkout {
         &self,
         by_build: bool,
         guard: &RefreshMemory,
+        open_records: impl FnOnce() -> StoredRecords,
     ) -> Result<Option<UpdateStats>, DataError> {
         let (published, state, changes, covered, invalidated) = {
             let live = self.live.read().expect("no panics while holding it");
@@ -138,6 +144,16 @@ impl Checkout {
         if changes.is_empty() || !published.graph_built || !self.planes.callgraph {
             return Ok(None);
         }
+        // Opening the family's reader needs I/O. Do it before locking the
+        // engine; if the store cannot be opened, the source bytes still work.
+        let stored = if changes
+            .values()
+            .any(|change| change.content.peek().is_none())
+        {
+            open_records()
+        } else {
+            StoredRecords::default()
+        };
         // An update that stopped part way through dropped its engine before
         // anything else could read the mutex, so a poisoned lock only means
         // the engine must start again.
@@ -161,6 +177,7 @@ impl Checkout {
                 changed_paths: changes.len(),
                 ..UpdateStats::default()
             },
+            stored,
         };
         // A damaged stored record or fragment can stop the update where it
         // expects one (every file the engine lists has a parse and a
@@ -368,6 +385,7 @@ impl Checkout {
         work: &mut RefreshWork<'_>,
     ) -> Result<EngineUpdate, UpdateError> {
         let guard = work.guard;
+        let stored = std::mem::take(&mut work.stored);
         // This test needs neither extraction nor an engine start. A single
         // watcher batch can already be larger than incremental admission.
         budget
@@ -406,10 +424,11 @@ impl Checkout {
                 extracting.par_iter().try_for_each(|change| {
                     guard.file()?;
                     let _label = carry.enter();
-                    change.content.get();
+                    change.content.extract(&stored);
                     Ok::<_, RefreshStop>(())
                 })
             })?;
+            drop(stored);
             guard.boundary()?;
             #[cfg(feature = "test-hooks")]
             refresh_probe::stage("planning");

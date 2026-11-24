@@ -6,6 +6,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "macos")]
+use super::mailbox::Message;
+
 /// How long a finished command waits for the watcher to acknowledge its flush marker.
 ///
 /// Native Windows file notifications are slower and less prompt than inotify or
@@ -34,7 +37,7 @@ pub(crate) struct FlushControl {
     #[cfg(any(target_os = "linux", target_os = "macos", windows))]
     marker_directory: Mutex<Option<PathBuf>>,
     #[cfg(target_os = "macos")]
-    native: Mutex<Option<mpsc::Sender<FlushRequest>>>,
+    native: Mutex<Option<NativeFlushSender>>,
     #[cfg(test)]
     pub(crate) force_timeout: std::sync::atomic::AtomicBool,
 }
@@ -48,6 +51,24 @@ pub(super) struct FlushRequest {
     pub(super) flushed: Option<mpsc::Sender<()>>,
 }
 
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug)]
+struct NativeFlushSender {
+    requests: mpsc::Sender<FlushRequest>,
+    wake: std::sync::Weak<mpsc::Sender<Message>>,
+}
+
+#[cfg(target_os = "macos")]
+impl NativeFlushSender {
+    fn send(&self, request: FlushRequest) -> bool {
+        // The separate request queue lets the backend flush promptly even when
+        // there are already native event batches waiting to be forwarded.
+        self.wake.upgrade().is_some_and(|wake| {
+            self.requests.send(request).is_ok() && wake.send(Message::Wake).is_ok()
+        })
+    }
+}
+
 impl FlushControl {
     /// Test-only comparison with the native flush, without waiting for a marker event.
     #[cfg(all(test, target_os = "macos"))]
@@ -59,13 +80,11 @@ impl FlushControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
             .is_some_and(|native| {
-                native
-                    .send(FlushRequest {
-                        deadline,
-                        flushed: Some(tx),
-                        marker_id: None,
-                    })
-                    .is_ok()
+                native.send(FlushRequest {
+                    deadline,
+                    flushed: Some(tx),
+                    marker_id: None,
+                })
             })
             && rx
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -79,12 +98,18 @@ impl FlushControl {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(path);
     }
     #[cfg(target_os = "macos")]
-    pub(super) fn register_native(&self) -> mpsc::Receiver<FlushRequest> {
+    pub(super) fn register_native(
+        &self,
+        wake: &std::sync::Arc<mpsc::Sender<Message>>,
+    ) -> mpsc::Receiver<FlushRequest> {
         let (tx, rx) = mpsc::channel();
         *self
             .native
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(tx);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(NativeFlushSender {
+            requests: tx,
+            wake: std::sync::Arc::downgrade(wake),
+        });
         rx
     }
     #[cfg(target_os = "macos")]

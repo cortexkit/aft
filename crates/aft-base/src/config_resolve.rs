@@ -27,7 +27,9 @@ use crate::feature_config;
 use crate::harness::Harness;
 use crate::jsonc::strip_jsonc;
 
+mod parsed;
 pub mod schema;
+pub(crate) use parsed::ParsedConfigDocument;
 
 const FOREGROUND_WAIT_WINDOW_DEFAULT_MS: u64 = 15_000;
 const FOREGROUND_WAIT_WINDOW_MIN_MS: u64 = 5_000;
@@ -1025,6 +1027,14 @@ pub fn resolve_config_for_harness(
     tiers: &[ConfigTier],
     harness: Option<&Harness>,
 ) -> ResolveResult {
+    let documents: Vec<_> = tiers.iter().map(ParsedConfigDocument::new).collect();
+    resolve_parsed_config_for_harness(tiers.iter().zip(&documents), harness)
+}
+
+pub(crate) fn resolve_parsed_config_for_harness<'a>(
+    tiers: impl Iterator<Item = (&'a ConfigTier, &'a ParsedConfigDocument)> + Clone,
+    harness: Option<&Harness>,
+) -> ResolveResult {
     let mut merged = RawAftConfig::default();
     let mut lsp_user_max_servers = 8;
     let mut dropped = Vec::new();
@@ -1033,19 +1043,9 @@ pub fn resolve_config_for_harness(
     // A name retired two or more releases ago refuses only the user config,
     // which AFT rewrites itself; a project config's old names are translated
     // below with a notice (see `removed_config_key_errors_for_file`).
-    let errors: Vec<String> = tiers
-        .iter()
-        .map(|tier| {
-            serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
-                .ok()
-                .and_then(|value| {
-                    value.as_object().map(|map| {
-                        feature_config::removed_config_key_errors_for_file(map, tier.tier == "user")
-                    })
-                })
-                .unwrap_or_default()
-        })
-        .find(|errors| !errors.is_empty())
+    let errors = tiers
+        .clone()
+        .find_map(|(_, doc)| (!doc.removed_keys.is_empty()).then(|| doc.removed_keys.clone()))
         .unwrap_or_default();
     if !errors.is_empty() {
         return ResolveResult {
@@ -1056,15 +1056,15 @@ pub fn resolve_config_for_harness(
         };
     }
 
-    let mut parsed = Vec::with_capacity(tiers.len());
-    for tier in tiers {
-        let outcome = match parse_tier(tier, harness, &mut warnings, &mut dropped) {
+    let mut parsed = Vec::with_capacity(tiers.size_hint().0);
+    for (tier, doc) in tiers.clone() {
+        let outcome = match parse_tier_document(tier, doc, harness, &mut warnings, &mut dropped) {
             Ok(outcome) => outcome,
             Err(errors) => {
                 // A rejected candidate still records where caches belong, or
                 // that the user file leaves it unknown, so caches stay off
                 // rather than falling back to the storage root.
-                let config = cache_location_checked_config(tiers, &mut warnings);
+                let config = cache_location_checked_config(tiers.clone(), &mut warnings);
                 return ResolveResult {
                     config: rejected_cache_config(tiers, config, &errors),
                     dropped,
@@ -1166,7 +1166,7 @@ pub fn resolve_config_for_harness(
         }
     }
 
-    let mut config = cache_location_checked_config(tiers, &mut warnings);
+    let mut config = cache_location_checked_config(tiers.clone(), &mut warnings);
     if let Err(missing) = apply_resolved_config(&merged, &mut config, &mut warnings) {
         return ResolveResult {
             config: rejected_cache_config(tiers, config, &missing),
@@ -1226,15 +1226,12 @@ pub fn resolve_config_for_harness(
 /// A default config carrying the user tier's cache-location verdict: when the
 /// user file is unreadable or its storage section invalid, the cache location
 /// is unknown and a `cache_dir_config_unknown` warning says so.
-fn cache_location_checked_config(
-    tiers: &[ConfigTier],
+fn cache_location_checked_config<'a>(
+    mut tiers: impl Iterator<Item = (&'a ConfigTier, &'a ParsedConfigDocument)>,
     warnings: &mut Vec<ConfigWarning>,
 ) -> Config {
     let mut config = Config::default();
-    config.cache_config_unknown = tiers
-        .iter()
-        .filter(|tier| tier.tier == "user")
-        .find_map(cache_location_config_error);
+    config.cache_config_unknown = tiers.find_map(|(_, doc)| doc.cache_location_error.clone());
     if let Some(reason) = &config.cache_config_unknown {
         warnings.push(ConfigWarning {
             code: "cache_dir_config_unknown", key: "storage.cache_dir", tier: "user".into(),
@@ -1245,21 +1242,18 @@ fn cache_location_checked_config(
     config
 }
 
-fn rejected_cache_config(tiers: &[ConfigTier], mut config: Config, errors: &[String]) -> Config {
+fn rejected_cache_config<'a>(
+    tiers: impl Iterator<Item = (&'a ConfigTier, &'a ParsedConfigDocument)>,
+    mut config: Config,
+    errors: &[String],
+) -> Config {
     if config.cache_dir.is_none() {
         // Read only `storage.cache_dir` from the user document itself: the
         // candidate was rejected, possibly for another section, so the tier
         // as a whole may not parse.
         let mut choice = None;
-        for tier in tiers.iter().filter(|tier| tier.tier == "user") {
-            if let Some(next) = serde_json::from_str::<Value>(&strip_jsonc(&tier.doc))
-                .ok()
-                .and_then(|doc| {
-                    parse_cache_dir(doc.get("storage")?.get("cache_dir").cloned()?).ok()
-                })
-            {
-                merge_cache_dir(&mut choice, next);
-            }
+        for next in tiers.filter_map(|(_, doc)| doc.cache_choice_after_rejection.clone()) {
+            merge_cache_dir(&mut choice, next);
         }
         match choice {
             Some(RawCacheDir::Dir { path: raw }) => {
@@ -1426,28 +1420,33 @@ fn first_superseded_note(source: &str, key: &str, message: &str) -> bool {
         .insert(format!("{source}\u{0}{key}\u{0}{message}"))
 }
 
+#[cfg(test)]
 fn parse_tier(
     tier: &ConfigTier,
     harness: Option<&Harness>,
     warnings: &mut Vec<ConfigWarning>,
     dropped: &mut Vec<DroppedKey>,
 ) -> Result<(RawAftConfig, feature_config::DocumentTranslation), Vec<String>> {
-    let stripped = strip_jsonc(&tier.doc);
-    let value = serde_json::from_str::<Value>(&stripped)
-        .map_err(|_| vec!["invalid_config_document".to_string()])?;
-    let Value::Object(mut map) = value else {
-        return Err(vec!["invalid_config_document".to_string()]);
-    };
-    // Retired keys are translated on the raw document, before the strict
-    // schema sees it, so they never reach `RawAftConfig`; the names retired in
-    // 0.62 or earlier were already refused by `removed_config_key_errors`. Only the user
-    // tier's base block may receive the absent-base default disables.
-    let document_tier = if tier.tier == "user" {
-        feature_config::DocumentTier::User
-    } else {
-        feature_config::DocumentTier::Project
-    };
-    let translation = feature_config::translate_document(&mut map, document_tier);
+    parse_tier_document(
+        tier,
+        &ParsedConfigDocument::new(tier),
+        harness,
+        warnings,
+        dropped,
+    )
+}
+
+fn parse_tier_document(
+    tier: &ConfigTier,
+    doc: &ParsedConfigDocument,
+    harness: Option<&Harness>,
+    warnings: &mut Vec<ConfigWarning>,
+    dropped: &mut Vec<DroppedKey>,
+) -> Result<(RawAftConfig, feature_config::DocumentTranslation), Vec<String>> {
+    let (mut map, translation) = doc
+        .translated
+        .clone()
+        .ok_or_else(|| vec!["invalid_config_document".to_string()])?;
     // Machine limits cannot be selected by repositories or harness blocks.
     // Drop even malformed values before validating neighbouring security keys.
     if tier.tier != "user" && map.remove("memory").is_some() {
@@ -1692,15 +1691,14 @@ pub(crate) fn storage_like_key(key: &str, value: Option<&Value>) -> bool {
 /// Why a user tier leaves its cache location unknown. Storage sections and
 /// storage-like typos fail closed; unrelated unknown keys retain partial parsing.
 pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
-    let stripped = strip_jsonc(&tier.doc);
-    let value = match serde_json::from_str::<Value>(&stripped) {
-        Ok(value) => value,
-        Err(error) => return Some(format!("{} does not parse: {error}", tier.source)),
-    };
-    let Value::Object(map) = value else {
-        return Some(format!("{} is not a JSON object", tier.source));
-    };
-    if let Some(error) = feature_config::removed_config_key_errors(&map)
+    match parsed::parse_config_object(tier) {
+        Ok(map) => cache_location_error_for_map(tier, &map),
+        Err(error) => Some(error),
+    }
+}
+
+fn cache_location_error_for_map(tier: &ConfigTier, map: &Map<String, Value>) -> Option<String> {
+    if let Some(error) = feature_config::removed_config_key_errors(map)
         .into_iter()
         .find(|error| error.contains("storage"))
     {
@@ -1724,7 +1722,7 @@ pub fn cache_location_config_error(tier: &ConfigTier) -> Option<String> {
                 })
         })
     };
-    if let Some(error) = unknown_key(&map) {
+    if let Some(error) = unknown_key(map) {
         return Some(format!("{} has an invalid setting: {error}", tier.source));
     }
     // Stricter than the resolver's RawStorage: a misspelled key inside

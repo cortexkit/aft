@@ -1,5 +1,6 @@
 use super::super::*;
-use super::convert_recorded;
+use super::{convert_recorded, extract_recorded};
+use crate::data_layer::content::{parses_of_for_test, record_key};
 use aft_store::family::BuildScratch;
 
 const SOURCE: &str = "class Broken { static void M() {} void Call() { Broken.M(); } }";
@@ -115,7 +116,9 @@ fn record_conversion_failure_is_counted_and_warned_in_refresh() {
         let live = checkout.write_live();
         let change = &live.changes[PATH.as_bytes()];
         let mut source = change.content.source.lock().unwrap();
-        let failed = convert_recorded(&source.take().unwrap(), &invalid);
+        let recorded = source.take().unwrap();
+        let key = record_key(recorded.content, &recorded.language);
+        let failed = convert_recorded(&recorded.path, key, &invalid);
         assert!(matches!(failed, Extracted::ConversionFailed));
         assert!(change.content.extracted.set(failed).is_ok());
         drop(source);
@@ -125,4 +128,135 @@ fn record_conversion_failure_is_counted_and_warned_in_refresh() {
         assert!(checkout.refresh_callgraph().unwrap().is_none());
     });
     check_warning(&logs, PATH, &reason);
+}
+
+fn bound_checkout(root: &Path, store: &Path) -> Checkout {
+    Checkout::bind(
+        Arc::new(DataLayer::new(8 << 20, 2)),
+        store,
+        FamilyId::from_digest(Digest128::of(b"changed content reuse")),
+        root,
+    )
+    .unwrap()
+}
+
+fn changed_source(checkout: &Checkout, path: &str) -> (Arc<ChangeContent>, Arc<RecordedSource>) {
+    let change = Arc::clone(&checkout.live.read().unwrap().changes[path.as_bytes()].content);
+    assert!(change.peek().is_none(), "recording does not extract");
+    let source = change.source.lock().unwrap().clone().unwrap();
+    (change, source)
+}
+
+#[test]
+fn refresh_reuses_a_sibling_content_record_without_parsing() {
+    let sibling_root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let checkout = bound_checkout(root.path(), store.path());
+    std::fs::write(root.path().join("unrelated.rs"), "fn unrelated() {}\n").unwrap();
+    checkout.build().unwrap();
+
+    let source =
+        b"// TODO: keep the record across paths\nfn original() {}\nfn caller() { original(); }\n";
+    let sibling = bound_checkout(sibling_root.path(), store.path());
+    std::fs::write(sibling_root.path().join("original.rs"), source).unwrap();
+    sibling.build().unwrap();
+
+    let path = "copied.rs";
+    std::fs::write(root.path().join(path), source).unwrap();
+    checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+    let (change, recorded) = changed_source(&checkout, path);
+    let before = parses_of_for_test(source);
+    checkout.refresh_callgraph().unwrap().unwrap();
+    assert_eq!(parses_of_for_test(source), before, "a hit never parses");
+
+    let Extracted::Parse(key, parse, encoded) = change.get() else {
+        panic!("expected a parsed record on a hit");
+    };
+    let Extracted::Parse(fresh_key, fresh_parse, fresh_encoded) =
+        extract_recorded(&recorded, &StoredRecords::default())
+    else {
+        panic!("expected a freshly parsed record");
+    };
+    assert_eq!(key, &fresh_key);
+    assert_eq!(parse, &fresh_parse);
+    assert_eq!(encoded, &fresh_encoded);
+    checkout.publish_changes().unwrap().unwrap();
+    let published = checkout
+        .family_records()
+        .unwrap()
+        .record(record_key(recorded.content, &recorded.language));
+    assert_eq!(
+        published.as_ref().map(EncodedRecord::of),
+        Some((*fresh_encoded).clone())
+    );
+}
+
+#[test]
+fn refresh_parses_a_content_record_miss() {
+    let root = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let checkout = bound_checkout(root.path(), store.path());
+    std::fs::write(root.path().join("previous.rs"), "fn previous() {}\n").unwrap();
+    checkout.build().unwrap();
+
+    let path = "new.rs";
+    let source = b"fn never_stored_for_this_refresh() {}\n";
+    std::fs::write(root.path().join(path), source).unwrap();
+    checkout.record_paths(&[path.as_bytes().to_vec()]).unwrap();
+    let (change, recorded) = changed_source(&checkout, path);
+    assert!(checkout
+        .family_records()
+        .unwrap()
+        .record(record_key(recorded.content, &recorded.language))
+        .is_none());
+    let before = parses_of_for_test(source);
+    checkout.refresh_callgraph().unwrap().unwrap();
+    assert_eq!(parses_of_for_test(source), before + 1);
+    assert!(matches!(change.get(), Extracted::Parse(..)));
+}
+
+#[test]
+fn refresh_reuses_config_comment_markers_without_parsing() {
+    let root = tempfile::tempdir().unwrap();
+    let store = tempfile::tempdir().unwrap();
+    let checkout = bound_checkout(root.path(), store.path());
+    let source = b"# TODO: carry the workspace marker\n[workspace]\nmembers = []\n";
+    std::fs::write(root.path().join("Cargo.toml"), source).unwrap();
+    checkout.build().unwrap();
+
+    let path = "nested/Cargo.toml";
+    std::fs::create_dir(root.path().join("nested")).unwrap();
+    std::fs::rename(root.path().join("Cargo.toml"), root.path().join(path)).unwrap();
+    checkout
+        .record_paths(&[b"Cargo.toml".to_vec(), path.as_bytes().to_vec()])
+        .unwrap();
+    let (change, recorded) = changed_source(&checkout, path);
+    let before = parses_of_for_test(source);
+    let markers = checkout
+        .todo_markers(
+            &checkout.view().unwrap(),
+            &[path.as_bytes().to_vec()],
+            u64::MAX,
+        )
+        .unwrap();
+    assert!(matches!(markers.as_slice(), [PathTodos::Recorded(Some(_))]));
+    checkout.refresh_callgraph().unwrap().unwrap();
+    assert_eq!(
+        parses_of_for_test(source),
+        before,
+        "stored config TODOs need no grammar"
+    );
+
+    let Extracted::Config(config, encoded) = change.get() else {
+        panic!("expected a config record");
+    };
+    let Extracted::Config(fresh_config, fresh_encoded) =
+        extract_recorded(&recorded, &StoredRecords::default())
+    else {
+        panic!("expected a freshly extracted config record");
+    };
+    assert!(fresh_encoded.todos().unwrap().is_some());
+    assert_eq!(config, &fresh_config);
+    assert_eq!(encoded, &fresh_encoded);
 }

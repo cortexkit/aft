@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { getActiveLogger, setActiveLogger } from "../active-logger.js";
 import {
   __fileDigestWorkForTests,
   cachedFileSha256,
@@ -13,6 +14,9 @@ import { __test__ } from "../onnx-runtime.js";
 
 test("ONNX stamped startups hash zero bytes and reject a changed library", async () => {
   const root = mkdtempSync(join(tmpdir(), "aft-onnx-stamp-"));
+  const previousLogger = getActiveLogger();
+  const errors: string[] = [];
+  setActiveLogger({ log: () => {}, warn: () => {}, error: (line) => errors.push(line) });
   try {
     const dir = join(root, "onnxruntime", __test__.ORT_VERSION);
     mkdirSync(dir, { recursive: true });
@@ -39,7 +43,10 @@ test("ONNX stamped startups hash zero bytes and reject a changed library", async
       await __test__.resolveOnnxRuntime(root, { platformInfo: null, systemSearchPaths: [] }),
     ).toBeNull();
     expect(__fileDigestWorkForTests().asyncHashes - before.asyncHashes).toBe(1);
+    expect(errors).toHaveLength(1);
+    expect(errors[0]).toContain("npx @cortexkit/aft doctor --fix");
   } finally {
+    setActiveLogger(previousLogger!);
     rmSync(root, { recursive: true, force: true });
   }
 });

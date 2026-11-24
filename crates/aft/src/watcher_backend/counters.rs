@@ -101,6 +101,12 @@ struct WatcherLossRecovery {
 #[derive(Debug, Default)]
 pub(crate) struct WatcherCounters {
     pub(crate) bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    matcher_wakes: Mutex<Vec<MatcherWake>>,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(super) backend_activity: Mutex<(u64, u64)>,
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+    pub(super) matcher_registration_gate: Mutex<Option<super::activity_tests::RegistrationGate>>,
     pub(crate) bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
     overflow_ignore_evidence: AtomicU8,
     /// Legacy rescan work coalesces repeated drops, but a newly installed views
@@ -151,6 +157,13 @@ pub(crate) struct WatcherCounters {
     dispatch_backlog_events: AtomicUsize,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug)]
+struct MatcherWake {
+    generation: std::sync::Weak<AtomicU64>,
+    sender: std::sync::Weak<std::sync::mpsc::Sender<super::mailbox::Message>>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WatcherRescanInterval {
     pub(crate) raw_events: u64,
@@ -167,6 +180,36 @@ impl Drop for DirectoryArrivalGuard<'_> {
 }
 
 impl WatcherCounters {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn register_matcher_wake(
+        &self,
+        generation: &Arc<AtomicU64>,
+        sender: &Arc<std::sync::mpsc::Sender<super::mailbox::Message>>,
+    ) -> u64 {
+        let mut wakes = self.matcher_wakes.lock().unwrap();
+        wakes.retain(|wake| wake.sender.strong_count() != 0);
+        wakes.push(MatcherWake {
+            generation: Arc::downgrade(generation),
+            sender: Arc::downgrade(sender),
+        });
+        drop(wakes);
+        #[cfg(test)]
+        super::activity_tests::pause_after_matcher_registration(self);
+        // A publication either precedes this read or can now wake the backend.
+        generation.load(Ordering::Acquire)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn wake_for_matcher(&self, generation: &Arc<AtomicU64>) {
+        self.matcher_wakes.lock().unwrap().retain(|wake| {
+            let Some(sender) = wake.sender.upgrade() else {
+                return false;
+            };
+            wake.generation.as_ptr() != Arc::as_ptr(generation)
+                || sender.send(super::mailbox::Message::Wake).is_ok()
+        });
+    }
+
     pub(crate) fn note_directory_arrival(&self) {
         self.directory_arrivals_total
             .fetch_add(1, Ordering::Relaxed);

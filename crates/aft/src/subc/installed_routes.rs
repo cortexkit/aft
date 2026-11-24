@@ -1,5 +1,71 @@
 //! Installed-route bookkeeping, including per-runner status key-value lifetimes.
 use super::*;
+use crate::subc_config::BindConfigCache;
+
+#[derive(Default)]
+pub(super) struct RootChannels {
+    pub(super) channels: HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    pub(super) config: BindConfigCache,
+}
+
+impl std::ops::Deref for RootChannels {
+    type Target = HashMap<ProjectRootId, HashSet<RouteChannel>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.channels
+    }
+}
+
+impl RootChannels {
+    pub(super) fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub(super) fn remove(&mut self, root: &ProjectRootId) {
+        self.channels.remove(root);
+        self.config.release_project(root.as_path());
+    }
+
+    pub(super) fn release_if_unbound(
+        &mut self,
+        root: &ProjectRootId,
+        pending_binds: &HashMap<RouteChannel, PendingBind>,
+        replacement_root: Option<&ProjectRootId>,
+    ) -> bool {
+        let has_pending_bind = pending_binds
+            .values()
+            .any(|bind| &bind.bind_root_id == root);
+        if should_quiesce_removed_root(root, self, has_pending_bind, replacement_root) {
+            self.config.release_project(root.as_path());
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+impl From<HashMap<ProjectRootId, HashSet<RouteChannel>>> for RootChannels {
+    fn from(channels: HashMap<ProjectRootId, HashSet<RouteChannel>>) -> Self {
+        Self {
+            channels,
+            ..Self::default()
+        }
+    }
+}
+
+pub(super) fn remove_root_channel(
+    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root: &ProjectRootId,
+    channel: RouteChannel,
+) {
+    if let Some(channels) = root_channels.get_mut(root) {
+        channels.remove(&channel);
+        if channels.is_empty() {
+            root_channels.remove(root);
+        }
+    }
+}
 
 pub(super) fn status_unbound(route: &RouteIdentity) {
     crate::late_result_bus::status::route_unbound(Arc::as_ptr(&route.0) as usize, &route.session);
@@ -49,6 +115,51 @@ pub(super) fn insert_route_channel(
 mod tests {
     use super::*;
     use crate::subc::test_support::{route_identity, test_root};
+
+    #[test]
+    fn parsed_project_config_leaves_with_last_route_but_survives_replacement() {
+        use crate::{harness::Harness, subc_config::PreparedBindConfig};
+        let (_dir, root) = test_root("route-config-lifetime");
+        let path = root.as_path().join(".cortexkit/aft.jsonc");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "{}").unwrap();
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_600_000_000, 0))
+            .unwrap();
+        let mut routes = HashMap::new();
+        let mut roots = RootChannels::default();
+        let first = route_key(71, 1);
+        let second = route_key(72, 1);
+        let bind = |roots: &mut RootChannels| {
+            PreparedBindConfig::read_cached(
+                &mut roots.config,
+                None,
+                None,
+                root.as_path(),
+                root.as_path(),
+                &Harness::Opencode,
+            )
+            .unwrap();
+        };
+        bind(&mut roots);
+        for route in [first, second] {
+            insert_route_channel(
+                &mut routes,
+                &mut roots.channels,
+                route,
+                route_identity(&root, "config-lifetime"),
+            );
+        }
+        remove_route_channel(&mut routes, &mut roots.channels, first);
+        assert!(!roots.release_if_unbound(&root, &HashMap::new(), None));
+        bind(&mut roots);
+        remove_route_channel(&mut routes, &mut roots.channels, second);
+        assert!(!roots.release_if_unbound(&root, &HashMap::new(), Some(&root)));
+        bind(&mut roots);
+        assert_eq!(roots.config.file_parses(), 1);
+        assert!(roots.release_if_unbound(&root, &HashMap::new(), None));
+        bind(&mut roots);
+        assert_eq!(roots.config.file_parses(), 2);
+    }
 
     #[test]
     fn status_kv_tracks_installed_routes_and_channel_replacement() {
@@ -111,7 +222,7 @@ pub(super) async fn process_route_bind_completion(
     on_management_install: impl FnOnce(&ManagementIdentity),
     management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,

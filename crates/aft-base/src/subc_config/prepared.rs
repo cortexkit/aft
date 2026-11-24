@@ -1,6 +1,7 @@
 //! Trusted-local config observations retained across a bind's configure attempts.
 
-use super::*;
+use super::{bind_cache::ObservedFile, *};
+use crate::config_resolve::resolve_parsed_config_for_harness;
 use std::cell::RefCell;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -8,13 +9,7 @@ use std::sync::Arc;
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
-const CONFIG_FILE_LIMIT: usize = 1024 * 1024;
-
-#[derive(Clone, Debug)]
-pub(crate) enum ConfigObservation {
-    Present(ConfigTier),
-    Missing,
-}
+pub(super) const CONFIG_FILE_LIMIT: usize = 1024 * 1024;
 
 #[derive(Debug)]
 pub struct ConfigObservationError {
@@ -57,47 +52,57 @@ impl PreparedBindConfig {
         root: &Path,
         harness: &Harness,
     ) -> Result<Arc<Self>, ConfigObservationError> {
-        let mut observations = Vec::new();
-        let mut migration = None;
-        if let Some(user) = approved_user {
-            observations.push(ConfigObservation::Present(user.snapshot()));
+        Self::read_cached(
+            &mut BindConfigCache::default(),
+            user_path,
+            approved_user,
+            root,
+            root,
+            harness,
+        )
+    }
+
+    pub fn read_cached(
+        cache: &mut BindConfigCache,
+        user_path: Option<&Path>,
+        approved_user: Option<&ApprovedUser>,
+        root: &Path,
+        root_key: &Path,
+        harness: &Harness,
+    ) -> Result<Arc<Self>, ConfigObservationError> {
+        let (user, migration) = if let Some(user) = approved_user {
+            (Some(ObservedFile::approved(user.snapshot())), None)
         } else if let Some(path) = user_path {
-            // Distinguish a missing user file from other read errors before
-            // migration. Migration's own rereads use the same byte limit.
-            let first = observe(path, "user")?;
-            if matches!(first, ConfigObservation::Present(_)) {
-                migration =
-                    crate::config_fix::auto_migrate_user_config_bounded(path, CONFIG_FILE_LIMIT)
-                        .map_err(|error| unknown(path, &error))?;
-                observations.push(observe(path, "user")?);
-            } else {
-                observations.push(first);
-            }
-        }
+            cache.observe(path, None)?
+        } else {
+            (None, None)
+        };
         let mut project_path = cortexkit_project_config_path(root);
+        let mut project = None;
         for candidate in super::project_config_candidates(root, Some(harness)) {
-            let observation = observe(&candidate, "project")?;
-            let present = matches!(observation, ConfigObservation::Present(_));
-            if present {
+            if let (Some(file), _) = cache.observe(&candidate, Some(root_key))? {
                 project_path = candidate;
-                observations.push(observation);
+                project = Some(file);
                 break;
             }
-            observations.push(observation);
         }
-        let tiers: Vec<_> = observations
-            .iter()
-            .filter_map(|observation| match observation {
-                ConfigObservation::Present(tier) => Some(tier.clone()),
-                ConfigObservation::Missing => None,
-            })
-            .collect();
-        let resolution = crate::config_resolve::resolve_config_for_harness(&tiers, Some(harness));
+        let files = user.iter().chain(&project).map(|file| &file.parsed);
+        let resolution = resolve_parsed_config_for_harness(
+            files.clone().map(|file| (&file.tier, &file.document)),
+            Some(harness),
+        );
         if !resolution.errors.is_empty() {
             return Err(ConfigObservationError {
                 code: "config_rejected",
                 detail: format!("configuration rejected: {}", resolution.errors.join(", ")),
             });
+        }
+        let tiers = files.map(|file| file.tier.clone()).collect();
+        if let Some(user) = user {
+            cache.remember(user, None);
+        }
+        if let Some(project) = project {
+            cache.remember(project, Some(root_key));
         }
         Ok(Arc::new(Self {
             snapshot_id: NEXT_SNAPSHOT_ID.fetch_add(1, Ordering::Relaxed),
@@ -153,7 +158,7 @@ impl PreparedBindConfig {
     }
 }
 
-fn unknown(path: &Path, error: &std::io::Error) -> ConfigObservationError {
+pub(super) fn unknown(path: &Path, error: &std::io::Error) -> ConfigObservationError {
     ConfigObservationError {
         code: "config_unknown",
         detail: format!(
@@ -162,25 +167,6 @@ fn unknown(path: &Path, error: &std::io::Error) -> ConfigObservationError {
             error
         ),
     }
-}
-
-fn observe(path: &Path, tier: &str) -> Result<ConfigObservation, ConfigObservationError> {
-    // Shared open: on Windows this handle shares delete, so a tool may replace
-    // the file while the bind reads it instead of being refused access.
-    let file = match crate::config::open_config_file(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(ConfigObservation::Missing)
-        }
-        Err(error) => return Err(unknown(path, &error)),
-    };
-    let doc =
-        read_bounded_config(file, CONFIG_FILE_LIMIT).map_err(|error| unknown(path, &error))?;
-    Ok(ConfigObservation::Present(ConfigTier {
-        tier: tier.into(),
-        source: path.to_string_lossy().into_owned(),
-        doc,
-    }))
 }
 
 /// Bound I/O itself, including migration's locked reread, rather than reading

@@ -6,7 +6,7 @@
  : (view.completion.outcome ?? view.record.outcome) == "partial" ? <ToolText text="Partly applied" size="small" tone="warning" />
  : (view.completion.outcome ?? view.record.outcome) == "error" ? <ToolText text="Failed" size="small" tone="danger" />
  : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null
- ? <Card appearance="clear" direction="row" gap="xs"><ToolText text={"+" + Text(view.completion.addedLines ?? view.record.addedLines)} font="mono" size="small" tone="success" /><ToolText text={"−" + Text(view.completion.removedLines ?? view.record.removedLines)} font="mono" size="small" tone="danger" /></Card>
+ ? <Card appearance="clear" direction="row" gap="xs"><ToolText text={"+" + Text(view.completion.addedLines ?? view.record.addedLines)} font="mono" size="small" tone="success" width="natural" /><ToolText text={"−" + Text(view.completion.removedLines ?? view.record.removedLines)} font="mono" size="small" tone="danger" width="natural" /></Card>
  : view.call.phase == "running" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}
 </Slot>
 </ToolHeader>

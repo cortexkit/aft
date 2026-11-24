@@ -104,7 +104,7 @@ async fn accept_module_hello(listener: &TcpListener) -> (TcpStream, ModuleHelloB
     // the protocol struct that the module uses to serialize it. The manifest
     // itself varies with the host's supported tools and build provenance.
     let suffix = format!(
-        r#","protocol_ver":{PROTOCOL_VERSION},"control_ops":["route.bind","route.status","health.check"],"launch_nonce":"{PIPE_NONCE}"}}"#
+        r#","protocol_ver":{PROTOCOL_VERSION},"control_ops":["route.bind","route.status","health.check","config.review"],"launch_nonce":"{PIPE_NONCE}"}}"#
     );
     assert!(hello.body.starts_with(br#"{"manifest":{"#));
     assert!(

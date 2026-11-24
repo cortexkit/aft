@@ -657,6 +657,8 @@ impl WatcherExclusionPaths {
     // read the combined exclusion list.
     #[cfg(any(unix, test))]
     pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+        EXCLUSION_TEST_PATHS.with(|calls| calls.set(calls.get() + 1));
         self.lasting
             .iter()
             .map(|entry| entry.path.clone())
@@ -775,6 +777,11 @@ impl WatcherExclusionPaths {
         }
         self.external != previous
     }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+thread_local! {
+    pub(crate) static EXCLUSION_TEST_PATHS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1102,6 +1109,12 @@ pub(crate) enum WatcherExclusionUpdate {
 
 #[cfg(any(target_os = "macos", target_os = "linux", test))]
 impl WatcherExclusionRetry {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn retry_deadline(&self) -> Option<Instant> {
+        self.retry_at
+            .filter(|_| self.attempts < EXCLUSION_PLAN_MAX_ATTEMPTS)
+    }
+
     /// Install completed plans, or remove stale exclusions when a new matcher
     /// cannot be planned yet. Retrying the full plan keeps its own budget.
     pub(crate) fn replacement(

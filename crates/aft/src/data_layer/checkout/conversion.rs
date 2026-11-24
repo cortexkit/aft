@@ -1,9 +1,9 @@
 //! Conversion of extracted content records to call-graph inputs.
 
 use super::super::{content, grammar};
-use super::{staged_records, Extracted, RecordedSource};
+use super::{staged_records, Extracted, RecordedSource, StoredRecords};
 use crate::callgraph_store::join::{CallgraphBlob, ParseBlob};
-use aft_store::content::{ContentRecord, EncodedRecord, RecordBody};
+use aft_store::content::{ContentRecord, EncodedRecord, RecordBody, RecordKey};
 use std::sync::Arc;
 
 pub(super) fn parse_record(record: &ContentRecord) -> Result<ParseBlob, String> {
@@ -37,7 +37,15 @@ pub(super) fn staged_failure(
 
 /// What the call graph reads from a changed file. As in a cold build, a
 /// file whose record cannot be converted has no parse.
-pub(super) fn extract_recorded(source: &RecordedSource) -> Extracted {
+pub(super) fn extract_recorded(source: &RecordedSource, stored: &StoredRecords) -> Extracted {
+    let key = content::record_key(source.content, &source.language);
+    if let Some(record) = stored.record(key) {
+        // The stored record already includes config TODOs. The key's
+        // language includes the grammar that read them.
+        if let Ok(extracted) = try_convert_recorded(key, &record) {
+            return extracted;
+        }
+    }
     let mut extracted = match grammar::extract(&source.bytes, &source.language) {
         Ok(record) => record,
         Err(error) => {
@@ -48,30 +56,29 @@ pub(super) fn extract_recorded(source: &RecordedSource) -> Extracted {
         // Without them a configuration file's TODOs are reported unread.
         let _ = content::add_config_markers(&mut extracted, path, &source.bytes);
     }
-    convert_recorded(source, &extracted)
+    convert_recorded(&source.path, key, &extracted)
 }
 
-fn convert_recorded(source: &RecordedSource, record: &ContentRecord) -> Extracted {
-    match &record.data {
+fn convert_recorded(path: &[u8], key: RecordKey, record: &ContentRecord) -> Extracted {
+    try_convert_recorded(key, record).unwrap_or_else(|reason| {
+        warn_conversion_failure(&String::from_utf8_lossy(path), &reason);
+        Extracted::ConversionFailed
+    })
+}
+
+fn try_convert_recorded(key: RecordKey, record: &ContentRecord) -> Result<Extracted, String> {
+    Ok(match &record.data {
         RecordBody::Config { source } => {
             let source = Arc::from(source.as_slice());
             Extracted::Config(source, Arc::new(EncodedRecord::of(record)))
         }
         RecordBody::Markers => Extracted::Markers(Arc::new(EncodedRecord::of(record))),
-        RecordBody::Parsed { .. } => match parse_record(record) {
-            Ok(parse) => Extracted::Parse(
-                content::record_key(source.content, &source.language)
-                    .digest()
-                    .to_string(),
-                Arc::new(parse),
-                Arc::new(EncodedRecord::of(record)),
-            ),
-            Err(reason) => {
-                warn_conversion_failure(&String::from_utf8_lossy(&source.path), &reason);
-                Extracted::ConversionFailed
-            }
-        },
-    }
+        RecordBody::Parsed { .. } => Extracted::Parse(
+            key.digest().to_string(),
+            Arc::new(parse_record(record)?),
+            Arc::new(EncodedRecord::of(record)),
+        ),
+    })
 }
 
 #[cfg(test)]

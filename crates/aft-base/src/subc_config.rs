@@ -19,11 +19,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 mod approved;
+mod bind_cache;
 mod prepared;
 pub use approved::ApprovedUser;
+pub use bind_cache::BindConfigCache;
 pub use prepared::{
     current_prepared_bind_config, read_bounded_config, with_prepared_bind_config,
-    PreparedBindConfig,
+    ConfigObservationError, PreparedBindConfig,
 };
 
 /// Legacy AFT config lookup, kept to find files written before AFT used the

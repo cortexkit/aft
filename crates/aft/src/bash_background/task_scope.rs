@@ -7,6 +7,9 @@ pub(crate) use unsupported::*;
 #[path = "scope_kill.rs"]
 mod scope_kill;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use scope_kill::with_scope_kill_open_error_for_test;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use super::super::HardKill;

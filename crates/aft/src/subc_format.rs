@@ -626,7 +626,10 @@ fn format_delete(data: &Value) -> String {
         text.push_str("\nwarning ");
         text.push_str(&warning);
     }
-    text
+    // A partial batch names every path it left and why, so the agent can
+    // retry exactly those (for example in smaller groups) instead of listing
+    // the folder again to find them.
+    append_ast_skipped_files(text, response.get("skipped_files"))
 }
 fn format_move(data: &Value, ctx: &FormatContext) -> String {
     let response = data.as_object();
@@ -1405,7 +1408,7 @@ fn format_bash_status(
 // consumers show the model the same text.
 fn format_bash_kill(data: &Value) -> String {
     let task_id = bash_task_id(data);
-    let outcome = if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
+    let mut outcome = if data.get("kill_signaled").and_then(Value::as_bool) == Some(true) {
         let reached = data
             .get("kill_reached")
             .and_then(Value::as_u64)
@@ -1422,13 +1425,13 @@ fn format_bash_kill(data: &Value) -> String {
             format!("Task {task_id}: {status}")
         }
     };
-    match data
-        .get("bot_write_revocation_warning")
-        .and_then(Value::as_str)
-    {
-        Some(warning) => format!("{outcome}\n{warning}"),
-        None => outcome,
+    for key in ["kill_state_warning", "bot_write_revocation_warning"] {
+        if let Some(warning) = data.get(key).and_then(Value::as_str) {
+            outcome.push('\n');
+            outcome.push_str(warning);
+        }
     }
+    outcome
 }
 
 // Formats a PTY write result exactly as the OpenCode tool does
@@ -4895,6 +4898,25 @@ fn compact_inspect_terminal_field(value: Option<&Value>, fallback: &str) -> Stri
 }
 
 #[cfg(test)]
+mod delete_format_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn partial_delete_names_each_skipped_path_and_reason() {
+        let rendered = format_delete(&json!({
+            "complete": false,
+            "deleted": [{"file": "/repo/a.txt"}, {"file": "/repo/b.txt"}],
+            "skipped_files": [{"file": "/repo/big", "reason": "backup would copy more than 100 MiB"}],
+        }));
+        assert_eq!(
+            rendered,
+            "Deleted 2/3 file(s)\n\nIncomplete: skipped 1 file(s)\n  /repo/big: backup would copy more than 100 MiB"
+        );
+    }
+}
+
+#[cfg(test)]
 mod move_format_tests {
     use super::*;
     use serde_json::json;
@@ -6127,13 +6149,14 @@ mod bot_kill_warning_tests {
     use super::*;
     #[test]
     fn kill_warning_keeps_the_reported_kill_outcome_first() {
+        let state_warning = "The command was stopped, but AFT could not save its state: disk full.";
         let text = format_bash_kill(
-            &serde_json::json!({"task_id":"bash-warning","status":"killed","bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
+            &serde_json::json!({"task_id":"bash-warning","status":"killed","kill_state_warning":state_warning,"bot_write_revocation_warning":crate::gh_shim_speech::REVOCATION_NOT_DURABLE}),
         );
         assert_eq!(
             text,
             format!(
-                "Task bash-warning: killed\n{}",
+                "Task bash-warning: killed\n{state_warning}\n{}",
                 crate::gh_shim_speech::REVOCATION_NOT_DURABLE
             )
         );

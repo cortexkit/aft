@@ -66,7 +66,9 @@ maybeDescribe("e2e delete and move commands", () => {
     const partial = toolResultText(
       await tool.execute({ files: ["partial-delete.txt", "missing-delete.txt"] }, runtime(h)),
     );
-    expect(partial).toBe("Deleted 1/2 file(s)");
+    const skippedPrefix = "Deleted 1/2 file(s)\n\nIncomplete: skipped 1 file(s)\n  ";
+    expect(partial.startsWith(skippedPrefix)).toBe(true);
+    expect(partial.endsWith("missing-delete.txt: file not found")).toBe(true);
     expect(existsSync(partialPath)).toBe(false);
 
     await expect(tool.execute({ files: ["fully-missing.txt"] }, runtime(h))).rejects.toThrow(

@@ -4,7 +4,7 @@ use super::{
 };
 use crate::db::remote_grant_rows::{self as grants, Mode};
 use crate::subc::test_support::{bind_config_without_indexes, test_root};
-use cortexkit_role_tool_provider::call::SchemaPin;
+use cortexkit_role_tool_provider::call::{SchemaPin, ToolMajorPin};
 use tool_provider::CatalogPreset;
 
 const HELD: &str = "held-reply/v1";
@@ -260,6 +260,34 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
             versions.message,
             "This tool differs between the AFT versions on the two computers."
         );
+        let current_read =
+            tool_provider::tools_for_session(CatalogPreset::Head, &[], false, false, false)
+                .into_iter()
+                .find(|tool| tool.name == "read")
+                .unwrap();
+        let major = current_read.version.unwrap().major;
+        for (corr, stale) in [
+            (80, ToolMajorPin::new("read", "0".repeat(64), major)),
+            (
+                81,
+                ToolMajorPin::new("read", &current_read.schema_digest, major + 1),
+            ),
+            (
+                82,
+                ToolMajorPin::new("edit", &current_read.schema_digest, major),
+            ),
+        ] {
+            let mut mismatch = read("head", "a.txt", "stale-tp2");
+            mismatch["schema_pin"] = json!(stale.encode().unwrap());
+            let versions = refusal(
+                rpc(&mut daemon, 3, corr, mismatch).await,
+                "remote_tool_versions_differ",
+            );
+            assert_eq!(
+                versions.message,
+                "This tool differs between the AFT versions on the two computers."
+            );
+        }
         for (channel, corr) in [(1, 13), (4, 14), (5, 15)] {
             refusal(
                 rpc(
@@ -312,7 +340,23 @@ async fn remote_wire_admission_audit_read_and_pairing_custody() {
         assert_eq!(card_count.load(Ordering::Relaxed), 1);
         assert!(READS.lock().unwrap().is_empty());
         let first = reply(rpc(&mut daemon, 1, 21, read("reader", "a.txt", "same-key")).await);
-        let second = reply(rpc(&mut daemon, 2, 22, read("head", "b.txt", "same-key")).await);
+        let versioned_pin = current_read.schema_pin().encode().unwrap();
+        assert!(versioned_pin.starts_with("tp2:"));
+        let second = reply(
+            rpc(
+                &mut daemon,
+                2,
+                22,
+                request(
+                    "read",
+                    "head",
+                    json!({"path":"b.txt"}),
+                    "same-key",
+                    versioned_pin,
+                ),
+            )
+            .await,
+        );
         assert!(text(&first).contains("first pairing contents"), "{first}");
         assert!(
             text(&second).contains("second pairing contents"),
@@ -552,7 +596,7 @@ fn check_rows(db: &record::Db, folder: &Path) {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap();
-    assert_eq!(rows.len(), 14, "{rows:?}");
+    assert_eq!(rows.len(), 17, "{rows:?}");
     for (time, fields) in &rows {
         assert!(*time > 0);
         assert_eq!(fields[0], "b".repeat(32));
@@ -560,12 +604,19 @@ fn check_rows(db: &record::Db, folder: &Path) {
         assert_eq!(fields[4], folder.to_str().unwrap());
     }
     assert_eq!(&rows[0].1[5..], ["read", "refused", "invalid_request"]);
-    assert_eq!(&rows[10].1[5..], ["read", "denied", "remote_access_denied"]);
-    assert_eq!(&rows[11].1[5..], ["read", "saved_grant", "ok"]);
-    assert_eq!(rows[11].1[1], SCOPES[0]);
-    assert_eq!(&rows[12].1[5..], ["read", "saved_grant", "ok"]);
-    assert_eq!(rows[12].1[1], SCOPES[1]);
-    assert_eq!(&rows[13].1[5..], ["read", "replay", "ok"]);
+    for (_, fields) in &rows[2..6] {
+        assert_eq!(fields[1], SCOPES[2]);
+        assert_eq!(
+            &fields[5..],
+            ["read", "refused", "remote_tool_versions_differ"]
+        );
+    }
+    assert_eq!(&rows[13].1[5..], ["read", "denied", "remote_access_denied"]);
+    assert_eq!(&rows[14].1[5..], ["read", "saved_grant", "ok"]);
+    assert_eq!(rows[14].1[1], SCOPES[0]);
+    assert_eq!(&rows[15].1[5..], ["read", "saved_grant", "ok"]);
+    assert_eq!(rows[15].1[1], SCOPES[1]);
+    assert_eq!(&rows[16].1[5..], ["read", "replay", "ok"]);
 }
 
 #[path = "remote_edit_lifetime_tests.rs"]

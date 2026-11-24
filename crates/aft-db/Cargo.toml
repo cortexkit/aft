@@ -25,7 +25,7 @@ tokio = { version = "1", features = ["sync"] }
 blake3 = "1"
 parking_lot = "0.12"
 subc-protocol = "=0.37.4"
-cortexkit-role-tool-provider = "=0.15.15"
+cortexkit-role-tool-provider = "=0.15.17"
 tempfile = { version = "3", optional = true }
 
 [target.'cfg(windows)'.dependencies]

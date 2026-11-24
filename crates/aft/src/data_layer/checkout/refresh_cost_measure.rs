@@ -67,7 +67,7 @@ fn status_mib(field: &str) -> Option<u64> {
     Some(kib >> 10)
 }
 
-fn timed<T>(run: impl FnOnce() -> T) -> (T, String) {
+pub(super) fn timed<T>(run: impl FnOnce() -> T) -> (T, String) {
     // Resets the process's peak resident size to its current one (Linux),
     // so the peak read afterwards is this step's.
     let _ = std::fs::write("/proc/self/clear_refs", "5");

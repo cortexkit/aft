@@ -2964,6 +2964,7 @@ fn runner_notices_final_refusals_stop_without_retry() {
         "scope_owner_mismatch",
         "expired",
         "session_released",
+        "unknown_session",
         "send_id_reuse",
         "delivery_unsupported",
         "invalid_params",

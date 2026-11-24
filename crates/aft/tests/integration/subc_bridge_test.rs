@@ -25,8 +25,7 @@ use aft::subc::{
 use serde_json::{json, Value};
 use subc_protocol::manifest::{ModuleManifest, ProviderRole};
 use subc_protocol::session::{
-    HealthReport, ModuleControlRequest, ModuleControlRequestFromModule, ModuleControlResponse,
-    ModuleControlResponseToModule, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
+    HealthReport, ModuleControlRequest, ModuleControlResponse, MODULE_TO_SUBC_OP_CATALOG_UPDATE,
 };
 use subc_protocol::{
     BindIdentity, ErrorBody, Flags, Frame, FrameType, ModuleHelloAckBody, ModuleHelloBody,
@@ -41,7 +40,9 @@ use tokio::sync::mpsc;
 use super::helpers::ReleaseOnDrop;
 
 mod management_surface;
+mod readiness;
 use management_surface::drive_management_surface_daemon;
+use readiness::{ack_catalog_update, read_ready_catalog_update};
 
 static BRIDGE_STATE: OnceLock<Mutex<Option<Arc<BridgeState>>>> = OnceLock::new();
 static BRIDGE_TEST_SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
@@ -4216,50 +4217,29 @@ async fn drive_readiness_daemon(
     )
     .await;
 
-    // With no artifact warmer installed, readiness starts with the ready flip.
-    // A live-root request here would waste a round trip without warming anything.
+    // With no user file, the ready catalog omits the default-disabled tools
+    // and otherwise preserves the HELLO roles and their metadata.
+    let mut expected_roles = hello_body.manifest.provides;
+    for role in &mut expected_roles {
+        if let ProviderRole::ToolProvider { tools, .. } = role {
+            tools.retain(|tool| !matches!(tool.name.as_str(), "delete" | "move"));
+        }
+    }
 
-    // Fail the first flip attempt; the retry must come.
+    // There are no live-root artifacts to warm in this test, so the first
+    // request must be the ready flip. Refuse it once to exercise the retry.
     let mut flip_corrs = Vec::new();
     for attempt in 0..2 {
-        let flip = read_any_frame_timeout(&mut stream, "catalog.update request").await;
-        assert_eq!(flip.header.ty, FrameType::Request);
-        assert_eq!(flip.header.channel, 0);
-        let flip_body: ModuleControlRequestFromModule =
-            serde_json::from_slice(&flip.body).expect("catalog.update body");
-        match flip_body {
-            ModuleControlRequestFromModule::CatalogUpdate {
-                provides,
-                capabilities,
-                ready,
-            } => {
-                assert_eq!(ready, Some(true));
-                assert_eq!(capabilities, None);
-                assert_eq!(
-                    provides, hello_body.manifest.provides,
-                    "the flip must keep the registered roles"
-                );
-            }
-            other => panic!("expected catalog.update, got {other:?}"),
-        }
-        flip_corrs.push(flip.header.corr);
+        let (corr, provides) = read_ready_catalog_update(&mut stream).await;
+        assert_eq!(
+            provides, expected_roles,
+            "the flip must keep the registered roles except for default-disabled tools"
+        );
+        flip_corrs.push(corr);
         if attempt == 0 {
-            send_channel_zero_error(&mut stream, flip.header.corr, "catalog_busy").await;
+            send_channel_zero_error(&mut stream, corr, "catalog_busy").await;
         } else {
-            send_frame(
-                &mut stream,
-                Frame::build(
-                    FrameType::Response,
-                    control_flags(),
-                    0,
-                    0,
-                    flip.header.corr,
-                    serde_json::to_vec(&ModuleControlResponseToModule::CatalogUpdate {})
-                        .expect("catalog.update reply"),
-                )
-                .expect("catalog.update reply frame"),
-            )
-            .await;
+            ack_catalog_update(&mut stream, corr).await;
         }
     }
     assert_ne!(flip_corrs[0], flip_corrs[1], "each retry is a new request");
@@ -4321,18 +4301,15 @@ async fn send_channel_zero_error(stream: &mut tokio::net::TcpStream, corr: u64, 
     .await;
 }
 
-/// The tool names a module's hello catalog advertises.
-fn hello_tool_names(hello: &ModuleHelloBody) -> Vec<String> {
-    hello
-        .manifest
-        .provides
+fn catalog_tool_names(provides: &[ProviderRole]) -> Vec<&str> {
+    provides
         .iter()
         .filter_map(|role| match role {
             ProviderRole::ToolProvider { tools, .. } => Some(tools),
             _ => None,
         })
         .flatten()
-        .map(|tool| tool.name.clone())
+        .map(|tool| tool.name.as_str())
         .collect()
 }
 
@@ -11770,24 +11747,19 @@ fn hold_bash_until_release_command(
     release: &std::path::Path,
     terminal_text: &str,
 ) -> String {
+    // Ends when the release file appears, when the test's temp folder is gone
+    // (the test ended first), or after 300 s of wall time; a poll count would
+    // overshoot, since each `sleep` also spawns a process. Windows runners use
+    // PowerShell, not a POSIX shell.
+    let (m, r) = (shell_path(marker), shell_path(release));
+    let f = shell_path(release.parent().expect("release file has a parent folder"));
     if cfg!(windows) {
-        // The Windows runner uses PowerShell, not a POSIX shell. Keep the
-        // command alive until the test releases it, even if frame handling is
-        // slower than the shell's startup.
         format!(
-            "Set-Content -NoNewline -Path \"{}\" -Value started; $polls = 0; while ((-not (Test-Path \"{}\")) -and ($polls -lt 6000)) {{ Start-Sleep -Milliseconds 50; $polls++ }}; if (Test-Path \"{}\") {{ Write-Output '{}' }} else {{ Write-Output 'gate-timeout' }}",
-            shell_path(marker),
-            shell_path(release),
-            shell_path(release),
-            terminal_text,
+            "Set-Content -NoNewline -Path \"{m}\" -Value started; $deadline = (Get-Date).AddSeconds(300); while ((-not (Test-Path \"{r}\")) -and (Test-Path \"{f}\") -and ((Get-Date) -lt $deadline)) {{ Start-Sleep -Milliseconds 50 }}; if (Test-Path \"{r}\") {{ Write-Output '{terminal_text}' }} else {{ Write-Output 'gate-timeout' }}"
         )
     } else {
         format!(
-            "printf started > \"{}\"; polls=0; until [ -e \"{}\" ] || [ \"$polls\" -ge 6000 ]; do sleep 0.05; polls=$((polls + 1)); done; if [ -e \"{}\" ]; then printf '{}\\n'; else printf 'gate-timeout\\n'; fi",
-            shell_path(marker),
-            shell_path(release),
-            shell_path(release),
-            terminal_text,
+            "printf started > \"{m}\"; end=$(( $(date +%s) + 300 )); until [ -e \"{r}\" ] || [ ! -d \"{f}\" ] || [ \"$(date +%s)\" -ge \"$end\" ]; do sleep 0.05; done; if [ -e \"{r}\" ]; then printf '{terminal_text}\\n'; else printf 'gate-timeout\\n'; fi"
         )
     }
 }
@@ -13666,22 +13638,32 @@ async fn drive_disabled_tools_daemon(input: FakeDaemonInput) {
             mut stream, root1, ..
         },
         hello,
-    ) = open_fake_daemon_session_with_hello(input).await;
+    ) = open_fake_daemon_session_with_ops(input, &[MODULE_TO_SUBC_OP_CATALOG_UPDATE]).await;
 
-    // The catalog sent at connect omits what the user config disables.
-    let advertised = hello_tool_names(&hello);
-    for hidden in ["delete", "bash"] {
+    let disabled = ["delete", "bash"];
+    assert_eq!(hello.manifest.ready, Some(false));
+    let hello_tools = catalog_tool_names(&hello.manifest.provides);
+    for hidden in disabled {
+        assert!(hello_tools.contains(&hidden), "HELLO omits {hidden}");
+    }
+
+    // The first update must remove the disabled tools in the same frame that
+    // makes the module ready. Only then may the daemon open a route.
+    let (corr, provides) = read_ready_catalog_update(&mut stream).await;
+    let advertised = catalog_tool_names(&provides);
+    for hidden in disabled {
         assert!(
-            !advertised.iter().any(|name| name == hidden),
-            "disabled {hidden} must not be advertised: {advertised:?}"
+            !advertised.contains(&hidden),
+            "disabled {hidden} must not be advertised at readiness: {advertised:?}"
         );
     }
     for kept in ["move", "read", "bash_status"] {
         assert!(
-            advertised.iter().any(|name| name == kept),
+            advertised.contains(&kept),
             "{kept} stays advertised: {advertised:?}"
         );
     }
+    ack_catalog_update(&mut stream, corr).await;
 
     let victim = root1.join("victim.txt");
     std::fs::write(&victim, "keep me\n").expect("write delete target");

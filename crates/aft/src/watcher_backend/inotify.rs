@@ -9,13 +9,14 @@ use std::time::{Duration, Instant};
 use notify::event::{CreateKind, Flag, ModifyKind, RenameMode};
 use notify::{ErrorKind, Event, EventKind, RecursiveMode, Watcher};
 
+use super::mailbox::{receive, Message};
 use crate::watcher_filter::{
     derive_watcher_exclusion_plan, start_watcher_rebuild, watcher_directory_is_ignored_by_matcher,
     watcher_exclusion_paths, watcher_path_is_ignored_by_matcher, ExclusionPlanUnavailable,
     SharedGitignore, WATCHER_EXCLUSION_LIMIT,
 };
 
-const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const PENDING_WORK_POLL_INTERVAL: Duration = Duration::from_millis(50);
 /// Most files reported for one batch of newly watched directories. Past it
 /// the backend asks for a rescan instead of a partial list.
 const NEW_DIRECTORY_FILE_CAP: usize = 4_096;
@@ -28,6 +29,7 @@ const NEW_DIRECTORY_REPORT_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) struct ProjectWatcher {
     shutdown: Arc<AtomicBool>,
+    wake: Arc<mpsc::Sender<Message>>,
     join: Option<JoinHandle<()>>,
     watched_directory_count: Arc<AtomicUsize>,
 }
@@ -99,8 +101,10 @@ impl ProjectWatcher {
         // it here, not on the backend thread: a bump between spawn and the
         // thread's first instruction would otherwise be read as "already
         // observed" and the rebuild it requires would never run.
-        let generation = matcher_generation.load(Ordering::Acquire);
+        let (backend_tx, backend_rx) = mpsc::channel();
+        let wake = Arc::new(backend_tx.clone());
         let counters = crate::watcher_backend::counters::watcher_counters_for_root(&root);
+        let generation = counters.register_matcher_wake(&matcher_generation, &wake);
         let mut planning = crate::watcher_filter::WatcherExclusionRetry::default();
         let outcome = planning
             .attempt(&root, generation, &counters, || derive(&root, &matcher))
@@ -112,8 +116,9 @@ impl ProjectWatcher {
         let exclusion_paths = exclusion_state.paths();
         super::log_exclusions(&root, &exclusions, generation);
 
-        let (backend_tx, backend_rx) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(backend_tx)?;
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = backend_tx.send(Message::Events(event));
+        })?;
         counters.set_backend_exclusions(
             observed_generation.unwrap_or(0),
             exclusion_paths.clone(),
@@ -370,8 +375,17 @@ impl ProjectWatcher {
                         }
                     }
 
-                    match backend_rx.recv_timeout(BACKEND_POLL_INTERVAL) {
-                        Ok(Ok(event)) => {
+                    #[cfg(test)]
+                    super::activity_tests::note_backend_wait(&counters);
+                    let deadline =
+                        if pending_rebuild.is_some() || new_directory_files.since.is_some() {
+                            // Keep polling only while a rebuild or deferred report needs it.
+                            Some(Instant::now() + PENDING_WORK_POLL_INTERVAL)
+                        } else {
+                            planning.retry_deadline()
+                        };
+                    match receive(&backend_rx, deadline) {
+                        Ok(Message::Events(Ok(event))) => {
                             let directory_arrival = is_directory_arrival(&event);
                             if event.paths.iter().any(|path| {
                                 super::cookie::is_cookie_path(path)
@@ -494,12 +508,12 @@ impl ProjectWatcher {
                                 return;
                             }
                         }
-                        Ok(Err(error)) => {
+                        Ok(Message::Events(Err(error))) => {
                             if tx.send(Err(error)).is_err() {
                                 return;
                             }
                         }
-                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Ok(Message::Wake) | Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return,
                     }
                 }
@@ -508,6 +522,7 @@ impl ProjectWatcher {
 
         Ok(Self {
             shutdown,
+            wake,
             join: Some(join),
             watched_directory_count,
         })
@@ -542,6 +557,7 @@ impl PendingWatchRebuild {
 impl Drop for ProjectWatcher {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        let _ = self.wake.send(Message::Wake);
         self.watched_directory_count.store(0, Ordering::Release);
         if let Some(join) = self.join.take() {
             let _ = join.join();
@@ -1285,6 +1301,7 @@ pub(super) mod tests {
             let block = WalkBlock { path, gate };
             *matcher.write().unwrap() = None;
             generation.fetch_add(1, Ordering::Release);
+            counters.wake_for_matcher(&generation);
             block.wait_for_walks(1);
             Self {
                 block,
@@ -1885,6 +1902,8 @@ pub(super) mod tests {
         builder.add(root.path().join(".gitignore"));
         *matcher.write().unwrap() = Some(Arc::new(builder.build().unwrap()));
         generation.fetch_add(1, Ordering::Release);
+        super::super::counters::watcher_counters_for_root(&canonical_root)
+            .wake_for_matcher(&generation);
 
         let deadline = Instant::now() + Duration::from_secs(2);
         while watcher.watched_directory_count() != 1 && Instant::now() < deadline {

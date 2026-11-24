@@ -195,11 +195,12 @@ fn kill_persistence_failure_is_not_task_absence() {
         let reply = with_task_io_fault(TaskIoFault::RecordWriteNotFound, || {
             crate::commands::bash_kill::handle(&req, ctx)
         });
-        assert_eq!(reply.data["code"], "kill_failed", "{:?}", reply.data);
-        assert!(reply.data["message"]
-            .as_str()
-            .unwrap()
-            .contains("failed to persist"));
+        assert!(reply.success, "{:?}", reply.data);
+        assert_eq!(reply.data["status"], "killed");
+        assert_eq!(
+            reply.data["kill_state_warning"],
+            "The command was stopped, but AFT could not save its state: injected task record storage not found."
+        );
     });
 }
 

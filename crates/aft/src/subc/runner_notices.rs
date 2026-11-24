@@ -1355,10 +1355,13 @@ fn retry(class: FailureClass, detail: impl ToString) -> Outcome {
 fn refusal(code: &str) -> Outcome {
     // `session_held_elsewhere`: the session moved to another computer, whose
     // own AFT serves it now, so a resend from here can never land.
+    // `unknown_session`: the session was deleted. A notice must never recreate
+    // it, so a resend can't land either.
     match code {
         "scope_owner_mismatch"
         | "expired"
         | "session_released"
+        | "unknown_session"
         | "session_unconverted"
         | "session_held_elsewhere"
         | "send_id_reuse"

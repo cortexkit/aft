@@ -389,7 +389,7 @@ mod tests {
             &mut HashMap::from([(41, 1)]),
             &mut routes,
             &mut HashMap::new(),
-            &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+            &mut RootChannels::from(HashMap::from([(root.clone(), HashSet::from([route]))])),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),

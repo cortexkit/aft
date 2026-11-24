@@ -146,12 +146,44 @@ function backendUnavailableLabel(detail?: SemanticBackendDetail): string {
   return label;
 }
 
+const DISK_RESERVE = "disk_reserve";
+
+export function diskPausedIndexLabel(status: string, reason?: string | null): string | null {
+  return status === "unavailable" && reason === DISK_RESERVE ? "paused (low disk space)" : null;
+}
+
+export function formatSearchIndexLabel(index: { status: string; reason?: string | null }): string {
+  return diskPausedIndexLabel(index.status, index.reason) ?? index.status;
+}
+
+/** Returns one disk-reserve warning even if multiple indexes are unavailable. */
+export function indexDiskPauseMessage(snapshot: Record<string, unknown>): string | undefined {
+  for (const key of ["search_index", "callgraph_store", "semantic_index"]) {
+    const plane = snapshot[key];
+    if (
+      plane &&
+      typeof plane === "object" &&
+      "status" in plane &&
+      plane.status === "unavailable" &&
+      "reason" in plane &&
+      plane.reason === DISK_RESERVE &&
+      "error" in plane &&
+      typeof plane.error === "string" &&
+      plane.error.length > 0
+    ) {
+      return plane.error;
+    }
+  }
+}
+
 export function formatSemanticIndexStatus(
   status: string,
   stage?: string | null,
   error?: string | null,
   backend?: SemanticBackendDetail,
 ): string {
+  const diskPause = diskPausedIndexLabel(status, backend?.reason);
+  if (diskPause) return diskPause;
   // A failure outranks any progress stage. Telling the reader the index is
   // rebuilding when the build cannot start asks them to wait for something that
   // will never finish.

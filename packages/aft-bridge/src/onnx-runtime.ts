@@ -71,9 +71,11 @@ interface OrtPlatformInfo {
 }
 
 // Pins are of the exact entries extracted from Microsoft's Microsoft.ML.OnnxRuntime
-// NuGet package (ORT_PACKAGE_URL). Keep the NuGet pins in crates/aft/src/ort_pin.rs
-// identical; a Rust test checks them. The Rust loader also accepts the older
-// macOS tarball build so existing managed caches continue working.
+// NuGet package (ORT_PACKAGE_URL). A Rust test checks these against the loader's
+// pins in crates/aft-base/src/ort_pin.rs, including the older macOS tarball build
+// accepted for existing managed caches.
+const LEGACY_MACOS_LIBRARY_SHA256 =
+  "872533f130f1839a5bc01788ddb4f75c83a189763441ba1178788ed965449289";
 
 const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
   darwin: {
@@ -109,6 +111,22 @@ const ORT_PLATFORM_MAP: Record<string, Record<string, OrtPlatformInfo>> = {
     },
   },
 };
+
+/** Hash a managed library without consulting its installer metadata. */
+export async function isPinnedOnnxRuntimeLibrary(libraryPath: string): Promise<boolean> {
+  try {
+    if (!statSync(libraryPath).isFile()) return false;
+    const sha256 = await sha256File(libraryPath);
+    return (
+      sha256 === LEGACY_MACOS_LIBRARY_SHA256 ||
+      Object.values(ORT_PLATFORM_MAP).some((platform) =>
+        Object.values(platform).some((info) => sha256 === info.librarySha256),
+      )
+    );
+  } catch {
+    return false;
+  }
+}
 
 /** Get platform info for the current system, or null if unsupported.
  *
@@ -167,6 +185,11 @@ export function getManualInstallHint(): string {
  */
 export async function ensureOnnxRuntime(storageDir: string): Promise<string | null> {
   return resolveOnnxRuntime(storageDir, {});
+}
+
+/** Resolve a managed runtime without using a system library as a fallback. */
+export async function ensureManagedOnnxRuntime(storageDir: string): Promise<string | null> {
+  return resolveOnnxRuntime(storageDir, { systemSearchPaths: [] });
 }
 
 /**
@@ -232,8 +255,7 @@ async function findCachedOnnxRuntime(
     // TOFU: if we recorded a hash for this version,
     // verify the library still matches. A mismatch means tampering or
     // partial install corruption. Refuse to use it and let the caller
-    // either retry the download (after the user clears the cache) or
-    // fall back to system install.
+    // fall back to a system install or try a fresh download.
     // Our installer writes the TOFU meta file to the version root, never the
     // lib/ subdir, so always read it from there.
     const meta = readOnnxInstalledMeta(ortVersionDir);
@@ -244,7 +266,7 @@ async function findCachedOnnxRuntime(
           error(
             `ONNX Runtime at ${resolvedOrtDir}: TOFU sha256 mismatch — refusing to use ` +
               `tampered binary. Recorded ${meta.sha256}, current ${currentHash}. ` +
-              `Run \`npx @cortexkit/aft doctor --clear\` to re-download from scratch.`,
+              `Run \`npx @cortexkit/aft doctor --fix\` to re-download from scratch.`,
           );
           // Fall through to system path / re-download attempt below.
         } else {
@@ -604,7 +626,7 @@ function findSystemOnnxRuntime(libName?: string, searchPathsOverride?: string[])
   const searchPaths: string[] = [...(searchPathsOverride ?? [])];
 
   if (searchPathsOverride) {
-    // Tests supply the exact candidate list.
+    // An explicit list overrides platform discovery, even when it is empty.
   } else if (process.platform === "darwin") {
     // Homebrew locations
     searchPaths.push("/opt/homebrew/lib", "/usr/local/lib");

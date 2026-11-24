@@ -6,12 +6,33 @@ import {
   formatCompressionStatusRows,
   renderStatusDialogInnerForTest,
 } from "../dialogs/status-dialog.js";
-import { coerceAftStatus } from "../shared/status.js";
+import { coerceAftStatus, formatStatusDialogMessage } from "../shared/status.js";
 
 const theme = {
   bold: (text: string) => text,
   fg: (_color: string, text: string) => text,
 } as unknown as Theme;
+
+test("disk-floor Pi status overlay and text fallback label both blocked planes and warn once", () => {
+  const paused = {
+    status: "unavailable",
+    reason: "disk_reserve",
+    error:
+      "Index storage is paused: 3.7 GiB is free on this disk and AFT keeps 4.0 GiB free. Unused index data is being cleaned up; retry later.",
+  };
+  const snapshot = coerceAftStatus({
+    search_index: paused,
+    semantic_index: paused,
+    callgraph_store: paused,
+  });
+  const overlay = renderStatusDialogInnerForTest(snapshot, null, theme, 80);
+  for (const text of [overlay.join(" "), formatStatusDialogMessage(snapshot)]) {
+    expect(text.match(/paused \(low disk space\)/g)).toHaveLength(2);
+    expect(text.replace(/\s+/g, " ")).toContain(`⚠ ${paused.error}`);
+    expect(text.match(/Index storage is paused:/g)).toHaveLength(1);
+  }
+  expect(overlay.every((line) => line.length <= 80)).toBe(true);
+});
 
 function status(compression: Record<string, unknown> | undefined) {
   return coerceAftStatus({

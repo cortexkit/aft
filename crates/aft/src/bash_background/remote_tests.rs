@@ -2156,6 +2156,7 @@ fn remote_kill_result_names_the_full_job_id() {
 #[test]
 fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
     let mut remote = RemoteTask {
+        copy_warning: false,
         submission: None,
         accepted_platform: None,
         explicit_runon: false,
@@ -2175,6 +2176,7 @@ fn remote_execution_header_without_a_job_id_keeps_its_existing_text() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -4236,26 +4238,8 @@ async fn exec_remote_bash_kill_inside_tool_call_budget_returns_prompt_terminal()
     assert!(done.info.status_reason.unwrap().contains("cancel"));
 }
 
-#[tokio::test]
-async fn exec_remote_bash_continuous_output_cannot_starve_cancel() {
-    let daemon = daemon(Script::Continuous, "exec-remote/v1").await;
-    let dir = tempfile::tempdir().unwrap();
-    let registry = registry();
-    let task_id = start(&registry, dir.path(), daemon.connection.clone());
-    let task = registry.task(&task_id).unwrap();
-    // Cancel during active output without waiting for a coalesced durable checkpoint.
-    wait_for(
-        "continuous output must be consumed before cancelling",
-        || (fs::metadata(&task.paths.stdout).unwrap().len() >= 11).then_some(()),
-    )
-    .await;
-    assert!(registry.record_remote_cancel(&task).unwrap());
-    daemon.wait_for_requests("exec.cancel", 1).await;
-    assert_eq!(
-        terminal(&registry, &task_id).await.info.status,
-        BgTaskStatus::Killed
-    );
-}
+#[path = "remote_tests/output_limit.rs"]
+mod output_limit;
 
 #[tokio::test]
 async fn exec_remote_launch_is_fenced_by_a_refused_startup_receipt() {
@@ -4772,6 +4756,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        copy_warning: false,
         submission: keyed.then(|| KeyedSubmission {
             key: format!("aft:{task_id}"),
             created_at_ms: unix_millis(),
@@ -4801,6 +4786,7 @@ async fn restart_uses_persisted_seq_without_duplicates_or_gaps(keyed: bool) {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -8053,135 +8039,8 @@ async fn runon_sends_the_whole_compound_line_remote_exactly_as_written() {
     );
 }
 
-#[tokio::test]
-async fn runon_launch_logs_send_phases_and_acceptance_capture_time() {
-    let daemon = daemon(Script::GatedAcceptance, "exec-remote/v1").await;
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = remote_test_context(dir.path());
-    let capture = Arc::new(Mutex::new(Vec::new()));
-    remote_launch_log_captures()
-        .lock()
-        .unwrap()
-        .insert(dir.path().canonicalize().unwrap(), capture.clone());
-    let command = "printf runon-diagnostic-command";
-    let secret = "runon-diagnostic-secret-value";
-    let response = handle_with_policy(
-        &ctx,
-        Some(launch(daemon.connection.clone())),
-        serde_json::json!({
-            "command": command,
-            "runon": "linux",
-            "env": {"DIAGNOSTIC_TOKEN": secret},
-        }),
-    );
-    assert!(response.success, "{response:?}");
-    let task_id = response.data["task_id"].as_str().unwrap();
-    daemon.wait_for_requests("exec.run", 1).await;
-    wait_for(
-        "exec.run sent must be logged before the executor accepts",
-        || {
-            capture
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|line| line.contains("runon: exec.run sent "))
-                .then_some(())
-        },
-    )
-    .await;
-    assert!(!capture
-        .lock()
-        .unwrap()
-        .iter()
-        .any(|line| line.contains("runon: remote task accepted ")));
-    daemon.acceptance_gate.notify_one();
-    wait_for("executor acceptance must be logged", || {
-        capture
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|line| line.contains("runon: remote task accepted "))
-            .then_some(())
-    })
-    .await;
-    let registry = ctx.bash_background().clone();
-    let kill_id = task_id.to_string();
-    tokio::task::spawn_blocking(move || registry.kill(&kill_id, "session"))
-        .await
-        .unwrap()
-        .unwrap();
-    terminal(ctx.bash_background(), task_id).await;
-    remote_worker_exited(task_id).await;
-    let lines = capture.lock().unwrap().clone();
-    let sent: Vec<_> = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.contains("runon: exec.run sent "))
-        .collect();
-    assert_eq!(sent.len(), 1, "{lines:?}");
-    let (sent_index, sent) = sent[0];
-    assert!(sent.starts_with("INFO "), "{sent}");
-    assert!(
-        sent.contains(&format!("task_id={task_id} session=session ")),
-        "{sent}"
-    );
-    let (_, timings) = sent.split_once("pre_send_ms=").unwrap();
-    let (total, phases) = timings.split_once(" phases=").unwrap();
-    let total: u128 = total.parse().unwrap();
-    let phases: Vec<_> = phases
-        .split(',')
-        .map(|phase| {
-            let (name, millis) = phase.split_once(':').unwrap();
-            (name, millis.parse::<u128>().unwrap())
-        })
-        .collect();
-    for required in [
-        "secret_preflight",
-        "workdir_return_paths",
-        "permission_preflight",
-        "sandbox_preflight",
-        "changed_files_baseline",
-        "workdir_repository_git",
-        "cd_snapshot_git",
-        "worker_dispatch",
-        "connect_route",
-        "supports_submission_key",
-        "submission_persistence",
-        "send",
-    ] {
-        assert!(
-            phases.iter().any(|(name, _)| *name == required),
-            "missing {required}: {sent}"
-        );
-    }
-    let phase_total: u128 = phases.iter().map(|(_, millis)| millis).sum();
-    assert!(
-        phase_total <= total && total - phase_total < phases.len() as u128,
-        "{sent}"
-    );
-    let (accepted_index, accepted) = lines
-        .iter()
-        .enumerate()
-        .find(|(_, line)| line.contains("runon: remote task accepted "))
-        .unwrap();
-    assert!(sent_index < accepted_index, "{lines:?}");
-    assert!(
-        accepted.contains(&format!(
-            "task_id={task_id} session=session job_id={}",
-            id()
-        )),
-        "{accepted}"
-    );
-    accepted
-        .split_once("capture_ms=")
-        .unwrap()
-        .1
-        .parse::<u128>()
-        .unwrap();
-    for line in [sent, accepted] {
-        assert!(!line.contains(command) && !line.contains(secret), "{line}");
-    }
-}
+#[path = "runon_capture_tests.rs"]
+mod runon_capture_tests;
 
 #[tokio::test]
 async fn runon_macos_reaches_the_wire_request_as_macos_platform() {
@@ -9321,6 +9180,7 @@ async fn non_blocking_runon_is_still_promoted_at_the_foreground_wait_window() {
 #[test]
 fn remote_phase_comes_from_runner_evidence() {
     let mut remote = RemoteTask {
+        copy_warning: false,
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -9340,6 +9200,7 @@ fn remote_phase_comes_from_runner_evidence() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -9651,6 +9512,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
     metadata.status = BgTaskStatus::Running;
     metadata.started_at = 1_000_000;
     metadata.remote = Some(RemoteTask {
+        copy_warning: false,
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -9670,6 +9532,7 @@ fn remote_phase_note_says_submitting_then_queued_until_started() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -10123,6 +9986,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
     // Submitted first nine minutes ago; the runner drained until now.
     metadata.started_at = now - 9 * MINUTE_MS;
     metadata.remote = Some(RemoteTask {
+        copy_warning: false,
         submission: None,
         accepted_platform: None,
         connection_file: None,
@@ -10142,6 +10006,7 @@ async fn reattach_limit_counts_from_a_late_draining_resubmission() {
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,
@@ -17118,6 +16983,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
     metadata.harness = Some("runner".into());
     metadata.execution_note = Some("ran remotely on ck-motor".into());
     metadata.remote = Some(RemoteTask {
+        copy_warning: false,
         submission: None,
         accepted_platform: None,
         explicit_runon: true,
@@ -17137,6 +17003,7 @@ async fn runon_return_paths_restart_before_the_manifest_replays_chunks_and_place
         stdout_len: 0,
         stderr_len: 0,
         unknown_len: 0,
+        output_limit_dropped_bytes: 0,
         cancel_requested: false,
         cancel_pending: false,
         owner_pause_cancel: None,

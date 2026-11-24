@@ -8,6 +8,8 @@ use subc_protocol::{
     ErrorBody,
 };
 
+use super::health::FINDINGS_SNAPSHOT_MAX_AGE_MS;
+
 pub(super) const OPERATION: &str = "diagnostics.findings";
 
 const DEFAULT_WINDOW_MS: u64 = 21_600_000;
@@ -222,7 +224,6 @@ fn collect_floor_refusals(
 }
 
 const LIVENESS_BOUND_MS: u64 = 60_000;
-const SNAPSHOT_MAX_AGE_MS: u64 = 30_000;
 
 #[allow(clippy::too_many_arguments)]
 fn condition(
@@ -290,7 +291,7 @@ fn from_health_with_budget(
     mut exhausted: impl FnMut() -> bool,
 ) -> Vec<Finding> {
     let mut findings = vec![];
-    if stale_reason.is_some() || age_ms.is_none_or(|age| age > SNAPSHOT_MAX_AGE_MS) {
+    if stale_reason.is_some() || age_ms.is_none_or(|age| age > FINDINGS_SNAPSHOT_MAX_AGE_MS) {
         findings.push(unknown(
             "health_snapshot",
             stale_reason.unwrap_or("snapshot_older_than_30s_or_unmeasured"),
@@ -304,21 +305,6 @@ fn from_health_with_budget(
     for field in ["root_details_omitted", "cache_unavailable_omitted"] {
         if metrics[field].as_u64().unwrap_or(0) > 0 {
             findings.push(unknown("health_snapshot", field, now));
-        }
-    }
-    // The rollup clock covers backend/root/cleanup evidence. Allocator walks
-    // have their own adaptive reuse window, recorded with that observation.
-    // Unsupported allocator accounting has no age and is not a root-health check.
-    if let Some(age) = metrics["memory"]["allocator_observation_age_ms"].as_u64() {
-        if metrics["memory"]["allocator_reuse_ms"]
-            .as_u64()
-            .is_none_or(|reuse| age.saturating_add(age_ms.unwrap_or(0)) > reuse)
-        {
-            findings.push(unknown(
-                "health_snapshot",
-                "allocator_observation_expired",
-                now,
-            ));
         }
     }
     match metrics["embedding_backend"]["available"].as_bool() {
@@ -801,7 +787,7 @@ mod tests {
         let metrics = healthy_metrics();
         for (age, reason) in [
             (None, None),
-            (Some(30_001), None),
+            (Some(FINDINGS_SNAPSHOT_MAX_AGE_MS + 1), None),
             (Some(0), Some("cache_contended")),
         ] {
             let findings = from_health(&metrics, age, reason, 1_000_000, 1);
@@ -821,37 +807,6 @@ mod tests {
         assert!(findings
             .iter()
             .all(|f| f.severity == Severity::Error && f.key.contains("unavailable")));
-    }
-
-    #[test]
-    fn diagnostics_findings_freshness_is_per_part() {
-        let mut metrics = healthy_metrics();
-        metrics["memory"] = json!({
-            "rss_bytes": 6_000_000_000_u64,
-            "allocator_observation_age_ms": 90_000,
-            "allocator_reuse_ms": 120_000,
-        });
-        assert!(from_health(&metrics, Some(3_000), None, 1_000_000, 1).is_empty());
-        assert!(from_health(&metrics, Some(30_000), None, 1_000_000, 1).is_empty());
-
-        // A stopped rollup cannot borrow the allocator's longer reuse window.
-        let stale = from_health(&metrics, Some(30_001), None, 1_000_000, 1);
-        assert_eq!(stale.len(), 1);
-        assert_eq!(stale[0].check, "health_snapshot");
-        assert_eq!(stale[0].severity, Severity::Error);
-
-        metrics["memory"]["allocator_observation_age_ms"] = json!(120_001);
-        let expired = snapshot(&metrics);
-        assert_eq!(expired.len(), 1);
-        assert_eq!(expired[0].check, "health_snapshot");
-        assert_eq!(
-            expired[0].samples[0]["reason"],
-            "allocator_observation_expired"
-        );
-
-        metrics["memory"]["allocator_observation_age_ms"] = json!(120_000);
-        assert!(snapshot(&metrics).is_empty());
-        assert_eq!(from_health(&metrics, Some(1), None, 1_000_000, 1).len(), 1);
     }
 
     #[test]

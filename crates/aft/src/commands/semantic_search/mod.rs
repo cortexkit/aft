@@ -1900,7 +1900,11 @@ impl SearchLaneStatus {
         [("trigram", &self.trigram), ("semantic", &self.semantic)]
             .into_iter()
             .map(|(name, lane)| {
-                if name == "semantic" && !lane.is_ready() && lane.effective != IndexEffective::Off {
+                if name == "semantic"
+                    && !lane.is_ready()
+                    && lane.effective != IndexEffective::Off
+                    && !lane.disk_paused()
+                {
                     let backend = ctx.semantic_backend_health_snapshot();
                     if !backend.available && backend.paused_until_ms.is_some() {
                         // A scheduled pause is not an ordinary unavailable-index
@@ -1908,34 +1912,13 @@ impl SearchLaneStatus {
                         return paused_backend_detail(&backend);
                     }
                 }
-                let state = match lane.effective {
-                    IndexEffective::Unavailable
-                        if lane.unavailable_reason.as_deref()
-                            == Some(feature_cause::SEMANTIC_NOT_OPENED) =>
-                    {
-                        crate::semantic_admission::NOT_OPENED_LABEL.to_string()
-                    }
-                    IndexEffective::Unavailable => format!(
-                        "unavailable: {}",
-                        lane.unavailable_reason.as_deref().unwrap_or("unknown")
-                    ),
-                    IndexEffective::Off => lane.unavailable_reason.as_deref().map_or_else(
-                        || "unavailable: disabled".to_string(),
-                        |reason| format!("off: {reason}"),
-                    ),
-                    _ => lane.effective.as_str().to_string(),
-                };
+                let state = lane.readiness_label();
                 let state = if name == "semantic" {
-                    // With the data layer's meaning plane serving the lane,
-                    // its own status words the label.
-                    let status = match crate::commands::data_search::DataSemantic::probe(ctx) {
-                        Some(data) => Some(data.status()),
-                        None => ctx
-                            .semantic_index_status()
-                            .try_read()
-                            .ok()
-                            .map(|status| status.clone()),
-                    };
+                    // Prefer the current semantic index status over the stored snapshot.
+                    let snapshot = ctx.semantic_index_status();
+                    let status = crate::commands::data_search::DataSemantic::probe(ctx)
+                        .map(|data| data.status())
+                        .or_else(|| snapshot.try_read().ok().map(|status| status.clone()));
                     match status.as_ref() {
                         Some(SemanticIndexStatus::Ready { refreshing, .. })
                             if !refreshing.is_empty() && lane.is_ready() =>
@@ -1943,17 +1926,21 @@ impl SearchLaneStatus {
                             "refreshing (previous generation serving)".to_string()
                         }
                         Some(SemanticIndexStatus::Building {
-                            entries_done: Some(done),
-                            entries_total: Some(total),
+                            stage,
+                            entries_done,
+                            entries_total,
                             ..
-                        }) if *total > 0 && lane.effective == IndexEffective::Building => {
-                            format!("building {}%", done.saturating_mul(100) / total)
-                        }
-                        Some(SemanticIndexStatus::Building { stage, .. })
-                            if stage == "loading_artifacts"
-                                && lane.effective == IndexEffective::Building =>
-                        {
-                            "loading".to_string()
+                        }) if lane.effective == IndexEffective::Building => {
+                            match (stage.as_str(), entries_done, entries_total) {
+                                ("waiting_for_onnx_runtime_download", _, _) => {
+                                    "waiting for ONNX Runtime download".to_string()
+                                }
+                                (_, Some(done), Some(total)) if *total > 0 => {
+                                    format!("building {}%", done.saturating_mul(100) / total)
+                                }
+                                ("loading_artifacts", _, _) => "loading".to_string(),
+                                _ => state,
+                            }
                         }
                         _ => state,
                     }
@@ -1962,6 +1949,11 @@ impl SearchLaneStatus {
                 };
                 format!("{name}: {state}")
             })
+            .chain(
+                (self.trigram.disk_paused() || self.semantic.disk_paused())
+                    .then(|| crate::feature_status::disk_pause_detail(ctx))
+                    .flatten(),
+            )
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -2002,7 +1994,7 @@ impl SearchLaneStatus {
             || self.semantic.effective == IndexEffective::Building
         {
             "\nRetry shortly or use grep."
-        } else if both_off {
+        } else if both_off || self.trigram.disk_paused() || self.semantic.disk_paused() {
             ""
         } else {
             "\nUse grep, or inspect the unavailable lane's configuration."
@@ -13101,6 +13093,33 @@ mod tests {
         let response = lanes.refusal("loading-text", &ctx).unwrap();
         let rendered = crate::subc_format::format_response("search", &response, false);
         assert!(rendered.contains("semantic: loading"), "{rendered}");
+    }
+
+    #[test]
+    fn refusal_message_names_onnx_runtime_download_wait() {
+        let project = tempfile::tempdir().unwrap();
+        let ctx = test_context(project.path());
+        let lanes = SearchLaneStatus {
+            trigram: IndexObservation::building(),
+            semantic: IndexObservation::building(),
+            semantic_reload_started: false,
+        };
+        for (entries_done, entries_total) in [(None, None), (Some(3), Some(10))] {
+            *ctx.semantic_index_status().write().unwrap() = SemanticIndexStatus::Building {
+                stage: "waiting_for_onnx_runtime_download".into(),
+                files: None,
+                entries_done,
+                entries_total,
+            };
+            let response = lanes.refusal("onnx-download-text", &ctx).unwrap();
+            let rendered = crate::subc_format::format_response("search", &response, false);
+            assert!(
+                rendered
+                    .lines()
+                    .any(|line| line == "semantic: waiting for ONNX Runtime download"),
+                "{rendered}"
+            );
+        }
     }
 
     #[test]

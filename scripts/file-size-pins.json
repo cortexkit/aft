@@ -1,22 +1,22 @@
 {
   "crates/aft/src/bash_background/registry.rs": {
-    "lines": 18655,
+    "lines": 18595,
     "reason": "Split registry lifecycle and persistence by area pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote_tests.rs": {
-    "lines": 18062,
+    "lines": 17929,
     "reason": "Split remote execution tests by scenario pending; AFT crate split lane."
   },
   "crates/aft/tests/integration/subc_bridge_test.rs": {
-    "lines": 16350,
+    "lines": 16332,
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
-    "lines": 12988,
+    "lines": 12934,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
-    "lines": 11419,
+    "lines": 11401,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/lsp/manager.rs": {
@@ -28,7 +28,7 @@
     "reason": "Split sandbox spawning by platform pending; AFT crate split lane."
   },
   "crates/aft/src/commands/semantic_search/mod.rs": {
-    "lines": 10736,
+    "lines": 10728,
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/semantic_index.rs": {
@@ -60,11 +60,11 @@
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
   "crates/aft/src/data_layer/checkout.rs": {
-    "lines": 6175,
+    "lines": 6116,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },
   "crates/aft/src/bash_background/remote.rs": {
-    "lines": 6161,
+    "lines": 6065,
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
   "crates/aft/src/inspect/manager.rs": {
@@ -84,7 +84,7 @@
     "reason": "Split executor tests by command family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/health.rs": {
-    "lines": 5568,
+    "lines": 5556,
     "reason": "Split daemon health monitoring responsibilities pending; AFT crate split lane."
   }
 }

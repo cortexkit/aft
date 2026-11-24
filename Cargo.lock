@@ -1188,9 +1188,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-bus-client"
-version = "0.1.10"
+version = "0.1.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05e2e5a482cf7bccdfdbc774f3b4b370e96bb7eb70fffdf494d6df44c2195d2a"
+checksum = "0a32f3d0f17dab213996bacf5acff1cc69271b0d470774f52e97a9bae0e64546"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1217,9 +1217,9 @@ checksum = "86e6375d0a75f121ae3af801b1377880e89291ea840ae1cce57aa1d38dd27fa5"
 
 [[package]]
 name = "cortexkit-bus-nats"
-version = "0.5.5"
+version = "0.5.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "694071b83af0ae156a947aa76544b84cc1a0072014e7d0926c17be06c0eca811"
+checksum = "61503cc0234c5be60939b6d6e8339e89784d5754de73ffaa66bdcc118f830f29"
 dependencies = [
  "async-nats",
  "async-trait",
@@ -1354,9 +1354,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-display"
-version = "0.1.13"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf3ded1fca4e8676f9fee3df020f927b15db42547390e7a0f57c5c1c9b7c6822"
+checksum = "b747316be66c224ba1ff89d35edd6747de28a8d53dc56ac469e575d84d239a40"
 dependencies = [
  "serde",
  "serde_jcs",
@@ -1367,9 +1367,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider"
-version = "0.15.15"
+version = "0.15.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "104925d2fc294147f0c4b39ebf7f3c744da22ed18a9598603efd20604e2cf37d"
+checksum = "4e095ca06056932225c809a14de198fdac3cbd3567667e5cdcc35a19dac04a00"
 dependencies = [
  "cortexkit-bus-naming",
  "cortexkit-role-tool-display",
@@ -1382,9 +1382,9 @@ dependencies = [
 
 [[package]]
 name = "cortexkit-role-tool-provider-conformance"
-version = "0.15.16"
+version = "0.15.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02fcfdb3cdd5bb3894446b13e2e611292583459120e516211c72c2b542e139a0"
+checksum = "d07840f8c22ac6f07c9d2eb705652f2e5d684853397b5e00a615725e1b5b7a09"
 dependencies = [
  "async-trait",
  "cortexkit-role-harness",

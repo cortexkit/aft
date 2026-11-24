@@ -9,6 +9,23 @@ use super::*;
 // slowly; HealthCheck and memory.census wake the worker on demand.
 pub(super) const BACKGROUND_INTERVAL: Duration = Duration::from_secs(30);
 
+const CONTENDED_RETRY: Duration = Duration::from_secs(1);
+const MAX_CONTENDED_RETRIES: u8 = 3;
+
+pub(super) fn next_background_delay(
+    interval: Duration,
+    published: bool,
+    retries: &mut u8,
+) -> Duration {
+    if !published && *retries < MAX_CONTENDED_RETRIES {
+        *retries += 1;
+        CONTENDED_RETRY
+    } else {
+        *retries = 0;
+        interval
+    }
+}
+
 impl HealthRollupCache {
     pub(super) fn request_health_refresh(&self, age_ms: Option<u64>) {
         if age_ms.is_some_and(|age| age < duration_millis_u64(HEALTH_ROLLUP_TTL)) {
@@ -62,6 +79,27 @@ pub(super) fn advance_memory_ages(metrics: &mut serde_json::Map<String, Value>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn health_rollup_retries_contention_briefly_then_resumes_idle_interval() {
+        let delay = |published, retries: &mut u8| {
+            next_background_delay(BACKGROUND_INTERVAL, published, retries)
+        };
+        let retry_delay = Duration::from_secs(1);
+        let mut retries = 0;
+        assert_eq!(delay(true, &mut retries), BACKGROUND_INTERVAL);
+        assert_eq!(delay(false, &mut retries), retry_delay);
+        assert_eq!(delay(true, &mut retries), BACKGROUND_INTERVAL);
+
+        let mut elapsed = BACKGROUND_INTERVAL;
+        for _ in 0..3 {
+            let wait = delay(false, &mut retries);
+            assert_eq!(wait, retry_delay);
+            elapsed += wait;
+        }
+        assert!((elapsed.as_millis() as u64) < FINDINGS_SNAPSHOT_MAX_AGE_MS);
+        assert_eq!(delay(false, &mut retries), BACKGROUND_INTERVAL);
+    }
 
     fn wait_for_refresh(cache: &HealthRollupCache, count: u64) {
         let deadline = Instant::now() + Duration::from_secs(2);

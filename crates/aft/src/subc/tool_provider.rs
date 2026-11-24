@@ -8,8 +8,10 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
+use cortexkit_role_tool_provider::call::SchemaPin;
 use cortexkit_role_tool_provider::{
-    call::{check_call, SchemaPin},
+    call::check_versioned_call,
     catalog::{
         check_model_param, composition_digest, schema_digest, session_capabilities,
         system_text_digest, CatalogAnswer, CatalogRequest, CatalogTool, Reply, SystemTextAnswer,
@@ -26,6 +28,7 @@ use crate::hashline::integration::RegistrationRequest;
 mod admission_close;
 mod guidance;
 mod shell_detaches;
+pub(super) mod versions;
 pub(super) use shell_detaches::ShellDetaches;
 #[cfg(test)]
 mod guidance_text_tests;
@@ -603,7 +606,8 @@ fn catalog_entry(
         .expect("tool schemas are objects")
         .remove("description");
     let digest = schema_digest(&schema).expect("embedded schema has a structural digest");
-    let mut entry = CatalogTool::new(name, digest, semantics, schema);
+    let mut entry =
+        CatalogTool::new(name, digest, semantics, schema).with_version(versions::version(name));
     let mut modes = vec![cortexkit_role_tool_provider::CallMode::Classic];
     if name != "bash_watch" {
         modes.push(cortexkit_role_tool_provider::CallMode::Codemode);
@@ -1454,8 +1458,8 @@ fn render_catalog(
             }
         }
     }
-    // Last, once the served names are final: every description names the
-    // tools of this catalog and no other.
+    versions::prepare_catalog(&mut answer.tools);
+    // Every description names the tools of this catalog and no other.
     render_tool_references(&mut answer.tools);
     declare_result_format(&mut answer.tools, super::result_body::DECLARE_RESULT_FORMAT);
     // Every preset can settle a keyed call after its reply (a held shell
@@ -1645,7 +1649,7 @@ pub(super) fn admit_for_session(
     trusted: bool,
     hashline_route: bool,
 ) -> Result<CallerRole, ErrorBody> {
-    check_call(call)?;
+    check_versioned_call(call)?;
     let role = resolve_caller_role(
         call.preset.as_deref(),
         scoped_route && !native_completion_ack(&call.name),
@@ -4237,7 +4241,7 @@ fn admit_arguments_for(
     let hashline_edit = hashline_route
         && role == CallerRole::Head
         && call.name == "edit"
-        && takes_hashline_arm(call);
+        && versions::takes_hashline_arm(call);
     // The worker preset serves every head tool plus the preset-only ones, so
     // its catalog holds the served schema of every admitted name.
     let served = if hashline_edit {
@@ -4257,44 +4261,8 @@ fn admit_arguments_for(
         .as_ref()
         .or(served.with_ref.as_ref())
         .unwrap_or(&served.catalog);
-    // Shared argument validation accepts both shell schemas. Check the behavior
-    // version against the caller's preset so a worker wait change does not
-    // invalidate calls pinned to the head's unchanged bash behavior.
-    let semantics = if role.is_worker() || hashline_edit {
-        tool.semantics
-    } else {
-        served_tools(CatalogPreset::Head)
-            .iter()
-            .find(|entry| entry.catalog.name == call.name)
-            .map_or(tool.semantics, |entry| entry.catalog.semantics)
-    };
-    // A runner head is offered its own `bash_watch` (see `RunnerHeadTools`),
-    // whose arguments the worker schema checked below also accepts; a pin
-    // taken from that catalog carries its digest and behavior version.
-    let head_watch = (role == CallerRole::Head && call.name == "bash_watch")
-        .then_some(&RUNNER_HEAD_TOOLS.bash_watch.catalog);
     if let Some(encoded) = call.schema_pin.as_ref().filter(|_| check_pin) {
-        let pin = SchemaPin::parse(encoded)
-            .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))?;
-        let head_watch = head_watch.filter(|entry| entry.schema_digest == pin.schema_digest);
-        if pin.schema_digest != tool.schema_digest
-            && pin.schema_digest != served.catalog.schema_digest
-            && !legacy_file_path_digests(&call.name).contains(&pin.schema_digest)
-            && head_watch.is_none()
-        {
-            return Err(ErrorBody::new(errors::TOOL_SCHEMA_CHANGED, "schema pin is stale").with_detail(json!({"tool": call.name, "expected": pin.schema_digest, "current": tool.schema_digest})));
-        }
-        let semantics = head_watch.map_or(semantics, |entry| entry.semantics);
-        if pin.semantics != semantics
-            && !super::tool_views::runs_under_newer_semantics(&call.name, pin.semantics, semantics)
-        {
-            return Err(
-                ErrorBody::new(errors::TOOL_SEMANTICS_CHANGED, "semantics pin is stale")
-                    .with_detail(
-                        json!({"tool": call.name, "expected": pin.semantics, "current": semantics}),
-                    ),
-            );
-        }
+        versions::admit_pin(call, encoded, role, served, tool, hashline_edit)?;
     }
     let arguments = call
         .arguments
@@ -4362,19 +4330,6 @@ fn admit_arguments_for(
         ));
     }
     Ok(())
-}
-
-/// Whether an `edit` call takes the hashline arm: its schema pin names that
-/// arm's digest, or it carries no readable pin and passes a `patch`.
-fn takes_hashline_arm(call: &cortexkit_role_tool_provider::call::ToolCallRequest) -> bool {
-    match call
-        .schema_pin
-        .as_deref()
-        .and_then(|pin| SchemaPin::parse(pin).ok())
-    {
-        Some(pin) => pin.schema_digest == RUNNER_HEAD_TOOLS.hashline_edit.catalog.schema_digest,
-        None => call.arguments.get("patch").is_some(),
-    }
 }
 
 /// The role a tool call runs under. It decides everything the core words or
@@ -4476,30 +4431,20 @@ fn head_catalog_name(name: &str) -> Option<&'static str> {
 pub(super) fn route_head_call_name(
     call: &mut cortexkit_role_tool_provider::call::ToolCallRequest,
     scoped_route: bool,
-) {
+) -> Option<String> {
     if !matches!(
         resolve_caller_role(call.preset.as_deref(), scoped_route, false),
         Ok(CallerRole::Head)
     ) {
-        return;
+        return None;
     }
-    let Some(catalog_name) = head_catalog_name(&call.name) else {
-        return;
-    };
+    let catalog_name = head_catalog_name(&call.name)?;
     let renamed_pin = call
         .schema_pin
         .as_deref()
-        .and_then(|pin| SchemaPin::parse(pin).ok())
-        .filter(|pin| pin.tool == call.name)
-        .and_then(|pin| {
-            SchemaPin::new(catalog_name, pin.schema_digest, pin.semantics)
-                .encode()
-                .ok()
-        });
-    if let Some(pin) = renamed_pin {
-        call.schema_pin = Some(pin);
-    }
+        .and_then(|pin| versions::rename_pin(pin, &call.name, catalog_name));
     call.name = catalog_name.into();
+    renamed_pin.and_then(|pin| call.schema_pin.replace(pin))
 }
 
 /// The key a runner head's catalog records its edit mode under: the bind
@@ -5158,10 +5103,10 @@ mod tests {
                 .unwrap(),
         );
         let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
-        assert_eq!(refusal.code, "tool_semantics_changed");
+        assert_eq!(refusal.code, "tool_major_changed");
         assert_eq!(
             refusal.detail.unwrap(),
-            json!({"tool":"bash","expected":1,"current":3})
+            json!({"tool":"bash","expected":request.schema_pin.unwrap(),"current":tool.schema_pin().encode().unwrap()})
         );
         request.schema_pin = None;
         assert_eq!(
@@ -5193,11 +5138,15 @@ mod tests {
                     .unwrap(),
             );
             let refusal = admit(&request, false, &[], true, "session", true).unwrap_err();
-            assert_eq!(refusal.code, "tool_semantics_changed");
-            assert_eq!(
-                refusal.detail.unwrap(),
-                json!({"tool":name,"expected":old,"current":current})
-            );
+            if name == "bash" {
+                assert_eq!(refusal.code, "tool_major_changed");
+            } else {
+                assert_eq!(refusal.code, "tool_semantics_changed");
+                assert_eq!(
+                    refusal.detail.unwrap(),
+                    json!({"tool":name,"expected":old,"current":current})
+                );
+            }
             request.schema_pin = Some(
                 SchemaPin::new(name, &tool.schema_digest, current)
                     .encode()
@@ -5233,6 +5182,7 @@ mod tests {
     fn notice_template_vectors() -> BTreeMap<String, String> {
         use crate::subc::runner_notices::notice_templates::{self as notices, Notice, Target};
         use sha2::{Digest, Sha256};
+        let _legacy_catalog = versions::legacy_catalog();
         let mut files = BTreeMap::new();
         files.insert(
             "README.md".into(),
@@ -5446,6 +5396,7 @@ mod tests {
 
     #[test]
     fn full_catalog_goldens_and_digest_only_have_exact_identity() {
+        let _legacy_catalog = versions::legacy_catalog();
         let mut presets_seen = BTreeSet::new();
         for (_, raw) in CATALOG_FIXTURES {
             let fixtures: Value = serde_json::from_str(raw).unwrap();
@@ -5470,6 +5421,7 @@ mod tests {
     fn legacy_bash_false_catalog_matches_pre_migration_bytes() {
         use crate::config_resolve::{resolve_config, ConfigTier};
 
+        let _legacy_catalog = versions::legacy_catalog();
         // Captured from the pre-migration resolver and renderer at 4d0a522e.
         // In hashline edit mode the description names shell reads that mint
         // line tags only when Bash rewriting is enabled. Pin that wording and
@@ -7271,14 +7223,10 @@ mod tests {
                 3,
                 Some("tool_schema_changed"),
             ),
-            (
-                schema.schema_digest.as_str(),
-                1,
-                Some("tool_semantics_changed"),
-            ),
+            (schema.schema_digest.as_str(), 1, Some("tool_major_changed")),
             // Version 2 differs from 3 only in the display record the apps draw
             // (3 adds the `tail` field); the command runs the same, so a version-2
-            // pin is still admitted (see `tool_views::runs_under_newer_semantics`).
+            // pin maps to the same major.
             (schema.schema_digest.as_str(), 2, None),
         ] {
             let mut request = call("bash", json!({"command": "echo"}));
@@ -7308,6 +7256,51 @@ pub(in crate::subc) mod route_tests {
     /// The last dispatched request's command, session and parameters.
     static LAST_DISPATCH: std::sync::Mutex<Option<Value>> = std::sync::Mutex::new(None);
     static EXCHANGE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    #[tokio::test]
+    async fn tool_views_answers_current_versioned_bash_and_file_tool_pins() {
+        use cortexkit_role_tool_provider::views::{ViewManifest, ViewsReply, ViewsRequest};
+
+        let tools: Vec<_> = tools_for_session(CatalogPreset::Head, &[], false, true, false)
+            .into_iter()
+            .filter(|tool| {
+                matches!(
+                    tool.name.as_str(),
+                    "bash" | "edit" | "write" | "apply_patch"
+                )
+            })
+            .collect();
+        assert_eq!(tools.len(), 4);
+        let pins: Vec<_> = tools
+            .iter()
+            .map(|tool| tool.schema_pin().encode().unwrap())
+            .collect();
+        let frame = exchange(
+            json!({"op":"tool.views","pins":pins}),
+            RouteRole::ToolProviderV1,
+            "versioned-views",
+            vec![],
+        )
+        .await;
+        assert_eq!(frame.header.ty, FrameType::Response);
+        let answer: Value = serde_json::from_slice(&frame.body).unwrap();
+        let reply: ViewsReply = serde_json::from_value(answer.clone()).unwrap();
+        reply
+            .validate_for(&ViewsRequest::new(pins.clone()))
+            .unwrap();
+        for (tool, pin) in tools.iter().zip(pins) {
+            assert!(pin.starts_with("tp2:"));
+            let manifest: ViewManifest =
+                serde_json::from_value(answer["views"][&pin].clone()).unwrap();
+            assert!(manifest.check_pin(&pin).unwrap());
+            let legacy_pin = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+                .encode()
+                .unwrap();
+            let legacy_view = super::super::tool_views::view(&legacy_pin).unwrap();
+            assert_eq!(manifest.record_schema, legacy_view.record_schema);
+            assert_eq!(manifest.template, legacy_view.template);
+        }
+    }
 
     #[tokio::test]
     async fn tool_views_every_shipped_pin_remains_servable_on_the_real_handler() {

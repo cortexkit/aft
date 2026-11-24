@@ -23,19 +23,8 @@ const WAITING_HEALTH: &str =
     "AFT is not ready because its settings are unavailable from Subconscious.";
 const PENDING_HEALTH: &str = "AFT is using its last approved settings while a settings update awaits approval in Subconscious.";
 
-// Keep production opted out until config-gate §6.4 rewrites old settings and
-// retains their original bytes before AFT connects. The daemon captures the
-// on-disk shape; a module review cannot substitute translated values.
-pub fn requested() -> bool {
-    #[cfg(all(feature = "test-hooks", debug_assertions))]
-    if std::env::var_os("AFT_TEST_SETTINGS_SCHEMA").is_some() {
-        return true;
-    }
-    false
-}
-
 fn declaration(path: Option<&Path>) -> Option<(ConfigDeclareRequest, Schema)> {
-    let schema = test_schema()?;
+    let schema = declaration_schema()?;
     let validated = Schema::new(schema.clone()).ok()?;
     Some((
         ConfigDeclareRequest::new(schema, path?.to_str()?, vec![]),
@@ -43,12 +32,12 @@ fn declaration(path: Option<&Path>) -> Option<(ConfigDeclareRequest, Schema)> {
     ))
 }
 
-fn test_schema() -> Option<Value> {
+fn declaration_schema() -> Option<Value> {
     #[cfg(all(feature = "test-hooks", debug_assertions))]
     if let Some(path) = std::env::var_os("AFT_TEST_SETTINGS_SCHEMA") {
         return serde_json::from_slice(&std::fs::read(path).ok()?).ok();
     }
-    None
+    Some(crate::config_live::schema::settings_declaration())
 }
 
 async fn request<T: serde::Serialize, R: serde::de::DeserializeOwned>(
@@ -224,6 +213,7 @@ impl Session {
     ) -> Result<(), &'static str> {
         let next = view_from_reply(request(control, &ConfigGetRequest::new()).await?)?;
         let mut current = self.view.lock().await;
+        // On unstamped installs, effective values can change at generation zero.
         if next.generation < current.generation {
             return Ok(());
         }

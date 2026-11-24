@@ -87,6 +87,10 @@ impl Drop for Fixture {
     }
 }
 fn fixture(tool: &str, name: &str) -> Fixture {
+    fixture_with_pin(tool, name, None)
+}
+
+fn fixture_with_pin(tool: &str, name: &str, pin: Option<String>) -> Fixture {
     TEST_SINK.with(|sink| {
         sink.replace(Some(Vec::new()));
     });
@@ -101,7 +105,7 @@ fn fixture(tool: &str, name: &str) -> Fixture {
     }
     let mut call = subc_protocol::tool_call::ToolCallRequest::new(tool, json!({}));
     call.call_key = Some(name.into());
-    call.schema_pin = Some(
+    call.schema_pin = Some(pin.unwrap_or_else(|| {
         crate::subc::tool_views::SHIPPED
             .keys()
             .find(|pin| {
@@ -112,8 +116,8 @@ fn fixture(tool: &str, name: &str) -> Fixture {
                 }
             })
             .unwrap()
-            .clone(),
-    );
+            .clone()
+    }));
     let key_value = crate::subc::tool_provider::LedgerEdge::key(&route, name);
     register(&key_value, &route, &call);
     let capture = CALLS.lock().unwrap()[&key(&key_value)].clone();
@@ -197,6 +201,47 @@ fn bash_tail_foreground_publishes_after_record_and_detail_only_when_nonempty() {
             assert_eq!(writes.len(), 2);
         }
     }
+}
+
+#[test]
+fn display_versioned_bash_pin_publishes_the_legacy_rich_record_and_tail() {
+    use cortexkit_role_tool_provider::call::SchemaPin;
+
+    let bash = crate::subc::tool_provider::versions::current_pin_tools()
+        .find(|tool| tool.name == "bash")
+        .unwrap();
+    let legacy = SchemaPin::new(&bash.name, &bash.schema_digest, bash.semantics)
+        .encode()
+        .unwrap();
+    let versioned = bash.schema_pin().encode().unwrap();
+    let run = |name, pin: String| {
+        let f = fixture_with_pin("bash", name, Some(pin.clone()));
+        let _active = enter(Some(&f.key));
+        let mut display = current_task().unwrap();
+        let mut metadata = task();
+        metadata.status = BgTaskStatus::Completed;
+        metadata.exit_code = Some(0);
+        metadata.display = Some(display.clone());
+        let mut bodies = bash_bodies(&metadata, Some(3), Some(("ok\n".into(), "".into())));
+        bodies.tail = bash_tail(&metadata, "ok\n", "", &|text| Some(text.into()));
+        bash_reply(&mut display, bodies, false);
+        f.capture.lock().unwrap().processing_ms = 12;
+        reply(&f.key, false, false, None);
+        publications()
+            .into_iter()
+            .map(|publication| {
+                assert_eq!(publication.identity.schema_pin, pin);
+                (publication.kind, publication.body)
+            })
+            .collect::<Vec<_>>()
+    };
+    let legacy = run("display-legacy-bash", legacy);
+    let versioned = run("display-versioned-bash", versioned);
+    assert_eq!(versioned, legacy);
+    assert_eq!(versioned[0].0, DisplayKind::Record);
+    assert_eq!(versioned[1].0, DisplayKind::Detail);
+    assert_eq!(versioned[2].0, DisplayKind::Completion);
+    assert_eq!(versioned[2].1["tail"], json!([{"text":"ok"}]));
 }
 
 #[test]
@@ -741,7 +786,11 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new\n");
         assert!(response.data.get("view").is_none());
         assert!(response.data.get("record").is_none());
-        let (record, _) = file_bodies(&f.capture.lock().unwrap(), true);
+        handler_ready(Some(&f.key), &response);
+        reply(&f.key, false, false, None);
+        let writes = publications();
+        let record = &writes[0].body;
+        assert_eq!(record["outcome"], "success", "{tool}: {record}");
         assert_eq!(record["fileCount"], 1, "{tool}: {record}");
         assert_eq!(
             record[if tool == "write" {
@@ -752,6 +801,51 @@ fn native_edit_write_and_patch_capture_final_mutations_without_reply_fields() {
             1
         );
     }
+}
+
+#[test]
+fn native_partial_patch_publishes_only_the_applied_files() {
+    let f = fixture("apply_patch", "display-partial-patch");
+    let ctx = crate::subc::test_support::test_ctx();
+    ctx.update_config(|config| {
+        config.project_root = Some(f._dir.path().into());
+        config.storage_dir = Some(f._dir.path().join("storage"));
+        config.format_on_edit = false;
+    });
+    let first = f._dir.path().join("first.txt");
+    let second = f._dir.path().join("second.txt");
+    let third = f._dir.path().join("third.txt");
+    for path in [&first, &second, &third] {
+        std::fs::write(path, "old\n").unwrap();
+    }
+    let patch_text = format!(
+        "*** Begin Patch\n\
+         *** Update File: {}\n@@\n-old\n+new\n\
+         *** Update File: {}\n@@\n-missing\n+new\n\
+         *** Update File: {}\n@@\n-old\n+new\n\
+         *** End Patch",
+        first.display(),
+        second.display(),
+        third.display()
+    );
+    let request = serde_json::from_value(json!({
+        "id":"native","command":"apply_patch","patch_text":patch_text
+    }))
+    .unwrap();
+    let _active = enter(Some(&f.key));
+    let response = crate::commands::apply_patch::handle_apply_patch(&request, &ctx);
+    assert!(response.success, "{response:?}");
+    assert_eq!(response.data["partial"], true);
+    assert_eq!(std::fs::read_to_string(first).unwrap(), "new\n");
+    assert_eq!(std::fs::read_to_string(second).unwrap(), "old\n");
+    assert_eq!(std::fs::read_to_string(third).unwrap(), "new\n");
+
+    handler_ready(Some(&f.key), &response);
+    reply(&f.key, false, false, None);
+    let writes = publications();
+    let record = &writes[0].body;
+    assert_eq!(record["outcome"], "partial");
+    assert_eq!(record["fileCount"], 2);
 }
 
 #[test]

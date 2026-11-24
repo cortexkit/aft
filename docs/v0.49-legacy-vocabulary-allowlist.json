@@ -3129,6 +3129,39 @@
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
     },
     {
+      "path": "crates/aft/tests/tool_provider_conformance/versions.rs",
+      "line": 19,
+      "column": 24,
+      "token": "filePath",
+      "text": "properties.insert(\"filePath\".into(), path);",
+      "location": "line 19, column 24",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "historical read schema fixture proves the shipped tp1 pin with filePath still maps"
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance/versions.rs",
+      "line": 20,
+      "column": 33,
+      "token": "filePath",
+      "text": "older[\"required\"] = json!([\"filePath\"]);",
+      "location": "line 20, column 33",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "historical read schema fixture proves the shipped tp1 pin with filePath still maps"
+    },
+    {
+      "path": "crates/aft/tests/tool_provider_conformance/versions.rs",
+      "line": 28,
+      "column": 32,
+      "token": "filePath",
+      "text": "arguments: json!({\"filePath\":\".cortexkit/aft.jsonc\"}),",
+      "location": "line 28, column 32",
+      "ordinal": 1,
+      "class": "internal-compatibility",
+      "reason": "historical read schema fixture proves the shipped tp1 pin with filePath still maps"
+    },
+    {
       "path": "crates/aft/tests/worker_jail.rs",
       "line": 2445,
       "column": 21,

@@ -414,6 +414,8 @@ fn resolve_owner(
                 owner_channel,
                 other_channel,
                 &fields,
+                &owners,
+                using_saved,
             ));
         }
         policies.push(saved_policy(other));
@@ -451,6 +453,8 @@ fn resolve_owner(
                     owner_channel,
                     other_channel,
                     &["saved_policy"],
+                    &owners,
+                    using_saved,
                 ));
             }
         }
@@ -472,6 +476,8 @@ fn ambiguous_owner(
     owner: &RouteChannel,
     other: &RouteChannel,
     fields: &[&str],
+    candidates: &[(&RouteChannel, &RouteIdentity)],
+    using_saved: bool,
 ) -> subc_protocol::ErrorBody {
     let channels = [owner.channel, other.channel];
     let (scope, reason) = match named {
@@ -484,6 +490,31 @@ fn ambiguous_owner(
         channels[0],
         channels[1]
     );
+    let source = if using_saved { "saved" } else { "live" };
+    for (channel, identity) in candidates {
+        let (principal_id, bind_harness) = match &identity.spawn_principal {
+            AuthenticatedPrincipal::RouteBind {
+                principal_id,
+                harness,
+                ..
+            } => (
+                principal_id.as_deref().unwrap_or("absent"),
+                harness.as_str(),
+            ),
+            AuthenticatedPrincipal::FirstParty => ("absent", identity.harness.as_str()),
+        };
+        let stamp = identity.scope.as_ref();
+        crate::slog_info!(
+            "codemode {scope} route ambiguity candidate: run_id={run_id} source={source} channel={} epoch={} harness={:?} bind_harness={bind_harness:?} session={:?} principal_id={principal_id:?} stamp_owner={:?} scope_kind={} root={:?}",
+            channel.channel,
+            channel.epoch,
+            identity.harness,
+            identity.session,
+            principal_label(&stamp.map(|stamp| stamp.owner.clone())),
+            stamp.map_or_else(|| "none".to_owned(), |stamp| format!("{:?}", stamp.kind).to_lowercase()),
+            identity.root.as_path(),
+        );
+    }
     let mut error = not_bound(
         reason,
         format!(

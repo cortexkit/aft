@@ -1920,6 +1920,10 @@ const HEALTH_PROJECT_FIELDS: [&str; 7] = [
 // the daemon applies its 16 KiB cache ceiling to a larger envelope.
 const HEALTH_REPLY_HARD_LIMIT_BYTES: usize = 16 * 1024;
 pub(super) const HEALTH_ROLLUP_TTL: Duration = Duration::from_secs(3);
+// Idle refreshes start one interval after the last publication. Allow another
+// five seconds for assembly and short scheduler-contention retries.
+pub(super) const FINDINGS_SNAPSHOT_MAX_AGE_MS: u64 =
+    demand::BACKGROUND_INTERVAL.as_millis() as u64 + 5_000;
 const HEALTH_RETENTION_COUNT_MAX_AGE_MS: u64 = 30_000;
 /// How long the health rollup carries the full memory census forward while
 /// no `memory.census` read asked for a new one. Measuring it renders an
@@ -3088,6 +3092,8 @@ pub(super) struct HealthRollupCache {
     stale_through_generation: AtomicU64,
     #[cfg(test)]
     root_details_assembled: AtomicUsize,
+    // Hold this lock only to clone or swap the Arc. Building, reading and
+    // dropping its payload outside the lock makes blocking readers cheap.
     snapshot: std::sync::RwLock<Arc<HealthDiagnosticRollup>>,
     plane_timings: std::sync::Mutex<HashMap<(String, &'static str), PlaneTiming>>,
     allocator: std::sync::Mutex<Option<CachedAllocatorObservation>>,
@@ -3125,22 +3131,13 @@ impl HealthRollupCache {
         now_ms: u64,
         window_ms: u64,
     ) -> Vec<super::diagnostics_findings::Finding> {
-        let snapshot = match self.snapshot.try_read() {
-            Ok(snapshot) => Arc::clone(&snapshot),
-            Err(_) => {
-                return super::diagnostics_findings::from_health(
-                    &Value::Null,
-                    None,
-                    Some("cache_contended_or_poisoned"),
-                    now_ms,
-                    window_ms,
-                )
-            }
-        };
+        let snapshot = self.published_snapshot();
         let age_ms = snapshot
             .generated_at_ms
             .map(|generated| self.now_ms().saturating_sub(generated));
-        let reason = if self.census_contended(&snapshot) {
+        // A failed attempt does not invalidate complete evidence from a recent
+        // publication. If nothing has been measured yet, report why if known.
+        let reason = if age_ms.is_none() && self.census_contended(&snapshot) {
             Some("executor_contended")
         } else {
             snapshot.stale_reason
@@ -3243,11 +3240,14 @@ impl HealthRollupCache {
         )
     }
 
-    /// Assemble outside the cache lock. Probe readers never wait for a refresh.
-    pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) {
+    /// Assemble outside the cache lock. Returns whether the refresh published.
+    pub(super) fn refresh(&self, executor: &Executor, shared_app: &App) -> bool {
         #[cfg(test)]
         self.root_details_assembled.store(0, Ordering::Relaxed);
-        self.publish(build_health_diagnostic_rollup(self, executor, shared_app));
+        let rollup = build_health_diagnostic_rollup(self, executor, shared_app);
+        let published = rollup.is_some();
+        self.publish(rollup);
+        published
     }
 
     fn refresh_for_test(&self, executor: &Executor, shared_app: &App) {
@@ -3272,15 +3272,14 @@ impl HealthRollupCache {
             rollup.memory_census_at_ms = rollup.memory_census_at_ms.or(rollup.generated_at_ms);
             let generation = rollup.generation;
             let rollup = Arc::new(rollup);
-            let mut snapshot = self
-                .snapshot
-                .write()
-                .unwrap_or_else(|error| error.into_inner());
-            *snapshot = rollup;
+            let old = std::mem::replace(
+                &mut *self.snapshot.write().unwrap_or_else(|e| e.into_inner()),
+                rollup,
+            );
             self.published_generation
                 .store(generation, Ordering::Release);
-            drop(snapshot);
             self.publications.send_replace(generation);
+            drop(old);
         } else {
             // Mark the census being served now as stale, without touching it.
             self.stale_through_generation.fetch_max(
@@ -3305,6 +3304,10 @@ impl HealthRollupCache {
             }
         }
         duration_millis_u64(self.origin.elapsed())
+    }
+
+    fn published_snapshot(&self) -> Arc<HealthDiagnosticRollup> {
+        Arc::clone(&self.snapshot.read().unwrap_or_else(|e| e.into_inner()))
     }
 
     fn snapshot(&self) -> (Arc<HealthDiagnosticRollup>, Option<u64>) {
@@ -3467,12 +3470,7 @@ impl HealthRollupCache {
         actor_entries: &[(ProjectRootId, Arc<AppContext>)],
     ) -> (u64, Option<CarriedCensus>) {
         let requests = self.census_requests.load(Ordering::Acquire);
-        let published = Arc::clone(
-            &self
-                .snapshot
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        );
+        let published = self.published_snapshot();
         let Some(measured_at_ms) = published.memory_census_at_ms else {
             return (requests, None);
         };
@@ -3531,17 +3529,138 @@ impl HealthRollupCache {
 mod findings_snapshot_tests {
     use super::*;
 
+    fn snapshot_findings(cache: &HealthRollupCache) -> Vec<Value> {
+        serde_json::to_value(cache.findings(1_000_000, 60_000))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|finding| finding["check"] == "health_snapshot")
+            .cloned()
+            .collect()
+    }
+
     #[test]
-    fn diagnostics_findings_contended_cache_returns_unknown_without_fallback_probes() {
+    fn diagnostics_findings_keep_last_snapshot_through_idle_interval_and_assembly() {
         let cache = HealthRollupCache::new();
-        let _held = cache.snapshot.write().unwrap();
-        let findings = serde_json::to_value(cache.findings(1_000_000, 60_000)).unwrap();
-        assert_eq!(findings.as_array().unwrap().len(), 1);
+        let executor = Executor::new();
+        let app = App::default_shared();
+        let (wake_tx, wake_rx) = std::sync::mpsc::sync_channel(1);
+        *cache.census_wake.lock().unwrap() = Some(wake_tx);
+
+        let published_at = 1_000;
+        cache.clock_ms.store(published_at, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+        let next_start = published_at + duration_millis_u64(demand::BACKGROUND_INTERVAL);
+        cache.clock_ms.store(next_start, Ordering::Relaxed);
+        let building = build_health_diagnostic_rollup_from_actors(&cache, &executor, &app, vec![]);
+
+        // The worker waits a full interval before building the next rollup.
+        // Until it swaps in that rollup, readers still get the last publication.
+        let latest_healthy = next_start + 5_000;
+        cache.clock_ms.store(latest_healthy, Ordering::Relaxed);
+        let findings = snapshot_findings(&cache);
+        assert!(findings.is_empty(), "{findings:?}");
+        assert_eq!(cache.refresh_count_for_test(), 1);
+
+        // If assembly outlasts the idle interval plus five seconds, the old
+        // publication is no longer fresh evidence.
+        cache.clock_ms.store(latest_healthy + 1, Ordering::Relaxed);
+        let findings = snapshot_findings(&cache);
+        assert_eq!(findings.len(), 1);
         assert_eq!(findings[0]["severity"], "error");
         assert_eq!(
             findings[0]["samples"][0]["reason"],
-            "cache_contended_or_poisoned"
+            "snapshot_older_than_30s_or_unmeasured"
         );
+        assert_eq!(
+            wake_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        );
+        assert!(!cache.health_requested.load(Ordering::Acquire));
+
+        cache.publish(Some(building));
+        assert!(snapshot_findings(&cache).is_empty());
+    }
+
+    #[test]
+    fn diagnostics_findings_use_fresh_evidence_after_a_contended_refresh() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.refresh_for_test(&executor, &app);
+
+        let interval_ms = duration_millis_u64(demand::BACKGROUND_INTERVAL);
+        cache.clock_ms.store(interval_ms, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| {
+            assert!(!cache.refresh(&executor, &app));
+        });
+        let (published, age) = cache.snapshot();
+        assert!(cache.census_contended(&published));
+        assert_eq!(age, Some(interval_ms));
+        let findings = snapshot_findings(&cache);
+        assert!(findings.is_empty(), "{findings:?}");
+
+        // Further missed refreshes must not update the last success's age.
+        cache.clock_ms.store(interval_ms + 5_001, Ordering::Relaxed);
+        executor.hold_state_lock_for_test(|| {
+            assert!(!cache.refresh(&executor, &app));
+        });
+        let findings = snapshot_findings(&cache);
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0]["severity"], "error");
+        assert_eq!(
+            findings[0]["samples"][0]["reason"],
+            "snapshot_older_than_30s_or_unmeasured"
+        );
+    }
+
+    #[test]
+    fn diagnostics_findings_can_read_last_publication_after_lock_poisoning() {
+        let cache = HealthRollupCache::new();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.refresh_for_test(&Executor::new(), &App::default_shared());
+        std::thread::scope(|scope| {
+            assert!(scope
+                .spawn(|| {
+                    let _held = cache.snapshot.write().unwrap();
+                    panic!("simulate a publication interrupted while holding the pointer lock");
+                })
+                .join()
+                .is_err());
+        });
+        let findings = snapshot_findings(&cache);
+        assert!(findings.is_empty(), "{findings:?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn diagnostics_findings_ignore_expired_allocator_in_fresh_idle_rollups() {
+        let cache = HealthRollupCache::new();
+        let executor = Executor::new();
+        let app = App::default_shared();
+        cache.clock_ms.store(0, Ordering::Relaxed);
+        cache.allocator_walk_ms_for_test.store(0, Ordering::Relaxed);
+        cache.request_census();
+        cache.refresh_for_test(&executor, &app);
+        let walks = crate::memory::allocator_snapshot_calls_for_test();
+
+        let interval_ms = duration_millis_u64(demand::BACKGROUND_INTERVAL);
+        let first_past_reuse = (300_000 / interval_ms + 1) * interval_ms;
+        for now in [first_past_reuse, first_past_reuse + interval_ms] {
+            cache.clock_ms.store(now, Ordering::Relaxed);
+            cache.refresh_for_test(&executor, &app);
+            let (rollup, age) = cache.snapshot();
+            assert_eq!(age, Some(0));
+            assert!(rollup.metrics["memory"]["allocator_observation_age_ms"]
+                .as_u64()
+                .is_some_and(|age| age >= now));
+            assert!(cache.allocator_breakdown_due());
+            let findings = snapshot_findings(&cache);
+            assert!(findings.is_empty(), "{findings:?}");
+        }
+        assert_eq!(crate::memory::allocator_snapshot_calls_for_test(), walks);
     }
 }
 
@@ -3580,15 +3699,7 @@ impl Drop for CensusWaiter<'_> {
 pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Instant) -> Value {
     let ticket = cache.request_census();
     let answered = |snapshot: &HealthDiagnosticRollup| snapshot.memory_census_answers >= ticket;
-    let published = || {
-        Arc::clone(
-            &cache
-                .snapshot
-                .read()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
-    };
-    let snapshot = published();
+    let snapshot = cache.published_snapshot();
     let current = cache
         .census_age_ms(&snapshot)
         .is_some_and(|age| age <= duration_millis_u64(HEALTH_ROLLUP_TTL));
@@ -3604,7 +3715,7 @@ pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Ins
     let mut publications = cache.publications.subscribe();
     cache.wake_for_census();
     loop {
-        let snapshot = published();
+        let snapshot = cache.published_snapshot();
         if answered(&snapshot) {
             return cache.render_memory_census(&snapshot);
         }
@@ -3616,7 +3727,7 @@ pub(super) async fn fresh_memory_census(cache: &HealthRollupCache, deadline: Ins
         {
             Ok(Ok(())) => {}
             // Out of time, or the cache is going away: serve what is there.
-            Ok(Err(_)) | Err(_) => return cache.render_memory_census(&published()),
+            Ok(Err(_)) | Err(_) => return cache.render_memory_census(&cache.published_snapshot()),
         }
     }
 }
@@ -3736,20 +3847,23 @@ impl HealthRollupWorker {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(wake_tx.clone());
         let worker_cache = Arc::clone(&cache);
+        let mut retries = 0;
         let join = std::thread::Builder::new()
             .name("aft-health-rollup".to_string())
             .spawn(move || 'worker: loop {
                 worker_cache
                     .health_requested
                     .store(false, Ordering::Release);
-                worker_cache.refresh(&executor, &shared_app);
+                let published = worker_cache.refresh(&executor, &shared_app);
                 // Bind completions can arrive during a rollup. A queued request
                 // must not start another full census immediately; the interval
-                // is a minimum quiet period after each completed refresh. A
+                // is a quiet period after a successful refresh. A
                 // census read that waits is answered now; a health liveness
-                // read can shorten the slow cadence to HEALTH_ROLLUP_TTL.
+                // read can shorten the slow cadence to HEALTH_ROLLUP_TTL. A
+                // failed scheduler snapshot gets a few short retries first.
                 let completed = Instant::now();
-                let next_refresh = completed + interval;
+                let next_refresh =
+                    completed + demand::next_background_delay(interval, published, &mut retries);
                 loop {
                     let next = if worker_cache.health_requested.load(Ordering::Acquire) {
                         next_refresh.min(completed + HEALTH_ROLLUP_TTL)
@@ -4619,8 +4733,7 @@ fn build_health_diagnostic_rollup_from_actors(
 
     let root_details_omitted = root_count.saturating_sub(roots.len());
     rollup_mark!(timer, "root JSON assembly");
-    let (allocator, allocator_reuse_ms) = cache.allocator_observation();
-    let allocator_age_ms = allocator.age_ms;
+    let allocator = cache.allocator_observation();
     rollup_mark!(timer, "allocator observation");
     // Shared bases and semantic arenas are measured once for the compact
     // rollup; a rollup that also measures the census reuses that measurement.
@@ -4755,10 +4868,6 @@ fn build_health_diagnostic_rollup_from_actors(
         "roots": diagnostics_roots,
         "embedding_backend": metrics["embedding_backend"],
         "storage_retention": metrics["storage_retention"],
-        "memory": {
-            "allocator_observation_age_ms": allocator_age_ms,
-            "allocator_reuse_ms": allocator_reuse_ms,
-        },
     });
     rollup_mark!(timer, "metrics JSON assembly");
     let tick = timer.metrics();
@@ -8783,7 +8892,9 @@ mod tests {
             "{detail}"
         );
 
-        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
         let report = build_health_report(&cache, &executor, &HashMap::new(), &metrics, &app);
         assert_eq!(report.status, HealthStatus::Degraded);
         assert!(report
@@ -8819,7 +8930,9 @@ mod tests {
         let good = cache.snapshot().0;
         assert_eq!(good.metrics["lsp_children"]["spawned"], 1);
         cache.clock_ms.store(1_300, Ordering::Relaxed);
-        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
 
         let stale = cache.snapshot().0;
         // A failed refresh only marks the retained census stale. It must not
@@ -8867,7 +8980,9 @@ mod tests {
         let cache = HealthRollupCache::new();
         cache.clock_ms.store(250, Ordering::Relaxed);
         let app = App::default_shared();
-        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
         let report = build_health_report(
             &cache,
             &executor,
@@ -8926,7 +9041,9 @@ mod tests {
     #[test]
     fn a_census_read_before_recovery_stays_stale_after_it() {
         let (_dir, executor, cache, app) = contended_health_fixture();
-        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
         // A probe takes the stale census, then a refresh recovers before the
         // probe judges its freshness.
         let held = cache.snapshot().0;
@@ -8942,7 +9059,9 @@ mod tests {
     fn health_contention_recovery_clears_staleness() {
         let (_dir, executor, cache, app) = contended_health_fixture();
         cache.clock_ms.store(1_300, Ordering::Relaxed);
-        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
         cache.clock_ms.store(1_900, Ordering::Relaxed);
         cache.refresh_for_test(&executor, &app);
         let report = build_health_report(
@@ -8967,7 +9086,9 @@ mod tests {
         let dispatch = DispatchPathMetrics::new();
         for (now_ms, age_ms) in [(1_300, 300), (1_700, 700)] {
             cache.clock_ms.store(now_ms, Ordering::Relaxed);
-            executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+            executor.hold_state_lock_for_test(|| {
+                cache.refresh(&executor, &app);
+            });
             let report = build_health_report(&cache, &executor, &HashMap::new(), &dispatch, &app);
             let metrics = report.metrics.unwrap();
             assert_eq!(metrics["age_ms"], age_ms);
@@ -9028,45 +9149,6 @@ mod tests {
             &crate::context::App::default_shared(),
             Vec::new(),
         )
-    }
-
-    #[test]
-    fn diagnostics_findings_allocator_window_travels_with_snapshot() {
-        let cache = HealthRollupCache::new();
-        cache.clock_ms.store(0, Ordering::Relaxed);
-        cache
-            .allocator_walk_ms_for_test
-            .store(1_800, Ordering::Relaxed);
-        cache.publish(Some(allocator_rollup(&cache)));
-
-        cache.clock_ms.store(90_000, Ordering::Relaxed);
-        let rollup = allocator_rollup(&cache);
-        assert_eq!(
-            rollup.findings_metrics["memory"]["allocator_reuse_ms"],
-            360_000
-        );
-        #[cfg(target_os = "linux")]
-        assert!(
-            rollup.findings_metrics["memory"]["allocator_observation_age_ms"]
-                .as_u64()
-                .unwrap()
-                >= 90_000
-        );
-        cache.publish(Some(rollup));
-        let has_snapshot_finding = || {
-            serde_json::to_value(cache.findings(1_000_000, 60_000))
-                .unwrap()
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|finding| finding["check"] == "health_snapshot")
-        };
-        assert!(!has_snapshot_finding());
-        cache.clock_ms.store(120_001, Ordering::Relaxed);
-        assert!(
-            has_snapshot_finding(),
-            "a stopped rollup must still be unknown"
-        );
     }
 
     #[test]
@@ -9268,7 +9350,9 @@ mod tests {
         let app = crate::context::App::default_shared();
 
         let before_contended_attempt = crate::context::memory_estimate_walks_for_test();
-        executor.hold_state_lock_for_test(|| cache.refresh(&executor, &app));
+        executor.hold_state_lock_for_test(|| {
+            cache.refresh(&executor, &app);
+        });
         assert_eq!(
             crate::context::memory_estimate_walks_for_test() - before_contended_attempt,
             0,

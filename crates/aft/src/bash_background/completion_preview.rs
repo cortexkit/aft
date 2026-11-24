@@ -2,6 +2,60 @@ use super::*;
 use crate::log_redact::aft_redactor;
 use std::borrow::Cow;
 
+pub(super) fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
+    let warning = metadata
+        .remote
+        .as_ref()
+        .and_then(|remote| remote.output_incomplete.as_ref())
+        .map(remote::RemoteOutputIncomplete::warning_line);
+    let mut note = match (warning, metadata.execution_note.as_deref()) {
+        (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
+        (Some(warning), _) => Some(warning),
+        (None, Some(note)) => Some(note.to_owned()),
+        (None, None) => None,
+    };
+    // Disk recovery can render the task's terminal result before the finalizer has
+    // saved its execution note. Keep the same memory advice on that path.
+    if let Some(oom) = remote::remote_oom_kill(metadata) {
+        let message = oom.message();
+        if !note.as_ref().is_some_and(|note| note.contains(&message)) {
+            note = Some(match note {
+                Some(note) => format!("{note}\n{message}"),
+                None => message,
+            });
+        }
+    }
+    let note = if metadata.status == BgTaskStatus::Killed
+        && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
+    {
+        let cancellation = "[killed (cancelled by owner); expected stop, not a command failure]";
+        Some(match note {
+            Some(note) => format!("{cancellation}\n{note}"),
+            None => cancellation.to_owned(),
+        })
+    } else {
+        note
+    };
+    #[cfg(unix)]
+    let note = runon_capture::render_warning(metadata, note);
+    match (metadata.memory_policy.as_ref(), note) {
+        (Some(policy), Some(note)) => Some(format!("{}\n{note}", policy.note())),
+        (Some(policy), None) => Some(policy.note()),
+        (None, note) => note,
+    }
+}
+
+/// Print what a remote run's report says about the workspace after the
+/// command's output, where a reader looks once the output ends.
+pub(super) fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
+    if let Some(report) = remote::remote_report(metadata) {
+        if !output.is_empty() && !output.ends_with('\n') {
+            output.push('\n');
+        }
+        output.push_str(&report);
+    }
+}
+
 #[path = "capture_reads.rs"]
 pub(super) mod capture_reads;
 

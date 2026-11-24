@@ -78,6 +78,35 @@ describe("coerceAftStatus", () => {
     expect(dialog).toContain("- project checkpoints (all sessions): —");
   });
 
+  test("text status dialog shows a single shared Index store size", () => {
+    const dialog = formatStatusDialogMessage(
+      coerceAftStatus({ ...baseResponse, disk: { ...baseResponse.disk, data_store_bytes: 4096 } }),
+    );
+    expect(dialog.match(/^- Index store: 4\.0 KB$/gm)).toHaveLength(1);
+    expect(dialog).not.toMatch(/^- (trigram|semantic) index:/m);
+  });
+
+  test("disk-floor OpenCode text status and slash fallback warn once for the shared store", () => {
+    const paused = {
+      status: "unavailable",
+      reason: "disk_reserve",
+      error:
+        "Index storage is paused: 3.7 GiB is free on this disk and AFT keeps 4.0 GiB free. Unused index data is being cleaned up; retry later.",
+    };
+    const status = coerceAftStatus({
+      ...baseResponse,
+      search_index: paused,
+      semantic_index: paused,
+      callgraph_store: paused,
+      disk: { data_store_bytes: 4096 },
+    });
+    for (const text of [formatStatusDialogMessage(status), formatStatusMarkdown(status)]) {
+      expect(text.match(/paused \(low disk space\)/g)).toHaveLength(2);
+      expect(text).toContain(`⚠ ${paused.error}`);
+      expect(text.match(/Index storage is paused:/g)).toHaveLength(1);
+    }
+  });
+
   test("off inspect categories survive status parsing and never show stale counts", () => {
     const status = coerceAftStatus({
       ...baseResponse,

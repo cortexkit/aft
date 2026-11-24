@@ -249,6 +249,9 @@ pub(crate) mod folder_grants;
 pub(crate) mod remote;
 #[path = "return_files.rs"]
 pub(crate) mod return_files;
+#[cfg(unix)]
+#[path = "runon_capture.rs"]
+pub(crate) mod runon_capture;
 pub(crate) const LINUX_SCOPE_ENV: &str = "AFT_INTERNAL_LINUX_SCOPE";
 
 #[cfg(test)]
@@ -1050,6 +1053,8 @@ pub struct BgTaskSnapshot {
     pub kill_signaled: bool,
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub kill_reached: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kill_state_warning: Option<String>,
     /// Result of probing cancellation of a finished task whose outcome is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub remote_cancel: Option<String>,
@@ -1832,6 +1837,10 @@ pub(crate) struct BgTask {
     descendant_sample_saved: std::sync::Condvar,
     #[cfg(unix)]
     remote_cancel_notify: tokio::sync::Notify,
+    #[cfg(unix)]
+    local_capture_command: std::sync::OnceLock<runon_capture::LocalCommand>,
+    #[cfg(unix)]
+    runon_copy_warning: AtomicBool,
     /// Harness namespace the task's aft.db row is keyed under: the harness of
     /// the route that started it (or of the row it was replayed from). The
     /// root context is shared by routes from several harnesses, so this can
@@ -6059,6 +6068,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -6148,6 +6161,10 @@ impl BgTaskRegistry {
                 false
             } else if let TaskRuntime::Piped(Some(child)) = &mut state.runtime {
                 if let Some(mut release) = child.stdin.take() {
+                    if !task.holds_background_slot.load(Ordering::Acquire) {
+                        task.local_capture_command
+                            .get_or_init(|| runon_capture::LocalCommand::start(&task, &workdir));
+                    }
                     if let Err(error) = release.write_all(b"run\n") {
                         crate::slog_warn!(
                             "background task {task_id} bootstrap release failed: {error}"
@@ -6518,6 +6535,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -6902,6 +6923,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -8272,62 +8297,19 @@ impl BgTaskRegistry {
             .folder_grants
             .is_some()
             .then(|| (metadata.task_id.clone(), metadata.session_id.clone()));
-        let (marker, process_alive) = if matches!(
-            metadata.status,
-            BgTaskStatus::Starting | BgTaskStatus::Running | BgTaskStatus::Killing
-        ) {
-            let mut marker = read_exit_marker(&paths).ok().flatten();
-            let process_alive = if marker.is_none() {
-                let alive = process_is_alive(&metadata);
-                #[cfg(target_os = "linux")]
-                let alive = if alive && metadata.mode == BgMode::Pipes && metadata.remote.is_none()
-                {
-                    let recovered = (|| -> Result<(), String> {
-                        if let Some(super::task_scope::ScopeLookup::Present(scope)) =
-                            self.recover_persisted_task_scope(&metadata)?
-                        {
-                            if let Some(policy) = metadata.memory_policy.as_mut() {
-                                let monitor = super::memory_limit::Monitor::recover_task_scope(
-                                    policy.mib, &scope,
-                                );
-                                *policy = monitor.policy.clone();
-                                self.inner
-                                    .memory_monitors
-                                    .lock()
-                                    .unwrap_or_else(|error| error.into_inner())
-                                    .insert(metadata.task_id.clone(), monitor);
-                            }
-                        }
-                        Ok(())
-                    })();
-                    if recovered.is_err() {
-                        super::task_scope::log_unconfirmed_scope();
-                        false
-                    } else {
-                        alive
-                    }
-                } else {
-                    alive
-                };
-                if !alive {
-                    // The wrapper writes its exit marker before exiting. It may
-                    // have done both since our first read, so observe the marker
-                    // again after detecting death before declaring the outcome lost.
-                    marker = read_exit_marker(&paths).ok().flatten();
-                }
-                alive
-            } else {
-                false
-            };
-            (marker, process_alive)
-        } else {
-            (None, false)
-        };
+        let (marker, process_alive, memory_reason) =
+            self.replay_exit_observation(&mut metadata, &paths, process_is_alive);
         match metadata.status {
             BgTaskStatus::Starting => {
                 let completion_was_delivered = metadata.completion_delivered;
                 if let Some(marker) = marker {
-                    metadata = terminal_metadata_from_marker(metadata, marker, None);
+                    metadata = scope_runtime::replay_terminal_metadata(
+                        metadata,
+                        &paths,
+                        marker,
+                        None,
+                        memory_reason,
+                    );
                 } else if process_alive {
                     crate::slog_info!("background task {} replay Starting -> Running: durable child identity child_pid={:?} pgid={:?}", metadata.task_id, metadata.child_pid, metadata.pgid);
                     metadata.status = BgTaskStatus::Running;
@@ -8351,7 +8333,13 @@ impl BgTaskRegistry {
                 if metadata.mode == BgMode::Pty {
                     if let Some(marker) = marker {
                         let completion_was_delivered = metadata.completion_delivered;
-                        metadata = terminal_metadata_from_marker(metadata, marker, None);
+                        metadata = scope_runtime::replay_terminal_metadata(
+                            metadata,
+                            &paths,
+                            marker,
+                            None,
+                            memory_reason,
+                        );
                         metadata.completion_delivered |= completion_was_delivered;
                         let _ = self.persist_task(&paths, &metadata);
                         self.enqueue_replay_completion_if_needed(
@@ -8382,7 +8370,13 @@ impl BgTaskRegistry {
                             metadata.task_id);
                     }
                     let completion_was_delivered = metadata.completion_delivered;
-                    metadata = terminal_metadata_from_marker(metadata, marker, reason);
+                    metadata = scope_runtime::replay_terminal_metadata(
+                        metadata,
+                        &paths,
+                        marker,
+                        reason,
+                        memory_reason,
+                    );
                     metadata.completion_delivered |= completion_was_delivered;
                     let _ = self.persist_task(&paths, &metadata);
                     self.enqueue_replay_completion_if_needed(&mut metadata, &paths, session_id)?;
@@ -11092,6 +11086,8 @@ impl BgTaskRegistry {
                     .map_err(|e| format!("failed to promote background task: {e}"))?;
                 state.metadata = updated;
                 task.holds_background_slot.store(true, Ordering::SeqCst);
+                #[cfg(unix)]
+                task.finish_local_capture_command();
                 Ok::<_, String>(state.metadata.status.is_terminal())
             })?
         };
@@ -12419,6 +12415,9 @@ impl BgTaskRegistry {
         };
         let marker = match polled {
             Ok(Some(marker)) => marker,
+            // A killed PTY's waiter can reap the process even when a full
+            // disk prevents it from writing its exit marker.
+            _ if Self::pty_kill_observed(task) => ExitMarker::Killed,
             Ok(None) => {
                 #[cfg(unix)]
                 self.reap_adopted_child(task);
@@ -12547,7 +12546,7 @@ impl BgTaskRegistry {
             return false;
         }
         let child_exit_observed = state.child_exit_observed;
-        let memory_reason = pending_memory_stop_reason(state);
+        let memory_reason = pending_resource_stop_reason(state);
         let updated = self.update_task_metadata_locked(task, db, |metadata| {
             if let Some(reason) = &memory_reason {
                 metadata.mark_terminal(BgTaskStatus::Failed, Some(137), Some(reason.clone()));
@@ -13818,6 +13817,10 @@ impl BgTaskRegistry {
             descendant_sample_saved: std::sync::Condvar::new(),
             #[cfg(unix)]
             remote_cancel_notify: tokio::sync::Notify::new(),
+            #[cfg(unix)]
+            local_capture_command: Default::default(),
+            #[cfg(unix)]
+            runon_copy_warning: AtomicBool::new(false),
             remote_launch_ready: AtomicBool::new(false),
             runon_launch_state: Mutex::new(None),
             #[cfg(unix)]
@@ -14192,23 +14195,25 @@ impl BgTaskRegistry {
             .ok_or_else(|| RegistryError::TaskNotFound(task_id.into()))?;
         #[cfg(unix)]
         self.stop_secret_proxy(task_id);
-        let pending_memory_reason = task
+        let pending_resource_reason = task
             .lock_state()
             .ok()
-            .and_then(|state| pending_memory_stop_reason(&state));
-        let terminal_status = if pending_memory_reason.is_some() {
+            .and_then(|state| pending_resource_stop_reason(&state));
+        let terminal_status = if pending_resource_reason.is_some() {
             BgTaskStatus::Failed
         } else {
             terminal_status
         };
-        let reason = pending_memory_reason.or(reason);
+        let reason = pending_resource_reason.or(reason);
+        let mut saves = KillStateSave::default();
         let audit_reason = reason.clone();
         let kill_reason = audit_reason.as_deref().unwrap_or("kill_requested");
-        let memory_kill = terminal_status == BgTaskStatus::Failed
+        let resource_kill = terminal_status == BgTaskStatus::Failed
             && reason.is_some()
-            && task
-                .lock_state()
-                .is_ok_and(|state| state.metadata.memory_policy.is_some());
+            && (reason.as_deref() == Some(super::buffer::OUTPUT_LIMIT_REASON)
+                || task
+                    .lock_state()
+                    .is_ok_and(|state| state.metadata.memory_policy.is_some()));
         let speech_path = self
             .inner
             .speech_db_path
@@ -14237,24 +14242,29 @@ impl BgTaskRegistry {
                     .map_err(|_| "background task lock poisoned")?;
                 if !state.metadata.is_terminal() {
                     state.metadata.status_reason = reason.clone();
-                    self.persist_task_locked(&task, &state.metadata, &mut db)
-                        .map_err(|e| e.to_string())?;
+                    saves.record(
+                        &task,
+                        self.persist_task_locked(&task, &state.metadata, &mut db),
+                        false,
+                    );
                 }
             }
             if reason.as_deref() == Some(OWNER_PAUSED_REASON) {
-                self.record_owner_pause_remote(&task)
+                self.record_owner_pause_remote(&task, &mut saves)
                     .map_err(RegistryError::from)?;
-                return Ok(self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES));
+                let mut snapshot =
+                    self.snapshot_with_terminal_cache(&task, RUNNING_OUTPUT_PREVIEW_BYTES);
+                snapshot.kill_state_warning = saves.into_warning();
+                return Ok(snapshot);
             }
-            return self.kill_remote_task(&task).map_err(RegistryError::from);
+            return self
+                .kill_remote_task_with_saves(&task, saves)
+                .map_err(RegistryError::from);
         }
         let mut terminalized = false;
         let mut kill_signaled = false;
         let mut kill_reached = 0;
-        // Declared before the state locks below, so it runs after they are
-        // released on every exit, including a failed persist that returns
-        // early after the task was already marked terminal and would
-        // otherwise never reach `post_terminal_transition`.
+        // Release retained handles on every exit, after the state lock.
         let _release_handles = ReleaseIoHandlesOnExit(&task);
 
         // The Killing row is captured under the state lock, but its database
@@ -14283,16 +14293,20 @@ impl BgTaskRegistry {
                     }
                     _ => KillSignalPlan::Nothing,
                 }
-            } else if let Ok(Some(marker)) = read_exit_marker(&task.paths) {
-                let memory_reason = pending_memory_stop_reason(&state);
-                let memory_kill = memory_kill || memory_reason.is_some();
-                let reason = memory_reason.or_else(|| reason.clone());
+            } else if let Some(marker) = read_exit_marker(&task.paths)
+                .ok()
+                .flatten()
+                .filter(|_| reason.as_deref() != Some(super::buffer::OUTPUT_LIMIT_REASON))
+            {
+                let resource_reason = pending_resource_stop_reason(&state);
+                let resource_kill = resource_kill || resource_reason.is_some();
+                let reason = resource_reason.or_else(|| reason.clone());
                 // A cap violation is a forced stop, not a natural exit. Polling
-                // for output here would reschedule the same memory kill before
+                // for output here would reschedule the same cap kill before
                 // ConPTY can close, leaving the task running indefinitely.
                 #[cfg(any(windows, test))]
                 let needs_pty_drain = matches!(&state.runtime, TaskRuntime::Pty(Some(pty))
-                    if pty.output_drain.is_some() && !pty.was_killed.load(Ordering::SeqCst) && !memory_kill);
+                    if pty.output_drain.is_some() && !pty.was_killed.load(Ordering::SeqCst) && !resource_kill);
                 #[cfg(not(any(windows, test)))]
                 let needs_pty_drain = false;
                 if needs_pty_drain {
@@ -14311,7 +14325,7 @@ impl BgTaskRegistry {
                     } else {
                         None
                     };
-                    let terminal_reason = if marker == ExitMarker::Killed || memory_kill {
+                    let terminal_reason = if marker == ExitMarker::Killed || resource_kill {
                         reason.clone()
                     } else if committed_piped_override.is_some() {
                         state.metadata.status_reason.clone()
@@ -14330,7 +14344,7 @@ impl BgTaskRegistry {
                             terminal_reason,
                         )
                     };
-                    if memory_kill {
+                    if resource_kill {
                         state.metadata.mark_terminal(
                             BgTaskStatus::Failed,
                             Some(137),
@@ -14361,8 +14375,11 @@ impl BgTaskRegistry {
                         TaskRuntime::Piped(_) => None,
                     };
                     state.detached = true;
-                    self.persist_task_locked(&task, &state.metadata, &mut killing_db)
-                        .map_err(|e| format!("failed to persist terminal state: {e}"))?;
+                    saves.record(
+                        &task,
+                        self.persist_task_locked(&task, &state.metadata, &mut killing_db),
+                        true,
+                    );
                     terminalized = true;
                     KillSignalPlan::RetirePty(retired_pty)
                 }
@@ -14384,11 +14401,14 @@ impl BgTaskRegistry {
                     killing.status_reason = reason.clone();
                 }
                 if !was_already_killing || reason.is_some() {
-                    self.persist_task_locked(&task, &killing, &mut killing_db)
-                        .map_err(|e| format!("failed to persist killing state: {e}"))?;
+                    saves.record(
+                        &task,
+                        self.persist_task_locked(&task, &killing, &mut killing_db),
+                        false,
+                    );
                 }
                 state.metadata = killing;
-                if memory_kill
+                if resource_kill
                     || (!was_already_killing
                         && state.metadata.mode == BgMode::Pty
                         && matches!(
@@ -14468,10 +14488,10 @@ impl BgTaskRegistry {
                     let marker = read_exit_marker(&task.paths)
                         .ok()
                         .flatten()
-                        .filter(|marker| !memory_kill && matches!(marker, ExitMarker::Code(_)));
+                        .filter(|marker| !resource_kill && matches!(marker, ExitMarker::Code(_)));
                     if marker.is_none()
                         && !state.metadata.status.is_terminal()
-                        && pending_memory_stop_reason(&state).is_none()
+                        && pending_resource_stop_reason(&state).is_none()
                     {
                         // Serialize the signal decision with marker finalization.
                         // A later numeric marker can be the waiter's report of
@@ -14515,10 +14535,10 @@ impl BgTaskRegistry {
                 // (the task's own exit marker, read by the watchdog) stands.
                 if !state.metadata.status.is_terminal() {
                     state.detached = true;
-                    let memory_reason = pending_memory_stop_reason(&state);
-                    let memory_kill = memory_kill || memory_reason.is_some();
-                    let reason = memory_reason.or(reason);
-                    let terminal_status = if memory_kill {
+                    let resource_reason = pending_resource_stop_reason(&state);
+                    let resource_kill = resource_kill || resource_reason.is_some();
+                    let reason = resource_reason.or(reason);
+                    let terminal_status = if resource_kill {
                         BgTaskStatus::Failed
                     } else {
                         terminal_status
@@ -14531,7 +14551,8 @@ impl BgTaskRegistry {
                             None,
                             Some(format!("Task outcome is unknown: {error}.")),
                         );
-                    } else if let Some(marker) = natural_exit_before_signal.filter(|_| !memory_kill)
+                    } else if let Some(marker) =
+                        natural_exit_before_signal.filter(|_| !resource_kill)
                     {
                         state.metadata =
                             terminal_metadata_from_marker(state.metadata.clone(), marker, None);
@@ -14576,7 +14597,7 @@ impl BgTaskRegistry {
                             }
                         };
 
-                        let exit_code = forced_terminal_exit_code(&terminal_status, memory_kill);
+                        let exit_code = forced_terminal_exit_code(&terminal_status, resource_kill);
                         state
                             .metadata
                             .mark_terminal(terminal_status, exit_code, terminal_reason);
@@ -14584,8 +14605,11 @@ impl BgTaskRegistry {
 
                     state.pending_terminal_override = None;
                     task.mark_terminal_now();
-                    self.persist_task_locked(&task, &state.metadata, &mut db)
-                        .map_err(|e| format!("failed to persist killed state: {e}"))?;
+                    saves.record(
+                        &task,
+                        self.persist_task_locked(&task, &state.metadata, &mut db),
+                        true,
+                    );
                     terminalized = true;
                 }
             }
@@ -14609,7 +14633,13 @@ impl BgTaskRegistry {
                 }
                 settle_killed_process_group(&task.task_id, pid.map(|pid| pid as i32));
                 close_pty_master(master);
-                terminalized = self.finish_pty_kill(&task, terminal_status, reason, memory_kill)?;
+                terminalized = self.finish_pty_kill(
+                    &task,
+                    terminal_status,
+                    reason,
+                    resource_kill,
+                    &mut saves,
+                )?;
             }
         }
 
@@ -14641,6 +14671,7 @@ impl BgTaskRegistry {
         }
         snapshot.kill_signaled = kill_signaled;
         snapshot.kill_reached = kill_reached;
+        snapshot.kill_state_warning = saves.into_warning();
         #[cfg(feature = "test-timing-hooks")]
         if scope_diagnostic {
             crate::slog_info!(
@@ -14709,65 +14740,6 @@ impl BgTaskRegistry {
             wait_on_group_sample_gate_for_test(&task.task_id);
             let _ = self.sample_task_process_group(task);
         }
-    }
-
-    /// Re-take the state lock after a PTY kill's signal and close the master.
-    /// Returns whether this call published the terminal state.
-    fn finish_pty_kill(
-        &self,
-        task: &Arc<BgTask>,
-        terminal_status: BgTaskStatus,
-        reason: Option<String>,
-        memory_kill: bool,
-    ) -> Result<bool, String> {
-        #[cfg_attr(not(windows), allow(unused_mut, unused_variables))]
-        let mut db = DeferredDbWrites::new(self, task);
-        let mut state = task
-            .lock_state()
-            .map_err(|_| "background task lock poisoned".to_string())?;
-        state.kill_in_flight = false;
-        task.kill_settled.notify_all();
-
-        // On Unix the PTY waiter writes the exit marker and the watchdog
-        // publishes the terminal state from it. Windows ConPTY gives no such
-        // signal, so the kill publishes it here.
-        #[cfg(windows)]
-        if !state.metadata.status.is_terminal() {
-            let memory_reason = pending_memory_stop_reason(&state);
-            let memory_kill = memory_kill || memory_reason.is_some();
-            let reason = memory_reason.or(reason);
-            let default_status = if terminal_status == BgTaskStatus::TimedOut {
-                BgTaskStatus::TimedOut
-            } else {
-                BgTaskStatus::Killed
-            };
-            let target_status = state
-                .pending_terminal_override
-                .take()
-                .unwrap_or(default_status);
-            if !task.paths.exit.exists() {
-                write_kill_marker_if_absent(&task.paths)
-                    .map_err(|e| format!("failed to write kill marker: {e}"))?;
-            }
-
-            let exit_code = forced_terminal_exit_code(&target_status, memory_kill);
-            state
-                .metadata
-                .mark_terminal(target_status, exit_code, reason.clone());
-
-            state.pending_terminal_override = None;
-            task.mark_terminal_now();
-            if let TaskRuntime::Pty(runtime) = &mut state.runtime {
-                *runtime = None;
-            }
-            state.detached = true;
-            self.persist_task_locked(task, &state.metadata, &mut db)
-                .map_err(|e| format!("failed to persist killed PTY state: {e}"))?;
-            return Ok(true);
-        }
-        #[cfg(not(windows))]
-        let _ = (terminal_status, reason, memory_kill);
-        Ok(false)
     }
 
     /// Wait, without holding the task's state lock, for a kill that another
@@ -14863,7 +14835,7 @@ impl BgTaskRegistry {
                 return Ok(());
             }
 
-            let memory_reason = pending_memory_stop_reason(&state);
+            let memory_reason = pending_resource_stop_reason(&state);
             let pending_override = state.pending_terminal_override.take();
             let is_pty = state.metadata.mode == BgMode::Pty;
             let committed_piped_override = if is_pty {
@@ -14872,7 +14844,7 @@ impl BgTaskRegistry {
                 pending_override.clone()
             };
             // Before a piped kill commits, numeric markers remain natural exits.
-            // A known memory breach or committed signal outcome takes precedence
+            // A known resource-limit breach or committed signal outcome takes precedence
             // over later numeric waiter reports.
             let inherited_reason = if state.metadata.status == BgTaskStatus::Killing
                 && matches!(marker, ExitMarker::Code(_))
@@ -17797,6 +17769,7 @@ fn terminal_metadata_snapshot(metadata: PersistedTask) -> BgTaskSnapshot {
         live_descendants_summary,
         kill_signaled: false,
         kill_reached: 0,
+        kill_state_warning: None,
         remote_cancel: None,
         hard_kill,
         elapsed_ms: None,
@@ -18000,6 +17973,7 @@ impl BgTask {
             live_descendants_summary: live_descendants_summary(metadata),
             kill_signaled: false,
             kill_reached: 0,
+            kill_state_warning: None,
             remote_cancel: None,
             hard_kill: if metadata.remote.is_none() {
                 HardKillDeadline::reported(metadata, self.hard_kill_renewable)
@@ -18103,7 +18077,16 @@ impl BgTask {
         true
     }
 
+    #[cfg(unix)]
+    fn finish_local_capture_command(&self) {
+        if let Some(command) = self.local_capture_command.get() {
+            command.finish();
+        }
+    }
+
     fn mark_terminal_now(&self) {
+        #[cfg(unix)]
+        self.finish_local_capture_command();
         if let Ok(mut terminal_at) = self.terminal_at.lock() {
             if terminal_at.is_none() {
                 *terminal_at = Some(Instant::now());
@@ -18255,19 +18238,20 @@ fn terminal_exit_code_for_status(status: &BgTaskStatus) -> Option<i64> {
     }
 }
 
-fn forced_terminal_exit_code(status: &BgTaskStatus, memory_kill: bool) -> Option<i64> {
-    // A failed memory stop is still a known forced termination. Ordinary
+fn forced_terminal_exit_code(status: &BgTaskStatus, resource_kill: bool) -> Option<i64> {
+    // A failed resource-limit stop is still a known forced termination. Ordinary
     // failures without an observed code must continue to report an unknown code.
-    if memory_kill {
+    if resource_kill {
         Some(137)
     } else {
         terminal_exit_code_for_status(status)
     }
 }
 
-fn pending_memory_stop_reason(state: &BgTaskState) -> Option<String> {
+fn pending_resource_stop_reason(state: &BgTaskState) -> Option<String> {
     (state.pending_terminal_override == Some(BgTaskStatus::Failed)
-        && state.metadata.memory_policy.is_some())
+        && (state.metadata.memory_policy.is_some()
+            || state.metadata.status_reason.as_deref() == Some(super::buffer::OUTPUT_LIMIT_REASON)))
     .then(|| state.metadata.status_reason.clone())
     .flatten()
 }
@@ -18525,61 +18509,13 @@ mod pty_replay;
 
 #[path = "adopted_identity.rs"]
 mod adopted_identity;
+mod kill_state;
+use kill_state::KillStateSave;
 
 #[path = "completion_queue.rs"]
 pub(crate) mod completion_queue;
 
-fn rendered_execution_note(metadata: &PersistedTask) -> Option<String> {
-    let warning = metadata
-        .remote
-        .as_ref()
-        .and_then(|remote| remote.output_incomplete.as_ref())
-        .map(remote::RemoteOutputIncomplete::warning_line);
-    let mut note = match (warning, metadata.execution_note.as_deref()) {
-        (Some(warning), Some(note)) if !note.is_empty() => Some(format!("{warning}\n{note}")),
-        (Some(warning), _) => Some(warning),
-        (None, Some(note)) => Some(note.to_owned()),
-        (None, None) => None,
-    };
-    // Disk recovery can render the task's terminal result before the finalizer has
-    // saved its execution note. Keep the same memory advice on that path.
-    if let Some(oom) = remote::remote_oom_kill(metadata) {
-        let message = oom.message();
-        if !note.as_ref().is_some_and(|note| note.contains(&message)) {
-            note = Some(match note {
-                Some(note) => format!("{note}\n{message}"),
-                None => message,
-            });
-        }
-    }
-    let note = if metadata.status == BgTaskStatus::Killed
-        && metadata.status_reason.as_deref() == Some(OWNER_PAUSED_REASON)
-    {
-        let cancellation = "[killed (cancelled by owner); expected stop, not a command failure]";
-        Some(match note {
-            Some(note) => format!("{cancellation}\n{note}"),
-            None => cancellation.to_owned(),
-        })
-    } else {
-        note
-    };
-    match (metadata.memory_policy.as_ref(), note) {
-        (Some(policy), Some(note)) => Some(format!("{}\n{note}", policy.note())),
-        (Some(policy), None) => Some(policy.note()),
-        (None, note) => note,
-    }
-}
-
-/// Print what a remote run's report says about the workspace after the
-/// command's output, where a reader looks once the output ends.
-fn append_remote_report(output: &mut String, metadata: &PersistedTask) {
-    if let Some(report) = remote::remote_report(metadata) {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&report);
-    }
-}
+use completion_preview::{append_remote_report, rendered_execution_note};
 
 fn append_source_read_only_note(output: &mut String, metadata: &PersistedTask, buffer: &BgBuffer) {
     use std::io::BufRead;
@@ -18639,6 +18575,10 @@ mod completion_replay_ordering_tests;
 #[cfg(all(test, unix))]
 #[path = "kill_survivor_tests.rs"]
 mod kill_survivor_tests;
+
+#[cfg(all(test, unix))]
+#[path = "output_limit_tests.rs"]
+mod output_limit_tests;
 
 #[cfg(test)]
 #[path = "memory_limit_tests.rs"]
@@ -19578,17 +19518,25 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_failed_killing_persist_preserves_running_state() {
+    fn lifecycle_failed_kill_persist_leaves_terminal_state_retryable() {
+        use super::super::persistence::{with_task_io_fault, TaskIoFault};
+
         let registry = BgTaskRegistry::default();
+        registry.inner.shutdown.store(true, Ordering::SeqCst);
         let dir = tempfile::tempdir().unwrap();
         let task = lifecycle_running_fixture(&registry, &dir);
-        fs::remove_file(&task.paths.json).unwrap();
-        fs::create_dir(&task.paths.json).unwrap();
-        assert!(registry.kill(&task.task_id, "session").is_err());
-        let state = task.lock_state().unwrap();
-        assert_eq!(state.metadata.status, BgTaskStatus::Running);
-        assert_eq!(state.metadata.status_reason, None);
-        assert!(!state.kill_in_flight);
+        let stopped = with_task_io_fault(TaskIoFault::TerminalEnospc, || {
+            registry.kill(&task.task_id, "session").unwrap()
+        });
+        assert_eq!(stopped.info.status, BgTaskStatus::Killed);
+        assert!(stopped.kill_state_warning.is_some());
+        assert!(!task.kill_in_flight());
+        assert!(task.terminal_persist_dirty.load(Ordering::SeqCst));
+        registry.retry_terminal_persist(&task).unwrap();
+        assert_eq!(
+            read_task(&task.paths.json).unwrap().status,
+            BgTaskStatus::Killed
+        );
     }
 
     #[test]
@@ -20112,6 +20060,7 @@ mod tests {
         assert!(registry.take_wait_mode_detach("session"));
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn lifecycle_abort_attempts_every_task_and_retains_failures() {
         let registry = BgTaskRegistry::default();
@@ -20131,9 +20080,22 @@ mod tests {
         } else {
             first
         };
-        fs::remove_file(&failing.paths.json).unwrap();
-        fs::create_dir(&failing.paths.json).unwrap();
-        assert!(registry.abort_inflight("session").is_err());
+        // The wrapper exited, but the task's cgroup still needs stopping.
+        // Make the cgroup kill fail without preventing either state save.
+        fs::write(&failing.paths.exit, b"0").unwrap();
+        let cgroup = dir.path().join("fake-cgroup");
+        fs::create_dir_all(cgroup.join("cgroup.kill")).unwrap();
+        registry
+            .inner
+            .task_scopes
+            .register(super::super::task_scope::handle_for_test(
+                &failing_id,
+                cgroup,
+            ));
+        assert!(registry
+            .abort_inflight("session")
+            .unwrap_err()
+            .contains("scope could not be killed"));
         assert!(other.state.lock().unwrap().metadata.is_terminal());
         assert!(
             registry.inner.wait_registered_tasks.lock().unwrap()["session"].contains(&failing_id)

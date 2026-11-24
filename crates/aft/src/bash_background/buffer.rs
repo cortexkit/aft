@@ -17,6 +17,43 @@ thread_local! {
 }
 
 pub const DISK_LIMIT_BYTES: u64 = 100 * 1024 * 1024;
+pub(super) const RUNNING_DISK_LIMIT_BYTES: u64 = 1024 * 1024 * 1024;
+pub(super) const OUTPUT_LIMIT_REASON: &str = "Command stopped: output exceeded the 1 GiB limit.";
+
+pub(super) fn running_disk_limit_bytes(_session_dir: &Path) -> u64 {
+    #[cfg(all(test, unix))]
+    if let Some(limit) = TEST_LIMITS.lock().unwrap().get(_session_dir) {
+        return *limit;
+    }
+    #[cfg(feature = "test-hooks")]
+    if let Some(limit) = std::env::var("AFT_TEST_BASH_OUTPUT_LIMIT_BYTES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+    {
+        return limit;
+    }
+    RUNNING_DISK_LIMIT_BYTES
+}
+
+#[cfg(all(test, unix))]
+static TEST_LIMITS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(Mutex::default);
+
+#[cfg(all(test, unix))]
+pub(super) fn limit_for_test(session_dir: PathBuf, bytes: u64) -> impl Drop {
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_LIMITS.lock().unwrap().remove(&self.0);
+        }
+    }
+    assert!(TEST_LIMITS
+        .lock()
+        .unwrap()
+        .insert(session_dir.clone(), bytes)
+        .is_none());
+    Restore(session_dir)
+}
 
 struct RecoveredReadDiagnostics {
     task_id: String,
@@ -396,6 +433,19 @@ impl BgBuffer {
                 stderr_prefix_bytes: 0,
                 combined_prefix_bytes: combined.replace_with_tail(DISK_LIMIT_BYTES).unwrap_or(0),
             },
+        }
+    }
+
+    pub(super) fn running_disk_bytes(&self) -> u64 {
+        let len = |source: &ArtifactSource| {
+            std::fs::symlink_metadata(source.path())
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map_or(0, |metadata| metadata.len())
+        };
+        match self {
+            Self::Pipes { stdout, stderr } => len(stdout).saturating_add(len(stderr)),
+            Self::Pty { combined } => len(combined),
         }
     }
 

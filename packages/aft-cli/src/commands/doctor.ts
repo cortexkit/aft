@@ -61,6 +61,7 @@ import {
   type DiagnosticReport,
   findPluginCliVersionSkews,
   formatDiagnosticIssuesSection,
+  ONNX_CACHE_PIN_WARNING,
   pluginVersionSkewFor,
   renderDiagnosticsMarkdown,
   tailLogFile,
@@ -463,10 +464,14 @@ export async function runDoctor(options: DoctorOptions): Promise<number> {
       if (!h.onnxRuntime.cachedPath && !h.onnxRuntime.systemPath) {
         parts.push(`not installed — ${h.onnxRuntime.installHint}`);
       }
-      if (h.onnxRuntime.cachedCompatible === false || h.onnxRuntime.systemCompatible === false) {
+      if (
+        (h.onnxRuntime.cachedCompatible === false && !h.onnxRuntime.cachedPinMismatch) ||
+        h.onnxRuntime.systemCompatible === false
+      ) {
         parts.push(`needs reinstall — run \`${CLI} doctor --fix\``);
       }
       log.info(`  onnx runtime: ${parts.join(" · ")}`);
+      if (h.onnxRuntime.cachedPinMismatch) log.warn(ONNX_CACHE_PIN_WARNING);
     } else {
       const load = h.pluginLoad;
       const why =

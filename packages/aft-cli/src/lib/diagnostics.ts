@@ -10,6 +10,7 @@ import {
 import { join } from "node:path";
 import {
   isOrtAutoDownloadSupported,
+  isPinnedOnnxRuntimeLibrary,
   resolveCortexKitProjectConfigPath,
 } from "@cortexkit/aft-bridge";
 
@@ -34,8 +35,10 @@ import {
   findCachedOnnxRuntime,
   findIgnoredWindowsSystemOnnxRuntime,
   getManualInstallHint,
+  getOnnxLibraryName,
   inspectSystemOnnxRuntime,
   isOrtVersionCompatible,
+  ONNX_RUNTIME_VERSION,
   REQUIRED_ORT_MAJOR,
   REQUIRED_ORT_MIN_MINOR,
 } from "./onnx.js";
@@ -48,6 +51,10 @@ import {
 import { sanitizeValue } from "./sanitize.js";
 import { getSelfVersion } from "./self-version.js";
 import { compareSemver } from "./semver.js";
+
+const ONNX_CACHE_PIN_MISMATCH = `ONNX Runtime in AFT's cache doesn't match the pinned ${ONNX_RUNTIME_VERSION} build; AFT won't load it.`;
+const ONNX_CACHE_PIN_REMEDIATION = `Run: ${CLI} doctor --fix`;
+export const ONNX_CACHE_PIN_WARNING = `${ONNX_CACHE_PIN_MISMATCH} ${ONNX_CACHE_PIN_REMEDIATION}`;
 
 export interface DiagnosticReport {
   timestamp: string;
@@ -118,6 +125,7 @@ export interface HarnessDiagnostic {
     cachedPath: string | null;
     cachedVersion: string | null;
     cachedCompatible: boolean | null;
+    cachedPinMismatch?: boolean;
     platform: string;
     installHint: string;
     /**
@@ -239,6 +247,10 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
   const cachedOrtDir = findCachedOnnxRuntime(storage);
   const systemVersion = systemOrtDir ? detectOrtVersion(systemOrtDir) : null;
   const cachedVersion = cachedOrtDir ? detectOrtVersion(cachedOrtDir) : null;
+  const cachedVersionCompatible = cachedVersion ? isOrtVersionCompatible(cachedVersion) : null;
+  const cachedPinMismatch =
+    cachedOrtDir !== null &&
+    !(await isPinnedOnnxRuntimeLibrary(join(cachedOrtDir, getOnnxLibraryName())));
 
   return {
     kind: adapter.kind,
@@ -272,7 +284,8 @@ async function diagnoseHarness(adapter: HarnessAdapter): Promise<HarnessDiagnost
       ignoredSystemReason: ignoredSystem?.reason ?? null,
       cachedPath: cachedOrtDir,
       cachedVersion,
-      cachedCompatible: cachedVersion ? isOrtVersionCompatible(cachedVersion) : null,
+      cachedCompatible: cachedPinMismatch ? false : cachedVersionCompatible,
+      ...(cachedPinMismatch ? { cachedPinMismatch } : {}),
       platform: `${process.platform}-${process.arch}`,
       installHint: getManualInstallHint(),
       autoDownloadable: isOrtAutoDownloadSupported(),
@@ -597,8 +610,12 @@ export function collectDiagnosticIssues(report: DiagnosticReport): DiagnosticIss
           code: "onnx_incompatible",
           severity: "medium",
           scope: h.displayName,
-          message: `Cached ONNX Runtime ${h.onnxRuntime.cachedVersion ?? "unknown"} is incompatible (requires ${h.onnxRuntime.requirement}).`,
-          remediation: `Run \`${CLI} doctor --fix\` to refresh AFT-managed ONNX Runtime state.`,
+          message: h.onnxRuntime.cachedPinMismatch
+            ? ONNX_CACHE_PIN_MISMATCH
+            : `Cached ONNX Runtime ${h.onnxRuntime.cachedVersion ?? "unknown"} is incompatible (requires ${h.onnxRuntime.requirement}).`,
+          remediation: h.onnxRuntime.cachedPinMismatch
+            ? ONNX_CACHE_PIN_REMEDIATION
+            : `Run \`${CLI} doctor --fix\` to refresh AFT-managed ONNX Runtime state.`,
         });
       }
       if (h.onnxRuntime.systemCompatible === false) {

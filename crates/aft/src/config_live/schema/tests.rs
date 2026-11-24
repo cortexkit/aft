@@ -21,6 +21,24 @@ fn config_settings_editor_output_is_unchanged() {
     assert!(bytes == include_bytes!("../../../../../assets/aft.schema.json"));
 }
 
+#[test]
+fn config_settings_cache_dir_is_json_with_one_full_description() {
+    const CACHE_DIR: &str = "/properties/storage/properties/cache_dir";
+    let editor = editor_schema();
+    let editor_cache_dir = editor.pointer(CACHE_DIR).unwrap();
+    let declaration = settings_declaration();
+    let cache_dir = declaration.pointer(CACHE_DIR).unwrap();
+    assert_eq!(cache_dir["x-ck-kind"], "json");
+    assert_eq!(cache_dir["description"], editor_cache_dir["description"]);
+    let description = serde_json::to_string(&editor_cache_dir["description"]).unwrap();
+    let serialized = serde_json::to_string(cache_dir).unwrap();
+    assert_eq!(serialized.matches(description.as_str()).count(), 1);
+    for branch in cache_dir["oneOf"].as_array().unwrap() {
+        assert_eq!(branch["additionalProperties"], false);
+    }
+    Schema::new(declaration).expect("valid Subconscious vocabulary");
+}
+
 fn annotations(node: &Value, path: &str, found: &mut BTreeSet<(String, String)>) {
     for keyword in ["description", "markdownDescription"] {
         if let Some(text) = node.get(keyword).and_then(Value::as_str) {
@@ -382,4 +400,69 @@ fn config_settings_has_three_top_level_setup_sections() {
             "semantic": {"feature":"semantic", "order":30, "recommended":{}}
         })
     );
+}
+
+#[test]
+fn config_settings_declares_only_keywords_subconscious_enforces() {
+    // Subconscious refuses these on ordinary settings because it does not
+    // enforce them; inside a `x-ck-kind: "json"` value they still apply.
+    const REFUSED: &[&str] = &[
+        "minProperties",
+        "maxProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "prefixItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        "multipleOf",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "readOnly",
+        "writeOnly",
+        "$id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$vocabulary",
+        "definitions",
+        "dependencies",
+        "$recursiveAnchor",
+        "$recursiveRef",
+        "additionalItems",
+        "propertyNames",
+        "not",
+        "allOf",
+        "anyOf",
+        "if",
+    ];
+    fn walk(node: &Value, path: &str, found: &mut Vec<String>) {
+        let Some(object) = node.as_object() else {
+            return;
+        };
+        if object.get("x-ck-kind").and_then(Value::as_str) == Some("json") {
+            return;
+        }
+        for (key, child) in object {
+            let names_settings =
+                path.ends_with("/properties") || path.ends_with("/patternProperties");
+            if !names_settings && REFUSED.contains(&key.as_str()) {
+                found.push(format!("{path}/{key}"));
+            }
+            match child {
+                Value::Object(_) => walk(child, &format!("{path}/{key}"), found),
+                Value::Array(items) => {
+                    for (at, item) in items.iter().enumerate() {
+                        walk(item, &format!("{path}/{key}/{at}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&settings_declaration(), "", &mut found);
+    assert!(found.is_empty(), "keywords Subconscious refuses: {found:?}");
 }

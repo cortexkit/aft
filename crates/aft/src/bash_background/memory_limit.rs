@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 pub(super) const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const LINUX_WATCHER_KIND: &str =
     "Linux process-group RSS watcher; kernel memory controller unavailable";
+const LINUX_CGROUP_KIND: &str = "Linux cgroup v2 memory.max";
 #[cfg(unix)]
 const PID_BUDGET: usize = 4096;
 
@@ -176,6 +177,17 @@ pub struct MemoryPolicy {
 impl MemoryPolicy {
     #[cfg(target_os = "linux")]
     pub(crate) const TASK_SCOPE_MEMORY_KIND: &str = "Linux task scope memory.max";
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn systemd_cgroup(&self) -> Option<&std::path::Path> {
+        self.cgroup.as_deref().filter(|path| {
+            // New memory policies save the payload cgroup. Policies saved by
+            // older AFT versions use the systemd scope for accounting instead.
+            self.kind == LINUX_CGROUP_KIND
+                && (path.ends_with("payload") || path.extension().is_some_and(|ext| ext == "scope"))
+        })
+    }
+
     pub fn note(&self) -> String {
         format!("Memory cap: {} MiB ({}).", self.mib, self.kind)
     }
@@ -195,13 +207,27 @@ impl MemoryPolicy {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(super) struct ScopeHolder(Option<std::process::Child>);
+
+#[cfg(target_os = "linux")]
+impl Drop for ScopeHolder {
+    fn drop(&mut self) {
+        if let Some(helper) = self.0.take() {
+            linux::stop_bootstrap(helper);
+        }
+    }
+}
+
 pub(crate) struct Monitor {
     pub policy: MemoryPolicy,
     last_sample: Option<Instant>,
     exceeded: bool,
     accounting_failed: bool,
     #[cfg(target_os = "linux")]
-    bootstrap: Option<std::process::Child>,
+    holder: Option<ScopeHolder>,
+    #[cfg(target_os = "linux")]
+    exit_oom_sampled: bool,
     #[cfg(target_os = "linux")]
     retired_cgroup: Option<std::path::PathBuf>,
     #[cfg(target_os = "linux")]
@@ -213,13 +239,13 @@ pub(crate) struct Monitor {
 impl Monitor {
     pub fn prepare(mib: u64, task_id: &str) -> Result<Self, String> {
         #[cfg(target_os = "linux")]
-        let (cgroup, bootstrap) = linux::create(mib, task_id);
+        let (cgroup, holder) = linux::create(mib, task_id);
         #[cfg(not(target_os = "linux"))]
         let cgroup = None;
         #[cfg(windows)]
         let job = windows::Job::new(mib, task_id)?;
         let kind = if cgroup.is_some() {
-            "Linux cgroup v2 memory.max"
+            LINUX_CGROUP_KIND
         } else if cfg!(target_os = "linux") {
             LINUX_WATCHER_KIND
         } else if cfg!(target_os = "macos") {
@@ -238,7 +264,9 @@ impl Monitor {
             exceeded: false,
             accounting_failed: false,
             #[cfg(target_os = "linux")]
-            bootstrap,
+            holder,
+            #[cfg(target_os = "linux")]
+            exit_oom_sampled: false,
             #[cfg(target_os = "linux")]
             retired_cgroup: None,
             #[cfg(target_os = "linux")]
@@ -260,10 +288,6 @@ impl Monitor {
                 self.use_watcher_fallback();
             }
         }
-        #[cfg(target_os = "linux")]
-        if let Some(helper) = self.bootstrap.take() {
-            linux::stop_bootstrap(helper);
-        }
         #[cfg(windows)]
         self.job.attach(pid)?;
         let _ = pid;
@@ -274,9 +298,7 @@ impl Monitor {
     fn use_watcher_fallback(&mut self) {
         let failed = self.policy.cgroup.take();
         self.policy.kind = LINUX_WATCHER_KIND.into();
-        if let Some(helper) = self.bootstrap.take() {
-            linux::stop_bootstrap(helper);
-        }
+        drop(self.take_holder());
         if let Some(path) = failed {
             if std::fs::remove_dir(&path).is_err() {
                 // If immediate removal fails, retry it when this monitor is dropped.
@@ -307,7 +329,9 @@ impl Monitor {
             exceeded: false,
             accounting_failed: false,
             #[cfg(target_os = "linux")]
-            bootstrap: None,
+            holder: None,
+            #[cfg(target_os = "linux")]
+            exit_oom_sampled: false,
             #[cfg(target_os = "linux")]
             retired_cgroup: None,
             #[cfg(target_os = "linux")]
@@ -332,7 +356,7 @@ impl Monitor {
         self.last_sample = Some(Instant::now());
         #[cfg(target_os = "linux")]
         let over = match &self.policy.cgroup {
-            Some(path) => linux::oom(path),
+            Some(path) => linux::oom(path).unwrap_or(false),
             None => match group_bytes(pgid) {
                 Some(bytes) => bytes > self.policy.mib * 1024 * 1024,
                 None => {
@@ -356,6 +380,43 @@ impl Monitor {
         let _ = pgid;
         self.exceeded = over;
         over
+    }
+
+    pub(super) fn exceeded_at_exit(&mut self, pgid: i32, task_id: &str, sigkill: bool) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(path) = self.policy.systemd_cgroup() {
+            if !self.exceeded && !self.exit_oom_sampled {
+                match linux::oom(path) {
+                    Ok(over) => self.exceeded = over,
+                    Err(error) if sigkill => {
+                        crate::slog_warn!(
+                            "could not read memory-cap accounting for {task_id} after exit 137 at {}: {error}",
+                            path.join("memory.events").display()
+                        );
+                    }
+                    Err(_) => {}
+                }
+            }
+            self.exit_oom_sampled = true;
+            return self.exceeded;
+        }
+        let _ = (task_id, sigkill);
+        self.exceeded(pgid)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn take_holder(&mut self) -> Option<ScopeHolder> {
+        self.holder.take()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn holder_release_pending(&self, persisted: bool) -> bool {
+        self.holder.is_some() && (!self.exit_oom_sampled || !persisted)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn set_holder_for_test(&mut self, helper: std::process::Child) {
+        self.holder = Some(ScopeHolder(Some(helper)));
     }
 
     pub fn terminate(&self) {
@@ -416,7 +477,8 @@ impl Monitor {
             last_sample: None,
             exceeded: false,
             accounting_failed: false,
-            bootstrap: None,
+            holder: None,
+            exit_oom_sampled: false,
             retired_cgroup: None,
             borrowed_scope: Some(scope.clone()),
         }
@@ -440,15 +502,15 @@ impl Monitor {
 impl Drop for Monitor {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
-        if let Some(helper) = self.bootstrap.take() {
-            linux::stop_bootstrap(helper);
-        }
+        drop(self.take_holder());
         #[cfg(target_os = "linux")]
+        // Let systemd remove its cgroups. During restart recovery, the
+        // monitor can be dropped before AFT saves the memory-cap reason.
         if let Some(path) = self
             .policy
             .cgroup
             .as_ref()
-            .filter(|_| self.borrowed_scope.is_none())
+            .filter(|_| self.borrowed_scope.is_none() && self.policy.systemd_cgroup().is_none())
         {
             let _ = std::fs::remove_dir(path);
         }
@@ -500,10 +562,7 @@ mod linux {
         result
     }
 
-    pub(super) fn create(
-        mib: u64,
-        task_id: &str,
-    ) -> (Option<PathBuf>, Option<std::process::Child>) {
+    pub(super) fn create(mib: u64, task_id: &str) -> (Option<PathBuf>, Option<super::ScopeHolder>) {
         #[cfg(test)]
         if let Some(path) = super::attach_fault_candidate(task_id) {
             return (Some(path), None);
@@ -528,7 +587,6 @@ mod linux {
                 "--collect",
                 "--property=Delegate=yes",
             ])
-            .arg(format!("--property=MemoryMax={}", mib * 1024 * 1024))
             .args(["/bin/sh", "-c", "read -r ready"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
@@ -538,20 +596,28 @@ mod linux {
             return (None, None);
         };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut result = None;
         while std::time::Instant::now() < deadline {
             let child_pid =
                 std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", helper.id()))
                     .ok()
                     .and_then(|children| children.split_whitespace().next()?.parse::<u32>().ok());
-            let scope = current(helper.id())
-                .filter(|scope| scope != &parent)
-                .or_else(|| child_pid.and_then(current).filter(|scope| scope != &parent));
-            if let Some(scope) = scope {
-                if write_control(&scope.join("memory.oom.group"), "1").is_ok()
-                    && write_control(&scope.join("memory.swap.max"), "0").is_ok()
-                {
-                    result = Some(scope);
+            let placement = [Some(helper.id()), child_pid]
+                .into_iter()
+                .flatten()
+                .find_map(|pid| {
+                    current(pid)
+                        .filter(|scope| scope != &parent)
+                        .map(|scope| (pid, scope))
+                });
+            if let Some((pid, scope)) = placement {
+                if let Ok(payload) = setup_systemd_payload(
+                    &scope,
+                    pid,
+                    mib,
+                    |path| std::fs::create_dir(path),
+                    write_control,
+                ) {
+                    return (Some(payload), Some(super::ScopeHolder(Some(helper))));
                 }
                 break;
             }
@@ -560,13 +626,34 @@ mod linux {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        // Keep the delegated scope alive until the real task has joined its child cgroup.
-        // A populated descendant keeps the scope's cgroup from being collected.
-        if result.is_some() {
-            return (result, Some(helper));
-        }
         stop_bootstrap(helper);
         (None, None)
+    }
+
+    pub(in crate::bash_background) fn setup_systemd_payload(
+        scope: &Path,
+        bootstrap_pid: u32,
+        mib: u64,
+        mkdir: impl FnMut(&Path) -> std::io::Result<()>,
+        write: impl FnMut(&Path, &str) -> std::io::Result<()>,
+    ) -> std::io::Result<PathBuf> {
+        let (mut mkdir, mut write) = (mkdir, write);
+        let holder = scope.join("holder");
+        mkdir(&holder)?;
+        // Cgroup v2 only lets the scope delegate memory once its last process
+        // has moved out. The holder keeps the scope populated without sharing the cap.
+        write(&holder.join("cgroup.procs"), &bootstrap_pid.to_string())?;
+        write(&scope.join("cgroup.subtree_control"), "+memory")?;
+        let payload = scope.join("payload");
+        mkdir(&payload)?;
+        write(
+            &payload.join("memory.max"),
+            &(mib * 1024 * 1024).to_string(),
+        )?;
+        write(&payload.join("memory.oom.group"), "1")?;
+        // Keep swap from bypassing the physical-memory ceiling.
+        write(&payload.join("memory.swap.max"), "0")?;
+        Ok(payload)
     }
 
     pub(super) fn stop_bootstrap(mut helper: std::process::Child) {
@@ -586,8 +673,8 @@ mod linux {
         let _ = helper.wait();
     }
 
-    pub(super) fn oom(path: &Path) -> bool {
-        std::fs::read_to_string(path.join("memory.events")).is_ok_and(|text| {
+    pub(super) fn oom(path: &Path) -> std::io::Result<bool> {
+        std::fs::read_to_string(path.join("memory.events")).map(|text| {
             text.lines().any(|line| {
                 line.split_once(' ').is_some_and(|(key, value)| {
                     matches!(key, "oom" | "oom_kill" | "oom_group_kill")
@@ -640,10 +727,10 @@ mod linux {
                 .spawn()
                 .unwrap();
             let helper_pid = helper.id();
-            monitor.bootstrap = Some(helper);
+            monitor.holder = Some(super::super::ScopeHolder(Some(helper)));
             monitor.attach(12345).unwrap();
             assert_eq!(fault.attempts(), 1);
-            assert!(monitor.bootstrap.is_none());
+            assert!(monitor.holder.is_none());
             assert!(monitor.policy.cgroup.is_none());
             assert_eq!(monitor.policy.mib, 64);
             assert_eq!(std::fs::read_to_string(marker).unwrap(), "released");
@@ -790,6 +877,9 @@ mod linux {
         }
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use linux::setup_systemd_payload;
 
 #[cfg(target_os = "linux")]
 fn group_bytes(pgid: i32) -> Option<u64> {

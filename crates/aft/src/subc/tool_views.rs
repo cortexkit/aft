@@ -1,13 +1,13 @@
-//! View templates answered through `tool.views`, keyed by the exact schema pin
-//! (the hash of one tool definition) each was served for. Once served, a pin
-//! stays here even after the catalog moves to a newer definition, so a
-//! transcript's older calls can still be drawn.
-use std::collections::BTreeMap;
+//! View templates answered through `tool.views`. Legacy pins keep their exact
+//! views; versioned pins resolve to current or shipped tool definitions so
+//! transcripts can still draw calls made against an older schema.
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 
 use cortexkit_role_tool_provider::{
-    call::SchemaPin,
-    views::{ViewEntry, ViewManifest, ViewsReply, ViewsRequest},
+    call::{SchemaPin, ToolMajorPin},
+    catalog::{CatalogTool, ToolVersion},
+    views::{ViewEntry, ViewManifest, ViewTool, ViewsReply, ViewsRequest},
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -15,23 +15,9 @@ use subc_protocol::ErrorBody;
 
 pub(super) mod current;
 use super::rich_ui::notices;
+use super::tool_provider::versions;
 
 pub(crate) const BASH_SEMANTICS: u64 = 3;
-
-/// Earlier `bash` behavior versions whose calls still run. Version 3 only added
-/// the `tail` completion field to the app record; the command's input and
-/// behavior are the same as version 2. A session keeps the version its plan
-/// named, and a worker keeps its tool list for its whole run, so refusing
-/// version 2 would take `bash` away from every running session until its
-/// tool list refreshed. A call pinned to version 2 runs as before, and its
-/// record is drawn with the version-2 view, which has no `tail`.
-const BASH_RECORD_ONLY_PREDECESSORS: &[u64] = &[2];
-
-/// Whether a call pinned to `pinned` may run against the current `semantics`
-/// of `tool` because the versions differ only in what the app record carries.
-pub(crate) fn runs_under_newer_semantics(tool: &str, pinned: u64, semantics: u64) -> bool {
-    tool == "bash" && semantics == BASH_SEMANTICS && BASH_RECORD_ONLY_PREDECESSORS.contains(&pinned)
-}
 
 #[derive(Clone, Deserialize, serde::Serialize)]
 pub(crate) struct Definition {
@@ -74,23 +60,94 @@ pub(crate) static SHIPPED: LazyLock<BTreeMap<String, Shipped>> = LazyLock::new(|
 pub(crate) fn has_bash_tail(pin: &str) -> bool {
     SHIPPED
         .get(pin)
+        .or_else(|| versioned_source(pin).map(|(entry, ..)| entry))
         .is_some_and(|entry| entry.tool.name == "bash" && entry.tool.semantics == BASH_SEMANTICS)
 }
 
 pub(crate) fn view(pin: &str) -> Option<ViewManifest> {
-    let shipped = SHIPPED.get(pin)?;
-    let digest =
-        cortexkit_role_tool_provider::catalog::schema_digest(&shipped.tool.input_schema).ok()?;
-    let catalog = cortexkit_role_tool_provider::catalog::CatalogTool::new(
-        shipped.tool.name.clone(),
-        digest,
-        shipped.tool.semantics,
-        shipped.tool.input_schema.clone(),
+    if let Some(shipped) = SHIPPED.get(pin) {
+        return Some(shipped.history.last()?.clone().with_tool(ViewTool::new(
+            &shipped.tool.name,
+            shipped.tool.input_schema.clone(),
+            shipped.tool.semantics,
+        )));
+    }
+    let (shipped, schema, major) = versioned_source(pin)?;
+    // Minor and patch are catalog metadata, not part of a view's identity.
+    let tool = ViewTool::new_versioned(
+        &shipped.tool.name,
+        schema.clone(),
+        ToolVersion::new(major, 0, 0),
     );
-    Some(shipped.history.last()?.clone().with_tool(
-        cortexkit_role_tool_provider::views::ViewTool::from(&catalog),
-    ))
+    Some(shipped.history.last()?.clone().with_tool(tool))
 }
+
+fn versioned_source(encoded: &str) -> Option<(&'static Shipped, &'static Value, u64)> {
+    let pin = ToolMajorPin::parse(encoded).ok()?;
+    let (entry, schema) = versioned_source_for(&pin, versions::current_pin_tools())?;
+    Some((entry, schema, pin.major))
+}
+
+fn versioned_source_for<'a>(
+    pin: &ToolMajorPin,
+    current: impl Iterator<Item = &'a CatalogTool>,
+) -> Option<(&'static Shipped, &'a Value)> {
+    let mut current = current
+        .filter(|tool| {
+            tool.name == pin.tool
+                && tool
+                    .version
+                    .is_some_and(|version| version.major == pin.major)
+        })
+        .peekable();
+    current.peek()?;
+
+    if let Some(tool) = current.find(|tool| tool.schema_digest == pin.schema_digest) {
+        let legacy = SchemaPin::new(&tool.name, &tool.schema_digest, tool.semantics)
+            .encode()
+            .ok()?;
+        let entry = SHIPPED.get(&legacy).or_else(|| {
+            // A current schema variant (such as hashline edit) can use the
+            // same record template without having had its own legacy view.
+            SHIPPED
+                .values()
+                .filter(|entry| entry.tool.name == tool.name)
+                .max_by_key(|entry| entry.tool.semantics)
+        })?;
+        return Some((entry, &tool.input_schema));
+    }
+
+    let entry = SHIPPED
+        .iter()
+        .filter(|(encoded, entry)| {
+            entry.tool.name == pin.tool
+                && versions::shipped_major(encoded) == Some(pin.major)
+                && SchemaPin::parse(encoded)
+                    .is_ok_and(|legacy| legacy.schema_digest == pin.schema_digest)
+        })
+        .map(|(_, entry)| entry)
+        .max_by_key(|entry| entry.tool.semantics)?;
+    Some((entry, &entry.tool.input_schema))
+}
+
+static VERSIONED_VIEW_PINS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
+    let current = versions::current_pin_tools().filter_map(|tool| {
+        SHIPPED
+            .values()
+            .any(|entry| entry.tool.name == tool.name)
+            .then(|| tool.schema_pin().encode().expect("current view pin"))
+    });
+    let historical = SHIPPED.keys().filter_map(|encoded| {
+        let major = versions::shipped_major(encoded)?;
+        let legacy = SchemaPin::parse(encoded).expect("shipped view pin");
+        let pin = ToolMajorPin::new(legacy.tool, legacy.schema_digest, major)
+            .encode()
+            .expect("versioned view pin");
+        versioned_source(&pin)?;
+        Some(pin)
+    });
+    current.chain(historical).collect()
+});
 
 pub(crate) fn answer(body: Value) -> Result<Value, ErrorBody> {
     let request: ViewsRequest = serde_json::from_value(body).map_err(|_| {
@@ -121,6 +178,7 @@ pub(crate) fn bus_snapshot() -> Vec<(String, Vec<u8>)> {
     SHIPPED
         .keys()
         .chain(notice_view_pins())
+        .chain(VERSIONED_VIEW_PINS.iter())
         .map(|pin| {
             let reply = answer(serde_json::json!({"pins":[pin]})).expect("shipped pin request");
             (
@@ -149,6 +207,45 @@ mod tests {
                     .unwrap();
             assert_eq!(format!("{:x}", Sha256::digest(canonical)), digest, "{slot}");
         }
+    }
+
+    #[test]
+    fn versioned_views_select_shipped_history_but_refuse_unknown_digests_and_majors() {
+        let legacy =
+            "tp1:apply_patch:fa62c9797e5d14436714f5630d15815d2adc1185023a3dcba3f3ed20fc9f0548:1";
+        let old = SchemaPin::parse(legacy).unwrap();
+        let pin = ToolMajorPin::new(&old.tool, &old.schema_digest, 1);
+        let schema = json!({"type":"object", "properties":{"different": {"type":"string"}}});
+        let newer = CatalogTool::new(&old.tool, schema_digest(&schema).unwrap(), 1, schema)
+            .with_version(ToolVersion::new(1, 1, 0));
+        assert_ne!(newer.schema_digest, pin.schema_digest);
+        let (entry, schema) = versioned_source_for(&pin, std::iter::once(&newer)).unwrap();
+        assert!(std::ptr::eq(entry, &SHIPPED[legacy]));
+        assert_eq!(*schema, SHIPPED[legacy].tool.input_schema);
+
+        let unknown_digest = ToolMajorPin::new(&old.tool, "0".repeat(64), 1)
+            .encode()
+            .unwrap();
+        let unknown_major = ToolMajorPin::new(&old.tool, &old.schema_digest, 99)
+            .encode()
+            .unwrap();
+        let response = answer(json!({"pins":[unknown_digest,unknown_major]})).unwrap();
+        assert_eq!(response["views"][&unknown_digest], "unknown");
+        assert_eq!(response["views"][&unknown_major], "unknown");
+    }
+
+    #[test]
+    fn versioned_views_include_the_current_hashline_edit_schema() {
+        let hashline = versions::current_pin_tools()
+            .find(|tool| {
+                tool.name == "edit" && tool.input_schema["properties"].get("patch").is_some()
+            })
+            .unwrap();
+        let pin = hashline.schema_pin().encode().unwrap();
+        assert!(VERSIONED_VIEW_PINS.contains(&pin));
+        let view = view(&pin).unwrap();
+        assert!(view.check_pin(&pin).unwrap());
+        assert_eq!(view.tool.unwrap().input_schema, hashline.input_schema);
     }
 
     #[test]
@@ -232,6 +329,8 @@ mod tests {
                     "tail".into(),
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
+            } else if matches!(entry.tool.name.as_str(), "edit" | "write" | "apply_patch") {
+                assert_eq!(view.template_revision, 4);
             } else {
                 assert_eq!(view.template_revision, 3);
             }
@@ -261,27 +360,27 @@ mod tests {
                 );
             }
             let page = view.template["page"]["source"].as_str().unwrap();
-            assert!(page.contains(if entry.tool.name == "edit" {
-                "view.detail.hunks"
-            } else {
-                "view.output ??"
+            assert!(page.contains(match entry.tool.name.as_str() {
+                "edit" => "view.detail.hunks",
+                "write" => "codeString={input.content}",
+                "apply_patch" => "view.detail.files",
+                _ => "view.output ??",
             }));
-            // Canonical row and page SHA-256s reported by occipital-check from
-            // cortexkit/occipital at 6771d71. The run used the edit call from
-            // the phone-reader-tool-display-v7 tag and AFT's exported write and
-            // apply_patch samples at phone and desktop widths.
+            // Canonical row and page SHA-256s reported by occipital-check
+            // 0.1.7. Samples for all three file tools were checked at phone
+            // and desktop widths.
             let digests = match entry.tool.name.as_str() {
                 "apply_patch" => [
-                    "808bb3c1e481027c3e5b8ab46f532ca0ed91be1936064dbda748a854d39ce434",
-                    "e6a2c7a3607648817895ed3c4cd3e40f868d8ddef0ac54dd654e13a42b0ee4d2",
+                    "3ec957da89287b0d7abaef752ddd79a862bb83c74f0fc0b7eb11af193e73193d",
+                    "58f52d34e95b95f474281175d3790627a4f9263e87a078b8b1fefef80116688b",
                 ],
                 "edit" => [
-                    "f245c72b27b00e954216045081ed1b2721ac52fe2055ce8f927c794e253a6a6e",
+                    "0fea838e52c7f79185fa7892f1605fd6be7b2c4e97ec93e9c0543ef95807f531",
                     "3a457fd30d60ca7acc5bab258da9786bc309a44190d5454795f2b80a870332d7",
                 ],
                 "write" => [
-                    "39eb5d8d7be00d7b901f5bf5ee6f0a47d5840989349fe61bf61e70ddb564e3ec",
-                    "c87fe9bf996c6a5c84488a4a063a96939c79ea4e2d4597c16f696852c4f912df",
+                    "0fea838e52c7f79185fa7892f1605fd6be7b2c4e97ec93e9c0543ef95807f531",
+                    "3422ad764d8aea87c95e6f6b38e21bf10096d27ef72bedb07a9f4276b8fa23fd",
                 ],
                 "bash" => continue, // Covered by the tail-pin compatibility test.
                 name => panic!("missing template digests for {name}"),
@@ -407,33 +506,35 @@ mod tests {
         let dir = std::path::Path::new(crate::test_support::manifest_dir())
             .join("../../target/tool-views-check");
         std::fs::create_dir_all(&dir).unwrap();
+        let file_samples: BTreeMap<String, Value> = serde_json::from_str(include_str!(
+            "../../tests/fixtures/tool_views/write-and-apply-patch-samples.json"
+        ))
+        .unwrap();
         for (index, (pin, entry)) in SHIPPED.iter().enumerate() {
-            let input = match entry.tool.name.as_str() {
-                "bash" => json!({"command":"printf ok"}),
-                "edit" => {
-                    json!({"path":"src/a.rs","edits":[{"oldString":"old","newString":"new"}]})
-                }
-                "write" => json!({"path":"src/a.rs","content":"new\n"}),
-                "apply_patch" => {
-                    json!({"patchText":"*** Begin Patch\n*** Add File: src/a.rs\n+new\n*** End Patch"})
-                }
+            let name = &entry.tool.name;
+            let (filename, samples) = match name.as_str() {
+                "bash" => (
+                    format!("{index}.json"),
+                    json!(bash_checker_samples(
+                        &json!({"command":"printf ok"}),
+                        has_bash_tail(pin)
+                    )),
+                ),
+                "edit" => (
+                    "edit.json".into(),
+                    json!([{
+                        "name":"edit-one-file",
+                        "input":{"path":"src/a.rs","edits":[{"oldString":"old","newString":"new"}]},
+                        "record":{"durationMs":1,"outcome":"held","reason":"consent"},
+                        "completion":{"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"},
+                        "detail":{"schema":"aft/files-detail/1","revision":1,"files":[{"change":"modified","path":"src/a.rs"}],"hunks":[{"title":"Change 1 · line 1","oldStart":1,"newStart":1,"lines":[{"kind":"delete","text":"old"},{"kind":"add","text":"new"}]}]},
+                    }]),
+                ),
+                "write" | "apply_patch" => (format!("{name}.json"), file_samples[name].clone()),
                 _ => unreachable!(),
             };
-            let samples = if entry.tool.name == "bash" {
-                bash_checker_samples(&input, has_bash_tail(pin))
-            } else {
-                vec![json!({
-                    "input":input,
-                    "record":{"durationMs":1,"outcome":"held","reason":"consent"},
-                    "completion":{"durationMs":12,"heldMs":2000,"outcome":"success","fileCount":1,"modifiedCount":1,"createdCount":0,"deletedCount":0,"movedCount":0,"addedLines":1,"removedLines":1,"path":"src/a.rs"},
-                })]
-            };
             let document = json!({"input_schema":entry.tool.input_schema,"view":view(pin).unwrap(),"samples":samples});
-            std::fs::write(
-                dir.join(format!("{index}.json")),
-                serde_json::to_vec(&document).unwrap(),
-            )
-            .unwrap();
+            std::fs::write(dir.join(filename), serde_json::to_vec(&document).unwrap()).unwrap();
         }
     }
 

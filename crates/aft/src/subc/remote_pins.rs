@@ -1,7 +1,7 @@
 //! Compatibility with the exact catalog entry pinned on the sending computer.
 
 use super::*;
-use cortexkit_role_tool_provider::call::ToolCallRequest;
+use cortexkit_role_tool_provider::call::{ToolCallRequest, VersionedSchemaPin};
 use std::sync::Arc;
 
 fn spellings(tool: &CatalogTool, name: &str) -> bool {
@@ -56,34 +56,33 @@ pub(in crate::subc) fn transport(preset: CatalogPreset) -> (bool, Option<bool>) 
     })
 }
 
-pub(in crate::subc) fn parse(call: &ToolCallRequest) -> Result<SchemaPin, ErrorBody> {
+pub(in crate::subc) fn parse(call: &ToolCallRequest) -> Result<VersionedSchemaPin, ErrorBody> {
     let encoded = call.schema_pin.as_ref().ok_or_else(|| {
         errors::invalid_request("schema_pin", "remote tool calls require a schema pin")
     })?;
-    SchemaPin::parse(encoded)
+    VersionedSchemaPin::parse(encoded)
         .map_err(|error| errors::invalid_request("schema_pin", error.to_string()))
 }
 
-pub(in crate::subc) fn validate(call: &ToolCallRequest, pin: &SchemaPin) -> Result<(), ErrorBody> {
-    let head = [
-        &RUNNER_HEAD_TOOLS.hashline_edit,
-        &RUNNER_HEAD_TOOLS.bash_watch,
-    ];
-    let matched = CatalogPreset::ALL
-        .into_iter()
-        .flat_map(served_tools)
-        .chain(head)
-        .filter(|tool| spellings(&tool.catalog, &call.name))
-        .flat_map(|tool| {
-            [
-                Some(&tool.catalog),
-                tool.with_ref.as_ref(),
-                tool.with_runon.as_ref(),
-            ]
-            .into_iter()
-            .flatten()
+pub(in crate::subc) fn validate(
+    call: &ToolCallRequest,
+    pin: &VersionedSchemaPin,
+) -> Result<(), ErrorBody> {
+    let matched = versions::current_pin_tools()
+        .filter(|tool| spellings(tool, &call.name))
+        .find(|tool| match pin {
+            VersionedSchemaPin::Tp1(pin) => {
+                pin.schema_digest == tool.schema_digest && pin.semantics == tool.semantics
+            }
+            VersionedSchemaPin::Tp2(pin) => {
+                pin.tool == call.name
+                    && pin.schema_digest == tool.schema_digest
+                    && tool
+                        .version
+                        .is_some_and(|version| version.major == pin.major)
+            }
+            _ => false,
         })
-        .find(|tool| pin.schema_digest == tool.schema_digest && pin.semantics == tool.semantics)
         .ok_or_else(|| {
             ErrorBody::new(
                 "remote_tool_versions_differ",

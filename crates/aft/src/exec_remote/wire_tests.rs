@@ -3,6 +3,7 @@
 //! refusal reasons, just like the executor's caller contract permits.
 use super::{tests::MemorySink, types::*, *};
 use serde_json::{json, Value};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use subc_protocol::{BindIdentity, Frame, FrameType, ModuleHelloAckBody, PROTOCOL_VERSION};
@@ -193,6 +194,10 @@ pub(crate) enum Script {
     /// Accepted, then exited 0 with a terminal record that reports nothing
     /// about the workspace (no changed-file list).
     Plain,
+    /// Copy one tracked file and report the bytes taken by this fake snapshot.
+    CaptureCheckout {
+        gated: bool,
+    },
     /// A runner with a long queue: accepted at `position`, then queued for
     /// `queue` with no records, then one output record (it started), then
     /// after a further `run` it exits 0.
@@ -427,6 +432,21 @@ pub(crate) async fn daemon_with_capabilities(
                 },
                 FrameType::Request => {
                     match body["method"].as_str().unwrap() {
+                        "exec.run" if matches!(script, Script::CaptureCheckout { .. }) => {
+                            if matches!(script, Script::CaptureCheckout { gated: true }) {
+                                server_acceptance_gate.notified().await;
+                            }
+                            let root = Path::new(body["params"]["workspace_key"].as_str().unwrap());
+                            let bytes = std::fs::read(root.join("tracked.txt")).unwrap();
+                            for record in [
+                                StreamRecord::Accepted(Accepted::new(id(), 1)),
+                                StreamRecord::Output(Output::new(0, OutputStream::Stdout, BytePayload(bytes))),
+                                StreamRecord::Terminal(TerminalRecord::new(id(), Outcome::Exit { code: 0 }, 0, 0, 0)),
+                            ] {
+                                replies.push(reply(FrameType::StreamData, serde_json::to_value(record).unwrap()));
+                            }
+                            replies.push(reply(FrameType::StreamEnd, Value::Null));
+                        }
                         "exec.run" if matches!(script, Script::ReturnCapRefusal { .. }) => {
                             let Script::ReturnCapRefusal { code, field, max_bytes, always, after_accepted } = script else { unreachable!() };
                             runs += 1;

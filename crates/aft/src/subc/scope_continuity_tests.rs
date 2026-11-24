@@ -48,7 +48,7 @@ impl Drop for Fixture {
 }
 
 impl Fixture {
-    async fn new(scope: &ScopeStamp) -> Self {
+    async fn new(scope: &ScopeStamp, grant_sweep: Option<TestGrantSweep>) -> Self {
         let (dir, root) = test_support::test_root("prefrontal-scope-continuity");
         let ctx = test_support::test_ctx();
         ctx.update_config(|config| {
@@ -80,6 +80,7 @@ impl Fixture {
             move || work_scopes(source_executor.clone(), watched_runs.clone()),
             Some(speech),
             Some(runs),
+            grant_sweep,
         );
         let task = spawn_scoped(&ctx, &root, scope, "sleep 30");
         Self {
@@ -131,11 +132,11 @@ impl Fixture {
 
     async fn reply(&mut self, expected: &ScopeStamp, reply: ModuleControlResponseToModule) {
         let query = request(&mut self.frames, "scope.describe").await;
-        self.respond_to_describe(&query, expected, reply);
+        Self::respond_to_describe(&self.pending, &query, expected, reply);
     }
 
     fn respond_to_describe(
-        &self,
+        pending: &readiness::PendingControlReplies,
         query: &WriterFrame,
         expected: &ScopeStamp,
         reply: ModuleControlResponseToModule,
@@ -146,7 +147,7 @@ impl Fixture {
             serde_json::to_value(&expected.owner).unwrap()
         );
         assert_eq!(body["ref"], expected.scope_ref);
-        response(&self.pending, query, reply);
+        response(pending, query, reply);
     }
 
     async fn reply_through_watch_reopen(
@@ -186,7 +187,7 @@ impl Fixture {
         })
         .await
         .unwrap_or_else(|error| panic!("missing scope.watch or scope.describe {stage}: {error}"));
-        self.respond_to_describe(&query, expected, reply);
+        Self::respond_to_describe(&self.pending, &query, expected, reply);
         turns().await;
     }
 
@@ -212,12 +213,21 @@ impl Fixture {
     }
 }
 
-// This test exercises real inventory reads and process cleanup as well as retry
-// timers. Keep the frame and cleanup deadlines on the same wall clock.
 #[tokio::test]
 async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
     let old = named("prefrontal");
-    let mut f = Fixture::new(&old).await;
+    // The saved-grant sweep can ask about the same owner/ref as the watch
+    // worker. Give it its own writer so its reply cannot stand in for a poll.
+    let (sweep_control, sweep_pending, mut sweep_frames) = control(&["scope.describe"]);
+    let (start_sweep, sweep_start) = tokio::sync::oneshot::channel();
+    let mut f = Fixture::new(
+        &old,
+        Some(TestGrantSweep {
+            control: sweep_control,
+            start: sweep_start,
+        }),
+    )
+    .await;
     let watch = f.opened().await;
     let db = f.ctx.db().unwrap();
     let scope_key = grants::ScopeKey::for_grants(&old);
@@ -283,9 +293,42 @@ async fn prefrontal_scope_watch_holds_unconfigured_owner_until_confirmed_end() {
     assert_survives(&f);
 
     push(&f.pending, &watch, &old, ScopeWatchEvent::Ended);
-    f.reply(&old, described(ScopeStatus::Live, false, true))
-        .await;
-    turns().await;
+    let query = request(&mut f.frames, "scope.describe").await;
+    // Force the sweep's describe between the watch cancellation and either
+    // retry timer. The blocking waiter prevents Tokio from auto-advancing
+    // while the sweep reads SQLite; its deadline is on the wall clock.
+    let (unfreeze, frozen) = std::sync::mpsc::channel();
+    tokio::time::pause();
+    let clock = tokio::task::spawn_blocking(move || frozen.recv_timeout(Duration::from_secs(2)));
+    Fixture::respond_to_describe(
+        &f.pending,
+        &query,
+        &old,
+        described(ScopeStatus::Live, false, true),
+    );
+    let cancel = tokio::time::timeout(Duration::from_secs(2), f.frames.recv())
+        .await
+        .expect("initial watch cancellation deadline")
+        .unwrap();
+    assert_eq!(cancel.header.ty, FrameType::Cancel);
+    assert_eq!(cancel.header.corr, watch.header.corr);
+    start_sweep.send(()).unwrap();
+    let swept = request(&mut sweep_frames, "scope.describe").await;
+    assert!(matches!(
+        f.frames.try_recv(),
+        Err(mpsc::error::TryRecvError::Empty)
+    ));
+    Fixture::respond_to_describe(
+        &sweep_pending,
+        &swept,
+        &old,
+        described(ScopeStatus::Ended, false, true),
+    );
+    // The remaining frame deadlines and process cleanup run on wall time.
+    tokio::time::resume();
+    let _ = unfreeze.send(());
+    assert_eq!(clock.await.unwrap(), Ok(()), "saved-grant sweep deadline");
+
     assert_survives(&f);
     assert_eq!(f.continuity_holds(), 1);
     assert!(f.ended.try_recv().is_err());
@@ -325,7 +368,7 @@ async fn prefrontal_scope_watch_does_not_treat_the_old_or_unknown_owner_as_prefr
     for other in ["prefrontal-core", "third-module"] {
         let original = named(other);
         let prefrontal = named("prefrontal");
-        let mut f = Fixture::new(&original).await;
+        let mut f = Fixture::new(&original, None).await;
         let watch = f.opened().await;
         let mut identity = test_support::route_identity(&f.root, "watch-session");
         Arc::get_mut(&mut identity.0).unwrap().scope = Some(prefrontal);

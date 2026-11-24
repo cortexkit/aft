@@ -531,6 +531,13 @@ impl Meaning {
         self.note_round_ended(&outcome);
         self.memory_epoch
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        #[cfg(test)]
+        if matches!(outcome, Round::Done) {
+            if let Some(gate) = model_load_gate_for_test(checkout.root()) {
+                lock(&gate.state).done_rounds += 1;
+                gate.changed.notify_all();
+            }
+        }
         outcome
     }
 
@@ -574,10 +581,32 @@ impl Meaning {
             .as_ref()
             .is_none_or(|(made_for, _)| made_for != config)
         {
+            // A plane already made for this configuration knows which files
+            // still need vectors. Without one, the model must load first: the
+            // plane's stored vectors are keyed by the model that produced them.
+            let existing = lock(&self.plane)
+                .as_ref()
+                .filter(|configured| &configured.config == config)
+                .map(|configured| Arc::clone(&configured.plane));
+            if let Some(plane) = existing {
+                match plane.fill_waiting() {
+                    Ok(false) => return Round::Done,
+                    Ok(true) => {}
+                    Err(DataError::Cancelled) => return Round::Idle,
+                    Err(error) => return Round::Failed(FillFailure::Failed(error.to_string())),
+                }
+            }
             *model = None;
             #[cfg(test)]
-            while lock(model_holds_for_test()).contains(checkout.root()) {
-                std::thread::sleep(std::time::Duration::from_millis(10));
+            if let Some(gate) = model_load_gate_for_test(checkout.root()) {
+                let mut state = lock(&gate.state);
+                state.loads += 1;
+                gate.changed.notify_all();
+                drop(
+                    gate.changed
+                        .wait_while(state, |state| !state.released)
+                        .unwrap(),
+                );
             }
             #[cfg(test)]
             if let Some(error) = model_failure_for_test(checkout.root()) {
@@ -797,24 +826,92 @@ pub(crate) fn fill_without_model_for_test(root: &Path, dimensions: usize) -> imp
 }
 
 #[cfg(test)]
-fn model_holds_for_test() -> &'static Mutex<std::collections::HashSet<PathBuf>> {
-    static HOLDS: std::sync::OnceLock<Mutex<std::collections::HashSet<PathBuf>>> =
-        std::sync::OnceLock::new();
-    HOLDS.get_or_init(Default::default)
+#[derive(Default)]
+struct ModelLoadState {
+    loads: usize,
+    done_rounds: usize,
+    released: bool,
 }
 
-/// Holds every model load of a fill under `root` until the returned guard
-/// drops, so a test can look at a plane that is being read back.
 #[cfg(test)]
-pub(crate) fn hold_model_loads_for_test(root: &Path) -> impl Drop {
-    struct Release(PathBuf);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            lock(model_holds_for_test()).remove(&self.0);
-        }
+#[derive(Default)]
+struct ModelLoadGate {
+    state: Mutex<ModelLoadState>,
+    changed: std::sync::Condvar,
+}
+
+#[cfg(test)]
+fn model_load_gates_for_test(
+) -> &'static Mutex<std::collections::HashMap<PathBuf, Arc<ModelLoadGate>>> {
+    static GATES: std::sync::LazyLock<
+        Mutex<std::collections::HashMap<PathBuf, Arc<ModelLoadGate>>>,
+    > = std::sync::LazyLock::new(Mutex::default);
+    &GATES
+}
+
+#[cfg(test)]
+fn model_load_gate_for_test(root: &Path) -> Option<Arc<ModelLoadGate>> {
+    lock(model_load_gates_for_test()).get(root).cloned()
+}
+
+#[cfg(test)]
+pub(crate) struct ModelLoadHold {
+    root: PathBuf,
+    gate: Arc<ModelLoadGate>,
+}
+
+#[cfg(test)]
+impl ModelLoadHold {
+    fn wait_for(&self, what: &str, ready: impl Fn(&ModelLoadState) -> bool) -> usize {
+        let (state, _) = self
+            .gate
+            .changed
+            .wait_timeout_while(
+                lock(&self.gate.state),
+                std::time::Duration::from_secs(30),
+                |state| !ready(state),
+            )
+            .unwrap();
+        assert!(ready(&state), "timed out waiting for {what}");
+        state.loads
     }
-    lock(model_holds_for_test()).insert(root.to_path_buf());
-    Release(root.to_path_buf())
+
+    pub(crate) fn wait_for_load(&self) {
+        self.wait_for("the model load", |state| state.loads > 0);
+    }
+
+    pub(crate) fn loads_after_done_rounds(&self, count: usize) -> usize {
+        self.wait_for("the fill rounds to finish", |state| {
+            state.done_rounds >= count
+        })
+    }
+
+    pub(crate) fn release(&self) {
+        lock(&self.gate.state).released = true;
+        self.gate.changed.notify_all();
+    }
+}
+
+#[cfg(test)]
+impl Drop for ModelLoadHold {
+    fn drop(&mut self) {
+        lock(model_load_gates_for_test()).remove(&self.root);
+        self.release();
+    }
+}
+
+/// Holds model loads under `root` until released or dropped. Explicitly
+/// releasing the guard leaves counting enabled until the guard drops.
+#[cfg(test)]
+pub(crate) fn hold_model_loads_for_test(root: &Path) -> ModelLoadHold {
+    let gate = Arc::new(ModelLoadGate::default());
+    assert!(lock(model_load_gates_for_test())
+        .insert(root.to_path_buf(), Arc::clone(&gate))
+        .is_none());
+    ModelLoadHold {
+        root: root.to_path_buf(),
+        gate,
+    }
 }
 
 /// Holds a fill inside an ONNX Runtime section where it would create its

@@ -3,6 +3,7 @@
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import { join } from "node:path";
+import { coerceAftStatus } from "../shared/status.js";
 import baseline from "./fixtures/sidebar-appearance-baseline.json";
 
 /**
@@ -32,7 +33,7 @@ function snapshot(overrides: Record<string, unknown> = {}) {
       refreshing_count: 0,
       error: "ONNX Runtime not found. Install it.",
     },
-    disk: { trigram_disk_bytes: 1000, semantic_disk_bytes: 0 },
+    disk: { data_store_bytes: 4096 },
     ...overrides,
   };
 }
@@ -120,6 +121,54 @@ async function renderFrame(
 }
 
 describe("the sidebar at its real width", () => {
+  test(
+    "disk-floor sidebar shows the shared warning even when only the call graph is blocked",
+    async () => {
+      const paused = {
+        status: "unavailable",
+        reason: "disk_reserve",
+        error:
+          "Index storage is paused: 3.7 GiB is free on this disk and AFT keeps 4.0 GiB free. Unused index data is being cleaned up; retry later.",
+      };
+      const frame = await renderFrame(
+        coerceAftStatus(
+          snapshot({ search_index: paused, semantic_index: paused, callgraph_store: paused }),
+        ),
+      );
+      const blocked = frame.join(" ").replace(/\s+/g, " ");
+      expect(blocked.match(/paused \(low disk space\)/g)).toHaveLength(2);
+      const graphOnly = (
+        await renderFrame(
+          coerceAftStatus(
+            snapshot({ semantic_index: { status: "ready" }, callgraph_store: paused }),
+          ),
+        )
+      )
+        .join(" ")
+        .replace(/\s+/g, " ");
+      for (const text of [blocked, graphOnly]) {
+        expect(text).toContain(`Index store 4.0 KB ⚠ ${paused.error}`);
+        expect(text.match(/Index storage is paused:/g)).toHaveLength(1);
+      }
+      expect(graphOnly).not.toContain("paused (low disk space)");
+    },
+    TEST_TIMEOUT_MS,
+  );
+
+  test(
+    "sidebar shows a single shared Index store size",
+    async () => {
+      const frame = await renderFrame(
+        snapshot({
+          disk: { data_store_bytes: 4096, trigram_disk_bytes: 1024, semantic_disk_bytes: 2048 },
+        }),
+      );
+      expect(frame.filter((line) => /^ Index store\s+4\.0 KB$/.test(line))).toHaveLength(1);
+      expect(frame.some((line) => /^ Disk\b/.test(line))).toBe(false);
+    },
+    TEST_TIMEOUT_MS,
+  );
+
   test(
     "a long status value wraps under the value column and never overwrites its label",
     async () => {

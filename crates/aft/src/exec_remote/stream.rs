@@ -118,6 +118,8 @@ pub trait OutputSink {
 
 #[derive(Default)]
 pub struct StreamConsumer {
+    #[cfg(unix)]
+    pub(super) capture: Option<crate::bash_background::registry::runon_capture::Copy>,
     submission_job_id: Option<Uuid>,
     run_cursor: Option<u64>,
     point: Option<ResumePoint>,
@@ -317,6 +319,8 @@ impl StreamConsumer {
                     return Err(Error::Protocol("acceptance is not first".into()));
                 }
                 self.check_job(accepted.job_id)?;
+                #[cfg(unix)]
+                drop(self.capture.take());
                 sink.accepted(&accepted)?;
                 self.point = Some(ResumePoint {
                     job_id: accepted.job_id,
@@ -349,6 +353,8 @@ impl StreamConsumer {
             }
             StreamRecord::Terminal(record) => {
                 self.check_job(record.job_id)?;
+                #[cfg(unix)]
+                drop(self.capture.take());
                 if !self.pending.is_empty() {
                     let from_seq = self.next_seq()?;
                     let previous = self.point.as_ref().and_then(|p| p.gap_recovery.as_ref());

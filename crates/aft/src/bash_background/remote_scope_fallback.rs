@@ -135,6 +135,14 @@ impl BgTaskRegistry {
             Self::prepare_memory_limit(local.memory_limit_mib, &task.task_id)?
         };
         let gated = scope.is_some() || memory_monitor.is_some();
+        let start_capture = || {
+            (!task.holds_background_slot.load(Ordering::Acquire)
+                && task.local_capture_command.get().is_none())
+            .then(|| runon_capture::LocalCommand::start(task, &metadata.workdir))
+        };
+        // An ungated child can edit the checkout as soon as it spawns. Keep
+        // the guard here until launch succeeds so setup errors unregister it.
+        let mut capture = if gated { None } else { start_capture() };
         let spawn_child = |scope: Option<&super::super::super::task_scope::ScopeLaunch>,
                            io_handles: &mut TaskIoHandles| {
             spawn_detached_child(
@@ -269,16 +277,21 @@ impl BgTaskRegistry {
                 }
             }
             use std::io::Write;
-            child
+            let mut release = child
                 .stdin
                 .take()
-                .ok_or("local identity launch gate missing")?
+                .ok_or("local identity launch gate missing")?;
+            capture = start_capture();
+            release
                 .write_all(b"run\n")
                 .map_err(|error| error.to_string())?;
         }
         #[cfg(test)]
         if tests::simulate_crash_before_local_pid(&task.task_id) {
             return Ok(());
+        }
+        if let Some(capture) = capture {
+            task.local_capture_command.get_or_init(|| capture);
         }
         state.metadata.mark_running(child.id(), child.id() as i32);
         state.runtime = TaskRuntime::Piped(Some(child));

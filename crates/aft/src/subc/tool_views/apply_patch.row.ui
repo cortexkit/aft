@@ -1,0 +1,18 @@
+export const count = view.completion.fileCount ?? view.record.fileCount ?? 0
+export const path = view.completion.path ?? view.record.path ?? ""
+export const outcome = view.completion.outcome ?? view.record.outcome
+export const added = view.completion.addedLines ?? view.record.addedLines
+export const removed = view.completion.removedLines ?? view.record.removedLines
+
+<Slot width="fill">
+<ToolHeader icon="edit" title={count > 1 ? Text(count) + " files" : count == 1 && path != "" ? FileName(path) : "Patch"} subtitle={count == 1 && path != "" ? Folder(path) : null} truncate="middle" failed={outcome == "error"}>
+<Slot width="medium">
+{outcome == "error" && count == 0 ? <ToolText text="Not applied" size="small" tone="danger" />
+ : outcome == "partial" ? <ToolText text="Partly applied" size="small" tone="warning" />
+ : view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />
+ : added != null && removed != null
+ ? <Card appearance="clear" direction="row" gap="xs"><ToolText text={"+" + Text(added)} font="mono" size="small" tone="success" width="natural" /><ToolText text={"−" + Text(removed)} font="mono" size="small" tone="danger" width="natural" /></Card>
+ : view.call.phase == "running" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}
+</Slot>
+</ToolHeader>
+</Slot>

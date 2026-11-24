@@ -90,7 +90,7 @@ mod tests {
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
-                &mut HashMap::new(),
+                &mut RootChannels::default(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),
                 &mut HashMap::new(),

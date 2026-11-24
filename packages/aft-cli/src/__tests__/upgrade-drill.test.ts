@@ -30,6 +30,8 @@ import {
 } from "../lib/diagnostics.js";
 import type { NativeResult } from "../lib/feature-plan.js";
 import { AFT_SCHEMA_URL, ensureAftSchemaUrl } from "../lib/jsonc.js";
+import { getOnnxLibraryName, ONNX_RUNTIME_VERSION } from "../lib/onnx.js";
+import { runOnnxFix } from "../lib/onnx-fix.js";
 import { getSelfVersion } from "../lib/self-version.js";
 import type { OpenCodeHostDetection } from "../setup/host-generation.js";
 import {
@@ -573,6 +575,40 @@ describe("ONNX Runtime is required only for the local semantic backend", () => {
     const harness = await harnessFor({ indexes: { semantic: false } });
     expect(harness.onnxRuntime.required).toBe(false);
   });
+});
+
+test("doctor reports and replaces a version-matching managed ONNX Runtime with the wrong bytes", async () => {
+  writeUserConfig({ indexes: { semantic: true } });
+  const adapter = fixtureAdapter();
+  const relativeDir = join("onnxruntime", ONNX_RUNTIME_VERSION);
+  const cachedDir = join(adapter.getStorageDir(), relativeDir, "lib");
+  const libraryName = getOnnxLibraryName();
+  const cachedLibrary = join(cachedDir, libraryName);
+  mkdirSync(cachedDir, { recursive: true });
+  writeFileSync(cachedLibrary, "not a pinned build");
+
+  const { text } = await plainDoctor();
+  expect(text).toContain(
+    "ONNX Runtime in AFT's cache doesn't match the pinned 1.24.4 build; AFT won't load it. Run: npx @cortexkit/aft doctor --fix",
+  );
+  expect(readFileSync(cachedLibrary, "utf8")).toBe("not a pinned build");
+
+  const report = await collectDiagnostics([adapter]);
+  expect(report.harnesses[0]?.onnxRuntime.cachedVersion).toBe(ONNX_RUNTIME_VERSION);
+  const result = await runOnnxFix([adapter], report, {
+    yes: true,
+    ensureFn: async (staging) => {
+      const stagedLibraryDir = join(staging, relativeDir);
+      mkdirSync(stagedLibraryDir, { recursive: true });
+      writeFileSync(join(stagedLibraryDir, libraryName), "staged replacement");
+      return stagedLibraryDir;
+    },
+  });
+  expect(result).toMatchObject({ cleared: 1, installed: 1, errors: [] });
+  expect(existsSync(cachedLibrary)).toBe(false);
+  expect(readFileSync(join(adapter.getStorageDir(), relativeDir, libraryName), "utf8")).toBe(
+    "staged replacement",
+  );
 });
 
 describe("the pin message and doctor --fix agree", () => {

@@ -1,1 +1,4 @@
 Deleted 1/2 file(s)
+
+Incomplete: skipped 1 file(s)
+  <PROJECT_ROOT>/src/missing.ts: file not found

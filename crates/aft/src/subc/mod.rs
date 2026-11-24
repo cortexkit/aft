@@ -234,7 +234,9 @@ mod flow_read;
 mod fork_call;
 mod health;
 mod installed_routes;
-use installed_routes::{insert_route_channel, remove_route_channel};
+#[cfg(test)]
+use installed_routes::remove_root_channel;
+use installed_routes::{insert_route_channel, remove_route_channel, RootChannels};
 mod legacy_root;
 mod metadata_route;
 mod remote_calls;
@@ -255,7 +257,6 @@ use crate::bash_background::registry::RouteDeliverySessions;
 use route_delivery::sync_all_callgraph_refresh_policies as sync_bg_live_delivery_sessions;
 mod secret_consent;
 mod settings;
-pub use settings::requested as settings_gate_requested;
 #[cfg(test)]
 mod views_idle_checkout_tests;
 #[cfg(all(test, unix))]
@@ -2352,7 +2353,7 @@ fn quiesce_connection_roots(
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
     pending_binds: &mut HashMap<RouteChannel, PendingBind>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     installed_route_epochs: &mut HashMap<u16, u32>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
@@ -3091,7 +3092,7 @@ fn reap_idle_lsp_servers(
 fn purge_deleted_root_residents(
     root_id: &ProjectRootId,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     installed_route_epochs: &mut HashMap<u16, u32>,
     route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
     active_tool_calls: &ActiveToolCalls,
@@ -3136,7 +3137,7 @@ fn purge_deleted_root_residents(
         metrics.held_bash_calls.clear_progress_for_route(route);
         reclaimed_routes.insert(route);
         remove_installed_route(installed_route_epochs, route);
-        remove_route_channel(routes, root_channels, route);
+        remove_route_channel(routes, &mut root_channels.channels, route);
         if let Some(cancel) = route_bash_cancels.remove(&route) {
             cancel.token.cancel();
         }
@@ -3895,22 +3896,6 @@ async fn end_withdrawn_bash_ask(
     Ok(())
 }
 
-fn remove_root_channel(
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
-    root: &ProjectRootId,
-    channel: RouteChannel,
-) {
-    let remove_root = if let Some(channels) = root_channels.get_mut(root) {
-        channels.remove(&channel);
-        channels.is_empty()
-    } else {
-        false
-    };
-    if remove_root {
-        root_channels.remove(root);
-    }
-}
-
 /// Keeps semantic admission (see `semantic_admission`) in step with the
 /// installed routes: a session whose last route on a root is gone no longer
 /// holds that root open. Configure records the opening, before the route is
@@ -4049,7 +4034,7 @@ async fn teardown_installed_route(
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
@@ -4188,7 +4173,7 @@ async fn teardown_installed_route(
     // This test-only delay lets the lifecycle probe verify that a queued rebind
     // cannot run before the route is removed and a completion is recorded for replay.
     delay_route_detach_for_test(lifecycle_probe).await;
-    if let Some(identity) = remove_route_channel(routes, root_channels, channel) {
+    if let Some(identity) = remove_route_channel(routes, &mut root_channels.channels, channel) {
         metrics.completion_delivery.route_closed(channel);
         route_delivery::sync_route_change(
             executor,
@@ -4242,15 +4227,7 @@ async fn teardown_installed_route(
                 identity.session
             );
         }
-        let has_pending_bind = pending_binds
-            .values()
-            .any(|pending| pending.bind_root_id == identity.root);
-        if should_quiesce_removed_root(
-            &identity.root,
-            root_channels,
-            has_pending_bind,
-            replacement_root,
-        ) {
+        if root_channels.release_if_unbound(&identity.root, pending_binds, replacement_root) {
             quiesce_unbound_root(&identity.root, live_roots, executor);
         }
     } else {
@@ -4378,10 +4355,7 @@ fn run_subc_mode_on_runtime_thread(
     // Before any database opens: this process admits keyed calls, so it is
     // the one that recovers the call ledger after a restart.
     crate::db::call_ledger::mark_provider_process();
-    let opt_in = settings::requested();
-    let _daemon_storage_lease = (!opt_in)
-        .then(|| crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir()))
-        .transpose()
+    let _daemon_storage_lease = crate::root_cache::acquire_daemon_storage_lease(&ctx.storage_dir())
         .map_err(SubcError::StorageLease)?;
     let (runtime, dispatch_path_metrics, adopted) = match registration {
         Some(channel) => (channel.runtime, channel.metrics, Some(channel.stream)),
@@ -4399,9 +4373,6 @@ fn run_subc_mode_on_runtime_thread(
         let storage_dir = ctx.storage_dir();
         if registration::identity_ready() {
             crate::agent_commands::enable(&storage_dir);
-        }
-        if !opt_in {
-            settings::initialize_storage(shared_app.clone(), &storage_dir);
         }
         let using_registration = adopted.is_some();
         let stream: Box<dyn subc_client_rs::ModuleStream> = match adopted {
@@ -4915,7 +4886,7 @@ async fn drain_pending_route_bind_completions(
     management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
     writer_tx: &WriterSender,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -4992,16 +4963,16 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let spawn_role = readiness::SpawnRole::from_process_env();
-    let opt_in = startup_ctx.is_some() && settings::requested();
+    let manage_settings = startup_ctx.is_some();
     let hello = settings::negotiate(
         &mut read,
         &mut write,
         user_config_path.as_deref(),
-        opt_in,
+        manage_settings,
         using_registration,
     )
     .await?;
-    let gated = opt_in && hello.gated();
+    let gated = manage_settings && hello.gated();
     let rich_ui_proofs = hello.rich_ui;
     let hello_at = hello.at;
 
@@ -5104,11 +5075,9 @@ where
         .filter(|_| gated)
         .map(|ctx| ctx.config_unpinned());
     if let Some(ctx) = startup_ctx.as_ref() {
-        if opt_in {
-            settings::initialize_storage(shared_app.clone(), storage_dir);
-            crate::engram_catalog::refresh_catalog(storage_dir);
-        }
-        if opt_in && !gated {
+        settings::initialize_storage(shared_app.clone(), storage_dir);
+        crate::engram_catalog::refresh_catalog(storage_dir);
+        if !gated {
             settings::legacy_catalog(&control, user_config_path.as_deref());
         }
         settings::initialize_task_cleanup(ctx, storage_dir);
@@ -5265,7 +5234,7 @@ where
     let mut bg_wake_epoch: HashMap<(ProjectRootId, crate::bash_background::TaskIdentity), u64> =
         HashMap::new();
     let mut bg_unacked_keys_by_root: HashMap<ProjectRootId, HashSet<String>> = HashMap::new();
-    let mut root_channels: HashMap<ProjectRootId, HashSet<RouteChannel>> = HashMap::new();
+    let mut root_channels = RootChannels::default();
     let mut session_identity: HashMap<(ProjectRootId, String), RetainedSessionIdentity> =
         HashMap::new();
     let mut push_buffer: HashMap<push::ReplayKey, VecDeque<PushFrame>> = HashMap::new();
@@ -7539,7 +7508,7 @@ async fn handle_route_bind_completion(
     ack_written: bool,
     a0: &A0Egress,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     session_identity: &mut HashMap<(ProjectRootId, String), RetainedSessionIdentity>,
     push_buffer: &mut HashMap<push::ReplayKey, VecDeque<PushFrame>>,
     live_roots: &mut HashMap<ProjectRootId, RootMeta>,
@@ -7620,14 +7589,7 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             completion.inserted_new_actor,
         );
-        let has_pending_bind = pending_binds
-            .values()
-            .any(|pending| pending.bind_root_id == completion.bind_root_id);
-        if !root_channels
-            .get(&completion.bind_root_id)
-            .is_some_and(|channels| !channels.is_empty())
-            && !has_pending_bind
-        {
+        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
             quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
         }
         remove_installed_route(installed_route_epochs, route_id);
@@ -7658,14 +7620,7 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
-        let has_pending_bind = pending_binds
-            .values()
-            .any(|pending| pending.bind_root_id == completion.bind_root_id);
-        if !root_channels
-            .get(&completion.bind_root_id)
-            .is_some_and(|channels| !channels.is_empty())
-            && !has_pending_bind
-        {
+        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
             quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
         }
         log::debug!(
@@ -7695,14 +7650,7 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
-        let has_pending_bind = pending_binds
-            .values()
-            .any(|pending| pending.bind_root_id == completion.bind_root_id);
-        if !root_channels
-            .get(&completion.bind_root_id)
-            .is_some_and(|channels| !channels.is_empty())
-            && !has_pending_bind
-        {
+        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
             quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
         }
         let message = response_message(response, fallback);
@@ -7744,7 +7692,7 @@ async fn handle_route_bind_completion(
         executor,
         delivery,
         routes,
-        root_channels,
+        &mut root_channels.channels,
         route_id,
         completion.identity,
         &completion.bind_root_id,
@@ -8001,7 +7949,7 @@ async fn handle_control_request(
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
     management_routes: &mut HashMap<RouteChannel, ManagementIdentity>,
-    root_channels: &mut HashMap<ProjectRootId, HashSet<RouteChannel>>,
+    root_channels: &mut RootChannels,
     bg_subs: &mut HashMap<RouteChannel, BgSub>,
     bg_sub_by_session: &mut BgSubsBySession,
     bg_wake_pending: &mut BgWakePending,
@@ -8501,14 +8449,17 @@ async fn handle_control_request(
             // Invalid harnesses still reach configure's existing typed refusal.
             let active_harness = bind_harness.parse::<crate::harness::Harness>().ok();
             let prepared_config = match active_harness.as_ref() {
-                Some(harness) => match crate::subc_config::PreparedBindConfig::read_with_approved(
+                Some(harness) => match crate::subc_config::PreparedBindConfig::read_cached(
+                    &mut root_channels.config,
                     user_config_path,
                     settings_session.map(settings::Session::user),
                     Path::new(&bind_project_root),
+                    bind_root_id.as_path(),
                     harness,
                 ) {
                     Ok(snapshot) => Some(snapshot),
                     Err(error) => {
+                        root_channels.release_if_unbound(&bind_root_id, pending_binds, None);
                         let code = if error.code == "config_rejected" {
                             "config_divergence"
                         } else {
@@ -8546,6 +8497,7 @@ async fn handle_control_request(
             let configure_req = match serde_json::from_value::<RawRequest>(configure_json) {
                 Ok(req) => req,
                 Err(error) => {
+                    root_channels.release_if_unbound(&bind_root_id, pending_binds, None);
                     return send_route_bind_error(
                         tx,
                         frame,
@@ -10996,24 +10948,23 @@ async fn handle_tool_call_with_capabilities(
         ) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        if carrier_read_only::restricted(&identity) {
-            call.name = carrier_read_only::internal_name(&call.name).to_owned();
-        }
-        tool_provider::route_head_call_name(&mut call, identity.scope.is_some());
-        if let Err(error) =
-            admit_confined_call_name(executor, &identity, &mut call.name, confinement.as_ref())
-        {
-            return send_provider_error(tx, metrics, frame, error).await;
-        }
+        let sent_pin = match tool_provider::versions::route_call(
+            &mut call,
+            executor,
+            &identity,
+            confinement.as_ref(),
+        ) {
+            Ok(pin) => pin,
+            Err(error) => return send_provider_error(tx, metrics, frame, error).await,
+        };
         if let Err(error) = tool_provider::admit_call_mode(&call.name, &identity.call_mode) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
         if let Err(error) = rich_ui::admission::reject_non_carrier(&call.arguments) {
             return send_provider_error(tx, metrics, frame, error).await;
         }
-        // Plugin approvals are host transport metadata, not model-facing tool
-        // arguments. Keep the served schema closed and never accept these IDs
-        // as authority on an untrusted or stamped route.
+        // Plugin approvals are host metadata, not model arguments. Scoped
+        // runner calls and untrusted calls cannot carry plugin approval IDs.
         let plugin_grants = if matches!(
             access_grants::ask_route(&identity),
             crate::access_policy::AskRoute::Plugin { .. }
@@ -11024,16 +10975,11 @@ async fn handle_tool_call_with_capabilities(
         } else {
             None
         };
-        let role = match tool_provider::admit_on_route(
+        let role = match tool_provider::versions::admit_routed_call(
             &call,
-            identity.scope.is_some(),
-            &identity.disabled_tools,
-            crate::bash_background::powershell_available(),
-            &identity.session,
-            tool_provider::admission_trusted(&identity, &call),
-            &identity.project_root,
+            &identity,
             frame.header.channel,
-            tool_provider::head_catalog_key(&identity).is_some(),
+            sent_pin.as_deref(),
         ) {
             Ok(role) => role,
             Err(error) => return send_provider_error(tx, metrics, frame, error).await,
@@ -11064,7 +11010,7 @@ async fn handle_tool_call_with_capabilities(
             preset: call.preset,
             v1_role: Some(role),
             call_key: call.call_key,
-            schema_pin: call.schema_pin,
+            schema_pin: tool_provider::versions::record_pin(sent_pin, call.schema_pin),
         })
     } else {
         match decode_legacy_route_request(envelope) {
@@ -16195,7 +16141,8 @@ mod tests {
         let mut live_roots = HashMap::from([(root.clone(), RootMeta::new(Instant::now()))]);
         let cancel_signal = PersistentCancelSignal::new();
         let mut routes = HashMap::from([(route, route_identity(&root, "deleted-route"))]);
-        let mut root_channels = HashMap::from([(root.clone(), HashSet::from([route]))]);
+        let mut root_channels =
+            RootChannels::from(HashMap::from([(root.clone(), HashSet::from([route]))]));
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
         let mut route_bash_cancels = HashMap::from([(
             route,
@@ -16408,7 +16355,7 @@ mod tests {
         let frames = purge_deleted_root_residents(
             &root,
             &mut HashMap::from([(route, identity)]),
-            &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+            &mut RootChannels::from(HashMap::from([(root.clone(), HashSet::from([route]))])),
             &mut HashMap::from([(route.channel, route.epoch)]),
             &mut HashMap::new(),
             &active,
@@ -17081,7 +17028,8 @@ mod tests {
         let mut live_roots = HashMap::from([(root.clone(), meta)]);
         let mut pending_binds = HashMap::new();
         let mut routes = HashMap::from([(route, route_identity(&root, "abandoned"))]);
-        let mut root_channels = HashMap::from([(root.clone(), HashSet::from([route]))]);
+        let mut root_channels =
+            RootChannels::from(HashMap::from([(root.clone(), HashSet::from([route]))]));
         let mut installed_route_epochs = HashMap::from([(route.channel, route.epoch)]);
         let mut route_bash_cancels = HashMap::new();
         let active_tool_calls: ActiveToolCalls = Arc::new(StdMutex::new(HashMap::new()));
@@ -17381,7 +17329,7 @@ mod tests {
             live_roots,
             &mut HashMap::new(),
             &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut RootChannels::default(),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &Arc::new(StdMutex::new(HashMap::new())),
@@ -19175,7 +19123,7 @@ mod tests {
             false,
             &a0,
             &mut published_routes,
-            &mut HashMap::new(),
+            &mut RootChannels::default(),
             &mut HashMap::new(),
             &mut push_buffer,
             &mut HashMap::new(),
@@ -19211,7 +19159,7 @@ mod tests {
             true,
             &a0,
             &mut published_routes,
-            &mut HashMap::new(),
+            &mut RootChannels::default(),
             &mut HashMap::new(),
             &mut push_buffer,
             &mut HashMap::new(),
@@ -19308,7 +19256,7 @@ mod tests {
             true,
             &A0Egress::new(writer_tx.clone(), mpsc::channel(8).0),
             &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut RootChannels::default(),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
@@ -22461,7 +22409,10 @@ mod terminal_lifecycle_tests {
                         &mut HashMap::from([(route.channel, route.epoch)]),
                         &mut routes,
                         &mut HashMap::new(),
-                        &mut HashMap::from([(root.clone(), HashSet::from([route]))]),
+                        &mut RootChannels::from(HashMap::from([(
+                            root.clone(),
+                            HashSet::from([route]),
+                        )])),
                         &mut HashMap::new(),
                         &mut HashMap::new(),
                         &mut HashMap::new(),

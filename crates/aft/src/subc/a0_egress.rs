@@ -904,7 +904,7 @@ mod fixup_tests {
             |_| {},
             &mut HashMap::new(),
             &mut HashMap::new(),
-            &mut HashMap::new(),
+            &mut RootChannels::default(),
             &mut HashMap::new(),
             &mut HashMap::new(),
             &mut HashMap::new(),
@@ -1227,7 +1227,7 @@ mod ordering_tests {
             },
         )]);
         let mut routes = HashMap::new();
-        let mut roots = HashMap::new();
+        let mut roots = RootChannels::default();
         let mut sessions = HashMap::new();
         let mut buffered = HashMap::from([(
             replay_key.clone(),

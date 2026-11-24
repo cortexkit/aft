@@ -1550,6 +1550,12 @@ fn vector_membership(loaded: &Loaded) -> Vec<SegmentId> {
 }
 
 impl FillQueue {
+    fn matches(&self, view: &CheckoutView, loaded: &Loaded) -> bool {
+        self.text == view.text_generation()
+            && self.parse_gaps == view.parse_gaps_identity()
+            && self.segments == vector_membership(loaded)
+    }
+
     fn survey(view: &CheckoutView, loaded: &Loaded, max_files: usize) -> Result<Self, DataError> {
         #[cfg(test)]
         FILL_SURVEYS.with(|surveys| surveys.set(surveys.get() + 1));
@@ -1649,6 +1655,34 @@ impl VectorPlane {
         self.fill_rounds(embed, budget, usize::MAX, progress)
     }
 
+    /// Whether the current text view still needs a fill for this plane's
+    /// producer. Keep any new survey so the fill can reuse it if still current.
+    pub(super) fn fill_waiting(&self) -> Result<bool, DataError> {
+        check_cancelled()?;
+        let Some(view) = self.checkout.view() else {
+            return Ok(false);
+        };
+        let loaded = self.load()?;
+        {
+            let cached = self.fill_queue.lock().expect("no panics while holding it");
+            if let Some(queue) = cached
+                .as_ref()
+                .filter(|queue| queue.matches(&view, &loaded))
+            {
+                return Ok(!queue.pending.is_empty());
+            }
+        }
+        let queue = FillQueue::survey(&view, &loaded, self.max_files)?;
+        let waiting = !queue.pending.is_empty();
+        self.remember_fill_queue(queue);
+        Ok(waiting)
+    }
+
+    fn remember_fill_queue(&self, queue: FillQueue) {
+        *self.fill_queue.lock().expect("no panics while holding it") = Some(queue);
+        self.checkout.touch_memory();
+    }
+
     /// [`Self::fill`], stopping after `rounds` rounds; the files it did not
     /// reach are counted in [`FillReport::files_left`]. A running AFT fills
     /// one round per job, so other work on the root runs between rounds.
@@ -1680,13 +1714,7 @@ impl VectorPlane {
             .expect("no panics while holding it")
             .take();
         let mut queue = match previous {
-            Some(queue)
-                if queue.text == view.text_generation()
-                    && queue.parse_gaps == view.parse_gaps_identity()
-                    && queue.segments == vector_membership(&loaded) =>
-            {
-                queue
-            }
+            Some(queue) if queue.matches(&view, &loaded) => queue,
             _ => FillQueue::survey(&view, &loaded, self.max_files)?,
         };
         report.files = queue.files;
@@ -1999,8 +2027,7 @@ impl VectorPlane {
         {
             queue.embedded += report.files_filled + report.files_filled_elsewhere;
             queue.segments = vector_membership(&loaded);
-            *self.fill_queue.lock().expect("no panics while holding it") = Some(queue);
-            self.checkout.touch_memory();
+            self.remember_fill_queue(queue);
         }
         Ok(report)
     }

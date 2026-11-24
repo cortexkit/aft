@@ -9,8 +9,10 @@ import { AftRpcClient } from "../shared/rpc-client";
 import {
   type AftStatusSnapshot,
   coerceAftStatus,
+  diskPausedIndexLabel,
   formatBytes,
   formatCacheRoleLabel,
+  formatSearchIndexLabel,
   formatSemanticIndexLabel,
   formatSemanticRefreshing,
   NOT_STARTED_STATUS_TEXT,
@@ -290,6 +292,17 @@ export const StatusDialog = (props: StatusDialogProps) => {
             value={formatCacheRoleLabel(status()!.cache_role)}
             tone={cacheRoleTone(status()!.cache_role)}
           />
+          {status()!.disk.data_store_bytes != null && (
+            <R
+              theme={t()}
+              label="Index store"
+              value={formatBytes(status()!.disk.data_store_bytes!)}
+              tone="muted"
+            />
+          )}
+          {status()!.index_store_pause && (
+            <text fg={t().warning}>⚠ {status()!.index_store_pause}</text>
+          )}
         </box>
       ) : null}
 
@@ -306,7 +319,7 @@ export const StatusDialog = (props: StatusDialogProps) => {
             <R
               theme={t()}
               label="Status"
-              value={status()!.search_index.status}
+              value={formatSearchIndexLabel(status()!.search_index)}
               tone={statusTone(status()!.search_index.status)}
             />
             <R theme={t()} label="Files" value={formatCountShort(status()!.search_index.files)} />
@@ -314,12 +327,6 @@ export const StatusDialog = (props: StatusDialogProps) => {
               theme={t()}
               label="Trigrams"
               value={formatCountShort(status()!.search_index.trigrams)}
-            />
-            <R
-              theme={t()}
-              label="Disk"
-              value={formatBytes(status()!.disk.trigram_disk_bytes)}
-              tone="muted"
             />
 
             <box marginTop={1}>
@@ -413,12 +420,6 @@ export const StatusDialog = (props: StatusDialogProps) => {
                 tone="muted"
               />
             ) : null}
-            <R
-              theme={t()}
-              label="Disk"
-              value={formatBytes(status()!.disk.semantic_disk_bytes)}
-              tone="muted"
-            />
 
             <box marginTop={1}>
               <text fg={t().text}>
@@ -467,7 +468,8 @@ export const StatusDialog = (props: StatusDialogProps) => {
       ) : null}
 
       {/* Semantic error — full-width, themed error color */}
-      {status()?.semantic_index.error ? (
+      {status()?.semantic_index.error &&
+      !diskPausedIndexLabel(status()!.semantic_index.status, status()!.semantic_index.reason) ? (
         <box marginTop={1} width="100%">
           <text fg={t().error}>⚠ {status()!.semantic_index.error}</text>
         </box>

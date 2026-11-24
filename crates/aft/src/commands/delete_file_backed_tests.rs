@@ -235,3 +235,25 @@ fn backed_delete_failed_group_commit_never_unlinks_and_restores_sync_policy() {
         "ordinary snapshots retain full durability"
     );
 }
+
+#[test]
+fn batch_reason_drops_the_command_name_and_the_repeated_path() {
+    use super::batch_reason;
+    assert_eq!(
+        batch_reason("delete_file: file not found: /tmp/p/missing.txt"),
+        "file not found"
+    );
+    assert_eq!(
+        batch_reason("delete_file: '/tmp/p/dir' is a directory. Pass recursive: true to delete it with all contents."),
+        "is a directory. Pass recursive: true to delete it with all contents."
+    );
+    assert_eq!(
+        batch_reason("delete_file: failed to inspect '/tmp/p/x': Permission denied (os error 13)"),
+        "failed to inspect: Permission denied (os error 13)"
+    );
+    assert_eq!(
+        batch_reason("delete_file: request cancelled before deleting this target"),
+        "request cancelled before deleting this target"
+    );
+    assert_eq!(batch_reason("delete failed"), "delete failed");
+}
