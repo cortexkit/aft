@@ -119,6 +119,8 @@ pub(super) struct ScopeDescribes {
     #[cfg(test)]
     iterations: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
+    verification_reconciles: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
     completed: Arc<StdMutex<CompletedEnds>>,
 }
 
@@ -291,12 +293,16 @@ where
     let completed = Arc::new(StdMutex::new(CompletedEnds::default()));
     #[cfg(test)]
     let iterations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    #[cfg(test)]
+    let verification_reconciles = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = ScopeDescribes {
         goodbye,
         routed: routed.clone(),
         observed,
         #[cfg(test)]
         iterations: iterations.clone(),
+        #[cfg(test)]
+        verification_reconciles: verification_reconciles.clone(),
         #[cfg(test)]
         completed: completed.clone(),
     };
@@ -362,6 +368,8 @@ where
         let mut refresh = scope_watch::Refresh::new();
         let mut verifications = scope_watch::Verifications::default();
         let mut watches = scope_watch::Watches::new(control.metrics.clone());
+        let mut schedule = None;
+        let mut protected = scope_watch::Coverage::default();
         loop {
             #[cfg(test)]
             iterations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -390,7 +398,7 @@ where
             if confirmed.len() != last_confirmed {
                 indexed.mark_dirty();
             }
-            indexed.reconcile(&confirmed);
+            let inventory_changed = indexed.reconcile(&confirmed);
             let held_scopes = indexed.active();
             next_poll.retain(|key, _| held_scopes.contains_key(key));
             retry.retain(|key, _| held_scopes.contains_key(key));
@@ -405,10 +413,23 @@ where
                 .flat_map(|(_, group)| group.iter().map(|(key, _, _)| key.clone()))
                 .collect();
             pending.retain(|key| queued.contains_key(key) || active_keys.contains(key));
-            watches.reconcile(held_scopes, &control, interval);
-            let protected = watches.coverage(held_scopes.len());
+            if inventory_changed {
+                watches.update_membership(held_scopes);
+            }
+            watches.open_due(held_scopes, &control, interval);
+            let current = watches.schedule_state();
+            if inventory_changed || schedule != Some(current) {
+                schedule = Some(current);
+                let next = watches.coverage(held_scopes.len());
+                if next != protected {
+                    coverage.send_replace(next.clone());
+                    protected = next;
+                }
+                #[cfg(test)]
+                verification_reconciles.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                verifications.reconcile(&watches.healthy_keys(), held_scopes);
+            }
             let protected_keys = &protected.keys;
-            verifications.reconcile(&watches.healthy_keys(), held_scopes);
             if let Some(key) = verifications.take_due() {
                 if let Some(stamp) = held_scopes.get(&key) {
                     verification_keys.insert(key.clone());
@@ -426,7 +447,6 @@ where
             watches.health.poll_keys = next_poll.len();
             watches.health.confirmed_cleanup = confirmed.len();
             watches.health.prefrontal_continuity_holds = continuity_holds.len();
-            coverage.send_replace(protected.clone());
             control
                 .metrics
                 .scope_descriptions
@@ -914,7 +934,7 @@ pub(crate) async fn confirm_secret_rebind_for_test(
             }
         });
     // A still-open head route must not suppress authorization-epoch checks.
-    scopes.routed.lock().unwrap().keys.insert(stamp_key(&stamp));
+    Arc::make_mut(&mut scopes.routed.lock().unwrap().keys).insert(stamp_key(&stamp));
     let until = tokio::time::Instant::now() + Duration::from_secs(10);
     let mut answered_head = false;
     loop {

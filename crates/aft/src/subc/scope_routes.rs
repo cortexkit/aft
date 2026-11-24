@@ -9,7 +9,7 @@ use std::{
 #[derive(Default)]
 pub(super) struct RoutedScopes {
     identities: Vec<Weak<RouteIdentityData>>,
-    pub(super) keys: HashSet<(String, String, u64)>,
+    pub(super) keys: Arc<HashSet<(String, String, u64)>>,
     #[cfg(test)]
     rebuilds: usize,
     #[cfg(test)]
@@ -45,7 +45,7 @@ impl RoutedScopes {
             }
             current.insert(key);
         }
-        self.keys = current;
+        self.keys = Arc::new(current);
     }
 }
 
@@ -82,7 +82,7 @@ mod tests {
                 .collect()
         };
         routed.update(&routes);
-        assert_eq!(routed.keys, reference(&routes));
+        assert_eq!(*routed.keys, reference(&routes));
         assert_eq!((routed.rebuilds, routed.key_builds), (1, 60));
 
         const FRAMES: usize = 100;
@@ -103,7 +103,7 @@ mod tests {
             routed.update(&routes);
         }
         assert_eq!(routed.rebuilds, 1);
-        assert_eq!(routed.keys, previous);
+        assert_eq!(*routed.keys, previous);
         let key_builds = routed.key_builds - before;
         assert_eq!(key_builds, 0);
         eprintln!("{FRAMES} steady frames with 60 scoped routes: key builds {old_key_builds} -> {key_builds}; set rebuilds {FRAMES} -> 0");
@@ -112,24 +112,24 @@ mod tests {
         routed.update(&routes);
         routed.update(&routes);
         assert_eq!(routed.rebuilds, 2);
-        assert_eq!(routed.keys, reference(&routes));
+        assert_eq!(*routed.keys, reference(&routes));
 
         routes.insert(route_key(61, 1), route(&root, 61, 60));
         routed.update(&routes);
         assert_eq!(routed.rebuilds, 3);
-        assert_eq!(routed.keys, reference(&routes));
+        assert_eq!(*routed.keys, reference(&routes));
 
         routes.remove(&route_key(60, 1));
         routed.update(&routes);
         routed.update(&routes);
         assert_eq!(routed.rebuilds, 4);
-        assert_eq!(routed.keys, reference(&routes));
+        assert_eq!(*routed.keys, reference(&routes));
 
         for i in [62, 63] {
             routes.insert(route_key(i, 1), route(&root, i, 62));
         }
         routed.update(&routes);
-        assert_eq!(routed.keys, reference(&routes));
+        assert_eq!(*routed.keys, reference(&routes));
         assert_eq!(routed.rebuilds, 5);
     }
 }

@@ -826,6 +826,40 @@ fn control(
 }
 
 #[tokio::test(start_paused = true)]
+async fn steady_scope_observations_do_not_rebuild_verification_schedule() {
+    use std::sync::atomic::Ordering;
+
+    let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
+    let scopes: Vec<_> = (0..2_000).map(stamp).collect();
+    let (handle, _ended, worker) = start_with_scope_source(
+        control,
+        Arc::new(Executor::new()),
+        Duration::from_secs(60),
+        move || std::future::ready(scopes.clone()),
+    );
+    let mut covered = 0;
+    while covered < 2_000 {
+        let watch = request(&mut frames, "scope.watch").await;
+        covered += snapshot(&pending, &watch);
+    }
+    turns().await;
+    let before_iterations = handle.iterations.load(Ordering::Relaxed);
+    let before_reconciles = handle.verification_reconciles.load(Ordering::Relaxed);
+    for index in 0..100 {
+        // These observations wake the worker without changing the
+        // protected inventory or the health of any watch.
+        handle.observed.send(stamp(index)).unwrap();
+    }
+    turns().await;
+    assert!(handle.iterations.load(Ordering::Relaxed) >= before_iterations + 100);
+    assert_eq!(
+        handle.verification_reconciles.load(Ordering::Relaxed) - before_reconciles,
+        0
+    );
+    worker.abort();
+}
+
+#[tokio::test(start_paused = true)]
 async fn scope_watch_healthy_does_not_poll_and_live_rearm_needs_no_confirmation() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let scopes = vec![stamp(0), stamp(1), stamp(2)];
