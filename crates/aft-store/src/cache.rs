@@ -7,7 +7,7 @@
 //! cache holds each block only after its checksum verified, so a cached block
 //! is always good bytes, and its size is the data layer's resident read memory.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -93,8 +93,17 @@ struct State {
     /// candidate for eviction. A hit does not move its entry here; eviction
     /// moves an entry whose last use is newer than its listing.
     by_use: BTreeMap<u64, BlockKey>,
+    /// The keys of `entries` by file, so dropping a closed file's blocks
+    /// visits only that file's keys.
+    by_file: HashMap<FileToken, HashSet<BlockKey>>,
     resident: usize,
     evictions: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Keys `forget` has visited on this thread.
+    static FORGET_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug)]
@@ -240,17 +249,21 @@ impl BlockCache {
     }
 
     /// Drops every block of one file, so a closed segment's memory is
-    /// released at once rather than waiting for eviction.
+    /// released at once rather than waiting for eviction. Each shard finds
+    /// the file's blocks through its per-file index, so the cost follows the
+    /// file's own blocks, and a shard holding none of them is only read.
     pub(crate) fn forget(&self, file: FileToken) {
         for shard in &*self.shards {
+            if !shard.read().by_file.contains_key(&file) {
+                continue;
+            }
             let mut state = shard.write();
-            let doomed: Vec<BlockKey> = state
-                .entries
-                .keys()
-                .filter(|key| key.file == file)
-                .copied()
-                .collect();
+            let Some(doomed) = state.by_file.remove(&file) else {
+                continue;
+            };
             for key in doomed {
+                #[cfg(test)]
+                FORGET_VISITS.with(|visits| visits.set(visits.get() + 1));
                 state.remove(key);
             }
         }
@@ -272,7 +285,8 @@ impl BlockCache {
                 Err(std::sync::TryLockError::WouldBlock) => return None,
             };
             total += crate::heap::HeapBytes::heap_bytes(&state.entries, &mut seen)
-                + crate::heap::HeapBytes::heap_bytes(&state.by_use, &mut seen);
+                + crate::heap::HeapBytes::heap_bytes(&state.by_use, &mut seen)
+                + crate::heap::HeapBytes::heap_bytes(&state.by_file, &mut seen);
         }
         Some(total)
     }
@@ -313,6 +327,7 @@ impl State {
         let now = clock.fetch_add(1, Ordering::Relaxed) + 1;
         self.resident += bytes.len();
         self.by_use.insert(now, key);
+        self.by_file.entry(key.file).or_default().insert(key);
         self.entries.insert(
             key,
             Entry {
@@ -340,6 +355,7 @@ impl State {
             if let Some(entry) = self.entries.remove(&key) {
                 self.resident -= entry.bytes.len();
                 self.evictions += 1;
+                self.unindex(key);
             }
             return;
         }
@@ -349,6 +365,18 @@ impl State {
         if let Some(entry) = self.entries.remove(&key) {
             self.by_use.remove(&entry.listed_at);
             self.resident -= entry.bytes.len();
+            self.unindex(key);
+        }
+    }
+
+    /// Removes `key` from the per-file index, and the file once it has no
+    /// key left.
+    fn unindex(&mut self, key: BlockKey) {
+        if let Some(keys) = self.by_file.get_mut(&key.file) {
+            keys.remove(&key);
+            if keys.is_empty() {
+                self.by_file.remove(&key.file);
+            }
         }
     }
 }
@@ -488,6 +516,40 @@ mod tests {
         assert_eq!(stats.resident_bytes, BLOCK_LEN);
     }
 
+    /// Forgetting a file visits only that file's blocks, however many
+    /// blocks of other files the cache holds, and nothing for a file with
+    /// no block left.
+    #[test]
+    fn forgetting_a_file_visits_only_its_own_blocks() {
+        let cache = BlockCache::new(16 * MIN_SHARD_BLOCKS * BLOCK_LEN);
+        let (busy, closed, absent) = (FileToken::next(), FileToken::next(), FileToken::next());
+        for index in 0..128 {
+            cache
+                .get_or_load(key(busy, index), || Ok::<_, ()>(block(1)))
+                .unwrap();
+        }
+        for index in 0..5 {
+            cache
+                .get_or_load(key(closed, index), || Ok::<_, ()>(block(2)))
+                .unwrap();
+        }
+        let visits = || FORGET_VISITS.with(|visits| visits.replace(0));
+        visits();
+        cache.forget(absent);
+        assert_eq!(visits(), 0, "forgetting an absent file walked the cache");
+        cache.forget(closed);
+        assert_eq!(visits(), 5);
+        let stats = cache.stats();
+        assert_eq!(stats.blocks, 128);
+        assert_eq!(stats.resident_bytes, 128 * BLOCK_LEN);
+        for shard in &*cache.shards {
+            let state = shard.read();
+            assert!(!state.by_file.contains_key(&closed));
+            let indexed: usize = state.by_file.values().map(HashSet::len).sum();
+            assert_eq!(indexed, state.entries.len());
+        }
+    }
+
     #[test]
     fn a_sharded_cache_keeps_its_whole_budget_and_releases_a_file_from_every_shard() {
         let cache = BlockCache::new(4 * MIN_SHARD_BLOCKS * BLOCK_LEN);
@@ -573,6 +635,9 @@ mod tests {
             for (listed, key) in &state.by_use {
                 assert_eq!(state.entries[key].listed_at, *listed);
             }
+            // And indexed under its file exactly once, evicted ones not.
+            let indexed: usize = state.by_file.values().map(HashSet::len).sum();
+            assert_eq!(indexed, state.entries.len());
         }
     }
 
