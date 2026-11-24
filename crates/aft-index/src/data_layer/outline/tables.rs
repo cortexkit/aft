@@ -106,13 +106,15 @@ impl State {
 }
 
 /// The process's shared symbol tables.
-pub(crate) struct Tables {
+#[doc(hidden)]
+pub struct Tables {
     state: Mutex<State>,
     budget: u64,
 }
 
 /// What the shared tables hold, for the memory census.
-pub(crate) struct TableStats {
+#[doc(hidden)]
+pub struct TableStats {
     /// Tables some symbol cache, or this one for later binds, holds.
     pub(crate) tables: u64,
     /// Their estimated bytes, with the bookkeeping that lists them.
@@ -214,7 +216,8 @@ impl Tables {
     }
 
     /// What the tables hold now, or `None` while another thread holds them.
-    pub(crate) fn stats(&self) -> Option<TableStats> {
+    #[doc(hidden)]
+    pub fn stats(&self) -> Option<TableStats> {
         let state = self.state.try_lock().ok()?;
         let (tables, table_bytes) = state
             .slots

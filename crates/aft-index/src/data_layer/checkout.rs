@@ -4287,14 +4287,15 @@ impl CheckoutView {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// [`Self::dead_code_snapshot_shared`] as an owned snapshot, for tests
     /// that hand one to an inspect job.
     ///
     /// # Errors
     ///
     /// When a stored parse cannot be read.
-    pub(crate) fn dead_code_snapshot(
+    #[doc(hidden)]
+    pub fn dead_code_snapshot(
         &self,
         entry_points: &dyn super::dead_code_snapshot::EntryPoints,
     ) -> Result<crate::data_layer::dead_code_snapshot::CallgraphSnapshot, DataError> {
@@ -4304,7 +4305,7 @@ impl CheckoutView {
             })
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     /// The dead-code snapshot `aft_inspect` analyses: the call graph's
     /// files, exports and entry points, carrying this view's call graph for
     /// the rollup to read one file at a time. The parts it holds are built
@@ -4367,8 +4368,9 @@ impl CheckoutView {
     }
 
     /// Whether this view's call graph holds a built dead-code snapshot.
-    #[cfg(test)]
-    pub(crate) fn dead_code_snapshot_held(&self) -> bool {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn dead_code_snapshot_held(&self) -> bool {
         self.dead_code_memo().try_files().is_some()
     }
 

@@ -446,6 +446,12 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `watcher_filter::WatcherExclusion` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
 | `watcher_filter::ForcedExclusionFailure` | visibility widened | `aft-index` | Preserve the existing type or operation used by the engine’s test bridge. |
 
+| `CheckoutView::dead_code_snapshot` | test-support visibility widened | `aft-index` | Construct the owned snapshot for composed dead-code tests. |
+| `CheckoutView::dead_code_snapshot_held` | test-support visibility widened | `aft-index` | Let composition assert that dropping a view releases its held snapshot. |
+| `outline::tables::Tables` | visibility widened | `aft-index` | Reach the actual shared outline table when checking its memory. |
+| `outline::tables::TableStats` | visibility widened | `aft-index` | Read the table’s existing memory statistics through the test bridge. |
+| `outline::tables::Tables::stats` | visibility widened | `aft-index` | Preserve the outline cache byte observation. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |
