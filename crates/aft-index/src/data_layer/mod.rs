@@ -27,7 +27,8 @@ pub mod ignore_rules;
 pub mod incremental;
 #[cfg(test)]
 mod incremental_tests;
-pub(crate) mod meaning;
+#[doc(hidden)]
+pub mod meaning;
 pub mod old_index;
 #[doc(hidden)]
 pub mod outline;

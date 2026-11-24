@@ -1,4 +1,3 @@
-
 static NATIVE_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[doc(hidden)]

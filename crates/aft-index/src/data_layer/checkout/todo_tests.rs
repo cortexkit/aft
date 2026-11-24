@@ -29,7 +29,7 @@ fn fixture(files: usize) -> (tempfile::TempDir, Checkout, Vec<Vec<u8>>) {
 #[test]
 fn todo_count_one_edit_decodes_one_record_not_unchanged_files() {
     let (_temp, checkout, paths) = fixture(129);
-    let limit = crate::inspect::scanners::source_text::MAX_SOURCE_BYTES;
+    let limit = crate::search_index::DEFAULT_MAX_FILE_SIZE;
     checkout
         .todo_counts(&checkout.view().unwrap(), &paths, limit)
         .unwrap();
@@ -72,7 +72,7 @@ fn todo_count_one_edit_decodes_one_record_not_unchanged_files() {
 #[test]
 fn todo_count_cache_does_not_hide_a_missing_overlay_or_size_limit() {
     let (_temp, checkout, paths) = fixture(2);
-    let limit = crate::inspect::scanners::source_text::MAX_SOURCE_BYTES;
+    let limit = crate::search_index::DEFAULT_MAX_FILE_SIZE;
     std::fs::write(checkout.root.join("file_00000.rs"), "// BUG: first edit\n").unwrap();
     checkout.record_paths(&[paths[0].clone()]).unwrap();
     let old_view = checkout.view().unwrap();

@@ -25,7 +25,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::parser::LangId;
 
-    pub(crate) const FIXTURE: &str = include_str!("../../aft/tests/fixtures/luau/symbols.luau");
+    pub(crate) const FIXTURE: &str = include_str!("../tests/fixtures/luau/symbols.luau");
 
     pub(crate) fn ready() {
         static DIRECTORY: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
@@ -35,7 +35,7 @@ pub(crate) mod tests {
             crate::private_storage::create_dir_all(&root).unwrap();
             let manifest = crate::grammar::manifest();
             let fixture = crate::test_support::manifest_dir()
-                .join("../aft/tests/fixtures/grammars")
+                .join("tests/fixtures/grammars")
                 .join(format!("{}.wasm", manifest.sha256));
             crate::private_storage::write(
                 root.join(format!("{}.wasm", manifest.sha256)),
@@ -147,11 +147,8 @@ pub(crate) mod tests {
             ),
             (12, 0, 34)
         );
-        let comments = crate::inspect::scanners::todos::markers_from_tree(
-            FIXTURE.as_bytes(),
-            LangId::Luau,
-            &tree,
-        );
+        let comments =
+            crate::parser::todo_markers::markers_from_tree(FIXTURE.as_bytes(), LangId::Luau, &tree);
         assert_eq!(
             comments
                 .items

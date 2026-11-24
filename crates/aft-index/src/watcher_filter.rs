@@ -3031,7 +3031,7 @@ impl WatcherFilterThread {
         emit_watcher_overflow_log(line);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     fn push_raw_paths(&mut self, paths: Vec<PathBuf>) -> bool {
         self.push_raw_paths_with_kind(paths, false)
     }

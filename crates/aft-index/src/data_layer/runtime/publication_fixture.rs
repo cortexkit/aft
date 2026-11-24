@@ -35,7 +35,6 @@ impl PublicationFixture {
         }
     }
 
-    #[cfg(test)]
     pub(super) fn add(&self, stem: &str, count: usize) {
         let paths = (0..count)
             .map(|i| {
@@ -47,7 +46,6 @@ impl PublicationFixture {
         self.handle.note_paths(&paths);
     }
 
-    #[cfg(test)]
     pub(super) fn refresh(&self) {
         assert!(matches!(
             self.handle.fresh_view(Duration::from_secs(60)),
@@ -56,7 +54,6 @@ impl PublicationFixture {
         wait_until(|| !self.handle.work.refreshing.load(Ordering::Acquire));
     }
 
-    #[cfg(test)]
     pub(super) fn publications(&self) -> usize {
         self.handle.work.publications_started.load(Ordering::SeqCst)
     }

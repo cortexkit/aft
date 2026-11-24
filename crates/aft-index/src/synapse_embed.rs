@@ -2604,7 +2604,7 @@ mod tests {
         // Discovery is irrelevant to destruction. Reuse the production
         // constructor's real runtime and state, with recorded model metadata.
         let transport = SynapseRerankTransport::new(&config).unwrap();
-        let envelope = include_bytes!("../../aft/tests/fixtures/synapse/models-list-live-raw.json");
+        let envelope = include_bytes!("../tests/fixtures/synapse/models-list-live-raw.json");
         let metadata = parse_models_list(envelope).unwrap().remove(0);
         let client = SynapseEmbeddingClient {
             runtime: transport.runtime,
@@ -2672,7 +2672,7 @@ mod tests {
     #[test]
     fn models_list_live_shapes_allow_optional_dims() {
         let models = parse_models_list(include_bytes!(
-            "../../aft/tests/fixtures/synapse/models-list-live-raw.json"
+            "../tests/fixtures/synapse/models-list-live-raw.json"
         ))
         .unwrap();
         assert_eq!(models.len(), 7);
@@ -2840,8 +2840,7 @@ mod tests {
 
     #[test]
     fn captured_live_error_envelope_is_typed() {
-        let raw =
-            include_bytes!("../../aft/tests/fixtures/synapse/embed-query-0-live.json").to_vec();
+        let raw = include_bytes!("../tests/fixtures/synapse/embed-query-0-live.json").to_vec();
         let error = decode_result_envelope(raw).unwrap_err();
         assert!(matches!(error, SynapseEmbeddingError::ModelNotCertified(_)));
     }
@@ -2881,12 +2880,12 @@ mod tests {
     fn pages_reassemble_by_chunk_and_item_id() {
         let expected = vec![item("item:0", "a"), item("item:1", "b")];
         let first = parse_embedding_page(
-            include_bytes!("../../aft/tests/fixtures/synapse/embed-batch-page-1.json"),
+            include_bytes!("../tests/fixtures/synapse/embed-batch-page-1.json"),
             &expected,
         )
         .unwrap();
         let second = parse_embedding_page(
-            include_bytes!("../../aft/tests/fixtures/synapse/embed-batch-page-2.json"),
+            include_bytes!("../tests/fixtures/synapse/embed-batch-page-2.json"),
             &expected,
         )
         .unwrap();

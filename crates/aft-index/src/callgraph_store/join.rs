@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn blob_extraction_is_deterministic_for_nested_callers() {
-        let source = include_str!("../../../../benchmarks/aft-search/author_real_query.py");
+        let source = include_str!("../../tests/fixtures/source-corpus/author_real_query.py");
         let first = CallgraphBlob::extract(source, "python", "determinism-test-v1").unwrap();
         let expected = first.to_bytes().unwrap();
         for attempt in 1..32 {

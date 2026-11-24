@@ -485,7 +485,7 @@ struct Work {
     refreshing: Arc<AtomicBool>,
     #[cfg(any(test, feature = "test-support"))]
     refreshes_started: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     refresh_hold: Arc<AtomicBool>,
     /// Timer requests survive a refresh already running when they arrive.
     publish_requested: parking_lot::Mutex<Publish>,
@@ -735,7 +735,7 @@ impl Work {
             let mut requested = false;
             #[cfg(any(test, feature = "test-support"))]
             work.refreshes_started.fetch_add(1, Ordering::SeqCst);
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             while work.refresh_hold.load(Ordering::Acquire) {
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -1547,7 +1547,7 @@ impl DataCheckout {
             refreshing: Arc::new(AtomicBool::new(false)),
             #[cfg(any(test, feature = "test-support"))]
             refreshes_started: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             refresh_hold: Arc::new(AtomicBool::new(false)),
             publish_requested: parking_lot::Mutex::new(Publish::WhenMany),
             settle: Arc::new(QuietTimer::new(settle_period, {
@@ -1764,19 +1764,19 @@ struct QuietTimer {
     /// Also fences dispatch against checkout shutdown.
     stopped: std::sync::Mutex<bool>,
     timer: std::sync::Mutex<Option<crate::shared_timer::Timer>>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     manual_clock: parking_lot::Mutex<Option<ManualQuietClock>>,
     #[cfg(feature = "test-timing-hooks")]
     test_gate: bool,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct ManualQuietClock {
     now: Instant,
     pending: Option<ManualQuietDeadline>,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 struct ManualQuietDeadline {
     at: Instant,
     fire: Box<dyn FnMut() -> Option<Instant> + Send>,
@@ -1793,7 +1793,7 @@ impl QuietTimer {
             fire: Box::new(fire),
             stopped: std::sync::Mutex::new(false),
             timer: std::sync::Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             manual_clock: parking_lot::Mutex::new(None),
             #[cfg(feature = "test-timing-hooks")]
             test_gate: false,
@@ -1829,7 +1829,7 @@ impl QuietTimer {
     }
 
     fn now(&self) -> Instant {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = self.manual_clock.lock().as_ref() {
             return clock.now;
         }
@@ -1953,7 +1953,7 @@ impl QuietTimer {
             }
             None
         };
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         if let Some(clock) = self.manual_clock.lock().as_mut() {
             clock.pending = Some(ManualQuietDeadline {
                 at,
@@ -2446,6 +2446,10 @@ pub(crate) fn memory_figure_walks_for_test() -> usize {
 #[doc(hidden)]
 pub mod publication_fixture;
 
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod composed_checks;
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::publication_fixture::{wait_until, PublicationFixture};
@@ -2808,7 +2812,7 @@ pub(crate) mod tests {
             super::super::surfaces::checkout_estimate(memory, Some(0), seen.contended())
         };
         let now = Instant::now();
-        crate::context::with_memory_walk_clock_for_test(now, || {
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(now, || {
             let original = handle.memory_figure(None, walk);
             assert_eq!(original.shared.counts["changed_paths"], 0);
             assert_eq!(original.shared.counts["callgraph_engine_started"], 0);
@@ -2858,7 +2862,7 @@ pub(crate) mod tests {
         };
         let epoch = Instant::now();
         let read_at = |seconds| {
-            crate::context::with_memory_walk_clock_for_test(
+            aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
                 epoch + Duration::from_secs(seconds),
                 || handle.memory_figure(None, walk),
             )
@@ -2930,7 +2934,7 @@ pub(crate) mod tests {
             meaning: 0,
         };
         let epoch = Instant::now();
-        crate::context::with_memory_walk_clock_for_test(epoch, || {
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(epoch, || {
             handle.memory_figure(None, complete)
         });
         let walks = memory_figure_walks_for_test();
@@ -2940,23 +2944,25 @@ pub(crate) mod tests {
             .meaning
             .configure(Some(&crate::config::SemanticBackendConfig::default()));
         assert_eq!(handle.checkout().memory_epoch(), checkout_epoch);
-        let aged =
-            crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(3), || {
-                handle.memory_figure(None, complete)
-            });
+        let aged = aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(3),
+            || handle.memory_figure(None, complete),
+        );
         assert_eq!(aged.shared.bytes_status, "partial");
-        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(30), || {
-            handle.memory_figure(None, complete)
-        });
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(30),
+            || handle.memory_figure(None, complete),
+        );
         assert_eq!(memory_figure_walks_for_test(), walks + 1);
-        let aged = crate::context::with_memory_walk_clock_for_test(
+        let aged = aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
             epoch + Duration::from_secs(33),
             || handle.memory_figure(Some(1), complete),
         );
         assert_eq!(aged.shared.bytes_status, "partial");
-        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(60), || {
-            handle.memory_figure(Some(1), complete)
-        });
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(60),
+            || handle.memory_figure(Some(1), complete),
+        );
         assert_eq!(memory_figure_walks_for_test(), walks + 2);
     }
 
@@ -2971,7 +2977,7 @@ pub(crate) mod tests {
             meaning: 0,
         };
         let epoch = Instant::now();
-        crate::context::with_memory_walk_clock_for_test(epoch, || {
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(epoch, || {
             handle.memory_figure(None, || {
                 let mut partial = estimate();
                 partial.shared = partial.shared.gap("locked_parts");
@@ -2980,12 +2986,15 @@ pub(crate) mod tests {
             })
         });
         let walks = memory_figure_walks_for_test();
-        crate::context::with_memory_walk_clock_for_test(epoch + Duration::from_secs(3), || {
-            handle.memory_figure(None, || {
-                panic!("a partial map walk must also be rate-limited")
-            })
-        });
-        let complete = crate::context::with_memory_walk_clock_for_test(
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
+            epoch + Duration::from_secs(3),
+            || {
+                handle.memory_figure(None, || {
+                    panic!("a partial map walk must also be rate-limited")
+                })
+            },
+        );
+        let complete = aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
             epoch + Duration::from_secs(30),
             || handle.memory_figure(None, estimate),
         );
@@ -3005,11 +3014,11 @@ pub(crate) mod tests {
             meaning: 0,
         };
         let epoch = Instant::now();
-        crate::context::with_memory_walk_clock_for_test(epoch, || {
+        aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(epoch, || {
             handle.memory_figure(None, complete)
         });
         fixture.add("invalidate", 1);
-        let busy = crate::context::with_memory_walk_clock_for_test(
+        let busy = aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
             epoch + Duration::from_secs(30),
             || handle.memory_figure(None, super::super::surfaces::DataLayerMemory::busy_checkout),
         );
@@ -3018,14 +3027,14 @@ pub(crate) mod tests {
         assert_eq!(busy.callgraph, 1000);
         assert_eq!(busy.measured_age_ms(), 30_000);
         let walks = memory_figure_walks_for_test();
-        let held = crate::context::with_memory_walk_clock_for_test(
+        let held = aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
             epoch + Duration::from_secs(33),
             || handle.memory_figure(None, complete),
         );
         assert_eq!(memory_figure_walks_for_test(), walks);
         assert_eq!(held.measured_age_ms(), 33_000);
         assert_eq!(held.shared.bytes_status, "partial");
-        let retried = crate::context::with_memory_walk_clock_for_test(
+        let retried = aft_base::test_support::memory_walk::with_memory_walk_clock_for_test(
             epoch + Duration::from_secs(60),
             || handle.memory_figure(None, complete),
         );

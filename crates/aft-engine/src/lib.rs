@@ -343,8 +343,10 @@ pub mod test_bridge;
 
 #[cfg(test)]
 mod index_embedding_composed_tests;
-#[cfg(feature = "test-support")]
+#[cfg(any(test, feature = "test-support"))]
 mod index_publication_fixture;
+#[cfg(test)]
+mod index_runtime_composed_tests;
 #[cfg(test)]
 mod index_status_composed_tests;
 #[cfg(any(test, feature = "test-support"))]

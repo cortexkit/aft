@@ -34,7 +34,7 @@ impl ForwardingDirectoryWatcher {
         // project watcher's backend state for the same root.
         let mut watcher = crate::watcher_backend::DirectoryWatcher::new(
             tx,
-            Arc::new(crate::context::WatcherCounters::default()),
+            Arc::new(super::counters::WatcherCounters::default()),
         );
         watcher.watch(dir, notify::RecursiveMode::NonRecursive)?;
         let forwarder = std::thread::Builder::new()

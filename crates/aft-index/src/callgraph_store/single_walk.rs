@@ -43,15 +43,15 @@ mod tests {
             (include_str!("dispatch.rs"), "rust"),
             (include_str!("../calls.rs"), "rust"),
             (
-                include_str!("../../../../packages/aft-bridge/src/bash-hints.ts"),
+                include_str!("../../tests/fixtures/source-corpus/bash-hints.ts"),
                 "typescript",
             ),
             (
-                include_str!("../../../../benchmarks/aft-search/author_real_query.py"),
+                include_str!("../../tests/fixtures/source-corpus/author_real_query.py"),
                 "python",
             ),
             (
-                include_str!("../../../aft/tests/store_diet/corpus/receiver-go/receiver.go"),
+                include_str!("../../tests/fixtures/source-corpus/receiver.go"),
                 "go",
             ),
             (

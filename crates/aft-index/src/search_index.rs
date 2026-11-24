@@ -5082,7 +5082,7 @@ mod tests {
         fs::create_dir_all(storage.join("nested")).unwrap();
         {
             let _env = crate::test_env::without_storage_override();
-            assert_eq!(crate::bash_background::storage_dir(Some(&storage)), storage);
+            assert_eq!(aft_base::storage_path::storage_dir(Some(&storage)), storage);
         }
         fs::write(root.join("source.rs"), "fn user_source() {}\n").unwrap();
         for path in [

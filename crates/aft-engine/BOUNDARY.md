@@ -325,6 +325,12 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `watcher_filter::test_helpers::verify_full_dispatch_backlog` | test-support driver | `aft-index` | Assert private backlog behavior with the actual application pending-state probe. |
 | `local_embed::test_helpers::{native_test, wait_for_sessions}` | test-support helpers | `aft-index` | Keep one serial native-embedding guard and the same session-release check in both test binaries. |
 
+| `data_layer::runtime::composed_checks::PublicationRouting` | test-support port | `aft-index` | Feed actual context route changes to the publication checks. |
+| `data_layer::runtime::composed_checks` | test-support drivers | `aft-index` | Keep private queue, timer and publication assertions beside their implementation. |
+| `index_publication_fixture::compose_context` | test-support adapter | `aft-engine` | Pin the actual index fixture in the running engine context. |
+| `data_layer::meaning` | visibility widened | `aft-index` | Keep the preexisting embedding test fixtures available through the engine bridge. |
+| `data_layer::meaning::use_constant_vectors` | test-support visibility widened | `aft-index` | Preserve the deterministic embedding fixture for parity checks. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

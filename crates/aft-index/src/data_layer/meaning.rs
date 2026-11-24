@@ -848,7 +848,8 @@ pub(crate) fn waiting(coverage: &Coverage) -> bool {
 }
 
 #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
-pub(crate) use main_parity_vectors::use_constant_vectors;
+#[doc(hidden)]
+pub use main_parity_vectors::use_constant_vectors;
 
 #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
 #[path = "main_parity_vectors.rs"]
