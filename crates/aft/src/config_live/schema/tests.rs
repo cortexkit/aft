@@ -401,3 +401,68 @@ fn config_settings_has_three_top_level_setup_sections() {
         })
     );
 }
+
+#[test]
+fn config_settings_declares_only_keywords_subconscious_enforces() {
+    // Subconscious refuses these on ordinary settings because it does not
+    // enforce them; inside a `x-ck-kind: "json"` value they still apply.
+    const REFUSED: &[&str] = &[
+        "minProperties",
+        "maxProperties",
+        "dependentRequired",
+        "dependentSchemas",
+        "prefixItems",
+        "contains",
+        "minContains",
+        "maxContains",
+        "unevaluatedItems",
+        "multipleOf",
+        "format",
+        "contentEncoding",
+        "contentMediaType",
+        "contentSchema",
+        "readOnly",
+        "writeOnly",
+        "$id",
+        "$anchor",
+        "$dynamicAnchor",
+        "$vocabulary",
+        "definitions",
+        "dependencies",
+        "$recursiveAnchor",
+        "$recursiveRef",
+        "additionalItems",
+        "propertyNames",
+        "not",
+        "allOf",
+        "anyOf",
+        "if",
+    ];
+    fn walk(node: &Value, path: &str, found: &mut Vec<String>) {
+        let Some(object) = node.as_object() else {
+            return;
+        };
+        if object.get("x-ck-kind").and_then(Value::as_str) == Some("json") {
+            return;
+        }
+        for (key, child) in object {
+            let names_settings =
+                path.ends_with("/properties") || path.ends_with("/patternProperties");
+            if !names_settings && REFUSED.contains(&key.as_str()) {
+                found.push(format!("{path}/{key}"));
+            }
+            match child {
+                Value::Object(_) => walk(child, &format!("{path}/{key}"), found),
+                Value::Array(items) => {
+                    for (at, item) in items.iter().enumerate() {
+                        walk(item, &format!("{path}/{key}/{at}"), found);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(&settings_declaration(), "", &mut found);
+    assert!(found.is_empty(), "keywords Subconscious refuses: {found:?}");
+}

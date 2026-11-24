@@ -24,6 +24,12 @@ pub fn settings_declaration() -> Value {
     }
     annotate_cache_dir(&mut schema["properties"]["storage"]["properties"]["cache_dir"]);
     declare(&mut schema, "", Some(&defaults::values()), "", false);
+    // The editor schema's public URL means nothing to Subconscious, which
+    // refuses `$id` in a declaration.
+    schema
+        .as_object_mut()
+        .expect("settings schema")
+        .remove("$id");
     setup_sections(&mut schema["properties"]);
     schema
 }
@@ -127,6 +133,10 @@ fn declare(
         // not as settings. Keep additionalProperties to reject unknown fields.
         return;
     }
+    // Subconscious refuses keywords it does not enforce on ordinary settings.
+    // The schema generator adds `format` to integers ("uint64" and so on);
+    // every unsigned one also carries `minimum: 0`, so nothing is lost.
+    node.remove("format");
     let structural = node.get("type") == Some(&json!("object"));
     if structural {
         node.insert("unevaluatedProperties".into(), json!(false));
