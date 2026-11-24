@@ -81,6 +81,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn audit_resolution_same_size_and_mtime_do_not_keep_old_symbols() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.rs");
+        std::fs::write(&path, "fn old() {}\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        let mut parser = FileParser::new();
+        assert_eq!(parser.extract_symbols(&path).unwrap()[0].name, "old");
+        std::fs::write(&path, "fn new() {}\n").unwrap();
+        let mtime = before.modified().unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(after.len(), before.len());
+        assert_eq!(after.modified().unwrap(), mtime);
+        #[cfg(unix)]
+        assert_ne!(Stamp::of(&after), Stamp::of(&before));
+        assert_eq!(parser.extract_symbols(&path).unwrap()[0].name, "new");
+    }
+
     /// The reason a too deeply nested Markdown file is not parsed reaches
     /// the coding agents that call AFT's tools, in the error for that file.
     /// Its wording is a reviewed interface, so it is pinned here, and it
@@ -2883,48 +2907,52 @@ fn body_macros_are_not_items() {
         (dir, file, mtime, size, hash)
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[test]
     fn cached_freshness_unchanged_metadata_skips_hashing() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert_eq!(fresh_file_stamp(&file, stamp, size, hash), Some(stamp));
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_mtime_with_identical_content_hashes_fresh() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
         filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert!(fresh_file_stamp(&file, stamp, size, hash).is_some());
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_mtime_and_same_size_content_hashes_stale() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn one() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn one() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
         std::fs::write(&file, "pub fn two() {}\n").unwrap();
         filetime::set_file_mtime(&file, filetime::FileTime::from_unix_time(2, 0)).unwrap();
         assert_eq!(std::fs::metadata(&file).unwrap().len(), size);
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert!(fresh_file_stamp(&file, stamp, size, hash).is_none());
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 1);
     }
 
     #[cfg(debug_assertions)]
     #[test]
     fn cached_freshness_changed_size_skips_hashing() {
-        let (_dir, file, mtime, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let (_dir, file, _, size, hash) = cached_freshness_fixture("pub fn hello() {}\n");
+        let stamp = Stamp::of(&std::fs::metadata(&file).unwrap());
         std::fs::write(&file, "pub fn hello() {}\n// longer\n").unwrap();
 
         cache_freshness::reset_hash_file_if_small_count_for_debug();
-        assert!(!cached_file_is_fresh(&file, mtime, size, hash, mtime));
+        assert!(fresh_file_stamp(&file, stamp, size, hash).is_none());
         assert_eq!(cache_freshness::hash_file_if_small_count_for_debug(), 0);
     }
 
@@ -2971,7 +2999,7 @@ fn body_macros_are_not_items() {
         eprintln!("heading line visits: baseline {old_line_visits}, indexed {indexed_visits}");
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(all(debug_assertions, unix))]
     #[test]
     fn touched_symbol_cache_rehashes_only_first_query() {
         let (_dir, file, _, _, _) = cached_freshness_fixture("pub fn hello() {}\n");

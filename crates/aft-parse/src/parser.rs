@@ -18,6 +18,7 @@ use crate::error::AftError;
 use crate::symbols::{Range, Symbol, SymbolKind, SymbolMatch};
 
 mod file_language;
+mod freshness;
 pub use file_language::dynamic_language_for_extension;
 mod grammar_selection;
 mod navigation_symbols;
@@ -25,6 +26,10 @@ pub use grammar_selection::grammar_for;
 pub mod dead_code_facts;
 pub mod outline_facts;
 mod reusable;
+#[cfg(any(test, feature = "test-support"))]
+pub use freshness::{fresh_file_stamp, Stamp};
+#[cfg(not(any(test, feature = "test-support")))]
+use freshness::{fresh_file_stamp, Stamp};
 #[cfg(not(any(test, feature = "test-support")))]
 use reusable::parse_source_with_parser_deadline;
 pub use reusable::reusable_parser_pools_memory;
@@ -1209,6 +1214,7 @@ test_support_visibility! {
 /// Cached parse result: mtime at parse time + the tree.
 struct CachedTree {
     mtime: SystemTime,
+    stamp: Option<Stamp>,
     size: u64,
     content_hash: blake3::Hash,
     tree: Tree,
@@ -1239,6 +1245,7 @@ pub struct ParsedFile {
     pub lang: LangId,
     pub modules: Option<Arc<Vec<RustModule>>>,
     mtime: SystemTime,
+    stamp: Option<Stamp>,
     size: u64,
     content_hash: blake3::Hash,
 }
@@ -1251,6 +1258,7 @@ struct CachedSymbols {
     pub mtime: SystemTime,
     #[cfg(not(any(test, feature = "test-support")))]
     mtime: SystemTime,
+    stamp: Option<Stamp>,
     size: u64,
     content_hash: blake3::Hash,
     /// Shared so a lookup can snapshot an entry under the read lock with a
@@ -1301,46 +1309,6 @@ thread_local! {
     pub static FRESHNESS_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
     pub static CACHE_REFRESH_TEST_MUTATOR: std::cell::RefCell<Option<Box<dyn FnMut()>>> = const { std::cell::RefCell::new(None) };
     pub static CACHE_REFRESH_TEST_BARRIERS: std::cell::RefCell<Option<(std::sync::Arc<std::sync::Barrier>, std::sync::Arc<std::sync::Barrier>)>> = const { std::cell::RefCell::new(None) };
-}
-
-test_support_visibility! {
-fn cached_file_is_fresh(
-    path: &Path,
-    cached_mtime: SystemTime,
-    cached_size: u64,
-    cached_content_hash: blake3::Hash,
-    fallback_mtime: SystemTime,
-) -> bool {
-    #[cfg(any(test, feature = "test-support"))]
-    FRESHNESS_TEST_BARRIERS.with(|slot| {
-        if let Some((arrived, released)) = slot.borrow_mut().take() {
-            arrived.wait();
-            released.wait();
-        }
-    });
-    let Ok(metadata) = crate::bounded_io::metadata(path) else {
-        return false;
-    };
-    let current_size = metadata.len();
-    if current_size != cached_size {
-        return false;
-    }
-
-    let current_mtime = metadata.modified().unwrap_or(fallback_mtime);
-    // Matching size and mtime is the steady-state fast path. If only mtime moved,
-    // hash below to keep touched or no-op rewritten files cached when content is identical.
-    if current_mtime == cached_mtime {
-        return true;
-    }
-    if current_size > cache_freshness::CONTENT_HASH_SIZE_CAP {
-        return false;
-    }
-
-    matches!(
-        cache_freshness::hash_file_if_small(path, current_size),
-        Ok(Some(hash)) if hash == cached_content_hash
-    )
-}
 }
 
 /// Shared symbol cache that can be pre-warmed in a background thread
@@ -1479,6 +1447,7 @@ impl SymbolCache {
         self.insert_shared(
             path,
             mtime,
+            None,
             size,
             content_hash,
             Arc::new(symbols),
@@ -1499,7 +1468,17 @@ impl SymbolCache {
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
     ) -> bool {
-        self.insert_entry(path, mtime, size, content_hash, symbols, None, None, true)
+        self.insert_entry(
+            path,
+            mtime,
+            None,
+            size,
+            content_hash,
+            symbols,
+            None,
+            None,
+            true,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1507,6 +1486,7 @@ impl SymbolCache {
         &mut self,
         path: PathBuf,
         mtime: SystemTime,
+        stamp: Option<Stamp>,
         size: u64,
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
@@ -1516,6 +1496,7 @@ impl SymbolCache {
         self.insert_entry(
             path,
             mtime,
+            stamp,
             size,
             content_hash,
             symbols,
@@ -1530,6 +1511,7 @@ impl SymbolCache {
         &mut self,
         path: PathBuf,
         mtime: SystemTime,
+        stamp: Option<Stamp>,
         size: u64,
         content_hash: blake3::Hash,
         symbols: Arc<Vec<Symbol>>,
@@ -1541,6 +1523,8 @@ impl SymbolCache {
             if cached.mtime == mtime
                 && cached.size == size
                 && cached.content_hash == content_hash
+                && (content_hash != cache_freshness::zero_hash()
+                    || stamp.is_some() && cached.stamp == stamp)
                 && cached.symbols == symbols
             {
                 // Same content: keep what was already derived from it. A
@@ -1565,11 +1549,13 @@ impl SymbolCache {
                 if has_error.is_some() {
                     cached.has_error = has_error;
                 }
+                cached.stamp = stamp.or(cached.stamp);
                 return false;
             }
         }
         let entry = CachedSymbols {
             mtime,
+            stamp,
             size,
             content_hash,
             symbols,
@@ -1611,15 +1597,13 @@ impl SymbolCache {
     }
 
     /// Return cached symbols when the source file is still fresh.
-    pub fn get(&self, path: &Path, mtime: SystemTime) -> Option<Vec<Symbol>> {
+    pub fn get(&self, path: &Path, _mtime: SystemTime) -> Option<Vec<Symbol>> {
         self.entries.get(path).and_then(|cached| {
-            cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime).then(
-                || {
-                    #[cfg(any(test, feature = "test-support"))]
-                    work_counters::OWNED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
-                    cached.symbols.as_ref().clone()
-                },
-            )
+            fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash).map(|_| {
+                #[cfg(any(test, feature = "test-support"))]
+                work_counters::OWNED_SYMBOL_COPIES.with(|count| count.set(count.get() + 1));
+                cached.symbols.as_ref().clone()
+            })
         })
     }
 
@@ -1777,16 +1761,14 @@ impl SymbolCache {
 pub fn cached_symbol_count_shared(
     cache: &SharedSymbolCache,
     path: &Path,
-    mtime: SystemTime,
+    _mtime: SystemTime,
     size: u64,
 ) -> Option<usize> {
     let cached = cache.read().ok()?.entries.get(path)?.clone();
-    if cached.mtime == mtime && cached.size == size {
-        return Some(cached.symbols.len());
-    }
-    if !cached_file_is_fresh(path, cached.mtime, cached.size, cached.content_hash, mtime) {
+    if cached.size != size {
         return None;
     }
+    fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)?;
     // Hashing runs without a guard. A replacement during that I/O must not
     // turn the old table into a fresh count for the newly installed entry.
     let current = cache.read().ok()?;
@@ -1900,23 +1882,19 @@ impl FileParser {
             })?;
 
         let canon = path.to_path_buf();
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|m| m.modified())
-            .map_err(|e| AftError::FileNotFound {
-                path: format!("{}: {}", path.display(), e),
-            })?;
+        let metadata = crate::bounded_io::metadata(path).map_err(|e| AftError::FileNotFound {
+            path: format!("{}: {}", path.display(), e),
+        })?;
+        let current_mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        let stamp = Stamp::of(&metadata);
 
         // Check cache validity. Mtime alone is not enough: editors and tests can
         // restore timestamps after changing file contents, so small files fall
         // back to a Blake3 content hash when size does not prove staleness.
         let needs_reparse = match self.cache.get(&canon) {
-            Some(cached) => !cached_file_is_fresh(
-                path,
-                cached.mtime,
-                cached.size,
-                cached.content_hash,
-                current_mtime,
-            ),
+            Some(cached) => {
+                fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash).is_none()
+            }
             None => true,
         };
 
@@ -1937,6 +1915,7 @@ impl FileParser {
                 canon.clone(),
                 CachedTree {
                     mtime: current_mtime,
+                    stamp: stamp.and_then(|stamp| stamp.unchanged_after(path)),
                     size: source.len() as u64,
                     content_hash: content_hash_for_source(&source),
                     tree,
@@ -1988,6 +1967,7 @@ impl FileParser {
                     // a real mtime, so a later `parse` of the path checks the
                     // content hash before reusing this tree.
                     mtime: SystemTime::UNIX_EPOCH,
+                    stamp: None,
                     size,
                     content_hash,
                     tree,
@@ -2038,6 +2018,7 @@ impl FileParser {
             lang,
             modules,
             mtime: cached.mtime,
+            stamp: cached.stamp,
             size: cached.size,
             content_hash: cached.content_hash,
         })
@@ -2062,8 +2043,8 @@ impl FileParser {
             Some(cached)
                 if cached.size == parsed.size
                     && cached.content_hash == parsed.content_hash
-                    && (cached.mtime == parsed.mtime
-                        || parsed.content_hash != cache_freshness::zero_hash()) =>
+                    && (parsed.content_hash != cache_freshness::zero_hash()
+                        || parsed.stamp.is_some() && cached.stamp == parsed.stamp) =>
             {
                 cached.symbols
             }
@@ -2087,6 +2068,7 @@ impl FileParser {
             cache.insert_shared(
                 path.to_path_buf(),
                 parsed.mtime,
+                parsed.stamp,
                 parsed.size,
                 parsed.content_hash,
                 Arc::clone(&symbols),
@@ -2101,39 +2083,21 @@ impl FileParser {
     /// `Some(true)` when the file had syntax errors. `None` when there is no
     /// entry, the entry has no verdict, or the file changed since.
     pub fn cached_has_error(&self, path: &Path) -> Option<bool> {
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
         let cached = self.symbol_cache.read().ok()?.entries.get(path)?.clone();
         let has_error = cached.has_error?;
-        cached_file_is_fresh(
-            path,
-            cached.mtime,
-            cached.size,
-            cached.content_hash,
-            current_mtime,
-        )
-        .then_some(has_error)
+        fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)?;
+        Some(has_error)
     }
 
     /// Everything a multi-file outline stored for `path`, when the entry is
     /// still fresh and carries outline facts. A miss means the caller parses.
     pub fn cached_outline(&self, path: &Path) -> Option<CachedOutline> {
-        let current_mtime = crate::bounded_io::metadata(path)
-            .and_then(|metadata| metadata.modified())
-            .ok()?;
         let cached = self.symbol_cache.read().ok()?.entries.get(path)?.clone();
         let (Some(has_error), Some(facts)) = (cached.has_error, cached.outline_facts) else {
             return None;
         };
-        cached_file_is_fresh(
-            path,
-            cached.mtime,
-            cached.size,
-            cached.content_hash,
-            current_mtime,
-        )
-        .then_some(CachedOutline {
+        fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)?;
+        Some(CachedOutline {
             symbols: cached.symbols,
             modules: cached.modules,
             has_error,
@@ -2258,6 +2222,7 @@ impl FileParser {
                     canon.clone(),
                     CachedTree {
                         mtime: current_mtime,
+                        stamp: None,
                         size,
                         content_hash,
                         tree,
@@ -2315,11 +2280,12 @@ impl FileParser {
         // bypasses the symbol-cache snapshot and parses one coherent source read.
         for attempt in 0..=3 {
             let canon = path.to_path_buf();
-            let current_mtime = crate::bounded_io::metadata(path)
-                .and_then(|m| m.modified())
-                .map_err(|e| AftError::FileNotFound {
+            let metadata =
+                crate::bounded_io::metadata(path).map_err(|e| AftError::FileNotFound {
                     path: format!("{}: {}", path.display(), e),
                 })?;
+            let current_mtime = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let stamp = Stamp::of(&metadata);
             // A shared symbol cache cannot opt a built-in-only context into a
             // dynamic language after another context has populated that cache.
             if !self.dynamic_languages && language_for_extension(path).is_none() {
@@ -2348,14 +2314,10 @@ impl FileParser {
                 None
             };
             if let Some(cached) = cached {
-                if cached_file_is_fresh(
-                    path,
-                    cached.mtime,
-                    cached.size,
-                    cached.content_hash,
-                    current_mtime,
-                ) {
-                    if cached.mtime != current_mtime {
+                if let Some(fresh_stamp) =
+                    fresh_file_stamp(path, cached.stamp, cached.size, cached.content_hash)
+                {
+                    if cached.stamp != fresh_stamp || cached.mtime != current_mtime {
                         #[cfg(any(test, feature = "test-support"))]
                         CACHE_REFRESH_TEST_BARRIERS.with(|slot| {
                             if let Some((arrived, released)) = slot.borrow_mut().take() {
@@ -2377,10 +2339,12 @@ impl FileParser {
                                 })?;
                         if let Some(entry) = cache.entries.get_mut(&canon) {
                             if entry.mtime == cached.mtime
+                                && entry.stamp == cached.stamp
                                 && entry.size == cached.size
                                 && entry.content_hash == cached.content_hash
                             {
                                 entry.mtime = current_mtime;
+                                entry.stamp = fresh_stamp;
                             } else {
                                 // A concurrent writer replaced the snapshot while we hashed.
                                 // Retry rather than returning superseded symbols.
@@ -2399,6 +2363,7 @@ impl FileParser {
             let source = read_source(path).map_err(|e| AftError::FileNotFound {
                 path: format!("{}: {}", path.display(), e),
             })?;
+            let stamp = stamp.and_then(|stamp| stamp.unchanged_after(path));
             let size = source.len() as u64;
             let content_hash = content_hash_for_source(&source);
 
@@ -2426,28 +2391,19 @@ impl FileParser {
                 .map_err(|_| AftError::ParseError {
                     message: "symbol cache lock poisoned".to_string(),
                 })?;
-            let cache_changed = if let Some(generation) = self.symbol_cache_generation {
-                symbol_cache.generation == generation
-                    && symbol_cache.insert_shared(
-                        canon,
-                        current_mtime,
-                        size,
-                        content_hash,
-                        Arc::clone(&symbols),
-                        modules,
-                        has_error,
-                    )
-            } else {
-                symbol_cache.insert_shared(
+            let cache_changed = self
+                .symbol_cache_generation
+                .is_none_or(|generation| symbol_cache.generation == generation)
+                && symbol_cache.insert_shared(
                     canon,
                     current_mtime,
+                    stamp,
                     size,
                     content_hash,
                     Arc::clone(&symbols),
                     modules,
                     has_error,
-                )
-            };
+                );
 
             return Ok((symbols, cache_changed, false));
         }
