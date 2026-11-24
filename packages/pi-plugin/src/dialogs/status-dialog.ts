@@ -81,6 +81,7 @@ class AftStatusDialogComponent implements Component {
   private errorMessage: string | null = null;
   private refreshTimer: ReturnType<typeof setInterval> | null = null;
   private closed = false;
+  private fetchPending = false;
 
   constructor(props: DialogProps) {
     this.props = props;
@@ -96,6 +97,8 @@ class AftStatusDialogComponent implements Component {
   }
 
   private async fetchOnce(): Promise<void> {
+    if (this.fetchPending) return;
+    this.fetchPending = true;
     try {
       const bridge = bridgeFor(this.props.pluginCtx, this.props.extCtx.cwd);
       // Prefer the in-memory push-frame cache — that's the whole reason
@@ -123,6 +126,8 @@ class AftStatusDialogComponent implements Component {
       if (this.closed) return;
       this.errorMessage = err instanceof Error ? err.message : String(err);
       this.props.tui.requestRender();
+    } finally {
+      this.fetchPending = false;
     }
   }
 

@@ -55,6 +55,39 @@ describe("aft-status dialog cache", () => {
       component?.dispose?.();
     }
   });
+
+  test("does not overlap status requests while the initial fetch is pending", async () => {
+    let resolveStatus!: (value: Record<string, unknown>) => void;
+    const pendingStatus = new Promise<Record<string, unknown>>((resolve) => {
+      resolveStatus = resolve;
+    });
+    const { bridge, calls } = makeMockBridge(() => pendingStatus);
+    let component: { dispose?: () => void } | undefined;
+    try {
+      await showAftStatusDialog(
+        {} as ExtensionAPI,
+        {
+          cwd: projectRoot,
+          sessionManager: { getSessionId: () => "session" },
+          ui: {
+            custom: async (factory: (...args: unknown[]) => unknown) => {
+              component = factory({ requestRender: () => undefined }, {}, {}, () => undefined) as {
+                dispose?: () => void;
+              };
+            },
+          },
+        } as never,
+        makePluginContext(bridge),
+      );
+
+      await waitUntil(() => calls.length === 1);
+      await new Promise((resolve) => setTimeout(resolve, 1_600));
+      expect(calls).toHaveLength(1);
+    } finally {
+      resolveStatus({ success: true, session: { id: "session" } });
+      component?.dispose?.();
+    }
+  });
 });
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
