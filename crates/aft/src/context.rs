@@ -7693,49 +7693,37 @@ impl AppContext {
         self.tier2_refresh_scheduler.lock().pull_demand_pending()
     }
 
-    fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
-        let generation = self.configure_generation();
-        if !self.inspect_writer()
-            || !self.heavy_root_work_allowed()
-            || !manager.automatic_tier2_refresh_allowed()
-            || !self.config().inspect.enabled
-        {
-            return;
-        }
-        let _ = self.run_if_subc_bound_generation(generation, || {
-            self.start_tier2_refresh_admitted(reason, manager);
-        });
-    }
-
     /// Refresh the status bar's TODO count, which only an explicit
     /// `aft_inspect` would otherwise compute. This is the only analysis the
     /// scheduler runs: dead code, unused exports, duplicates, cycles and
     /// complexity cost seconds and hundreds of MB on a large repository, so
     /// they run only when an agent asks for them. The completion is drained
     /// with the other inspect completions, which refreshes the bar.
-    fn start_tier2_refresh_admitted(
-        &self,
-        reason: Tier2TriggerReason,
-        manager: Arc<InspectManager>,
-    ) {
-        let Some(snapshot) = self.tier2_refresh_snapshot() else {
+    fn start_tier2_refresh(&self, reason: Tier2TriggerReason, manager: Arc<InspectManager>) {
+        let generation = self.configure_generation();
+        let Some(snapshot) = self.tier2_refresh_snapshot().filter(|snapshot| {
+            let inspect = &snapshot.config.inspect;
+            inspect.enabled
+                && inspect.category_enabled(InspectCategory::Todos)
+                && self.inspect_writer()
+                && self.heavy_root_work_allowed()
+                && manager.automatic_tier2_refresh_allowed()
+                // An unbound root does no work, not even listing its files.
+                && self.run_if_subc_bound_generation(generation, || ()).is_some()
+        }) else {
             return;
         };
-        if !snapshot
-            .config
-            .inspect
-            .category_enabled(InspectCategory::Todos)
-        {
-            return;
-        }
-        match manager.submit_background(
-            snapshot.clone(),
-            InspectCategory::Todos,
-            crate::inspect::JobScope::for_project(snapshot.project_root.clone()),
-        ) {
-            Ok(_) => crate::slog_info!("todos refresh scheduled: reason={}", reason.as_str()),
-            Err(error) => crate::slog_info!("todos refresh not scheduled: {}", error),
-        }
+        // The scope list may walk the repository, so it is built before
+        // admission, which holds the lifecycle lock that unbinding waits on.
+        let inventory = crate::inspect::inventory::for_background_job(&snapshot.project_root);
+        let _ = self.run_if_subc_bound_generation(generation, || {
+            let _inventory = inventory.install();
+            let scope = crate::inspect::JobScope::for_project(snapshot.project_root.clone());
+            match manager.submit_background(snapshot, InspectCategory::Todos, scope) {
+                Ok(_) => crate::slog_info!("todos refresh scheduled: reason={}", reason.as_str()),
+                Err(error) => crate::slog_info!("todos refresh not scheduled: {}", error),
+            }
+        });
     }
 
     fn tier2_refresh_snapshot(&self) -> Option<InspectSnapshot> {

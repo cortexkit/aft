@@ -25,6 +25,84 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    /// A context ready to start the status bar's background TODO refresh,
+    /// with the refresh due now.
+    fn todo_refresh_context(root: &Path) -> Arc<crate::context::AppContext> {
+        let ctx = Arc::new(crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.to_path_buf()),
+                ..crate::config::Config::default()
+            },
+        ));
+        ctx.set_harness(crate::harness::Harness::Opencode);
+        let configured_at = std::time::Instant::now()
+            .checked_sub(
+                crate::inspect::tier2_scheduler::TIER2_REFRESH_COLD_CACHE_DELAY
+                    + std::time::Duration::from_secs(1),
+            )
+            .unwrap();
+        ctx.reset_tier2_refresh_scheduler_at(configured_at);
+        ctx
+    }
+
+    /// Listing the files can walk the whole repository, so it must not hold
+    /// the root lifecycle lock: an unbind during the listing finishes at once,
+    /// and the listed work is then not enqueued for the unbound root.
+    #[test]
+    fn background_todo_refresh_lists_files_outside_the_lifecycle_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let root = canonicalize_normalized(temp.path());
+        write(&root, "src/lib.rs", "// TODO: listed\n");
+
+        // Control: with nothing unbinding the root, the refresh is enqueued.
+        let control = todo_refresh_context(&root);
+        assert!(control
+            .tick_tier2_refresh_scheduler_at(std::time::Instant::now(), 0)
+            .is_some());
+        assert!(control.inspect_manager().tier2_any_in_flight());
+
+        let ctx = todo_refresh_context(&root);
+        let listed = Arc::new(AtomicBool::new(false));
+        let unbound_while_listing = Arc::new(AtomicBool::new(false));
+        let (hook_ctx, hook_listed, hook_unbound) = (
+            Arc::clone(&ctx),
+            Arc::clone(&listed),
+            Arc::clone(&unbound_while_listing),
+        );
+        BACKGROUND_JOB_LISTING_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                hook_listed.store(true, Ordering::SeqCst);
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    hook_ctx.mark_subc_unbound();
+                    let _ = done_tx.send(());
+                });
+                // The bound only stops a broken build from hanging: an unbind
+                // that waits for this listing never finishes inside it.
+                let finished = done_rx
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .is_ok();
+                hook_unbound.store(finished, Ordering::SeqCst);
+            }));
+        });
+        ctx.tick_tier2_refresh_scheduler_at(std::time::Instant::now(), 0);
+        BACKGROUND_JOB_LISTING_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(
+            listed.load(Ordering::SeqCst),
+            "the refresh never listed files"
+        );
+        assert!(
+            unbound_while_listing.load(Ordering::SeqCst),
+            "unbinding the root waited for the file listing"
+        );
+        assert!(
+            !ctx.inspect_manager().tier2_any_in_flight(),
+            "work listed before an unbind was enqueued for the unbound root"
+        );
+    }
+
     #[test]
     fn inspect_inventory_preserves_both_walks_and_their_directory_boundaries() {
         let temp = tempfile::tempdir().unwrap();
@@ -305,6 +383,32 @@ pub(crate) fn current(root: &Path) -> Option<Arc<InspectInventory>> {
 
 pub(super) fn inherited() -> Option<Arc<InspectInventory>> {
     CURRENT.with(|slot| slot.borrow().clone())
+}
+
+/// The whole-project source list a background job needs, built before the
+/// job is admitted: without a bound index store it walks the repository, and
+/// admission holds the root lifecycle lock that unbinding the root waits for.
+/// Installed around the admission, it lets the job's enqueue filter this list
+/// instead of walking under the lock. It carries no manifests; install it
+/// only around that enqueue.
+pub(crate) fn for_background_job(root: &Path) -> Arc<InspectInventory> {
+    #[cfg(test)]
+    if let Some(hook) = BACKGROUND_JOB_LISTING_HOOK.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+    let scope = super::JobScope::for_project(root.to_path_buf());
+    Arc::new(InspectInventory {
+        root: canonicalize_normalized(root),
+        sources: super::manager::scope_files(root, &scope),
+        manifests: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once on this thread while [`for_background_job`] lists files.
+    pub(crate) static BACKGROUND_JOB_LISTING_HOOK: RefCell<Option<Box<dyn FnOnce()>>> =
+        const { RefCell::new(None) };
 }
 
 pub(crate) struct InventoryGuard(Option<Arc<InspectInventory>>);
