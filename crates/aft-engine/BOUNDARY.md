@@ -746,3 +746,46 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `lsp::test_support::{idle_fixture::IdleLspFixture, child_pid_for_test}` | test-support adapters | `aft-inspect` | Share the existing idle-manager setup and keep PID reads opt-in. |
 | `lsp_idle_fixture::IdleLspFixture` | test-support compatibility adapter | `aft-engine` | Use the same idle fixture with a real context for composed teardown and unchanged upper call sites. |
 | `test_bridge::search_misc::{LspManagerTestExt, LspClientTestExt}` | test-support compatibility adapters | `aft-engine` | Keep upper `resume` and `child_pid` call shapes without exposing the lower methods through the release API. |
+
+## GitHub and shell
+
+| Item | Kind | Owning crate | Reason |
+|---|---|---|---|
+| `gh_shim`, `gh_shim_relay`, `gh_shim_worker_endpoints`, `github_read` | compatibility re-exports | `aft-engine` | Keep the shim, relay, endpoint, and read paths used by shell and upper crates. |
+| `gh_shim_speech` | compatibility re-export | `aft-engine` | Preserve the speech service, types, and fixtures at their existing paths. |
+| `gh_shim_worker_broker` | compatibility re-exports | `aft-engine` | The old module presents the shared GitHub protocol alongside shell-owned service installation and provisioning. |
+| `remote_shell_marker::{active, PROBE}` | items moved down and widened | `aft-base` | Share the native marker's reader and value without linking the shim to shell filter construction. |
+| `sandbox_spawn::remote_shell_guard::active` | compatibility re-export | `aft-engine` | Keep the existing native verification path. |
+| `gh_shim_ticket::spawn_metadata::SpawnMetadata` | metadata view | `aft-github` | Capture and seal speech tickets using only the session, task, process, and remote-execution facts they need. |
+| `gh_shim_ticket::spawn_metadata::{ColdTaskDecoder, ColdTaskMetadata}` | decoder port and metadata view | `aft-github` | Cold redemption needs trusted task metadata, not the shell's persisted record format. |
+| `gh_shim_ticket::decode_cold_task` | port adapter | `aft-engine` | Deserialize the full shell record before returning the projection; invalid unused fields still refuse redemption. |
+| `gh_shim_ticket::{capture_spawn, seal_spawn}` | widened operations | `aft-github` | Accept the narrow metadata view supplied by the shell. |
+| `gh_shim_ticket::{capture_spawn, seal_spawn}` | compatibility wrappers | `aft-engine` | Keep the persisted-task call paths and construct the GitHub metadata view at the boundary. |
+| `gh_shim_ticket::{PendingTicket::issue_with_scope, PendingTicket::issue_for_project, ScopedTicket::issue_with_scope}` | scope port | `aft-github` | Read the authenticated spawn scope lazily, only if the speech launch context has no lifecycle scope. |
+| `gh_shim_ticket::PendingTicket` | compatibility wrapper | `aft-engine` | Retain issue, value, bind, and drop behavior while passing the real shell scope source. |
+| `gh_shim_ticket::ScopedTicket` | compatibility wrapper | `aft-engine` | Preserve the scoped-ticket constructor and drop semantics while passing the real scope source. |
+| `gh_shim_ticket::{redeem, revoke_task, Redeemed, GH_SHIM_TICKET_ENV, GH_SHIM_WORKER_ENV}` | compatibility re-exports | `aft-engine` | Keep the public ticket paths for unchanged upper callers. |
+| `gh_shim_speech::service::{Describe, start_with_task_decoder}` | widened type and decoder entry | `aft-github` | Construction binds the cold decoder to the service that needs it. |
+| `gh_shim_speech::service::start` | compatibility wrapper | `aft-engine` | The production constructor supplies the strict shell decoder without changing daemon callers. |
+| `gh_shim_speech::service::{record_service_with_task_decoder, RuntimeGuard, service_without_task_decoder_for_test}` | feature-gated test boundary | `aft-github` | Build services and exercise cold verification with or without the real decoder, and preserve the runtime guard path. |
+| `gh_shim_speech::service::record_service` and `test_bridge::bash_remote::record_service` | feature-gated compatibility wrappers | `aft-engine` | Share the production decoder with composed fixture services. |
+| `gh_shim_ticket::{SpawnTicketGuard, spawn_ticket_guard, pty_seal_required, finish_pty_seal_or_revoke, mark_spawn_background, promote_speech_task}` | widened lifecycle operations | `aft-github` | Shell retains ownership of process launch and informs the GitHub ticket store at the original lifecycle points. |
+| `gh_shim_ticket::{SpeechTicket, speech_for_task, SpeechTicket::database_path}` | widened type and read methods | `aft-github` | Shell can find the authority database after launch without reaching into a ticket's private prepared service. |
+| `gh_shim_ticket::PendingTicket::{reserve_task, worker_read_capability, attach_worker_read_endpoint, abandon_worker_read}` | widened provisioning operations | `aft-github` | Provisioning in shell still reserves, provisions, and rolls back the one existing ticket. |
+| `gh_shim_ticket::{redeem_worker_read, worker_read_scope_matches, renew_worker_read_deadline, worker_read_deadline}` | widened broker lifecycle operations | `aft-github` | The server keeps enforcing the GitHub ticket and revocation policy. |
+| `gh_shim_worker_broker::{SOCKET_ENV, CAPABILITY_FILE_ENV, STATE_ENV, CHILD_KEYS}` | widened protocol constants | `aft-github` | Shell child-environment scrubbing and provisioning use the client discovery keys. |
+| `gh_shim_worker_broker::{MAX_FRAME, CALL_DEADLINE, Operation, Envelope, Envelope::capability, Envelope::operation, refusal, decode, read_frame, write_reply}` | widened protocol | `aft-github` | Client and server share the existing frame, reply, and envelope implementations. |
+| `gh_shim::read_contract::{MAX_REPLY_BYTES, WORKER_GET_QUERY_KEYS, Request, Accept, GetArgs, SearchArgs, LogArgs, WorkerReadRefusal, Request::canonicalize_worker_path, Request::validate_worker_query}` | widened read protocol and validation | `aft-github` | The shell server still uses GitHub's closed request types and canonical route/query validation. |
+| `gh_shim_worker_endpoints::{Generation, Generation::new, Generation::bind, Endpoint, Endpoint::path, Endpoint::remove}` | widened endpoint operations | `aft-github` | Provision the socket in shell while preserving the endpoint identity shared with the ticket. |
+| `gh_shim::{read_contract, seed_worker_state}` | widened shim initialization | `aft-github` | The shell server uses the GitHub wire contract and seeds the existing state layout. |
+| `gh_shim_relay::{worker_scope, session_context, read_validated_request}` | widened relay operations | `aft-github` | The server calls the same relay policy and read operation without depending on GitHub internals by path. |
+| `gh_shim_speech::{Refusal::agent_text, service::revoke_task_records, service::revoke_at, start_view::sweep_queued, store::Store::pending_legacy_for_identity}` | widened speech operations | `aft-github` | Keep the shell's launch refusal, revocation, sweeper, and queued-write accounting tied to the speech store. |
+| `gh_shim::wrapper_config_dir_pattern_from_process` and `gh_shim::process_state_files_for_test` | widened path helper and feature-gated test helper | `aft-github` | Keep the engine hermeticity guard on the real shim state paths. |
+| `gh_shim_ticket::live_count_for_task` and `Redeemed::without_scope_for_test` | feature-gated test helpers | `aft-github` | Preserve engine assertions about registry lifetime and the complete redeemed record. |
+| `gh_shim_speech::test_bridge` | feature-gated extension implementations | `aft-github` | Keep inherent helpers and the speech test types beside their owning implementation. |
+| `test_bridge::bash_remote::speech` and `test_bridge::bash_remote::seal_spawn` | feature-gated compatibility re-export and wrapper | `aft-engine` | Preserve the upper speech fixture paths and route sealing through the shell metadata adapter. |
+| `gh_shim_relay::{bindings_fixture, daemon_fixture}` | feature-gated fixture exports | `aft-github` | Upper protocol tests continue to use the exact bindings vectors and loopback daemon. |
+| `gh_shim_worker_broker::test_wire::{MAX_RESPONSE, failure_text, read_reply, write_frame}` | feature-gated codec fixture helpers | `aft-github` | Real shell listener tests use the same codec as the GitHub broker client. |
+| `gh_shim::composed_test_driver::empty_home_uses_userprofile_for_config_and_parent_exclusion` | feature-gated test driver | `aft-github` | Keep the real shim configuration assertions while the engine checks parent discovery in the same child process. |
+| `gh_shim_relay::composed_test_driver::assert_spawned_ticket_relays` | feature-gated test driver | `aft-github` | Check the exact relay request and response for a real shell ticket and verify the audit line identifies that task. |
+| `github_read::{stale_thread_note_for_test, GithubReadDeferred::late_answer_for_test, GithubReadEngine::flights_empty_for_test}` | feature-gated test helpers | `aft-github` | Preserve the existing read test bridge's fixture and lifecycle observations. |
