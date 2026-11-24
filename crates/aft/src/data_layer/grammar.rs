@@ -78,6 +78,7 @@ pub(super) fn reason(error: &ManifestJoinError) -> Option<String> {
         ManifestJoinError::GrammarParseTimeout { .. } => {
             serde_json::json!({"code": "grammar_parse_timeout", "state": "parse_timeout"})
         }
+        ManifestJoinError::InvalidSourceEncoding => serde_json::json!({"code": "invalid_utf8"}),
         _ => return None,
     };
     let reason = value.to_string();
@@ -137,6 +138,10 @@ impl GapReply {
                 AftError::from(error).to_error_json()
             }
             "callgraph_off" => saved,
+            "invalid_utf8" => serde_json::json!({
+                "code": "invalid_utf8",
+                "message": crate::inspect::scanners::source_text::NOT_VALID_UTF8,
+            }),
             _ => return None,
         };
         value["path"] = serde_json::json!(path);

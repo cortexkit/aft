@@ -2636,20 +2636,37 @@ pub(crate) fn response_with_view(
     view: Option<&crate::data_layer::checkout::CheckoutView>,
     queried_paths: &[&Path],
 ) -> Response {
-    // Missing callers in downloaded grammars only affect traversals in those languages.
-    let languages: std::collections::BTreeSet<_> = queried_paths
-        .iter()
-        .filter_map(|path| super::grammar::downloaded_language(path))
-        .collect();
-    if !languages.is_empty() {
-        if let Some(view) = view {
+    if let Some(view) = view {
+        let language = |path: &Path| {
+            let relative = crate::callgraph_store::relative_path(view.root(), path)?;
+            Some(
+                view.current_state()
+                    .get(relative.as_bytes())?
+                    .language
+                    .as_str(),
+            )
+        };
+        let family = |label: &str| match label {
+            "typescript" | "tsx" | "javascript" => 0,
+            "c" | "cpp" | "cuda" | "metal" | "objc" => 1,
+            _ => 2,
+        };
+        let languages: BTreeSet<_> = queried_paths
+            .iter()
+            .filter_map(|path| language(path))
+            .collect();
+        if !languages.is_empty() {
             crate::data_layer::surfaces::disclose_parse_gaps(
                 view,
                 &[view.root().to_path_buf()],
                 &mut response,
                 |path| {
-                    super::grammar::downloaded_language(path)
-                        .is_some_and(|language| languages.contains(language))
+                    language(path).is_some_and(|label| {
+                        languages.iter().any(|queried| {
+                            *queried == label
+                                || (family(label) != 2 && family(label) == family(queried))
+                        })
+                    })
                 },
             );
         }

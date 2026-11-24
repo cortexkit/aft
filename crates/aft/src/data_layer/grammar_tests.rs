@@ -165,6 +165,47 @@ fn luau_s4_round4_non_luau_failures_preserve_main_search_contract() {
     assert!(text.contains("searchable"));
 }
 
+#[test]
+fn audit_resolution_invalid_utf8_caller_is_a_named_gap() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("project");
+    let target = write(&root, "target.py", "def target():\n    pass\n");
+    let source = write(
+        &root,
+        "caller.py",
+        "# coding: latin-1\n# café\nfrom target import target\ndef caller():\n    target()\n",
+    );
+    let root = std::fs::canonicalize(root).unwrap();
+    let ctx = context(&root, &dir.path().join("storage"));
+    let ready = ctx.data_checkout().unwrap();
+    let view = match ready.fresh_view(Duration::from_secs(60)) {
+        super::runtime::Fresh::Ready(view) => view,
+        _ => panic!("call graph did not become ready"),
+    };
+    assert!(view.callgraph_has_file("caller.py"));
+    let query = || ask(&ctx, "callers", json!({"file": target, "symbol": "target"}));
+    let valid = query();
+    assert_eq!(valid.data["total_callers"], 1, "{:?}", valid.data);
+    std::fs::write(
+        &source,
+        b"# coding: latin-1\n# caf\xe9\nfrom target import target\ndef caller():\n    target()\n",
+    )
+    .unwrap();
+    ready
+        .checkout()
+        .record_paths(&[b"caller.py".to_vec()])
+        .unwrap();
+    let invalid = query();
+    assert!(invalid.success, "{:?}", invalid.data);
+    assert_eq!(invalid.data["total_callers"], 0, "{:?}", invalid.data);
+    assert_eq!(invalid.data["complete"], false, "{:?}", invalid.data);
+    assert_eq!(
+        invalid.data["gaps"][0]["path"],
+        json!(root.join("caller.py"))
+    );
+    assert_eq!(invalid.data["gaps"][0]["message"], "not valid UTF-8");
+}
+
 #[cfg(unix)]
 #[test]
 fn audit_resolution_literal_backslash_and_directory_are_distinct() {

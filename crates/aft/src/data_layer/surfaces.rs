@@ -480,14 +480,14 @@ pub(crate) fn disclose_index_gaps(
     });
 }
 
-/// Adds only host-owned grammar diagnostics, preserving gap-free responses.
+/// Adds named parse gaps without changing gap-free responses.
 pub(super) fn disclose_parse_gaps(
     view: &super::checkout::CheckoutView,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,
     include: impl Fn(&Path) -> bool,
 ) {
-    if !cfg!(feature = "wasm-grammars") || view.current_state().skipped_parses().is_empty() {
+    if view.current_state().skipped_parses().is_empty() {
         return;
     }
     let fence = crate::context::confinement::capture();
