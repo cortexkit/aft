@@ -1062,6 +1062,8 @@ fn probe_gh_shim_binary_uncached(binary: &Path) -> Result<(), String> {
 }
 
 const SHIM_PROBE_BUDGET: Duration = Duration::from_secs(2);
+/// Largest `--shim-version` report the probe reads.
+const SHIM_REPORT_MAX_BYTES: u64 = 64 * 1024;
 const SHIM_WARMUP_BUDGET: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
@@ -1176,8 +1178,18 @@ fn probe_gh_shim_binary_with_budget(
         return Err(format!("--shim-version probe exited with {status}").into());
     }
     stdout.rewind().map_err(|error| error.to_string())?;
+    // The report is a small JSON object; refuse anything larger from its size
+    // instead of reading it, and never read past the budget.
+    let reported = stdout.metadata().map_err(|error| error.to_string())?.len();
+    if reported > SHIM_REPORT_MAX_BYTES {
+        return Err(format!(
+            "--shim-version probe report exceeds {SHIM_REPORT_MAX_BYTES} bytes ({reported} bytes)"
+        )
+        .into());
+    }
     let mut bytes = Vec::new();
     stdout
+        .take(SHIM_REPORT_MAX_BYTES)
         .read_to_end(&mut bytes)
         .map_err(|error| error.to_string())?;
     let report: ShimSelfReport = serde_json::from_slice(&bytes)
@@ -3244,6 +3256,29 @@ mod tests {
         assert!(matches!(error, ShimProbeFailure::TimedOut), "{error}");
         write_executable(&binary, "#!/bin/sh\n[ -z \"${HOME:-}\" ] || exit 1\nprintf '%s' '{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}'\n");
         probe_gh_shim_binary_uncached(&binary).unwrap();
+    }
+
+    /// The identity report is a small JSON object. A candidate that prints
+    /// more than the report budget (64 KiB) is rejected without loading its
+    /// output, even when the output is a valid report padded with whitespace.
+    #[cfg(unix)]
+    #[test]
+    fn probe_rejects_an_oversized_identity_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let binary = temp.path().join("aft-probe");
+        write_executable(
+            &binary,
+            &format!(
+                "#!/bin/sh\nprintf '%s' '{{\"shim_version\":\"test\",\"gh_routing_schema_floor\":1}}'\nhead -c {} /dev/zero | tr '\\0' ' '\n",
+                64 * 1024 + 1
+            ),
+        );
+        let error =
+            probe_gh_shim_binary_with_budget(&binary, Duration::from_secs(60)).unwrap_err();
+        assert!(
+            matches!(&error, ShimProbeFailure::Rejected(reason) if reason.contains("exceeds")),
+            "{error}"
+        );
     }
 
     #[cfg(unix)]
