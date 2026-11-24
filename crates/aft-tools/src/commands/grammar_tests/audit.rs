@@ -1670,10 +1670,4 @@ isolated!(
 );
 
 #[cfg(test)]
-use aft_engine::test_bridge::display_data::CheckoutTestExt as _;
-#[cfg(test)]
 use aft_engine::test_bridge::display_data::CheckoutViewTestExt as _;
-#[cfg(test)]
-use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
-#[cfg(test)]
-use aft_engine::test_bridge::display_data::VectorPlaneTestExt as _;

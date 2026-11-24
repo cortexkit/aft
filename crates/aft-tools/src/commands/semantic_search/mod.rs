@@ -10862,7 +10862,6 @@ fn degraded_warning(ctx: &AppContext) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aft_engine::test_bridge::display_data::{CheckoutTestExt as _, DataCheckoutTestExt as _};
 
     use crate::config::{Config, SemanticBackend, SemanticBackendConfig};
     use crate::context::AppContext;

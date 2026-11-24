@@ -7,7 +7,6 @@
 
 #[allow(unused_imports)]
 pub(crate) use aft_base::nested_worktree_tests::*;
-use aft_engine::test_bridge::search_misc::search::SearchSnapshotTest as _;
 
 #[test]
 fn trigram_project_walk_skips_nested_worktrees() {

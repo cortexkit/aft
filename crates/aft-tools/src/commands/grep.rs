@@ -1893,7 +1893,6 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use aft_engine::test_bridge::search_misc::search::SearchSnapshotTest as _;
 
     #[test]
     fn grep_ignore_disclosure_wording_is_centralized() {

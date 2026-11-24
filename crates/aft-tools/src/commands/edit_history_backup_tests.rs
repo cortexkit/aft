@@ -64,6 +64,3 @@ fn backup_memory_history_response_is_byte_identical_after_release_and_restart() 
         0
     );
 }
-
-#[cfg(test)]
-use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;

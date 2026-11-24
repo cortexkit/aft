@@ -12224,13 +12224,9 @@ mod tests {
     }
 
     #[cfg(test)]
-    use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;
-    #[cfg(test)]
     use aft_engine::test_bridge::search_misc::InspectCacheTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::InspectManagerTestExt as _;
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
 
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::WatcherRescanIntervalTestExt as _;

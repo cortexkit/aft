@@ -903,5 +903,4 @@ mod shared_db_tests {
     #[cfg(test)]
     use aft_engine::test_bridge::bash_remote::BgTaskRegistryTestExt as _;
     use aft_engine::test_bridge::display_data::AppContextTestExt as _;
-    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }

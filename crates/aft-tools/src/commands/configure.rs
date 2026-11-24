@@ -10018,12 +10018,6 @@ mod tests {
     use aft_engine::test_bridge::display_data::RetrySlotTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::ArtifactCacheKeyTimingsTestExt as _;
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
 
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::WatcherBackendExclusionsTestExt as _;

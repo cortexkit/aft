@@ -342,9 +342,6 @@ mod audit_regressions {
             assert_eq!(store.history(session, &path).len(), 1);
         }
     }
-
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }
 
 fn build_batch_output(

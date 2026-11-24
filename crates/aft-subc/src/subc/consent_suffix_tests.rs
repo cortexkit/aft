@@ -65,5 +65,3 @@ async fn consent_worker_read_suggests_unique_longest_indexed_suffix_without_aski
 
 #[cfg(test)]
 use aft_engine::test_bridge::display_data::IndexHost as _;
-
-use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

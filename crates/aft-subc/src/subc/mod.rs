@@ -15105,9 +15105,6 @@ pub(crate) mod test_support {
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     }
-
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::CheckpointStoreTestExt as _;
 }
 
 #[cfg(test)]
@@ -22300,8 +22297,6 @@ mod tests {
     use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::display_data::RetrySlotTestExt as _;
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::BackendSlotTestExt as _;
     #[cfg(test)]
     use aft_engine::test_bridge::search_misc::BuildInputsTestExt as _;
     #[cfg(test)]

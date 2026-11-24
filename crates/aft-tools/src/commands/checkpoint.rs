@@ -91,9 +91,6 @@ mod tests {
             }
         }
     }
-
-    #[cfg(test)]
-    use aft_engine::test_bridge::search_misc::BackupStoreTestExt as _;
 }
 
 fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response, Response> {

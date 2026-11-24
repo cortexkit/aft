@@ -14,7 +14,7 @@ use crate::config::{Config, RerankConfig};
 use crate::context::{AppContext, SemanticIndexStatus};
 use crate::parser::TreeSitterProvider;
 use crate::protocol::RawRequest;
-use aft_engine::test_bridge::search_misc::rerank::{self as bridge, BackendSlotTest as _};
+use aft_engine::test_bridge::search_misc::rerank as bridge;
 
 thread_local! {
     static TEST_BACKEND: RefCell<Option<SelectedBackend>> = const { RefCell::new(None) };

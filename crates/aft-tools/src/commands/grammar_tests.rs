@@ -380,8 +380,6 @@ fn luau_s4_feature_matrix() {
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
 fn scenario(phase: &str) {
-    use aft_engine::test_bridge::display_data::CheckoutTestExt as _;
-
     let dir = PathBuf::from(std::env::var_os("AFT_S4_ROOT").unwrap());
     let root = dir.join("project");
     let storage = dir.join("storage");
@@ -860,6 +858,3 @@ fn ready_tools_and_resolver(ctx: &AppContext, root: &Path, dir: &Path) {
         7
     );
 }
-
-#[cfg(test)]
-use aft_engine::test_bridge::display_data::DataCheckoutTestExt as _;

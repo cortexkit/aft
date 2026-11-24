@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use aft_engine::test_bridge::display_data::{AppContextTestExt as _, DataCheckoutTestExt as _};
+    use aft_engine::test_bridge::display_data::AppContextTestExt as _;
     use std::fs;
     use std::sync::Arc;
 

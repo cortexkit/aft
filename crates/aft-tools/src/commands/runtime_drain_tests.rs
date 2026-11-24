@@ -215,7 +215,5 @@ use aft_engine::test_bridge::display_data::AppContextTestExt as _;
 use aft_engine::test_bridge::display_data::DataStoreReportTestExt as _;
 #[cfg(test)]
 use aft_engine::test_bridge::search_misc::InspectManagerTestExt as _;
-#[cfg(test)]
-use aft_engine::test_bridge::search_misc::WatcherCountersTestExt as _;
 
 use aft_engine::test_bridge::search_misc::WatcherCountersSnapshotTestExt as _;
