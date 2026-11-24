@@ -1333,12 +1333,33 @@ impl Work {
                     );
                 }
                 Round::Idle => {}
+                Round::Waiting => work.wake_fill_when_family_free(),
                 Round::Failed(failure) => work.retry_fill_later(failure.message()),
             }
             if more || work.fill_requested.load(Ordering::Acquire) != requested {
                 work.start_fill();
             }
         });
+    }
+
+    /// After a fill round found another fill of the repository holding its
+    /// lock: starts the fill again once that lock is free, waiting on the
+    /// family's one waiting thread rather than in a fill-pool place.
+    /// `start_fill` admits the new round through the root's executor, so a
+    /// root unbound in the meantime runs none.
+    fn wake_fill_when_family_free(self: &Arc<Self>) {
+        let weak = Arc::downgrade(self);
+        let waiting = super::fill_waiters::wake_when_free(
+            self.checkout.family_dir(),
+            Box::new(move || {
+                if let Some(work) = weak.upgrade() {
+                    work.start_fill();
+                }
+            }),
+        );
+        if !waiting {
+            self.retry_fill_later("another fill of this repository holds its fill lock");
+        }
     }
 
     fn retry_fill_later(self: &Arc<Self>, error: &str) {

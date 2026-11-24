@@ -12,6 +12,7 @@ pub(crate) mod dead_code;
 pub mod dead_code_graph;
 pub mod edit_gate;
 pub mod extract_gate;
+mod fill_waiters;
 pub mod fragment;
 pub(crate) mod gate;
 pub(crate) mod grammar;

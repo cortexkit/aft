@@ -1862,6 +1862,8 @@ pub fn fill_root(
     loop {
         match meaning.round(&checkout) {
             Round::More => {}
+            Round::Waiting => super::vectors::wait_for_other_fill(checkout.family_dir())
+                .map_err(|error| error.to_string())?,
             Round::Done => break,
             Round::Idle => return Err("the checkout has nothing published to fill".to_string()),
             Round::Failed(failure) => return Err(failure.message().to_string()),

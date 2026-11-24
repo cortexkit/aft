@@ -1012,7 +1012,7 @@ const FILL_WAIT: Duration = Duration::from_secs(600);
 /// The file in a family's folder whose lock a fill round holds while it
 /// embeds and publishes (see [`FillLock`]). The store ignores names it does
 /// not write.
-const FILL_LOCK: &str = "vector-fill.lock";
+pub(super) const FILL_LOCK: &str = "vector-fill.lock";
 
 /// One fill round's hold on its repository: while one round, in any
 /// process, embeds texts and publishes them, every other round of the
@@ -1087,6 +1087,29 @@ impl FillLock {
             std::thread::sleep(Duration::from_millis(20));
         }
     }
+}
+
+/// Blocks until no other fill holds the fill lock of the family in `dir`,
+/// without polling, then lets it go at once: for a fill that stopped because
+/// another fill held the lock, so it can start again once that one is done.
+///
+/// # Errors
+///
+/// When the lock file cannot be opened or locked.
+pub(super) fn wait_for_other_fill(dir: &Path) -> Result<(), DataError> {
+    let path = dir.join(FILL_LOCK);
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&path)
+        .map_err(|error| DataError::Store(format!("{}: {error}", path.display())))?;
+    file.lock()
+        .map_err(|error| DataError::Store(format!("{}: {error}", path.display())))
 }
 
 /// How far a fill has come, reported after each round it publishes, and
@@ -1174,6 +1197,10 @@ pub struct FillReport {
     pub merge_ms: f64,
     /// Why the fill stopped before finishing; what it published stands.
     pub error: Option<String>,
+    /// A round that may not wait found another fill of the repository
+    /// holding its lock, and stopped before reading any file.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub blocked_by_other_fill: bool,
 }
 
 fn no_files(value: &usize) -> bool {
@@ -1753,6 +1780,36 @@ impl VectorPlane {
         rounds: usize,
         progress: &mut dyn FnMut(FillProgress),
     ) -> Result<FillReport, DataError> {
+        self.fill_rounds_with(embed, budget, rounds, true, progress)
+    }
+
+    /// One round of [`Self::fill_rounds`] that never waits for another fill
+    /// of the repository: it takes the repository's fill lock before it
+    /// reads or cuts any file, and when another fill holds it, the round
+    /// stops at once with [`FillReport::blocked_by_other_fill`] set. A
+    /// running AFT's fill pool has few places for every root, and a round
+    /// waiting there for minutes held one of them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::fill`].
+    pub(super) fn fill_round_unless_blocked(
+        &self,
+        embed: &mut dyn FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        budget: FillBudget,
+        progress: &mut dyn FnMut(FillProgress),
+    ) -> Result<FillReport, DataError> {
+        self.fill_rounds_with(embed, budget, 1, false, progress)
+    }
+
+    fn fill_rounds_with(
+        &self,
+        embed: &mut dyn FnMut(Vec<String>) -> Result<Vec<Vec<f32>>, String>,
+        budget: FillBudget,
+        rounds: usize,
+        wait: bool,
+        progress: &mut dyn FnMut(FillProgress),
+    ) -> Result<FillReport, DataError> {
         check_cancelled()?;
         let mut report = FillReport::default();
         let Some(view) = self.checkout.view() else {
@@ -1800,6 +1857,21 @@ impl VectorPlane {
                 break;
             }
             rounds_run += 1;
+
+            // A round that may not wait takes the fill lock first, and reads
+            // what other fills published before it, as a waiting round does
+            // once it has the lock.
+            let mut early_lock = None;
+            if !wait {
+                let Some(lock) = FillLock::try_take(self.checkout.family_dir())? else {
+                    report.blocked_by_other_fill = true;
+                    report.files_left += queue.pending.len();
+                    break;
+                };
+                early_lock = Some(lock);
+                loaded = self.load()?;
+                reusable &= queue.segments == vector_membership(&loaded);
+            }
 
             // Cut the round's files, and collect the texts no segment holds:
             // those the old meaning index has vectors for, and the rest,
@@ -1890,7 +1962,9 @@ impl VectorPlane {
             // Wait for any other fill of the repository to publish, then
             // leave out what it published: its texts' vectors, and the files
             // whose chunk maps it finished.
-            let round_lock = if wanted.is_empty() && imported.is_empty() {
+            let round_lock = if early_lock.is_some() {
+                early_lock.take()
+            } else if wanted.is_empty() && imported.is_empty() {
                 None
             } else {
                 let started = Instant::now();
@@ -2743,6 +2817,41 @@ mod tests {
                 &mut |_| {},
             )
             .unwrap()
+    }
+
+    /// A round that may not wait, finding another fill of the repository
+    /// holding its lock, stops before reading or embedding anything, so its
+    /// fill-pool place is free at once; once the lock is free it fills.
+    #[test]
+    fn a_round_blocked_by_another_fill_stops_before_any_work() {
+        let store = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        project(dir.path());
+        let checkout = bind(store.path(), dir.path());
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 100);
+        let other = FillLock::try_take(checkout.family_dir())
+            .unwrap()
+            .expect("no fill holds the lock yet");
+        let mut recorder = Recorder::default();
+        let budget = FillBudget {
+            max_batch: 5,
+            files_per_round: 100,
+        };
+        let blocked = plane
+            .fill_round_unless_blocked(&mut |texts| recorder.embed(texts), budget, &mut |_| {})
+            .unwrap();
+        assert!(blocked.blocked_by_other_fill, "{blocked:?}");
+        assert!(blocked.files_left > 0, "{blocked:?}");
+        assert_eq!(blocked.chunks, 0, "a blocked round cut files: {blocked:?}");
+        assert!(recorder.texts.is_empty(), "a blocked round embedded texts");
+
+        drop(other);
+        let filled = plane
+            .fill_round_unless_blocked(&mut |texts| recorder.embed(texts), budget, &mut |_| {})
+            .unwrap();
+        assert!(!filled.blocked_by_other_fill, "{filled:?}");
+        assert!(filled.files_filled > 0, "{filled:?}");
+        assert!(!recorder.texts.is_empty());
     }
 
     #[test]
