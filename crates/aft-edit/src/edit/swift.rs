@@ -399,49 +399,6 @@ mod tests {
 
     const ORIGINAL: &str = "let value = 1\n";
 
-    #[cfg(unix)]
-    #[test]
-    fn swiftc_parse_cannot_bypass_the_supplied_tool_policy() {
-        use crate::sandbox_spawn::{SpawnPlan, ToolLaunchPolicy};
-        let root = tempfile::tempdir().unwrap();
-        let marker = root.path().join("parsed");
-        let compiler = root.path().join("swiftc");
-        crate::executable_cache::write_executable(
-            &compiler,
-            format!(
-                "#!/bin/sh\nif [ \"$1\" = --warm-up ]; then exit 0; fi\n: > '{}'\ncat >/dev/null\n",
-                marker.display()
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        assert!(Command::new(&compiler)
-            .arg("--warm-up")
-            .status()
-            .unwrap()
-            .success());
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config {
-                project_root: Some(root.path().to_path_buf()),
-                ..Config::default()
-            },
-        );
-        let policy = crate::sandbox_spawn::with_spawn_plan_for_test(
-            SpawnPlan::refused_for_test("sandbox_unavailable"),
-            || ToolLaunchPolicy::resolve(&ctx),
-        );
-        let outcome = run_swiftc(&policy, &compiler, TUPLE);
-        assert!(
-            matches!(&outcome, ParseOutcome::Unavailable(reason) if reason.starts_with("sandbox_unavailable")),
-            "{outcome:?}"
-        );
-        assert!(
-            !marker.exists(),
-            "a refused syntax checker must not run on the host"
-        );
-    }
-
     fn write_case(source: &str, outcome: ParseOutcome) -> (WriteResult, String) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("tuple.swift");

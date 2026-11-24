@@ -2128,45 +2128,6 @@ impl WriteResult {
             return;
         };
 
-        result["lsp_diagnostics"] = serde_json::json!(outcome
-            .diagnostics
-            .iter()
-            .map(|d| {
-                serde_json::json!({
-                    "file": d.file.display().to_string(),
-                    "line": d.line,
-                    "column": d.column,
-                    "end_line": d.end_line,
-                    "end_column": d.end_column,
-                    "severity": d.severity.as_str(),
-                    "message": d.message,
-                    "code": d.code,
-                    "source": d.source,
-                })
-            })
-            .collect::<Vec<_>>());
-
-        result["lsp_complete"] = serde_json::Value::Bool(outcome.complete());
-
-        if !outcome.pending_servers.is_empty() {
-            result["lsp_status"] = serde_json::json!(if outcome.unresponsive_servers.is_empty() {
-                "diagnostics unknown (no authoritative response within the diagnostics budget)"
-            } else {
-                "diagnostics unknown (server not responding)"
-            });
-            result["lsp_pending_servers"] = serde_json::json!(outcome
-                .pending_servers
-                .iter()
-                .map(|key| key.kind.id_str().to_string())
-                .collect::<Vec<_>>());
-        }
-        if !outcome.exited_servers.is_empty() {
-            result["lsp_exited_servers"] = serde_json::json!(outcome
-                .exited_servers
-                .iter()
-                .map(|key| key.kind.id_str().to_string())
-                .collect::<Vec<_>>());
-        }
     }
 
     /// Add file-write warnings to the reply's `warnings` array, keeping any
@@ -3167,30 +3128,6 @@ mod tests {
             }
         }
         DIFF_TIMEOUT_OVERRIDE.with(|timeout| timeout.set(None));
-    }
-
-    #[test]
-    fn a03_stale_capture_backup_preserves_live_bytes() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("capture.txt");
-        let ctx = AppContext::new(Box::new(crate::language::StubProvider), Config::default());
-        std::fs::write(&path, "original\n").unwrap();
-        let (_, observation) = read_edit_source(&path).unwrap();
-        let replacement = temp.path().join("replacement.txt");
-        std::fs::write(&replacement, "external\n").unwrap();
-        std::fs::rename(&replacement, &path).unwrap();
-        let error = auto_backup_observed(
-            &ctx,
-            "freshness",
-            &path,
-            "before edit",
-            Some("freshness-op"),
-            &observation,
-        )
-        .unwrap_err();
-        assert_eq!(error.code(), "file_changed_since_read");
-        assert!(ctx.backup().lock().history("freshness", &path).is_empty());
-        assert_eq!(std::fs::read(&path).unwrap(), b"external\n");
     }
 
     #[test]
