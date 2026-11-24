@@ -1835,10 +1835,9 @@ pub(crate) fn push_fuzzy_replacement(
     // A match that already ends with its line's separator replaces it, so the
     // text after it (such as a following blank line) is not a separator to
     // drop.
-    let remaining = source[end..].trim_start_matches([' ', '\t']);
-    let separator_is_outside = matched.pass > 1
-        && !source[..end].ends_with('\n')
-        && (remaining.starts_with('\n') || remaining.starts_with("\r\n"));
+    let remaining = source[end..].trim_start_matches(|ch: char| ch != '\n' && ch.is_whitespace());
+    let separator_is_outside =
+        matched.pass > 1 && !source[..end].ends_with('\n') && remaining.starts_with('\n');
     if separator_is_outside && replacement.ends_with('\n') {
         output.push_str(
             replacement
@@ -1849,7 +1848,11 @@ pub(crate) fn push_fuzzy_replacement(
         output.push_str(replacement);
     }
     if fuzzy_replacement_restores_newline(source, matched, replacement) {
-        output.push('\n');
+        output.push_str(if source[..end].ends_with("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        });
     }
     Ok(())
 }
@@ -2820,6 +2823,36 @@ mod audit_regressions {
             )
             .unwrap(),
             "x\ny\r\nc\r\n"
+        );
+    }
+
+    #[test]
+    fn fuzzy_separator_after_unicode_padding_is_not_duplicated() {
+        let source = "alpha\u{a0}\nnext\n";
+        let matches = crate::fuzzy_match::find_all_fuzzy(source, "alpha\n");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, "alpha\n", "beta\n", None,
+            )
+            .unwrap(),
+            "beta\u{a0}\nnext\n"
+        );
+    }
+
+    #[test]
+    fn fuzzy_restore_retains_the_consumed_crlf() {
+        let source = "alpha\r\nnext\r\n";
+        let needle = "alpha \n";
+        let matches = crate::fuzzy_match::find_all_fuzzy(source, needle);
+        assert_eq!(matches.len(), 1);
+        assert_eq!(&source[..matches[0].byte_len], "alpha\r\n");
+        assert_eq!(
+            super::apply_sorted_non_overlapping_fuzzy_matches(
+                source, &matches, needle, "beta", None,
+            )
+            .unwrap(),
+            "beta\r\nnext\r\n"
         );
     }
 }
