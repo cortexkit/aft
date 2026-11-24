@@ -80,16 +80,14 @@ fn build() -> BusyRoot {
         crate::lsp::registry::ServerKind::Bash,
     ] {
         let mut manager = ctx.lsp();
-        let client = crate::lsp::client::LspClient::spawn_with_reclaim_root(
+        let (client, _) = crate::lsp::manager::startup_fixture::spawn_client_for_test(
+            &manager,
             kind,
             root.clone(),
             Path::new("/bin/cat"),
             &[],
-            &HashMap::new(),
-            manager.event_sender_for_test(),
             app.lsp_child_registry(),
             None,
-            false,
         )
         .unwrap();
         manager.insert_client_for_test(client);

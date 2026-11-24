@@ -1894,10 +1894,7 @@ mod payload_count_tests {
 
     #[test]
     fn started_producers_without_authoritative_reports_are_named_gaps() {
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config::default(),
-        );
+        let ctx = crate::inspect::test_support::DiagnosticsFixture::default();
         let expected = [ServerKind::Rust].map(|kind| ServerKey {
             kind,
             root: PathBuf::from("/repo"),
@@ -1923,10 +1920,7 @@ mod payload_count_tests {
 
     #[test]
     fn external_reports_are_collected_only_for_the_requested_files() {
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config::default(),
-        );
+        let ctx = crate::inspect::test_support::DiagnosticsFixture::default();
         let external = tempfile::tempdir().unwrap();
         let outside = external.path().join("selected.rs");
         let unrelated = external.path().join("unrelated.rs");
@@ -1955,10 +1949,7 @@ mod payload_count_tests {
     #[cfg(unix)]
     #[test]
     fn external_reports_match_symlinked_scope_without_rewriting_paths() {
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config::default(),
-        );
+        let ctx = crate::inspect::test_support::DiagnosticsFixture::default();
         let external = tempfile::tempdir().unwrap();
         let root = crate::path_identity::canonicalize_normalized(external.path());
         let real = root.join("real");
@@ -1985,7 +1976,7 @@ mod payload_count_tests {
 
     fn typescript_sync_exclusion_fixture() -> (
         tempfile::TempDir,
-        crate::context::AppContext,
+        crate::inspect::test_support::DiagnosticsFixture,
         InspectSnapshot,
         PathBuf,
         PathBuf,
@@ -2020,10 +2011,7 @@ mod payload_count_tests {
                 Ok(vec![diagnostic]),
             );
         }
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config::default(),
-        );
+        let ctx = crate::inspect::test_support::DiagnosticsFixture::default();
         let snapshot = InspectSnapshot::new(
             configured.clone(),
             configured.join(".aft"),
@@ -2334,10 +2322,7 @@ mod payload_count_tests {
             Arc::new(Config::default()),
             Arc::new(RwLock::new(SymbolCache::new())),
         );
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Default::default(),
-        );
+        let ctx = crate::inspect::test_support::DiagnosticsFixture::default();
         let failure = ApplicableServerFailure {
             server_key: ServerKey {
                 kind: ServerKind::Dockerfile,
@@ -2555,7 +2540,7 @@ mod ignore_rule_candidate_tests {
 
     use super::{scoped_coverage_candidates, DiagnosticsCollection};
     use crate::config::Config;
-    use crate::context::ignore_rules_fixture as fixture;
+    use crate::data_layer::ignore_rules::ignore_rules_fixture as fixture;
     use crate::inspect::job::{InspectSnapshot, JobScope};
     use crate::parser::SymbolCache;
 
@@ -2610,10 +2595,7 @@ mod ignore_rule_candidate_tests {
             super::ScopeWalkBudget::with_entry_limit(None, 4),
         );
         assert!(files.files.is_empty());
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            Config::default(),
-        );
+        let ctx = crate::inspect::test_support::DiagnosticsFixture::default();
         let outcome = super::run_diagnostics_category(
             &ctx,
             &snapshot,

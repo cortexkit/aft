@@ -57,7 +57,8 @@ pub struct PendingLspChanges {
 
 impl PendingLspChanges {
     /// Queue a document whose contents changed on disk.
-    pub(crate) fn queue_document(&mut self, path: &Path, start_servers: bool) {
+    #[doc(hidden)]
+    pub fn queue_document(&mut self, path: &Path, start_servers: bool) {
         if self.overflowed {
             return;
         }
@@ -92,7 +93,8 @@ impl PendingLspChanges {
         }
     }
 
-    pub(crate) fn queue_watched_with_stamps(
+    #[doc(hidden)]
+    pub fn queue_watched_with_stamps(
         &mut self,
         events: &[(PathBuf, FileChangeType)],
         stamps: &WatchedFileStamps,
@@ -109,7 +111,8 @@ impl PendingLspChanges {
         }
     }
 
-    pub(crate) fn queue_mutation_watched(
+    #[doc(hidden)]
+    pub fn queue_mutation_watched(
         &mut self,
         events: &[(PathBuf, FileChangeType)],
         stamps: &WatchedFileStamps,

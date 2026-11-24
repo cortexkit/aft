@@ -3,12 +3,13 @@ use crate::lsp::client::ServerExitReason;
 use crate::lsp::registry::builtin_servers;
 use serde_json::json;
 
-use super::idle_fixture::idle_hover_params;
-pub(crate) use super::idle_fixture::IdleLspFixture;
+use crate::lsp::test_support::idle_fixture::{idle_hover_params, IdleLspFixture};
 
 impl IdleLspFixture {
-    pub(crate) fn new() -> Self {
-        Self::with_server_binary(crate::fake_lsp_test_helper::fake_server_binary)
+    fn new() -> Self {
+        Self::with_manager(crate::fake_lsp_test_helper::fake_server_binary, |_| {
+            Arc::new(parking_lot::Mutex::new(LspManager::new()))
+        })
     }
 }
 
@@ -16,12 +17,11 @@ impl IdleLspFixture {
 fn server_capacity_evicts_least_recently_used_client_and_clears_its_diagnostics() {
     let fixture = IdleLspFixture::new();
     let key = fixture
-        .ctx
         .lsp()
         .server_key_for_file(&fixture.idle, &fixture.config)
         .unwrap();
     {
-        let mut manager = fixture.ctx.lsp();
+        let mut manager = fixture.lsp();
         seed_instance_state(&mut manager, &key, &fixture.idle);
         manager.make_server_capacity(2, 2).unwrap();
         assert_eq!(manager.server_count(), 1);
@@ -327,7 +327,6 @@ fn idle_lsp_restart_races_return_start_in_progress_after_three_attempts() {
     for pull in [false, true] {
         let fixture = IdleLspFixture::new();
         let key = fixture
-            .ctx
             .lsp()
             .server_key_for_file(&fixture.idle, &fixture.config)
             .unwrap();
@@ -341,7 +340,7 @@ fn idle_lsp_restart_races_return_start_in_progress_after_three_attempts() {
                 call < 3 * locks_per_attempt,
                 "restart must stop after three attempts"
             );
-            let mut manager = fixture.ctx.lsp();
+            let mut manager = fixture.lsp();
             // Keep startup successful without spawning another process, then
             // detach the client again before the caller can re-lock to use it.
             if call % locks_per_attempt == 0 {
@@ -377,20 +376,17 @@ fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() 
     // Use the manager's own key: its root is canonical, and on Windows the
     // temp path's short `RUNNER~1` spelling would name a different key.
     let key = fixture
-        .ctx
         .lsp()
         .server_key_for_file(&fixture.idle, &fixture.config)
         .unwrap();
     {
-        let mut manager = fixture.ctx.lsp();
+        let mut manager = fixture.lsp();
         seed_instance_state(&mut manager, &key, &fixture.idle);
     }
-    let events = fixture.ctx.lsp().event_rx.clone();
-    let clients =
-        fixture
-            .ctx
-            .lsp()
-            .take_idle_clients(Instant::now(), Duration::from_secs(300), false);
+    let events = fixture.lsp().event_rx.clone();
+    let clients = fixture
+        .lsp()
+        .take_idle_clients(Instant::now(), Duration::from_secs(300), false);
     assert_eq!(clients.len(), 1);
     LspManager::spawn_idle_lsp_reap(clients);
     // The fake server acknowledges receiving Shutdown but withholds its reply.
@@ -407,7 +403,7 @@ fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() 
     }
     fixture.assert_only_busy();
     {
-        let manager = fixture.ctx.lsp();
+        let manager = fixture.lsp();
         assert!(!manager.documents.contains_key(&key));
         assert!(!manager
             .diagnostics
@@ -417,7 +413,7 @@ fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() 
             .contains_key(&(key.clone(), fixture.idle.clone())));
     }
     let response = send_file_request_unlocked::<lsp_types::request::HoverRequest, _>(
-        || fixture.ctx.lsp(),
+        || fixture.lsp(),
         &fixture.idle,
         &fixture.config,
         idle_hover_params(&fixture.idle),
@@ -430,7 +426,6 @@ fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() 
     fixture.hover(&fixture.busy);
     // A retired reader's exit must not remove the new client or its state.
     fixture
-        .ctx
         .lsp()
         .handle_event(
             &LspEvent::ServerExited {
@@ -442,7 +437,7 @@ fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() 
             .into(),
         )
         .unwrap();
-    fixture.ctx.lsp().drain_events();
+    fixture.lsp().drain_events();
     fixture.hover(&fixture.idle);
 }
 
@@ -458,7 +453,7 @@ fn idle_lsp_document_notifications_refresh_last_use_but_push_diagnostics_do_not(
         .parse()
         .unwrap();
     let old = Instant::now() - Duration::from_secs(301);
-    let mut manager = fixture.ctx.lsp();
+    let mut manager = fixture.lsp();
     // The manager's own key root, canonical on every platform.
     let server_key = manager
         .server_key_for_file(&fixture.idle, &fixture.config)

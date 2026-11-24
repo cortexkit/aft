@@ -4031,7 +4031,7 @@ mod idle_lsp_tests {
 
     #[test]
     fn idle_lsp_standalone_reaps_unused_package_while_requests_keep_root_busy() {
-        let fixture = crate::lsp::manager::regression_tests::IdleLspFixture::new();
+        let fixture = crate::lsp_idle_fixture::IdleLspFixture::new();
         let busy_pid = fixture.pid(&fixture.busy).unwrap();
         for _ in 0..3 {
             fixture.hover(&fixture.busy);
@@ -4045,19 +4045,16 @@ mod idle_lsp_tests {
     fn spawn_sleep_client(ctx: &AppContext, root: std::path::PathBuf) -> u32 {
         let registry = LspChildRegistry::new();
         ctx.lsp().set_child_registry(registry.clone());
-        let client = LspClient::spawn_with_reclaim_root(
+        let (client, pid) = crate::lsp::manager::startup_fixture::spawn_client_for_test(
+            &ctx.lsp(),
             ServerKind::TypeScript(None),
             root,
             Path::new("sh"),
             &["-c".to_string(), "exec sleep 60".to_string()],
-            &HashMap::new(),
-            ctx.lsp().event_sender_for_test(),
             registry,
             None,
-            false,
         )
         .expect("spawn idle-lsp stand-in");
-        let pid = client.child_pid();
         ctx.lsp().insert_client_for_test(client);
         pid
     }

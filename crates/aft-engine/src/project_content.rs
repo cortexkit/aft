@@ -95,7 +95,7 @@ mod tests {
             assert!(read(&path).is_err(), "admitted {path:?}");
             assert!(open(&path).is_err(), "opened {path:?}");
             assert!(read_to_string(&path).is_err(), "decoded {path:?}");
-            assert!(crate::inspect::scanners::source_text::read_source_text(&path).is_ok());
+            assert!(crate::inspect::compatibility_test::read_source_is_disclosed(&path));
         }
         assert!(
             probe.paths().is_empty(),

@@ -283,7 +283,6 @@ fn applicability_walk_rechecks_ancestor_biome_contents_and_identity() {
         .any(|c| c.key.kind == ServerKind::Biome));
 }
 
-
 #[test]
 fn applicability_walk_fifty_content_batches_do_zero_full_walks() {
     let temp = tempfile::tempdir().unwrap();

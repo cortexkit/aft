@@ -1,4 +1,7 @@
 pub mod cache;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod compatibility_test;
 #[doc(hidden)]
 pub mod diagnostics_category;
 #[doc(hidden)]
@@ -23,6 +26,8 @@ pub(crate) mod manager;
 pub mod oxc_engine;
 pub mod phase_log;
 pub mod scanners;
+#[cfg(test)]
+mod test_support;
 pub mod tier2_scheduler;
 #[cfg(test)]
 pub(crate) mod walk_profile;
@@ -41,9 +46,10 @@ pub use job::{
     JobOutcome, JobScope, JobStatus, WorkerCtx,
 };
 pub(crate) use manager::scope_files as tier2_scope_files;
-#[cfg(test)]
-pub(crate) use manager::InspectBuilderState;
 pub use manager::InspectManager;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use manager::{filter_payload_for_scope_for_test, InspectBuilderState, MetricsWaitForTest};
 pub use phase_log::{
     format_wait_text, inspect_phase_log_for_request, InspectPhaseEntry, InspectPhaseId,
     InspectPhaseLog, InspectPhaseLogSnapshot,

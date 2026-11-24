@@ -19,7 +19,8 @@ pub mod pull_params;
 pub mod registry;
 pub mod roots;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod test_support;
+#[doc(hidden)]
+pub mod test_support;
 pub mod transport;
 pub mod tsconfig_membership;
 pub(crate) mod typescript_diagnostics;

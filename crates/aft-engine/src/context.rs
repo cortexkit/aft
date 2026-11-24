@@ -13139,7 +13139,7 @@ mod health_warming_honesty_tests {
         ctx.inspect_manager().record_tier2_attempt_outcome_for_test(
             crate::inspect_category::InspectCategory::DeadCode,
             crate::inspect::JobOutcome::Fresh {
-                payload: crate::inspect::scanners::dead_code::callgraph_unavailable_aggregate(0),
+                payload: crate::inspect::compatibility_test::callgraph_unavailable_aggregate(0),
             },
         );
         assert_eq!(

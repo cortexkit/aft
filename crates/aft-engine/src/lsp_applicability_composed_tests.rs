@@ -21,3 +21,15 @@ fn applicability_walk_manifest_change_invalidates_from_watcher() {
         .iter()
         .any(|c| c.key.kind == ServerKind::Go));
 }
+use std::path::Path;
+
+use crate::config::Config;
+use crate::lsp::manager::walk_applicable_area;
+use crate::lsp::registry::ServerKind;
+
+fn config(root: &Path) -> Config {
+    Config {
+        project_root: Some(root.to_path_buf()),
+        ..Config::default()
+    }
+}

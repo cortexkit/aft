@@ -160,7 +160,7 @@ pub mod lsp {
         use crate::lsp::manager::LspManager;
 
         pub mod regression_tests {
-            pub use crate::lsp::manager::idle_fixture::IdleLspFixture;
+            pub use crate::lsp_idle_fixture::IdleLspFixture;
         }
 
         pub fn settled_lsp<R>(
@@ -188,7 +188,7 @@ pub trait IdleLspFixtureTestExt {
     fn idle(&self) -> &std::path::PathBuf;
 }
 
-impl IdleLspFixtureTestExt for crate::lsp::manager::idle_fixture::IdleLspFixture {
+impl IdleLspFixtureTestExt for crate::lsp_idle_fixture::IdleLspFixture {
     fn ctx(&self) -> &std::sync::Arc<crate::context::AppContext> {
         &self.ctx
     }

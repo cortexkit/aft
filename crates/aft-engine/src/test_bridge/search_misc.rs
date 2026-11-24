@@ -162,18 +162,15 @@ pub mod lsp_startup {
         args: &[String],
         note: Option<&str>,
     ) -> std::io::Result<()> {
-        let mut client = crate::lsp::client::LspClient::spawn_with_reclaim_root(
+        let (client, _) = crate::lsp::manager::startup_fixture::spawn_client_for_test(
+            &ctx.lsp(),
             kind,
             root,
             binary,
             args,
-            &std::collections::HashMap::new(),
-            ctx.lsp().event_sender_for_test(),
             crate::lsp::child_registry::LspChildRegistry::new(),
-            None,
-            false,
+            note,
         )?;
-        client.runtime_note = note.map(str::to_owned);
         ctx.lsp().insert_client_for_test(client);
         Ok(())
     }

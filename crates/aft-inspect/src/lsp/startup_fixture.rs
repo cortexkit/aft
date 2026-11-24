@@ -174,11 +174,37 @@ impl LspManager {
         }
     }
 
-    pub(crate) fn insert_client_for_test(&mut self, client: LspClient) {
+    #[doc(hidden)]
+    pub fn insert_client_for_test(&mut self, client: LspClient) {
         let key = ServerKey {
             kind: client.kind(),
             root: client.root().to_path_buf(),
         };
         self.clients.insert(key, client);
     }
+}
+
+pub fn spawn_client_for_test(
+    manager: &LspManager,
+    kind: ServerKind,
+    root: PathBuf,
+    binary: &Path,
+    args: &[String],
+    registry: LspChildRegistry,
+    note: Option<&str>,
+) -> std::io::Result<(LspClient, u32)> {
+    let mut client = LspClient::spawn_with_reclaim_root(
+        kind,
+        root,
+        binary,
+        args,
+        &HashMap::new(),
+        manager.event_sender_for_test(),
+        registry,
+        None,
+        false,
+    )?;
+    client.runtime_note = note.map(str::to_owned);
+    let pid = client.child_pid();
+    Ok((client, pid))
 }

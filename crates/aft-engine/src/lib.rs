@@ -195,6 +195,10 @@ pub mod logging;
 pub mod lsp {
     pub use aft_inspect::lsp::*;
 }
+#[cfg(test)]
+mod lsp_applicability_composed_tests;
+#[cfg(all(test, unix))]
+mod lsp_drain_composed_tests;
 #[cfg(any(test, feature = "test-support"))]
 mod lsp_idle_fixture;
 pub use aft_inspect::lsp_hints;

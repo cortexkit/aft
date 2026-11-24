@@ -32,7 +32,8 @@ pub struct TsconfigMembershipCache {
 }
 
 impl TsconfigMembershipCache {
-    pub(crate) fn new() -> Self {
+    #[doc(hidden)]
+    pub fn new() -> Self {
         Self::default()
     }
 
@@ -42,18 +43,21 @@ impl TsconfigMembershipCache {
     /// resolution and `extends` chains make per-key invalidation unsound (a new
     /// nested tsconfig or an edited `extends` parent changes membership for
     /// files keyed under a different directory).
-    pub(crate) fn clear(&mut self) {
+    #[doc(hidden)]
+    pub fn clear(&mut self) {
         self.projects.clear();
         self.canonical_files.clear();
         self.file_projects.clear();
         self.clear_generation = self.clear_generation.wrapping_add(1);
     }
 
-    pub(crate) fn generation(&self) -> u64 {
+    #[doc(hidden)]
+    pub fn generation(&self) -> u64 {
         self.clear_generation
     }
 
-    pub(crate) fn should_skip_diagnostics(&mut self, file: &Path) -> bool {
+    #[doc(hidden)]
+    pub fn should_skip_diagnostics(&mut self, file: &Path) -> bool {
         if !is_ts_js_file(file) {
             return false;
         }

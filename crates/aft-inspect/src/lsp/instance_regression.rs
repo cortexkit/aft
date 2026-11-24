@@ -1,7 +1,8 @@
 use super::*;
-use crate::context::{default_language_provider_factory, AppContext};
+#[cfg(test)]
 use crate::lsp::client::ServerExitReason;
 use crossbeam_channel::{Receiver, Sender};
+#[cfg(test)]
 use lsp_types::notification::Notification;
 use serde_json::{json, Value};
 use std::sync::Mutex;
@@ -70,7 +71,7 @@ pub(crate) fn pause_reader(instance: ServerInstanceId) {
     pause(instance, Stage::Reader);
 }
 
-pub(crate) fn pause_dispatch(instance: ServerInstanceId) {
+pub fn pause_dispatch(instance: ServerInstanceId) {
     pause(instance, Stage::Dispatch);
 }
 
@@ -90,6 +91,7 @@ fn frame(message: Value) -> String {
     format!("Content-Length: {}\r\n\r\n{body}", body.len())
 }
 
+#[cfg(test)]
 fn diagnostics(file: &Path, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
         "uri": uri_for_path(file).unwrap(), "version": 0, "diagnostics": [{
@@ -434,35 +436,31 @@ fn unversioned_push_authority_tracks_disk_content_and_dynamic_pull_registration(
     );
 }
 
-#[test]
-fn drain_dispatch_rechecks_instance_after_restart() {
+pub fn drain_dispatch_rechecks_instance_after_restart(
+    manager: &parking_lot::Mutex<LspManager>,
+    drain: impl FnOnce(usize) -> (usize, bool) + Send + 'static,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let ctx = Arc::new(AppContext::new(
-        default_language_provider_factory(),
-        Config::default(),
-    ));
     let instance = ServerInstanceId::next();
     let reader_pause = Pause::install(instance, Stage::Reader);
     let command = format!("printf '%s' {}; exec cat", quote(&frame(request())));
-    let client = spawn(&ctx.lsp(), dir.path(), instance, &command);
-    ctx.lsp().clients.insert(key(dir.path()), client);
+    let client = spawn(&manager.lock(), dir.path(), instance, &command);
+    manager.lock().clients.insert(key(dir.path()), client);
     reader_pause.wait();
     drop(reader_pause);
-    let receipt = next(&ctx.lsp());
-    ctx.lsp().event_tx.send(receipt).unwrap();
+    let receipt = next(&manager.lock());
+    manager.lock().event_tx.send(receipt).unwrap();
     let dispatch_pause = Pause::install(instance, Stage::Dispatch);
-    let worker_ctx = Arc::clone(&ctx);
-    let worker =
-        std::thread::spawn(move || crate::runtime_drain::drain_lsp_events_bounded(&worker_ctx, 1));
+    let worker = std::thread::spawn(move || drain(1));
     dispatch_pause.wait();
-    let (current, _old) = replace(&mut ctx.lsp(), dir.path(), "exec cat");
+    let (current, _old) = replace(&mut manager.lock(), dir.path(), "exec cat");
     drop(dispatch_pause);
-    let outcome = worker.join().unwrap();
-    assert_eq!(outcome.processed, 1);
-    assert!(!outcome.has_more);
-    assert_eq!(ctx.lsp().clients[&key(dir.path())].instance, current);
+    let (processed, has_more) = worker.join().unwrap();
+    assert_eq!(processed, 1);
+    assert!(!has_more);
+    assert_eq!(manager.lock().clients[&key(dir.path())].instance, current);
     assert_eq!(
-        ctx.lsp().retired_events_dropped,
+        manager.lock().retired_events_dropped,
         1,
         "dispatch accepted a receipt retired after the manager drain"
     );
@@ -539,42 +537,34 @@ fn retired_receipts_consume_the_raw_drain_budget() {
     assert_eq!(manager.retired_events_dropped, 1);
 }
 
-#[test]
-fn drain_dispatch_does_not_wait_for_a_contended_manager() {
+pub fn drain_dispatch_does_not_wait_for_a_contended_manager(
+    manager: &parking_lot::Mutex<LspManager>,
+    drain: impl FnOnce(usize) -> (usize, bool) + Send + 'static,
+) {
     let dir = tempfile::tempdir().unwrap();
-    let ctx = Arc::new(AppContext::new(
-        default_language_provider_factory(),
-        Config::default(),
-    ));
     let instance = ServerInstanceId::next();
     let reader_pause = Pause::install(instance, Stage::Reader);
     let command = format!("printf '%s' {}; exec cat", quote(&frame(request())));
-    let client = spawn(&ctx.lsp(), dir.path(), instance, &command);
-    ctx.lsp().clients.insert(key(dir.path()), client);
+    let client = spawn(&manager.lock(), dir.path(), instance, &command);
+    manager.lock().clients.insert(key(dir.path()), client);
     reader_pause.wait();
     drop(reader_pause);
-    let receipt = next(&ctx.lsp());
-    ctx.lsp().event_tx.send(receipt).unwrap();
+    let receipt = next(&manager.lock());
+    manager.lock().event_tx.send(receipt).unwrap();
     let dispatch_pause = Pause::install(instance, Stage::Dispatch);
-    let worker_ctx = Arc::clone(&ctx);
     let (done_tx, done_rx) = bounded(1);
     let worker = std::thread::spawn(move || {
-        done_tx
-            .send(crate::runtime_drain::drain_lsp_events_bounded(
-                &worker_ctx,
-                1,
-            ))
-            .unwrap();
+        done_tx.send(drain(1)).unwrap();
     });
     dispatch_pause.wait();
-    let manager = ctx.lsp();
+    let locked = manager.lock();
     drop(dispatch_pause);
-    let outcome = done_rx
+    let (processed, has_more) = done_rx
         .recv_timeout(DEADLINE)
         .expect("dispatch must not wait behind the manager");
-    assert_eq!(outcome.processed, 1);
-    assert!(outcome.has_more);
-    drop(manager);
+    assert_eq!(processed, 1);
+    assert!(has_more);
+    drop(locked);
     worker.join().unwrap();
 }
 

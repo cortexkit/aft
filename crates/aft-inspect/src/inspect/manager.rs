@@ -879,7 +879,8 @@ impl InspectManager {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn non_expiring_metrics_wait_for_test(&self) -> MetricsWaitForTest {
+    #[doc(hidden)]
+    pub fn non_expiring_metrics_wait_for_test(&self) -> MetricsWaitForTest {
         let (release_tx, release_rx) = bounded(1);
         let control = Arc::new(MetricsWaitControlForTest {
             non_expiring: true,
@@ -908,7 +909,8 @@ impl InspectManager {
                 .cancel_requested_before_commit()
     }
 
-    pub(crate) fn cancel_root_work(&self) {
+    #[doc(hidden)]
+    pub fn cancel_root_work(&self) {
         self.root_work_cancellation
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -924,7 +926,8 @@ impl InspectManager {
         self.dead_code_release_armed.store(false, Ordering::SeqCst);
     }
 
-    pub(crate) fn set_root_lifecycle(
+    #[doc(hidden)]
+    pub fn set_root_lifecycle(
         &self,
         lifecycle: crate::executor::root_lifecycle::SubcLifecycleAdmission,
     ) {
@@ -935,7 +938,8 @@ impl InspectManager {
         *token = token.clone().with_lifecycle(lifecycle);
     }
 
-    pub(crate) fn resume_root_work(&self) {
+    #[doc(hidden)]
+    pub fn resume_root_work(&self) {
         self.dead_code_release_stopped
             .store(false, Ordering::SeqCst);
         let mut token = self
@@ -947,10 +951,8 @@ impl InspectManager {
         }
     }
 
-    pub(crate) fn set_cold_build_limiter(
-        &self,
-        limiter: Arc<cold_build_limiter::ColdBuildLimiter>,
-    ) {
+    #[doc(hidden)]
+    pub fn set_cold_build_limiter(&self, limiter: Arc<cold_build_limiter::ColdBuildLimiter>) {
         *self
             .cold_build_limiter
             .lock()
@@ -1165,7 +1167,8 @@ impl InspectManager {
         }
     }
 
-    pub(crate) fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
+    #[doc(hidden)]
+    pub fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
         let key = JobKey::for_project_category(category);
         if let Ok(states) = self.builder_states.lock() {
             if let Some(entry) = states.get(&key) {
@@ -1190,7 +1193,8 @@ impl InspectManager {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
     }
 
-    pub(crate) fn dead_code_build_is_pending(&self) -> bool {
+    #[doc(hidden)]
+    pub fn dead_code_build_is_pending(&self) -> bool {
         self.builder_states.lock().ok().is_some_and(|states| {
             states
                 .get(&JobKey::for_project_category(InspectCategory::DeadCode))
@@ -1225,7 +1229,8 @@ impl InspectManager {
 
     /// Marks a dead-code pass as waiting for its call graph, or no longer.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
+    #[doc(hidden)]
+    pub fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
         if waiting {
             self.dead_code_callgraph_waits
                 .fetch_add(1, Ordering::SeqCst);
@@ -1364,7 +1369,8 @@ impl InspectManager {
     /// Whether any Tier-2 category is registered in the builder registry.
     /// Health uses this instead of published status-bar completeness so the
     /// two surfaces cannot disagree about a live rebuild.
-    pub(crate) fn try_tier2_builder_busy(&self) -> Option<bool> {
+    #[doc(hidden)]
+    pub fn try_tier2_builder_busy(&self) -> Option<bool> {
         let states = self.builder_states.try_lock().ok()?;
         if states
             .iter()
@@ -1562,7 +1568,8 @@ impl InspectManager {
             .unwrap_or(false)
     }
 
-    pub(crate) fn try_tier2_any_in_flight(&self) -> Option<bool> {
+    #[doc(hidden)]
+    pub fn try_tier2_any_in_flight(&self) -> Option<bool> {
         self.in_flight
             .try_lock()
             .ok()
@@ -1572,7 +1579,8 @@ impl InspectManager {
     /// Hold the in-flight job map for the duration of `while_held`, so a test
     /// can prove a caller does not wait for it.
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
+    #[doc(hidden)]
+    pub fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
         let _held = self
             .in_flight
             .lock()
@@ -1581,7 +1589,8 @@ impl InspectManager {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
+    #[doc(hidden)]
+    pub fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
         let key = JobKey::for_project_category(category);
         let mut jobs = self
             .in_flight
@@ -1599,7 +1608,8 @@ impl InspectManager {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn record_tier2_attempt_outcome_for_test(
+    #[doc(hidden)]
+    pub fn record_tier2_attempt_outcome_for_test(
         &self,
         category: InspectCategory,
         outcome: JobOutcome,
@@ -1708,7 +1718,8 @@ impl InspectManager {
     /// layer's dead-code memo) leaves it to the projection's figure. `None`
     /// when there is none, or when its slot is held: that figure then counts
     /// nothing.
-    pub(crate) fn try_callgraph_projection_snapshot(&self) -> Option<Arc<CallgraphSnapshot>> {
+    #[doc(hidden)]
+    pub fn try_callgraph_projection_snapshot(&self) -> Option<Arc<CallgraphSnapshot>> {
         let projection = self.callgraph_projection.try_lock().ok()?;
         projection
             .as_ref()
@@ -1863,8 +1874,9 @@ impl InspectManager {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn dead_code_timer_registration_for_test(&self) -> Option<u64> {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn dead_code_timer_registration_for_test(&self) -> Option<u64> {
         self.dead_code_release_timer
             .lock()
             .unwrap()
@@ -6210,20 +6222,6 @@ mod guard_tests {
         );
         (root, dir, walked)
     }
-    /// A context whose index-store checkout of `root` is bound and has
-    /// published its scan, as the daemon's is once a root is configured.
-    fn bound_store_context(root: &Path) -> crate::context::AppContext {
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(root.to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
-        ctx
-    }
-
     /// The status bar's TODO refresh enqueues its job from a maintenance
     /// thread where no request installed a census. With the root's
     /// index-store checkout bound and published, the enqueue lists the root's
@@ -6232,10 +6230,11 @@ mod guard_tests {
     #[test]
     fn background_todo_refresh_lists_files_from_the_bound_store_without_walking() {
         let (root, _dir, walked) = store_list_fixture();
-        let ctx = bound_store_context(&root);
-        assert!(ctx
-            .data_checkout()
-            .is_some_and(|checkout| checkout.view().is_some_and(|view| !view.rescanning())));
+        let fixture = crate::inspect::test_support::CheckoutFixture::open(&root, false);
+        assert!(fixture
+            .checkout
+            .view()
+            .is_some_and(|view| !view.rescanning()));
         assert!(
             super::super::inventory::current(&root).is_none(),
             "no census is installed on this thread"
@@ -6283,8 +6282,8 @@ mod guard_tests {
             Some(StoreListMiss::NotBound)
         );
 
-        let ctx = bound_store_context(&root);
-        let checkout = ctx.data_checkout().expect("bound");
+        let fixture = crate::inspect::test_support::CheckoutFixture::open(&root, false);
+        let checkout = &fixture.checkout;
         let project = JobScope::for_project(root.clone());
         checkout.checkout().begin_rescan();
         assert_eq!(
@@ -6361,9 +6360,9 @@ mod guard_tests {
         let edits = number("AFT_SCOPE_WALK_REPLAY_EDITS", 430);
         let batch = number("AFT_SCOPE_WALK_REPLAY_BATCH", 10).max(1);
         let bind_started = Instant::now();
-        let ctx = bound_store_context(&root);
+        let fixture = crate::inspect::test_support::CheckoutFixture::open(&root, false);
         let bind_ms = bind_started.elapsed().as_millis();
-        let checkout = ctx.data_checkout().expect("bound");
+        let checkout = &fixture.checkout;
         let project = JobScope::for_project(root.clone());
         let targets = crate::callgraph::walk_project_files(
             &root,
@@ -8125,7 +8124,7 @@ export function bannerUnused() {}
             let project_key = crate::root_identity::key::artifact_cache_key(&root);
             crate::root_cache::configure_artifact_access(&root, &project_key, false);
             let snapshot =
-                Arc::new(crate::callgraph_store::dead_code_projection::snapshot_for_test(&root));
+                Arc::new(crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&root));
             let mut job = snapshot_job(&root, &storage.join("inspect").join(&project_key), true);
             job.scope_files = files.clone();
             job.callgraph_snapshot = Some(snapshot.clone());
@@ -9040,7 +9039,7 @@ export function bannerUnused() {}
     /// it lists would be scanned by every tier-1 and tier-2 category.
     #[test]
     fn inspect_scope_files_honour_gitignore_in_non_git_root_like_git_root() {
-        use crate::context::ignore_rules_fixture as fixture;
+        use crate::data_layer::ignore_rules::ignore_rules_fixture as fixture;
         let plain = tempfile::tempdir().unwrap();
         let git = tempfile::tempdir().unwrap();
         fixture::write(plain.path(), false);
@@ -9650,7 +9649,7 @@ mod dead_code_projection_tests {
     }
 
     fn fixture_callgraph_snapshot(root: &Path) -> CallgraphSnapshot {
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(root)
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(root)
     }
 
     fn dead_code_aggregate(

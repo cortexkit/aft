@@ -927,7 +927,8 @@ impl PendingWorkspacePull {
 pub struct DrainedLspEvents {
     pub events: Vec<LspEvent>,
     /// Reader identities in the same order as `events`, retained for dispatch.
-    pub(crate) instances: Vec<Option<ServerInstanceId>>,
+    #[doc(hidden)]
+    pub instances: Vec<Option<ServerInstanceId>>,
     /// Events this drain worked through: channel receipts (including ones
     /// rejected as retired or held back for a server still starting) plus
     /// startup events released from the ready queue.
@@ -1460,7 +1461,8 @@ impl LspManager {
         self.retry_clock = clock;
     }
 
-    pub(crate) fn enable_background_document_pulls(
+    #[doc(hidden)]
+    pub fn enable_background_document_pulls(
         &mut self,
         owner: Weak<parking_lot::Mutex<LspManager>>,
     ) {
@@ -1469,10 +1471,8 @@ impl LspManager {
         self.background_pull_owner = owner;
     }
 
-    pub(crate) fn set_server_capacity(
-        &mut self,
-        capacity: Arc<parking_lot::Mutex<ServerCapacity>>,
-    ) {
+    #[doc(hidden)]
+    pub fn set_server_capacity(&mut self, capacity: Arc<parking_lot::Mutex<ServerCapacity>>) {
         self.capacity = capacity;
     }
 
@@ -1604,11 +1604,13 @@ impl LspManager {
             .retain(|key, _| key.kind != ServerKind::Rust);
     }
 
-    pub(crate) fn rust_worker_policy(&self) -> Arc<std::sync::atomic::AtomicBool> {
+    #[doc(hidden)]
+    pub fn rust_worker_policy(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.rust_cargo_disabled_for_worker.clone()
     }
 
-    pub(crate) fn rust_cargo_disabled_for_worker(&self) -> bool {
+    #[doc(hidden)]
+    pub fn rust_cargo_disabled_for_worker(&self) -> bool {
         self.rust_cargo_disabled_for_worker
             .load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1926,19 +1928,22 @@ impl LspManager {
 
     /// Forgets the recorded applicability, so project diagnostics read as
     /// pending until the next walk stores one.
-    pub(crate) fn clear_project_applicability(&mut self) {
+    #[doc(hidden)]
+    pub fn clear_project_applicability(&mut self) {
         self.project_applicability = None;
     }
 
     /// Whether a walk has recorded which servers apply to the project.
-    pub(crate) fn has_project_applicability(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_project_applicability(&self) -> bool {
         self.project_applicability.is_some()
     }
 
     /// Warm counts may retain a previously certified pair during reanalysis.
     /// This is not inspect's fresh per-file authority; failures and clients
     /// without a certified baseline still prevent numeric project counts.
-    pub(crate) fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {
+    #[doc(hidden)]
+    pub fn project_diagnostics_authority(&self) -> (bool, Vec<serde_json::Value>) {
         let Some(snapshot) = &self.project_applicability else {
             return (false, Vec::new());
         };
@@ -1990,7 +1995,8 @@ impl LspManager {
         (authoritative, gaps)
     }
 
-    pub(crate) fn project_analysis_progress_pending(&self) -> bool {
+    #[doc(hidden)]
+    pub fn project_analysis_progress_pending(&self) -> bool {
         self.project_applicability.as_ref().is_some_and(|snapshot| {
             snapshot.server_keys.iter().any(|key| {
                 self.clients.get(key).is_some_and(|client| {
@@ -3282,7 +3288,8 @@ impl LspManager {
         self.notify_files_watched_changed_with_stamps(paths, &WatchedFileStamps::new())
     }
 
-    pub(crate) fn notify_files_watched_changed_with_stamps(
+    #[doc(hidden)]
+    pub fn notify_files_watched_changed_with_stamps(
         &mut self,
         paths: &[(PathBuf, FileChangeType)],
         stamps: &WatchedFileStamps,
@@ -3488,7 +3495,8 @@ impl LspManager {
         )
     }
 
-    pub(crate) fn forward_watcher_file_events_with_stamps(
+    #[doc(hidden)]
+    pub fn forward_watcher_file_events_with_stamps(
         &mut self,
         events: &[(PathBuf, FileChangeType)],
         extra_config_markers: &[String],
@@ -6069,7 +6077,8 @@ impl LspManager {
     /// Detach idle clients while holding the manager lock, before stopping them.
     /// Requests either reserve a pending response first or find the key absent
     /// and start a replacement; they cannot acquire a half-stopped client.
-    pub(crate) fn take_idle_clients(
+    #[doc(hidden)]
+    pub fn take_idle_clients(
         &mut self,
         now: Instant,
         ttl: Duration,
@@ -6170,7 +6179,8 @@ impl LspManager {
         }
     }
 
-    pub(crate) fn resume(&self) {
+    #[doc(hidden)]
+    pub fn resume(&self) {
         self.quiesced
             .store(false, std::sync::atomic::Ordering::Release);
     }
@@ -7076,7 +7086,8 @@ impl LspManager {
         self.retired_events_dropped
     }
 
-    pub(crate) fn accept_event_instance(
+    #[doc(hidden)]
+    pub fn accept_event_instance(
         &mut self,
         event: &LspEvent,
         instance: Option<ServerInstanceId>,
@@ -8778,7 +8789,8 @@ fn resolve_for_lsp_uri(file_path: &Path) -> PathBuf {
     resolved
 }
 
-pub(crate) fn language_id_for_path(path: &Path, source: Option<&str>) -> &'static str {
+#[doc(hidden)]
+pub fn language_id_for_path(path: &Path, source: Option<&str>) -> &'static str {
     if path.extension().and_then(|ext| ext.to_str()) == Some("h") {
         let lang = match source {
             Some(source) => crate::parser::detect_language_from_source(path, source),
@@ -9478,8 +9490,10 @@ struct PendingWatchedChange {
     stamp: Option<WatchedFileStamp>,
 }
 
-pub(crate) type WatchedFileStamp = (u64, Option<std::time::SystemTime>);
-pub(crate) type WatchedFileStamps = HashMap<PathBuf, WatchedFileStamp>;
+#[doc(hidden)]
+pub type WatchedFileStamp = (u64, Option<std::time::SystemTime>);
+#[doc(hidden)]
+pub type WatchedFileStamps = HashMap<PathBuf, WatchedFileStamp>;
 
 /// Capture disk observations before taking the LSP manager lock. Queued changes
 /// carry these observations through delivery and startup replay without new I/O.
@@ -10052,7 +10066,8 @@ impl WatcherForwardBacklog {
     /// and return the rust-analyzer reloads to start once the lock is
     /// released. Change kinds are read from disk now, not when queued, so a
     /// file created and deleted while waiting is reported as deleted.
-    pub(crate) fn apply(self, lsp: &mut LspManager) -> Vec<(ServerKey, Vec<PathBuf>)> {
+    #[doc(hidden)]
+    pub fn apply(self, lsp: &mut LspManager) -> Vec<(ServerKey, Vec<PathBuf>)> {
         // No notification or reload can be delivered without a current client.
         // Check while holding the manager lock, before probing queued paths.
         if lsp.clients.is_empty() {
@@ -10673,15 +10688,17 @@ pub(crate) mod regression_tests;
 
 #[cfg(all(unix, any(test, feature = "test-support")))]
 #[path = "startup_fixture.rs"]
-pub(crate) mod startup_fixture;
+#[doc(hidden)]
+pub mod startup_fixture;
 
 #[cfg(all(test, unix))]
 #[path = "startup_regression_tests.rs"]
 pub(crate) mod startup_regression_tests;
 
-#[cfg(all(test, unix))]
-#[path = "instance_regression_tests.rs"]
-pub(crate) mod instance_regression_tests;
+#[cfg(all(unix, any(test, feature = "test-support")))]
+#[doc(hidden)]
+#[path = "instance_regression.rs"]
+pub mod instance_regression_tests;
 
 #[cfg(test)]
 #[path = "watcher_work_tests.rs"]
@@ -13567,10 +13584,8 @@ mod current_content_diagnostics_tests {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn settled_lsp<R>(
-    manager: &mut LspManager,
-    operation: impl Fn(&mut LspManager) -> R,
-) -> R {
+#[doc(hidden)]
+pub fn settled_lsp<R>(manager: &mut LspManager, operation: impl Fn(&mut LspManager) -> R) -> R {
     let initial = operation(manager);
     if !manager.has_pending_startups() {
         return initial;

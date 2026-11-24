@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::time::Instant;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(test)]
 pub(crate) use crate::data_layer::bound_checkouts::note_root;
 pub(crate) use crate::data_layer::bound_checkouts::RootKind;
 use crate::data_layer::bound_checkouts::{bound_checkout_roots, newest_bound_checkouts, root_kind};
@@ -338,7 +338,8 @@ static STORE_WAITS_FOR_TEST: Mutex<Vec<(PathBuf, std::time::Duration)>> = Mutex:
 /// Makes the TODO count of `project_root` wait `wait` for a building
 /// checkout instead of [`TODO_STORE_WAIT`].
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn set_todo_store_wait_for_test(project_root: &Path, wait: std::time::Duration) {
+#[doc(hidden)]
+pub fn set_todo_store_wait_for_test(project_root: &Path, wait: std::time::Duration) {
     STORE_WAITS_FOR_TEST
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -629,28 +630,9 @@ fn file_todos_skip(path: &Path) -> bool {
     crate::inspect::scanners::todos::path_todo_language(path).is_none()
 }
 
-/// A context whose index-store checkout of `root` is bound and has
-/// published its call graph, so the TODO count of `root` reads records.
-/// The checkout lives as long as the context.
+/// Sets up an index-store checkout for `root` and waits for its call graph
+/// to publish so the TODO scanner can read the stored records.
 #[cfg(test)]
-pub(crate) fn bind_published_for_test(root: &Path) -> crate::context::AppContext {
-    let ctx = crate::context::AppContext::new(
-        Box::new(crate::parser::TreeSitterProvider::new()),
-        crate::config::Config {
-            project_root: Some(root.to_path_buf()),
-            ..crate::config::Config::default()
-        },
-    );
-    crate::data_layer::surfaces::serve_text_index_for_test(&ctx);
-    let checkout = ctx.data_checkout().expect("the index store binds the root");
-    let deadline = Instant::now() + std::time::Duration::from_secs(60);
-    while !checkout
-        .view()
-        .is_some_and(|view| view.status().callgraph_published)
-        || checkout.checkout().status().building
-    {
-        assert!(Instant::now() < deadline, "the call graph never published");
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    ctx
+pub(super) fn bind_published_for_test(root: &Path) -> super::test_support::CheckoutFixture {
+    super::test_support::CheckoutFixture::open(root, true)
 }

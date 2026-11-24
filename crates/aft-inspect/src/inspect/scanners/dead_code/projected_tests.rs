@@ -135,13 +135,13 @@ impl NeverConstructed {
     let project_root = crate::path_identity::canonicalize_normalized(&root);
 
     let first_snapshot =
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&project_root);
 
     let first_scope_files = first_snapshot.files.clone();
     let first_success = scan(job(&project_root, first_scope_files, Some(first_snapshot)));
 
     let second_snapshot =
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&project_root);
 
     let second_scope_files = second_snapshot.files.clone();
     let second_success = scan(job(
@@ -231,7 +231,7 @@ mod tests {
     let project_root = crate::path_identity::canonicalize_normalized(&root);
 
     let first_snapshot =
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&project_root);
 
     let first_success = scan(job(
         &project_root,
@@ -240,7 +240,7 @@ mod tests {
     ));
 
     let second_snapshot =
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&project_root);
 
     let second_success = scan(job(
         &project_root,
@@ -338,13 +338,13 @@ func Less(i, j int) bool { return false }
     let project_root = crate::path_identity::canonicalize_normalized(&root);
 
     let first_snapshot =
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&project_root);
 
     let first_scope_files = first_snapshot.files.clone();
     let first_success = scan(job(&project_root, first_scope_files, Some(first_snapshot)));
 
     let second_snapshot =
-        crate::callgraph_store::dead_code_projection::snapshot_for_test(&project_root);
+        crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&project_root);
 
     let second_scope_files = second_snapshot.files.clone();
     let second_success = scan(job(

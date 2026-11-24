@@ -48,7 +48,8 @@ use super::job::{
 };
 
 #[derive(Debug, Default)]
-pub(crate) struct Tier2ContributionUpdates {
+#[doc(hidden)]
+pub struct Tier2ContributionUpdates {
     pub upserts: Vec<FileContribution>,
     pub deletes: Vec<PathBuf>,
     pub metadata_updates: Vec<(PathBuf, FileFreshness)>,
@@ -263,7 +264,8 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn aggregate_memory_walks_for_test() -> usize {
+#[doc(hidden)]
+pub fn aggregate_memory_walks_for_test() -> usize {
     AGGREGATE_MEMORY_WALKS.with(std::cell::Cell::get)
 }
 
@@ -624,7 +626,8 @@ pub struct ReadonlyInspectCache {
 
 impl InspectCache {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
+    #[doc(hidden)]
+    pub fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
         let memory = match self.memory.try_read() {
             Ok(memory) => memory,
             Err(_) => return crate::memory::MemoryEstimate::busy(),
@@ -865,8 +868,9 @@ impl InspectCache {
         &self.sqlite_path
     }
 
-    #[cfg(test)]
-    pub(crate) fn page_size_for_test(&self) -> u64 {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn page_size_for_test(&self) -> u64 {
         self.conn
             .lock()
             .expect("inspect cache connection lock")
@@ -1177,7 +1181,8 @@ impl InspectCache {
         self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash))
     }
 
-    pub(crate) fn apply_contribution_updates_for_config(
+    #[doc(hidden)]
+    pub fn apply_contribution_updates_for_config(
         &self,
         category: InspectCategory,
         updates: Tier2ContributionUpdates,
@@ -1319,7 +1324,8 @@ impl InspectCache {
         }
     }
 
-    pub(crate) fn latest_aggregate_any_hash(
+    #[doc(hidden)]
+    pub fn latest_aggregate_any_hash(
         &self,
         category: InspectCategory,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
@@ -1378,7 +1384,8 @@ impl InspectCache {
         Ok(last_full_run)
     }
 
-    pub(crate) fn store_tier2_aggregate(
+    #[doc(hidden)]
+    pub fn store_tier2_aggregate(
         &self,
         key: JobKey,
         contribution_set_hash: &str,
@@ -1624,7 +1631,8 @@ impl InspectCache {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn contribution_set_hash_for_version_for_test(
+    #[doc(hidden)]
+    pub fn contribution_set_hash_for_version_for_test(
         &self,
         category: InspectCategory,
         config: &Config,
@@ -2884,7 +2892,8 @@ fn now_nanos() -> u128 {
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "foreign_writer_fixture.rs"]
-pub(crate) mod foreign_writer_fixture;
+#[doc(hidden)]
+pub mod foreign_writer_fixture;
 
 #[cfg(test)]
 pub(crate) mod tests {

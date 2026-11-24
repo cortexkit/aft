@@ -445,7 +445,8 @@ pub enum ServerState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ServerInstanceId(u64);
+#[doc(hidden)]
+pub struct ServerInstanceId(u64);
 
 impl ServerInstanceId {
     pub(crate) fn next() -> Self {
@@ -512,7 +513,7 @@ impl LspEventSender {
         match self {
             Self::Standalone(sender) => sender.send(event).map_err(|_| ()),
             Self::Managed { sender, instance } => {
-                #[cfg(all(test, unix))]
+                #[cfg(all(unix, any(test, feature = "test-support")))]
                 super::manager::instance_regression_tests::pause_reader(*instance);
                 sender
                     .send(ReceivedLspEvent {
@@ -3035,7 +3036,8 @@ fn stderr_tail_to_string(tail: &VecDeque<String>) -> String {
 /// Necessary because some LSP servers ship as npm-installed Node shims that
 /// spawn the real binary as a child. Killing only the wrapper PID leaves the
 /// real server orphaned to PID 1 and accumulates over time.
-pub(crate) fn kill_lsp_child_group(child: &mut std::process::Child) {
+#[doc(hidden)]
+pub fn kill_lsp_child_group(child: &mut std::process::Child) {
     #[cfg(unix)]
     {
         let pgid = child.id() as i32;

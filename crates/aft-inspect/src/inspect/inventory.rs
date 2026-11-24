@@ -79,20 +79,6 @@ mod tests {
         assert!(current(other.path()).is_none());
     }
 
-    /// A context for `root` whose index-store checkout is bound and has
-    /// published its scan of the folder.
-    fn bound_context(root: &Path) -> crate::context::AppContext {
-        let ctx = crate::context::AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(root.to_path_buf()),
-                ..crate::config::Config::default()
-            },
-        );
-        crate::data_layer::surfaces::serve_text_only_for_test(&ctx);
-        ctx
-    }
-
     /// The index store's members, filtered by the walks' own rules, list
     /// exactly the sources and manifests the shared walk finds, across every
     /// rule where the two could part: hidden paths, ignore files, the walks'
@@ -146,8 +132,8 @@ mod tests {
         std::os::unix::fs::symlink("src/main.rs", root.join("link.rs")).unwrap();
         crate::project_content::register_storage_root(&root.join("storage"));
 
-        let ctx = bound_context(&root);
-        let checkout = ctx.data_checkout().expect("the checkout is bound");
+        let fixture = crate::inspect::test_support::CheckoutFixture::open(&root, false);
+        let checkout = &fixture.checkout;
         let view = checkout.view().expect("the scan is published");
         let from_store =
             InspectInventory::from_checkout(&root, &view).expect("the view stands in for a walk");
@@ -203,8 +189,8 @@ mod tests {
         let root = canonicalize_normalized(Path::new(
             &std::env::var("AFT_INVENTORY_PARITY_ROOT").expect("AFT_INVENTORY_PARITY_ROOT"),
         ));
-        let ctx = bound_context(&root);
-        let view = ctx.data_checkout().unwrap().view().unwrap();
+        let fixture = crate::inspect::test_support::CheckoutFixture::open(&root, false);
+        let view = fixture.checkout.view().unwrap();
         let started = std::time::Instant::now();
         let from_store = InspectInventory::from_checkout(&root, &view).expect("stands in");
         let store_time = started.elapsed();

@@ -6070,7 +6070,7 @@ mod tests {
     fn stored_rust_fixture_scan(files: &[(&str, &str)]) -> Value {
         let (temp, root, paths) = canonical_fixture(files);
 
-        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let snapshot = crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         drop(temp);
         aggregate
@@ -6117,7 +6117,7 @@ mod tests {
             ),
         ]);
 
-        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let snapshot = crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
@@ -6126,7 +6126,7 @@ mod tests {
         );
         assert_eq!(aggregate["test_only_count"], 0, "{aggregate:#}");
 
-        let view = crate::callgraph_store::dead_code_projection::view_for_test(&root);
+        let view = crate::inspect::test_support::callgraph_fixture::view_for_test(&root);
         let tree = crate::data_layer::callgraph_store_adapter::call_tree_result(
             &view.callgraph(),
             Path::new("src/main.rs"),
@@ -6193,7 +6193,7 @@ pub(crate) fn drop(_value: i32) {}
             ),
         ]);
 
-        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let snapshot = crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert_eq!(
             headline_symbols(&aggregate),
@@ -7803,7 +7803,7 @@ mod tests {
             analysis.cfg_test_ranges
         );
 
-        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let snapshot = crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
         assert!(
             aggregate_test_only_item(&aggregate, "src/index.rs", "shares_index_with").is_none(),
@@ -8523,7 +8523,7 @@ pub fn false_helper() -> String { "dead".to_string() }
         )
         .expect("write manifest");
 
-        let snapshot = crate::callgraph_store::dead_code_projection::snapshot_for_test(&root);
+        let snapshot = crate::inspect::test_support::callgraph_fixture::snapshot_for_test(&root);
         let aggregate = scan(job(&root, paths, snapshot));
 
         assert_eq!(
