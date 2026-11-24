@@ -252,6 +252,8 @@ export interface BgNotificationDelivery {
     sessionID: string | undefined,
     match: import("@cortexkit/aft-bridge").BashPatternMatchAck,
   ): void;
+  /** A confirmed task-level acknowledgement of a drained completion. */
+  completionAcked?(sessionID: string | undefined, taskId: string): void;
   /** Durable absence also retires state when an acknowledgement response was lost. */
   patternMatchesPending?(
     sessionID: string | undefined,
@@ -393,7 +395,7 @@ export function consumeBgCompletion(sessionID: string | undefined, taskId: strin
 export async function markBgCompletionDelivered(
   drainContext: DrainContext,
   taskId: string,
-): Promise<void> {
+): Promise<boolean> {
   // C-#1 site 5: an inline bash_watch wait already delivered this task's result
   // in its tool output. Mark it awaiting-ack so a forced drain racing this ack
   // re-acks rather than re-delivering, then confirm/keep on the ack result. (Do
@@ -403,6 +405,7 @@ export async function markBgCompletionDelivered(
   markDeliveredAwaitingAck(state, [taskId]);
   const acked = await ackCompletions(drainContext, [{ task_id: taskId }]);
   if (acked) confirmAcked(state, [taskId]);
+  return acked;
 }
 
 /**
@@ -1929,6 +1932,7 @@ async function ackCompletions(
     for (const target of completions) {
       if ("watch_id" in target)
         drainContext.delivery?.patternMatchAcked?.(drainContext.sessionID, target);
+      else drainContext.delivery?.completionAcked?.(drainContext.sessionID, target.task_id);
     }
     stateFor(drainContext.sessionID).batchAdmissions.confirmed(completions);
     // Trace #6 of 7: bash_ack_completions succeeded on the Rust side.

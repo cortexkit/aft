@@ -143,6 +143,27 @@ const STANDALONE_RETRY_DELAYS_MS: readonly number[] = [
 export interface V2RuntimeConsumerOptions {
   /** Delays before each automatic retry of a failed standalone wake; tests shorten them. */
   readonly standaloneRetryDelaysMs?: readonly number[];
+  /**
+   * Test seam: schedules retirement of an acknowledged Subc wake key after
+   * {@link SUBC_ACKED_WAKE_HOLD_MS}. Returns a function that cancels it.
+   */
+  readonly scheduleAckedWakeRetirement?: (retire: () => void, delayMs: number) => () => void;
+}
+
+/**
+ * How long a Subc wake's admission key is kept after the daemon confirms its
+ * acknowledgement. A duplicate of the same wake can still arrive after the
+ * ACK (a push frame sent before it, or a drain answered just before it), and
+ * the kept key turns that duplicate into "already-delivered" instead of a
+ * second wake. After the window the key is dropped, so a long-lived Location
+ * does not keep one key for every wake it ever admitted.
+ */
+export const SUBC_ACKED_WAKE_HOLD_MS = 10 * 60_000;
+
+function scheduleUnrefTimer(run: () => void, delayMs: number): () => void {
+  const timer = setTimeout(run, delayMs);
+  timer.unref?.();
+  return () => clearTimeout(timer);
 }
 
 function holdUnrouted(completion: BashCompletedPayload, bridge: AftProjectTransport): void {
@@ -384,10 +405,30 @@ export function createV2RuntimeConsumer(
   options: V2RuntimeConsumerOptions = {},
 ): V2RuntimeConsumer {
   const delivery = new V2SessionDelivery(context.session);
-  // SubC owns acknowledgement retries outside admission. Keep its existing
-  // completion and non-batched watch keys. Batched watch keys clear when an
-  // acknowledgement is confirmed or the watch is absent from the pending list.
+  // SubC owns acknowledgement retries outside admission. Completion and
+  // non-batched watch keys are kept until their acknowledgement is confirmed,
+  // then for SUBC_ACKED_WAKE_HOLD_MS more to absorb late duplicates, then
+  // retired. Batched watch keys clear as soon as an acknowledgement is
+  // confirmed or the watch is absent from the pending list.
   const subcDelivery = new V2SessionDelivery(context.session, Number.POSITIVE_INFINITY);
+  const scheduleAckedWakeRetirement = options.scheduleAckedWakeRetirement ?? scheduleUnrefTimer;
+  const ackedWakeRetirements = new Map<string, () => void>();
+  const retireSubcWakeAfterHold = (wake: {
+    sessionID: string;
+    taskIDs: [string];
+    notificationID?: string;
+  }) => {
+    if (disposed) return;
+    const key = JSON.stringify([wake.sessionID, wake.taskIDs[0], wake.notificationID ?? null]);
+    ackedWakeRetirements.get(key)?.();
+    ackedWakeRetirements.set(
+      key,
+      scheduleAckedWakeRetirement(() => {
+        ackedWakeRetirements.delete(key);
+        subcDelivery.retireCompletion(wake);
+      }, SUBC_ACKED_WAKE_HOLD_MS),
+    );
+  };
   const sessions = new Set<string>();
   let subcPool: (() => AftTransportPool) | undefined;
   const pendingMatches = new Map<
@@ -821,7 +862,7 @@ export function createV2RuntimeConsumer(
       if (acknowledge) {
         if (subcPool) {
           consumeBgCompletion(completion.session_id, completion.task_id);
-          await markBgCompletionDelivered(
+          const acked = await markBgCompletionDelivered(
             {
               ctx: { pool: subcPool() },
               directory: bridge.getCwd(),
@@ -830,6 +871,11 @@ export function createV2RuntimeConsumer(
             },
             completion.task_id,
           );
+          if (acked)
+            retireSubcWakeAfterHold({
+              sessionID: completion.session_id,
+              taskIDs: [completion.task_id],
+            });
         } else {
           await bridge.send("bash_ack_completions", {
             session_id: completion.session_id,
@@ -1090,9 +1136,19 @@ export function createV2RuntimeConsumer(
               if (!sessionID) return;
               const key = JSON.stringify([sessionID, match.task_id, match.watch_id]);
               const progress = subcLineProgress.get(key);
-              if (!progress) return;
+              if (!progress) {
+                retireSubcWakeAfterHold({
+                  sessionID,
+                  taskIDs: [match.task_id],
+                  notificationID: subcMatchID(match.watch_id, match.match_offset),
+                });
+                return;
+              }
               retireSubcBatchVersion(sessionID, match.task_id, match.watch_id, match.match_offset);
               if (progress.admittedVersion === match.match_offset) subcLineProgress.delete(key);
+            },
+            completionAcked: (sessionID, taskId) => {
+              if (sessionID) retireSubcWakeAfterHold({ sessionID, taskIDs: [taskId] });
             },
             patternMatchesPending: (sessionID, matches) => {
               const pending = new Map(
@@ -1154,6 +1210,8 @@ export function createV2RuntimeConsumer(
       eachLineWork.clear();
       lineProgress.clear();
       subcLineProgress.clear();
+      for (const cancel of ackedWakeRetirements.values()) cancel();
+      ackedWakeRetirements.clear();
       delivery.dispose();
       subcDelivery.dispose();
       const { routes } = wakeRouteState();
