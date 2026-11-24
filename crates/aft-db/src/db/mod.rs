@@ -750,6 +750,7 @@ pub fn open_with_mode(path: &Path, mode: OpenMode) -> Result<TrackedConnection, 
             run_migrations(&mut conn)?;
             ensure_additive_indexes(&conn)?;
             display_records::install(&conn)?;
+            sandbox_escape_records::install(&conn)?;
             codemode_owners::install(&conn)?;
             clear_stored_compression_commands(&mut conn)?;
             access_grants::migrate_prefrontal_owner(&mut conn)?;
