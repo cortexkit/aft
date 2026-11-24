@@ -293,7 +293,8 @@ impl RequestFiles {
     /// Keep bytes a phase read on its own (the exact memo's digest check
     /// reads with stats of its own), so later phases need not read again.
     /// Bytes kept already win: every phase sees the first read.
-    pub(crate) fn keep_read(
+    #[doc(hidden)]
+    pub fn keep_read(
         &self,
         path: &Path,
         bytes: Vec<u8>,

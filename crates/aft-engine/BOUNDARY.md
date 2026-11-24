@@ -569,6 +569,25 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `PackFingerprint` | test-support visibility widened | `aft-index` | Keep the compiled rerank fixture’s original fingerprint type in the bridge. |
 | `DirectoryArrivalGuard` | visibility widened | `aft-index` | Let composed watcher tests hold the actual in-flight arrival guard. |
 
+| `RefreshCounts::new_for_test` | moved test-support constructor | `aft-index` | Preserve the original refresh accounting fixture on its owning type. |
+| `BuildInputs::new_for_test` | moved test-support constructor | `aft-index` | Preserve the original rerank inputs fixture on its owning type. |
+| `SiteResolution::target_count_for_test` | test-support accessor | `aft-index` | Inspect tests still count the exact stored call targets. |
+| `SiteResolution::protected_count_for_test` | test-support accessor | `aft-index` | Inspect tests still count the exact protected targets. |
+| `SiteResolution::shares_resolution_for_test` | test-support accessor | `aft-index` | Verify the sites share the same allocation without exposing it. |
+| `SiteResolution::line_for_test` | test-support accessor | `aft-index` | Use the stored site’s line in the mixed-source test. |
+| `DiskMeasurement::expire_for_test` | test-support visibility widened | `aft-index` | Expire the actual checkout disk measurement in the composed status test. |
+| `PackFingerprint::backend` | test-support visibility widened | `aft-index` | Read the fixture’s backend fingerprint component. |
+| `RequestFiles::keep_read` | visibility widened | `aft-index` | Keep the request-file lease test on the real retention code. |
+| `DataCheckout::request_refresh` | visibility widened | `aft-index` | Exercise real checkout refresh admission through the established test bridge. |
+| `DataCheckout::configure_meaning` | visibility widened | `aft-index` | Apply the actual embedding configuration in the composed test. |
+| `DataCheckout::meaning_status` | visibility widened | `aft-index` | Read the actual meaning plane status through the existing test bridge. |
+| `Checkout::retry_grammar_gaps` | visibility widened | `aft-index` | Exercise real grammar lag recovery through the test bridge. |
+| `Checkout::has_unpublished_luau_changes` | visibility widened | `aft-index` | Test the existing pending Luau update state. |
+| `Checkout::publish_text_first` | visibility widened | `aft-index` | Test the existing independent text publication. |
+| `VectorPlane::cached_snapshot` | visibility widened | `aft-index` | Test reuse of the real cached embedding snapshot. |
+| `SearchIndex::search_grep_profiled_with_filters` | visibility widened | `aft-index` | Keep the existing profiling test on the real grep path. |
+| `SearchIndex::search_grep_profiled_with_filters_and_query_in_order` | visibility widened | `aft-index` | Preserve ordered grep’s existing phase observations. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

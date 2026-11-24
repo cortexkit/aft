@@ -1326,32 +1326,31 @@ mod tests {
         let files = view.dead_code_files();
         let resolution = files.resolution(CALLER).unwrap();
         assert_eq!(resolution.sites.len(), 128);
-        let first = &resolution.sites[0].resolution;
-        assert!(!first.targets.is_empty());
-        assert!(first.protected.len() > first.targets.len());
+        let first = &resolution.sites[0];
+        let targets = first.target_count_for_test();
+        let protected = first.protected_count_for_test();
+        assert!(targets > 0);
+        assert!(protected > targets);
         assert!(resolution
             .sites
             .iter()
-            .all(|site| Arc::ptr_eq(first, &site.resolution)));
+            .all(|site| first.shares_resolution_for_test(site)));
 
         let graph = DeadCodeGraph::open_lazy(&fixture.root, &files);
         let projection = graph
             .project_file(CALLER, &|_| SeedClass::TestFile, false)
             .unwrap();
-        assert_eq!(projection.unknown_live.len(), first.protected.len());
-        assert_eq!(
-            graph.unknown_live(CALLER).unwrap().len(),
-            first.protected.len()
-        );
+        assert_eq!(projection.unknown_live.len(), protected);
+        assert_eq!(graph.unknown_live(CALLER).unwrap().len(), protected);
         assert_eq!(
             projection
                 .outbound_calls
                 .iter()
                 .filter(|call| call.provenance == "name_match")
                 .count(),
-            first.targets.len()
+            targets
         );
-        let first_line = resolution.sites[0].site.line;
+        let first_line = first.line_for_test();
         let mixed = graph
             .project_file(
                 CALLER,
@@ -1365,7 +1364,7 @@ mod tests {
                 false,
             )
             .unwrap();
-        assert_eq!(mixed.unknown_live.len(), 3 * first.protected.len());
+        assert_eq!(mixed.unknown_live.len(), 3 * protected);
         assert!(mixed
             .unknown_live
             .iter()

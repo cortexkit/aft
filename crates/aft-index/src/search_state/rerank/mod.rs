@@ -10,6 +10,8 @@ pub mod remote;
 pub mod slot;
 #[doc(hidden)]
 pub mod synapse;
+#[cfg(any(test, feature = "test-support"))]
+mod test_build_inputs;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

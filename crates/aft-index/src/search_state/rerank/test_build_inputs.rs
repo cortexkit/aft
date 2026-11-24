@@ -4,7 +4,7 @@ impl slot::BuildInputs {
         semantic: crate::config::SemanticBackendConfig,
         under_subc: bool,
         cache_unavailable: bool,
-        cache_lease: Option<std::sync::Arc<crate::root_cache::CacheLease>>,
+        cache_lease: Option<std::sync::Arc<aft_db::root_cache::CacheLease>>,
         cache_epoch: u64,
     ) -> Self {
         Self {
@@ -17,3 +17,5 @@ impl slot::BuildInputs {
         }
     }
 }
+use super::slot;
+use crate::config::SearchConfig;

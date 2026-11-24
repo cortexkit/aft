@@ -990,8 +990,9 @@ impl std::fmt::Debug for DiskMeasurement {
 }
 
 impl DiskMeasurement {
-    #[cfg(test)]
-    pub(crate) fn expire_for_test(&self) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn expire_for_test(&self) {
         let mut sample = self.sample.lock().unwrap();
         assert!(!sample.running);
         sample.started = None;

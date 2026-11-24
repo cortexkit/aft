@@ -3358,3 +3358,5 @@ aft_store::heap_bytes_of_fields!(MethodCallInputs {
     go_required,
     computed_while_resolving,
 });
+#[cfg(any(test, feature = "test-support"))]
+mod test_access;

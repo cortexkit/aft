@@ -58,6 +58,8 @@ mod fold;
 mod memory_profile;
 mod recording;
 mod refresh;
+#[cfg(any(test, feature = "test-support"))]
+mod refresh_test_access;
 pub use refresh::RefreshCounts;
 pub(crate) mod resume;
 pub(crate) mod staged_records;
@@ -1315,7 +1317,8 @@ impl Checkout {
 
     /// Re-read only unavailable grammar members, even when stat and content
     /// are unchanged. A ready event is not a filesystem edit.
-    pub(crate) fn retry_grammar_gaps(&self) -> Result<bool, DataError> {
+    #[doc(hidden)]
+    pub fn retry_grammar_gaps(&self) -> Result<bool, DataError> {
         let paths = {
             let live = self.live.read().expect("no panics while holding it");
             let state = live
@@ -1368,7 +1371,8 @@ impl Checkout {
         })
     }
 
-    pub(crate) fn has_unpublished_luau_changes(&self) -> bool {
+    #[doc(hidden)]
+    pub fn has_unpublished_luau_changes(&self) -> bool {
         cfg!(feature = "wasm-grammars")
             && self
                 .live
@@ -2521,7 +2525,8 @@ impl Checkout {
     /// that names no call-graph fragments, so text queries can start while
     /// the call graph builds. Returns `false` when another process published
     /// this checkout first; the checkout then serves that publication.
-    pub(crate) fn publish_text_first(&self) -> Result<bool, DataError> {
+    #[doc(hidden)]
+    pub fn publish_text_first(&self) -> Result<bool, DataError> {
         self.publish_text(&mut BuildReport::default())
     }
 

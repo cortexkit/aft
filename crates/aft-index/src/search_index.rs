@@ -1506,7 +1506,8 @@ impl SearchIndexSnapshot {
         )
     }
 
-    pub(crate) fn search_grep_profiled_with_filters(
+    #[doc(hidden)]
+    pub fn search_grep_profiled_with_filters(
         &self,
         pattern: &CompiledPattern,
         filters: &PathFilters,
@@ -1553,7 +1554,8 @@ impl SearchIndexSnapshot {
     /// [`Self::search_grep_profiled_with_filters_and_query`] with a choice
     /// of which lines are kept past the result cap.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn search_grep_profiled_with_filters_and_query_in_order(
+    #[doc(hidden)]
+    pub fn search_grep_profiled_with_filters_and_query_in_order(
         &self,
         pattern: &CompiledPattern,
         query: &RegexQuery,

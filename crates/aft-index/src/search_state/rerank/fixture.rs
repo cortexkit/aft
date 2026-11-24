@@ -23,7 +23,8 @@ pub(crate) const PACK_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[doc(hidden)]
 pub struct PackFingerprint {
-    pub(crate) backend: String,
+    #[doc(hidden)]
+    pub backend: String,
     pub(crate) model: String,
     pub(crate) revision: String,
 }

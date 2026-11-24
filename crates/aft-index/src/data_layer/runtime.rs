@@ -1722,7 +1722,8 @@ impl DataCheckout {
     /// Builds the checkout if it needs it, and otherwise makes sure a
     /// call-graph refresh runs if any change is pending: when the root is
     /// bound, and for a query about to wait for the call graph.
-    pub(crate) fn request_refresh(&self) {
+    #[doc(hidden)]
+    pub fn request_refresh(&self) {
         self.work.catch_up(Publish::WhenMany, true);
     }
 
@@ -2209,7 +2210,8 @@ impl DataCheckout {
     /// semantic search is off or not admitted for it, as a configure binds
     /// the root; a changed one is filled under from now on. Starts a fill
     /// when files wait for vectors.
-    pub(crate) fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>) {
+    #[doc(hidden)]
+    pub fn configure_meaning(&self, config: Option<&crate::config::SemanticBackendConfig>) {
         self.work.meaning.configure(config);
         self.meaning(|| None);
     }
@@ -2238,7 +2240,8 @@ impl DataCheckout {
 
     /// How meaning search stands for the current view, for status reads:
     /// starts nothing.
-    pub(crate) fn meaning_status(&self) -> MeaningState {
+    #[doc(hidden)]
+    pub fn meaning_status(&self) -> MeaningState {
         self.work.meaning.state(self.view().as_ref())
     }
 

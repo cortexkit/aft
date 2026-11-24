@@ -313,8 +313,6 @@ pub use aft_base::worker_jail_canary;
 #[cfg(test)]
 mod gate_hermeticity_tests;
 #[cfg(test)]
-pub(crate) use aft_base::search_hot_path_measurements as search_test_counts;
-#[cfg(test)]
 pub(crate) use aft_base::test_allocations;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "base_tests/test_env.rs"]
