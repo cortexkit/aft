@@ -1490,8 +1490,24 @@ pub(crate) fn block_cache_estimate() -> Option<MemoryEstimate> {
             estimate = estimate
                 .count_u64("symbol_table_bytes", tables.bytes)
                 .count_u64("symbol_tables", tables.tables)
-                .count_u64("symbol_table_kept_bytes", tables.kept_bytes)
-                .count_u64("symbol_table_budget_bytes", tables.budget_bytes)
+                .count_u64("symbol_table_kept_bytes", tables.keep_set_payload_bytes)
+                .count_u64("symbol_table_budget_bytes", tables.keep_set_budget_bytes)
+                .count_u64(
+                    "symbol_table_keep_set_budget_bytes",
+                    tables.keep_set_budget_bytes,
+                )
+                .count_u64(
+                    "symbol_table_keep_set_payload_bytes",
+                    tables.keep_set_payload_bytes,
+                )
+                .count_u64(
+                    "symbol_table_live_outside_keep_set_payload_bytes",
+                    tables.live_outside_keep_set_payload_bytes,
+                )
+                .count_u64(
+                    "symbol_table_registry_bookkeeping_bytes",
+                    tables.registry_bookkeeping_bytes,
+                )
                 .count_u64("symbol_table_hits", tables.hits)
                 .count_u64("symbol_table_misses", tables.misses);
         }
@@ -2763,6 +2779,21 @@ mod tests {
         assert_eq!(cache.bytes_status, "estimated");
         assert!(cache.counts["budget_bytes"] > 0);
         assert!(cache.counts["blocks"] > 0);
+        assert_eq!(cache.counts["symbol_table_keep_set_budget_bytes"], 64 << 20);
+        assert_eq!(
+            cache.counts["symbol_table_budget_bytes"],
+            cache.counts["symbol_table_keep_set_budget_bytes"]
+        );
+        assert_eq!(
+            cache.counts["symbol_table_kept_bytes"],
+            cache.counts["symbol_table_keep_set_payload_bytes"]
+        );
+        assert_eq!(
+            cache.counts["symbol_table_bytes"],
+            cache.counts["symbol_table_keep_set_payload_bytes"]
+                + cache.counts["symbol_table_live_outside_keep_set_payload_bytes"]
+                + cache.counts["symbol_table_registry_bookkeeping_bytes"]
+        );
         assert!(
             cache.estimated_bytes.unwrap() > cache.counts["resident_bytes"],
             "the cache's figure is its blocks and its tables: {cache:?}"
