@@ -80,6 +80,7 @@ use super::watches::{
 use super::{counted_mutex::CountedMutex, BgTaskInfo, BgTaskStatus};
 use crate::db::bash_tasks::BashTaskRow;
 use crate::db::bash_watches::BashPatternWatchRow;
+mod recovered_output;
 mod saved_delivery;
 use saved_delivery::list_delivery_gaps;
 mod live_delivery;
@@ -3969,8 +3970,13 @@ impl BgTaskRegistry {
         let render = super::buffer::with_recovered_read_diagnostics(&metadata.task_id, || {
             self.render_terminal_output_from_paths(metadata, paths)
         });
-        let unknown_result = (metadata.status == BgTaskStatus::FateUnknown)
-            .then(|| self.unknown_bash_result_from_render(metadata, paths, render.as_ref()));
+        let unknown_result = (metadata.status == BgTaskStatus::FateUnknown).then(|| {
+            // A capture error without captured bytes is not output from a missing local process.
+            let preview = render
+                .as_ref()
+                .filter(|_| metadata.remote.is_some() || row.output_bytes.unwrap_or(0) > 0);
+            self.unknown_bash_result_from_render(metadata, paths, preview)
+        });
         crate::slog_info!(
             "recovered bash reply phase=render_finished task={} preview_bytes={:?} truncated={:?}",
             metadata.task_id,
@@ -4082,25 +4088,6 @@ impl BgTaskRegistry {
             }
             Err(_) => false,
         }
-    }
-
-    fn unknown_bash_result_from_render(
-        &self,
-        metadata: &PersistedTask,
-        paths: &TaskPaths,
-        render: Option<&TerminalOutputCache>,
-    ) -> crate::db::call_ledger::RecordedFrame {
-        let preview = render
-            .map(|cache| {
-                self.terminal_preview_for_reply(metadata, cache, Some(paths))
-                    .0
-            })
-            .unwrap_or_default();
-        crate::db::call_ledger::unknown_bash_result(
-            &metadata.task_id,
-            remote_job_id(metadata).as_deref(),
-            &preview,
-        )
     }
 
     pub(crate) fn unknown_bash_result_for_task(
