@@ -37,6 +37,7 @@ mod manifest_guard;
 pub(crate) mod manifest_sync;
 mod manifest_wire;
 mod native_guard;
+mod numeric_id_cache;
 mod prefrontal_route;
 pub(crate) mod read_contract;
 mod rename_guard;
@@ -3556,9 +3557,7 @@ fn resolve_and_cache_numeric_id(paths: &StatePaths, login: &str) -> Option<u64> 
         command,
         std::time::Instant::now() + crate::format::AVAILABILITY_PROBE_BUDGET,
     )?;
-    let mut ids = cached_numeric_ids(paths);
-    ids.insert(login.to_string(), numeric_id);
-    write_numeric_ids_silently(paths, &ids);
+    numeric_id_cache::record(paths, login, numeric_id);
     Some(numeric_id)
 }
 
@@ -3576,21 +3575,6 @@ fn numeric_id_from_command(command: Command, deadline: std::time::Instant) -> Op
         .parse::<u64>()
         .ok()
         .filter(|id| *id > 0)
-}
-
-fn write_numeric_ids_silently(paths: &StatePaths, ids: &BTreeMap<String, u64>) {
-    let Ok(bytes) = serde_json::to_vec(ids) else {
-        return;
-    };
-    if crate::private_storage::open_root(&paths.root).is_err() {
-        return;
-    }
-    let temporary = paths.root.join("numeric-ids.json.tmp");
-    if crate::private_storage::write(&temporary, bytes).is_ok() {
-        #[cfg(windows)]
-        let _ = fs::remove_file(&paths.numeric_ids);
-        let _ = fs::rename(temporary, &paths.numeric_ids);
-    }
 }
 
 fn repository_key_from_origin(project_root: &Path) -> Option<String> {
