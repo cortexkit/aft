@@ -1,7 +1,7 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock, Mutex, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::SystemTime;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1034,105 +1034,10 @@ pub fn parse_source_with_cached_parser(
     parse_resolved_source(path, source, lang).map(|(tree, _)| tree)
 }
 
-#[derive(Default)]
-struct HeaderParseCache {
-    entries: HashMap<blake3::Hash, (Tree, LangId)>,
-    order: VecDeque<blake3::Hash>,
-}
-
-// FileParser instances are request-local. Share header trees by content so a
-// language-only consumer and a later symbol/graph consumer use the same verdict
-// without repeating the fallback parses. Eviction affects reuse, not results.
-static HEADER_PARSE_CACHE: LazyLock<Mutex<HeaderParseCache>> =
-    LazyLock::new(|| Mutex::new(HeaderParseCache::default()));
-
+mod header_cache;
 #[cfg(any(test, feature = "test-support"))]
-thread_local! {
-    pub static HEADER_PARSE_ON_MISS: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
-}
-
-/// Reuse a resolved header tree in path-free extraction without changing the
-/// caller's already-resolved language.
-pub fn cached_header_tree(source: &str, lang: LangId) -> Option<Tree> {
-    if !matches!(lang, LangId::C | LangId::Cpp | LangId::ObjC) {
-        return None;
-    }
-    HEADER_PARSE_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries
-        .get(&cache_freshness::hash_bytes(source.as_bytes()))
-        .filter(|(_, resolved)| *resolved == lang)
-        .map(|(tree, _)| tree.clone())
-}
-
-pub fn parse_resolved_source(
-    path: &Path,
-    source: &str,
-    lang: LangId,
-) -> Result<(Tree, LangId), AftError> {
-    if !is_h_header(path) {
-        return parse_source_with_parser(path, source, lang).map(|tree| (tree, lang));
-    }
-    let hash = cache_freshness::hash_bytes(source.as_bytes());
-    if let Some(parsed) = HEADER_PARSE_CACHE
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .entries
-        .get(&hash)
-    {
-        return Ok(parsed.clone());
-    }
-
-    #[cfg(any(test, feature = "test-support"))]
-    HEADER_PARSE_ON_MISS.with(|hook| {
-        if let Some(hook) = hook.borrow_mut().take() {
-            hook();
-        }
-    });
-
-    let c_tree = parse_source_with_parser(path, source, LangId::C)?;
-    let mut resolved = (c_tree.clone(), LangId::C);
-    if c_tree.root_node().has_error() {
-        for candidate in [LangId::Cpp, LangId::ObjC] {
-            let Some(tree) = parse_source_with_parser_deadline(
-                path,
-                source,
-                candidate,
-                Some(HEADER_FALLBACK_PARSE_DEADLINE),
-            )?
-            else {
-                continue;
-            };
-            // has_error includes both ERROR nodes and inserted MISSING nodes.
-            if !tree.root_node().has_error() {
-                resolved = (tree, candidate);
-                break;
-            }
-        }
-    }
-    // Parsing must not serialize unrelated headers behind this cache lock.
-    // Racing misses may both parse; return the first inserted verdict to both
-    // callers, including when one of their fallback attempts was cancelled.
-    // Wall deadlines are load-sensitive: a near-budget clean alternative could
-    // finish in only one racing thread. The 1,900 ms budget leaves over 10x Zig's
-    // measured 189.362 ms 99.9th-percentile Objective-C header parse time as a
-    // margin (see the deadline constant below). Returning the stored verdict
-    // keeps callers consistent at that boundary.
-    let mut cache = HEADER_PARSE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(parsed) = cache.entries.get(&hash) {
-        return Ok(parsed.clone());
-    }
-    // Bound retained trees independently of the number of FileParser instances.
-    if cache.entries.len() == 128 {
-        if let Some(oldest) = cache.order.pop_front() {
-            cache.entries.remove(&oldest);
-        }
-    }
-    cache.order.push_back(hash);
-    cache.entries.insert(hash, resolved.clone());
-    Ok(resolved)
-}
+pub use header_cache::HEADER_PARSE_ON_MISS;
+pub use header_cache::{cached_header_tree, parse_resolved_source};
 
 test_support_visibility! {
 fn parse_source_with_parser(path: &Path, source: &str, lang: LangId) -> Result<Tree, AftError> {

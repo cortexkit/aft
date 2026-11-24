@@ -457,6 +457,38 @@ mod tests {
         }
     }
 
+    #[ignore = "run in isolation so pressure on the process-wide cache cannot affect other tests"]
+    #[test]
+    fn review_opus2_header_cache_bounds_retained_trees() {
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (0..22_000)
+            .map(|i| format!("#define REG_{i:05} 0x{i:08X}\n"))
+            .collect();
+        let mut sources = Vec::new();
+        for i in 0..128 {
+            let path = dir.path().join(format!("reg{i}.h"));
+            let source = format!("// {path:?}\n{body}");
+            std::fs::write(&path, source).unwrap();
+            sources.push(path);
+        }
+        for path in &sources {
+            let source = std::fs::read_to_string(path).unwrap();
+            let (_, lang) = parse_resolved_source(path, &source, LangId::C).unwrap();
+            assert_eq!(lang, LangId::C);
+        }
+        let mut trees = 0;
+        let mut retained_bytes = 0;
+        for path in sources {
+            let source = std::fs::read_to_string(path).unwrap();
+            if let Some(tree) = cached_header_tree(&source, LangId::C) {
+                trees += 1;
+                retained_bytes += source.len() + 128 * tree.root_node().descendant_count();
+            }
+        }
+        eprintln!("128 generated headers ({} bytes each): {trees} cached trees, {retained_bytes} estimated retained bytes", body.len());
+        assert!(retained_bytes <= 16 * 1024 * 1024);
+    }
+
     #[test]
     fn h_header_missing_nodes_count_as_errors_and_keep_c_when_all_fail() {
         let source = "int missing_semicolon(void)";
