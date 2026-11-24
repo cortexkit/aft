@@ -774,9 +774,15 @@ impl StandingActor {
         };
         if let Some(ctx) = self.executor.actor_context(&root_id) {
             ctx.set_standing_artifact_exempt(true);
-            self.owned_actors
-                .lock()
-                .insert(entry.literal_path.clone(), (root_id.clone(), false));
+            let mut owned = self.owned_actors.lock();
+            // An actor this module created for the root stays its own across
+            // passes. A context a session bound (it carries a harness marker)
+            // is never removed by standing maintenance.
+            let owned_here = ctx.config().harness.is_none()
+                && owned
+                    .get(&entry.literal_path)
+                    .is_some_and(|(owned_root, owned_here)| *owned_here && *owned_root == root_id);
+            owned.insert(entry.literal_path.clone(), (root_id.clone(), owned_here));
             return Some(root_id);
         }
 
@@ -1982,6 +1988,25 @@ mod tests {
         );
         fixture.actor.tick();
         assert!(!fixture.standing_actor_registered());
+    }
+
+    /// Repeated maintenance ticks reuse the actor they created. It stays
+    /// theirs: its stale configuration never stands in for the session's, and
+    /// removing the root later retires it.
+    #[test]
+    fn repeated_ticks_keep_ownership_of_the_standing_actor() {
+        let fixture = OwnedActorFixture::new();
+        fixture.actor.tick();
+        fixture.actor.tick();
+        assert!(fixture.standing_actor_registered());
+
+        fixture.remove_standing_root_from_config();
+        fixture.actor.tick();
+        assert!(fixture.actor.roots.entries().is_empty());
+        assert!(
+            !fixture.standing_actor_registered(),
+            "a removed standing root kept the actor maintenance created for it"
+        );
     }
 
     /// A standing entry over a small Rust crate, reconciled but with no
