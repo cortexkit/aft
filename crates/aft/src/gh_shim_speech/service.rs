@@ -361,6 +361,19 @@ impl Service {
         session: &str,
         task: &str,
     ) -> Result<(), Refusal> {
+        self.check_pending_in_memory(incarnation, launch, session, task)?;
+        self.store.check_launch(launch)
+    }
+
+    /// The part of [`Self::check_pending`] that reads only this process's
+    /// pending revocations and scope ends, never the database.
+    pub(crate) fn check_pending_in_memory(
+        &self,
+        incarnation: Option<&str>,
+        launch: &LaunchAuthority,
+        session: &str,
+        task: &str,
+    ) -> Result<(), Refusal> {
         if self.identity_pending(session, task) {
             return Err(Refusal::new(
                 Code::AuthorityUnavailable,
@@ -388,7 +401,7 @@ impl Service {
                 return Err(Refusal::scoped(Code::ScopeEnded, "ended", role));
             }
         }
-        self.store.check_launch(launch)
+        Ok(())
     }
 
     pub(crate) fn revoke(self: &Arc<Self>, incarnation: &str, reason: &str) -> Result<(), Refusal> {
