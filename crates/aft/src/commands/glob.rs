@@ -18,6 +18,7 @@ use super::multi_path::{canonical_key, resolve_path_or_multi, SearchPathResoluti
 struct GlobDiscovery {
     files: Vec<PathBuf>,
     indexed_mtimes: HashMap<PathBuf, SystemTime>,
+    walk_failed: bool,
     walk_truncated: bool,
     walk_time_limit_reached: bool,
     source: &'static str,
@@ -41,8 +42,10 @@ pub fn handle_glob(req: &RawRequest, ctx: &AppContext) -> Response {
     let config = ctx.config();
     let _pin = false.then(|| ctx.pin_config_to(config));
     ctx.with_read_policy_snapshot(&req.id, || {
-        crate::context::confinement::with_floor_disclosure(|| {
-            crate::bounded_io_command::command(req, ctx, handle_glob_inner)
+        crate::bounded_io::with_skip_disclosure(|| {
+            crate::context::confinement::with_floor_disclosure(|| {
+                crate::bounded_io_command::command(req, ctx, handle_glob_inner)
+            })
         })
     })
 }
@@ -153,6 +156,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     };
     let (
         mut files,
+        walk_failed,
         walk_truncated,
         walk_time_limit_reached,
         source,
@@ -167,6 +171,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         indexed_mtimes = answer.indexed_mtimes;
         (
             answer.files,
+            false,
             answer.walk_truncated,
             answer.walk_time_limit_reached,
             if answer.walked { "fallback" } else { "index" },
@@ -199,6 +204,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         indexed_mtimes = discovery.indexed_mtimes;
         (
             discovery.files,
+            discovery.walk_failed,
             discovery.walk_truncated,
             discovery.walk_time_limit_reached,
             discovery.source,
@@ -234,6 +240,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
                 Err(error) => return crate::context::view_load_error_response(&req.id, error),
             }
         }
+        let walk_failed = discoveries.iter().any(|d| d.walk_failed);
         let walk_truncated = discoveries.iter().any(|d| d.walk_truncated);
         let walk_time_limit_reached = discoveries.iter().any(|d| d.walk_time_limit_reached);
         let entries_visited = discoveries.iter().map(|d| d.entries_visited).sum();
@@ -257,6 +264,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         let files = merge_glob_files(discoveries.into_iter().flat_map(|d| d.files).collect());
         (
             files,
+            walk_failed,
             walk_truncated,
             walk_time_limit_reached,
             source,
@@ -318,8 +326,8 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     let mut body = serde_json::json!({
         "text": text,
         "rendered_files": rendered_files,
-        "complete": all_candidates_checked && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
-        "no_files_matched_scope": !scope_has_files,
+        "complete": all_candidates_checked && !walk_failed && !walk_truncated && skipped_foreign_mounts == 0 && !presence_budget_exhausted,
+        "no_files_matched_scope": !walk_failed && !scope_has_files,
         "skipped_foreign_mounts": skipped_foreign_mounts,
         "files": files.iter().map(|path| path.display().to_string()).collect::<Vec<_>>(),
         "total": all_candidates_checked.then_some(total),
@@ -344,14 +352,14 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
             body["text"].as_str().unwrap_or_default(),
         ));
     }
-    if !scope_has_files && has_named_ignored_root {
+    if !walk_failed && !scope_has_files && has_named_ignored_root {
         // The prefix walk already examined this scope. Probing the original
         // root would count the overridden ignore rule instead of those entries.
         body["text"] = serde_json::Value::String(format!(
             "{}\n\n(0 files searched: no files matched the pattern in the named folder scope; nothing was searched.)",
             body["text"].as_str().unwrap_or_default(),
         ));
-    } else if !scope_has_files {
+    } else if !walk_failed && !scope_has_files {
         let counts = {
             let filters = build_path_filters(&[pattern.to_string()], &[]).unwrap_or_default();
             search_roots.iter().zip(&ignored_targets).try_fold(
@@ -409,7 +417,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
         rendered_count,
         total,
         result_truncated,
-        walk_truncated,
+        walk_failed || walk_truncated,
         walk_time_limit_reached,
         skipped_foreign_mounts,
     );
@@ -537,6 +545,7 @@ fn discover_glob_root(
                 || outcome.skipped_foreign_mounts > 0,
             files: outcome.files,
             indexed_mtimes: HashMap::new(),
+            walk_failed: outcome.error.is_some(),
             walk_truncated: outcome.walk_truncated,
             walk_time_limit_reached: outcome.walk_time_limit_reached,
             source: "fallback",
@@ -605,6 +614,7 @@ fn glob_root(
             scope_has_files: !files.is_empty(),
             files,
             indexed_mtimes: HashMap::new(),
+            walk_failed: false,
             walk_truncated: false,
             walk_time_limit_reached: false,
             source: "task-output",
@@ -633,6 +643,7 @@ fn glob_root(
             return Ok(GlobDiscovery {
                 files: outcome.files,
                 indexed_mtimes: HashMap::new(),
+                walk_failed: outcome.error.is_some(),
                 walk_truncated: outcome.walk_truncated,
                 walk_time_limit_reached: outcome.walk_time_limit_reached,
                 source: "fallback",
@@ -683,6 +694,7 @@ fn glob_from_view(
         entries_visited,
         files,
         indexed_mtimes,
+        walk_failed: false,
         walk_truncated: false,
         walk_time_limit_reached: false,
         source: "index",
@@ -758,6 +770,7 @@ fn fallback_glob(
     GlobDiscovery {
         files: outcome.files,
         indexed_mtimes: HashMap::new(),
+        walk_failed: outcome.error.is_some(),
         walk_truncated: outcome.walk_truncated,
         walk_time_limit_reached: outcome.walk_time_limit_reached,
         source: "fallback",

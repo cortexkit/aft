@@ -3791,6 +3791,23 @@ pub(crate) fn open_grep_file(
     )
 }
 
+#[derive(Debug)]
+struct BinaryGrepInput;
+
+impl std::fmt::Display for BinaryGrepInput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("binary grep input")
+    }
+}
+
+impl std::error::Error for BinaryGrepInput {}
+
+pub(crate) fn is_binary_grep_input(error: &std::io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|cause| cause.is::<BinaryGrepInput>())
+}
+
 fn open_grep_file_after_open(
     path: &Path,
     deadline: Option<Instant>,
@@ -3807,7 +3824,7 @@ fn open_grep_file_after_open(
     if is_binary_bytes(&prefix) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
-            "binary grep input",
+            BinaryGrepInput,
         ));
     }
     if prefix.len() < 1024 {

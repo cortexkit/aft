@@ -31,8 +31,6 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::extensions::{RawQuery, Token};
@@ -330,8 +328,10 @@ fn sweep_after_metadata(
 
     // Enumerate first, checking the deadline at every walk entry (directories
     // and rejected entries included), so a huge tree cannot hold the request.
-    let skipped_foreign_mounts = Arc::new(AtomicUsize::new(0));
-    let walker = crate::grep_executor::fallback_project_walk_builder(root, skipped_foreign_mounts);
+    let walker = crate::grep_executor::fallback_project_walk_builder(
+        root,
+        crate::grep_executor::WalkCoverage::default(),
+    );
     let mut files: Vec<(FileClass, PathBuf)> = Vec::new();
     for entry in walker.build() {
         if Instant::now() >= deadline || crate::executor::current_job_cancelled() {
