@@ -98,27 +98,6 @@ pub struct StandingRootRefusal {
     pub error: String,
 }
 
-/// The typed result used when a contained path has no selected index kind.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StandingRouteError {
-    NoContainingEntry,
-    KindUnavailable {
-        deepest_literal_path: String,
-        deepest_selection: Vec<IndexKind>,
-    },
-    StrictVerificationRequired {
-        literal_path: String,
-        kind: IndexKind,
-    },
-}
-
-/// A successful route discloses the selected configuration entry rather than
-/// implying that the deepest containing entry necessarily served the request.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StandingRoute {
-    pub entry: StandingRootEntry,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StandingPublicationAdmission {
     pub admission_epoch: u64,
@@ -671,53 +650,6 @@ impl StandingRoots {
         Ok(())
     }
 
-    /// Route an explicit path through overlapping entries by deepest recorded
-    /// path then configuration order. If no candidate supports the requested
-    /// kind, preserve the deepest entry in the typed unavailable result.
-    pub fn route_explicit_path(
-        &self,
-        query_path: &Path,
-        kind: IndexKind,
-    ) -> Result<StandingRoute, StandingRouteError> {
-        let query_path = canonicalize_existing_ancestor(query_path);
-        let mut candidates = self
-            .entries()
-            .into_iter()
-            .filter(|entry| query_path.starts_with(&entry.resolved_target))
-            .collect::<Vec<_>>();
-        candidates.sort_by(|left, right| {
-            path_depth(&right.resolved_target)
-                .cmp(&path_depth(&left.resolved_target))
-                .then_with(|| left.config_order.cmp(&right.config_order))
-        });
-        let Some(deepest) = candidates.first().cloned() else {
-            return Err(StandingRouteError::NoContainingEntry);
-        };
-        let Some(entry) = candidates
-            .into_iter()
-            .find(|entry| entry.indexes.contains(&kind))
-        else {
-            return Err(StandingRouteError::KindUnavailable {
-                deepest_literal_path: deepest.literal_path,
-                deepest_selection: deepest.indexes,
-            });
-        };
-        let conn = self
-            .open_database()
-            .map_err(|_| StandingRouteError::NoContainingEntry)?;
-        if standing_roots::needs_strict_verify(&conn, &entry.literal_path, kind)
-            .ok()
-            .flatten()
-            .unwrap_or(true)
-        {
-            return Err(StandingRouteError::StrictVerificationRequired {
-                literal_path: entry.literal_path,
-                kind,
-            });
-        }
-        Ok(StandingRoute { entry })
-    }
-
     /// Execute a standing publication while `ArtifactPublishEpoch` holds its
     /// exclusive per-root mutex continuously across WriterLease validation,
     /// admission comparison, caller-supplied fingerprint/generation comparisons,
@@ -868,35 +800,6 @@ fn mark_kinds_needing_strict_verify(
     tx.commit()
         .map_err(standing_roots::StandingRootError::from)?;
     Ok(())
-}
-
-fn path_depth(path: &Path) -> usize {
-    path.components().count()
-}
-
-/// Route containment must compare the same canonical spelling recorded for an
-/// entry, while still accepting an explicit path whose final file is absent.
-fn canonicalize_existing_ancestor(path: &Path) -> PathBuf {
-    if let Ok(canonical) = std::fs::canonicalize(path) {
-        return canonical;
-    }
-    let mut missing = Vec::new();
-    let mut ancestor = path;
-    while !ancestor.exists() {
-        let Some(name) = ancestor.file_name() else {
-            return path.to_path_buf();
-        };
-        missing.push(name.to_os_string());
-        let Some(parent) = ancestor.parent() else {
-            return path.to_path_buf();
-        };
-        ancestor = parent;
-    }
-    let mut canonical = std::fs::canonicalize(ancestor).unwrap_or_else(|_| ancestor.to_path_buf());
-    for component in missing.iter().rev() {
-        canonical.push(component);
-    }
-    canonical
 }
 
 fn now_ms() -> i64 {
@@ -1457,30 +1360,6 @@ mod tests {
     }
 
     #[test]
-    fn route_falls_back_to_shallower_entry_and_discloses_it() {
-        let storage = tempdir().unwrap();
-        let outer = tempdir().unwrap();
-        let inner = outer.path().join("inner");
-        std::fs::create_dir(&inner).unwrap();
-        let roots = StandingRoots::default();
-        let cfg = config(
-            storage.path(),
-            vec![
-                root(outer.path(), vec![IndexKind::Search]),
-                root(&inner, vec![IndexKind::Callgraph]),
-            ],
-        );
-        roots.reconcile(&cfg).unwrap();
-        roots
-            .record_strict_verification(outer.path().to_str().unwrap(), IndexKind::Search)
-            .unwrap();
-        let route = roots
-            .route_explicit_path(&inner.join("file.rs"), IndexKind::Search)
-            .unwrap();
-        assert_eq!(route.entry.literal_path, outer.path().to_string_lossy());
-    }
-
-    #[test]
     fn publication_is_a_noop_after_bind_epoch_revocation() {
         let storage = tempdir().unwrap();
         let root_dir = tempdir().unwrap();
@@ -1642,30 +1521,34 @@ mod tests {
             storage.path(),
             vec![root(root_dir.path(), vec![IndexKind::Search])],
         );
+        let literal = root_dir.path().to_str().unwrap();
         let first = StandingRoots::default();
         first.reconcile(&cfg).unwrap();
         first
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
         first
-            .mark_observation_gap(root_dir.path().to_str().unwrap(), &[IndexKind::Search])
+            .mark_observation_gap(literal, &[IndexKind::Search])
             .unwrap();
         drop(first);
 
         // Restarting between verification and its transaction commit must retain
-        // the durable gap and reject a query rather than serving its baseline.
+        // the durable gap, so a query reading the flag rejects the baseline.
         let restarted = StandingRoots::default();
         restarted.reconcile(&cfg).unwrap();
-        assert!(matches!(
-            restarted.route_explicit_path(&root_dir.path().join("missing.rs"), IndexKind::Search),
-            Err(StandingRouteError::StrictVerificationRequired { .. })
-        ));
+        assert!(strict(storage.path(), literal, IndexKind::Search));
         restarted
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
-        assert!(restarted
-            .route_explicit_path(&root_dir.path().join("missing.rs"), IndexKind::Search)
-            .is_ok());
+        assert!(!strict(storage.path(), literal, IndexKind::Search));
+    }
+
+    /// The durable strict-verification flag, as queries read it.
+    fn strict(storage: &Path, literal_path: &str, kind: IndexKind) -> bool {
+        let conn = crate::db::open(&storage.join("aft.db")).unwrap();
+        standing_roots::needs_strict_verify(&conn, literal_path, kind)
+            .unwrap()
+            .expect("a freshness row")
     }
 
     #[test]
@@ -1685,10 +1568,7 @@ mod tests {
         roots
             .mark_observation_gap(literal, &[IndexKind::Search])
             .unwrap();
-        assert!(matches!(
-            roots.route_explicit_path(&root_dir.path().join("query.rs"), IndexKind::Search),
-            Err(StandingRouteError::StrictVerificationRequired { .. })
-        ));
+        assert!(strict(storage.path(), literal, IndexKind::Search));
     }
 
     #[test]
@@ -1700,31 +1580,21 @@ mod tests {
             storage.path(),
             vec![root(root_dir.path(), vec![IndexKind::Search])],
         );
+        let literal = root_dir.path().to_str().unwrap();
         roots.reconcile(&cfg).unwrap();
         roots
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
-        let build = roots
-            .admit_build(root_dir.path().to_str().unwrap())
-            .unwrap();
-        roots
-            .begin_case_a_bind(root_dir.path().to_str().unwrap())
-            .unwrap();
+        let build = roots.admit_build(literal).unwrap();
+        roots.begin_case_a_bind(literal).unwrap();
         assert!(build.checkpoint());
         std::fs::write(root_dir.path().join("edited.rs"), "fn changed() {}\n").unwrap();
+        roots.resume_after_session(literal, &[]).unwrap();
+        assert!(strict(storage.path(), literal, IndexKind::Search));
         roots
-            .resume_after_session(root_dir.path().to_str().unwrap(), &[])
+            .record_strict_verification(literal, IndexKind::Search)
             .unwrap();
-        assert!(matches!(
-            roots.route_explicit_path(&root_dir.path().join("edited.rs"), IndexKind::Search),
-            Err(StandingRouteError::StrictVerificationRequired { .. })
-        ));
-        roots
-            .record_strict_verification(root_dir.path().to_str().unwrap(), IndexKind::Search)
-            .unwrap();
-        assert!(roots
-            .route_explicit_path(&root_dir.path().join("edited.rs"), IndexKind::Search)
-            .is_ok());
+        assert!(!strict(storage.path(), literal, IndexKind::Search));
     }
 
     #[test]

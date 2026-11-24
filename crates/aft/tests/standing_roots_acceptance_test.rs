@@ -8,11 +8,10 @@
 //! | Acceptance row | Executor |
 //! | --- | --- |
 //! | Serialized entries, dependency closure, and trust boundary | `config_resolve::tests::index_roots_are_user_only_normalized_and_validate_before_resolution`; `config_resolve::tests::index_roots_project_and_mcp_tiers_are_rejected_at_the_trust_boundary` |
-//! | Shared `aft.db`, migration, and busy-timeout-before-WAL | `db::tests::migration_runner_advances_version`; `db::tests::pragmas_applied_correctly`; `shared_database_and_overlapping_route_smoke` |
+//! | Shared `aft.db`, migration, and busy-timeout-before-WAL | `db::tests::migration_runner_advances_version`; `db::tests::pragmas_applied_correctly`; `shared_database_smoke` |
 //! | Transactional strict clear and crash recovery | `db::standing_roots::tests::strict_verification_clear_is_atomic_and_drop_before_commit_keeps_flag`; `standing_roots::tests::crash_before_freshness_clear_blocks_verify_on_query_until_transactional_clear` |
 //! | Resolved-path drift | `subc::health::tests::standing_health_names_resolved_path_drift_without_re_recording`; `scoped_key::tests::symlink_retargeting_resolves_to_a_different_pinned_identity` |
 //! | Three artifact identities, scoped vectors, worktrees, and duplicates | `scoped_key::tests::subtree_key_never_equals_or_prewarms_the_repository_session_key`; `scoped_key::tests::non_git_roots_use_the_existing_path_scope_key`; `scoped_key::tests::scoped_v1_has_domain_separation_and_stable_bytes`; `scoped_key::tests::scoped_v1_preserves_unicode_case_and_never_normalizes`; `scoped_key::tests::scoped_v1_rejects_unsafe_logical_paths`; `scoped_key::tests::same_repo_worktree_and_logical_subtree_share_scoped_v1_key`; `scoped_key::tests::duplicate_artifact_keys_are_refused_before_admission` |
-//! | Overlapping route selection and disclosure | `standing_roots::tests::route_falls_back_to_shallower_entry_and_discloses_it`; `shared_database_and_overlapping_route_smoke` |
 //! | Initial and periodic maintenance, cadence, and coalescing | `subc::standing::tests::standing_interval_uses_the_existing_subc_maintenance_cadence`; `standing_roots::tests::maintenance_snapshot_preserves_configuration_and_fixed_kind_order`; executor coalescing is exercised by `subc::standing::StandingActor::submit_entry_pass` |
 //! | Case-A publication fence and paired admission epoch | `standing_roots::tests::publication_is_a_noop_after_bind_epoch_revocation`; `standing_roots::tests::publication_fence_holds_epoch_mutex_through_final_rename`; `case_a_fence_and_resume_smoke` |
 //! | Suspension-resume freshness and shared-key selection | `standing_roots::tests::suspension_edit_resume_requires_strict_verification_before_query`; `standing_roots::tests::shared_key_handoff_preserves_session_proven_kind_and_marks_other_kind`; `case_a_fence_and_resume_smoke` |
@@ -41,7 +40,7 @@ use aft::db::standing_roots::{get_standing_root, mark_needs_strict_verify, needs
 use aft::parser::TreeSitterProvider;
 use aft::protocol::{RawRequest, Response};
 use aft::root_cache::{configure_artifact_access, RootCacheDomain, WriterLease};
-use aft::standing_roots::{StandingRoots, StandingRouteError};
+use aft::standing_roots::StandingRoots;
 use serde_json::Value;
 
 fn config(storage: &Path, roots: Vec<IndexRootConfig>) -> Config {
@@ -126,7 +125,7 @@ fn has_stale_snapshot_warning(response: &Value) -> bool {
 }
 
 #[test]
-fn shared_database_and_overlapping_route_smoke() {
+fn shared_database_smoke() {
     let storage = tempfile::tempdir().expect("storage directory");
     let outer = tempfile::tempdir().expect("outer root");
     let inner = outer.path().join("inner");
@@ -158,18 +157,6 @@ fn shared_database_and_overlapping_route_smoke() {
     assert_eq!(
         needs_strict_verify(&conn, &literal_outer, IndexKind::Search).expect("freshness row"),
         Some(false)
-    );
-
-    let route = cli
-        .route_explicit_path(&inner.join("query.rs"), IndexKind::Search)
-        .expect("shallower selected entry serves search");
-    assert_eq!(route.entry.literal_path, literal_outer);
-    assert_eq!(
-        cli.route_explicit_path(&inner.join("query.rs"), IndexKind::Semantic),
-        Err(StandingRouteError::KindUnavailable {
-            deepest_literal_path: inner.display().to_string(),
-            deepest_selection: vec![IndexKind::Callgraph],
-        })
     );
 }
 
@@ -223,10 +210,11 @@ fn case_a_fence_and_resume_smoke() {
     roots
         .resume_after_session(&literal_path, &[])
         .expect("standing resume");
-    assert!(matches!(
-        roots.route_explicit_path(&root_dir.path().join("query.rs"), IndexKind::Search),
-        Err(StandingRouteError::StrictVerificationRequired { .. })
-    ));
+    let conn = aft::db::open(&storage.path().join("aft.db")).expect("shared database");
+    assert_eq!(
+        needs_strict_verify(&conn, &literal_path, IndexKind::Search).expect("freshness row"),
+        Some(true)
+    );
 }
 
 /// A standing root holding one source file, in a Git repository, and a user
