@@ -2850,9 +2850,9 @@ mod tests {
 
         // nixfmt formats only Nix: the same value under another language's
         // key must contribute no candidate, not run nixfmt over that file.
-        // The Cargo.toml below makes auto-detection a live rustfmt candidate,
-        // so a refusal that silently fell through to detection instead of
-        // contributing nothing would surface rustfmt and trip is_empty().
+        // With a Cargo.toml present, auto-detection would offer rustfmt for
+        // Rust, so a refusal that silently fell through to detection instead
+        // of contributing nothing would surface rustfmt and trip is_empty().
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
         let mut cross = crate::config::Config::default();

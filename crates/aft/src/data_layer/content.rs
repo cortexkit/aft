@@ -1517,7 +1517,7 @@ mod tests {
         // it still has to be reported.
         // A comment sits inside the innermost wrapper so the doc-comment
         // walk traverses the full depth with real comments in range. That
-        // core comment sits at byte ~10,011 of the header, past the 1024-byte
+        // core comment sits at byte ~10,016 of the header, past the 1024-byte
         // signature truncation every outline symbol passes through before
         // storage (extract_symbols_from_tree_with, cloned into the outline
         // at callgraph.rs:1784-1787), so it cannot answer whether comments
