@@ -53,3 +53,6 @@ aft-db = { path = "../aft-db", version = "0.66.0", features = ["test-support"] }
 graphql-parser = "0.4.1"
 tempfile = "3"
 tokio = { version = "1", features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+landlock = "=0.4.5"

@@ -163,7 +163,8 @@ impl Refusal {
         )
     }
 
-    pub(crate) fn agent_text(&self) -> String {
+    #[doc(hidden)]
+    pub fn agent_text(&self) -> String {
         format!("{}: {}", self.code.as_str(), self.text())
     }
 

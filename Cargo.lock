@@ -320,6 +320,7 @@ dependencies = [
  "glob",
  "graphql-parser",
  "image",
+ "landlock",
  "libc",
  "log",
  "parking_lot",

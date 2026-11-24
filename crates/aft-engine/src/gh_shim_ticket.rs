@@ -7,7 +7,17 @@ use aft_github::gh_shim_ticket::{
 
 use crate::bash_background::{persistence::PersistedTask, registry::scope_for_spawn};
 
-pub use aft_github::gh_shim_ticket::*;
+#[cfg(all(test, unix))]
+pub(crate) use ticket::live_count_for_task;
+pub use ticket::{
+    finish_pty_seal_or_revoke, mark_spawn_background, promote_speech_task, pty_seal_required,
+    redeem, revoke_task, spawn_ticket_guard, speech_for_task, Redeemed, GH_SHIM_TICKET_ENV,
+    GH_SHIM_WORKER_ENV,
+};
+#[cfg(unix)]
+pub use ticket::{
+    redeem_worker_read, renew_worker_read_deadline, worker_read_deadline, worker_read_scope_matches,
+};
 
 /// A ticket for a background task that has not been bound to its task ID yet.
 pub struct PendingTicket(ticket::PendingTicket);

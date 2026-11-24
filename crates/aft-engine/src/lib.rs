@@ -209,7 +209,6 @@ pub use aft_inspect::lsp_hints;
 pub mod memory;
 pub use aft_index::memory_census;
 pub mod native_route;
-pub(crate) use aft_base::native_stat;
 pub use aft_base::ndjson_text;
 pub use aft_base::ort_lifecycle;
 pub use aft_index::ort_pin;
@@ -228,7 +227,6 @@ pub use aft_edit::patch;
 pub mod persisted_format;
 pub(crate) use aft_base::pinned_dir;
 pub mod pinned_executable;
-use aft_base::platform_tls;
 pub(crate) use aft_base::policy_path;
 #[cfg(unix)]
 pub(crate) use aft_base::posix_spawn;
@@ -299,6 +297,7 @@ pub use aft_base::tool_path;
 use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
+#[cfg(test)]
 pub(crate) use aft_base::walk_boundary;
 pub use aft_base::write_counters;
 pub use aft_index::url_fetch;
