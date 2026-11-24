@@ -1053,11 +1053,14 @@ pub(crate) fn macro_gap_paths(
         return Ok(Vec::new());
     }
     let fence = crate::context::confinement::capture();
-    let sites = store.ref_sites_named(
-        MACRO_MENTION_REF_KIND,
-        crate::calls::MACRO_MENTION_OVERFLOW_KEY,
-        super::surfaces::INDEX_GAP_PREVIEW,
-    )?;
+    let sites = store
+        .ref_sites_named(
+            crate::calls::MACRO_MENTION_OVERFLOW_KEY,
+            &[(MACRO_MENTION_REF_KIND, super::surfaces::INDEX_GAP_PREVIEW)],
+        )?
+        .into_iter()
+        .next()
+        .unwrap_or_default();
     Ok(sites
         .into_iter()
         .map(|site| store.project_root().join(site.file))
