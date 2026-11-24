@@ -20,6 +20,10 @@ pub struct DirEntry {
 }
 
 pub trait ProjectFacts {
+    /// Only direct disk navigation may reuse answers validated by live metadata.
+    fn uses_live_filesystem(&self) -> bool {
+        false
+    }
     /// Whether the resolver should record which configuration fields it reads.
     fn records_config_facts(&self) -> bool {
         false

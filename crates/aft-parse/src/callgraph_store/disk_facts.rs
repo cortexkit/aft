@@ -21,6 +21,10 @@ impl DiskFacts {
 }
 
 impl ProjectFacts for DiskFacts {
+    fn uses_live_filesystem(&self) -> bool {
+        true
+    }
+
     fn is_file(&self, rel: &[u8]) -> bool {
         self.project_root.join(byte_path(rel)).is_file()
     }
