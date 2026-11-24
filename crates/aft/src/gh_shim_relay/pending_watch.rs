@@ -54,15 +54,19 @@ mod tests {
     use crate::gh_shim_speech::Code;
 
     #[tokio::test(start_paused = true)]
-    async fn a_two_second_post_reads_the_database_at_most_three_times() {
-        let in_memory = Arc::new(AtomicUsize::new(0));
+    async fn two_seconds_of_ticks_read_the_database_at_most_three_times() {
+        let ticks = Arc::new(AtomicUsize::new(0));
         let durable = Arc::new(AtomicUsize::new(0));
-        let watch = until_refused(
+        // The post ends on the 22nd tick: 2.1 s of watching at 100 ms a tick.
+        until_refused(
             {
-                let in_memory = Arc::clone(&in_memory);
+                let ticks = Arc::clone(&ticks);
                 move || {
-                    in_memory.fetch_add(1, Ordering::SeqCst);
-                    Ok(())
+                    if ticks.fetch_add(1, Ordering::SeqCst) == 21 {
+                        Err(Refusal::new(Code::AuthorityUnavailable, "post_finished"))
+                    } else {
+                        Ok(())
+                    }
                 }
             },
             {
@@ -72,12 +76,10 @@ mod tests {
                     Ok(())
                 }
             },
-        );
-        // The post itself takes two seconds on the paused test clock.
-        assert!(tokio::time::timeout(Duration::from_secs(2), watch)
-            .await
-            .is_err());
-        assert_eq!(in_memory.load(Ordering::SeqCst), 21);
+        )
+        .await;
+        assert_eq!(ticks.load(Ordering::SeqCst), 22);
+        // Ticks 0, 10 and 20; checking on every tick made it 21.
         assert_eq!(durable.load(Ordering::SeqCst), 3);
     }
 
