@@ -210,10 +210,12 @@ pub(crate) fn cap_final_output_preserving(
         marker,
         final_lines,
         failed,
+        false,
     );
     pieced.into_capped(truncated)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cap_preserving_pieces(
     input: &str,
     threshold: usize,
@@ -222,6 +224,7 @@ fn cap_preserving_pieces(
     marker: Option<&str>,
     final_lines: &[String],
     rescue_failures: bool,
+    bound_ordinary_last_line: bool,
 ) -> (PiecedText, bool) {
     cap_test_verdict(
         input,
@@ -231,6 +234,7 @@ fn cap_preserving_pieces(
         marker,
         final_lines,
         rescue_failures,
+        bound_ordinary_last_line,
     )
     .map(|pieced| (pieced, true))
     .unwrap_or_else(|| match marker {
@@ -293,7 +297,7 @@ pub(crate) fn cap_completion_output_preserving_pieces(
 ) -> (PiecedText, bool) {
     let (threshold, head, tail) = completion_caps(exit_ok);
     // Completion previews are a short glance; full replies keep failure lines.
-    cap_preserving_pieces(input, threshold, head, tail, marker, final_lines, false)
+    cap_preserving_pieces(input, threshold, head, tail, marker, final_lines, false, true)
 }
 
 /// Reserve the runner's verdict before spending bytes on ordinary head/tail
@@ -303,6 +307,10 @@ pub(crate) fn cap_completion_output_preserving_pieces(
 ///
 /// The byte cap is soft when mandatory names/totals or final command lines
 /// themselves exceed it: the verdict takes precedence over the preview budget.
+/// With `bound_ordinary_last_line` (completion previews), an ordinary last line
+/// too long for the budget is not made mandatory: with no verdict or stream
+/// ending to protect, the ordinary head/tail cut keeps a marked fragment.
+#[allow(clippy::too_many_arguments)]
 fn cap_test_verdict(
     input: &str,
     threshold: usize,
@@ -311,6 +319,7 @@ fn cap_test_verdict(
     marker: Option<&str>,
     final_lines: &[String],
     rescue_failures: bool,
+    bound_ordinary_last_line: bool,
 ) -> Option<PiecedText> {
     if input.len() + marker.map_or(0, |marker| marker.len() + 1) <= threshold {
         return None;
@@ -320,10 +329,11 @@ fn cap_test_verdict(
     // Even a non-runner command's last line is never split by a compressed
     // byte cap. Ordinary fitting tails retain their original cap policy.
     let last = lines.len().checked_sub(1)?;
+    let last_line_overflows = bound_ordinary_last_line && lines[last].len() >= threshold;
     if !rescue_failures
         && verdict.is_none()
         && final_lines.is_empty()
-        && lines[last].len() <= keep_tail
+        && (lines[last].len() <= keep_tail || last_line_overflows)
     {
         return None;
     }
@@ -1056,6 +1066,32 @@ mod tests {
         const {
             assert!(COMPLETION_FAILURE_PREVIEW_BYTES > COMPLETION_SUCCESS_PREVIEW_BYTES);
             assert!(COMPLETION_FAILURE_PREVIEW_BYTES < 4 * 1024);
+        }
+    }
+
+    /// One long ordinary line (no test verdict) must not make the whole line
+    /// mandatory in a completion preview: the preview keeps a marked fragment
+    /// within its budget, and the marker points at the full output.
+    #[test]
+    fn completion_cap_bounds_a_single_long_ordinary_line() {
+        let marker = "[truncated output; full output: read /tmp/task/stdout]";
+        for (exit_ok, budget) in [
+            (true, COMPLETION_SUCCESS_PREVIEW_BYTES),
+            (false, COMPLETION_FAILURE_PREVIEW_BYTES),
+        ] {
+            for input in ["z".repeat(48 * 1024), format!("first\n{}", "z".repeat(48 * 1024))] {
+                let capped = cap_completion_output_with_marker(&input, marker, exit_ok);
+                assert!(capped.truncated);
+                assert!(capped.text.contains(marker), "{}", capped.text);
+                assert!(
+                    capped.text.len() <= budget + marker.len() + 2,
+                    "exit_ok={exit_ok}: {} bytes",
+                    capped.text.len()
+                );
+                let unmarked = cap_completion_output(&input, exit_ok);
+                assert!(unmarked.truncated);
+                assert!(unmarked.text.len() <= budget + 128, "{} bytes", unmarked.text.len());
+            }
         }
     }
 
