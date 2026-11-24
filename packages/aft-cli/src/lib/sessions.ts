@@ -118,18 +118,21 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
         }
       })
       .filter((entry): entry is { filePath: string; mtimeMs: number } => entry !== null)
-      .sort((a, b) => b.mtimeMs - a.mtimeMs)
-      .slice(0, MAX_RECENT_SESSIONS * 4);
+      .sort((a, b) => b.mtimeMs - a.mtimeMs);
 
     const sessions: RecentSession[] = [];
     for (const file of files) {
-      const parsed = parsePiSessionJsonl(
-        readFileSync(file.filePath, "utf8"),
-        basename(file.filePath),
-      );
-      if (!parsed) continue;
-      sessions.push({ ...parsed, lastActivity: file.mtimeMs });
-      if (sessions.length >= MAX_RECENT_SESSIONS) break;
+      try {
+        const parsed = parsePiSessionJsonl(
+          readFileSync(file.filePath, "utf8"),
+          basename(file.filePath),
+        );
+        if (!parsed) continue;
+        sessions.push({ ...parsed, lastActivity: file.mtimeMs });
+        if (sessions.length >= MAX_RECENT_SESSIONS) break;
+      } catch {
+        continue;
+      }
     }
     return sessions;
   } catch {

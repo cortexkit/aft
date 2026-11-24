@@ -142,4 +142,39 @@ describe("listPiSessionsFromDir", () => {
       rmSync(root, { recursive: true, force: true });
     }
   });
+
+  test("continues past newer unusable candidates to find older valid sessions", () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-pi-sessions-invalid-"));
+    try {
+      for (let i = 0; i < 5; i += 1) {
+        const id = `019e6307-0749-4000-9000-10000000000${i}`;
+        const file = join(root, `valid-${id}.jsonl`);
+        writeFileSync(
+          file,
+          [
+            JSON.stringify({ type: "session", id }),
+            JSON.stringify({ type: "message", message: { role: "user", content: `valid ${i}` } }),
+          ].join("\n"),
+        );
+        const date = new Date(1_700_000_000_000 + i * 1000);
+        utimesSync(file, date, date);
+      }
+      for (let i = 0; i < 20; i += 1) {
+        const file = join(root, `incomplete-${i}.jsonl`);
+        writeFileSync(file, JSON.stringify({ type: "model_change", modelId: "gpt" }));
+        const date = new Date(1_800_000_000_000 + i * 1000);
+        utimesSync(file, date, date);
+      }
+
+      expect(listPiSessionsFromDir(root).map((session) => session.title)).toEqual([
+        "valid 4",
+        "valid 3",
+        "valid 2",
+        "valid 1",
+        "valid 0",
+      ]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 });
