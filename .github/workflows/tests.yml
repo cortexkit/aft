@@ -350,7 +350,9 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.release-binary.outputs.cache-hit != 'true'
         with:
-          shared-key: search-quality-ci-storm
+          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          shared-key: linux-search-ci-storm-wasm
+          env-vars: ImageOS
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # The scored benchmark uses the ci-storm profile (opt-level 3 like the
@@ -387,6 +389,28 @@ jobs:
         with:
           path: target/ci-storm/aft
           key: ${{ steps.release-binary.outputs.cache-primary-key }}
+
+  rust-cache-prune:
+    name: Prune superseded Linux Rust caches
+    # Swatinem saves in post-job steps. Wait for the producers to finish and
+    # keep cache deletion permission out of the build jobs.
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' }}
+    needs: [unit, e2e, search-quality-binary]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    continue-on-error: true
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - name: Retain two caches per compatible lane
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUST_CACHE_NAMESPACE: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+        run: python3 scripts/prune-rust-cache.py
 
   search-quality-gate:
     name: search-quality-gate
