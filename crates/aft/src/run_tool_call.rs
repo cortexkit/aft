@@ -787,7 +787,57 @@ pub fn run_tool_call(
     app_ctx: &AppContext,
     dispatch: &DispatchFn<'_>,
     finalizer: Option<&FinalizeFn<'_>>,
+    phase_trace: Option<&mut PhaseTrace>,
+) -> ToolCallOutcome {
+    run_tool_call_with_origin(
+        bare_name,
+        args,
+        format_context,
+        ctx,
+        app_ctx,
+        dispatch,
+        finalizer,
+        phase_trace,
+        CallOrigin::Agent,
+    )
+}
+
+pub(crate) fn run_carrier_tool_call(
+    bare_name: &str,
+    args: Value,
+    format_context: &crate::subc_format::FormatContext,
+    ctx: &ToolCallContext,
+    app_ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+) -> ToolCallOutcome {
+    run_tool_call_with_origin(
+        bare_name,
+        args,
+        format_context,
+        ctx,
+        app_ctx,
+        dispatch,
+        None,
+        None,
+        CallOrigin::Carrier,
+    )
+}
+
+enum CallOrigin {
+    Agent,
+    Carrier,
+}
+
+fn run_tool_call_with_origin(
+    bare_name: &str,
+    args: Value,
+    format_context: &crate::subc_format::FormatContext,
+    ctx: &ToolCallContext,
+    app_ctx: &AppContext,
+    dispatch: &DispatchFn<'_>,
+    finalizer: Option<&FinalizeFn<'_>>,
     mut phase_trace: Option<&mut PhaseTrace>,
+    origin: CallOrigin,
 ) -> ToolCallOutcome {
     // The allocation tracer attributes what the call allocates, including
     // pool work that carries the label, to the tool.
@@ -803,16 +853,19 @@ pub fn run_tool_call(
         .session_id
         .as_deref()
         .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-    let repeat = RepeatObservation::for_agent_call(
-        session_id,
-        bare_name,
-        &args,
-        ctx.preview,
-        ctx.worker_session,
-        format_context
-            .bash_watch_available
-            .unwrap_or(ctx.worker_session),
-    );
+    let repeat = match origin {
+        CallOrigin::Agent => RepeatObservation::for_agent_call(
+            session_id,
+            bare_name,
+            &args,
+            ctx.preview,
+            ctx.worker_session,
+            format_context
+                .bash_watch_available
+                .unwrap_or(ctx.worker_session),
+        ),
+        CallOrigin::Carrier => None,
+    };
     // Only a dispatched call is finalized; a translation or request-shape refusal never was.
     let mut finalize_after_breaker = false;
     let mut result = match prepare_tool_call(
