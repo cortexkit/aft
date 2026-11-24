@@ -1173,6 +1173,18 @@ fn github_read_response(
             page.truncated,
         )
     } else {
+        // A start past the end selects nothing. An empty success would read
+        // as "those lines exist and are empty", as for file reads.
+        if start_line > completion.total_lines && completion.total_lines > 0 {
+            return Response::error(
+                &req.id,
+                "invalid_range",
+                format!(
+                    "invalid_range: startLine {start_line} is past the end of the document ({total} lines); no lines selected. Use a start line between 1 and {total}.",
+                    total = completion.total_lines
+                ),
+            );
+        }
         let lines_read = completion.content.lines().count();
         let actual_end = start_line.saturating_add(lines_read.saturating_sub(1));
         (
@@ -2835,6 +2847,45 @@ mod tests {
             (50_000..=100_000).contains(&bytes),
             "retained {bytes} bytes"
         );
+    }
+
+    #[test]
+    fn github_read_page_past_the_end_is_refused_not_reported_complete() {
+        let request = RawRequest {
+            id: "github-past-end".to_string(),
+            command: "read".to_string(),
+            lsp_hints: None,
+            session_id: None,
+            params: json!({ "file": "issue://7", "start_line": 3 }),
+        };
+        let canonical = "line one\nline two\n";
+        let completion = |start_line| GithubReadCompletion {
+            content: crate::github_read::apply_selector(
+                canonical,
+                crate::github_read::GithubReadSelector::LineRange {
+                    start_line,
+                    end_line: None,
+                    limit: 2000,
+                },
+            ),
+            total_lines: 2,
+            freshness: crate::github_read::GithubReadFreshness::Fetched,
+            attachments: Vec::new(),
+            document: None,
+            diff_page: None,
+        };
+
+        let response = github_read_response(&request, completion(3), 3);
+        assert!(!response.success, "{:?}", response.data);
+        assert_eq!(response.data["code"], "invalid_range");
+        let message = response.data["message"].as_str().unwrap();
+        assert!(message.contains("(2 lines)"), "{message}");
+
+        // The last line itself is still an ordinary page.
+        let response = github_read_response(&request, completion(2), 2);
+        assert!(response.success);
+        assert_eq!(response.data["content"], "line two\n");
+        assert_eq!(response.data["end_line"], 2);
     }
 
     #[test]
