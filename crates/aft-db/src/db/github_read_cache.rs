@@ -95,6 +95,16 @@ pub fn lookup_github_read_cache_entry(
     key: &GithubReadCacheKey,
 ) -> rusqlite::Result<Option<GithubReadCacheEntry>> {
     ensure_github_read_cache_schema(conn)?;
+    lookup_github_read_cache_entry_after_schema(conn, key)
+}
+
+/// [`lookup_github_read_cache_entry`] for a caller that already ran
+/// [`ensure_github_read_cache_schema`] on this connection, so a hot read path
+/// does not repeat the schema statements on every call.
+pub fn lookup_github_read_cache_entry_after_schema(
+    conn: &Connection,
+    key: &GithubReadCacheKey,
+) -> rusqlite::Result<Option<GithubReadCacheEntry>> {
     conn.query_row(
         "SELECT canonical_text, fetched_at_ms, updated_at_ms
          FROM github_read_cache
@@ -130,6 +140,17 @@ pub fn upsert_github_read_cache_entry(
     fetched_at_ms: i64,
 ) -> rusqlite::Result<()> {
     ensure_github_read_cache_schema(conn)?;
+    upsert_github_read_cache_entry_after_schema(conn, key, canonical_text, fetched_at_ms)
+}
+
+/// [`upsert_github_read_cache_entry`] for a caller that already ran
+/// [`ensure_github_read_cache_schema`] on this connection.
+pub fn upsert_github_read_cache_entry_after_schema(
+    conn: &Connection,
+    key: &GithubReadCacheKey,
+    canonical_text: &str,
+    fetched_at_ms: i64,
+) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO github_read_cache (
             resource_kind,
@@ -185,6 +206,24 @@ pub fn invalidate_github_read_cache_resource(
     effective_authentication_identity: Option<&str>,
 ) -> rusqlite::Result<usize> {
     ensure_github_read_cache_schema(conn)?;
+    invalidate_github_read_cache_resource_after_schema(
+        conn,
+        resource_kind,
+        resolved_repository,
+        resource_number,
+        effective_authentication_identity,
+    )
+}
+
+/// [`invalidate_github_read_cache_resource`] for a caller that already ran
+/// [`ensure_github_read_cache_schema`] on this connection.
+pub fn invalidate_github_read_cache_resource_after_schema(
+    conn: &Connection,
+    resource_kind: GithubReadResourceKind,
+    resolved_repository: &str,
+    resource_number: i64,
+    effective_authentication_identity: Option<&str>,
+) -> rusqlite::Result<usize> {
     let normalized_repository = normalize_repository(resolved_repository);
 
     match effective_authentication_identity {

@@ -7,9 +7,9 @@ use parking_lot::Mutex;
 
 use crate::config::GithubConfig;
 use crate::db::github_read_cache::{
-    invalidate_github_read_cache_resource, lookup_github_read_cache_entry,
-    upsert_github_read_cache_entry, GithubReadCacheEntry, GithubReadCacheKey,
-    GithubReadResourceKind,
+    ensure_github_read_cache_schema, invalidate_github_read_cache_resource_after_schema,
+    lookup_github_read_cache_entry_after_schema, upsert_github_read_cache_entry_after_schema,
+    GithubReadCacheEntry, GithubReadCacheKey, GithubReadResourceKind,
 };
 
 use super::attachments::{
@@ -56,18 +56,38 @@ pub trait GithubReadCacheStore: Send + Sync {
         number: u64,
         authentication_identity: Option<&str>,
     ) -> Result<usize, String>;
+
+    /// Point the store at the caller's resident `aft.db` connection, if it
+    /// keeps one. Stores without a database ignore this.
+    fn attach_resident_connection(&self, _connection: Option<&SharedConnection>) {}
 }
 
+/// The context's long-lived `aft.db` connection.
+pub type SharedConnection = Arc<std::sync::Mutex<crate::db::TrackedConnection>>;
+
 /// `aft.db` implementation of the GitHub read cache seam.
-#[derive(Clone, Debug)]
+///
+/// It works through the context's resident connection when one is attached
+/// and still alive, creating the cache table once per connection. Opening the
+/// database per operation (a schema peek, PRAGMAs and the migration check on
+/// the request thread) is only the fallback for a caller with no resident
+/// connection.
 pub struct SqliteGithubReadCacheStore {
     database_path: PathBuf,
+    /// Weak, so the store never keeps a connection open after the context
+    /// has let it go.
+    resident: Mutex<std::sync::Weak<std::sync::Mutex<crate::db::TrackedConnection>>>,
+    /// Address of the resident connection the cache table was last created
+    /// on. Cleared after any failure so the next operation creates it again.
+    schema_ready_on: Mutex<Option<usize>>,
 }
 
 impl SqliteGithubReadCacheStore {
     pub fn new(database_path: impl Into<PathBuf>) -> Self {
         Self {
             database_path: database_path.into(),
+            resident: Mutex::new(std::sync::Weak::new()),
+            schema_ready_on: Mutex::new(None),
         }
     }
 
@@ -76,13 +96,43 @@ impl SqliteGithubReadCacheStore {
             .inspect(|connection| connection.close_in_background())
             .map_err(|error| format!("failed to open GitHub read cache: {error}"))
     }
+
+    /// Run `operation` on the resident connection, or on a fresh one when
+    /// there is none. `what` names the operation in the error.
+    fn run<T>(
+        &self,
+        what: &str,
+        operation: impl FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+    ) -> Result<T, String> {
+        let failed =
+            |error: rusqlite::Error| format!("failed to {what} GitHub read cache: {error}");
+        let resident = self.resident.lock().upgrade();
+        let Some(shared) = resident else {
+            let connection = self.connection()?;
+            ensure_github_read_cache_schema(&connection).map_err(failed)?;
+            return operation(&connection).map_err(failed);
+        };
+        let connection = shared
+            .lock()
+            .map_err(|_| format!("failed to {what} GitHub read cache: connection lock poisoned"))?;
+        let address = Arc::as_ptr(&shared) as usize;
+        let mut ready = self.schema_ready_on.lock();
+        if *ready != Some(address) {
+            ensure_github_read_cache_schema(&connection).map_err(failed)?;
+            *ready = Some(address);
+        }
+        operation(&connection).map_err(|error| {
+            *ready = None;
+            failed(error)
+        })
+    }
 }
 
 impl GithubReadCacheStore for SqliteGithubReadCacheStore {
     fn lookup(&self, key: &GithubReadCacheKey) -> Result<Option<GithubReadCacheEntry>, String> {
-        let connection = self.connection()?;
-        lookup_github_read_cache_entry(&connection, key)
-            .map_err(|error| format!("failed to look up GitHub read cache: {error}"))
+        self.run("look up", |connection| {
+            lookup_github_read_cache_entry_after_schema(connection, key)
+        })
     }
 
     fn upsert(
@@ -91,9 +141,14 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
         canonical_text: &str,
         fetched_at_ms: i64,
     ) -> Result<(), String> {
-        let connection = self.connection()?;
-        upsert_github_read_cache_entry(&connection, key, canonical_text, fetched_at_ms)
-            .map_err(|error| format!("failed to update GitHub read cache: {error}"))
+        self.run("update", |connection| {
+            upsert_github_read_cache_entry_after_schema(
+                connection,
+                key,
+                canonical_text,
+                fetched_at_ms,
+            )
+        })
     }
 
     fn invalidate(
@@ -105,15 +160,19 @@ impl GithubReadCacheStore for SqliteGithubReadCacheStore {
     ) -> Result<usize, String> {
         let number = i64::try_from(number)
             .map_err(|_| "GitHub resource number exceeds cache storage range".to_string())?;
-        let connection = self.connection()?;
-        invalidate_github_read_cache_resource(
-            &connection,
-            database_kind(kind),
-            repository,
-            number,
-            authentication_identity,
-        )
-        .map_err(|error| format!("failed to invalidate GitHub read cache: {error}"))
+        self.run("invalidate", |connection| {
+            invalidate_github_read_cache_resource_after_schema(
+                connection,
+                database_kind(kind),
+                repository,
+                number,
+                authentication_identity,
+            )
+        })
+    }
+
+    fn attach_resident_connection(&self, connection: Option<&SharedConnection>) {
+        *self.resident.lock() = connection.map(Arc::downgrade).unwrap_or_default();
     }
 }
 
@@ -477,6 +536,12 @@ impl GithubReadEngine {
                 effective_authentication_identity,
             )
             .map_err(cache_failure)
+    }
+
+    /// Let the cache use the caller's resident `aft.db` connection instead of
+    /// opening the database for each operation.
+    pub fn attach_resident_connection(&self, connection: Option<&SharedConnection>) {
+        self.cache.attach_resident_connection(connection);
     }
 
     fn require_enabled(&self, github: &GithubConfig) -> Result<(), GithubReadError> {
@@ -976,6 +1041,50 @@ mod tests {
         );
         assert_eq!(select(canonical, page(2, Some(2))).0, "two\n");
         assert_eq!(select(canonical, page(4, None)).0, "");
+    }
+
+    #[test]
+    fn sqlite_store_reuses_the_resident_connection_and_creates_its_table_once() {
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("aft.db");
+        let resident: SharedConnection =
+            Arc::new(std::sync::Mutex::new(crate::db::open(&database).unwrap()));
+        let store = SqliteGithubReadCacheStore::new(&database);
+        store.attach_resident_connection(Some(&resident));
+        let key = GithubReadCacheKey::new(GithubReadResourceKind::Issue, "owner/repo", 7, "id");
+
+        // Every operation used to open the database again: a read-only schema
+        // peek, PRAGMAs and the migration check, on the request thread.
+        let peeks = crate::db::schema_peek_count_for_test();
+        assert_eq!(store.lookup(&key).unwrap(), None);
+        store.upsert(&key, "# Issue\n", 1_000).unwrap();
+        assert_eq!(
+            store.lookup(&key).unwrap().unwrap().canonical_text,
+            "# Issue\n"
+        );
+        assert_eq!(
+            store
+                .invalidate(GithubResourceKind::Issue, "owner/repo", 7, Some("id"))
+                .unwrap(),
+            1
+        );
+        assert_eq!(crate::db::schema_peek_count_for_test(), peeks);
+
+        // The table is created once per connection, not before every
+        // statement: dropped behind the store's back, the next statement
+        // fails, and the one after creates it again.
+        resident
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TABLE github_read_cache")
+            .unwrap();
+        assert!(store.lookup(&key).is_err());
+        assert_eq!(store.lookup(&key).unwrap(), None);
+
+        // Once the context lets its connection go, the store opens its own.
+        drop(resident);
+        assert_eq!(store.lookup(&key).unwrap(), None);
+        assert!(crate::db::schema_peek_count_for_test() > peeks);
     }
 
     #[derive(Default)]

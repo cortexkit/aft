@@ -1047,14 +1047,18 @@ pub(crate) fn github_read_engine(ctx: &AppContext) -> Arc<GithubReadEngine> {
     let mut engines = GITHUB_READ_ENGINES
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    Arc::clone(engines.entry(database_path.clone()).or_insert_with(|| {
+    let engine = Arc::clone(engines.entry(database_path.clone()).or_insert_with(|| {
         Arc::new(GithubReadEngine::new(
-            sqlite_cache_store(database_path),
+            sqlite_cache_store(database_path.clone()),
             Arc::new(GhCliFetcher::system()),
             Arc::new(ReqwestGithubImageDownloader),
             Arc::new(SystemGithubReadClock),
         ))
-    }))
+    }));
+    drop(engines);
+    // The cache works through the context's own connection when it has one.
+    engine.attach_resident_connection(ctx.db_for_path(&database_path).as_ref());
+    engine
 }
 
 fn github_read_selector(req: &RawRequest) -> (GithubReadSelector, usize) {
