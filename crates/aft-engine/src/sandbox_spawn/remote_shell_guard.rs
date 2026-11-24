@@ -1,5 +1,6 @@
 //! The shim identifies remote shells from an inherited native policy, not environment variables.
 
+#[cfg_attr(not(target_os = "linux"), allow(unused_imports))]
 pub(crate) use aft_base::remote_shell_marker::active;
 #[cfg(target_os = "linux")]
 use aft_base::remote_shell_marker::PROBE;
