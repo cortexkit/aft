@@ -1,6 +1,11 @@
 use super::*;
 use subc_protocol::session::{HealthReport, HealthStatus, MODULE_CONTROL_OP_HEALTH_CHECK};
 
+/// Backoff bounds for retrying the first settings fetch after a transient
+/// control failure.
+const FIRST_VIEW_RETRY_MIN: Duration = Duration::from_secs(1);
+const FIRST_VIEW_RETRY_MAX: Duration = Duration::from_secs(30);
+
 pub(in crate::subc) struct LegacySettings {
     _watch: Option<crate::config_live::ConfigFileWatch>,
 }
@@ -148,19 +153,35 @@ pub(super) async fn drive_first_view(
         "settings_declaration_unavailable"
     };
     let mut should_fetch = declaration.is_some();
-    let mut declare = should_fetch;
+    // The declaration counts as sent only once the daemon acknowledged it; a
+    // declaration that timed out or failed in transit is sent again on the
+    // next attempt.
+    let declared = std::sync::atomic::AtomicBool::new(false);
+    let mut retry_delay: Option<Duration> = None;
+    let mut backoff = FIRST_VIEW_RETRY_MIN;
     loop {
         let attempt_fetch = should_fetch;
-        let attempt_declare = declare;
+        let attempt_declare = !declared.load(std::sync::atomic::Ordering::Acquire);
+        let delay = retry_delay.take();
+        let declared = &declared;
+        // True while the attempt only waits out its backoff and has no request
+        // in flight, so a `config.changed` push can restart it at once.
+        let backing_off = std::sync::atomic::AtomicBool::new(delay.is_some());
+        let backing_off = &backing_off;
         let fetch = async {
             if !attempt_fetch {
                 return std::future::pending().await;
+            }
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+                backing_off.store(false, std::sync::atomic::Ordering::Release);
             }
             let (input, schema) = declaration
                 .as_ref()
                 .ok_or("settings_declaration_unavailable")?;
             if attempt_declare {
                 let _: ConfigDeclareReply = request(control, input).await?;
+                declared.store(true, std::sync::atomic::Ordering::Release);
             }
             let reply: ConfigGetReply = request(control, &ConfigGetRequest::new()).await?;
             let recovery = reply.pending.as_ref().and_then(|_| reply.active.clone());
@@ -216,15 +237,27 @@ pub(super) async fn drive_first_view(
                         replies.resolve(frame);
                     } else if declaration.is_some() && is_changed(&frame) {
                         changed = true;
-                        if !should_fetch { break; }
+                        if !should_fetch || backing_off.load(std::sync::atomic::Ordering::Acquire) { break; }
                     } else if let Some(reply) = pre_ready_reply(&frame, declaration.as_ref().map(|(_, schema)| schema), reason).await? {
                         send_frame(writer, metrics, reply).await?;
                     }
                 }
             }
         }
-        declare = false;
-        should_fetch = changed;
+        // A transient control failure (a timeout or a lost reply) is retried
+        // with backoff even without a `config.changed` push; an unapproved or
+        // invalid configuration still waits for the daemon's push.
+        let transient = matches!(
+            reason,
+            "settings_request_failed" | "settings_catalog_unavailable"
+        );
+        if changed {
+            backoff = FIRST_VIEW_RETRY_MIN;
+        } else if transient && declaration.is_some() {
+            retry_delay = Some(backoff);
+            backoff = (backoff * 2).min(FIRST_VIEW_RETRY_MAX);
+        }
+        should_fetch = changed || retry_delay.is_some();
         if declaration.is_none() {
             reason = "settings_declaration_unavailable";
         }

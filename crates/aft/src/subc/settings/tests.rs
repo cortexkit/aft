@@ -334,6 +334,79 @@ async fn exercise_bootstrap() {
     assert_eq!(report.detail.as_deref(), Some(PENDING_HEALTH));
 }
 
+#[tokio::test(start_paused = true)]
+async fn settings_first_declaration_timeout_is_retried_without_a_push() {
+    tokio::time::timeout(Duration::from_secs(600), async {
+        let (writer, mut written) = mpsc::channel(16);
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(16);
+        let replies = readiness::PendingControlReplies::default();
+        let metrics = Arc::new(DispatchPathMetrics::new());
+        let control = readiness::DaemonControl::new(
+            writer.clone(),
+            metrics.clone(),
+            PROTOCOL_VERSION,
+            vec![],
+            vec![],
+            replies.clone(),
+            2,
+        );
+        let ctx = Arc::new(AppContext::from_app(
+            App::default_shared(),
+            crate::config::Config::default(),
+        ));
+        let schema = sample_schema();
+        let declaration =
+            ConfigDeclareRequest::new(schema.clone(), "/config/aft.jsonc", vec![]);
+        let (boot, ()) = tokio::join!(
+            startup::drive_first_view(
+                &control,
+                &ctx,
+                Some((declaration, Schema::new(schema).unwrap())),
+                &mut incoming_rx,
+                &replies,
+                &writer,
+                &metrics
+            ),
+            async {
+                // The first declaration is never answered, so it times out on
+                // the paused clock; no `config.changed` push follows.
+                let (_, first) = next(&mut written).await;
+                assert_eq!(first["op"], "config.declare");
+                let (corr, second) = next(&mut written).await;
+                assert_eq!(second["op"], "config.declare", "{second}");
+                incoming(
+                    &incoming_tx,
+                    frame(
+                        FrameType::Response,
+                        corr,
+                        json_as(golden!("config_declare_reply")),
+                    ),
+                )
+                .await;
+                let (corr, get) = next(&mut written).await;
+                assert_eq!(get, json_as::<Value>(golden!("config_get_request")));
+                // A gated answer is not transient: the module waits for a push
+                // and sends nothing more until the connection closes.
+                incoming(
+                    &incoming_tx,
+                    frame(
+                        FrameType::Error,
+                        corr,
+                        json_as(golden!("config_get_error_gated")),
+                    ),
+                )
+                .await;
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                assert!(written.try_recv().is_err());
+                drop(incoming_tx);
+            },
+        );
+        assert!(matches!(boot, Ok(Err(ModuleLoopExit::ConnectionLost))));
+    })
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn settings_changed_fetches_and_applies_pending_generation_before_ack() {
     tokio::time::timeout(Duration::from_secs(10), async {
