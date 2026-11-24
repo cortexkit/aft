@@ -133,14 +133,15 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
     const sessions: RecentSession[] = [];
     for (const file of files) {
       try {
-        const filename = basename(file.filePath);
-        const head = parsePiSessionJsonl(readPiSessionHead(file.filePath), filename);
+        const path = file.filePath;
+        const filename = basename(path);
+        const head = parsePiSessionJsonl(readPiSessionHead(path), filename);
         // Preserve late titles in older logs, but avoid the full read when the
         // head already contains both the session id and a real user title.
         const parsed =
           head && head.title !== head.id
             ? head
-            : parsePiSessionJsonl(readFileSync(file.filePath, "utf8"), filename);
+            : parsePiSessionJsonl(readFileSync(path, "utf8"), filename);
         if (!parsed) continue;
         sessions.push({ ...parsed, lastActivity: file.mtimeMs });
         if (sessions.length >= MAX_RECENT_SESSIONS) break;
@@ -154,8 +155,8 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
   }
 }
 
-function readPiSessionHead(filePath: string): string {
-  const descriptor = openSync(filePath, "r");
+function readPiSessionHead(path: string): string {
+  const descriptor = openSync(path, "r");
   try {
     const buffer = Buffer.allocUnsafe(PI_SESSION_HEAD_BYTES);
     const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);

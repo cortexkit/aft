@@ -4231,22 +4231,11 @@
     },
     {
       "path": "packages/aft-cli/src/lib/sessions.ts",
-      "line": 127,
+      "line": 136,
       "column": 27,
       "token": "filePath",
-      "text": "readFileSync(file.filePath, \"utf8\"),",
-      "location": "line 127, column 27",
-      "ordinal": 1,
-      "class": "internal-compatibility",
-      "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
-    },
-    {
-      "path": "packages/aft-cli/src/lib/sessions.ts",
-      "line": 128,
-      "column": 23,
-      "token": "filePath",
-      "text": "basename(file.filePath),",
-      "location": "line 128, column 23",
+      "text": "const path = file.filePath;",
+      "location": "line 136, column 27",
       "ordinal": 1,
       "class": "internal-compatibility",
       "reason": "The spelling is an internal variable, payload, migration, or historical compatibility reference."
