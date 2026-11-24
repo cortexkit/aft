@@ -132,7 +132,48 @@ fn audit_resolution_typescript_super_uses_extends_not_implements() {
 }
 
 #[test]
-fn python_super_follows_a_diamond_across_files_and_reused_ordinals() {
+fn audit_resolution_nested_python_body_has_only_its_own_caller() {
+    let inputs = checkout(
+        &[(
+            "a.py",
+            "def outer():\n    def inner(x=default_value()):\n        target()\n",
+        )],
+        &[],
+    );
+    let (_, parse) = inputs.parses.read("a.py").unwrap();
+    for (callee, owner) in [("target", "inner"), ("default_value", "outer")] {
+        let owners = parse
+            .refs
+            .iter()
+            .filter(|reference| reference.short_name.as_deref() == Some(callee))
+            .map(|reference| reference.caller_symbol.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(owners, [Some(owner)], "{callee}");
+    }
+}
+
+#[test]
+fn audit_resolution_nested_typescript_body_has_only_its_own_caller() {
+    let inputs = checkout(
+        &[(
+            "a.ts",
+            "function outer() { function inner() { target(); } }",
+        )],
+        &[],
+    );
+    let (_, parse) = inputs.parses.read("a.ts").unwrap();
+    let owners = parse
+        .refs
+        .iter()
+        .filter(|reference| reference.short_name.as_deref() == Some("target"))
+        .map(|reference| reference.caller_symbol.as_deref().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(owners.len(), 1, "{owners:?}");
+    assert!(owners[0].ends_with("inner"), "{owners:?}");
+}
+
+#[test]
+fn python_super_follows_a_diamond_across_files_and_nested_scopes() {
     let inputs = checkout(
         &[
             (
@@ -150,8 +191,8 @@ fn python_super_follows_a_diamond_across_files_and_reused_ordinals() {
         ],
         &[],
     );
-    // Python keeps a site for each caller a nested call has, under one
-    // syntax ordinal; the records key sites by position, not ordinal.
+    // The nested body and the enclosing function each contain one hello
+    // call; neither body should gain a second call from the other.
     let leaf = inputs.parses.read("pkg/leaf.py").unwrap().1;
     let ordinals = leaf
         .dispatch
@@ -160,7 +201,8 @@ fn python_super_follows_a_diamond_across_files_and_reused_ordinals() {
         .map(|site| site.ordinal)
         .collect::<Vec<_>>();
     let distinct = ordinals.iter().collect::<std::collections::BTreeSet<_>>();
-    assert!(distinct.len() < ordinals.len(), "{:?}", leaf.dispatch.sites);
+    assert!(ordinals.len() >= 3, "{:?}", leaf.dispatch.sites);
+    assert_eq!(distinct.len(), ordinals.len(), "{:?}", leaf.dispatch.sites);
     let resolved = records_match_files(&inputs);
     // D's resolution order is D, B, C, A: B declares no `hello`, so D's
     // super() reaches C's, not A's.

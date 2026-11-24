@@ -1118,6 +1118,7 @@ struct SymbolCallRange {
     symbol_index: usize,
     byte_start: usize,
     byte_end: usize,
+    callable_body: Option<std::ops::Range<usize>>,
 }
 
 test_support_visibility! {
@@ -1138,6 +1139,7 @@ fn collect_calls_by_symbol<'tree>(
         symbols,
         extract_calls_full_with(source, root, 0, source.len(), lang, nav),
         lang,
+        root,
     )
 }
 }
@@ -1207,6 +1209,7 @@ fn collect_rust_value_refs_by_symbol<'tree>(
         symbols,
         extract_rust_value_references_with(source, root, nav),
         LangId::Rust,
+        root,
     );
     // A function item remains a reference whether it is passed to an API or
     // stored for later use. The resolver rejects non-callable value candidates.
@@ -1263,14 +1266,23 @@ fn attribute_sites_to_symbols(
     symbols: &[Symbol],
     raw_sites: Vec<(String, String, u32, usize, usize)>,
     lang: LangId,
+    root: Node<'_>,
 ) -> HashMap<String, Vec<CallSite>> {
     let mut ranges = symbols
         .iter()
         .enumerate()
-        .map(|(symbol_index, symbol)| SymbolCallRange {
-            symbol_index,
-            byte_start: line_index.byte_offset(symbol.range.start_line, symbol.range.start_col),
-            byte_end: line_index.byte_offset(symbol.range.end_line, symbol.range.end_col),
+        .map(|(symbol_index, symbol)| {
+            let byte_start =
+                line_index.byte_offset(symbol.range.start_line, symbol.range.start_col);
+            let byte_end = line_index.byte_offset(symbol.range.end_line, symbol.range.end_col);
+            let callable_body = matches!(symbol.kind, SymbolKind::Function | SymbolKind::Method)
+                .then(|| callable_body(root, byte_start, byte_end).unwrap_or(byte_start..byte_end));
+            SymbolCallRange {
+                symbol_index,
+                byte_start,
+                byte_end,
+                callable_body,
+            }
         })
         .collect::<Vec<_>>();
     ranges.sort_by(|left, right| {
@@ -1303,22 +1315,28 @@ fn attribute_sites_to_symbols(
             byte_start,
             byte_end,
         };
+        let callable = active_ranges
+            .iter()
+            .map(|index| &ranges[*index])
+            .filter(|range| {
+                range
+                    .callable_body
+                    .as_ref()
+                    .is_some_and(|body| body.start <= byte_start && byte_end <= body.end)
+            })
+            .min_by_key(|range| (range.byte_end - range.byte_start, range.symbol_index));
         let mut attributed = false;
         for range_index in &active_ranges {
             let range = &ranges[*range_index];
-            // Method bodies execute when the method is called, not when its class is constructed.
-            if symbols[range.symbol_index].kind == SymbolKind::Class
-                && active_ranges.iter().any(|index| {
-                    let callable = &ranges[*index];
-                    range.byte_start <= callable.byte_start
-                        && callable.byte_end <= range.byte_end
-                        && byte_end <= callable.byte_end
-                        && matches!(
-                            symbols[callable.symbol_index].kind,
-                            SymbolKind::Function | SymbolKind::Method
-                        )
-                })
-            {
+            // An enclosing function or class does not execute a nested callable's body.
+            if callable.is_some_and(|inner| {
+                range.symbol_index != inner.symbol_index
+                    && range.byte_start <= inner.byte_start
+                    && inner.byte_end <= range.byte_end
+            }) && matches!(
+                symbols[range.symbol_index].kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Class
+            ) {
                 continue;
             }
             if byte_end <= range.byte_end {
@@ -1350,6 +1368,19 @@ fn attribute_sites_to_symbols(
         calls_by_symbol.insert(TOP_LEVEL_SYMBOL.to_string(), top_level_sites);
     }
     calls_by_symbol
+}
+
+fn callable_body(root: Node<'_>, start: usize, end: usize) -> Option<std::ops::Range<usize>> {
+    let mut node = root.descendant_for_byte_range(end.checked_sub(1)?, end)?;
+    while node.start_byte() >= start && node.end_byte() <= end {
+        if node.end_byte() == end {
+            if let Some(body) = node.child_by_field_name("body") {
+                return Some(body.byte_range());
+            }
+        }
+        node = node.parent()?;
+    }
+    None
 }
 
 pub fn build_file_data_from_source_with_lang(
@@ -1507,9 +1538,14 @@ fn build_file_data_from_tree_observed<'tree>(
         let (raw_calls, body_calls) =
             split_macro_body_calls(line_index, &symbols, raw_calls, &macro_facts.bodies);
         macro_body_calls_by_macro = body_calls;
-        macro_mentions_by_symbol =
-            attribute_sites_to_symbols(line_index, &symbols, macro_facts.unparsed_mentions, lang);
-        attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang)
+        macro_mentions_by_symbol = attribute_sites_to_symbols(
+            line_index,
+            &symbols,
+            macro_facts.unparsed_mentions,
+            lang,
+            root,
+        );
+        attribute_sites_to_symbols(line_index, &symbols, raw_calls, lang, root)
     } else {
         collect_calls_by_symbol(&source, root, lang, &symbols, line_index, nav)
     };
@@ -1538,6 +1574,7 @@ fn build_file_data_from_tree_observed<'tree>(
             &symbols,
             crate::calls::extract_go_value_references(source, root),
             lang,
+            root,
         )
     } else if matches!(lang, LangId::TypeScript | LangId::Tsx | LangId::JavaScript) {
         attribute_sites_to_symbols(
@@ -1545,6 +1582,7 @@ fn build_file_data_from_tree_observed<'tree>(
             &symbols,
             crate::calls::extract_js_callback_references_with(source, root, nav),
             lang,
+            root,
         )
     } else {
         HashMap::new()
