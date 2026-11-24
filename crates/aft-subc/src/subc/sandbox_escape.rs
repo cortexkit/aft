@@ -187,9 +187,12 @@ pub fn is_escape(permission: &Permission) -> bool {
     matches!(permission, Permission::SandboxEscape { .. })
 }
 
-/// Real sandbox_escape filing stays disabled until Cingulate's approving-device
-/// fix ships. Tests must install the fake explicitly; there is no fallback to
-/// the process's real transport even in a test build.
+/// Real sandbox_escape approval requests stay disabled. Cingulate is the daemon module
+/// that shows approval cards on the person's approving device. It must first
+/// stop accepting approvals from a key that is not a real approving device;
+/// verify that route check before enabling this gate. Tests must install the
+/// fake explicitly; there is no fallback to the process's real transport even
+/// in a test build.
 pub fn card_transport() -> Option<Arc<dyn ConsentTransport>> {
     #[cfg(test)]
     {
@@ -633,9 +636,11 @@ pub async fn complete(call: &HeldCall, result: Option<&(Response, Option<String>
         timeout: UNARY_TIMEOUT,
     };
     if let Err(error) = transport.call(report).await {
-        // A pruned acknowledged card is too late to report. Other failures are
-        // also not retried here: a duplicate execution report is never a reason
-        // to rerun the approved command.
+        // Once an answered card has been acknowledged, Cingulate may delete its
+        // retained record (prune it). No card is then left to attach an execution
+        // report to, so reporting is too late. Other failures are also not
+        // retried here: a duplicate execution report is never a reason to rerun
+        // the approved command.
         log::warn!("sandbox escape execution report failed: {error:?}");
     }
 }
