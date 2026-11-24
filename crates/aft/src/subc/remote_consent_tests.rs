@@ -258,6 +258,29 @@ async fn non_user_answer_denies_all_waiters_and_fresh_card_uses_remote_scope_and
 }
 
 #[tokio::test]
+async fn daemon_edge_allow_once_stays_with_cancelled_card_owner() {
+    let mut f = Fixture::new();
+    let one = f.request(f.call("read", Mode::Read)).await;
+    let (first, answer) = f.card().await;
+    let mut two = f.request(f.call("grep", Mode::Read)).await;
+    drop(one);
+
+    allow(answer, false);
+    f.finish().await;
+    assert!(
+        matches!(two.try_recv(), Err(oneshot::error::TryRecvError::Empty)),
+        "the first card must not authorize the queued call"
+    );
+
+    let (second, answer) = f.card().await;
+    assert_eq!(second.params["tool"], "grep");
+    assert_ne!(second.params["call_key"], first.params["call_key"]);
+    allow(answer, false);
+    f.finish().await;
+    assert_eq!(authority(two).await, Authorization::Once);
+}
+
+#[tokio::test]
 async fn allow_once_is_fifo_then_always_allow_lists_filters_upgrades_and_revokes() {
     let mut f = Fixture::new();
     let one = f.request(f.call("read", Mode::Read)).await;

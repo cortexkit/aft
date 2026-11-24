@@ -411,8 +411,7 @@ impl Authorizer {
             .remove(&group)
             .expect("matching generation")
             .waiters;
-        waiters.retain(|waiter| !waiter.receiver.is_closed());
-        if waiters.is_empty() {
+        if waiters.iter().all(|waiter| waiter.receiver.is_closed()) {
             return;
         }
         let result = result.and_then(|outcome| {
@@ -445,7 +444,10 @@ impl Authorizer {
             .as_ref()
             .is_ok_and(|authority| *authority == Authorization::Once)
         {
-            waiters.pop_front().expect("oldest waiter").finish(result);
+            // The first waiter owns the displayed card, even if it closed
+            // while the person's answer was in flight.
+            waiters.pop_front().expect("card owner").finish(result);
+            waiters.retain(|waiter| !waiter.receiver.is_closed());
             if let Some(next) = waiters.front() {
                 let (_, card) = Card::prepare(&next.call, group.can_ask);
                 self.start(group, card, waiters);
