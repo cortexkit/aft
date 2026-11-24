@@ -252,6 +252,38 @@ async fn consent_expiry_deletes_unpublished_backlog_without_touching_shell_asks(
 }
 
 #[tokio::test]
+async fn daemon_edge_reattach_retries_after_an_ask_read_failure() {
+    let _lock = CONSENT_TEST_LOCK.lock().await;
+    let (f, _endpoint) = setup(Controls::default());
+    reopen_consent_database(&f);
+    let scope = access_grants::scope_key(&f.worker);
+    let key = (scope.owner.clone(), scope.scope_ref.clone(), scope.epoch);
+    let db = f.ctx.db().unwrap();
+    let runtime = tokio::runtime::Handle::current();
+    db.lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE access_asks RENAME TO unavailable_asks")
+        .unwrap();
+    assert!(asks::for_scope(&db.lock().unwrap(), &scope).is_err());
+    reattach(&f.ctx, &f.worker, &runtime);
+    let marked_after_failure = REATTACHED.lock().unwrap().remove(&key);
+    db.lock()
+        .unwrap()
+        .execute_batch("ALTER TABLE unavailable_asks RENAME TO access_asks")
+        .unwrap();
+    assert!(
+        !marked_after_failure,
+        "an unsuccessful read suppressed future reattach attempts"
+    );
+
+    reattach(&f.ctx, &f.worker, &runtime);
+    assert!(
+        REATTACHED.lock().unwrap().remove(&key),
+        "the successful read must be recorded"
+    );
+}
+
+#[tokio::test]
 async fn consent_expiry_failed_withdrawal_keeps_the_row_for_the_next_sweep() {
     let _lock = CONSENT_TEST_LOCK.lock().await;
     let (f, endpoint) = setup(Controls::default());

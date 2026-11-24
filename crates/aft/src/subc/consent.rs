@@ -3371,10 +3371,11 @@ pub(super) fn reattach(
         return;
     }
     let scope = access_grants::scope_key(identity);
-    if !REATTACHED
+    let key = (scope.owner.clone(), scope.scope_ref.clone(), scope.epoch);
+    if REATTACHED
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert((scope.owner.clone(), scope.scope_ref.clone(), scope.epoch))
+        .contains(&key)
     {
         return;
     }
@@ -3396,7 +3397,12 @@ pub(super) fn reattach(
         }
         records
     };
-    if transport().is_none() {
+    if transport().is_none()
+        || !REATTACHED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key)
+    {
         return;
     }
     for record in records {
