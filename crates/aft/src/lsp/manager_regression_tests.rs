@@ -424,7 +424,9 @@ fn idle_lsp_restart_races_return_start_in_progress_after_three_attempts() {
             .lsp()
             .server_key_for_file(&fixture.idle, &fixture.config)
             .unwrap();
-        let locks_per_attempt = if pull { 3 } else { 2 };
+        // Both callers acquire the manager to resolve startup, then again to
+        // use the client. A pull opens the document in that second acquisition.
+        let locks_per_attempt = 2;
         let locks = std::cell::Cell::new(0);
         let detached = std::cell::RefCell::new(None);
         let detachments = std::cell::Cell::new(0);
