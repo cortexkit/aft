@@ -970,7 +970,8 @@ impl From<BTreeMap<String, FileResolution>> for Resolutions {
 /// same answer share it: an unknown receiver's answer can name thousands of
 /// methods, and every site calling that name gets it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct SiteResolution {
+#[doc(hidden)]
+pub struct SiteResolution {
     pub(crate) site: SiteHint,
     pub(crate) resolution: Arc<Resolution>,
 }

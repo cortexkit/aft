@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-#[cfg(any(test, feature = "test-timing-hooks"))]
+#[cfg(any(test, feature = "test-timing-hooks", feature = "test-support"))]
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -1754,7 +1754,7 @@ pub fn derive_excluded_subtrees(
 }
 
 /// [`derive_watcher_exclusion_plan`] for a stated backend coverage.
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 fn derive_exclusion_plan(
     root: &Path,
     matcher: &SharedGitignore,

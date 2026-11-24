@@ -564,6 +564,11 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `ignore_rules_fixture::relative_set` | test-support visibility widened | `aft-index` | Compare results using the same relative file names. |
 | `ignore_rules_fixture::assert_honours_ignore_rules` | test-support visibility widened | `aft-index` | Keep the same inclusion and exclusion assertions across consumers. |
 
+| `SiteResolution` | visibility widened | `aft-index` | Preserve use of the actual stored resolution rows by the dead-code gate. |
+| `DiskMeasurement` | visibility widened | `aft-index` | Preserve the checkout’s disk measurement used by the status test driver. |
+| `PackFingerprint` | test-support visibility widened | `aft-index` | Keep the compiled rerank fixture’s original fingerprint type in the bridge. |
+| `DirectoryArrivalGuard` | visibility widened | `aft-index` | Let composed watcher tests hold the actual in-flight arrival guard. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

@@ -21,7 +21,8 @@ pub(crate) const PACK_VERSION: u32 = 1;
 
 /// The fingerprint of the backend whose scores a pack holds.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PackFingerprint {
+#[doc(hidden)]
+pub struct PackFingerprint {
     pub(crate) backend: String,
     pub(crate) model: String,
     pub(crate) revision: String,

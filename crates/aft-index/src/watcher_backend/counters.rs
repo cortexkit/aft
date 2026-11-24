@@ -173,7 +173,8 @@ pub struct WatcherRescanInterval {
     pub raw_events: u64,
 }
 
-pub(crate) struct DirectoryArrivalGuard<'a>(&'a WatcherCounters);
+#[doc(hidden)]
+pub struct DirectoryArrivalGuard<'a>(&'a WatcherCounters);
 
 impl Drop for DirectoryArrivalGuard<'_> {
     fn drop(&mut self) {

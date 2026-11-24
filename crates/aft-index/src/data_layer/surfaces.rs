@@ -974,7 +974,8 @@ struct DiskWalk {
 /// temporary files can grow without publishing a generation. All checkouts of
 /// a family share one coalesced sampler; push and operator reads never walk the
 /// family directory on the caller's thread.
-pub(crate) struct DiskMeasurement {
+#[doc(hidden)]
+pub struct DiskMeasurement {
     family: aft_store::ids::FamilyId,
     sample: std::sync::Mutex<DiskSample>,
     listeners: std::sync::Mutex<Vec<std::sync::Weak<dyn Fn() + Send + Sync>>>,
