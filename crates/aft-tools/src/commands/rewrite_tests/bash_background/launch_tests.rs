@@ -50,12 +50,12 @@ fn windows_launchers_use_injected_production_retry_policies() {
     // in their production bodies; comments and test adapters cannot satisfy this check.
     for (source, function, callee) in [
         (
-            include_str!("../../../../../aft-engine/src/bash_background/scope_spawn.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/scope_spawn.rs"),
             "spawn_detached_child",
             "crate::windows_shell::spawn_piped_candidates",
         ),
         (
-            include_str!("../../../../../aft-engine/src/bash_background/pty_process.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/pty_process.rs"),
             "spawn_pty_for_command",
             "crate::windows_shell::spawn_pty_candidates",
         ),

@@ -10,7 +10,7 @@ const NONCE_NAMES: &[&str] = &[
     "SUBC_LAUNCH_NONCE_ENV_FD",
 ];
 const NONCE_OWNER: &str = "crates/aft-base/src/launch_nonce.rs";
-const CHILD_ENV: &str = "crates/aft-engine/src/agent_child_env.rs";
+const CHILD_ENV: &str = "crates/aft-shell/src/agent_child_env.rs";
 
 fn test_only(node: Node<'_>, source: &str) -> bool {
     let mut previous = node.prev_named_sibling();
@@ -534,11 +534,7 @@ fn scrub() {
 mod arbitrary_name { fn fixture() { std::env::var("SUBC_LAUNCH_NONCE"); } }
 "#;
     assert!(scan(rust, removals).is_empty());
-    assert!(scan(
-        Path::new("crates/aft-engine/src/sandbox_spawn.rs"),
-        removals
-    )
-    .is_empty());
+    assert!(scan(Path::new("crates/aft-shell/src/sandbox_spawn.rs"), removals).is_empty());
     assert!(scan(
         Path::new(NONCE_OWNER),
         "fn f() { subc_os::launch_nonce(); }"

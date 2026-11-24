@@ -490,13 +490,13 @@ async fn remote_queue_wait_wire_vectors_reach_bash_status_as_queued_progress() {
     // Send their bytes unchanged: enum construction can conceal pin changes.
     for (bytes, digest) in [
         (
-            include_bytes!("../../../../aft-engine/src/exec_remote/fixtures/progress/queue-wait.jcs").as_slice(),
-            include_str!("../../../../aft-engine/src/exec_remote/fixtures/progress/queue-wait.sha256"),
+            include_bytes!("../../../../aft-shell/src/exec_remote/fixtures/progress/queue-wait.jcs").as_slice(),
+            include_str!("../../../../aft-shell/src/exec_remote/fixtures/progress/queue-wait.sha256"),
         ),
         (
-            include_bytes!("../../../../aft-engine/src/exec_remote/fixtures/progress/queue-wait-unknown-reason.jcs")
+            include_bytes!("../../../../aft-shell/src/exec_remote/fixtures/progress/queue-wait-unknown-reason.jcs")
                 .as_slice(),
-            include_str!("../../../../aft-engine/src/exec_remote/fixtures/progress/queue-wait-unknown-reason.sha256"),
+            include_str!("../../../../aft-shell/src/exec_remote/fixtures/progress/queue-wait-unknown-reason.sha256"),
         ),
     ] {
         assert_eq!(format!("{:x}", Sha256::digest(bytes)), digest.trim());

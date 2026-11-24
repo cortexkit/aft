@@ -1238,7 +1238,7 @@ fn confine_answer_is_kept_once_confined() {
 
 fn plan(name: &str) -> Value {
     let root = Path::new(crate::test_support::manifest_dir())
-        .join("../aft-engine/src/exec_remote/fixtures/plans");
+        .join("../aft-shell/src/exec_remote/fixtures/plans");
     let jcs = std::fs::read(root.join(format!("{name}.jcs"))).unwrap();
     assert_eq!(
         format!("{:x}", Sha256::digest(&jcs)),

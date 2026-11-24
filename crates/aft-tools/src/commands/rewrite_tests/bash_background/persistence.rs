@@ -2,12 +2,12 @@ mod tests {
     #[test]
     fn registered_artifact_consumers_do_not_reopen_paths_directly() {
         let rust_sources = [
-            include_str!("../../../../../aft-engine/src/bash_background/buffer.rs"),
-            include_str!("../../../../../aft-engine/src/bash_background/registry.rs"),
-            include_str!("../../../../../aft-engine/src/bash_background/process.rs"),
-            include_str!("../../../../../aft-engine/src/bash_background/pty_process.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/buffer.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/registry.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/process.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/pty_process.rs"),
             include_str!("../../../../../aft-base/src/task_watches.rs"),
-            include_str!("../../../../../aft-engine/src/bash_background/watchdog.rs"),
+            include_str!("../../../../../aft-shell/src/bash_background/watchdog.rs"),
             include_str!("../../bash_status.rs"),
         ];
         for source in rust_sources {
