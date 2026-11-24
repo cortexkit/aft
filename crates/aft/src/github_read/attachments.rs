@@ -15,6 +15,10 @@ pub const MAX_GITHUB_IMAGE_ATTACHMENTS: usize = 8;
 /// total. A candidate that exceeds the remaining budget is dropped whole, so
 /// callers never receive a partial image.
 pub const MAX_GITHUB_IMAGE_ATTACHMENT_BYTES: usize = 8 * 1024 * 1024;
+/// Most image downloads one read attempts, failed ones included. Without it a
+/// thread linking many deleted images costs one request (up to a minute each)
+/// per link, since only successful downloads count toward the attachment cap.
+pub const MAX_GITHUB_IMAGE_DOWNLOAD_ATTEMPTS: usize = 2 * MAX_GITHUB_IMAGE_ATTACHMENTS;
 const MAX_IMAGE_REDIRECTS: usize = 5;
 const IMAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const IMAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
@@ -51,6 +55,55 @@ pub trait GithubImageDownloader: Send + Sync {
     ) -> Result<Option<DownloadedGithubImage>, String>;
 }
 
+/// One HTTP client for every image download: building one per image redid
+/// the TLS setup each time.
+static IMAGE_CLIENT: LazyLock<Result<Client, String>> = LazyLock::new(|| {
+    let tls = crate::platform_tls::client_config()
+        .map_err(|error| format!("failed to configure GitHub image TLS: {error}"))?;
+    Client::builder()
+        .redirect(Policy::none())
+        .connect_timeout(IMAGE_CONNECT_TIMEOUT)
+        .timeout(IMAGE_REQUEST_TIMEOUT)
+        .use_preconfigured_tls(tls)
+        .build()
+        .map_err(|error| format!("failed to build GitHub image client: {error}"))
+});
+
+/// Downloads shared by every reader of one live fetch. Coalesced readers of
+/// the same resource discover the same images, so each image is requested
+/// once per fetch, not once per reader.
+pub(crate) struct FlightImageDownloads<'a> {
+    inner: &'a dyn GithubImageDownloader,
+    results: parking_lot::Mutex<
+        std::collections::BTreeMap<(String, usize), Result<Option<DownloadedGithubImage>, String>>,
+    >,
+}
+
+impl<'a> FlightImageDownloads<'a> {
+    pub(crate) fn new(inner: &'a dyn GithubImageDownloader) -> Self {
+        Self {
+            inner,
+            results: parking_lot::Mutex::new(std::collections::BTreeMap::new()),
+        }
+    }
+}
+
+impl GithubImageDownloader for FlightImageDownloads<'_> {
+    fn download(
+        &self,
+        url: &Url,
+        maximum_bytes: usize,
+    ) -> Result<Option<DownloadedGithubImage>, String> {
+        let key = (url.to_string(), maximum_bytes);
+        if let Some(result) = self.results.lock().get(&key) {
+            return result.clone();
+        }
+        let result = self.inner.download(url, maximum_bytes);
+        self.results.lock().insert(key, result.clone());
+        result
+    }
+}
+
 /// Production GitHub-image downloader. Redirect following is manual so every
 /// target receives the same allowlist check as the original URL.
 #[derive(Default)]
@@ -65,15 +118,7 @@ impl GithubImageDownloader for ReqwestGithubImageDownloader {
         if !is_allowed_github_image_url(url) || maximum_bytes == 0 {
             return Ok(None);
         }
-        let tls = crate::platform_tls::client_config()
-            .map_err(|error| format!("failed to configure GitHub image TLS: {error}"))?;
-        let client = Client::builder()
-            .redirect(Policy::none())
-            .connect_timeout(IMAGE_CONNECT_TIMEOUT)
-            .timeout(IMAGE_REQUEST_TIMEOUT)
-            .use_preconfigured_tls(tls)
-            .build()
-            .map_err(|error| format!("failed to build GitHub image client: {error}"))?;
+        let client = IMAGE_CLIENT.as_ref().map_err(Clone::clone)?;
         let mut current = url.clone();
 
         for redirects in 0..=MAX_IMAGE_REDIRECTS {
@@ -172,14 +217,18 @@ pub fn download_github_image_attachments(
 ) -> Vec<GithubImageAttachment> {
     let mut attachments = Vec::new();
     let mut consumed_bytes = 0usize;
+    let mut attempts = 0usize;
     for url in discover_github_image_urls(canonical_text) {
-        if attachments.len() == MAX_GITHUB_IMAGE_ATTACHMENTS {
+        if attachments.len() == MAX_GITHUB_IMAGE_ATTACHMENTS
+            || attempts == MAX_GITHUB_IMAGE_DOWNLOAD_ATTEMPTS
+        {
             break;
         }
         let remaining = MAX_GITHUB_IMAGE_ATTACHMENT_BYTES.saturating_sub(consumed_bytes);
         if remaining == 0 {
             break;
         }
+        attempts += 1;
         let Ok(Some(downloaded)) = downloader.download(&url, remaining) else {
             continue;
         };
@@ -261,6 +310,28 @@ mod tests {
                 bytes: vec![137, 80, 78, 71, 13, 10, 26, 10],
             }))
         }
+    }
+
+    #[test]
+    fn failed_downloads_count_toward_a_bounded_number_of_attempts() {
+        struct Missing(Mutex<usize>);
+        impl GithubImageDownloader for Missing {
+            fn download(&self, _: &Url, _: usize) -> Result<Option<DownloadedGithubImage>, String> {
+                *self.0.lock().unwrap() += 1;
+                Ok(None)
+            }
+        }
+        // Thirty deleted images: none ever counts toward the attachment cap.
+        let text = (0..30)
+            .map(|index| format!("https://user-images.githubusercontent.com/{index}/gone.png"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let downloader = Missing(Mutex::new(0));
+        assert!(download_github_image_attachments(&text, &downloader).is_empty());
+        assert_eq!(
+            *downloader.0.lock().unwrap(),
+            MAX_GITHUB_IMAGE_DOWNLOAD_ATTEMPTS
+        );
     }
 
     #[test]

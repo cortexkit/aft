@@ -13,7 +13,8 @@ use crate::db::github_read_cache::{
 };
 
 use super::attachments::{
-    download_github_image_attachments, GithubImageAttachment, GithubImageDownloader,
+    download_github_image_attachments, FlightImageDownloads, GithubImageAttachment,
+    GithubImageDownloader,
 };
 use super::fetch::{GithubFetchRequest, GithubFetcher, GithubReadError};
 use super::render::{render_document_for_resource, render_outline_for_resource};
@@ -658,6 +659,8 @@ impl GithubReadEngine {
                     ))
                 });
                 let waiters = state.lock().flights.remove(&slot).unwrap_or_default();
+                // Coalesced readers share one download of each image.
+                let downloads = FlightImageDownloads::new(downloader.as_ref());
                 for waiter in waiters {
                     let result = match &fetched {
                         Ok(document) => {
@@ -668,7 +671,7 @@ impl GithubReadEngine {
                                         waiter.selector,
                                         canonical_text,
                                         GithubReadFreshness::Fetched,
-                                        downloader.as_ref(),
+                                        &downloads,
                                         waiter.view,
                                         Some(document.clone()),
                                     )
@@ -680,7 +683,7 @@ impl GithubReadEngine {
                                 waiter.selector,
                                 cached_fallback_text(&entry, error, waiter.request.resource.kind),
                                 GithubReadFreshness::CachedFallback,
-                                downloader.as_ref(),
+                                &downloads,
                                 waiter.view,
                                 None,
                             ),
@@ -1822,6 +1825,67 @@ mod tests {
         assert!(fetched_text(explicit).contains("Repository: team/old\n"));
         assert!(fetched_text(shorthand).contains("Repository: team/new\n"));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    /// Holds its first fetch until released; the body links two images.
+    struct ImageFetcher {
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl GithubFetcher for ImageFetcher {
+        fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            let _ = self.started.send(());
+            if let Some(release) = self.release.lock().take() {
+                release.recv().expect("release live fetch");
+            }
+            Ok(GithubDocument {
+                repository: "owner/repo".to_string(),
+                kind: GithubDocumentKind::Issue,
+                number: request.resource.number,
+                title: "fixture".to_string(),
+                state: "OPEN".to_string(),
+                body: "https://user-images.githubusercontent.com/1/a.png https://user-images.githubusercontent.com/2/b.png".to_string(),
+                ..GithubDocument::default()
+            })
+        }
+    }
+
+    #[test]
+    fn coalesced_vision_readers_download_each_image_once() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let downloader = Arc::new(CountingDownloader::default());
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(ImageFetcher {
+                started: started_tx,
+                release: Mutex::new(Some(release_rx)),
+            }),
+            downloader.clone(),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        let start = || {
+            engine
+                .start(
+                    &enabled_gh_read(),
+                    request(Some(true)),
+                    GithubReadSelector::default(),
+                )
+                .unwrap()
+        };
+        let first = start();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("live fetch started");
+        let followers = [start(), start()];
+        release_tx.send(()).expect("release the shared fetch");
+        fetched_text(first);
+        for follower in followers {
+            fetched_text(follower);
+        }
+        // Two images, three readers of one fetch: two requests, not six.
+        assert_eq!(downloader.0.load(Ordering::SeqCst), 2);
     }
 
     #[test]
