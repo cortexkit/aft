@@ -110,8 +110,9 @@ jobs:
 
       - name: Loader state and compile tests
         run: |
-          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-tools --lib -- grammar_)
+          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-edit -p aft-tools --lib -- grammar_)
           listing="$(cargo test "${args[@]}" --list)"
+          [[ "$listing" == *"extract::tests::grammar_refactor_body_failures_are_not_silently_unchanged_or_conflict_free: test"* ]] || { echo 'missing aft-edit grammar loader tests' >&2; exit 1; }
           [[ "$listing" == *"commands::grammar_tests::luau_s4_round4_non_luau_failures_preserve_main_search_contract: test"* ]] || { echo 'missing aft-tools grammar loader tests' >&2; exit 1; }
           cargo test "${args[@]}"
       - name: Process restart and concurrent publication
@@ -199,7 +200,7 @@ jobs:
 
       - name: ARM64 compile with Pulley
         run: |
-          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-engine --features test-hooks --tests --target aarch64-pc-windows-msvc
+          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine --features test-hooks --tests --target aarch64-pc-windows-msvc
           cargo tree --features wasm-grammars --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path

@@ -16,6 +16,8 @@ import tomllib
 import unittest
 from unittest import mock
 
+from release_retry import VERSION_FILES
+
 
 ROOT = Path(__file__).resolve().parents[2]
 SPEC = importlib.util.spec_from_file_location("workflow_gates", Path(__file__).with_name("workflow-gates.py"))
@@ -30,7 +32,7 @@ COVERED = {
 }
 PLATFORMS = ("darwin-arm64", "darwin-x64", "linux-arm64", "linux-x64", "win32-arm64", "win32-x64")
 TAG_PUBLISH_GUARD = "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')"
-RELEASE_CRATES = ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools")
+RELEASE_CRATES = ("aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", "aft-edit", "aft-engine", "aft-tools", "aft-subc", "agent-file-tools")
 REHEARSAL_VERSION = "0.63.5-rehearsal.1.1"
 
 
@@ -382,7 +384,7 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
                 manifest = fixture / "packages" / package / "package.json"
                 manifest.parent.mkdir(parents=True)
                 manifest.write_text(json.dumps({"version": "0.65.0"}))
-            crates = ("aft", "aft-base", "aft-db", "aft-engine", "aft-parse", "aft-store", "aft-subc", "aft-tokenizer", "aft-tools", "secret-rules")
+            crates = ("aft", "aft-base", "aft-db", "aft-edit", "aft-engine", "aft-parse", "aft-store", "aft-subc", "aft-tokenizer", "aft-tools", "secret-rules")
             for crate in crates:
                 manifest = fixture / "crates" / crate / "Cargo.toml"
                 manifest.parent.mkdir(parents=True)
@@ -394,6 +396,8 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             current = engine["package"]["version"]
             dry_run = subprocess.run([*sync, "--dry-run"], check=True, capture_output=True, text=True).stdout
             for change in (
+                f"crates/aft-edit/Cargo.toml:\n  version: {current} → {version}",
+                f"crates/aft-engine/Cargo.toml:\n  aft-edit dep version: {current} → {version}",
                 f"crates/aft-engine/Cargo.toml:\n  version: {current} → {version}",
                 f"crates/aft-engine/Cargo.toml:\n  aft-base dep version: {current} → {version}",
                 f"crates/aft-tools/Cargo.toml:\n  version: {current} → {version}",
@@ -407,6 +411,9 @@ class NativeReleaseWorkflowTests(unittest.TestCase):
             self.assertNotIn("WARNING:", dry_run)
             self.assertEqual([path.read_bytes() for path in manifests], before)
             subprocess.run(sync, check=True, capture_output=True, text=True)
+            changed = {path.relative_to(fixture).as_posix() for path, original in zip(manifests, before)
+                       if path.read_bytes() != original}
+            self.assertEqual(changed - VERSION_FILES, set(), "retry guard rejects version-sync changes")
             for crate in crates:
                 manifest = tomllib.loads((fixture / "crates" / crate / "Cargo.toml").read_text())
                 self.assertEqual(manifest["package"]["version"], version, crate)
@@ -585,7 +592,7 @@ class ReleaseRehearsalWorkflowTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "must require aft-engine =" + re.escape(REHEARSAL_VERSION)):
                     exec(script, {})
                 write_rehearsal_crate(upper)
-                for name in ("agent-file-tools", "aft-parse", "aft-engine", "aft-tools", "aft-subc"):
+                for name in ("agent-file-tools", "aft-parse", "aft-edit", "aft-engine", "aft-tools", "aft-subc"):
                     archive = next(file for file in files if file.name.startswith(name + "-"))
                     for size in (10 * 1024 * 1024, 10 * 1024 * 1024 + 1):
                         with self.subTest(package=name, size=size):

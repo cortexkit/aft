@@ -28,12 +28,15 @@ class Audit:
 
 
 # Match the feature selections in .github/workflows/_unit-suite.yml. The
-# workspace test build forwards test-support to both lower crates via test-hooks.
-ABOVE_LOWER = ("aft", "aft-engine", "aft-tools", "aft-subc")
+# workspace test build forwards test-support to the lower crates via test-hooks.
+ABOVE_EDIT = ("aft", "aft-engine", "aft-tools", "aft-subc")
+ABOVE_LOWER = (*ABOVE_EDIT, "aft-edit")
 AUDITS = (
     Audit("aft-base", ABOVE_LOWER,
           ("test-hooks", "test-support"), ("test-hooks", "test-support")),
     Audit("aft-db", ABOVE_LOWER,
+          ("test-hooks", "test-support"), ("test-hooks", "test-support")),
+    Audit("aft-edit", ABOVE_EDIT,
           ("test-hooks", "test-support"), ("test-hooks", "test-support")),
     Audit("aft-engine", ("aft", "aft-tools", "aft-subc"),
           ("test-hooks", "wasm-grammars"), ("test-hooks", "test-support")),

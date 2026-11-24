@@ -20,8 +20,10 @@ from landing_policy import ROOT, git
 
 VERSION = re.compile(r"v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 VERSION_FILES = {
-    "bun.lock", "Cargo.lock", "crates/aft/Cargo.toml",
-    "crates/aft-tokenizer/Cargo.toml", "crates/secret-rules/Cargo.toml",
+    "bun.lock", "Cargo.lock",
+    *(f"crates/{name}/Cargo.toml" for name in
+      ("aft", "aft-base", "aft-db", "aft-edit", "aft-engine", "aft-parse", "aft-store",
+       "aft-subc", "aft-tokenizer", "aft-tools", "secret-rules")),
     *(f"packages/{name}/package.json" for name in
       ("aft-bridge", "aft-cli", "opencode-plugin", "pi-plugin")),
     *(f"packages/npm/{name}/package.json" for name in

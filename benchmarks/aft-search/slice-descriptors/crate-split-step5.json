@@ -1,0 +1,7 @@
+{
+  "slice_class": "engine_unwired",
+  "targeted_mechanism": "none",
+  "kind": "harness",
+  "fixtures": ["harness-goldens", "crates/aft/tests/integration/tool_call_parity_test.rs"],
+  "note": "The split touches fenced crate roots in aft-base, aft-db, aft-edit and aft-engine, and moves the watcher counters out of aft-engine/src/search_index.rs. Crate boundaries change, not ranking or routing. Search-quality rows must remain identical."
+}
