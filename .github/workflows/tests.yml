@@ -350,7 +350,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         if: steps.release-binary.outputs.cache-hit != 'true'
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-search-ci-storm-wasm
           env-vars: ImageOS
           cache-on-failure: true
@@ -406,10 +406,10 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-      - name: Retain two caches per compatible lane
+      - name: Retain two current caches per lane
         env:
           GH_TOKEN: ${{ github.token }}
-          RUST_CACHE_NAMESPACE: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          RUST_CACHE_NAMESPACE: aft-rust-v1
         run: python3 scripts/prune-rust-cache.py
 
   search-quality-gate:

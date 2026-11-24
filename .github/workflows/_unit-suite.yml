@@ -75,10 +75,10 @@ jobs:
         run: bash scripts/ci-sccache-start.sh
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        # Rust-cache hashes the compiler and environment before the lockfile
-        # suffix. Include the runner image and build definitions in that fallback key.
+        # Keep the fallback cache key stable across manifest edits. The lane
+        # and runner image stay in the key; Cargo rebuilds stale artifacts.
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-archive-test-wasm-hooks
           env-vars: ImageOS
           cache-on-failure: true
@@ -214,7 +214,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-conformance-dev-test-wasm-timing-hooks
           env-vars: ImageOS
           cache-on-failure: true
@@ -418,7 +418,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-plugin-e2e-dev-wasm
           env-vars: ImageOS
           cache-on-failure: true
@@ -527,7 +527,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-worker-landlock-dev-test-wasm-hooks
           env-vars: ImageOS
           cache-on-failure: true
@@ -598,7 +598,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-sandbox-landlock-dev-test-wasm-timing-hooks
           env-vars: ImageOS
           cache-on-failure: true
@@ -657,7 +657,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-storm-ci-storm-off-wasm-hooks
           env-vars: ImageOS
           cache-on-failure: true
@@ -687,7 +687,7 @@ jobs:
         run: bash scripts/ci-sccache-start.sh
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-storm-ci-storm-thin-wasm-hooks
           env-vars: ImageOS
           cache-on-failure: true
@@ -732,7 +732,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          prefix-key: aft-rust-v1-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', '.cargo/config*') }}
+          prefix-key: aft-rust-v1
           shared-key: linux-msrv-dev-check-wasm-hooks
           env-vars: ImageOS
           cache-on-failure: true

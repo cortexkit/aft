@@ -104,51 +104,67 @@ class CacheWritePolicyTests(unittest.TestCase):
 
 
 class CacheRetentionTests(unittest.TestCase):
-    namespace = "aft-rust-v1-" + "a" * 64
-    lane = f"{namespace}-linux-archive-test-wasm-hooks-"
+    namespace = "aft-rust-v1"
+    old_hashed_namespace = namespace + "-" + "a" * 64
+    lane = "linux-archive-test-wasm-hooks"
     started = datetime.fromisoformat("2026-11-24T12:00:00+00:00")
 
-    def entry(self, cache_id, minute, *, lane=None, environment="aaaaaaaa", ref=prune.MAIN):
+    def entry(self, cache_id, minute, *, namespace=None, lane=None, environment="aaaaaaaa", ref=prune.MAIN):
         return {
             "id": cache_id,
-            "key": f"{lane or self.lane}Linux-x64-{environment}-{cache_id:08x}",
+            "key": f"{namespace or self.namespace}-{lane or self.lane}-Linux-x64-{environment}-{cache_id:08x}",
             "ref": ref,
             "created_at": f"2026-11-24T12:{minute:02d}:00Z",
             "last_accessed_at": "2026-11-24T13:00:00Z",
             "size_in_bytes": 100,
         }
 
-    def test_prune_only_older_caches_in_the_same_compatibility_prefix(self):
+    def test_prune_keeps_two_current_lane_caches_and_removes_superseded_prefixes(self):
         entries = [
             self.entry(5, 8), self.entry(1, 2), self.entry(4, 7), self.entry(2, 3),
             self.entry(6, 5, environment="bbbbbbbb"),
             self.entry(7, 6, ref="refs/heads/train/other"),
-            self.entry(8, 9, lane=f"{self.namespace}-linux-search-ci-storm-wasm-"),
+            self.entry(8, 9, namespace=self.old_hashed_namespace, lane="linux-search-ci-storm-wasm"),
+            self.entry(9, 10, namespace=self.old_hashed_namespace),
+            self.entry(10, 11, namespace="aft-rust-v0"),
+            self.entry(11, 12, namespace="aft-rust-v2"),
+            self.entry(12, 13, lane=self.lane + "-thin"),
         ]
-        # Supply all entries in arbitrary order, as if the API ignored its
-        # prefix/ref filters. No deletion may cross those boundaries anyway.
-        api = Mock(side_effect=[{"actions_caches": entries[:4]}, {"actions_caches": entries[4:]},
-                                OSError("read-only repository"), None])
+        # A page overlap must not count a cache twice. The listing can contain
+        # other lanes or a newer namespace whose run is still in flight.
+        api = Mock(side_effect=[
+            {"actions_caches": entries[:6]},
+            {"actions_caches": [entries[0], *entries[6:11]]},
+            {"actions_caches": entries[11:]},
+            OSError("read-only repository"), None, None, None, None,
+        ])
         output = io.StringIO()
-        with patch.object(prune, "PAGE_SIZE", 4), redirect_stdout(output):
-            prune.prune_lane(api, self.lane, self.started)
+        with patch.object(prune, "PAGE_SIZE", 6), redirect_stdout(output):
+            listed = prune.list_main_caches(api)
+            prune.prune_lane(api, self.namespace, self.lane, listed, self.started)
         self.assertEqual(api.call_args_list, [
-            call("GET", "/actions/caches", key=self.lane, ref=prune.MAIN, per_page=4, page=1),
-            call("GET", "/actions/caches", key=self.lane, ref=prune.MAIN, per_page=4, page=2),
+            call("GET", "/actions/caches", key="aft-rust-v", ref=prune.MAIN, per_page=6, page=1),
+            call("GET", "/actions/caches", key="aft-rust-v", ref=prune.MAIN, per_page=6, page=2),
+            call("GET", "/actions/caches", key="aft-rust-v", ref=prune.MAIN, per_page=6, page=3),
+            call("DELETE", "/actions/caches/10"),
+            call("DELETE", "/actions/caches/9"),
+            call("DELETE", "/actions/caches/6"),
             call("DELETE", "/actions/caches/2"),
             call("DELETE", "/actions/caches/1"),
         ])
         self.assertIn(f"Kept {entries[0]['key']}", output.getvalue())
         self.assertIn(f"Kept {entries[2]['key']}", output.getvalue())
         self.assertIn(f"Deleted {entries[1]['key']}", output.getvalue())
+        self.assertIn(f"Deleted {entries[7]['key']}", output.getvalue())
         self.assertIn("read-only repository", output.getvalue())
 
     def test_a_prefix_without_a_new_save_is_left_untouched(self):
-        api = Mock(return_value={"actions_caches": [self.entry(i, i) for i in (1, 2, 3)]})
+        api = Mock()
+        entries = [self.entry(1, 1), self.entry(2, 2), self.entry(3, 11, namespace=self.old_hashed_namespace)]
         with redirect_stdout(io.StringIO()):
-            prune.prune_lane(api, self.lane, datetime.fromisoformat("2026-11-24T12:10:00+00:00"))
-        api.assert_called_once_with("GET", "/actions/caches", key=self.lane,
-                                    ref=prune.MAIN, per_page=100, page=1)
+            prune.prune_lane(api, self.namespace, self.lane, entries,
+                             datetime.fromisoformat("2026-11-24T12:10:00+00:00"))
+        api.assert_not_called()
 
     def test_non_main_never_queries_the_cache_api(self):
         api = Mock()
@@ -168,6 +184,22 @@ class CacheRetentionTests(unittest.TestCase):
         self.assertIn("could not establish run start time: API unavailable", output.getvalue())
         self.assertIn("could not read repository total: API unavailable", output.getvalue())
 
+    def test_failed_listing_is_nonfatal_and_still_reports_usage(self):
+        api = Mock(side_effect=[
+            {"run_started_at": "2026-11-24T12:00:00Z"},
+            {"actions_caches": [self.entry(3, 3)]},
+            OSError("list unavailable"),
+            {"active_caches_count": 3, "active_caches_size_in_bytes": 300},
+        ])
+        env = {"GITHUB_REF": prune.MAIN, "RUST_CACHE_NAMESPACE": self.namespace,
+               "GITHUB_RUN_ID": "127", "GITHUB_RUN_ATTEMPT": "2"}
+        output = io.StringIO()
+        with patch.object(prune, "PAGE_SIZE", 1), patch.dict(os.environ, env), redirect_stdout(output):
+            prune.main(api)
+        self.assertTrue(all(args[0] == "GET" for args, _ in api.call_args_list))
+        self.assertIn("could not list main Rust caches: list unavailable", output.getvalue())
+        self.assertIn("Repository cache total: 3 entries, 300 bytes", output.getvalue())
+
     def test_workflow_prune_is_main_only_and_not_required(self):
         workflow = ROOT / ".github/workflows/tests.yml"
         jobs = parser.parse_workflow(str(workflow))["jobs"]
@@ -184,11 +216,12 @@ class CacheRetentionTests(unittest.TestCase):
         matches = {}
         workflow = parser.parse_workflow(str(ROOT / ".github/workflows/tests.yml"))
         expected = workflow["jobs"]["rust-cache-prune"]["steps"][1]["env"]["RUST_CACHE_NAMESPACE"]
+        self.assertEqual(expected, "aft-rust-v1")
         for file, job_id, _, _, step in steps():
             if not step.get("uses", "").startswith("Swatinem/rust-cache@"):
                 continue
             config = step.get("with", {})
-            if not config.get("prefix-key", "").startswith("aft-rust-v1-"):
+            if not config.get("prefix-key", "").startswith("aft-rust-v"):
                 continue
             lane = config["shared-key"].replace("${{ inputs.cargo_profile }}", "stage")
             with self.subTest(file=file, job=job_id):
