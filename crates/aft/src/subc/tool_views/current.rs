@@ -7,11 +7,11 @@ pub(in crate::subc) const CATALOG_DIGEST: &str =
 
 pub(super) fn append(entry: &mut Shipped) {
     let mut manifest = entry.history.last().expect("shipped view").clone();
-    // The file-tool views changed since revision 3. Bash still serves the
-    // same sources on this catalog.
+    // The file-tool rows advance from revision 4, frozen in shipped.json.
+    // Bash still serves the same sources on this catalog.
     let (revision_delta, sources) = match entry.tool.name.as_str() {
         "edit" => (
-            3,
+            1,
             Some([include_str!("edit.row.ui"), include_str!("edit.page.ui")]),
         ),
         "bash" => (
@@ -19,11 +19,11 @@ pub(super) fn append(entry: &mut Shipped) {
             Some([include_str!("bash.row.ui"), include_str!("bash.page.ui")]),
         ),
         "write" => (
-            3,
+            1,
             Some([include_str!("edit.row.ui"), include_str!("write.page.ui")]),
         ),
         "apply_patch" => (
-            3,
+            1,
             Some([
                 include_str!("apply_patch.row.ui"),
                 include_str!("apply_patch.page.ui"),

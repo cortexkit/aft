@@ -244,6 +244,7 @@ mod tests {
         let pin = hashline.schema_pin().encode().unwrap();
         assert!(VERSIONED_VIEW_PINS.contains(&pin));
         let view = view(&pin).unwrap();
+        assert_eq!(view.template_revision, 5);
         assert!(view.check_pin(&pin).unwrap());
         assert_eq!(view.tool.unwrap().input_schema, hashline.input_schema);
     }
@@ -330,7 +331,7 @@ mod tests {
                     cortexkit_role_tool_display::FieldKind::TextLines,
                 );
             } else if matches!(entry.tool.name.as_str(), "edit" | "write" | "apply_patch") {
-                assert_eq!(view.template_revision, 4);
+                assert_eq!(view.template_revision, 5);
             } else {
                 assert_eq!(view.template_revision, 3);
             }
@@ -366,26 +367,31 @@ mod tests {
                 "apply_patch" => "view.detail.files",
                 _ => "view.output ??",
             }));
-            // Canonical row and page SHA-256s reported by occipital-check
-            // 0.1.7. Samples for all three file tools were checked at phone
-            // and desktop widths.
-            let digests = match entry.tool.name.as_str() {
-                "apply_patch" => [
+            // Revision 5 changes the row only; revision 4 keeps its published bytes.
+            let (published_row, current_row, page) = match entry.tool.name.as_str() {
+                "apply_patch" => (
                     "3ec957da89287b0d7abaef752ddd79a862bb83c74f0fc0b7eb11af193e73193d",
+                    "5cdbbdd92a8368d6bc9780a9b7095bb92e67c621c005f20db689032f8b8748de",
                     "58f52d34e95b95f474281175d3790627a4f9263e87a078b8b1fefef80116688b",
-                ],
-                "edit" => [
+                ),
+                "edit" => (
                     "0fea838e52c7f79185fa7892f1605fd6be7b2c4e97ec93e9c0543ef95807f531",
+                    "7c5c2d1cbaacfafc3f7c9730fd25e3ef72a733780a0be53c78bec817c3faa72f",
                     "3a457fd30d60ca7acc5bab258da9786bc309a44190d5454795f2b80a870332d7",
-                ],
-                "write" => [
+                ),
+                "write" => (
                     "0fea838e52c7f79185fa7892f1605fd6be7b2c4e97ec93e9c0543ef95807f531",
+                    "7c5c2d1cbaacfafc3f7c9730fd25e3ef72a733780a0be53c78bec817c3faa72f",
                     "3422ad764d8aea87c95e6f6b38e21bf10096d27ef72bedb07a9f4276b8fa23fd",
-                ],
+                ),
                 "bash" => continue, // Covered by the tail-pin compatibility test.
                 name => panic!("missing template digests for {name}"),
             };
-            assert_template_digests(&view.template, digests);
+            let published = &entry.history[entry.history.len() - 2];
+            assert_eq!(published.template_revision, 4);
+            assert_eq!(published.record_schema, view.record_schema);
+            assert_template_digests(&published.template, [published_row, page]);
+            assert_template_digests(&view.template, [current_row, page]);
         }
     }
 

@@ -1,5 +1,5 @@
 <ToolHeader icon="edit" title={FileName(input.path)} subtitle={Folder(input.path)} truncate="middle">
-<Slot width="medium">
+<Slot width="short">
 {view.call.phase == "unanswered" ? <ToolText text="Not run" size="small" tone="muted" />
  : (view.completion.reason ?? view.record.reason) == "no_match" ? <ToolText text="No match" size="small" tone="danger" />
  : (view.completion.reason ?? view.record.reason) == "invalid_syntax" || (view.completion.reason ?? view.record.reason) == "syntax_error" ? <ToolText text="Invalid syntax" size="small" tone="danger" />

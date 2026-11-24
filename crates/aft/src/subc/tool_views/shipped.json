@@ -59,6 +59,48 @@
             "source": "<TextContent text=\"AFT apply_patch\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
           }
         }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 4,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const count = view.completion.fileCount ?? view.record.fileCount ?? 0\nexport const path = view.completion.path ?? view.record.path ?? \"\"\nexport const outcome = view.completion.outcome ?? view.record.outcome\nexport const added = view.completion.addedLines ?? view.record.addedLines\nexport const removed = view.completion.removedLines ?? view.record.removedLines\n\n<Slot width=\"fill\">\n<ToolHeader icon=\"edit\" title={count > 1 ? Text(count) + \" files\" : count == 1 && path != \"\" ? FileName(path) : \"Patch\"} subtitle={count == 1 && path != \"\" ? Folder(path) : null} truncate=\"middle\" failed={outcome == \"error\"}>\n<Slot width=\"medium\">\n{outcome == \"error\" && count == 0 ? <ToolText text=\"Not applied\" size=\"small\" tone=\"danger\" />\n : outcome == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : added != null && removed != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(added)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(removed)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n</Slot>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const outcome = view.completion.outcome ?? view.record.outcome\n\n{outcome == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : outcome == \"error\" && (view.completion.fileCount ?? view.record.fileCount ?? 0) == 0\n ? <ToolText text=\"Not applied\" tone=\"danger\" /> : null}\n\n{Each(view.detail.files ?? [], \"file\", [\n  file.path != null ? <ToolText size=\"large\" text={FileName(file.path ?? \"\")} /> : null,\n  file.diff != null && file.diff != \"\" ? <Diff hunks={[{lines:\n    Each(Slice(Split(EndsWith(file.diff, \"\\n\") ? file.diff : (file.diff ?? \"\") + \"\\n\", \"\\n\"), StartsWith(file.diff, \"--- \") ? 2 : 0, -1), \"line\", {\n      kind: StartsWith(line, \"+\") ? \"add\" : StartsWith(line, \"-\") ? \"delete\" : StartsWith(line, \" \") ? \"context\" : \"plain\",\n      text: StartsWith(line, \"+\") || StartsWith(line, \"-\") || StartsWith(line, \" \") ? Slice(line, 1) : line\n    })\n  }]} /> : null\n])}\n"
+          }
+        }
       }
     ]
   },
@@ -410,6 +452,48 @@
             "source": "<TextContent text=\"AFT edit\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
           }
         }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 4,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"edit\" title={FileName(input.path)} subtitle={Folder(input.path)} truncate=\"middle\">\n<Slot width=\"medium\">\n{view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : (view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text=\"No match\" size=\"small\" tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" size=\"small\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" size=\"small\" tone=\"danger\" />\n : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(view.completion.addedLines ?? view.record.addedLines)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(view.completion.removedLines ?? view.record.removedLines)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<CardHeader title=\"Edit\" />\n\n<ToolText size=\"large\" text={FileName(input.path)} />\n\n<ToolText tone=\"muted\" text={Folder(input.path)} />\n\n{(view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text={\"No match · \" + (Count(input.edits ?? []) > 1 ? Text(Count(input.edits ?? [])) + \" changes\" : \"1 change\")} tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"success\" ? <ToolText text={\"Applied · \" + (Count(input.edits ?? []) > 1 ? Text(Count(input.edits ?? [])) + \" changes\" : \"1 change\") + ((view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null ? \" · +\" + Text(view.completion.addedLines ?? view.record.addedLines) + \" −\" + Text(view.completion.removedLines ?? view.record.removedLines) : \"\")} />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" /> : null}\n\n{view.detail.noMatchChange != null ? <ToolText text={\"Change \" + Text(view.detail.noMatchChange) + \" · No match\"} tone=\"danger\" /> : null}\n\n{view.detail.truncated == true ? <ToolText text=\"Only part of the diff was kept.\" tone=\"warning\" /> : null}\n\n{Count(view.detail.hunks ?? []) > 0 ? <Diff hunks={view.detail.hunks} /> : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0\n ? <ToolText text=\"The full diff is no longer kept. This shows the changes the agent asked for.\" tone=\"warning\" /> : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0\n ? Each(input.edits ?? [], \"edit\", <CodeBlock codeString={(edit.oldString ?? \"\") + \"\\n→\\n\" + (edit.newString ?? edit.content ?? \"\")} maxLines={40} />)\n : null}\n\n{view.call.phase == \"answered\" && view.call.isError != true && view.detail.truncated != true && Count(view.detail.hunks ?? []) == 0 && (input.appendContent != null || input.content != null)\n ? <CodeBlock codeString={\"→\\n\" + (input.appendContent ?? input.content ?? \"\")} maxLines={40} /> : null}\n"
+          }
+        }
       }
     ]
   },
@@ -476,6 +560,48 @@
             },
             "reads": [],
             "source": "<TextContent text=\"AFT write\" />\n\n<TextContent text={view.output ?? \"No output was kept.\"} />"
+          }
+        }
+      },
+      {
+        "record_schema": {
+          "name": "aft/files/1",
+          "revision": 1,
+          "fields": {
+            "fileCount": "integer",
+            "modifiedCount": "integer",
+            "createdCount": "integer",
+            "deletedCount": "integer",
+            "movedCount": "integer",
+            "addedLines": "integer",
+            "removedLines": "integer",
+            "path": "project_path"
+          }
+        },
+        "reads": [],
+        "template_revision": 4,
+        "template": {
+          "row": {
+            "schema": "occipital.template/1",
+            "profile": "tool_row",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "<ToolHeader icon=\"edit\" title={FileName(input.path)} subtitle={Folder(input.path)} truncate=\"middle\">\n<Slot width=\"medium\">\n{view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" size=\"small\" tone=\"muted\" />\n : (view.completion.reason ?? view.record.reason) == \"no_match\" ? <ToolText text=\"No match\" size=\"small\" tone=\"danger\" />\n : (view.completion.reason ?? view.record.reason) == \"invalid_syntax\" || (view.completion.reason ?? view.record.reason) == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" size=\"small\" tone=\"danger\" />\n : (view.completion.outcome ?? view.record.outcome) == \"partial\" ? <ToolText text=\"Partly applied\" size=\"small\" tone=\"warning\" />\n : (view.completion.outcome ?? view.record.outcome) == \"error\" ? <ToolText text=\"Failed\" size=\"small\" tone=\"danger\" />\n : (view.completion.addedLines ?? view.record.addedLines) != null && (view.completion.removedLines ?? view.record.removedLines) != null\n ? <Card appearance=\"clear\" direction=\"row\" gap=\"xs\"><ToolText text={\"+\" + Text(view.completion.addedLines ?? view.record.addedLines)} font=\"mono\" size=\"small\" tone=\"success\" width=\"natural\" /><ToolText text={\"−\" + Text(view.completion.removedLines ?? view.record.removedLines)} font=\"mono\" size=\"small\" tone=\"danger\" width=\"natural\" /></Card>\n : view.call.phase == \"running\" && view.call.startedAtMs != null ? <Elapsed start={view.call.startedAtMs ?? 0} /> : null}\n</Slot>\n</ToolHeader>\n"
+          },
+          "page": {
+            "schema": "occipital.template/1",
+            "profile": "tool_page",
+            "executionDialect": "1.0",
+            "catalog": {
+              "version": "1.1",
+              "digest": "sha256:6e3239281ade150b0935a2ca239ead0f7f922ab0fdeeffc470a19fc0fbf3ddb0"
+            },
+            "reads": [],
+            "source": "export const outcome = view.completion.outcome ?? view.record.outcome\nexport const reason = view.completion.reason ?? view.record.reason\nexport const added = view.completion.addedLines ?? view.record.addedLines\nexport const removed = view.completion.removedLines ?? view.record.removedLines\n\n<CardHeader title=\"Write\" />\n\n<ToolText size=\"large\" text={FileName(input.path)} />\n\n<ToolText tone=\"muted\" text={Folder(input.path)} />\n\n{reason == \"invalid_syntax\" || reason == \"syntax_error\" ? <ToolText text=\"Invalid syntax\" tone=\"danger\" />\n : outcome == \"partial\" ? <ToolText text=\"Partly applied\" tone=\"warning\" />\n : outcome == \"error\" ? <ToolText text=\"Failed\" tone=\"danger\" />\n : outcome == \"success\" ? <ToolText text={\"Applied · 1 change\" + (added != null && removed != null ? \" · +\" + Text(added) + \" −\" + Text(removed) : \"\")} />\n : view.call.phase == \"unanswered\" ? <ToolText text=\"Not run\" tone=\"muted\" /> : null}\n\n<CodeBlock codeString={input.content} maxLines={40} />\n"
           }
         }
       }
