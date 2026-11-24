@@ -108,8 +108,7 @@ drains that must never block reads). Jobs are classed `Interactive` or
 `Maintenance` so maintenance cannot starve tool calls; the maintenance queue is
 bounded and idempotent drains coalesce. Long work checks a `JobCancellation`
 token at phase boundaries. Process-wide heavy builds share slots through
-`crates/aft-base/src/cold_build_limiter.rs`, and `build_breaker.rs` suspends a
-build domain that keeps crashing.
+`crates/aft-base/src/cold_build_limiter.rs`.
 
 **Index store.** Text search, the call graph and meaning search live in one
 index store per repository (`indexes.trigram`, `indexes.callgraph`,
@@ -299,7 +298,7 @@ ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
 | Scopes, runs, code mode | `subc/scope_describe.rs`, `subc/run_scope.rs`, `subc/codemode.rs`, `subc/flow_read.rs` |
 | Access policy, consent, grants | `crates/aft-db/src/access_policy.rs`, `subc/call_policy.rs`, `subc/consent.rs`, `subc/access_grants.rs`, `crates/aft-db/src/db/access_grants.rs` |
 | Command handlers | `commands/` |
-| Executor | `crates/aft-base/src/executor/`, `crates/aft-base/src/cold_build_limiter.rs`, `build_breaker.rs` |
+| Executor | `crates/aft-base/src/executor/`, `crates/aft-base/src/cold_build_limiter.rs` |
 | Runtime state | `context.rs` (`AppContext`) |
 | Index store formats | `crates/aft-store/` |
 | Index store in AFT | `data_layer/` (checkout, runtime, incremental, meaning), `commands/data_callgraph.rs`, `commands/data_search.rs`, `inspect/data_sources.rs` |

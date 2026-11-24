@@ -232,8 +232,6 @@ pub(crate) enum InspectBuilderState {
     WaitingForCacheWriterLease,
     QueuedBehindColdBuilds,
     GatedBySemanticSeed,
-    #[cfg(test)]
-    Suspended,
     BuildDenied,
     Absent,
 }
@@ -245,8 +243,6 @@ impl InspectBuilderState {
             Self::WaitingForCacheWriterLease => "waiting_for_inspect_cache_writer_lease",
             Self::QueuedBehindColdBuilds => "queued_behind_cold_builds",
             Self::GatedBySemanticSeed => "gated_by_semantic_seed",
-            #[cfg(test)]
-            Self::Suspended => "suspended",
             Self::BuildDenied => "build_denied (borrow-only)",
             Self::Absent => "absent",
         }
@@ -268,7 +264,6 @@ struct BuilderStateEntry {
     first_attempt_unix: u64,
     attempt_count: u64,
     last_failure: Option<String>,
-    suspension: Option<crate::build_breaker::BuildSuspension>,
     progress: String,
 }
 
@@ -282,7 +277,6 @@ impl BuilderStateEntry {
             first_attempt_unix: now,
             attempt_count: 0,
             last_failure: None,
-            suspension: None,
             progress: "checking cached analysis".into(),
         }
     }
@@ -300,7 +294,6 @@ impl BuilderStateEntry {
 
     fn begin_attempt(&mut self, state: InspectBuilderState) {
         self.state = Some(state);
-        self.suspension = None;
         self.started_at = Instant::now();
         self.started_unix = unix_now_secs();
         if self.attempt_count == 0 && self.last_failure.is_none() {
@@ -311,14 +304,12 @@ impl BuilderStateEntry {
     /// Record a failed attempt.
     fn record_failure(&mut self, terminal: String) {
         self.state = None;
-        self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = Some(terminal);
     }
 
     fn record_cache_writer_wait(&mut self) {
         self.state = Some(InspectBuilderState::WaitingForCacheWriterLease);
-        self.suspension = None;
         self.attempt_count = self.attempt_count.saturating_add(1);
         self.last_failure = None;
     }
@@ -327,20 +318,10 @@ impl BuilderStateEntry {
     /// locked. The lock says nothing about the inputs, so it is not a failure.
     fn record_view_busy_wait(&mut self) {
         self.state = None;
-        self.suspension = None;
         self.last_failure = None;
     }
 
-    fn detail_at(&self, now_ms: u64) -> String {
-        if let Some(suspension) = self.suspension.as_ref() {
-            return format!(
-                "suspended domain={} deaths={} age_s={} reason={}",
-                suspension.domain.as_str(),
-                suspension.death_count,
-                suspension.age_seconds_at(now_ms),
-                suspension.reason,
-            );
-        }
+    fn detail(&self) -> String {
         if let Some(terminal) = self.last_failure.as_deref() {
             return format!(
                 "last attempt failed: {terminal} (attempt {}, first at {})",
@@ -991,12 +972,6 @@ impl InspectManager {
         let Ok(mut states) = self.builder_states.lock() else {
             return;
         };
-        if states
-            .get(key)
-            .is_some_and(|entry| entry.suspension.is_some())
-        {
-            return;
-        }
         match builder_attempt_terminal(outcome) {
             BuilderAttemptTerminal::Succeeded => {
                 states.remove(key);
@@ -1150,7 +1125,13 @@ impl InspectManager {
     }
 
     pub(crate) fn tier2_builder_state_detail(&self, category: InspectCategory) -> String {
-        self.tier2_builder_state_detail_at(category, unix_millis_now())
+        let key = JobKey::for_project_category(category);
+        if let Ok(states) = self.builder_states.lock() {
+            if let Some(entry) = states.get(&key) {
+                return entry.detail();
+            }
+        }
+        self.tier2_builder_state(category).as_str().to_string()
     }
 
     pub(crate) fn dead_code_build_is_pending(&self) -> bool {
@@ -1254,7 +1235,7 @@ impl InspectManager {
                     if kind == "view_pending" {
                         reason
                     } else {
-                        entry.detail_at(unix_millis_now())
+                        entry.detail()
                     },
                     entry.progress
                 );
@@ -1300,20 +1281,6 @@ impl InspectManager {
         }
         payload["gaps"] = serde_json::json!([{"kind": kind, "reason": reason}]);
         payload
-    }
-
-    pub(crate) fn tier2_builder_state_detail_at(
-        &self,
-        category: InspectCategory,
-        now_ms: u64,
-    ) -> String {
-        let key = JobKey::for_project_category(category);
-        if let Ok(states) = self.builder_states.lock() {
-            if let Some(entry) = states.get(&key) {
-                return entry.detail_at(now_ms);
-            }
-        }
-        self.tier2_builder_state(category).as_str().to_string()
     }
 
     fn builder_state_detail_for_job(&self, job: &InspectJob) -> String {

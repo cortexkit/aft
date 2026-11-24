@@ -83,7 +83,6 @@ pub enum CallGraphStoreError {
         path: PathBuf,
         project_root: PathBuf,
     },
-    Suspended(crate::build_state::BuildSuspension),
     Superseded,
     CorpusSnapshotMissing(PathBuf),
     CorpusInventoryChanged(Option<PathBuf>),
@@ -129,13 +128,6 @@ impl fmt::Display for CallGraphStoreError {
                 "callgraph path identity mismatch: {} is not under project root {}",
                 path.display(),
                 project_root.display()
-            ),
-            Self::Suspended(suspension) => write!(
-                formatter,
-                "callgraph build suspended for {} after {} deaths ({})",
-                suspension.domain.as_str(),
-                suspension.death_count,
-                suspension.reason
             ),
             Self::Superseded => {
                 write!(formatter, "callgraph store build superseded before publish")

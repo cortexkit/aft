@@ -68,11 +68,11 @@
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
   "crates/aft/src/inspect/manager.rs": {
-    "lines": 6020,
+    "lines": 5987,
     "reason": "Split inspection scheduling and coordination pending; AFT crate split lane."
   },
   "crates/aft-parse/src/callgraph_store/mod.rs": {
-    "lines": 5474,
+    "lines": 5466,
     "reason": "Split callgraph storage operations pending; AFT crate split lane."
   },
   "crates/aft/src/commands/inspect.rs": {

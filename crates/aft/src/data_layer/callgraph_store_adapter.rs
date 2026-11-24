@@ -2931,9 +2931,6 @@ pub fn index_refusal_response(
             note_callgraph_building(ctx, operation);
             building_response(req_id, operation)
         }
-        CallgraphStoreAccess::Suspended(suspension) => {
-            suspended_response(req_id, operation, suspension)
-        }
         CallgraphStoreAccess::Unavailable | CallgraphStoreAccess::Error(_) => {
             unavailable_for(req_id, operation, ctx)
         }
@@ -2960,42 +2957,6 @@ pub fn building_response(req_id: &str, operation: &str) -> Response {
         "callgraph_building",
         format!("{operation}: callgraph store is building in the background; retry shortly"),
         IndexObservation::building(),
-    )
-}
-
-/// A tripped breaker is terminal for this request: the store is configured,
-/// but its builder was suspended. The index is unavailable with the
-/// `build_suspended` cause; the message says how to resume.
-pub fn suspended_response(
-    req_id: &str,
-    operation: &str,
-    suspension: &crate::build_breaker::BuildSuspension,
-) -> Response {
-    suspended_response_at(
-        req_id,
-        operation,
-        suspension,
-        crate::callgraph_store::unix_millis_now(),
-    )
-}
-
-pub(crate) fn suspended_response_at(
-    req_id: &str,
-    operation: &str,
-    suspension: &crate::build_breaker::BuildSuspension,
-    now_ms: u64,
-) -> Response {
-    let age_ms = suspension.age_millis_at(now_ms);
-    callgraph_index_refusal(
-        req_id,
-        "callgraph_unavailable",
-        format!(
-            "{operation}: build_suspended domain={} deaths={} age_ms={age_ms} reason={}; run doctor reset-build-breaker to resume",
-            suspension.domain.as_str(),
-            suspension.death_count,
-            suspension.reason,
-        ),
-        IndexObservation::unavailable(cause::BUILD_SUSPENDED),
     )
 }
 

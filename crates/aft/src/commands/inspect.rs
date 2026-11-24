@@ -9450,7 +9450,6 @@ mod deferred_terminal_tests {
             InspectBuilderState::GatedBySemanticSeed.as_str(),
             "gated_by_semantic_seed"
         );
-        assert_eq!(InspectBuilderState::Suspended.as_str(), "suspended");
         assert_eq!(
             InspectBuilderState::BuildDenied.as_str(),
             "build_denied (borrow-only)"

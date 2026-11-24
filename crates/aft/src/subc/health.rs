@@ -10007,41 +10007,6 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
     }
 
-    /// The call-graph build breaker under `callgraph/<key>/` belongs to the
-    /// stores AFT 0.64 no longer builds, and `aft cache prune-legacy` deletes
-    /// it. Health must not read it: a stale file would report suspended
-    /// domains for builds that never run.
-    #[test]
-    fn rollup_never_opens_the_legacy_callgraph_breaker() {
-        let (storage, root) = test_root("health-breaker-cache");
-        let mut config = crate::config::Config::default();
-        config.storage_dir = Some(storage.path().join("state"));
-        let ctx = Arc::new(AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            config,
-        ));
-        let executor = Executor::new();
-        assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
-        let key = crate::root_identity::key::artifact_cache_key(root.as_path());
-        let path = ctx
-            .storage_dir()
-            .join("callgraph")
-            .join(&key)
-            .join("build-breaker.sqlite");
-        crate::build_breaker::BuildDeathBreaker::open(path).expect("create fixture breaker");
-        crate::build_breaker::BuildDeathBreaker::reset_open_calls_for_test();
-
-        let cache = HealthRollupCache::new();
-        let app = crate::context::App::default_shared();
-        cache.refresh(&executor, &app);
-        cache.refresh(&executor, &app);
-        assert_eq!(
-            crate::build_breaker::BuildDeathBreaker::open_calls_for_test(),
-            0,
-            "the health rollup opened the legacy call-graph breaker"
-        );
-    }
-
     #[test]
     fn bg_observability_rate_limit_reports_suppressed_count_and_lifecycle_lines() {
         let (_dir, root) = test_root("health-bg-observability-rate");

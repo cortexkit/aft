@@ -10,7 +10,6 @@ pub enum CallgraphStoreAccess {
     Building,
     /// The durable build-death breaker refuses this domain until an explicit reset
     /// or a time-to-live check confirms the suspension has expired.
-    Suspended(crate::build_state::BuildSuspension),
     /// Resolved configuration turns the callgraph index off. No build is
     /// started for a disabled index.
     Off,

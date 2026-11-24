@@ -117,7 +117,6 @@ tests are `*.test.ts`.
 - **`gh` shim routing:** `crates/aft/src/gh_shim.rs`. GitHub read rendering: `crates/aft/src/github_read/`.
 - **Alerts:** `crates/aft/src/alert_state.rs` (ingest), `alert_render.rs` (reminder text), `crates/aft-base/src/alert_records.rs` (SQLite records).
 - **List truncation surface:** `crates/aft-base/src/list_surfaces/[surface].rs`, registered in `crates/aft-base/src/list_surfaces.rs`.
-- **Build breaker domain:** `crates/aft/src/build_breaker.rs`.
 - **Semantic embedding backend:** `crates/aft/src/semantic_index.rs`, `synapse_embed.rs`, and the backend config in `crates/aft-base/src/config.rs`.
 - **Index store format (a section, record or lifecycle rule):** `crates/aft-store/src/`. How AFT builds, refreshes or reads it: `crates/aft/src/data_layer/`; command/tool read adapters: `commands/data_callgraph.rs`, `commands/data_search.rs`, `inspect/data_sources.rs`, `data_layer/text_scope.rs`.
 - **Call-graph resolution rule:** `crates/aft-parse/src/callgraph_store/` (dispatch, bindings, facts); bump `EXTRACTOR_VERSION` in `crates/aft/src/data_layer/content.rs` when stored records change.
