@@ -318,7 +318,7 @@ ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
 | Apps: display records, page bundles | `subc/rich_ui/`, `subc/tool_views.rs`, `page_collect/`, `crates/aft-db/src/db/rich_ui.rs` |
 | Backups, checkpoints | `backup.rs`, `checkpoint.rs`, `agent_data/`, `crates/aft-db/src/db/backups.rs` |
 | Health, alerts | `alert_state.rs`, `alert_render.rs`, `crates/aft-base/src/alert_records.rs`, `crates/aft-base/src/fleet_status.rs`, `commands/health_digest.rs`, `subc/health.rs`, `crates/aft-base/src/memory.rs` |
-| Watcher | `watcher/`, `watcher_backend/`, `watcher_filter.rs` |
+| Watcher | `watcher_backend/`, `watcher_filter.rs`, `watcher_filter/` |
 | Persistence | `crates/aft-db/src/db/` |
 
 Rust paths are relative to `crates/aft/src/` unless shown in full.

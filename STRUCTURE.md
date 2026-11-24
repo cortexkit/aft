@@ -60,8 +60,8 @@ patch/             `apply_patch` parser, matcher, applier
 search_b2/         `aft_search` query router, lane plans, token variants, readiness
 search_state/      Search-owned state, candidate memoization, and rerankers shared with the runtime
 subc/              Subc daemon edge: binds, trust, tool-provider role, remote calls, scopes, code mode, consent, push, drain, health
-watcher/           Project file watcher
 watcher_backend/   Native watcher backends (FSEvents, inotify, Windows)
+watcher_filter/    Bounded inbox between the native backends and the watcher's filter thread
 ```
 
 Compatibility directories `callgraph_store/`, `imports/`, `executor/`, `db/`,
