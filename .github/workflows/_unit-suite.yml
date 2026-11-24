@@ -306,14 +306,17 @@ jobs:
           node scripts/release-gate-v049.mjs --check-inputs
 
       - name: Cargo build (debug — needed by plugin e2e tests)
+        # Build all enabled binary targets, including hashline-schema-artifact.
         run: cargo build --features wasm-grammars -p agent-file-tools
 
       # release-gate --check-inputs validates JS artifacts without Cargo.
       # This full check also compares the committed hashline schema to its Rust
       # generator, preventing stale native schemas from landing on main while
-      # reusing the debug generator already built with the test binaries.
+      # reusing the generator from the debug build rather than invoking Cargo again.
       - name: Native generated-schema byte gate
         run: bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check
+        env:
+          AFT_HASHLINE_SCHEMA_GENERATOR: ${{ github.workspace }}/target/debug/hashline-schema-artifact
 
       - name: Rust test gate (watcher isolated, feature-enabled conformance)
         run: ./scripts/rust-test-gate.sh

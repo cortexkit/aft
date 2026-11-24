@@ -169,6 +169,19 @@ class BranchPatternTests(unittest.TestCase):
 
 
 class LightPREventGateTests(unittest.TestCase):
+    def test_native_schema_gate_reuses_the_wasm_debug_build(self) -> None:
+        root = Path(__file__).resolve().parents[2]
+        suite = workflow_gates.parse_workflow(str(root / ".github/workflows/_unit-suite.yml"))
+        steps = suite["jobs"]["unit-linux"]["steps"]
+        build = next(
+            step for step in steps if step.get("run") == "cargo build --features wasm-grammars -p agent-file-tools"
+        )
+        gate = next(step for step in steps if step.get("name") == "Native generated-schema byte gate")
+        self.assertLess(steps.index(build), steps.index(gate))
+        self.assertEqual(gate["run"], "bun packages/opencode-plugin/scripts/build-tool-schemas.ts --check")
+        self.assertEqual(gate["env"]["AFT_HASHLINE_SCHEMA_GENERATOR"],
+                         "${{ github.workspace }}/target/debug/hashline-schema-artifact")
+
     def test_worker_payload_probe_label_names_the_explicit_stdio_contract(self) -> None:
         root = Path(__file__).resolve().parents[2]
         source = (root / "crates/aft/tests/sandbox_launch_probe.rs").read_text()
