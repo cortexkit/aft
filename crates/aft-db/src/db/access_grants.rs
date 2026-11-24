@@ -469,11 +469,23 @@ pub fn holds(conn: &Connection, key: &ScopeKey, path: &Path) -> rusqlite::Result
 /// owner_synced=true; not_synced, errors, and timeouts retain all scope state.
 pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<()> {
     let tx = conn.unchecked_transaction()?;
+    end_scope_rows(&tx, key)?;
+    tx.commit()?;
+    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
+    Ok(())
+}
+
+/// The database half of a confirmed scope end, shared by the live scope-end
+/// handler and the background sweep so both leave the same rows behind.
+/// Returns how many grants were deleted.
+fn end_scope_rows(tx: &rusqlite::Transaction<'_>, key: &ScopeKey) -> rusqlite::Result<usize> {
+    // The tombstone keeps a late catalog from reviving the scope.
     tx.execute(
         "INSERT INTO access_scopes(owner,scope_ref,epoch,config,ended) VALUES (?1,?2,?3,'{}',1)
         ON CONFLICT(owner,scope_ref,epoch) DO UPDATE SET ended=1",
         params![key.owner, key.scope_ref, key.epoch.to_string()],
     )?;
+    let mut deleted_grants = 0;
     for table in [
         "access_grants",
         "access_launch_params",
@@ -481,16 +493,17 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
         "access_modes",
         "access_scope_agents",
     ] {
-        tx.execute(
+        let deleted = tx.execute(
             &format!("DELETE FROM {table} WHERE owner=?1 AND scope_ref=?2 AND epoch=?3"),
             params![key.owner, key.scope_ref, key.epoch.to_string()],
         )?;
+        if table == "access_grants" {
+            deleted_grants = deleted;
+        }
     }
-    crate::db::remote_exec::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
-    crate::db::catalog_edit_modes::forget_scope(&tx, &key.owner, &key.scope_ref, key.epoch)?;
-    tx.commit()?;
-    aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
-    Ok(())
+    crate::db::remote_exec::forget_scope(tx, &key.owner, &key.scope_ref, key.epoch)?;
+    crate::db::catalog_edit_modes::forget_scope(tx, &key.owner, &key.scope_ref, key.epoch)?;
+    Ok(deleted_grants)
 }
 
 /// Preserve per-row decoding errors so one corrupt row cannot hide other saved
@@ -555,17 +568,13 @@ pub fn saved_scope_batch(
     rows
 }
 
-/// A definite daemon end and its saved-grant deletion commit together.
+/// A definite daemon end and its saved-row cleanup commit together. The
+/// cleanup matches the live scope-end handler's: `end_scope_grants` plus the
+/// code-mode owner rows it removes separately.
 pub fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<usize> {
     let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "UPDATE access_scopes SET ended=1 WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
-        params![key.owner, key.scope_ref, key.epoch.to_string()],
-    )?;
-    let deleted = tx.execute(
-        "DELETE FROM access_grants WHERE owner=?1 AND scope_ref=?2 AND epoch=?3",
-        params![key.owner, key.scope_ref, key.epoch.to_string()],
-    )?;
+    let deleted = end_scope_rows(&tx, key)?;
+    crate::db::codemode_owners::end(&tx, key)?;
     tx.commit()?;
     aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
     Ok(deleted)
@@ -1256,5 +1265,79 @@ mod tests {
         insert(&conn, &worker, &grant).unwrap();
         assert!(list(&conn, &worker).unwrap().is_empty());
         assert!(!authorized(&conn, &head, &worker).unwrap());
+    }
+
+    /// Rows a scope end leaves for the ended epoch, and the launch parameters a
+    /// later epoch of the same scope would receive.
+    type EndOutcome = (Vec<(&'static str, i64)>, Option<serde_json::Value>);
+
+    fn end_with(end: impl Fn(&Connection, &ScopeKey)) -> EndOutcome {
+        use crate::access_policy::ApprovalMode;
+        use subc_protocol::Principal;
+        let owner = owner_key(&Principal::Reserved {
+            module_id: "prefrontal".into(),
+        });
+        let policy = |epoch| PolicyKey {
+            project_root: "/project".into(),
+            harness: "opencode".into(),
+            session: "session".into(),
+            principal: "principal".into(),
+            owner: owner.clone(),
+            scope_ref: "worker".into(),
+            epoch,
+            preset: "default".into(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let scope = ScopeKey::from_policy(&policy(5));
+        register_scope(&conn, &scope, None, &Config::default()).unwrap();
+        register_worker(&conn, &scope).unwrap();
+        set_mode(&conn, &scope, ApprovalMode::Ask).unwrap();
+        let outside = crate::policy_path::policy_path(dir.path()).join("outside");
+        let grant = AccessGrant {
+            path: outside.clone(),
+            kind: GrantKind::Subtree,
+            operation: AccessOperation::Read,
+        };
+        materialize(
+            &conn,
+            &policy(5),
+            &serde_json::json!([{"path": outside, "mode": "read"}]),
+            &[(grant, None)],
+        )
+        .unwrap();
+        end(&conn, &scope);
+        let left = [
+            "access_grants",
+            "access_launch_params",
+            "access_materialized",
+            "access_modes",
+            "access_scope_agents",
+        ]
+        .map(|table| {
+            let count = conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE scope_ref='worker' AND epoch='5'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (table, count)
+        })
+        .to_vec();
+        register_scope(&conn, &ScopeKey::from_policy(&policy(6)), None, &Config::default())
+            .unwrap();
+        (left, launch_params(&conn, &policy(6)).unwrap())
+    }
+
+    #[test]
+    fn sweep_scope_end_cleans_the_same_rows_as_the_live_scope_end() {
+        let live = end_with(|conn, key| end_scope_grants(conn, key).unwrap());
+        let sweep = end_with(|conn, key| {
+            end_saved_scope(conn, key).unwrap();
+        });
+        assert!(live.0.iter().all(|(_, count)| *count == 0), "{live:?}");
+        assert_eq!(live.1, None);
+        assert_eq!(sweep, live);
     }
 }
