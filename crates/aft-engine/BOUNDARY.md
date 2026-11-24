@@ -119,7 +119,7 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `format::parse_cargo_messages` | visibility widened | `aft-edit` | Inspect retains the same Cargo diagnostics parser. |
 | `format::isolate_in_process_group` | re-export visibility widened | `aft-edit` | Preserve the existing format path for lower process setup used by inspect, index, shell, and GitHub. |
 | `format::kill_process_tree` | re-export visibility widened | `aft-edit` | Preserve the existing format path for lower process cleanup used by index and GitHub. |
-| `format::validate_full_batch_for_test` | test-support driver | `aft-edit` | Exercise the real sandbox policy through the format batch checker. |
+| `format::first_batch_skip_reason_for_test` | test-support driver | `aft-edit` | Read the first batch result's skip reason under the real sandbox policy. |
 | `backup::ORDINARY_SCHEMA_VERSION` | re-export visibility widened | `aft-edit` | Engine's compatibility test reads the same ordinary backup schema constant. |
 
 ## Visibility widened for cross-crate callers

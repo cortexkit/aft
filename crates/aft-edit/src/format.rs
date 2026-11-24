@@ -1925,12 +1925,14 @@ struct CheckerBatch {
 /// deliberately delayed so edits to checker configuration are also visible.
 #[cfg(all(unix, feature = "test-support"))]
 #[doc(hidden)]
-pub fn validate_full_batch_for_test(
+pub fn first_batch_skip_reason_for_test(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     paths: &[PathBuf],
     config: &Config,
-) -> BatchValidation {
-    validate_full_batch(tool_policy, paths, config)
+) -> Option<String> {
+    validate_full_batch(tool_policy, paths, config).files[0]
+        .skipped_reason
+        .clone()
 }
 
 pub(crate) fn validate_full_batch(

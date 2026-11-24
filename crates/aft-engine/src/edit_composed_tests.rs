@@ -4,8 +4,8 @@ mod cases {
     use crate::edit::{auto_backup_observed, read_edit_source};
     #[cfg(unix)]
     use crate::format::{
-        auto_format, clear_tool_cache, ruff_probe_refused_for_test, validate_full,
-        validate_full_batch_for_test,
+        auto_format, clear_tool_cache, first_batch_skip_reason_for_test,
+        ruff_probe_refused_for_test, validate_full,
     };
     #[cfg(unix)]
     use std::{fs, process::Command};
@@ -126,8 +126,8 @@ mod cases {
             validate_full(&policy, &path, &config).1.as_deref(),
             Some("error")
         );
-        let batch = validate_full_batch_for_test(&policy, &[path], &config);
-        assert_eq!(batch.files[0].skipped_reason.as_deref(), Some("error"));
+        let skipped_reason = first_batch_skip_reason_for_test(&policy, &[path], &config);
+        assert_eq!(skipped_reason.as_deref(), Some("error"));
         assert!(ruff_probe_refused_for_test(
             &policy,
             config.project_root.as_deref()
