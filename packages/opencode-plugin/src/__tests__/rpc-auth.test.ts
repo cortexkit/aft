@@ -146,6 +146,66 @@ describe("AFT RPC auth", () => {
     }
   });
 
+  test("websocket ack is ignored before hello and never prunes other sessions' items", async () => {
+    const fixture = makeFixture();
+    const server = new AftRpcServer(fixture.storageDir, fixture.directory);
+    server.handle("noop", async () => ({ ok: true }));
+
+    // Resolves on the first message of the wanted type; the server answers
+    // messages on one socket in order, so a reply to a later message proves
+    // the earlier ack was already handled.
+    const nextMessage = (ws: WebSocket, type: string) =>
+      new Promise<void>((resolve, reject) => {
+        const timeout = setTimeout(() => reject(new Error(`no ${type} message`)), 2000);
+        const onMessage = (event: MessageEvent) => {
+          if (JSON.parse(String(event.data)).type !== type) return;
+          clearTimeout(timeout);
+          ws.removeEventListener("message", onMessage);
+          resolve();
+        };
+        ws.addEventListener("message", onMessage);
+      });
+    const openSocket = (port: number) =>
+      new Promise<WebSocket>((resolve, reject) => {
+        const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+        ws.addEventListener("open", () => resolve(ws));
+        ws.addEventListener("error", () => reject(new Error("websocket connection failed")));
+      });
+
+    try {
+      const port = await server.start();
+      const instancePortFile = resolveInstancePortFile(fixture.storageDir, fixture.directory);
+      const { token } = JSON.parse(readFileSync(instancePortFile, "utf-8")) as { token: string };
+      pushNotification("for-a", {}, "ses_a");
+      pushNotification("for-b", {}, "ses_b");
+      pushNotification("global", {});
+
+      // A socket that never authenticated sends a huge ack, then a bad hello
+      // whose "error" reply marks that the ack has been processed.
+      const stranger = await openSocket(port);
+      const rejected = nextMessage(stranger, "error");
+      stranger.send(JSON.stringify({ type: "ack", lastReceivedId: 1_000_000 }));
+      stranger.send(JSON.stringify({ type: "hello", token: "wrong" }));
+      await rejected;
+      stranger.close();
+      expect(drainNotifications(0).map((n) => n.type)).toEqual(["for-a", "for-b", "global"]);
+
+      // An authenticated socket with no session prunes only session-less items.
+      const sessionless = await openSocket(port);
+      const firstHello = nextMessage(sessionless, "hello-ack");
+      sessionless.send(JSON.stringify({ type: "hello", token, lastReceivedId: 0 }));
+      await firstHello;
+      const secondHello = nextMessage(sessionless, "hello-ack");
+      sessionless.send(JSON.stringify({ type: "ack", lastReceivedId: 1_000_000 }));
+      sessionless.send(JSON.stringify({ type: "hello", token, lastReceivedId: 0 }));
+      await secondHello;
+      sessionless.close();
+      expect(drainNotifications(0).map((n) => n.type)).toEqual(["for-a", "for-b"]);
+    } finally {
+      server.stop();
+    }
+  });
+
   test("client parses legacy integer port files without throwing", async () => {
     // Backward-compat at the parser level: old aft versions wrote a plain integer
     // port file. The new client must still parse those files (without exceptions

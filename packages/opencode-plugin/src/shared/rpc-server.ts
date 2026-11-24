@@ -13,6 +13,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { dirname, join } from "node:path";
 import { log, warn } from "../logger";
 import {
+  ackNotifications,
   drainNotifications,
   type NotificationSink,
   registerNotificationSink,
@@ -436,9 +437,11 @@ export class AftRpcServer {
     }
 
     if (msg.type === "ack") {
+      // Only a socket that passed the token check may prune the queue.
+      if (!ws.data.authed) return;
       const lastReceivedId = Number(msg.lastReceivedId ?? 0);
       if (Number.isFinite(lastReceivedId) && lastReceivedId > 0) {
-        drainNotifications(lastReceivedId, ws.data.sessionId);
+        ackNotifications(lastReceivedId, ws.data.sessionId);
       }
     }
   }

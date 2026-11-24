@@ -161,6 +161,23 @@ export function drainNotifications(lastReceivedId = 0, sessionId?: string): RpcN
   );
 }
 
+/** Prune the notifications a live socket client acknowledged, without returning any.
+ *
+ *  Unlike `drainNotifications`, a client that named no session prunes only
+ *  session-less notifications: an ack from a socket that is not tied to a
+ *  session must not drop other sessions' still-unseen items. A client that
+ *  named a session prunes its own items and session-less ones. */
+export function ackNotifications(lastReceivedId: number, sessionId?: string): void {
+  if (!(lastReceivedId > 0)) return;
+  queue = queue.filter(
+    (notification) =>
+      !(
+        notification.id <= lastReceivedId &&
+        (notification.sessionId === undefined || notification.sessionId === sessionId)
+      ),
+  );
+}
+
 /** Whether a TUI client is connected via a live notification socket. */
 export function isTuiConnected(sessionId?: string): boolean {
   if (notificationSinks.size === 0) return false;
