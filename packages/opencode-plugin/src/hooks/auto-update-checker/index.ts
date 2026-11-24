@@ -467,7 +467,11 @@ export function isNewerVersion(candidate: string, installed: string): boolean {
   const a = strip(candidate);
   const b = strip(installed);
   if (!semver.test(a) || !semver.test(b)) return false;
-  return compareSemver(a, b) > 0;
+  try {
+    return compareSemver(a, b) > 0;
+  } catch {
+    return false;
+  }
 }
 
 async function runStartupCheck(
