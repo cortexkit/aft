@@ -252,6 +252,9 @@ pub fn paths_with_trigram(
 #[derive(Debug)]
 pub struct TextMembers {
     segments: Vec<SegmentMembers>,
+    /// Positions of the paths whose content is not indexed, always
+    /// candidates of a search.
+    unchecked: Vec<usize>,
 }
 
 /// One segment's members among a checkout's paths.
@@ -326,18 +329,35 @@ impl TextMembers {
         segment_count: usize,
         overlay: &TextOverlay,
     ) -> Self {
+        #[cfg(test)]
+        MEMBERSHIP_WALKS.with(|walks| walks.set(walks.get() + 1));
         let mut members = vec![Vec::<(u32, usize)>::new(); segment_count];
+        let mut unchecked = Vec::new();
         for (index, record) in state.paths().iter().enumerate() {
             if overlay.contains(&record.path) {
                 continue;
             }
-            if let Place::Indexed { segment, ordinal } = membership.places[index] {
-                members[segment as usize].push((ordinal, index));
+            match membership.places[index] {
+                Place::Indexed { segment, ordinal } => {
+                    members[segment as usize].push((ordinal, index));
+                }
+                Place::Unchecked => unchecked.push(index),
+                Place::Excluded => {}
             }
         }
         let segments = members.into_iter().map(SegmentMembers::new).collect();
-        Self { segments }
+        Self {
+            segments,
+            unchecked,
+        }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Walks over every path of a checkout state that group its members for
+    /// a search, on this thread.
+    static MEMBERSHIP_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// [`paths_with_trigram`], with the paths grouped once in `members`, which
@@ -600,6 +620,77 @@ pub fn candidates(
     )
 }
 
+/// [`candidates`] over every path, with the paths grouped once in
+/// `members`, built from the same `state`, membership and `overlay`. A
+/// search then reads the grouped members instead of walking, grouping and
+/// sorting every path of the state again, which a rare term otherwise pays
+/// for in full however few candidates it has.
+///
+/// # Errors
+///
+/// When a segment cannot be read.
+pub fn candidates_among(
+    state: &CheckoutState,
+    members: &TextMembers,
+    segments: &[TextSegment<'_>],
+    overlay: &TextOverlay,
+    query: &Query,
+) -> Result<Vec<Vec<u8>>, SegmentError> {
+    if *query == Query::None {
+        return Ok(Vec::new());
+    }
+    let paths = state.paths();
+    let mut found = members
+        .unchecked
+        .iter()
+        .map(|&index| paths[index].path.clone())
+        .collect::<Vec<_>>();
+    for (segment, members) in members.segments.iter().enumerate() {
+        if members.members.is_empty() {
+            continue;
+        }
+        let hits = evaluate(
+            &segments[segment],
+            query,
+            &members.ordinals,
+            Some(SKIP_FACTOR),
+        )?;
+        for ordinal in hits {
+            found.extend(
+                members
+                    .paths(ordinal)
+                    .map(|index| paths[index].path.clone()),
+            );
+        }
+    }
+    overlay_candidates(overlay, query, Scope::All, &mut found);
+    found.sort_unstable();
+    found.dedup();
+    Ok(found)
+}
+
+/// Adds the overlay's paths in `scope` that may match `query`.
+fn overlay_candidates(
+    overlay: &TextOverlay,
+    query: &Query,
+    scope: Scope<'_>,
+    found: &mut Vec<Vec<u8>>,
+) {
+    for (path, entry) in &overlay.entries {
+        if !scope.contains(path) {
+            continue;
+        }
+        let candidate = match entry {
+            OverlayEntry::Content(trigrams) => query.matches(trigrams),
+            OverlayEntry::Unindexed => true,
+            OverlayEntry::Deleted => false,
+        };
+        if candidate {
+            found.push(path.clone());
+        }
+    }
+}
+
 fn search(
     state: &CheckoutState,
     membership: &TextMembership,
@@ -612,6 +703,8 @@ fn search(
     if *query == Query::None {
         return Ok(Vec::new());
     }
+    #[cfg(test)]
+    MEMBERSHIP_WALKS.with(|walks| walks.set(walks.get() + 1));
     let range = match scope {
         Scope::All => 0..state.paths().len(),
         Scope::Directory(dir) => state.directory(dir),
@@ -650,19 +743,7 @@ fn search(
             }
         }
     }
-    for (path, entry) in &overlay.entries {
-        if !scope.contains(path) {
-            continue;
-        }
-        let candidate = match entry {
-            OverlayEntry::Content(trigrams) => query.matches(trigrams),
-            OverlayEntry::Unindexed => true,
-            OverlayEntry::Deleted => false,
-        };
-        if candidate {
-            found.push(path.clone());
-        }
-    }
+    overlay_candidates(overlay, query, scope, &mut found);
     found.sort_unstable();
     found.dedup();
     Ok(found)
@@ -723,7 +804,10 @@ fn evaluate(
 
 crate::heap_bytes_none!(Place, Located);
 crate::heap_bytes_of_fields!(TextMembership { places, missing });
-crate::heap_bytes_of_fields!(TextMembers { segments });
+crate::heap_bytes_of_fields!(TextMembers {
+    segments,
+    unchecked
+});
 crate::heap_bytes_of_fields!(SegmentMembers {
     members,
     ordinals,
@@ -914,6 +998,8 @@ mod tests {
         );
 
         let mut nonempty = 0;
+        let members = TextMembers::build(&state, &membership, segments.len(), &overlay);
+        let walks = || MEMBERSHIP_WALKS.with(|walks| walks.replace(0));
         for pattern in PATTERNS {
             let query = plan_pattern(pattern, false).unwrap();
             let regex = regex::bytes::Regex::new(pattern).unwrap();
@@ -934,6 +1020,18 @@ mod tests {
                 .unwrap();
                 let fast =
                     candidates(&state, &membership, &segments, &overlay, &query, scope).unwrap();
+                if matches!(scope, Scope::All) {
+                    // Grouped once above, the members serve every search of
+                    // the whole checkout without another walk over its paths,
+                    // where each `candidates` call walks them all again.
+                    walks();
+                    candidates(&state, &membership, &segments, &overlay, &query, scope).unwrap();
+                    assert_eq!(walks(), usize::from(query != Query::None));
+                    let among =
+                        candidates_among(&state, &members, &segments, &overlay, &query).unwrap();
+                    assert_eq!(walks(), 0, "{pattern:?}: walked every path again");
+                    assert_eq!(among, fast, "{pattern:?}");
+                }
                 let mut expected = Vec::new();
                 for (path, entry) in &expect {
                     if !scope.contains(path) {

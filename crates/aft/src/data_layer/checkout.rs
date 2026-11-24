@@ -27,8 +27,8 @@ use aft_store::ids::{CheckoutId, ContentKey, Digest128, FamilyId, SegmentId};
 use aft_store::scan::{ContentKind, ContentSink, PathScan, Scan, ScanError, ScanPolicy};
 use aft_store::segment::{KnownSection, Segment};
 use aft_store::text::{
-    candidates, ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator,
-    TextMembership, TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
+    ContentTrigrams, Located, OverlayEntry, PathText, Query, Scope, TextLocator, TextMembership,
+    TextOverlay, TextSections, TextSectionsBuilder, TextSegment, TextStatus,
 };
 
 use super::callgraph::{CheckoutInputs, EncodedResolution, FileResolution};
@@ -62,6 +62,7 @@ mod status_view;
 mod stored_records;
 use stored_records::StoredRecords;
 mod text_build;
+mod text_query;
 use text_build::TextBuild;
 #[cfg(test)]
 mod grammar_parity_tests;
@@ -3979,17 +3980,7 @@ impl CheckoutView {
         query: &Query,
         scope: Scope<'_>,
     ) -> Result<Vec<Vec<u8>>, DataError> {
-        let published = &self.published;
-        let texts = published.texts()?;
-        candidates(
-            &published.state,
-            &published.membership,
-            &texts,
-            &self.text,
-            query,
-            scope,
-        )
-        .map_err(DataError::store)
+        text_query::candidates(self, query, scope)
     }
 
     /// What the text plane holds for `path`, with the changes since the
