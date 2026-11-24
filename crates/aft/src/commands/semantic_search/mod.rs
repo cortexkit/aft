@@ -1471,10 +1471,8 @@ fn file_cosines(
         .iter()
         .filter_map(|path| {
             index
-                .search_filtered(query_vector, 1, &|file| file == path.as_path())
-                .ok()?
-                .first()
-                .map(|result| (path.clone(), result.score))
+                .best_file_score(query_vector, path)
+                .map(|score| (path.clone(), score))
         })
         .collect()
 }

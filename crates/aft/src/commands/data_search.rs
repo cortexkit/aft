@@ -1138,6 +1138,21 @@ pub(crate) enum MeaningIndex<'a> {
 }
 
 impl MeaningIndex<'_> {
+    pub(crate) fn best_file_score(&self, query: &[f32], path: &Path) -> Option<f32> {
+        match self {
+            Self::Snapshot(_) => self
+                .search_filtered(query, 1, &|file| file == path)
+                .ok()?
+                .first()
+                .map(|hit| hit.score),
+            Self::Data(meaning) => waits::timed(SearchWait::VectorSearch, || {
+                meaning.snapshot.best_file_score(query, path)
+            })
+            .ok()
+            .flatten(),
+        }
+    }
+
     /// The `top_k` chunks closest to `query` among files whose absolute
     /// path `include` accepts, best first: `SemanticIndex::search_filtered`.
     ///

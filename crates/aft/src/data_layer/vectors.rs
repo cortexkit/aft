@@ -822,6 +822,62 @@ impl MeaningSnapshot {
         self.members.members.len()
     }
 
+    /// Score only this file's members without disturbing the filtered-search cache.
+    pub(crate) fn best_file_score(
+        &self,
+        query: &[f32],
+        path: &Path,
+    ) -> Result<Option<f32>, DataError> {
+        let (Some(shared), Ok(relative)) = (&self.loaded.shared, path.strip_prefix(&self.root))
+        else {
+            return Ok(None);
+        };
+        if query.len() != self.dimensions || query.iter().any(|value| !value.is_finite()) {
+            return Ok(None);
+        }
+        // The checkout stores relative path bytes, with `/` on every platform.
+        let mut key = Vec::new();
+        for component in relative.components() {
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend_from_slice(component.as_os_str().as_encoded_bytes());
+        }
+        let members = &self.members;
+        let Ok(file) = members.files.binary_search_by(|file| file.path.cmp(&key)) else {
+            return Ok(None);
+        };
+        let file_index = file as u32;
+        let start = members.file_of.partition_point(|&id| id < file_index);
+        let end = members.file_of.partition_point(|&id| id <= file_index);
+        let index = shared.index();
+        let set = index
+            .member_set(members.members[start..end].to_vec())
+            .map_err(store_error)?;
+        let found = index
+            .search(
+                &set,
+                &SearchRequest {
+                    query,
+                    k: 1,
+                    rescore_limit: None,
+                },
+            )
+            .map_err(store_error)?;
+        let Some(hit) = found.hits.first() else {
+            return Ok(None);
+        };
+        let file = &members.files[file];
+        let details = Loaded::details(&index, file.holder, file.content, &file.path)?;
+        let detail = &details.chunks[members.chunk_of[start + hit.member as usize] as usize];
+        if kind_of(detail.kind).is_none() {
+            return Err(DataError::Store(
+                "a chunk's kind code is unknown".to_string(),
+            ));
+        }
+        Ok(Some(hit.score))
+    }
+
     /// The `top_k` chunks closest to `query`, among files whose absolute
     /// path `include` accepts: today's `search_filtered` answer over the
     /// same vectors, as its rows. As today, a query of another dimension or
@@ -3164,6 +3220,58 @@ mod tests {
         let epoch = checkout.memory_epoch();
         plane.search(&view, &vector_of_tie(), 5, &include).unwrap();
         assert_eq!(checkout.memory_epoch(), epoch);
+    }
+
+    #[test]
+    fn single_file_scores_preserve_the_warm_filtered_meaning_subset() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let store = tempfile::tempdir().unwrap();
+        project(&root);
+        let checkout = bind(store.path(), &root);
+        let plane = VectorPlane::new(Arc::clone(&checkout), producer(), 20_000);
+        assert_eq!(fill(&plane, &mut Recorder::default(), 2).error, None);
+        let view = checkout.view().unwrap();
+        let meaning = plane.snapshot(&view).unwrap();
+        let query = vector_of_tie();
+        let paths = [
+            root.join("src/lib.rs"),
+            root.join("src/util.rs"),
+            root.join("missing.rs"),
+        ];
+        let expected: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                meaning
+                    .search(&query, 1, &|file| file == path)
+                    .unwrap()
+                    .first()
+                    .map(|hit| hit.score.to_bits())
+            })
+            .collect();
+        assert!(expected[0].is_some() && expected[1].is_some() && expected[2].is_none());
+        let include = |path: &Path| path.starts_with(root.join("src"));
+        let warm = meaning.search(&query, 5, &include).unwrap();
+        let epoch = checkout.memory_epoch();
+        let actual: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                meaning
+                    .best_file_score(&query, path)
+                    .unwrap()
+                    .map(f32::to_bits)
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            rows(&meaning.search(&query, 5, &include).unwrap()),
+            rows(&warm)
+        );
+        assert_eq!(
+            checkout.memory_epoch(),
+            epoch,
+            "file lookups rebuilt the filtered subset"
+        );
     }
 
     /// Every chunk text of the semantic files under `root`, as a fill cuts
