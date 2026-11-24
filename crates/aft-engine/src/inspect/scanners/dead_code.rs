@@ -6291,12 +6291,16 @@ fn read_with<T>(consume: impl FnOnce(bool) -> T) -> T { consume(crate::guard::is
 
     #[test]
     fn own_accuracy_exact_read_handle_guard_has_a_live_source_path() {
+        let source = std::fs::read_to_string(
+            crate::test_helpers::manifest_dir().join("../aft-edit/src/file_read_exact.rs"),
+        )
+        .unwrap();
         let aggregate = stored_rust_fixture_scan(&[
             (
                 "src/main.rs",
                 "mod read; mod db { pub mod file_identity; } fn main() { read::read_exact(); }",
             ),
-            ("src/read.rs", include_str!("../../file_read_exact.rs")),
+            ("src/read.rs", &source),
             (
                 "src/db/file_identity.rs",
                 "pub(crate) fn is_live_sqlite_handle() {}",

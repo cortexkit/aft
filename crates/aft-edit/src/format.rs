@@ -110,7 +110,8 @@ impl std::fmt::Display for FormatError {
     }
 }
 
-pub(crate) use crate::process_group::{isolate_in_process_group, kill_process_tree};
+#[doc(hidden)]
+pub use crate::process_group::{isolate_in_process_group, kill_process_tree};
 
 /// Spawn a subprocess and wait for completion with timeout protection.
 ///
@@ -1922,6 +1923,16 @@ struct CheckerBatch {
 /// Run each resolved checker once against the final project state. The root is
 /// the configured project root, just as in single-file validation; detection is
 /// deliberately delayed so edits to checker configuration are also visible.
+#[cfg(all(unix, feature = "test-support"))]
+#[doc(hidden)]
+pub fn validate_full_batch_for_test(
+    tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
+    paths: &[PathBuf],
+    config: &Config,
+) -> BatchValidation {
+    validate_full_batch(tool_policy, paths, config)
+}
+
 pub(crate) fn validate_full_batch(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     paths: &[PathBuf],

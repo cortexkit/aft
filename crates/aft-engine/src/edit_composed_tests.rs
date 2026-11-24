@@ -5,7 +5,7 @@ mod cases {
     #[cfg(unix)]
     use crate::format::{
         auto_format, clear_tool_cache, ruff_probe_refused_for_test, validate_full,
-        validate_full_batch,
+        validate_full_batch_for_test,
     };
     #[cfg(unix)]
     use std::{fs, process::Command};
@@ -126,7 +126,7 @@ mod cases {
             validate_full(&policy, &path, &config).1.as_deref(),
             Some("error")
         );
-        let batch = validate_full_batch(&policy, &[path], &config);
+        let batch = validate_full_batch_for_test(&policy, &[path], &config);
         assert_eq!(batch.files[0].skipped_reason.as_deref(), Some("error"));
         assert!(ruff_probe_refused_for_test(
             &policy,

@@ -342,7 +342,8 @@ fn run_restore_before_lock_hook_for_tests(session: &str, attempt: usize) {
 fn run_restore_before_lock_hook_for_tests(_session: &str, _attempt: usize) {}
 
 pub use crate::persisted_format::BACKUP_SCHEMA_VERSION as SCHEMA_VERSION;
-pub(crate) use crate::persisted_format::ORDINARY_BACKUP_SCHEMA_VERSION as ORDINARY_SCHEMA_VERSION;
+#[doc(hidden)]
+pub use crate::persisted_format::ORDINARY_BACKUP_SCHEMA_VERSION as ORDINARY_SCHEMA_VERSION;
 
 /// A single backup entry for a file.
 #[derive(Debug, Clone)]
