@@ -1638,7 +1638,14 @@ struct RouteLeases {
     pause: std::sync::Mutex<Option<Arc<LeaseTestPause>>>,
 }
 
-#[cfg(test)]
+#[cfg(any(
+    test,
+    all(
+        feature = "test-support",
+        debug_assertions,
+        any(target_os = "linux", target_os = "macos")
+    )
+))]
 #[derive(Default)]
 struct LeaseTestPause {
     acquired: tokio::sync::Notify,

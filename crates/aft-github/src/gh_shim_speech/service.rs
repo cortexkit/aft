@@ -199,6 +199,12 @@ fn new_service(root: PathBuf) -> Arc<Service> {
         notified: Mutex::new(HashSet::new()),
     })
 }
+
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub fn service_without_task_decoder_for_test(root: &Path) -> Arc<Service> {
+    new_service(key(root))
+}
 impl std::fmt::Debug for Service {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SpeechService")
