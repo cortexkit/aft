@@ -1,5 +1,6 @@
 //! Scope lifecycle subscriptions on AFT's existing registered connection.
 use super::*;
+use futures_util::future::{BoxFuture, FutureExt, Shared};
 use subc_client_rs::{ScopeWatchEvent, ScopeWatchSelector};
 use subc_protocol::scope::ScopeStamp;
 
@@ -365,8 +366,16 @@ pub(super) struct Watches {
     epochs: HashMap<Key, u64>,
     metrics: Arc<DispatchPathMetrics>,
     retiring: Vec<oneshot::Receiver<()>>,
+    retirement_barrier: Option<Shared<BoxFuture<'static, ()>>>,
 }
 impl Watches {
+    #[cfg(test)]
+    pub(super) fn pause_retirement_for_test(&mut self) -> oneshot::Sender<()> {
+        let (resume, queued) = oneshot::channel();
+        self.retiring.push(queued);
+        resume
+    }
+
     pub(super) fn new(metrics: Arc<DispatchPathMetrics>) -> Self {
         let (sender, receiver) = mpsc::unbounded_channel();
         Self {
@@ -380,6 +389,7 @@ impl Watches {
             epochs: HashMap::new(),
             metrics,
             retiring: vec![],
+            retirement_barrier: None,
         }
     }
     pub(super) fn healthy_keys(&self) -> HashSet<Key> {
@@ -463,6 +473,26 @@ impl Watches {
             if old_len != shard.keys.len() {
                 shard.reopen(&mut self.retiring);
             }
+        }
+        // Collect every retirement before opening replacements. Keep the
+        // barrier here so aborting a replacement cannot discard its waits.
+        if !self.retiring.is_empty() {
+            let retiring = std::mem::take(&mut self.retiring);
+            let previous = self.retirement_barrier.take();
+            self.retirement_barrier = Some(
+                async move {
+                    if let Some(previous) = previous {
+                        previous.await;
+                    }
+                    for closed in retiring {
+                        let _ = closed.await;
+                    }
+                }
+                .boxed()
+                .shared(),
+            );
+        }
+        for (index, shard) in self.shards.iter_mut().enumerate() {
             if shard.keys.is_empty()
                 || shard.task.is_some()
                 || shard.retry_at > tokio::time::Instant::now()
@@ -503,15 +533,15 @@ impl Watches {
             }
             let control = control.clone();
             let sender = self.sender.clone();
-            let retiring = std::mem::take(&mut self.retiring);
+            let retirement_barrier = self.retirement_barrier.clone();
             let (cancelled, closed) = oneshot::channel();
             shard.cancelled = Some(closed);
             shard.task = Some(tokio::spawn(async move {
                 // Queue cancellation before replacement requests, including at
                 // the 16-watch ceiling. Opening first can transiently exceed
                 // the daemon's connection limit even when the final set fits.
-                for closed in retiring {
-                    let _ = closed.await;
+                if let Some(barrier) = retirement_barrier {
+                    barrier.await;
                 }
                 let result: Result<(), readiness::ControlError> = async {
                     let mut subscription = control.scope_watch(selectors, cancelled).await?;
