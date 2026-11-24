@@ -352,6 +352,8 @@ mod linux {
         task_id: &str,
         recorded: Option<&Path>,
     ) -> Result<LocalScopeLookup, String> {
+        #[cfg(test)]
+        let _fixture = local_lookup_fixture();
         let unit = scope_unit(task_id).map_err(|_| "task scope could not be killed")?;
         // A cgroup file does not use the user bus.
         let cgroup = if let Some(recorded) = recorded {
@@ -927,6 +929,48 @@ mod linux {
     #[cfg(any(test, feature = "test-support"))]
     thread_local! {
         static LOCAL_RECOVERY_FIXTURE: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    thread_local! {
+        static LOCAL_LOOKUP_FIXTURE: std::cell::RefCell<Option<(PathBuf, PathBuf)>> = const { std::cell::RefCell::new(None) };
+    }
+
+    #[cfg(test)]
+    struct LocalLookupFixture(Option<(PathBuf, PathBuf)>);
+
+    #[cfg(test)]
+    impl Drop for LocalLookupFixture {
+        fn drop(&mut self) {
+            LOCAL_RECOVERY_FIXTURE.with(|slot| slot.replace(self.0.take()));
+        }
+    }
+
+    #[cfg(test)]
+    fn local_lookup_fixture() -> Option<LocalLookupFixture> {
+        let fixture = LOCAL_LOOKUP_FIXTURE.with(|slot| slot.borrow().clone())?;
+        Some(LocalLookupFixture(
+            LOCAL_RECOVERY_FIXTURE.with(|slot| slot.replace(Some(fixture))),
+        ))
+    }
+
+    /// Limit synthetic cgroup ancestry to local scope discovery. Restoring
+    /// persisted tasks can still query systemd to clean up unused scopes.
+    #[cfg(test)]
+    pub(crate) fn with_local_scope_lookup_fixture_for_test<T>(
+        current: PathBuf,
+        mount: PathBuf,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        struct Restore(Option<(PathBuf, PathBuf)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                LOCAL_LOOKUP_FIXTURE.with(|slot| slot.replace(self.0.take()));
+            }
+        }
+        let _restore =
+            Restore(LOCAL_LOOKUP_FIXTURE.with(|slot| slot.replace(Some((current, mount)))));
+        run()
     }
 
     #[cfg(any(test, feature = "test-support"))]

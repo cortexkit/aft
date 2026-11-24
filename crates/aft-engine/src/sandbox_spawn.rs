@@ -1,6 +1,6 @@
 pub use aft_shell::sandbox_spawn::*;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_shell::test_bridge::{pty_command_for_plan, with_spawn_plan_for_test};
 
 #[cfg(all(test, unix))]
@@ -11,6 +11,10 @@ use crate::{config::SandboxMode, context::AppContext};
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::path::Path;
+
+#[cfg(unix)]
+pub(crate) type ChildEnvironment =
+    std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString>;
 
 #[cfg(unix)]
 pub fn save_provider_approval(ctx: &AppContext, id: &str, snapshot: ProviderApprovalSnapshot) {

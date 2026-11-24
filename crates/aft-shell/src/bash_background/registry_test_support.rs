@@ -14,7 +14,7 @@ pub(super) fn without_named_task_scope<T>(run: impl FnOnce() -> T) -> T {
             .path()
             .join(format!("user@{uid}.service/replay-fixture.scope"));
         std::fs::create_dir_all(&current).unwrap();
-        crate::bash_background::task_scope::with_local_recovery_mount_for_test(
+        crate::bash_background::task_scope::with_local_scope_lookup_fixture_for_test(
             current,
             mount.path().to_path_buf(),
             run,
