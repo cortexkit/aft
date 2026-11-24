@@ -269,6 +269,18 @@ test("idle subc carriers evict and replay queued completions after recreation", 
     expect(delivered).toEqual(["completed-while-evicted"]);
     expect(pending.has("idle-3")).toBe(false);
     expect(client.routeOpens.length).toBe(42);
+
+    await pool.reapIdleSessions(Date.now() + 32 * 60_000);
+    expect(pool.__retainedSessionCountsForTests()).toEqual({
+      sessions: 0,
+      roots: 0,
+      routes: 0,
+      subscriptions: 0,
+      sweepTimers: 0,
+    });
+    expect(pool.__pendingSessionStartsForTests()).toBe(20);
+    await pool.closeSession(TEST_PROJECT_ROOT, "idle-3");
+    expect(pool.__pendingSessionStartsForTests()).toBe(19);
   } finally {
     await pool.shutdown();
   }

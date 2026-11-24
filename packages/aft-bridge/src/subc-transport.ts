@@ -2080,8 +2080,13 @@ export class SubcTransportPool implements AftTransportPool {
         now - record.lastUsedAt < 15 * 60_000
       )
         continue;
-      const owner = this.detachSession(key, "session_closed");
-      if (owner) detached.push(owner);
+      const owner = this.detachSession(key, "session_closed", true);
+      if (owner) {
+        if (this.observedStarts.size >= 256)
+          this.observedStarts.delete(this.observedStarts.values().next().value as IdentityKey);
+        this.observedStarts.add(key);
+        detached.push(owner);
+      }
     }
     if (this.sessions.size === 0 && this.sessionSweep) {
       clearInterval(this.sessionSweep);
@@ -2312,7 +2317,9 @@ export class SubcTransportPool implements AftTransportPool {
   private detachSession(
     key: IdentityKey,
     reason: "root_reaped" | "session_closed" | "shutdown",
+    preserveObservedStart = false,
   ): DetachedSession | null {
+    if (!preserveObservedStart) this.observedStarts.delete(key);
     const record = this.sessions.get(key);
     if (!record || record.closed) return null;
     record.closed = true;
