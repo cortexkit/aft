@@ -1245,7 +1245,7 @@ impl<S: SliceSource> CallGraphRead for SliceReader<S> {
                     .map(|index| slice.reference(*index as usize))
                     .filter(|reference| {
                         include_tests
-                            || (!crate::inspect::job::is_test_file(file)
+                            || (!crate::file_kind::is_test_file(file)
                                 && !reference
                                     .caller()
                                     .and_then(|handle| slice.node(handle))

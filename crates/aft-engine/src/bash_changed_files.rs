@@ -354,8 +354,7 @@ impl Capture {
         let journal = ctx
             .watcher_counters()
             .bash_changes
-            .get_or_init(|| Arc::new(Journal::default()))
-            .clone();
+            .get_or_init(|| Arc::new(Journal::default()));
         let mut capture = Self::begin(root, journal, mode, ctx.watcher_runtime_active());
         if mode == BashChangedFiles::Diff {
             Arc::get_mut(&mut capture).unwrap().read_policy = ctx

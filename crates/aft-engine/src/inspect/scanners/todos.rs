@@ -13,6 +13,7 @@ use std::time::Instant;
 
 use aft_store::content::{TodoMarker, TodoMarkers};
 
+pub(crate) use crate::data_layer::todo_counts::TodoCounts;
 use crate::inspect::job::{is_test_tree_file, ExcludedTestTally};
 use crate::inspect::{InspectJob, InspectResult, InspectScanSuccess};
 pub(crate) use crate::parser::todo_markers::*;

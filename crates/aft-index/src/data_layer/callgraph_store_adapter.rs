@@ -6,11 +6,12 @@ use serde::Serialize;
 use tree_sitter::Node;
 
 use crate::callgraph::{self, TraceToSymbolCandidate};
+use crate::callgraph_store::access::CallgraphStoreAccess;
 use crate::callgraph_store::{
     CallGraphRead, CallGraphStoreError, StoreCallSite, StoreNode, StoreUnresolvedCall,
     MACRO_BODY_CALL_REF_KIND, MACRO_MENTION_REF_KIND, UNRESOLVED_CALL_SITE_COUNT_LIMIT,
 };
-use crate::context::{AppContext, CallgraphStoreAccess};
+use crate::data_layer::callgraph_query_host::CallgraphQueryHost;
 use crate::data_layer::callgraph_roots::{RootKind, RootTally, Roots};
 use crate::edit::line_col_to_byte;
 use crate::error::AftError;
@@ -2701,14 +2702,10 @@ pub fn store_error_response(req_id: &str, operation: &str, error: CallGraphStore
 pub fn not_indexed_response(
     req_id: &str,
     operation: &str,
-    ctx: &AppContext,
+    ctx: &dyn CallgraphQueryHost,
     path: &Path,
 ) -> Response {
-    let ignored = ctx.gitignore().is_some_and(|matcher| {
-        matcher
-            .matched_path_or_any_parents(&path, false)
-            .is_ignore()
-    });
+    let ignored = ctx.callgraph_path_is_ignored(path);
     let (reason, detail) = if ignored {
         ("ignored", "path is ignored by the project's ignore rules")
     } else {
@@ -2769,22 +2766,17 @@ mod serialization_tests {
     }
 }
 
-pub fn note_callgraph_building(ctx: &crate::context::AppContext, tool: &str) {
-    ctx.note_index_query(crate::logging::IndexPlane::Callgraph, tool, 0, "building");
+pub fn note_callgraph_building(ctx: &dyn CallgraphQueryHost, tool: &str) {
+    ctx.note_callgraph_query(tool, 0, "building");
 }
 
 pub fn note_callgraph_served(
-    ctx: &crate::context::AppContext,
+    ctx: &dyn CallgraphQueryHost,
     tool: &str,
     service_ms: u64,
     status: &str,
 ) {
-    ctx.note_index_query(
-        crate::logging::IndexPlane::Callgraph,
-        tool,
-        service_ms,
-        status,
-    );
+    ctx.note_callgraph_query(tool, service_ms, status);
 }
 
 /// Refusal payload shared by every callgraph query whose index is not usable:
@@ -2813,7 +2805,7 @@ fn callgraph_index_refusal(
 pub fn index_refusal_response(
     req_id: &str,
     operation: &str,
-    ctx: &AppContext,
+    ctx: &dyn CallgraphQueryHost,
     access: &CallgraphStoreAccess,
 ) -> Response {
     // Configure switches the call graph off for a home root, so the home-root
@@ -2912,7 +2904,7 @@ pub fn home_root_disabled_response(req_id: &str, operation: &str) -> Response {
     )
 }
 
-pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Response {
+pub fn unavailable_for(req_id: &str, operation: &str, ctx: &dyn CallgraphQueryHost) -> Response {
     if let Some(reason) = ctx.cache_unavailable_reason() {
         return callgraph_index_refusal(
             req_id,
@@ -2924,7 +2916,7 @@ pub fn unavailable_for(req_id: &str, operation: &str, ctx: &AppContext) -> Respo
     if ctx.is_home_root() {
         return home_root_disabled_response(req_id, operation);
     }
-    if !ctx.is_worktree_bridge() && ctx.callgraph_project_root().is_some() {
+    if !ctx.is_worktree_bridge() && ctx.has_callgraph_project_root() {
         // A configured root whose store this runtime cannot use (for example
         // a borrowed read-only root, or a root that is being unbound): report
         // the plane's observed cause rather than "not configured".

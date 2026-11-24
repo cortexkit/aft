@@ -14,6 +14,10 @@ pub(crate) use crate::executor::root_lifecycle::SubcLifecycleAdmission;
 pub(crate) use crate::watcher_backend::counters::WatcherCounters;
 pub use crate::watcher_backend::counters::{watcher_counters_for_root, WatcherCountersSnapshot};
 
+mod watcher_changes;
+#[doc(hidden)]
+pub use watcher_changes::{BashChanges, WatcherCountersHandle};
+
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::io::{self, BufWriter};
 use std::path::{Component, Path, PathBuf};
@@ -8127,7 +8131,11 @@ impl AppContext {
         &self.watcher
     }
 
-    pub fn watcher_counters(&self) -> Arc<WatcherCounters> {
+    pub fn watcher_counters(&self) -> WatcherCountersHandle {
+        WatcherCountersHandle::new(self.index_watcher_counters())
+    }
+
+    pub(crate) fn index_watcher_counters(&self) -> Arc<WatcherCounters> {
         Arc::clone(
             &self
                 .watcher_counters

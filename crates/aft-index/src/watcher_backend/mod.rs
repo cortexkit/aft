@@ -4,7 +4,8 @@ use std::sync::{mpsc, Arc};
 
 use crate::watcher_filter::SharedGitignore;
 pub(crate) mod cookie;
-pub(crate) mod counters;
+#[doc(hidden)]
+pub mod counters;
 #[doc(hidden)]
 pub mod flush;
 
@@ -421,5 +422,7 @@ mod tests {
         );
     }
 }
+#[doc(hidden)]
+pub mod change_sink;
 #[cfg(windows)]
 pub(crate) mod readiness;

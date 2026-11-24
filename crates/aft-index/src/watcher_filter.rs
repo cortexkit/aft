@@ -2638,7 +2638,7 @@ impl WatcherFilterThread {
                         return;
                     }
                     let cookies = self.take_cookie_paths(&mut event);
-                    if self.config.counters.bash_changes.get().is_some()
+                    if self.config.counters.bash_changes().get().is_some()
                         && self.config.counters.bash_flush.observe(&event)
                     {
                         continue;
@@ -2672,7 +2672,7 @@ impl WatcherFilterThread {
                         && event.paths.is_empty()
                         && !event.need_rescan();
                     if !empty_arrival {
-                        if let Some(journal) = self.config.counters.bash_changes.get() {
+                        if let Some(journal) = self.config.counters.bash_changes().get() {
                             journal.event_for_root(
                                 &event,
                                 &self.config.project_root,
@@ -2741,7 +2741,7 @@ impl WatcherFilterThread {
                     if self.stop_for_deleted_root(true) {
                         return;
                     }
-                    if let Some(journal) = self.config.counters.bash_changes.get() {
+                    if let Some(journal) = self.config.counters.bash_changes().get() {
                         journal.gap();
                     }
                     let _ =

@@ -103,7 +103,7 @@ struct WatcherLossRecovery {
 #[doc(hidden)]
 pub struct WatcherCounters {
     pub bash_flush: Arc<crate::watcher_backend::flush::FlushControl>,
-    pub bash_changes: std::sync::OnceLock<Arc<crate::bash_changed_files::Journal>>,
+    pub(super) bash_changes: super::change_sink::WatcherChanges,
     overflow_ignore_evidence: AtomicU8,
     /// Legacy rescan work coalesces repeated drops, but a newly installed views
     /// snapshot must still learn that delivery was lost during that work.

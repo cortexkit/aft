@@ -408,6 +408,36 @@ fn bash_changed_files_off_does_no_probes_or_watcher_registration() {
 }
 
 #[test]
+fn bash_changed_files_watcher_slot_keeps_the_capture_journal_after_one_context_drops() {
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().canonicalize().unwrap();
+    let make_context = || {
+        let mut config = crate::config::Config::default();
+        config.project_root = Some(project.clone());
+        config.bash.changed_files = BashChangedFiles::List;
+        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    };
+    let first = make_context();
+    let second = make_context();
+    let capture = Capture::start(&first).unwrap();
+    let counters = second.index_watcher_counters();
+    let second_journal = second.watcher_counters().bash_changes.get().unwrap();
+    assert!(Arc::ptr_eq(&capture.journal, &second_journal));
+
+    drop(first);
+    let sink = counters.bash_changes().get().unwrap();
+    let matcher = Arc::new(std::sync::RwLock::new(None));
+    let event = notify::Event::new(notify::EventKind::Create(CreateKind::File))
+        .add_path(project.join("after-first-context.txt"));
+    sink.event_for_root(&event, &project, &matcher);
+    sink.gap();
+    let report = capture.finish();
+    assert_eq!(report.files.len(), 1);
+    assert_eq!(report.files[0].path, "after-first-context.txt");
+    assert!(report.text.contains(OVERFLOW));
+}
+
+#[test]
 fn bash_changed_files_git_capture_combines_metadata_and_shares_budget() {
     let mut calls = Vec::new();
     let mut deadlines = Vec::new();
@@ -549,10 +579,9 @@ impl NativeWatcher {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         let root = root.canonicalize().unwrap();
         let counters = crate::context::watcher_counters_for_root(&root);
-        let journal = counters
+        let journal = crate::context::WatcherCountersHandle::new(counters.clone())
             .bash_changes
-            .get_or_init(|| Arc::new(Journal::default()))
-            .clone();
+            .get_or_init(|| Arc::new(Journal::default()));
         let mut ignores = ignore::gitignore::GitignoreBuilder::new(&root);
         ignores.add_line(None, "/target/").unwrap();
         if root.join(".gitignore").is_file() {

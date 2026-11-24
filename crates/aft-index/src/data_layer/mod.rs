@@ -3,6 +3,8 @@
 //! stored records.
 
 pub mod callgraph;
+#[doc(hidden)]
+pub mod callgraph_query_host;
 pub mod callgraph_roots;
 pub mod callgraph_store_adapter;
 pub mod checkout;
@@ -67,6 +69,8 @@ pub mod symbol_prewarm_measure;
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
 pub(crate) mod test_gates;
+#[doc(hidden)]
+pub mod todo_counts;
 pub mod trace_measure;
 pub mod vectors;
 

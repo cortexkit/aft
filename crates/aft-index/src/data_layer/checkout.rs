@@ -5975,9 +5975,12 @@ pub(crate) enum PathTodos {
 
 /// The record's language and counts; unlike `TodoMarkers`, owns no marker text.
 #[derive(Clone, Debug)]
-pub(crate) struct TodoSummary {
-    pub(crate) language: Option<crate::inspect::scanners::todos::TodoLanguage>,
-    pub(crate) counts: Option<crate::inspect::scanners::todos::TodoCounts>,
+#[doc(hidden)]
+pub struct TodoSummary {
+    #[doc(hidden)]
+    pub language: Option<crate::parser::todo_markers::TodoLanguage>,
+    #[doc(hidden)]
+    pub counts: Option<super::todo_counts::TodoCounts>,
 }
 
 #[derive(Clone, Debug)]
@@ -5992,7 +5995,8 @@ pub(crate) enum PathTodoCounts {
 
 impl From<PathTodos> for PathTodoCounts {
     fn from(todos: PathTodos) -> Self {
-        use crate::inspect::scanners::todos::{TodoCounts, TodoLanguage};
+        use super::todo_counts::TodoCounts;
+        use crate::parser::todo_markers::TodoLanguage;
         match todos {
             PathTodos::Absent => Self::Absent,
             PathTodos::TooLarge => Self::TooLarge,

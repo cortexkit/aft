@@ -133,6 +133,26 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `IndexHost::try_semantic_index_resident` | port | `aft-index` | Distinguish a busy index slot from an empty one without exposing its lock. |
 | `IndexHost::semantic_build_in_progress` | port | `aft-index` | A present or busy build receiver remains evidence of an in-progress build. |
 | `impl IndexHost for AppContext` (semantic observations) | adapter | `aft-engine` | Keep lock acquisition and poison handling in composition. |
+| `CallgraphQueryHost` | port | `aft-index` | Supply only the observed runtime facts and accounting needed by call graph queries. |
+| `impl CallgraphQueryHost for AppContext` | adapter | `aft-engine` | Read the real project's ignore and root state and record call-graph timings and outcomes. |
+| `data_layer::grammar::prepare` | port consumer | `aft-index` | Prepare Luau against the same pinned configuration, only when the language matches. |
+| `data_layer::todo_counts` | module exposure | `aft-index` | Expose plain TODO-count data to the inspect projection. |
+| `TodoCounts` | item moved down | `aft-index` | Decode comment counts without a dependency on the inspect scanner. |
+| `TodoCounts::total` | visibility widened | `aft-index` | Retain inspect's total marker count. |
+| `TodoCounts::by_kind` | visibility widened | `aft-index` | Retain inspect's per-marker counts. |
+| `TodoCounts::of` | visibility widened | `aft-index` | The inspect scanner and checkout use exactly the same counting rule. |
+| `TodoSummary` | visibility widened | `aft-index` | Inspect classifies the checkout's count summary against its path. |
+| `TodoSummary::language` | visibility widened | `aft-index` | Keep inspect's stored-language check. |
+| `TodoSummary::counts` | visibility widened | `aft-index` | Keep inspect's stored marker counts. |
+| `watcher_backend::counters` | visibility widened | `aft-index` | Composition uses the same per-root watcher counters as native backends. |
+| `WatcherChangeSink` | port | `aft-index` | Deliver raw watcher events and losses without naming the Bash journal. |
+| `WatcherChanges` | handle | `aft-index` | Hold the optional sink in one slot shared with the root's counters. |
+| `WatcherCounters::bash_changes` | handle accessor | `aft-index` | Access the existing root-local sink slot without exposing its lock. |
+| `WatcherChanges::{get, get_or_init}` | handle operations | `aft-index` | Observe or initialize the single sink without replacing it. |
+| `impl WatcherChangeSink for Journal` | adapter | `aft-engine` | Keep the existing Bash event admission and journal gap logic. |
+| `WatcherCountersHandle` | compatibility wrapper | `aft-engine` | Preserve the existing watcher-counter, flush and journal call paths. |
+| `BashChanges` | compatibility wrapper | `aft-engine` | Type the sink as the same Bash journal used by shell capture. |
+| `BashChanges::get_or_init` | compatibility wrapper | `aft-engine` | Leave repeated initialization idempotent for inspect and shell callers. |
 
 ## Visibility widened for cross-crate callers
 

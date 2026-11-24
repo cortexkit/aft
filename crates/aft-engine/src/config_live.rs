@@ -257,14 +257,14 @@ pub fn sync_config_watches(ctx: &AppContext) {
         .flatten();
     if watches.user.as_ref().map(ConfigFileWatch::file) != wanted_user.as_deref() {
         watches.user = wanted_user.map(|path| {
-            ConfigFileWatch::start_for_root(path, state.signal(), ctx.watcher_counters())
+            ConfigFileWatch::start_for_root(path, state.signal(), ctx.index_watcher_counters())
         });
     }
 
     let wanted_project = (!covered).then_some(sources.project.path.clone()).flatten();
     if watches.project_fallback.as_ref().map(ConfigFileWatch::file) != wanted_project.as_deref() {
         watches.project_fallback = wanted_project.map(|path| {
-            ConfigFileWatch::start_for_root(path, state.signal(), ctx.watcher_counters())
+            ConfigFileWatch::start_for_root(path, state.signal(), ctx.index_watcher_counters())
         });
     }
 }

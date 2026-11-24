@@ -1,12 +1,19 @@
+use crate::parser::todo_markers::MARKERS;
+use aft_store::content::TodoMarker;
+
 /// Marker totals without any retained marker text.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct TodoCounts {
-    pub(crate) total: usize,
-    pub(crate) by_kind: [usize; 5],
+#[doc(hidden)]
+pub struct TodoCounts {
+    #[doc(hidden)]
+    pub total: usize,
+    #[doc(hidden)]
+    pub by_kind: [usize; 5],
 }
 
 impl TodoCounts {
-    pub(crate) fn of(items: &[TodoMarker]) -> Self {
+    #[doc(hidden)]
+    pub fn of(items: &[TodoMarker]) -> Self {
         let mut counts = Self {
             total: items.len(),
             ..Self::default()

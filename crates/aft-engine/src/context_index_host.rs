@@ -1,6 +1,7 @@
 //! Runtime implementations of the index and read-policy interfaces.
 
 use super::*;
+use crate::data_layer::callgraph_query_host::CallgraphQueryHost;
 use crate::data_layer::host::IndexHost;
 use crate::read_policy::ReadPolicy;
 
@@ -114,6 +115,33 @@ impl ReadPolicy for AppContext {
     }
     fn is_home_root(&self) -> bool {
         self.is_home_root()
+    }
+}
+
+impl CallgraphQueryHost for AppContext {
+    fn callgraph_path_is_ignored(&self, path: &Path) -> bool {
+        self.gitignore().is_some_and(|matcher| {
+            matcher
+                .matched_path_or_any_parents(&path, false)
+                .is_ignore()
+        })
+    }
+
+    fn note_callgraph_query(&self, tool: &str, service_ms: u64, status: &str) {
+        self.note_index_query(
+            crate::logging::IndexPlane::Callgraph,
+            tool,
+            service_ms,
+            status,
+        );
+    }
+
+    fn is_worktree_bridge(&self) -> bool {
+        self.is_worktree_bridge()
+    }
+
+    fn has_callgraph_project_root(&self) -> bool {
+        self.callgraph_project_root().is_some()
     }
 }
 

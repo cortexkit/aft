@@ -10,7 +10,7 @@ pub(crate) fn meaning_callgraph_off_reason() -> String {
 }
 
 #[doc(hidden)]
-pub fn prepare(ctx: &crate::context::AppContext, path: &std::path::Path) -> Result<(), AftError> {
+pub fn prepare(ctx: &dyn super::host::IndexHost, path: &std::path::Path) -> Result<(), AftError> {
     if crate::parser::detect_language_any(path, true) == Some(crate::parser::LangId::Luau) {
         crate::grammar::configure(&ctx.config()).request()?;
     }
