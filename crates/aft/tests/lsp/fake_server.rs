@@ -1153,6 +1153,25 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/diagnostic" => {
+                    if std::env::var_os("AFT_FAKE_LSP_MULTIPLE_PULL").is_some() {
+                        let params = params.unwrap_or_default();
+                        let provider = params["identifier"].as_str().unwrap();
+                        let result = format!("{provider}-result");
+                        record_pull_event(&format!("provider={provider} previous={}", params["previousResultId"]))?;
+                        if workspace_root.as_deref().is_some_and(|root| root.join(format!("fail-{provider}")).exists()) {
+                            write_json_message(&mut writer, &json!({"jsonrpc":"2.0","id":id,"error":{"code":-32603,"message":"provider failed"}}))?;
+                            continue;
+                        }
+                        if params["previousResultId"].as_str() == Some(&result) {
+                            write_response(&mut writer, id, json!({"kind":"unchanged","resultId":result}))?;
+                        } else {
+                            write_response(&mut writer, id, json!({"kind":"full","resultId":result,"items":[{
+                                "range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},
+                                "severity":1,"message":provider
+                            }]}))?;
+                        }
+                        continue;
+                    }
                     if dynamic_pull {
                         record_pull_event(&format!("pull registered={diagnostic_registered} {}", request_document_uri_string(&params)))?;
                         if !diagnostic_registered {
@@ -1468,7 +1487,15 @@ pub(crate) fn main() -> io::Result<()> {
             },
             ServerMessage::Notification { method, params } => match method.as_str() {
                 "initialized" => {
-                    if dynamic_pull && client_dynamic_pull {
+                    if std::env::var_os("AFT_FAKE_LSP_MULTIPLE_PULL").is_some() && client_dynamic_pull {
+                        let registrations = [("types", Value::Null), ("lint", Value::Null),
+                            ("other", json!([{"language":"javascript"}])), ("removed", Value::Null)]
+                            .map(|(id, selector)| json!({"id":id,"method":"textDocument/diagnostic","registerOptions":{
+                                "documentSelector":selector,"identifier":id,"interFileDependencies":true,"workspaceDiagnostics":false
+                            }}));
+                        write_request(&mut writer, 22_010, "client/registerCapability", json!({"registrations":registrations}))?;
+                        write_request(&mut writer, 22_011, "client/unregisterCapability", json!({"unregisterations":[{"id":"removed","method":"textDocument/diagnostic"}]}))?;
+                    } else if dynamic_pull && client_dynamic_pull {
                         if let Some(delay) = std::env::var("AFT_FAKE_LSP_REGISTER_DIAGNOSTICS_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
                             std::thread::sleep(std::time::Duration::from_millis(delay));
                         }

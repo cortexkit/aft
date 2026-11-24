@@ -20,7 +20,7 @@
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/lsp/manager.rs": {
-    "lines": 10456,
+    "lines": 10369,
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
   "crates/aft/src/sandbox_spawn.rs": {

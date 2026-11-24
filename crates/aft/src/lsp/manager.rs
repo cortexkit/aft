@@ -93,6 +93,7 @@ mod document_close;
 mod document_pull_lifetime;
 mod event_drain;
 mod memory;
+mod provider_pulls;
 mod shutdown;
 use memory::DiagnosticMergeCache;
 
@@ -616,6 +617,7 @@ enum DocumentPullState {
         wait_until: Instant,
     },
     Replied(Result<serde_json::Value, LspError>),
+    Registered(provider_pulls::RegisteredPulls),
 }
 
 impl DocumentPull {
@@ -634,6 +636,7 @@ impl DocumentPull {
             } => DocumentPullState::Replied(
                 request.wait(wait_until.saturating_duration_since(Instant::now())),
             ),
+            DocumentPullState::Registered(pulls) => DocumentPullState::Registered(pulls.wait()),
             settled => settled,
         };
         self
@@ -4909,110 +4912,6 @@ impl LspManager {
         Ok(self.begin_open_document_pull(key.clone(), &canonical_path, &uri, Some(deadline)))
     }
 
-    fn begin_open_document_pull(
-        &mut self,
-        key: ServerKey,
-        canonical_path: &Path,
-        uri: &lsp_types::Uri,
-        deadline: Option<Instant>,
-    ) -> DocumentPull {
-        let canonical_path = canonical_path.to_path_buf();
-        self.background_pull_pending
-            .remove(&(key.clone(), canonical_path.clone()));
-        let document_version = self
-            .documents
-            .get(&key)
-            .and_then(|store| store.version(&canonical_path));
-        let mut pull = DocumentPull {
-            document_version,
-            document_snapshot: self
-                .documents
-                .get(&key)
-                .and_then(|store| store.entry(&canonical_path))
-                .cloned(),
-            server_pid: self.clients.get(&key).map(LspClient::child_pid),
-            previous_report: self
-                .diagnostics
-                .entries_for_file(&canonical_path)
-                .into_iter()
-                .find(|(stored, entry)| {
-                    **stored == key && entry.from_document_pull && entry.result_id.is_some()
-                })
-                .map(|(_, entry)| entry.clone()),
-            key,
-            canonical_path,
-            opened_for_pull: None,
-            state: DocumentPullState::Done(PullFileOutcome::PullNotSupported),
-        };
-        if self.starting.contains_key(&pull.key) {
-            pull.state = DocumentPullState::Replied(Err(LspError::ServerNotReady(
-                START_IN_PROGRESS_REASON.into(),
-            )));
-            return pull;
-        }
-        let supports_pull = self
-            .clients
-            .get(&pull.key)
-            .and_then(|c| c.diagnostic_capabilities_for_file(&pull.canonical_path))
-            .is_some_and(|caps| caps.pull_diagnostics);
-        if !supports_pull {
-            return pull;
-        }
-
-        // Look up previous resultId for incremental requests.
-        let previous_result_id = pull
-            .previous_report
-            .as_ref()
-            .and_then(|entry| entry.result_id.clone());
-        let identifier = self
-            .clients
-            .get(&pull.key)
-            .and_then(|c| c.diagnostic_capabilities_for_file(&pull.canonical_path))
-            .and_then(|caps| caps.identifier.clone());
-        let params = AftDocumentDiagnosticParams {
-            text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
-            identifier,
-            previous_result_id,
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        };
-        // Capped below the global request timeout so a stalled pull server
-        // cannot consume the entire inspect or post-edit budget.
-        let timeout = deadline
-            .map(|deadline| {
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Self::PULL_FILE_TIMEOUT)
-            })
-            .unwrap_or(Self::PULL_FILE_TIMEOUT);
-        slog_info!(
-            "lsp_protocol server={} root={} method=textDocument/diagnostic event=sent file={} document_version={}",
-            pull.key.kind.id_str(),
-            pull.key.root.display(),
-            pull.canonical_path.display(),
-            pull.document_version
-                .map(|version| version.to_string())
-                .unwrap_or_else(|| "none".to_string())
-        );
-        let started = match self.clients.get_mut(&pull.key) {
-            Some(client) => client.start_document_diagnostic_request(&pull.canonical_path, params),
-            None => Err(LspError::ServerNotReady("server not found".into())),
-        };
-        pull.state = match started {
-            Ok((request, used_previous)) => {
-                if !used_previous {
-                    pull.previous_report = None;
-                }
-                DocumentPullState::InFlight {
-                    request,
-                    wait_until: Instant::now() + timeout,
-                }
-            }
-            Err(err) => DocumentPullState::Replied(Err(err)),
-        };
-        pull
-    }
-
     pub(crate) fn begin_scoped_typescript_diagnostics(
         &mut self,
         key: &ServerKey,
@@ -5083,11 +4982,9 @@ impl LspManager {
             state,
             ..
         } = pull;
-        let reply = match state {
-            DocumentPullState::Done(outcome) => return outcome,
-            DocumentPullState::Replied(reply) => reply,
-            DocumentPullState::InFlight { .. } => unreachable!("DocumentPull::wait replies"),
-        };
+        if let DocumentPullState::Done(outcome) = state {
+            return outcome;
+        }
         if self.clients.get(&key).map(LspClient::child_pid) != server_pid
             || self
                 .documents
@@ -5114,6 +5011,19 @@ impl LspManager {
                 reason: "document_diagnostics_not_registered".into(),
             };
         }
+        let reply = match state {
+            DocumentPullState::Registered(pulls) => {
+                return self.finish_registered_document_pulls(
+                    &key,
+                    &canonical_path,
+                    document_snapshot.as_ref(),
+                    previous_report.as_ref(),
+                    pulls,
+                )
+            }
+            DocumentPullState::Replied(reply) => reply,
+            _ => unreachable!("DocumentPull::wait replies"),
+        };
         let report = reply.and_then(|value| {
             serde_json::from_value::<lsp_types::DocumentDiagnosticReportResult>(value)
                 .map_err(Into::into)
@@ -6583,12 +6493,15 @@ impl LspManager {
                     kind: server_kind.clone(),
                     root: root.clone(),
                 };
-                if method == "client/unregisterCapability"
-                    && self.clients.get(&key).is_some_and(|client| {
-                        client.uses_analysis_progress() && !client.uses_document_pull(None)
-                    })
+                if matches!(
+                    method.as_str(),
+                    "client/registerCapability" | "client/unregisterCapability"
+                ) && self
+                    .clients
+                    .get(&key)
+                    .is_some_and(LspClient::uses_analysis_progress)
                 {
-                    self.diagnostics.invalidate_document_pulls(&key);
+                    self.invalidate_changed_providers(&key);
                 }
                 self.queue_open_document_pulls(&key);
                 None

@@ -100,6 +100,7 @@ pub struct DiagnosticEntry {
     /// Optional resultId from a pull response. Sent back as `previousResultId`
     /// on the next pull request to enable `kind: "unchanged"` short-circuiting.
     pub result_id: Option<String>,
+    pub(super) provider_results: Option<ProviderResults>,
     /// Document version this report was proven against. Versioned
     /// `publishDiagnostics` payloads provide it directly; a synchronous pull
     /// response is tagged with the client's current document version.
@@ -128,6 +129,19 @@ pub struct DiagnosticEntry {
     /// successful text sync supplied the version proof instead. This proof is
     /// no longer sufficient if that server later registers document pulls.
     pub from_receive_order: bool,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProviderResults {
+    pub(super) instance: super::client::ServerInstanceId,
+    pub(super) stamps: Vec<ProviderStamp>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ProviderStamp {
+    pub(super) generation: u64,
+    pub(super) result_id: Option<String>,
+    pub(super) items: std::ops::Range<usize>,
 }
 
 /// Stores diagnostics from all LSP servers, keyed per `(ServerKey, file)`.
@@ -465,14 +479,60 @@ impl DiagnosticsStore {
         version: Option<i32>,
         provisional: bool,
     ) {
+        self.publish_report(
+            server,
+            file,
+            diagnostics,
+            result_id,
+            version,
+            provisional,
+            None,
+        );
+    }
+
+    pub(super) fn publish_provider_results(
+        &mut self,
+        server: ServerKey,
+        file: PathBuf,
+        diagnostics: Vec<StoredDiagnostic>,
+        version: Option<i32>,
+        provisional: bool,
+        results: ProviderResults,
+    ) {
+        let result_id = match results.stamps.as_slice() {
+            [one] => one.result_id.clone(),
+            _ => None,
+        };
+        self.publish_report(
+            server,
+            file,
+            diagnostics,
+            result_id,
+            version,
+            provisional,
+            Some(results),
+        );
+    }
+
+    fn publish_report(
+        &mut self,
+        server: ServerKey,
+        file: PathBuf,
+        diagnostics: Vec<StoredDiagnostic>,
+        result_id: Option<String>,
+        version: Option<i32>,
+        provisional: bool,
+        provider_results: Option<ProviderResults>,
+    ) {
         let key = (server, file);
         self.next_epoch = self.next_epoch.saturating_add(1);
         self.generation = self.generation.wrapping_add(1);
-        let from_document_pull = result_id.is_some();
+        let from_document_pull = result_id.is_some() || provider_results.is_some();
         let entry = DiagnosticEntry {
             diagnostics,
             epoch: self.next_epoch,
             result_id,
+            provider_results,
             version,
             stale: false,
             provisional,
@@ -1046,6 +1106,30 @@ impl DiagnosticsStore {
         }
     }
 
+    pub(super) fn invalidate_changed_provider_results(
+        &mut self,
+        key: &ServerKey,
+        generations: impl Fn(&Path) -> Vec<u64>,
+    ) {
+        let mut changed = false;
+        for ((server, file), entry) in &mut self.entries {
+            if server == key
+                && !entry.stale
+                && entry.provider_results.as_ref().is_some_and(|results| {
+                    !generations(file)
+                        .into_iter()
+                        .eq(results.stamps.iter().map(|stamp| stamp.generation))
+                })
+            {
+                entry.stale = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
+        }
+    }
+
     pub(crate) fn has_provisional_report_for_server(&self, key: &ServerKey) -> bool {
         self.entries
             .iter()
@@ -1221,6 +1305,13 @@ impl DiagnosticsStore {
                     .map_or(0, |id| crate::memory::usize_to_u64(id.len())),
             )
             .saturating_add(diagnostic_bytes)
+            .saturating_add(entry.provider_results.as_ref().map_or(0, |results| {
+                results.stamps.iter().fold(0u64, |bytes, stamp| {
+                    bytes
+                        .saturating_add(std::mem::size_of::<ProviderStamp>() as u64)
+                        .saturating_add(stamp.result_id.as_ref().map_or(0, |id| id.len() as u64))
+                })
+            }))
     }
 
     // All report-removal paths retire the payload and its three secondary

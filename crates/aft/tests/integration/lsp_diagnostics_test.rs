@@ -2565,14 +2565,11 @@ fn post_edit_rejects_publish_with_stale_version() {
 
 #[test]
 fn post_edit_wait_rejects_stale_pre_edit_publish() {
-    use aft::lsp::diagnostics::{DiagnosticEntry, StoredDiagnostic};
     use aft::lsp::manager::{post_edit_entry_is_fresh, PreEditSnapshot};
 
     let file = PathBuf::from("/tmp/aft-stale.rs");
-    let stale = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: vec![StoredDiagnostic {
+    let stale = post_edit_entry_fixture(
+        StoredDiagnostic {
             file,
             line: 1,
             column: 1,
@@ -2582,14 +2579,11 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
             message: "stale pre-edit".into(),
             code: None,
             source: Some("fake".into()),
-        }],
-        epoch: 7,
-        result_id: None,
-        version: Some(4),
-        stale: false,
-        provisional: false,
-        from_document_pull: false,
-    };
+        },
+        7,
+        Some(4),
+        false,
+    );
 
     let pre_edit = PreEditSnapshot {
         epoch: 6,
@@ -2604,14 +2598,11 @@ fn post_edit_wait_rejects_stale_pre_edit_publish() {
 
 #[test]
 fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
-    use aft::lsp::diagnostics::{DiagnosticEntry, StoredDiagnostic};
     use aft::lsp::manager::{post_edit_entry_is_fresh, PreEditSnapshot};
 
     let file = PathBuf::from("/tmp/aft-unversioned.rs");
-    let unversioned = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: vec![StoredDiagnostic {
+    let unversioned = post_edit_entry_fixture(
+        StoredDiagnostic {
             file,
             line: 1,
             column: 1,
@@ -2621,14 +2612,11 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
             message: "unversioned".into(),
             code: None,
             source: Some("fake".into()),
-        }],
-        epoch: 8,
-        result_id: None,
-        version: None,
-        stale: false,
-        provisional: false,
-        from_document_pull: false,
-    };
+        },
+        8,
+        None,
+        false,
+    );
 
     let pre_edit = PreEditSnapshot {
         epoch: 7,
@@ -2639,6 +2627,31 @@ fn post_edit_wait_rejects_unversioned_epoch_only_publish() {
         !post_edit_entry_is_fresh(&unversioned, 5, pre_edit),
         "epoch advancement alone must not prove freshness for unversioned publishes"
     );
+}
+
+fn post_edit_entry_fixture(
+    diagnostic: StoredDiagnostic,
+    epoch: u64,
+    version: Option<i32>,
+    provisional: bool,
+) -> aft::lsp::diagnostics::DiagnosticEntry {
+    let mut store = aft::lsp::diagnostics::DiagnosticsStore::new();
+    let file = diagnostic.file.clone();
+    let key = ServerKey {
+        kind: ServerKind::Rust,
+        root: file.parent().unwrap().to_path_buf(),
+    };
+    store.publish_full_with_provisional(
+        key,
+        file.clone(),
+        vec![diagnostic],
+        None,
+        version,
+        provisional,
+    );
+    let mut entry = store.entries_for_file(&file)[0].1.clone();
+    entry.epoch = epoch;
+    entry
 }
 
 #[test]
@@ -2918,7 +2931,6 @@ fn rust_analyzer_warming_diagnostics_are_provisional_until_quiescent() {
 
 #[test]
 fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
-    use aft::lsp::diagnostics::DiagnosticEntry;
     use aft::lsp::manager::PreEditSnapshot;
 
     let file = PathBuf::from("/workspace/src/main.rs");
@@ -2926,10 +2938,8 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
         kind: ServerKind::Rust,
         root: PathBuf::from("/workspace"),
     };
-    let entry = DiagnosticEntry {
-        from_receive_order: false,
-        content_hash: None,
-        diagnostics: vec![StoredDiagnostic {
+    let entry = post_edit_entry_fixture(
+        StoredDiagnostic {
             file,
             line: 1,
             column: 1,
@@ -2939,14 +2949,11 @@ fn edit_diagnostics_reports_warming_publish_as_pending_until_quiescent() {
             message: "warming diagnostic".to_string(),
             code: Some("E-WARM".to_string()),
             source: Some("rust-analyzer".to_string()),
-        }],
-        epoch: 2,
-        result_id: None,
-        version: Some(1),
-        stale: false,
-        provisional: true,
-        from_document_pull: false,
-    };
+        },
+        2,
+        Some(1),
+        true,
+    );
 
     let outcome = LspManager::post_edit_outcome_for_entry_for_test(
         key,

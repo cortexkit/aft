@@ -1047,6 +1047,70 @@ fn review_gpt5_event_overflow_preserves_response_and_exit() {
     assert!(!manager.clients.contains_key(&key));
 }
 
+#[test]
+fn review_opus9_pulls_all_matching_dynamic_providers_with_their_own_result_ids() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let file = root.join("main.py");
+    std::fs::write(&file, "n = 1\n").unwrap();
+    let log = root.join("pull.log");
+    let key = ServerKey {
+        kind: ServerKind::Python,
+        root,
+    };
+    let mut manager = LspManager::new();
+    let mut client = lifecycle_fake_client_with_env(
+        &manager,
+        &key,
+        [
+            ("AFT_FAKE_LSP_MULTIPLE_PULL", "1"),
+            ("AFT_FAKE_LSP_DYNAMIC_PULL_LOG", log.to_str().unwrap()),
+        ],
+    );
+    client
+        .send_request::<lsp_types::request::HoverRequest>(idle_hover_params(&file))
+        .unwrap();
+    manager.clients.insert(key.clone(), client);
+    manager
+        .open_document_for_servers(&file, std::slice::from_ref(&key))
+        .unwrap();
+    for _ in 0..2 {
+        let pull = manager
+            .begin_document_pull(&key, &file, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        manager.finish_document_pull(pull);
+        let entries = manager.diagnostics.entries_for_file(&file);
+        let messages = entries
+            .into_iter()
+            .flat_map(|(_, entry)| entry.diagnostics.iter().map(|item| item.message.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(messages, ["lint", "types"]);
+    }
+    assert_eq!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        [
+            "provider=lint previous=null",
+            "provider=types previous=null",
+            "provider=lint previous=\"lint-result\"",
+            "provider=types previous=\"types-result\"",
+        ]
+    );
+    std::fs::write(key.root.join("fail-lint"), "").unwrap();
+    let pull = manager
+        .begin_document_pull(&key, &file, Instant::now() + Duration::from_secs(5))
+        .unwrap();
+    assert!(matches!(
+        manager.finish_document_pull(pull),
+        PullFileOutcome::RequestFailed { .. }
+    ));
+    assert!(!manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&key, &file));
+}
+
 fn reject_fixture_writes(client: &mut LspClient, file: &Path) {
     // Wait for the fake's hover reply before marking it unresponsive. Any
     // earlier notification received after the mark would clear it.

@@ -1736,18 +1736,14 @@ impl LspClient {
 
     pub(crate) fn start_document_diagnostic_request(
         &mut self,
-        file: &Path,
         mut params: super::pull_params::AftDocumentDiagnosticParams,
     ) -> Result<(PendingLspRequest, bool), LspError> {
-        let registrations = Arc::clone(&self.diagnostic_registrations);
-        let registrations = registrations.lock().unwrap_or_else(|p| p.into_inner());
         let caps = if self.pull_diagnostics_disabled {
             None
         } else {
             self.diagnostic_caps
                 .clone()
                 .filter(|caps| caps.pull_diagnostics)
-                .or_else(|| registrations.capabilities(&self.root, Some(file)))
         }
         .ok_or_else(|| {
             LspError::ServerNotReady("document diagnostics are not registered for this file".into())
@@ -1757,12 +1753,73 @@ impl LspClient {
         }
         params.identifier = caps.identifier;
         let used_previous = params.previous_result_id.is_some();
-        // Keep registration stable through FIFO enqueue: unregistration cannot
-        // be acknowledged ahead of a request authorized by the old registration.
         let request =
             self.start_request::<super::pull_params::AftDocumentDiagnosticRequest>(params)?;
-        drop(registrations);
         Ok((request, used_previous))
+    }
+
+    pub(super) fn registered_document_provider_generations(&self, file: &Path) -> Vec<u64> {
+        if self.pull_diagnostics_disabled
+            || self
+                .diagnostic_caps
+                .as_ref()
+                .is_some_and(|caps| caps.pull_diagnostics)
+        {
+            return Vec::new();
+        }
+        self.diagnostic_registrations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .document_providers(&self.root, file)
+            .into_iter()
+            .map(|(generation, _)| generation)
+            .collect()
+    }
+
+    pub(super) fn start_registered_document_pulls(
+        &mut self,
+        file: &Path,
+        uri: &lsp_types::Uri,
+        previous: Option<&super::diagnostics::ProviderResults>,
+    ) -> Vec<(u64, Result<PendingLspRequest, LspError>)> {
+        if self.pull_diagnostics_disabled
+            || self
+                .diagnostic_caps
+                .as_ref()
+                .is_some_and(|caps| caps.pull_diagnostics)
+        {
+            return Vec::new();
+        }
+        let registrations = Arc::clone(&self.diagnostic_registrations);
+        // Do not let an unregistration acknowledgement overtake a request
+        // authorised by that registration on the FIFO writer.
+        let registrations = registrations.lock().unwrap_or_else(|p| p.into_inner());
+        let previous = previous.filter(|results| results.instance == self.instance);
+        registrations
+            .document_providers(&self.root, file)
+            .into_iter()
+            .map(|(generation, identifier)| {
+                let previous_result_id = previous
+                    .and_then(|results| {
+                        results
+                            .stamps
+                            .iter()
+                            .find(|stamp| stamp.generation == generation)
+                    })
+                    .and_then(|stamp| stamp.result_id.clone());
+                let params = super::pull_params::AftDocumentDiagnosticParams {
+                    text_document: lsp_types::TextDocumentIdentifier { uri: uri.clone() },
+                    identifier,
+                    previous_result_id,
+                    work_done_progress_params: Default::default(),
+                    partial_result_params: Default::default(),
+                };
+                (
+                    generation,
+                    self.start_request::<super::pull_params::AftDocumentDiagnosticRequest>(params),
+                )
+            })
+            .collect()
     }
 
     /// Whether this server is still analyzing: Rust uses workspace/check state;
