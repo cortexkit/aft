@@ -86,6 +86,8 @@ impl Drop for BackgroundDocumentPullPause {
 
 #[path = "manager/document_pull_lifetime.rs"]
 mod document_pull_lifetime;
+mod memory;
+use memory::DiagnosticMergeCache;
 
 fn run_background_document_pulls(owner: Weak<parking_lot::Mutex<LspManager>>) {
     let Some(manager) = owner.upgrade() else {
@@ -1187,13 +1189,13 @@ pub struct LspManager {
     /// hide the other. A scoped inspect stores the union of the two. Other
     /// servers that support both report one analysis either way, so for them
     /// the pulled report stands alone as before.
-    latest_push_for_pull_servers: HashMap<(ServerKey, PathBuf), Vec<StoredDiagnostic>>,
+    latest_push_for_pull_servers: DiagnosticMergeCache,
     /// Pulled diagnostics a scoped inspect recorded per rust-analyzer file,
     /// kept so a later `cargo check` push for the file is stored beside them
     /// instead of replacing them. Forgotten once AFT opens or edits the file
     /// or the watcher sees it change, because they then describe an older
     /// state of the file.
-    latest_pull_for_rust: HashMap<(ServerKey, PathBuf), Vec<StoredDiagnostic>>,
+    latest_pull_for_rust: DiagnosticMergeCache,
     /// Files whose latest `cargo check` push from a rust-analyzer that answers
     /// pull requests carried compiler diagnostics AFT could not match to known
     /// file content: the document was not open in the server, or the push named
@@ -1443,8 +1445,8 @@ impl LspManager {
             late_close_replies: HashMap::new(),
             close_answering_servers: HashSet::new(),
             versioned_publish_servers: HashSet::new(),
-            latest_push_for_pull_servers: HashMap::new(),
-            latest_pull_for_rust: HashMap::new(),
+            latest_push_for_pull_servers: DiagnosticMergeCache::default(),
+            latest_pull_for_rust: DiagnosticMergeCache::default(),
             unproven_rust_compiler_reports: HashSet::new(),
             retry_clock: RetryClock::system(),
             project_applicability: None,
@@ -1727,38 +1729,6 @@ impl LspManager {
                 .keys()
                 .filter(|key| !self.clients.contains_key(*key))
                 .count()
-    }
-
-    /// Estimate the per-server document metadata and diagnostics retained by
-    /// the manager. LSP child-process memory is outside this process RSS and is
-    /// not included.
-    pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
-        let mut bytes = 0u64;
-        let mut document_count = 0u64;
-        for documents in self.documents.values() {
-            let estimate = documents.estimated_memory();
-            bytes = bytes.saturating_add(estimate.estimated_bytes.unwrap_or(0));
-            document_count = document_count
-                .saturating_add(estimate.counts.get("documents").copied().unwrap_or(0));
-        }
-        let diagnostics = self.diagnostics.estimated_memory();
-        bytes = bytes.saturating_add(diagnostics.estimated_bytes.unwrap_or(0));
-        crate::memory::MemoryEstimate::estimated(bytes)
-            .count("servers", self.clients.len())
-            .count("document_stores", self.documents.len())
-            .count_u64("documents", document_count)
-            .count_u64(
-                "diagnostic_entries",
-                diagnostics
-                    .counts
-                    .get("diagnostic_entries")
-                    .copied()
-                    .unwrap_or(0),
-            )
-            .count_u64(
-                "diagnostics",
-                diagnostics.counts.get("diagnostics").copied().unwrap_or(0),
-            )
     }
 
     /// Apply the configured diagnostic LRU cap (the `lsp.diagnostic_cache_size`

@@ -11183,8 +11183,7 @@ impl AppContext {
             .unwrap_or_else(crate::memory::MemoryEstimate::busy);
         #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         timer.mark("memory / lsp");
-        // Parsers are created per operation rather than retained in a pool, so
-        // parser bytes remain an explicit estimation gap instead of a guess.
+        // Reusable parser pools belong to the process, not a root.
         let parser_pool = crate::memory::MemoryEstimate::not_estimated()
             .count("pooled_parsers", 0)
             .gap("tree_sitter_parser_bytes");

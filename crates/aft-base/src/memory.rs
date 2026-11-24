@@ -439,6 +439,8 @@ pub struct ProcessMemorySnapshot {
     /// Present only once a checkout of this process has bound.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data_layer_block_cache_bytes: Option<u64>,
+    /// Reusable parser slots are shared across roots by worker threads.
+    pub reusable_parser_pools: MemoryEstimate,
     pub unattributed_bytes: Option<i64>,
     pub root_count: usize,
     pub busy_subsystems: usize,

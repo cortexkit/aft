@@ -131,6 +131,29 @@ pub struct FileFacts {
 }
 
 impl FileFacts {
+    pub(super) fn estimated_payload_bytes(&self) -> u64 {
+        use std::mem::{size_of, size_of_val};
+        let string_slots = self
+            .same_file_value_references
+            .len()
+            .saturating_add(self.used_import_bindings.len())
+            .saturating_add(self.type_referenced_import_bindings.len())
+            .saturating_add(self.value_referenced_import_bindings.len());
+        [
+            size_of::<Self>(),
+            size_of_val(self.exports.as_slice()),
+            size_of_val(self.imports.as_slice()),
+            size_of_val(self.re_exports.as_slice()),
+            size_of_val(self.dynamic_imports.as_slice()),
+            size_of::<String>().saturating_mul(string_slots),
+            self.path.as_os_str().len(),
+            self.content_hash.len(),
+            self.parse_error.as_ref().map_or(0, String::len),
+        ]
+        .into_iter()
+        .fold(0usize, usize::saturating_add) as u64
+    }
+
     pub fn empty(
         file_id: FileId,
         path: PathBuf,

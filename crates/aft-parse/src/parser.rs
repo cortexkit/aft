@@ -23,6 +23,12 @@ mod grammar_selection;
 pub use grammar_selection::grammar_for;
 pub mod dead_code_facts;
 pub mod outline_facts;
+mod reusable;
+#[cfg(not(any(test, feature = "test-support")))]
+use reusable::parse_source_with_parser_deadline;
+pub use reusable::reusable_parser_pools_memory;
+#[cfg(any(test, feature = "test-support"))]
+pub use reusable::{parse_source_with_parser_deadline, REUSABLE_PARSERS};
 pub mod todo_markers;
 
 const MAX_REEXPORT_DEPTH: usize = 10;
@@ -990,15 +996,6 @@ fn cached_query_for(lang: LangId) -> Result<Option<&'static Query>, AftError> {
 }
 }
 
-thread_local! {
-    // A Parser is mutable and not Sync, so each semantic/rayon worker retains its
-    // own language parsers without a global lock or cross-thread sharing.
-    #[cfg(any(test, feature = "test-support"))]
-    pub static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
-    #[cfg(not(any(test, feature = "test-support")))]
-    static REUSABLE_PARSERS: RefCell<HashMap<LangId, Parser>> = RefCell::new(HashMap::new());
-}
-
 pub fn read_source(path: &Path) -> std::io::Result<String> {
     #[cfg(any(test, feature = "test-support"))]
     work_counters::SOURCE_READS.with(|count| count.set(count.get() + 1));
@@ -1157,73 +1154,6 @@ test_support_visibility! {
 const HEADER_FALLBACK_PARSE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1900);
 }
 
-test_support_visibility! {
-fn parse_source_with_parser_deadline(
-    path: &Path,
-    source: &str,
-    lang: LangId,
-    deadline: Option<std::time::Duration>,
-) -> Result<Option<Tree>, AftError> {
-    if markdown_too_deep_to_parse(lang, source) {
-        return Err(AftError::ParseError {
-            message: format!("{}: {MARKDOWN_TOO_DEEP}", path.display()),
-        });
-    }
-    #[cfg(feature = "test-hooks")]
-    SEARCH_PARSE_COUNT.with(|count| count.set(count.get() + 1));
-    #[cfg(any(test, feature = "test-support"))]
-    work_counters::CACHED_PARSER_PARSES.with(|count| count.set(count.get() + 1));
-    REUSABLE_PARSERS.with(|parsers| {
-        let mut parsers = parsers.borrow_mut();
-        let mut parser = match parsers.remove(&lang) {
-            Some(parser) => parser,
-            None => {
-                #[cfg(any(test, feature = "test-support"))]
-                work_counters::GRAMMAR_LOADS.with(|count| count.set(count.get() + 1));
-                let mut parser = Parser::new();
-                initialize_parser(&mut parser, lang)?;
-                parser
-            }
-        };
-        #[cfg(any(test, feature = "test-support"))]
-        parser.note_parse();
-        let result = if let Some(deadline) = deadline {
-            let start = std::time::Instant::now();
-            let mut expired = false;
-            let mut progress = |_: &tree_sitter::ParseState| {
-                if start.elapsed() >= deadline {
-                    expired = true;
-                    std::ops::ControlFlow::Break(())
-                } else {
-                    std::ops::ControlFlow::Continue(())
-                }
-            };
-            let bytes = source.as_bytes();
-            let tree = parser.parse_with_options(
-                &mut |offset, _| bytes.get(offset..).unwrap_or_default(),
-                None,
-                Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
-            );
-            // A cancelled parser retains partial native state. Discard it rather
-            // than resuming that state on the next unrelated header.
-            if expired {
-                Ok(None)
-            } else {
-                tree.map(Some).ok_or_else(|| AftError::ParseError {
-                    message: format!("tree-sitter parse returned None for {}", path.display()),
-                })
-            }
-        } else {
-            parse_with_parser(&mut parser, path, source, lang, None).map(Some)
-        };
-        if matches!(result, Ok(Some(_))) {
-            parsers.insert(lang, parser);
-        }
-        result
-    })
-}
-}
-
 // The five largest react-lua runtime modules took 3.4-7.3 s each on an
 // unoptimized build using Wasmtime's Pulley bytecode interpreter. Release
 // builds are faster; 30 s leaves about fourfold margin over the slowest
@@ -1263,7 +1193,7 @@ pub fn with_luau_parse_deadline_for_test<T>(
 ))]
 pub fn install_luau_parser_for_test(parser: Parser) {
     REUSABLE_PARSERS.with(|parsers| {
-        parsers.borrow_mut().insert(LangId::Luau, parser);
+        parsers.edit(|map| map.insert(LangId::Luau, parser));
     });
 }
 

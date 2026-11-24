@@ -128,6 +128,7 @@ mod tests {
                 .memory_used_bytes
                 .saturating_add(7)
                 .saturating_add(snapshot.data_layer_block_cache_bytes.unwrap_or(0))
+                .saturating_add(snapshot.reusable_parser_pools.estimated_bytes.unwrap())
         );
 
         let serialized = serde_json::to_value(&snapshot).expect("serialize process memory");

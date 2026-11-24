@@ -83,6 +83,7 @@ pub(crate) fn render_memory_census_with_roots(
             "allocator_slack_measured": process.allocator_slack_measured,
             "allocator_observation_age_ms": process.allocator_observation_age_ms,
             "sqlite_bytes": process.sqlite.memory_used_bytes,
+            "reusable_parser_pools": process.reusable_parser_pools,
             // Shared semantic bases are attributed once for the whole process,
             // not on any root row; show them so the total adds up.
             "shared_semantic_base_bytes": snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0),
@@ -177,6 +178,8 @@ fn render_root_row(root: &str, detail: &crate::memory::RootMemorySnapshot) -> Va
         "attributed_bytes": planes_total,
         "exact_memo": detail.exact_memo,
         "compression_filters": detail.compression_filters,
+        "lsp": detail.lsp,
+        "inspect": detail.inspect,
         // Included in the semantic plane, not an additional plane to sum.
         "semantic_worker_bytes": detail.semantic.counts.get("worker_index_bytes").copied().unwrap_or(0),
         "semantic_overlay_bytes": detail.semantic.counts.get("checkout_overlay_bytes").copied().unwrap_or(0),
@@ -207,6 +210,8 @@ struct RootRowInputs {
     planes: [u64; 12],
     exact_memo: crate::memory::MemoryEstimate,
     compression_filters: crate::memory::MemoryEstimate,
+    lsp: crate::memory::MemoryEstimate,
+    inspect: crate::memory::MemoryEstimate,
     semantic_worker: u64,
     semantic_overlay: u64,
     evictable: u64,
@@ -234,6 +239,8 @@ impl From<&crate::memory::RootMemorySnapshot> for RootRowInputs {
             .map(|plane| plane.estimated_bytes.unwrap_or(0)),
             exact_memo: detail.exact_memo.clone(),
             compression_filters: detail.compression_filters.clone(),
+            lsp: detail.lsp.clone(),
+            inspect: detail.inspect.clone(),
             semantic_worker: detail
                 .semantic
                 .counts
@@ -453,6 +460,43 @@ mod tests {
         let second = cache.render(&snapshot);
         assert_eq!(second["/repo"]["exact_memo"]["candidates"], 4);
         assert_eq!(second["/repo"]["attributed_bytes"], 600);
+    }
+
+    #[test]
+    fn memory_census_renders_lsp_and_inspect_details_even_when_subtotals_do_not_change() {
+        use crate::memory::MemoryEstimate;
+        let mut snapshot = row_cache_fixture();
+        let mut cache = CensusRootRows::default();
+        let root = snapshot.roots.get_mut("/repo").unwrap();
+        root.lsp = MemoryEstimate::partial(500).count("event_channel_items", 3);
+        root.inspect = MemoryEstimate::partial(800).count_u64("oxc_fact_payload_bytes", 200);
+        let first = cache.render(&snapshot);
+        assert_eq!(first["/repo"]["planes"]["lsp"], 500);
+        assert_eq!(first["/repo"]["planes"]["inspect"], 800);
+        assert_eq!(first["/repo"]["lsp"]["event_channel_items"], 3);
+        assert_eq!(first["/repo"]["inspect"]["oxc_fact_payload_bytes"], 200);
+        let root = snapshot.roots.get_mut("/repo").unwrap();
+        root.lsp.counts.insert("event_channel_items".into(), 4);
+        root.inspect
+            .counts
+            .insert("oxc_fact_payload_bytes".into(), 300);
+        let second = cache.render(&snapshot);
+        assert_eq!(second["/repo"]["lsp"]["event_channel_items"], 4);
+        assert_eq!(second["/repo"]["inspect"]["oxc_fact_payload_bytes"], 300);
+        assert_eq!(
+            second["/repo"]["attributed_bytes"],
+            first["/repo"]["attributed_bytes"]
+        );
+
+        let census = render_memory_census(&snapshot, None);
+        let relief_source = census["process"].get("last_relief_source").unwrap();
+        assert!(relief_source.is_null() || relief_source.is_string());
+        assert_eq!(
+            census["process"]["reusable_parser_pools"]["bytes_status"],
+            "partial"
+        );
+        assert!(census["process"]["reusable_parser_pools"]["parsers"].is_u64());
+        assert!(census["process"]["reusable_parser_pools"]["threads_with_parsers"].is_u64());
     }
 
     #[test]

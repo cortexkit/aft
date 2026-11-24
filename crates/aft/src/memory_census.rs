@@ -48,9 +48,11 @@ pub(crate) fn process_from_root_rollups<'a>(
     } = allocator_observation;
     let data_layer_block_cache_bytes =
         data_layer_block_cache.and_then(|cache| cache.estimated_bytes);
+    let reusable_parser_pools = crate::parser::reusable_parser_pools_memory();
     let total_attributed_bytes = root_attributed_bytes
         .saturating_add(shared_semantic_bases.estimated_bytes.unwrap_or(0))
         .saturating_add(data_layer_block_cache_bytes.unwrap_or(0))
+        .saturating_add(reusable_parser_pools.estimated_bytes.unwrap_or(0))
         .saturating_add(embedding.model_bytes)
         .saturating_add(sqlite.memory_used_bytes);
     let rss_bytes = process_rss_bytes();
@@ -80,6 +82,7 @@ pub(crate) fn process_from_root_rollups<'a>(
         embedding_sessions: embedding.sessions,
         embedding_model_bytes: embedding.model_bytes,
         data_layer_block_cache_bytes,
+        reusable_parser_pools,
         unattributed_bytes,
         root_count,
         busy_subsystems,

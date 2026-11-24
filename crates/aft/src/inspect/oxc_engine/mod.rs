@@ -40,6 +40,7 @@ pub struct OxcFactsCache {
     entries_by_hash: BTreeMap<String, FileFacts>,
     entries_by_path: BTreeMap<PathBuf, OxcFactsPathEntry>,
     references_by_hash: BTreeMap<String, usize>,
+    payload_bytes: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,13 @@ impl OxcFactsCache {
 
     pub fn is_empty(&self) -> bool {
         self.entries_by_hash.is_empty()
+    }
+
+    /// Size of cached facts and their top-level collections, not the indexes
+    /// around them. Maintain the subtotal on writes so a census never walks
+    /// the facts cache while holding the inspect manager's lock.
+    pub(crate) fn estimated_payload_bytes(&self) -> u64 {
+        self.payload_bytes
     }
 
     fn facts_for_file(
@@ -162,6 +170,9 @@ impl OxcFactsCache {
 
         stats.misses += 1;
         let facts = parse_file_facts(file_id, path, source, content_hash, source_type);
+        self.payload_bytes = self
+            .payload_bytes
+            .saturating_add(facts.estimated_payload_bytes());
         self.entries_by_hash
             .insert(cache_key.clone(), facts.clone());
         if let Some((mtime, size)) = metadata {
@@ -192,7 +203,11 @@ impl OxcFactsCache {
                 *count -= 1;
                 if *count == 0 {
                     self.references_by_hash.remove(&previous.cache_key);
-                    self.entries_by_hash.remove(&previous.cache_key);
+                    if let Some(facts) = self.entries_by_hash.remove(&previous.cache_key) {
+                        self.payload_bytes = self
+                            .payload_bytes
+                            .saturating_sub(facts.estimated_payload_bytes());
+                    }
                 }
             }
         }
@@ -482,6 +497,45 @@ fn is_ts_js_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod audit_tests {
+    #[test]
+    fn memory_census_tracks_oxc_facts_until_last_path_is_replaced() {
+        use super::*;
+        let mut cache = OxcFactsCache::new();
+        let mut stats = OxcFactsCacheStats::default();
+        let mut cache_source = |cache: &mut OxcFactsCache, path: &str, source: &str| {
+            let path = Path::new(path);
+            let kind = SourceType::from_path(path).unwrap();
+            cache.facts_for_source_with_metadata(
+                FileId(0),
+                path,
+                source,
+                kind,
+                source_type_cache_key(kind),
+                Some((std::time::UNIX_EPOCH, source.len() as u64)),
+                &mut stats,
+            );
+        };
+        assert_eq!(cache.estimated_payload_bytes(), 0);
+        let with_exports = "export const first = 1; export const second = 2;";
+        cache_source(&mut cache, "a.ts", with_exports);
+        let first_bytes = cache.estimated_payload_bytes();
+        assert!(
+            first_bytes
+                >= (std::mem::size_of::<FileFacts>() + 2 * std::mem::size_of::<ExportFact>())
+                    as u64
+        );
+        cache_source(&mut cache, "b.ts", with_exports);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.estimated_payload_bytes(), first_bytes);
+        cache_source(&mut cache, "a.ts", "");
+        let both_bytes = cache.estimated_payload_bytes();
+        assert_eq!(cache.len(), 2);
+        assert!(both_bytes > first_bytes);
+        cache_source(&mut cache, "b.ts", "");
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.estimated_payload_bytes(), both_bytes - first_bytes);
+    }
+
     #[test]
     fn inspect_script_return_cache_keeps_strict_extensions_separate_when_warm() {
         use super::*;

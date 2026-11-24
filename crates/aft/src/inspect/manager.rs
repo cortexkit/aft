@@ -1645,19 +1645,17 @@ impl InspectManager {
         }
     }
 
-    /// Estimate inspect's resident aggregate maps without waiting on active
-    /// scans. SQLite allocations are measured process-wide; OXC fact payload
-    /// bytes remain an explicit gap.
+    /// Estimate resident aggregates and OXC facts without waiting on scans.
     pub fn estimated_memory(&self) -> crate::memory::MemoryEstimate {
         let caches = match self.caches.try_lock() {
             Ok(caches) => caches.values().cloned().collect::<Vec<_>>(),
             Err(_) => return crate::memory::MemoryEstimate::busy(),
         };
-        let facts_entries = match self.oxc_facts_cache.try_lock() {
-            Ok(facts) => facts.len(),
+        let (facts_entries, facts_bytes) = match self.oxc_facts_cache.try_lock() {
+            Ok(facts) => (facts.len(), facts.estimated_payload_bytes()),
             Err(_) => return crate::memory::MemoryEstimate::busy(),
         };
-        let mut bytes = 0u64;
+        let mut bytes = facts_bytes;
         let mut memory_aggregates = 0u64;
         for cache in &caches {
             let estimate = cache.estimated_memory();
@@ -1676,8 +1674,9 @@ impl InspectManager {
         crate::memory::MemoryEstimate::partial(bytes)
             .count("open_generation_handles", caches.len())
             .count("oxc_fact_entries", facts_entries)
+            .count_u64("oxc_fact_payload_bytes", facts_bytes)
             .count_u64("memory_aggregates", memory_aggregates)
-            .gap("oxc_fact_bytes")
+            .gap("oxc_nested_fact_payloads_and_cache_indexes")
     }
 
     pub(crate) fn dead_code_snapshot_census() -> DeadCodeSnapshotCensus {

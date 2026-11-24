@@ -2824,6 +2824,7 @@ mod tests {
             planes_sum
                 + snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0)
                 + process.data_layer_block_cache_bytes.unwrap()
+                + process.reusable_parser_pools.estimated_bytes.unwrap()
                 + process.embedding_model_bytes
                 + process.sqlite.memory_used_bytes
         );

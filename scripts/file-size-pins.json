@@ -16,11 +16,11 @@
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
-    "lines": 11401,
+    "lines": 11400,
     "reason": "Split workspace context responsibilities pending; AFT crate split lane."
   },
   "crates/aft/src/lsp/manager.rs": {
-    "lines": 11109,
+    "lines": 11079,
     "reason": "Split language-server lifecycle and requests pending; AFT crate split lane."
   },
   "crates/aft/src/sandbox_spawn.rs": {
@@ -36,7 +36,7 @@
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
   "crates/aft-parse/src/parser.rs": {
-    "lines": 9905,
+    "lines": 9835,
     "reason": "Split parser support by language pending; AFT crate split lane."
   },
   "crates/aft/src/gh_shim.rs": {
@@ -68,7 +68,7 @@
     "reason": "Split remote job transport and lifecycle pending; AFT crate split lane."
   },
   "crates/aft/src/inspect/manager.rs": {
-    "lines": 6051,
+    "lines": 6050,
     "reason": "Split inspection scheduling and coordination pending; AFT crate split lane."
   },
   "crates/aft-parse/src/callgraph_store/mod.rs": {
