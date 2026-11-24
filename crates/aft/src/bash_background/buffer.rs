@@ -627,10 +627,21 @@ fn read_two_file_head_tail(
             .map(Option::unwrap_or_default)
             .unwrap_or_default();
         let first_text = String::from_utf8_lossy(&first_bytes);
+        let second_text = String::from_utf8_lossy(&second_bytes);
         let boundary = first_text.len();
+        // Like the capped join, never let stderr continue stdout's unfinished
+        // last line; a stdout that ends its line needs no separator.
+        let separator = if !first_text.is_empty()
+            && !second_text.is_empty()
+            && !first_text.ends_with('\n')
+        {
+            "\n"
+        } else {
+            ""
+        };
         return (
             BoundedRead {
-                text: format!("{first_text}{}", String::from_utf8_lossy(&second_bytes)),
+                text: format!("{first_text}{separator}{second_text}"),
                 truncated: false,
                 total_bytes,
             },
@@ -1080,6 +1091,34 @@ stderr final
         assert_eq!(split_read, read);
         assert!(split_read.text[..boundary].ends_with("ERROR: stdout final\n"));
         assert!(split_read.text[boundary..].ends_with("stderr final\n"));
+    }
+
+    /// The two captures are concatenated, so stderr must start on its own line
+    /// when stdout's last record has no newline, whether or not the combined
+    /// read is capped. A stdout that already ends its line gets no blank line.
+    #[test]
+    fn combined_read_keeps_stderr_on_its_own_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout_path = dir.path().join("stdout");
+        let stderr_path = dir.path().join("stderr");
+        std::fs::write(&stdout_path, "one").unwrap();
+        std::fs::write(&stderr_path, "two\n").unwrap();
+        let buffer = BgBuffer::new(stdout_path.clone(), stderr_path.clone());
+
+        let (read, boundary) = buffer.read_combined_head_tail_with_boundary(1024, 512, 512);
+        assert!(!read.truncated);
+        assert_eq!(read.text, "one\ntwo\n");
+        assert_eq!(&read.text[..boundary], "one");
+
+        std::fs::write(&stderr_path, format!("two\n{}\nlast\n", "y".repeat(256))).unwrap();
+        let capped = buffer.read_combined_head_tail(64, 32, 32);
+        assert!(capped.truncated);
+        assert!(capped.text.starts_with("one\n"), "{:?}", capped.text);
+
+        std::fs::write(&stdout_path, "one\n").unwrap();
+        std::fs::write(&stderr_path, "two\n").unwrap();
+        let read = buffer.read_combined_head_tail(1024, 512, 512);
+        assert_eq!(read.text, "one\ntwo\n");
     }
 
     #[test]
