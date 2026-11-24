@@ -51,6 +51,9 @@ mod unix;
 pub use unix::prepare;
 #[cfg(all(target_os = "linux", any(test, feature = "test-support")))]
 pub(crate) use unix::prepare_with_launcher;
+#[cfg(target_os = "linux")]
+#[doc(hidden)]
+pub use unix::Start;
 #[cfg(all(target_os = "linux", feature = "test-support"))]
 pub(crate) use unix::Start as StartForTest;
 

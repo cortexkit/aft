@@ -273,6 +273,6 @@ impl BgTaskRegistry {
 #[path = "folder_grants_tests.rs"]
 mod tests;
 
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 #[path = "folder_grant_fixture.rs"]
 pub(crate) mod fixture;

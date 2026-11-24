@@ -71,7 +71,7 @@ pub mod bash_changed_files;
 #[doc(hidden)]
 pub use aft_shell::bash_db_hints;
 pub use aft_shell::bash_parse;
-pub use aft_shell::bash_permissions;
+pub mod bash_permissions;
 pub mod bash_rewrite;
 pub use aft_base::atomic_replace;
 pub(crate) use aft_base::bounded_io;
@@ -260,7 +260,7 @@ pub use aft_shell::secret_proxy;
 pub mod setup_plan;
 pub use aft_base::shell_format;
 #[doc(hidden)]
-pub use aft_shell::shell_env_provider;
+pub mod shell_env_provider;
 pub mod standing_roots;
 #[doc(hidden)]
 pub mod status_push;

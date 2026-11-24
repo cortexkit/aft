@@ -10438,12 +10438,22 @@ mod policy_tests {
     #[cfg(unix)]
     #[test]
     fn tool_policy_matches_session_shell_for_every_role_and_untrusted_bind() {
+        if !super::policy_fixture::in_isolated_policy_home(
+            "sandbox_spawn::policy_tests::tool_policy_matches_session_shell_for_every_role_and_untrusted_bind",
+        ) {
+            return;
+        }
         assert_tool_shell_policy_parity(|_, _| {});
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn tool_policy_matches_session_shell_despite_directory_churn_between_builds() {
+        if !super::policy_fixture::in_isolated_policy_home(
+            "sandbox_spawn::policy_tests::tool_policy_matches_session_shell_despite_directory_churn_between_builds",
+        ) {
+            return;
+        }
         let mut changes = 0;
         assert_tool_shell_policy_parity(|root, phase| {
             let before = root.join("inventory-before");
@@ -10471,6 +10481,11 @@ mod policy_tests {
     #[cfg(unix)]
     #[test]
     fn tool_policy_matches_session_shell_despite_cache_candidate_creation_between_builds() {
+        if !super::policy_fixture::in_isolated_policy_home(
+            "sandbox_spawn::policy_tests::tool_policy_matches_session_shell_despite_cache_candidate_creation_between_builds",
+        ) {
+            return;
+        }
         let mut changes = 0;
         assert_tool_shell_policy_parity(|root, phase| {
             let candidate = root.join(".cargo/git");

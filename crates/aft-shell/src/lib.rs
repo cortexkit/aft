@@ -52,7 +52,7 @@ use aft_base::{
 use aft_base::{developer_tools, file_kind, posix_spawn, worker_jail_canary};
 #[cfg(test)]
 use aft_base::{durability, test_support, walk_boundary};
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 use aft_base::{logging, test_env};
 #[cfg(test)]
 use aft_db::reader_floor;

@@ -9,7 +9,10 @@ pub(super) fn without_named_task_scope<T>(run: impl FnOnce() -> T) -> T {
     #[cfg(target_os = "linux")]
     {
         let mount = tempfile::tempdir().unwrap();
-        let current = mount.path().join("system.slice/replay-fixture.service");
+        let uid = unsafe { libc::geteuid() };
+        let current = mount
+            .path()
+            .join(format!("user@{uid}.service/replay-fixture.scope"));
         std::fs::create_dir_all(&current).unwrap();
         crate::bash_background::task_scope::with_local_recovery_mount_for_test(
             current,

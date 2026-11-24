@@ -4,6 +4,40 @@ use crate::{
 };
 use std::{path::PathBuf, sync::Arc};
 
+/// The paired profiles prepare a worker-jail verification file under HOME.
+/// Give each pair a separate process and home so a concurrent test cannot
+/// replace that file between the two profile builds.
+#[cfg(unix)]
+pub(super) fn in_isolated_policy_home(test: &str) -> bool {
+    const CHILD: &str = "AFT_TEST_ISOLATED_POLICY_HOME";
+    if std::env::var(CHILD).ok().as_deref() == Some(test) {
+        return true;
+    }
+    let home = tempfile::Builder::new()
+        .prefix("aft-policy-home-")
+        .tempdir_in(
+            super::absolute_env_path("HOME").expect("profile tests require an absolute HOME"),
+        )
+        .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture"])
+        .env(CHILD, test)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "isolated profile test did not run: {stdout}"
+    );
+    false
+}
+
 pub(crate) struct SandboxFixture {
     config: parking_lot::RwLock<Arc<Config>>,
     tasks: crate::bash_background::BgTaskRegistry,
