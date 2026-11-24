@@ -56,15 +56,36 @@ mod tests {
         let root = canonicalize_normalized(temp.path());
         write(&root, "src/lib.rs", "// TODO: listed\n");
 
-        // Control: with nothing unbinding the root, the refresh is enqueued.
+        // Control: with nothing unbinding the root, the refresh lists the
+        // files and enqueues a job whose completion arrives.
         let control = todo_refresh_context(&root);
+        let control_listed = Arc::new(AtomicBool::new(false));
+        let hook_listed = Arc::clone(&control_listed);
+        BACKGROUND_JOB_LISTING_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || hook_listed.store(true, Ordering::SeqCst)));
+        });
         assert!(control
             .tick_tier2_refresh_scheduler_at(std::time::Instant::now(), 0)
             .is_some());
-        // Registered when enqueued; cleared only when its completion drains.
+        BACKGROUND_JOB_LISTING_HOOK.with(|hook| hook.borrow_mut().take());
+        assert!(
+            control_listed.load(Ordering::SeqCst),
+            "the control never listed files"
+        );
         let todos = crate::inspect_category::InspectCategory::Todos;
         let absent = crate::inspect::InspectBuilderState::Absent;
-        assert_ne!(control.inspect_manager().tier2_builder_state(todos), absent);
+        let enqueued = |ctx: &crate::context::AppContext| {
+            ctx.inspect_manager().has_pending_completions()
+                || ctx.inspect_manager().tier2_builder_state(todos) != absent
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !enqueued(&control) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the control job never ran"
+            );
+            std::thread::yield_now();
+        }
 
         let ctx = todo_refresh_context(&root);
         let listed = Arc::new(AtomicBool::new(false));
@@ -100,9 +121,8 @@ mod tests {
             unbound_while_listing.load(Ordering::SeqCst),
             "unbinding the root waited for the file listing"
         );
-        assert_eq!(
-            ctx.inspect_manager().tier2_builder_state(todos),
-            absent,
+        assert!(
+            !enqueued(&ctx),
             "work listed before an unbind was enqueued for the unbound root"
         );
     }
