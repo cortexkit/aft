@@ -589,12 +589,7 @@ fn execute_mutate(
         file.remove_file,
         "hashline: pre-mutation backup",
     ) {
-        Ok(id) => {
-            if id.is_some() {
-                *journaled = true;
-            }
-            id
-        }
+        Ok(id) => id,
         Err(_) => {
             return StepExec::Stopped {
                 outcomes: vec![failed_outcome(
@@ -613,6 +608,18 @@ fn execute_mutate(
     if fault_is(ctx, ExecuteFault::BaselineDrift { step: step_index })
         || !baseline_matches(&file.canonical_path, &file.baseline_bytes)
     {
+        // A drift stop never wrote the file. Its snapshot must not become the
+        // user's next undo, or hide an earlier successful step's snapshot.
+        if backup_id.is_some() {
+            if let Err(error) = ctx.backups.try_discard_latest_operation_entry_for_path(
+                ctx.session,
+                op_id,
+                &file.canonical_path,
+            ) {
+                *journaled = true;
+                log::warn!("hashline: could not discard stale undo snapshot: {error}");
+            }
+        }
         return StepExec::Stopped {
             outcomes: vec![failed_outcome(
                 &file.canonical_path,
@@ -625,6 +632,7 @@ fn execute_mutate(
             reason: "hashline_baseline_drift",
         };
     }
+    *journaled |= backup_id.is_some();
 
     if fault_is(ctx, ExecuteFault::Write { step: step_index }) {
         return StepExec::Stopped {
@@ -1598,15 +1606,13 @@ mod tests {
         let plan = plan_transaction(&sections, &registers, true).unwrap();
 
         let mut backups = backup_store(&temp.path().join("backups"));
+        backups
+            .snapshot_with_op(SESSION, &a, "prior edit", Some("prior-op"))
+            .unwrap();
+        write_file(&a, b"external\n");
         let mut snapshots = SnapshotStore::new();
         let mut session_regs = RegisterStore::new();
-        let mut exec = ctx(
-            &mut backups,
-            &mut snapshots,
-            &mut session_regs,
-            true,
-            Some(ExecuteFault::BaselineDrift { step: 0 }),
-        );
+        let mut exec = ctx(&mut backups, &mut snapshots, &mut session_regs, true, None);
         let envelope = execute_transaction(plan, &mut exec);
         assert!(!envelope.success);
         assert!(!envelope.complete);
@@ -1622,11 +1628,14 @@ mod tests {
         assert_eq!(envelope.files[1].mutation_state, MutationState::Unmutated);
         assert_eq!(envelope.stop_reason, Some("hashline_baseline_drift"));
         assert!(envelope.summary_text.starts_with("0 of 2 files applied"));
-        // Journal runs before baseline recheck, so a drift stop after backup still
-        // yields op_id. Disk bytes remain unchanged (unmutated).
-        assert!(envelope.op_id.is_some());
-        assert_eq!(fs::read(&a).unwrap(), b"a\n");
+        assert_eq!(fs::read(&a).unwrap(), b"external\n");
         assert_eq!(fs::read(&b).unwrap(), b"b\n");
+        assert_eq!(
+            backups.restore_last_operation(SESSION).unwrap().op_id,
+            "prior-op"
+        );
+        assert!(envelope.op_id.is_none());
+        assert_eq!(fs::read(&a).unwrap(), b"a\n");
     }
 
     /// A8: partial failure keeps earlier applications under a shared op_id.
