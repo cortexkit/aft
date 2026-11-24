@@ -314,7 +314,8 @@ describe("runAutoInstall", () => {
     expect(source).toContain("await lspNpmInstallInvocation(npm, target, before)");
     expect(source).toMatch(/spawn\(invocation\.command, invocation\.args,/);
     expect(source).toContain("npmSpawnEnv(npm)");
-    expect(source).toContain("terminateNpmProcessTree(child, invocation)");
+    expect(source).toContain("runtime.terminate(child, invocation)");
+    expect(source).toContain("terminate: terminateNpmProcessTree");
     expect(source).toMatch(/terminationPromise\.then\(\s*finishAfterConfirmedTermination,/);
     expect(source).toContain("const completedSuccessfully = childCompletedSuccessfully()");
     expect(source).toContain("finish(completedSuccessfully)");

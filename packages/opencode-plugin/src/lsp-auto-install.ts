@@ -292,6 +292,9 @@ export function ensureInstallAnchor(cwd: string): void {
   }
 }
 
+/** How long one `npm install` may run before termination of its process tree is requested. */
+const NPM_INSTALL_DEADLINE_MS = 120_000;
+
 async function runInstall(
   spec: NpmServerSpec,
   version: string,
@@ -299,6 +302,11 @@ async function runInstall(
   installLock: InstallLockLease,
   before: string | undefined,
   signal?: AbortSignal,
+  // A stalled npm (dead registry socket, hung lifecycle) would otherwise hold
+  // the shared install lease until the host exits. Tests inject a shorter
+  // deadline and a fake spawn/terminate pair.
+  deadlineMs = NPM_INSTALL_DEADLINE_MS,
+  runtime = { spawn, terminate: terminateNpmProcessTree },
 ): Promise<boolean> {
   const target = `${spec.npm}@${version}`;
   log(`[lsp] installing ${target} to ${cwd}`);
@@ -340,7 +348,7 @@ async function runInstall(
   }
   ensureInstallAnchor(cwd);
   return new Promise((resolve) => {
-    const child = spawn(invocation.command, invocation.args, {
+    const child = runtime.spawn(invocation.command, invocation.args, {
       stdio: ["ignore", "pipe", "pipe"],
       cwd,
       env: { ...npmSpawnEnv(npm), ...invocation.env },
@@ -351,9 +359,11 @@ async function runInstall(
     let stderrBuf = "";
     let settled = false;
     let terminationPromise: Promise<void> | null = null;
+    let deadline: ReturnType<typeof setTimeout> | undefined;
 
     const cleanup = () => {
       signal?.removeEventListener("abort", onAbort);
+      clearTimeout(deadline);
     };
     const finish = (ok: boolean) => {
       if (settled) return;
@@ -367,13 +377,15 @@ async function runInstall(
       if (completedSuccessfully) log(`[lsp] installed ${target}`);
       finish(completedSuccessfully);
     };
-    const onAbort = () => {
+    // Shutdown and the install deadline share one path: the lease is released
+    // only after the npm process tree is confirmed gone.
+    const terminateInstall = (reason: string) => {
       if (childCompletedSuccessfully()) {
         finishAfterConfirmedTermination();
         return;
       }
-      warn(`[lsp] install ${target} aborted during shutdown`);
-      terminationPromise ??= terminateNpmProcessTree(child, invocation);
+      warn(`[lsp] install ${target} ${reason}`);
+      terminationPromise ??= runtime.terminate(child, invocation);
       void terminationPromise.then(finishAfterConfirmedTermination, (terminationError) => {
         // A child with no PID never spawned, so it cannot still be mutating the
         // cache and does not need cross-process quarantine.
@@ -390,6 +402,11 @@ async function runInstall(
         finish(false);
       });
     };
+    const onAbort = () => terminateInstall("aborted during shutdown");
+    deadline = setTimeout(() => terminateInstall("exceeded its installation deadline"), deadlineMs);
+    // The deadline bounds a running install; it must not keep an otherwise
+    // finished host alive on its own.
+    deadline.unref?.();
 
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
@@ -770,3 +787,5 @@ export async function pushLspPathsAfterAutoInstall(
   pool.setConfigureOverride("lsp_paths_extra", paths);
   await pool.reconfigure(projectRoot, { lsp_paths_extra: paths });
 }
+
+export { runInstall as _runInstallForTesting };
