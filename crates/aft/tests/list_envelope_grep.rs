@@ -189,6 +189,26 @@ fn cap_on_finished_walk_renders_at_least_floor() {
 }
 
 #[test]
+fn capped_grep_footer_does_not_remove_literal_from_a_source_row() {
+    let mut data = load_fixture("cap_100_of_1204.json");
+    data["text"] = serde_json::json!("src/lib.rs:1: println!(\"result (capped)\");\n\nFound 1204 matches across 21 files (capped) [index: building; fallback walk]");
+    let response = Response::success("capped", data);
+    let formatted = format_response_with_context("grep", &response, &FormatContext::default());
+    assert!(
+        formatted.starts_with("src/lib.rs:1: println!(\"result (capped)\");\n\n"),
+        "{formatted}"
+    );
+    assert!(
+        formatted.contains("Found 1204 matches across 21 files [index: building; fallback walk]"),
+        "{formatted}"
+    );
+    assert!(
+        formatted.ends_with("shown 100 of ≥1204 rows (cap) · narrow: offset, path, include"),
+        "{formatted}"
+    );
+}
+
+#[test]
 fn walk_truncated_and_cap_renders_mixed_cause() {
     let fixture = load_fixture("walk_truncated_and_cap.json");
 
