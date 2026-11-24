@@ -515,6 +515,7 @@ pub(super) fn run_cleanup(registries: impl IntoIterator<Item = BgTaskRegistry>) 
         let step = Instant::now();
         registry.cleanup_finished(FINISHED_RETENTION);
         pass.finished += step.elapsed();
+        registry.prune_completion_overflow();
     }
     let step = Instant::now();
     BgTaskRegistry::request_recurring_persisted_gc(&registries);

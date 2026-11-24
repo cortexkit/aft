@@ -8,8 +8,12 @@
 //! notices per session and overall. A notice that finds the queue full waits
 //! as its task id; as the session acknowledges what is queued, the queue
 //! refills from those tasks oldest first, a bounded batch at a time.
+//!
+//! Waiting ids are not capped, so no deliverable notice is ever dropped.
+//! Their bound is the registry's own task retention: the periodic cleanup
+//! pass removes the id of every task the registry no longer holds.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{Deref, DerefMut};
 
 use super::*;
@@ -42,6 +46,9 @@ pub(crate) struct NoticeQueue<N> {
     queued: VecDeque<N>,
     /// (session id, task id) of each notice waiting outside the queue.
     overflowed: VecDeque<(String, String)>,
+    /// The task ids in `overflowed`, so a repeated notice is found without
+    /// scanning the whole waiting list.
+    overflowed_tasks: HashSet<String>,
 }
 
 impl<N> Default for NoticeQueue<N> {
@@ -49,6 +56,7 @@ impl<N> Default for NoticeQueue<N> {
         Self {
             queued: VecDeque::new(),
             overflowed: VecDeque::new(),
+            overflowed_tasks: HashSet::new(),
         }
     }
 }
@@ -88,11 +96,7 @@ impl<N: QueuedNotice> NoticeQueue<N> {
         if self.queued.len() >= MAX_QUEUED
             || self.queued_for(notice.session_id()) >= MAX_QUEUED_PER_SESSION
         {
-            if !self
-                .overflowed
-                .iter()
-                .any(|(_, task)| task == notice.task_id())
-            {
+            if self.overflowed_tasks.insert(notice.task_id().to_string()) {
                 self.overflowed.push_back((
                     notice.session_id().to_string(),
                     notice.task_id().to_string(),
@@ -120,15 +124,52 @@ impl<N: QueuedNotice> NoticeQueue<N> {
                 continue;
             }
             let (session, task) = self.overflowed.remove(index).expect("index in range");
+            self.overflowed_tasks.remove(&task);
             *taken_for.entry(session).or_default() += 1;
             taken.push(task);
             free_overall -= 1;
         }
         taken
     }
+
+    /// Forget waiting ids for which `held` is false.
+    fn prune_waiting(&mut self, held: impl Fn(&str) -> bool) {
+        let tasks = &mut self.overflowed_tasks;
+        self.overflowed.retain(|(_, task)| {
+            let keep = held(task);
+            if !keep {
+                tasks.remove(task);
+            }
+            keep
+        });
+    }
 }
 
 impl BgTaskRegistry {
+    /// Drop waiting notice ids whose task the registry no longer holds; such a
+    /// notice can never be refilled. Task lookups run without the queue lock.
+    pub(crate) fn prune_completion_overflow(&self) {
+        let Some(waiting) = self.inner.completions.lock().ok().map(|queue| {
+            queue
+                .overflowed
+                .iter()
+                .map(|(_, task)| task.clone())
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        let gone = waiting
+            .into_iter()
+            .filter(|task_id| self.task(task_id).is_none())
+            .collect::<HashSet<_>>();
+        if gone.is_empty() {
+            return;
+        }
+        if let Ok(mut queue) = self.inner.completions.lock() {
+            queue.prune_waiting(|task| !gone.contains(task));
+        }
+    }
+
     /// Refill the queue from notices that found it full, oldest first, as
     /// acknowledgements make room. Each is enqueued again from its task, which
     /// re-checks the delivered mark and the queued task ids, so a notice is
@@ -250,5 +291,40 @@ mod tests {
         }
         // Every notice arrived, in the order its task finished.
         assert_eq!(delivered, finished);
+    }
+
+    /// Notices that found the queue full wait as task ids. Once the registry
+    /// no longer holds a task, its id can never be delivered, so the cleanup
+    /// pass removes it; waiting ids for retained tasks stay.
+    #[test]
+    fn cleanup_prunes_waiting_ids_of_tasks_the_registry_dropped() {
+        let fixture = tempfile::tempdir().unwrap();
+        let registry = BgTaskRegistry::default();
+        let total = MAX_QUEUED_PER_SESSION + 50;
+        let mut finished = Vec::new();
+        for _ in 0..total {
+            let (task_id, task) = super::super::tests::insert_terminal_piped_task(
+                &registry, &fixture, "cmd", "done\n", "", false,
+            );
+            let metadata = task.lock_state().unwrap().metadata.clone();
+            registry.enqueue_completion_if_needed(&metadata, Some(&task.paths), false);
+            finished.push(task_id);
+        }
+        let waiting = |registry: &BgTaskRegistry| registry.inner.completions.lock().unwrap().overflowed.len();
+        assert_eq!(waiting(&registry), 50);
+        // The registry forgets the first 30 waiting tasks.
+        {
+            let mut tasks = registry.inner.tasks.lock().unwrap();
+            for task_id in &finished[MAX_QUEUED_PER_SESSION..MAX_QUEUED_PER_SESSION + 30] {
+                tasks.remove(task_id);
+            }
+        }
+        crate::bash_background::watchdog::run_cleanup([registry.clone()]);
+        let queue = registry.inner.completions.lock().unwrap();
+        assert_eq!(queue.overflowed.len(), 20);
+        assert!(queue
+            .overflowed
+            .iter()
+            .all(|(_, task)| finished[MAX_QUEUED_PER_SESSION + 30..].contains(task)));
     }
 }
