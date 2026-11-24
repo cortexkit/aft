@@ -242,6 +242,15 @@ fn relative_files(root: &Path, files: Vec<String>) -> Vec<String> {
 /// Two ready repositories, then beta's checkout replaced by the existing
 /// refusing-executor fixture so it stays building without a timing race.
 fn with_loading_child(run: impl FnOnce(&AppContext, &Path, &Path)) {
+    with_prepared_loading_child(|_| {}, run);
+}
+
+/// [`with_loading_child`], with `prepare` run on the parent folder once both
+/// repositories are committed and before anything indexes them.
+fn with_prepared_loading_child(
+    prepare: impl FnOnce(&Path),
+    run: impl FnOnce(&AppContext, &Path, &Path),
+) {
     let temp = tempfile::tempdir().unwrap();
     let base = std::fs::canonicalize(temp.path()).unwrap();
     let root = base.join("projects");
@@ -250,6 +259,7 @@ fn with_loading_child(run: impl FnOnce(&AppContext, &Path, &Path)) {
     for name in ["alpha", "beta"] {
         init_repo(&root.join(name), name);
     }
+    prepare(&root);
     let parent = {
         let _git = crate::test_env::hermetic_git_env_guard();
         configure(&root, &storage, false)
@@ -352,6 +362,64 @@ fn parent_loading_child_walks_until_ready_then_returns_to_indexed_grep_and_glob(
         );
         assert_eq!(work.sort_canonicalizes, 0);
     });
+}
+
+/// A ready child's unreadable folder is named in a parent glob even when
+/// another child, still building, is walked instead: walking one child says
+/// nothing about the folders the ready child's index skipped.
+#[cfg(target_os = "linux")]
+#[test]
+fn parent_glob_names_a_ready_childs_unreadable_folder_beside_a_walked_child() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    with_prepared_loading_child(
+        |root| {
+            let locked = root.join("alpha/locked");
+            write(&locked, "hidden.rs", "pub fn hidden() {}\n");
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+            let restore_on_panic = Restore(locked.clone());
+            assert_eq!(
+                std::fs::read_dir(&locked)
+                    .err()
+                    .expect("run without DAC override privileges")
+                    .kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+            // Stays unreadable while the parent indexes it; the run below
+            // makes it readable again.
+            std::mem::forget(restore_on_panic);
+        },
+        |parent, root, _| {
+            // Readable again before the fixture removes its folder.
+            let _restore = Restore(root.join("alpha/locked"));
+            let reply = glob(parent, "**/*.rs");
+            assert_eq!(reply["fallback"], "filesystem", "{reply:#}");
+            assert_eq!(reply["complete"], false, "{reply:#}");
+            assert_eq!(reply["skipped_folders"], 1, "{reply:#}");
+            let unreadable = gaps(&reply)
+                .into_iter()
+                .filter(|gap| gap["kind"] == "unreadable_folder")
+                .collect::<Vec<_>>();
+            assert_eq!(unreadable.len(), 1, "{reply:#}");
+            assert_eq!(
+                unreadable[0]["path"],
+                json!(root.join("alpha/locked")),
+                "{reply:#}"
+            );
+            assert!(
+                reply["text"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("(Index skipped 1 unreadable folder;"),
+                "{reply:#}"
+            );
+        },
+    );
 }
 
 fn assert_gap_leads(reply: &Value, child: &str) {

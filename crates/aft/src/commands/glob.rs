@@ -157,6 +157,9 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     } else {
         crate::parent_search::glob_fan_out(ctx, &search_roots, pattern)
     };
+    // A parent folder's ready children are answered from their indexes even
+    // when another child is walked, so their skipped folders still count.
+    let answered_by_parent = parent_answer.is_some();
     let (
         mut files,
         unretained_candidates,
@@ -458,7 +461,7 @@ fn handle_glob_inner(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     let mut response = Response::success(&req.id, body);
-    if source == "index" {
+    if source == "index" || answered_by_parent {
         crate::data_layer::surfaces::disclose_index_gaps(ctx, &search_roots, &mut response);
     }
     response
