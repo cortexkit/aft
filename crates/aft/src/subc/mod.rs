@@ -2370,95 +2370,8 @@ fn submit_unbound_teardown_persist(executor: &Executor, root_id: &ProjectRootId)
     drop(executor.submit_unbound_teardown_async(root_id.clone(), request_id, job));
 }
 
-/// Which live roots' directories existed at one probe. The idle reaper needs
-/// this to retire deleted roots, but a `stat` can stall on a slow or hung
-/// filesystem, so the frame loop never runs it: [`RootPresenceProbe`] probes
-/// on a background thread and the reaper reads its newest finished result.
-#[derive(Clone, Debug, Default)]
-struct RootPresence {
-    /// Increases with every probe; zero means no probe has finished.
-    generation: u64,
-    probed: HashSet<ProjectRootId>,
-    absent: HashSet<ProjectRootId>,
-}
-
-impl RootPresence {
-    /// Check each root's directory on the calling thread. The frame loop
-    /// never calls this directly; [`RootPresenceProbe`] runs it on a
-    /// background thread.
-    fn probe<'a>(generation: u64, roots: impl IntoIterator<Item = &'a ProjectRootId>) -> Self {
-        let mut presence = Self {
-            generation,
-            ..Self::default()
-        };
-        for root_id in roots {
-            if !root_id.as_path().exists() {
-                presence.absent.insert(root_id.clone());
-            }
-            presence.probed.insert(root_id.clone());
-        }
-        presence
-    }
-
-    /// `Some(true)` when the probe found the root's directory missing,
-    /// `Some(false)` when it found it, `None` when the probe did not cover it.
-    fn observed_absent(&self, root_id: &ProjectRootId) -> Option<bool> {
-        self.probed
-            .contains(root_id)
-            .then(|| self.absent.contains(root_id))
-    }
-}
-
-/// Runs [`RootPresence`] probes off the frame loop, at most one at a time,
-/// and keeps the newest finished result.
-struct RootPresenceProbe {
-    latest: Arc<parking_lot::Mutex<RootPresence>>,
-    in_flight: Arc<AtomicBool>,
-    next_generation: u64,
-}
-
-impl RootPresenceProbe {
-    fn new() -> Self {
-        Self {
-            latest: Arc::new(parking_lot::Mutex::new(RootPresence::default())),
-            in_flight: Arc::new(AtomicBool::new(false)),
-            next_generation: 0,
-        }
-    }
-
-    /// The newest finished probe. A result being published right now reads
-    /// as "no probe yet", which the reaper treats as no new observation.
-    fn latest(&self) -> RootPresence {
-        self.latest
-            .try_lock()
-            .map(|presence| presence.clone())
-            .unwrap_or_default()
-    }
-
-    /// Start a probe of `roots` unless one is still running. A probe stuck
-    /// on a hung filesystem only delays deletion detection; the frame loop
-    /// never waits for it.
-    fn request(&mut self, roots: Vec<ProjectRootId>) {
-        if roots.is_empty() || self.in_flight.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        self.next_generation += 1;
-        let generation = self.next_generation;
-        let latest = Arc::clone(&self.latest);
-        let in_flight = Arc::clone(&self.in_flight);
-        let spawned = std::thread::Builder::new()
-            .name("aft-root-presence".to_owned())
-            .spawn(move || {
-                let presence = RootPresence::probe(generation, &roots);
-                *latest.lock() = presence;
-                in_flight.store(false, Ordering::Release);
-            });
-        if spawned.is_err() {
-            self.in_flight.store(false, Ordering::Release);
-        }
-    }
-}
-
+mod root_presence;
+use root_presence::{RootPresence, RootPresenceProbe};
 /// Tests reap with a presence probe taken synchronously, so each call sees
 /// the filesystem as it is when the call is made.
 #[cfg(test)]
@@ -2506,31 +2419,7 @@ fn reap_idle_roots_with_presence(
     let mut evicted_contexts: Option<Option<HashMap<ProjectRootId, Arc<AppContext>>>> = None;
 
     for (root_id, meta) in live_roots.iter_mut() {
-        // A missing directory makes a bound route obsolete, but one failed
-        // lookup is not enough evidence to tear down a client-visible actor.
-        // Requiring two presence probes protects atomic replacement and
-        // transient filesystem failures; observing the path resets the proof.
-        // Absence also covers renames: a task's cwd handle can follow the
-        // moved directory while the registered path disappears. The old
-        // path is deliberately treated as a retired root identity, so the
-        // reaper accepts killing such tasks; rename a project only with no
-        // live tasks rather than relying on cwd-resolution heuristics.
-        //
-        // Each probe result is counted once; sweeps that run before the next
-        // probe finishes keep the last observation.
-        let deleted = match presence.observed_absent(root_id) {
-            Some(absent) if presence.generation > meta.presence_generation_seen => {
-                meta.presence_generation_seen = presence.generation;
-                if absent {
-                    meta.consecutive_missing_sweeps =
-                        meta.consecutive_missing_sweeps.saturating_add(1);
-                } else {
-                    meta.consecutive_missing_sweeps = 0;
-                }
-                absent
-            }
-            _ => meta.consecutive_missing_sweeps > 0,
-        };
+        let deleted = presence.update_absence(root_id, meta);
         let deletion_confirmed = meta.consecutive_missing_sweeps >= 2;
         let has_bound_route = root_channels
             .get(root_id)

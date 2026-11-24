@@ -323,10 +323,12 @@ impl ReapWorld {
         };
         for (index, root) in self.roots.iter().enumerate() {
             if self.live_roots.contains_key(root) {
-                presence.probed.insert(root.clone());
-                if absent.contains(&index) {
-                    presence.absent.insert(root.clone());
-                }
+                let observation = if absent.contains(&index) {
+                    root_presence::Observation::Absent
+                } else {
+                    root_presence::Observation::Present
+                };
+                presence.observations.insert(root.clone(), observation);
             }
         }
         let mut sweep = || {
@@ -387,6 +389,49 @@ impl ReapWorld {
             census: self.metrics.reap_census_for_test(),
             metas,
             pending,
+        }
+    }
+}
+
+#[test]
+fn daemon_edge_permission_error_interrupts_confirmed_absence() {
+    use std::io::ErrorKind::{NotFound, PermissionDenied};
+
+    let mut world = ReapWorld::new(1, false);
+    let now = Instant::now();
+    world.set_meta(0, now, false);
+    world.set_bound(0, true);
+    let root = world.roots[0].clone();
+    for (generation, (error, misses)) in [
+        (PermissionDenied, 0),
+        (PermissionDenied, 0),
+        (NotFound, 1),
+        (PermissionDenied, 0),
+        (NotFound, 1),
+        (NotFound, 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let presence =
+            RootPresence::probe_with(generation as u64 + 1, [&root], |_| Err(error.into()));
+        let result = reap_idle_roots_with_presence(
+            now,
+            &mut world.live_roots,
+            &HashMap::new(),
+            &world.root_channels,
+            &world.executor,
+            &world.metrics,
+            &presence,
+        );
+        if misses < 2 {
+            assert!(result.forgotten_deleted_roots.is_empty());
+            assert_eq!(
+                world.live_roots[&root].consecutive_missing_sweeps, misses,
+                "a failed presence check is not confirmed absence: {error:?}"
+            );
+        } else {
+            assert!(result.forgotten_deleted_roots.contains(&root));
         }
     }
 }

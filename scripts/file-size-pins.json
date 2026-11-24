@@ -12,7 +12,7 @@
     "reason": "Split bridge integration tests by tool family pending; AFT crate split lane."
   },
   "crates/aft/src/subc/mod.rs": {
-    "lines": 12854,
+    "lines": 12743,
     "reason": "Split daemon orchestration by area pending; AFT crate split lane."
   },
   "crates/aft/src/context.rs": {
