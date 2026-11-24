@@ -379,6 +379,7 @@ dependencies = [
  "crossbeam-channel",
  "filetime",
  "getrandom 0.3.4",
+ "glob",
  "globset",
  "ignore",
  "libc",

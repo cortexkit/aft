@@ -7,9 +7,10 @@ pub mod lsp_hints;
 
 use aft_base::{
     bounded_io, cache_freshness, cold_build_limiter, config, developer_tools, effective_path,
-    executor, file_kind, inspect_category, io_accounting, jsonc, jsonc_edit, memory, native_stat,
-    private_storage, project_content, project_walk, protocol, shared_timer, slog_debug, slog_error,
-    slog_info, slog_warn, storage_path, symbols, tool_progress, walk_boundary, windows_path,
+    executor, file_kind, inspect_category, io_accounting, jsonc, jsonc_edit, logging, memory,
+    native_stat, private_storage, project_content, project_walk, protocol, shared_timer,
+    slog_debug, slog_error, slog_info, slog_warn, storage_path, symbols, tool_progress,
+    walk_boundary, windows_path,
 };
 use aft_db::{build_breaker, db, fs_lock, path_identity, root_cache, root_identity};
 use aft_edit::{format, imports};
@@ -25,8 +26,8 @@ use aft_base::test_support as test_helpers;
 use aft_base::windows_command;
 #[cfg(test)]
 use aft_base::{
-    config_resolve, durability, executable_cache, file_identity, git_probe, logging,
-    test_allocations, test_env, test_support, walk_profile,
+    config_resolve, durability, executable_cache, file_identity, git_probe, test_allocations,
+    test_env, test_support, walk_profile,
 };
 #[cfg(test)]
 use aft_index::{watcher_backend, watcher_filter};
