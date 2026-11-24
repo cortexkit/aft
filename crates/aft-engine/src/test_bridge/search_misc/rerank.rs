@@ -34,14 +34,7 @@ pub fn build_inputs(
     semantic: SemanticBackendConfig,
     under_subc: bool,
 ) -> slot::BuildInputs {
-    slot::BuildInputs {
-        search,
-        semantic,
-        under_subc,
-        cache_unavailable: false,
-        cache_lease: None,
-        cache_epoch: 0,
-    }
+    slot::BuildInputs::new_for_test(search, semantic, under_subc, false, None, 0)
 }
 
 pub fn search(inputs: &slot::BuildInputs) -> &SearchConfig {

@@ -1,4 +1,3 @@
-
 #[doc(hidden)]
 pub const FIXTURE: &str = include_str!("fixtures/symbols.luau");
 

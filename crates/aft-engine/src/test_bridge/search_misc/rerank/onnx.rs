@@ -7,6 +7,8 @@ pub use crate::search_state::rerank::onnx::{
     verify_pinned_files, with_provision_probe, OnnxPairScorer, OnnxReranker, PairScorer,
     ScorerLoader, SessionTuning, ALLOWED_MODELS, DEFAULT_MODEL,
 };
+#[cfg(unix)]
+pub use crate::search_state::rerank::onnx::{experimental_tuning, profiling_tuning};
 
 pub fn model_file(files: &ModelFiles) -> &Path {
     &files.model

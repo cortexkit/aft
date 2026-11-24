@@ -595,6 +595,9 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `data_layer::grammar::override_extraction_for_test` | test-hook visibility widened | `aft-index` | Trigger exactly the existing extraction fault for those cases. |
 | `DataCheckout::grammar_driver_running_for_test` | test-hook visibility widened | `aft-index` | Check the original grammar driver lifecycle from the facade tests. |
 
+| `rerank::onnx::{experimental_tuning, profiling_tuning}` | moved test-support constructors | `aft-index` | Build the same test tuning values without exposing their private fields. |
+| `test_bridge::search_misc::rerank::onnx::{experimental_tuning, profiling_tuning}` | test-support compatibility re-exports | `aft-engine` | Keep both existing ONNX tuning test paths. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |
