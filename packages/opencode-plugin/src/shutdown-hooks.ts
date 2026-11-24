@@ -15,7 +15,7 @@
  * listener and fire duplicate shutdowns.
  */
 
-import { log } from "./logger.js";
+import { flushLog, log } from "./logger.js";
 
 type Cleanup = (reason: string) => Promise<void> | void;
 type RegisteredCleanup = (reason: string) => Promise<void>;
@@ -72,6 +72,8 @@ export function runCleanups(reason: string): Promise<void> {
           }
         }),
       );
+      // A signal exit follows right after cleanup; persist the shutdown lines first.
+      await flushLog();
     })
     .finally(() => {
       state.runningCleanups = null;

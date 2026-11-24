@@ -110,16 +110,17 @@ export function getLogFilePath(): string {
 }
 
 /**
- * Write buffered log lines now instead of on the next flush tick. For lines
- * logged while the host may be about to exit, which would drop anything still
- * buffered.
+ * Write out buffered lines and wait until the file sink has persisted them.
+ * Lines are normally flushed by an unref'd timer, so a line logged while the
+ * host may be about to exit must be awaited through this to reach the file.
  */
-export function flushLog(): void {
+export async function flushLog(): Promise<void> {
   if (flushTimer) {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
   flush();
+  await fileSink.drain();
 }
 
 /**
