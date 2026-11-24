@@ -147,6 +147,7 @@ const EXTERNAL_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// A save AFT asked rust-analyzer to check.
 #[derive(Debug, Clone)]
 struct RustSaveRequest {
+    allow_resend: bool,
     /// The saved document.
     uri: lsp_types::Uri,
     /// Set while the save has not been sent: send it once this passes.
@@ -2133,12 +2134,19 @@ impl LspClient {
     fn record_save_sent_at(&mut self, uri: &lsp_types::Uri, at: Instant, begins_read: u64) {
         if self.rust_checks_on_save {
             self.rust_save = Some(RustSaveRequest {
+                allow_resend: true,
                 uri: uri.clone(),
                 due_at: None,
                 last_sent_at: Some(at),
                 sends: 1,
                 begins_read_at_send: Some(begins_read),
             });
+        }
+    }
+
+    pub(super) fn make_rust_save_one_shot(&mut self) {
+        if let Some(save) = self.rust_save.as_mut() {
+            save.allow_resend = false;
         }
     }
 
@@ -2154,6 +2162,7 @@ impl LspClient {
         if self.rust_checks_on_save {
             let now = Instant::now();
             self.rust_save = Some(RustSaveRequest {
+                allow_resend: true,
                 uri: uri.clone(),
                 due_at: Some(now + EXTERNAL_SAVE_DELAY),
                 last_sent_at: None,
@@ -2173,7 +2182,8 @@ impl LspClient {
         let due = match (save.due_at, save.last_sent_at) {
             (Some(due_at), _) => now >= due_at,
             (None, Some(sent)) => {
-                save.sends < MAX_SAVE_SENDS
+                save.allow_resend
+                    && save.sends < MAX_SAVE_SENDS
                     && now.saturating_duration_since(sent) >= SAVE_RESEND_AFTER
             }
             (None, None) => false,
@@ -2231,7 +2241,7 @@ impl LspClient {
             let awaiting = match save.last_sent_at {
                 None => true,
                 Some(sent) => {
-                    save.sends < MAX_SAVE_SENDS
+                    (save.allow_resend && save.sends < MAX_SAVE_SENDS)
                         || now.saturating_duration_since(sent) < SAVE_CHECK_START_GRACE
                 }
             };
@@ -2271,7 +2281,9 @@ impl LspClient {
         if let Some(save) = &self.rust_save {
             times.extend(save.due_at);
             if let Some(sent) = save.last_sent_at {
-                times.push(sent + SAVE_RESEND_AFTER);
+                if save.allow_resend {
+                    times.push(sent + SAVE_RESEND_AFTER);
+                }
                 times.push(sent + SAVE_CHECK_START_GRACE);
             }
         }
@@ -2316,6 +2328,9 @@ impl LspClient {
             return false;
         }
         if let Some(save) = self.rust_save.as_mut() {
+            if !save.allow_resend {
+                return false;
+            }
             save.due_at = Some(now);
             save.last_sent_at = None;
             save.sends = 0;

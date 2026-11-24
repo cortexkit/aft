@@ -109,7 +109,9 @@ impl LspManager {
             .latest_push_for_pull_servers
             .bytes()
             .saturating_add(self.latest_pull_for_rust.bytes())
-            .saturating_add(items::<FileKey>(self.unproven_rust_compiler_reports.len()));
+            .saturating_add(items::<(FileKey, Option<[u8; 32]>)>(
+                self.unproven_rust_compiler_reports.len(),
+            ));
         let manager_bytes = items::<Self>(1)
             .saturating_add(items::<(ServerKey, LspClient)>(self.clients.len()))
             .saturating_add(items::<(ServerKey, StartReservation)>(self.starting.len()));
@@ -213,7 +215,7 @@ mod tests {
             .insert(file_key.clone(), vec![diagnostic.clone(); 2]);
         manager
             .unproven_rust_compiler_reports
-            .insert(file_key.clone());
+            .insert(file_key.clone(), None);
         manager
             .pending_diagnostic_observations
             .push(AcceptedDiagnosticSnapshot::new(

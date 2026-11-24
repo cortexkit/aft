@@ -3209,7 +3209,7 @@ fn lsp_diagnostics_reports_cargo_check_after_an_aft_write_with_real_rust_analyze
     fs::create_dir_all(root.join("src")).expect("create src");
     fs::write(
         root.join("Cargo.toml"),
-        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        "[package]\nname = \"field-removal\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[workspace]\n",
     )
     .expect("write manifest");
     fs::write(root.join("src/lib.rs"), "pub mod s;\npub mod user;\n").expect("write lib");

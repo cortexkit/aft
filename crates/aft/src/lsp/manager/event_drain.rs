@@ -247,7 +247,7 @@ impl LspManager {
         self.latest_pull_for_rust
             .retain(|(server, _), _| server != key);
         self.unproven_rust_compiler_reports
-            .retain(|(server, _)| server != key);
+            .retain(|(server, _), _| server != key);
         if let Some(client) = self.clients.get_mut(key) {
             client.completed_rust_check = None;
         }

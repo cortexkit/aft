@@ -466,6 +466,36 @@ fn idle_lsp_restart_races_return_start_in_progress_after_three_attempts() {
 }
 
 #[test]
+fn rust_compiler_recheck_is_not_repeated_after_reopening_unchanged_contents() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let key = key(&root);
+    let file = root.join("lib.rs");
+    std::fs::write(&file, "pub fn first() {}\n").unwrap();
+    let mut manager = LspManager::new();
+    let client =
+        lifecycle_fake_client_with_env(&manager, &key, [("AFT_FAKE_LSP_CHECK_ON_SAVE", "0")]);
+    manager.clients.insert(key.clone(), client);
+    let servers = std::slice::from_ref(&key);
+    manager.open_document_for_servers(&file, servers).unwrap();
+    manager
+        .unproven_rust_compiler_reports
+        .insert((key.clone(), file.clone()), None);
+    let initial = manager.documents[&key].version(&file);
+    assert!(manager.recheck_unproven_rust_file(&key, &file));
+    manager.close_inspect_documents(&file, servers).unwrap();
+    manager.open_document_for_servers(&file, servers).unwrap();
+    assert!(manager.documents[&key].version(&file) > initial);
+    assert!(manager.rust_compiler_report_unproven(&key, &file));
+    assert!(!manager.recheck_unproven_rust_file(&key, &file));
+
+    manager.close_inspect_documents(&file, servers).unwrap();
+    std::fs::write(&file, "pub fn edited() {}\n").unwrap();
+    manager.open_document_for_servers(&file, servers).unwrap();
+    assert!(manager.recheck_unproven_rust_file(&key, &file));
+}
+
+#[test]
 fn idle_lsp_detach_clears_only_reaped_instance_state_and_restarts_during_stop() {
     let fixture = IdleLspFixture::new();
     let old_pid = fixture.pid(&fixture.idle).unwrap();

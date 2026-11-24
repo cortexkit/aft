@@ -94,6 +94,7 @@ mod document_pull_lifetime;
 mod event_drain;
 mod memory;
 mod provider_pulls;
+mod rust_compiler_retry;
 mod shutdown;
 mod watched_overflow;
 mod workspace_pulls;
@@ -1234,7 +1235,7 @@ pub struct LspManager {
     /// analysis and read as compiler-clean. Until a newer push for the file
     /// replaces them, a scoped inspect asks for a new check instead of
     /// certifying the pulled report.
-    unproven_rust_compiler_reports: HashSet<(ServerKey, PathBuf)>,
+    unproven_rust_compiler_reports: HashMap<(ServerKey, PathBuf), Option<[u8; 32]>>,
     /// Times the retry window of transient start failures in `failed_spawns`.
     retry_clock: RetryClock,
     /// Project-wide diagnostic producer expectations survive walks limited to
@@ -1482,7 +1483,7 @@ impl LspManager {
             versioned_publish_servers: HashSet::new(),
             latest_push_for_pull_servers: DiagnosticMergeCache::default(),
             latest_pull_for_rust: DiagnosticMergeCache::default(),
-            unproven_rust_compiler_reports: HashSet::new(),
+            unproven_rust_compiler_reports: HashMap::new(),
             retry_clock: RetryClock::system(),
             project_applicability: None,
         }
@@ -3821,46 +3822,6 @@ impl LspManager {
             .find_map(|(key, entry)| (key == server_key).then(|| entry.diagnostics.clone()))
     }
 
-    /// Whether rust-analyzer's latest `cargo check` push for `file` carried
-    /// compiler diagnostics that could not be matched to known file content
-    /// (see `unproven_rust_compiler_reports`). A pulled report for the file
-    /// then lacks those rows and cannot stand for its compiler result.
-    pub(crate) fn rust_compiler_report_unproven(
-        &self,
-        server_key: &ServerKey,
-        file_path: &Path,
-    ) -> bool {
-        self.unproven_rust_compiler_reports
-            .contains(&(server_key.clone(), normalize_lookup_path(file_path)))
-    }
-
-    /// Ask rust-analyzer for a new `cargo check` by telling it that `file`,
-    /// a document open in it, was saved. The check publishes its results for
-    /// open documents with their versions, which AFT can match to their
-    /// content. Until the check begins, [`Self::rust_check_state`] reports
-    /// it as running. Returns whether the save was sent.
-    pub(crate) fn request_rust_check(&mut self, server_key: &ServerKey, file_path: &Path) -> bool {
-        let Ok(content) = read_file_content(file_path) else {
-            return false;
-        };
-        let Ok(uri) = uri_for_path(file_path) else {
-            return false;
-        };
-        let Some(client) = self.clients.get_mut(server_key) else {
-            return false;
-        };
-        if client.save_notification().is_none() {
-            return false;
-        }
-        match send_did_save(client, &uri, &content) {
-            Ok(()) => true,
-            Err(error) => {
-                crate::slog_warn!("didSave for {} failed: {error}", uri.as_str());
-                false
-            }
-        }
-    }
-
     /// Store the union of a pulled report and the server's latest push for
     /// the same file, keeping the stored report's resultId and document
     /// version. See `latest_push_for_pull_servers` for why one would
@@ -5433,7 +5394,7 @@ impl LspManager {
         self.latest_pull_for_rust
             .retain(|(server, _), _| keep(server));
         self.unproven_rust_compiler_reports
-            .retain(|(server, _)| keep(server));
+            .retain(|(server, _), _| keep(server));
         self.inspect_closed_documents
             .retain(|(server, _), _| keep(server));
         self.late_close_replies
@@ -6563,7 +6524,8 @@ impl LspManager {
             // file's compiler result unknown, and any other push replaces them.
             if !stored.is_empty() && !confirmed {
                 self.unproven_rust_compiler_reports
-                    .insert((key.clone(), file.clone()));
+                    .entry((key.clone(), file.clone()))
+                    .or_insert(None);
             } else {
                 self.unproven_rust_compiler_reports
                     .remove(&(key.clone(), file.clone()));
@@ -6926,7 +6888,7 @@ impl LspManager {
                 self.latest_push_for_pull_servers
                     .retain(|(server, _), _| server != key);
                 self.unproven_rust_compiler_reports
-                    .retain(|(server, _)| server != key);
+                    .retain(|(server, _), _| server != key);
                 Ok(Some((pending, previous)))
             }
             Err(error) => {
