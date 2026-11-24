@@ -5091,34 +5091,38 @@ impl BgTaskRegistry {
         Ok(())
     }
 
+    /// Save `pattern_match` as its watch's pending match. `cursors` also
+    /// moves the watch's saved stream cursors; `None` leaves them, for a scan
+    /// that saves its cursors only after every match it found is saved, so a
+    /// restart between two match writes rescans the unsaved one. Returns false
+    /// when the match could not be saved.
     fn persist_watch_match(
         &self,
         session_id: &str,
         task_id: &str,
         pattern_match: &mut PatternMatch,
-        stdout_offset: u64,
-        stderr_offset: u64,
-        pty_offset: u64,
-    ) {
+        cursors: Option<(u64, u64, u64)>,
+    ) -> bool {
         // The scanner masks the intact capture before constructing this match.
         // Save that presentation verbatim so replay does not need task secrets.
-        let (stdout_offset, stderr_offset, pty_offset) =
-            self.watch_replay_cursors(task_id, (stdout_offset, stderr_offset, pty_offset));
+        let cursors = cursors.map(|cursors| self.watch_replay_cursors(task_id, cursors));
         let Some((harness, pool)) = self.db_harness_and_pool_for_task_id(session_id, task_id)
         else {
-            return;
+            return true;
         };
         let Ok(conn) = pool.lock() else {
-            return;
+            return false;
         };
-        let Ok(Some(mut row)) = crate::db::bash_watches::get_bash_pattern_watch(
+        let mut row = match crate::db::bash_watches::get_bash_pattern_watch(
             &conn,
             &harness,
             session_id,
             task_id,
             &pattern_match.watch_id,
-        ) else {
-            return;
+        ) {
+            Ok(Some(row)) => row,
+            Ok(None) => return true,
+            Err(_) => return false,
         };
         if pattern_match.batch.is_none() {
             if let Some(previous) = row
@@ -5170,9 +5174,10 @@ impl BgTaskRegistry {
             pattern_match.context =
                 crate::task_watch_lines::format_watch_line_batch(task_id, batch);
         }
-        row.stdout_offset = stdout_offset as i64;
-        row.stderr_offset = stderr_offset as i64;
-        row.pty_offset = pty_offset as i64;
+        if let Some((stdout_offset, stderr_offset, pty_offset)) = cursors {
+            (row.stdout_offset, row.stderr_offset) = (stdout_offset as i64, stderr_offset as i64);
+            row.pty_offset = pty_offset as i64;
+        }
         row.pending_match = true;
         row.match_text = Some(pattern_match.match_text.clone());
         row.match_offset = Some(pattern_match.match_offset as i64);
@@ -5196,7 +5201,9 @@ impl BgTaskRegistry {
                 task_id,
                 pattern_match.watch_id
             );
+            return false;
         }
+        true
     }
 
     fn persist_task_watch_cursors(
@@ -9088,9 +9095,7 @@ impl BgTaskRegistry {
                         &task.session_id,
                         &task_id,
                         pattern_match,
-                        stdout_offset,
-                        stderr_offset,
-                        pty_offset,
+                        Some((stdout_offset, stderr_offset, pty_offset)),
                     );
                     fresh.copy_delivery_identity(pattern_match);
                     self.emit_bash_pattern_match(&task.session_id, fresh);
@@ -14026,9 +14031,7 @@ impl BgTaskRegistry {
                 &task.session_id,
                 &task.task_id,
                 pattern_match,
-                stdout_offset,
-                stderr_offset,
-                pty_offset,
+                Some((stdout_offset, stderr_offset, pty_offset)),
             );
         }
         if !gap_matches.is_empty() || rows.iter().any(|row| row.scanning) {
@@ -18377,6 +18380,10 @@ impl Drop for BootstrapGateGuard<'_> {
 #[path = "pty_lifecycle_tests.rs"]
 mod pty_lifecycle_tests;
 
+#[cfg(all(test, unix))]
+#[path = "watch_scan_tests.rs"]
+mod watch_scan_tests;
+
 #[cfg(test)]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
@@ -18543,7 +18550,7 @@ mod tests {
                 ..Default::default()
             }),
         };
-        registry.persist_watch_match("session", task_id, &mut matched, 0, 30, 0);
+        registry.persist_watch_match("session", task_id, &mut matched, Some((0, 30, 0)));
         let saved = crate::db::bash_watches::get_bash_pattern_watch(
             &db.lock().unwrap(),
             "opencode",
@@ -30685,11 +30692,11 @@ mod tests {
             batch: None,
             literal_pattern: false,
         };
-        registry.persist_watch_match("session", &task.task_id, &mut first, 20, 0, 0);
+        registry.persist_watch_match("session", &task.task_id, &mut first, Some((20, 0, 0)));
         let mut second = first.clone();
         second.match_offset = 30;
         second.match_text = "READY second".into();
-        registry.persist_watch_match("session", &task.task_id, &mut second, 40, 0, 0);
+        registry.persist_watch_match("session", &task.task_id, &mut second, Some((40, 0, 0)));
         let frame = BashPatternMatchFrame::new(
             &task.task_id,
             "session",
@@ -31348,14 +31355,7 @@ mod tests {
             final_match.batch.as_ref().unwrap().lines[0].text,
             "READY tail"
         );
-        registry.persist_watch_match(
-            "session",
-            &task.task_id,
-            &mut final_match,
-            cursors.0,
-            cursors.1,
-            cursors.2,
-        );
+        registry.persist_watch_match("session", &task.task_id, &mut final_match, Some(cursors));
         assert_eq!(registry.watch_stream_cursors(&task.task_id), cursors);
         assert!(
             final_match.match_offset > first.match_offset,
