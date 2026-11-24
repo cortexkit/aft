@@ -32,8 +32,9 @@ struct CachedFileMetric {
     language: &'static str,
     loc: usize,
     skipped_reason: Option<String>,
-    /// The file disappeared (or is excluded project storage) between the walk
-    /// and this read: it contributes nothing, as the next walk will see it.
+    /// The file disappeared between the walk and this read, or is AFT's own
+    /// storage that `project_content` excludes from project source: it
+    /// contributes nothing, as the next walk will see it.
     vanished: bool,
 }
 

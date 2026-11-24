@@ -199,7 +199,8 @@ pub(crate) fn aggregate_cycle_contributions_with_limit(
     )
 }
 
-/// The honesty fields of one contribution, read without its import facts.
+/// The parse-error and skipped-file fields of one contribution, read without
+/// its import facts.
 #[derive(Debug, Deserialize)]
 struct CycleHonesty {
     // Required, like `CycleContribution::file`, so both paths count the same
