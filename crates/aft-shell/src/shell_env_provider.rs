@@ -421,7 +421,8 @@ impl Drop for PreflightLayout {
 }
 
 #[cfg(unix)]
-pub(crate) fn sweep_preflight_layouts_on_startup() {
+#[doc(hidden)]
+pub fn sweep_preflight_layouts_on_startup() {
     static SWEPT: OnceLock<()> = OnceLock::new();
     SWEPT.get_or_init(|| {
         let _ = crate::sandbox_spawn::sweep_provider_temp_layouts();

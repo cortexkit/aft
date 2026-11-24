@@ -758,12 +758,12 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `sandbox_spawn::remote_shell_guard::active` | compatibility re-export | `aft-engine` | Keep the existing native verification path. |
 | `gh_shim_ticket::spawn_metadata::SpawnMetadata` | metadata view | `aft-github` | Capture and seal speech tickets using only the session, task, process, and remote-execution facts they need. |
 | `gh_shim_ticket::spawn_metadata::{ColdTaskDecoder, ColdTaskMetadata}` | decoder port and metadata view | `aft-github` | Cold redemption needs trusted task metadata, not the shell's persisted record format. |
-| `gh_shim_ticket::decode_cold_task` | port adapter | `aft-engine` | Deserialize the full shell record before returning the projection; invalid unused fields still refuse redemption. |
+| `gh_shim_ticket::decode_cold_task` | port adapter | `aft-shell` | Deserialize the full shell record before returning the projection; invalid unused fields still refuse redemption. |
 | `gh_shim_ticket::{capture_spawn, seal_spawn}` | widened operations | `aft-github` | Accept the narrow metadata view supplied by the shell. |
-| `gh_shim_ticket::{capture_spawn, seal_spawn}` | compatibility wrappers | `aft-engine` | Keep the persisted-task call paths and construct the GitHub metadata view at the boundary. |
+| `gh_shim_ticket::{capture_spawn, seal_spawn}` | shell adapter | `aft-shell` | Keep the persisted-task call paths and construct the GitHub metadata view at the boundary. |
 | `gh_shim_ticket::{PendingTicket::issue_with_scope, PendingTicket::issue_for_project, ScopedTicket::issue_with_scope}` | scope port | `aft-github` | Read the authenticated spawn scope lazily, only if the speech launch context has no lifecycle scope. |
-| `gh_shim_ticket::PendingTicket` | compatibility wrapper | `aft-engine` | Retain issue, value, bind, and drop behavior while passing the real shell scope source. |
-| `gh_shim_ticket::ScopedTicket` | compatibility wrapper | `aft-engine` | Preserve the scoped-ticket constructor and drop semantics while passing the real scope source. |
+| `gh_shim_ticket::PendingTicket` | shell adapter | `aft-shell` | Retain issue, value, bind, and drop behavior while passing the real shell scope source. |
+| `gh_shim_ticket::ScopedTicket` | shell adapter | `aft-shell` | Preserve the scoped-ticket constructor and drop semantics while passing the real scope source. |
 | `gh_shim_ticket::{redeem, revoke_task, Redeemed, GH_SHIM_TICKET_ENV, GH_SHIM_WORKER_ENV}` | compatibility re-exports | `aft-engine` | Keep the public ticket paths for unchanged upper callers. |
 | `gh_shim_speech::service::{Describe, start_with_task_decoder}` | widened type and decoder entry | `aft-github` | Construction binds the cold decoder to the service that needs it. |
 | `gh_shim_speech::service::start` | compatibility wrapper | `aft-engine` | The production constructor supplies the strict shell decoder without changing daemon callers. |
@@ -789,3 +789,32 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `gh_shim::composed_test_driver::empty_home_uses_userprofile_for_config_and_parent_exclusion` | feature-gated test driver | `aft-github` | Keep the real shim configuration assertions while the engine checks parent discovery in the same child process. |
 | `gh_shim_relay::composed_test_driver::assert_spawned_ticket_relays` | feature-gated test driver | `aft-github` | Check the exact relay request and response for a real shell ticket and verify the audit line identifies that task. |
 | `github_read::{stale_thread_note_for_test, GithubReadDeferred::late_answer_fixture, GithubReadEngine::flights_empty_fixture}` | feature-gated test helpers | `aft-github` | Preserve the existing read test bridge's fixture and lifecycle observations. |
+
+## Shell composition
+
+| Item | Kind | Owning crate | Reason |
+|---|---|---|---|
+| `pinned_config::PinnedConfig` | config read port | `aft-shell` | Read the calling context's current pin-key configuration through the original engine accessor. |
+| `sandbox_spawn::SandboxHost` and `ConfigPin` | sandbox policy port and scoped pin | `aft-shell` | Resolve policy and storage against the bound context and keep the original config pin alive during Linux remote preparation. |
+| `sandbox_spawn::EscalationGrantState` | opaque owned handle | `aft-shell` | Keep the grant lock in shell and allow the expiry timer to hold only a weak reference to the per-context state. |
+| `bash_background::TaskRegistryAccess` | registry handle port | `aft-shell` | Use the same task registry for shell startup, output, scanner ownership and progress. |
+| `bash_background::SpawnHost` | launch coordination port | `aft-shell` | Check daemon mode on startup and reload filters and begin watcher capture just before task registration. |
+| `SpawnHost::check_spawn_folder_revocation` | post-spawn port | `aft-shell` | A new task checks the composing context's current database to close the revoke-versus-register race. |
+| `BgTaskRegistry::stop_if_folder_grant_revoked` | widened operation | `aft-shell` | Let composition invoke the existing check for new tasks; replay still selects the registry's own database pool. |
+| `PermissionScanHost` | scanner host | `aft-shell` | Bind the scanner's config read and the task artifact ownership check without handing it the application. |
+| `OutputStoreHost` | output namespace port | `aft-shell` | Keep output routing tied to the context's storage root, harness, file index and live task registry. |
+| `exec_remote::SiblingReadPolicy` | read permission port | `aft-shell` | Preserve the selected session's read decision without triggering an approval request. |
+| `bash_rewrite::RewriteHost` and `rules::ParsedRewriteRule` | rewrite port and widened trait | `aft-shell` | Keep shell decisions and response shaping below the tool handlers and bound ignore and hashline checks. |
+| `late_result_bus::LedgerDatabase` | shell → composition database port | `aft-shell` | Run retries and scans on the one owning connection through a synchronous borrow, with no lock or guard in the port. |
+| `late_result_bus::SharedDatabase` and `start` | database adapter and compatibility wrapper | `aft-engine` | Preserve the `start` entry point, database selection, open/busy errors and first-create catalog refresh. |
+| `late_result_bus::scan_from_start_for_test` | feature-gated test driver | `aft-shell` | Exercise the initial real bus scan against the composition-owned database. |
+| `policy_path::canonicalize_lenient` and `context::canonicalize_lenient` | moved policy, widened item and compatibility re-export | `aft-base` | Use one symlink-aware policy for engine paths and shell change detection. |
+| `bash_changed_files::start_for_spawn` | watcher adapter | `aft-engine` | Select the caller's watcher journal, policy and deadline before handing capture back to shell. |
+| `Journal::{event_for_root, gap}`, `Capture::{begin, setup_for_spawn}`, `SpawnPlan::changed_files_read_profile` | widened change detection operations | `aft-shell` | Wire the existing watcher journal and read profile without putting watcher coordination in shell. |
+| `SharedCallDeadline` and `changed_files_deadline_for_spawn` | opaque handle and widened deadline accessor | `aft-shell` | Hand the existing reply deadline to the change detector without exposing its mutex. |
+| `OutputFiles::{shared, restore, is_result_path}` | widened file-index operations | `aft-shell` | Keep engine setup, restart recovery and private output checks on the same index. |
+| `agent_child_env::ensure_git_hooks`, `shell_env_provider::sweep_preflight_layouts_on_startup`, `bash_background::commit_spawn_receipt_inline` | widened composition operations | `aft-shell` | Rescan child hooks after config reload, sweep stale provider layouts at startup and preserve receipts for composed rewrites. |
+| `bash_background::task_storage_dir` | compatibility wrapper | `aft-engine` | Accept `&AppContext` while selecting the shell task route from its pinned config. |
+| `gh_shim_ticket` | compatibility re-export | `aft-engine` | Present the original ticket paths while using the shell-owned task metadata adapter. |
+| `registry::test_support::{create_wait_fixture, mark_fixture_terminal, task_count, remote}` | feature-gated fixture drivers | `aft-shell` | Set up and observe real shell registry state without passing composition types to shell. |
+| `shell_test_fixtures::{registry, remote, push_projection}` | feature-gated compatibility fixtures | `aft-engine` | Keep real context construction only where upper harnesses or composed assertions need it. |

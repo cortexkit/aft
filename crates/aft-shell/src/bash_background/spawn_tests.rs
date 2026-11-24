@@ -802,11 +802,7 @@ fn agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_a
             "::agent_commands_local_shell_roots_and_cpu_are_declared_but_internal_children_are_not"
         );
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                name.strip_prefix("aft::").unwrap_or(name),
-                "--nocapture",
-            ])
+            .args(["--exact", name.split_once("::").unwrap().1, "--nocapture"])
             .env(CHILD, "1")
             .output()
             .unwrap();

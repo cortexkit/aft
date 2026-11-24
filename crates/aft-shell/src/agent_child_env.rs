@@ -674,7 +674,8 @@ fn maintain_with_probe(
 /// Install the managed git hooks that `git.co_author` needs, without touching
 /// the gh shim. A live config reload turning co-author attribution on calls
 /// this; the shim is only changed by a full configure.
-pub(crate) fn ensure_git_hooks(storage_root: &Path) -> Result<(), String> {
+#[doc(hidden)]
+pub fn ensure_git_hooks(storage_root: &Path) -> Result<(), String> {
     ensure_managed_git_hooks(&managed_git_hooks_dir(storage_root))
 }
 

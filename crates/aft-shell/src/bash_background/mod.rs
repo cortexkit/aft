@@ -502,7 +502,8 @@ pub(crate) fn commit_spawn_receipt(task_id: &str) -> Result<(), String> {
 /// this process. A rewrite can mutate files (an append becomes an edit), so it
 /// is fenced exactly like process creation: once the deadline has refused the
 /// startup, the rewrite must not run.
-pub(crate) fn commit_spawn_receipt_inline() -> Result<(), String> {
+#[doc(hidden)]
+pub fn commit_spawn_receipt_inline() -> Result<(), String> {
     enter_bash_startup_step(BashStartupStep::SpawnPreparation);
     CURRENT_SPAWN_RECEIPT.with(|slot| match slot.borrow().as_ref() {
         Some(receipt) => receipt.commit(SpawnReceiptState::CommittedInline),
