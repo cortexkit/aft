@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { redactSecrets, sanitizeContent, sanitizeValue } from "../lib/sanitize.js";
 
-// Cases shared with the Rust log redactor (crates/aft/src/log_redact.rs) so the
+// Cases shared with the Rust log redactor (crates/aft-base/src/log_redact.rs) so the
 // daemon's log files and `aft doctor --issue` mask secrets identically.
 const sharedRedactionCases = JSON.parse(
   readFileSync(

@@ -126,7 +126,7 @@ describe("Pi aft_inspect surface", () => {
     const description = inspect.description ?? "";
     const schemas = JSON.parse(
       readFileSync(
-        new URL("../../../../crates/aft/src/subc_tool_schemas.json", import.meta.url),
+        new URL("../../../../crates/aft-subc/src/subc_tool_schemas.json", import.meta.url),
         "utf8",
       ),
     ) as Record<string, { description: string }>;

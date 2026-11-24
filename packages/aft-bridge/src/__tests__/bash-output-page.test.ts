@@ -47,7 +47,7 @@ describe("watch sentences shared with the engine", () => {
   // The engine's own bash_watch renders these sentences too. Reading the Rust
   // source keeps the hosts and the engine from drifting apart.
   const engineWatch = readFileSync(
-    new URL("../../../../crates/aft/src/commands/bash_watch.rs", import.meta.url),
+    new URL("../../../../crates/aft-tools/src/commands/bash_watch.rs", import.meta.url),
     "utf8",
   );
 

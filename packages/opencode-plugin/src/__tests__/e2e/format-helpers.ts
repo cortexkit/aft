@@ -54,7 +54,7 @@ function findToolInWorkspace(tool: string): string | null {
 /**
  * Per-language formatter config installer. Each preset writes the minimum
  * config files a project needs for AFT's formatter detection logic in
- * `crates/aft/src/format.rs::formatter_candidates` to pick up the chosen
+ * `crates/aft-engine/src/format.rs::formatter_candidates` to pick up the chosen
  * tool.
  *
  * Add new presets here as the test suite grows.

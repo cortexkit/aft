@@ -71,7 +71,7 @@ async function main(): Promise<void> {
     check("glob returns success", glob.success === true);
 
     const outline = await bridge.toolCall(SESSION, "outline", {
-      target: "crates/aft/src/subc_translate.rs",
+      target: "crates/aft-tools/src/subc_translate.rs",
     });
     check("outline returns success", outline.success === true);
 
