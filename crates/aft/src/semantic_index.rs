@@ -4266,30 +4266,28 @@ fn find_managed_onnx_runtime(storage_dir: &Path) -> Option<PathBuf> {
         // ORT_DYLIB_PATH short-circuits the resolver without touching the tree.
         MANAGED_ORT_PROBE_READS.fetch_add(1, Ordering::Relaxed);
     }
-    let mut best: Option<(u32, u32, PathBuf)> = None;
+    let mut best = None;
     for entry in entries.flatten() {
         let path = entry.path();
         if !path.is_dir() {
             continue;
         }
-        let Some((major, minor)) = parse_managed_ort_version(&entry.file_name().to_string_lossy())
-        else {
+        let Some(version) = parse_managed_ort_version(&entry.file_name().to_string_lossy()) else {
             continue;
         };
-        if major != 1 || minor < MANAGED_ORT_MIN_MINOR {
+        if version.0 != 1 || version.1 < MANAGED_ORT_MIN_MINOR {
             continue;
         }
         let Some(lib_path) = managed_ort_lib_in_version_dir(&path) else {
             continue;
         };
-        if best
-            .as_ref()
-            .is_none_or(|(best_major, best_minor, _)| (major, minor) > (*best_major, *best_minor))
-        {
-            best = Some((major, minor, lib_path));
+        let candidate = (version, lib_path);
+        // Break ties between different directory spellings of the same version.
+        if best.as_ref().is_none_or(|previous| candidate > *previous) {
+            best = Some(candidate);
         }
     }
-    best.map(|(_, _, path)| path)
+    best.map(|(_, path)| path)
 }
 
 /// Locate the library file inside one `<version>` directory, preferring the
@@ -4309,16 +4307,16 @@ fn managed_ort_lib_in_version_dir(version_dir: &Path) -> Option<PathBuf> {
 /// Parse a `major.minor.patch` triple from a version directory name. Returns
 /// None for anything that is not exactly a three-part numeric version (so
 /// non-version dirs and malformed names are ignored).
-fn parse_managed_ort_version(name: &str) -> Option<(u32, u32)> {
+fn parse_managed_ort_version(name: &str) -> Option<(u32, u32, u32)> {
     let mut parts = name.split('.');
     let major = parts.next()?.parse::<u32>().ok()?;
     let minor = parts.next()?.parse::<u32>().ok()?;
-    let _patch = parts.next()?.parse::<u32>().ok()?;
+    let patch = parts.next()?.parse::<u32>().ok()?;
     // Reject trailing junk like "1.24.4.tmp" or "1.24.4.5".
     if parts.next().is_some() {
         return None;
     }
-    Some((major, minor))
+    Some((major, minor, patch))
 }
 
 /// Serializes ONNX Runtime loading, and remembers the outcome once `ort` has
@@ -16412,6 +16410,11 @@ public class Greeter {
     }
 
     #[test]
+    fn managed_ort_resolver_orders_compatible_versions_by_patch() {
+        assert!(parse_managed_ort_version("1.24.4") > parse_managed_ort_version("1.24.0"));
+    }
+
+    #[test]
     fn managed_ort_resolver_picks_highest_compatible_version() {
         let _env_lock = crate::test_env::process_env_lock();
         let storage = tempfile::tempdir().unwrap();
@@ -16421,6 +16424,7 @@ public class Greeter {
             &[
                 ("1.19.0", true), // below the 1.20 floor — must be ignored
                 ("1.20.1", true),
+                ("1.24.0", true),
                 ("1.24.4", true), // highest compatible — must win
                 ("1.23.0", true),
             ],
