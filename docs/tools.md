@@ -1161,15 +1161,9 @@ trigger a rebuild — the key isn't part of the fingerprint.
 
 **Constraints:**
 - `base_url` must be `http://` or `https://`.
-- **Loopback is allowed.** `127.0.0.1`, `localhost`, and `*.localhost` are accepted so
-  self-hosted backends like Ollama work at their default config (`http://127.0.0.1:11434`).
-  Loopback is by definition same-machine and not an SSRF target.
-- **Non-loopback private/reserved IPs are rejected** at configure time as an SSRF guard
-  against a malicious config redirecting embeddings to internal services. This includes
-  10/8, 172.16/12, 192.168/16, 169.254/16 (link-local), and 100.64/10 (CGNAT). mDNS
-  hostnames (`*.local`) are also rejected. Users running self-hosted services on a LAN IP
-  can either bind the service to loopback and use SSH/port-forward, or expose it on a
-  public-routable interface.
+- **`base_url` is accepted only from user-tier configuration.** It may point to a
+  loopback endpoint (such as Ollama at `http://127.0.0.1:11434`), a LAN server, or a
+  public endpoint. Project configuration cannot redirect embeddings to another endpoint.
 - The plugin retries failed HTTP requests with exponential backoff before giving up.
 - Vector dimension is detected from the first response and validated on every subsequent
   insert; mismatches abort the build instead of silently corrupting the index.

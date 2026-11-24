@@ -2529,17 +2529,8 @@ fn handle_configure_inner(
         }));
     }
 
-    // NO configure-time SSRF guard on semantic.base_url — deliberate (config
-    // relocation posture). The original guard existed to stop UNTRUSTED *project*
-    // config from pointing the embedding backend at an internal IP (SSRF). The tier
-    // resolver now drops project-tier `semantic.base_url` outright (SEMANTIC_SECRET_REASON),
-    // so the only base_url that can reach `next_config` is USER-tier — the same trust
-    // level as the binary itself. A user pointing AFT at their own self-hosted
-    // embedding server on the LAN/WAN (homelab Ollama/LMStudio at 192.168.x / 10.x, or
-    // a remote box) is legitimate and must be allowed; the SSRF threat model (attacker-
-    // controlled URL) does not apply to user-trusted config. The `validate_base_url_no_ssrf`
-    // primitive remains for any future less-trusted source. See semantic_test::
-    // configure_accepts_user_private_base_url.
+    // The resolver drops project-tier semantic.base_url; users may point their
+    // own embedding configuration at a local, LAN, or remote server.
 
     // Parse and validate process-state configure fields into a temporary config first.
     // AppContext is mutated only after this phase succeeds, so an invalid late
