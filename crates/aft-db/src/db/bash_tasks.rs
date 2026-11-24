@@ -287,6 +287,16 @@ pub(crate) fn prune_terminal_rows_guarded(
     delete_prepared_terminal_rows(conn, prepared)
 }
 
+/// Cheap first check before opening a sweep to count and inspect candidates.
+pub(crate) fn terminal_retention_due(conn: &Connection, now_ms: i64) -> rusqlite::Result<bool> {
+    let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);
+    conn.prepare_cached(&format!(
+        "SELECT EXISTS (SELECT 1 FROM bash_tasks INDEXED BY idx_bash_tasks_terminal_retention
+         WHERE {TERMINAL_ROW_PREDICATE})"
+    ))?
+    .query_row([cutoff], |row| row.get(0))
+}
+
 /// Count rows that meet the SQL retention predicate without filesystem or PID checks.
 pub fn terminal_rows_eligible_count(conn: &Connection, now_ms: i64) -> rusqlite::Result<usize> {
     let cutoff = now_ms.saturating_sub(TERMINAL_ROW_RETENTION_AGE_MS);

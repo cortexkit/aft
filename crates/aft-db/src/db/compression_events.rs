@@ -687,6 +687,20 @@ const RETENTION_CANDIDATES: &str = "
     WHERE (created_at, id) > (?1, ?2) AND created_at < ?3
     ORDER BY created_at, id LIMIT ?4";
 
+const OLD_COMPRESSION_EVENT_EXISTS: &str = "SELECT EXISTS (
+    SELECT 1 FROM compression_events INDEXED BY idx_compression_created
+    WHERE created_at < ?1 AND id <> ?2
+)";
+
+fn compression_retention_due(conn: &Connection, now_ms: i64) -> rusqlite::Result<bool> {
+    let watermark = compression_event_watermark(conn)?;
+    conn.prepare_cached(OLD_COMPRESSION_EVENT_EXISTS)?
+        .query_row(
+            params![now_ms.saturating_sub(RETENTION_AGE_MS), watermark],
+            |row| row.get(0),
+        )
+}
+
 /// Fold and remove at most 500 old events in one atomic transaction.
 ///
 /// The cursor bounds rows examined as well as rows deleted, so long-running
@@ -697,6 +711,9 @@ const RETENTION_CANDIDATES: &str = "
 /// the retention window no longer participates in duplicate suppression.
 pub fn prune_compression_events(conn: &mut Connection, now_ms: i64) -> rusqlite::Result<usize> {
     use rusqlite::TransactionBehavior;
+    if !compression_retention_due(conn, now_ms)? {
+        return Ok(0);
+    }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let deleted = prune_compression_events_in_transaction(&tx, now_ms)?;
     tx.commit()?;
@@ -708,6 +725,9 @@ fn prune_compression_events_in_transaction(
     now_ms: i64,
 ) -> rusqlite::Result<usize> {
     use rusqlite::OptionalExtension;
+    if !compression_retention_due(conn, now_ms)? {
+        return Ok(0);
+    }
     let (created_at, event_id) = conn
         .query_row(
             "SELECT created_at, event_id FROM compression_retention_cursor WHERE singleton = 1",
@@ -772,6 +792,9 @@ fn prune_compression_events_in_transaction(
         .last()
         .map(|row| (row.1, row.0))
         .unwrap_or((i64::MIN, 0));
+    if (next_created, next_id) == (created_at, event_id) {
+        return Ok(deleted);
+    }
     conn.execute(
         "INSERT INTO compression_retention_cursor VALUES (1, ?1, ?2)
          ON CONFLICT(singleton) DO UPDATE SET created_at = excluded.created_at, event_id = excluded.event_id",
@@ -1291,11 +1314,9 @@ pub fn maybe_spawn_retention(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis();
-            match prune_retention_sweep(
-                &db,
-                i64::try_from(now).unwrap_or(i64::MAX),
-                &guard,
-            ) {
+            let now_ms = i64::try_from(now).unwrap_or(i64::MAX);
+            if heavy_retention_due(&db, now_ms) {
+                match prune_retention_sweep(&db, now_ms, &guard) {
                 Ok(RetentionSweepOutcome::Completed(sweep)) => {
                     RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
                     log_completed_retention_sweep(&sweep);
@@ -1320,13 +1341,14 @@ pub fn maybe_spawn_retention(
                         );
                     }
                 }
-                Err(error) => crate::slog_warn!("retention failed: {}", error),
+                    Err(error) => crate::slog_warn!("retention failed: {}", error),
+                }
+            } else {
+                record_retention_sweep_skip(&db, None);
+                RETENTION_CONSECUTIVE_SKIPS.store(0, Ordering::Relaxed);
             }
             // Revoked bot-write authorities: bounded by its own time budget.
-            crate::db::gh_speech::retention::run_tick(
-                &db,
-                i64::try_from(now).unwrap_or(i64::MAX),
-            );
+            crate::db::gh_speech::retention::run_tick(&db, now_ms);
             // These sweeps write, so they take the same short busy budget as the
             // other maintenance writes: under another process's write lock they
             // defer to the next run instead of holding the connection mutex for
@@ -1373,6 +1395,21 @@ pub(crate) fn run_write_chores(db: &std::sync::Mutex<crate::db::TrackedConnectio
             crate::db::github_read_cache::sweep(conn, now_ms).map(|_| ())
         }),
     );
+}
+
+fn heavy_retention_due(db: &SharedDb, now_ms: i64) -> bool {
+    let Ok(conn) = db.try_lock() else {
+        // Let the normal sweep report contention and schedule a retry.
+        return true;
+    };
+    let due = || -> rusqlite::Result<bool> {
+        Ok(
+            crate::db::bash_tasks::terminal_retention_due(&conn, now_ms)?
+                || compression_retention_due(&conn, now_ms)?
+                || crate::db::rich_ui::preset_retention_due(&conn, now_ms)?,
+        )
+    };
+    due().unwrap_or(true)
 }
 
 fn log_completed_retention_sweep(sweep: &RetentionSweep) {
@@ -1865,7 +1902,6 @@ pub mod tests {
         );
     }
 
-    fn row<'a>(
     #[test]
     fn status_compression_does_not_rescan_for_unrelated_watermark_advances() {
         let dir = tempdir().unwrap();
@@ -1942,6 +1978,69 @@ pub mod tests {
         }
     }
 
+    #[test]
+    fn compression_retention_does_not_write_when_no_old_events_are_due() {
+        let dir = tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        insert_compression_event(&conn, &row("project-a", "recent", 100, 40, 100)).unwrap();
+        let before = conn.total_changes();
+        for now in 1..=60 {
+            assert_eq!(prune_compression_events(&mut conn, now).unwrap(), 0);
+        }
+        assert_eq!(conn.total_changes() - before, 0);
+    }
+
+    #[test]
+    fn idle_retention_ignores_the_watermark_without_loading_its_candidate_row() {
+        let dir = tempdir().unwrap();
+        let mut conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+        let watermark = insert_compression_event(&conn, &row("project-a", "only", 100, 40, 1))
+            .unwrap()
+            .unwrap();
+        let now = RETENTION_AGE_MS + 100;
+        let age_cutoff = now - RETENTION_AGE_MS;
+
+        // Before the due check, the full candidate projection read this row
+        // only to discard it as the watermark.
+        let candidates = conn
+            .prepare(RETENTION_CANDIDATES)
+            .unwrap()
+            .query_map(params![i64::MIN, 0, age_cutoff, RETENTION_BATCH], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(candidates, [watermark]);
+        let due_plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {OLD_COMPRESSION_EVENT_EXISTS}"
+            ))
+            .unwrap()
+            .query_map(params![age_cutoff, watermark], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            due_plan.contains("COVERING INDEX idx_compression_created (created_at<?)"),
+            "{due_plan}"
+        );
+        assert!(!compression_retention_due(&conn, now).unwrap());
+        let before = conn.total_changes();
+        assert_eq!(prune_compression_events(&mut conn, now).unwrap(), 0);
+        assert_eq!(conn.total_changes(), before);
+
+        let db = std::sync::Arc::new(std::sync::Mutex::new(conn));
+        assert!(!heavy_retention_due(&db, now));
+        insert_compression_event(&db.lock().unwrap(), &row("project-b", "new", 10, 5, now))
+            .unwrap();
+        assert!(heavy_retention_due(&db, now));
+    }
+
+    fn row<'a>(
         project_key: &'a str,
         task_id: &'a str,
         original_tokens: u32,
