@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 
-import { error, getActiveLogger, log, warn as activeWarn } from "./active-logger.js";
+import { warn as activeWarn, error, getActiveLogger, log } from "./active-logger.js";
 import { BinaryBridge, type BridgeOptions } from "./bridge.js";
 import { asCanonicalRootPath, type CanonicalRootPath } from "./lifecycle-registry.js";
 import type { Logger, LogMeta } from "./logger.js";

@@ -1,6 +1,6 @@
 import {
-  type Dirent,
   closeSync,
+  type Dirent,
   existsSync,
   openSync,
   readdirSync,
@@ -145,7 +145,7 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
         sessions.push({ ...parsed, lastActivity: file.mtimeMs });
         if (sessions.length >= MAX_RECENT_SESSIONS) break;
       } catch {
-        continue;
+        // Ignore a candidate that disappears or becomes unreadable.
       }
     }
     return sessions;

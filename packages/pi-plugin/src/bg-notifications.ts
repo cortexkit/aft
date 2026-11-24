@@ -1105,7 +1105,7 @@ function scheduleWake(
     reminder: string,
     completions: readonly BashAckTarget[],
     patternMatches?: readonly PatternMatchEntry[],
-  ) => Promise<void | typeof WAKE_SESSION_CHANGED>,
+  ) => Promise<undefined | typeof WAKE_SESSION_CHANGED>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
   includeDeferredCompletions = true,
 ): void {
