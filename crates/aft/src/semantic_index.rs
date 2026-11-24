@@ -27,7 +27,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use url::Url;
@@ -600,15 +600,11 @@ fn root_backend_probes() -> &'static Mutex<HashMap<PathBuf, RootBackendProbe>> {
     PROBES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Check that a remote embedding backend accepts connections while the
-/// semantic index is still building, without ever waiting on the network.
-///
-/// The outage state that search replies and the status sidebar report
-/// ("Semantic backend unavailable (<url>): <reason>") used to come only from a
-/// build attempt that had reached the backend and failed. Before that attempt
-/// (the artifact-load gate, the file walk, the cold-build queue, a large
-/// corpus's chunking) nothing was recorded, so a backend that was never
-/// listening read as "Semantic index is rebuilding" for as long as that took.
+mod root_state;
+pub(crate) use root_state::{try_lock_root_state, try_retire_root_embedding_state};
+
+/// Check the backend while the index builds, including before a build reaches
+/// the backend, without waiting on the network.
 ///
 /// `status` is polled by the sidebar and must stay cheap, and a backend behind
 /// a blackholed address or a hanging DNS lookup can take seconds to fail. So
@@ -702,6 +698,7 @@ fn check_remote_backend_for_root(
     if !fresh && !entry.in_flight {
         entry.in_flight = true;
         entry.started = Instant::now();
+        let started = entry.started;
         let root = root.to_path_buf();
         let url = base_url.to_string();
         let spawned = std::thread::Builder::new()
@@ -714,7 +711,7 @@ fn check_remote_backend_for_root(
                 let Some(entry) = probes.get_mut(&root) else {
                     return;
                 };
-                if entry.base_url != url {
+                if entry.base_url != url || entry.started != started {
                     return;
                 }
                 entry.in_flight = false;
@@ -10627,6 +10624,35 @@ pub(crate) mod tests {
     #[cfg(unix)]
     const RUST_QUERY_BASELINE_OUTPUT_HASH: &str =
         "36315439db74ed8e186076f79ed261079b2b13a4443ed4272861a2518c78d98b";
+
+    #[test]
+    fn root_eviction_retires_query_embed_health_and_backend_probes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        record_query_embed_observation(Some(&root), 73, true);
+        root_backend_probes().lock().unwrap().insert(
+            root.clone(),
+            RootBackendProbe {
+                base_url: "http://localhost".to_string(),
+                started: Instant::now(),
+                in_flight: false,
+                finished: Some((Instant::now(), Ok(()))),
+            },
+        );
+        assert_eq!(query_embed_health_snapshot(&root).query_embed_timeouts, 1);
+
+        assert!(ctx.try_evict_idle_artifacts());
+        assert_eq!(
+            query_embed_health_snapshot(&root),
+            QueryEmbedHealthSnapshot::default()
+        );
+        assert!(!root_backend_probes().lock().unwrap().contains_key(&root));
+    }
 
     struct CountingLocalProvider {
         calls: Arc<AtomicUsize>,

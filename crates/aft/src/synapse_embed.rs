@@ -126,6 +126,19 @@ fn page_row_caps() -> &'static Mutex<HashMap<(PathBuf, String), usize>> {
     CAPS.get_or_init(Mutex::default)
 }
 
+pub(crate) fn try_retire_root_state(root: &Path) -> bool {
+    use crate::semantic_index::try_lock_root_state;
+    let (Some(mut pauses), Some(mut caps)) = (
+        try_lock_root_state(lane_pauses()),
+        try_lock_root_state(page_row_caps()),
+    ) else {
+        return false;
+    };
+    pauses.remove(root);
+    caps.retain(|(owner, _), _| owner != root);
+    true
+}
+
 fn page_row_limit(root: &Path, model: &str, recommended: usize) -> usize {
     page_row_caps()
         .lock()
@@ -2005,6 +2018,38 @@ fn hex_sha256(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn root_eviction_forgets_synapse_page_limits_and_lane_pauses() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let ctx = crate::context::AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config::default(),
+        );
+        ctx.set_canonical_cache_root(root.clone());
+        let model = "fake-embeddings";
+        shrink_page_rows(&root, model, 64);
+        share_lane_pause(
+            &root,
+            &LanePause {
+                lane_id: "test".into(),
+                fingerprint: None,
+                retry_after_ms: None,
+                paused_until_ms: u64::MAX,
+                reason: "test pause".into(),
+                cause: PauseCause::Transient,
+                safe_to_retry_same_request: false,
+                record_id: 0,
+            },
+        );
+        assert_eq!(page_row_limit(&root, model, 64), 32);
+        assert!(lane_pause_for_root(&root).is_some());
+
+        assert!(ctx.try_evict_idle_artifacts());
+        assert_eq!(page_row_limit(&root, model, 64), 64);
+        assert!(lane_pause_for_root(&root).is_none());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn audit10_47_transport_label_does_not_turn_missing_route_into_timeout() {
         let directory = tempfile::tempdir().unwrap();

@@ -8786,17 +8786,12 @@ impl AppContext {
         }
     }
 
-    /// [`Self::evict_idle_artifacts`] for the subc frame loop: the eviction
-    /// gate and the resident-handle write locks are all try-locked, and
-    /// nothing is evicted unless every one of them was free. Returns false
-    /// when eviction is unsafe or a lock was contended; the reaper retries on
-    /// its next sweep.
+    /// Try to evict without blocking the frame loop. The next sweep retries failures.
     pub(crate) fn try_evict_idle_artifacts(&self) -> bool {
         self.try_evict_idle_artifacts_for_root(None, false)
     }
 
-    /// A standing checkout's views can age out too. The caller must exclude
-    /// in-flight actor work before releasing its resident registrations.
+    /// Release only the views of a still-registered checkout, after all in-flight work has finished.
     pub(crate) fn try_release_idle_checkout_views(&self) -> bool {
         self.try_evict_idle_artifacts_for_root(None, true)
     }
@@ -8840,9 +8835,7 @@ impl AppContext {
         let Some(mut refresh_worker) = self.semantic_refresh_worker.try_lock() else {
             return false;
         };
-        // The data layer's checkout keeps its published state on disk; what it
-        // holds in memory (decoded call-graph slices, the update engine, the
-        // text overlay's index) is rebuilt from that state at its next use.
+        // The checkout rebuilds its in-memory state from disk on the next use.
         let Some(mut data_checkout) = self.data_checkout.try_lock() else {
             return false;
         };
@@ -8850,6 +8843,14 @@ impl AppContext {
             return false;
         };
         if !self.search_exact_memo.try_clear_idle() {
+            return false;
+        }
+        if !allow_standing
+            && !self.canonical_cache_root.try_lock().is_some_and(|root| {
+                root.as_deref()
+                    .is_none_or(crate::semantic_index::try_retire_root_embedding_state)
+            })
+        {
             return false;
         }
         semantic_index.take();
@@ -8873,8 +8874,7 @@ impl AppContext {
             data_checkout,
             data_external,
         ));
-        // Native session destruction can wait for ORT. Keep it, and worker
-        // channel teardown, off the daemon's frame loop.
+        // Native session and worker teardown may block; keep both off the frame loop.
         let _ = std::thread::Builder::new()
             .name("aft-embedding-release".into())
             .spawn(move || drop(released));
