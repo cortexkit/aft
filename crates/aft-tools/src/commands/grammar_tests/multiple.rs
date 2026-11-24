@@ -108,7 +108,7 @@ fn check_registries(dir: &Path) {
     assert_eq!(luau.status_snapshot().unwrap().retry_after_ms, Some(10_000));
     assert_eq!((fake.request_count(), luau.request_count()), (2, 1));
 
-    let gap = super::super::grammar::GapReply::capture();
+    let gap = crate::data_layer::grammar::GapReply::capture();
     let stored = r#"{"code":"grammar_unavailable","state":"not_downloaded"}"#;
     assert_eq!(
         gap.value(stored, &fake_file).unwrap()["state"],

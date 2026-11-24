@@ -284,8 +284,13 @@ pub mod surfaces {
         surfaces::serve_text_index_for_test(ctx);
     }
 
-    pub fn disclose_parse_gaps(view: &CheckoutView, roots: &[PathBuf], response: &mut Response) {
-        surfaces::disclose_parse_gaps(view, roots, response, |_| true);
+    pub fn disclose_parse_gaps(
+        view: &CheckoutView,
+        roots: &[PathBuf],
+        response: &mut Response,
+        include: impl Fn(&std::path::Path) -> bool,
+    ) {
+        surfaces::disclose_parse_gaps(view, roots, response, include);
     }
 
     pub fn shared_memory_estimate(ctx: &AppContext) -> Option<crate::memory::MemoryEstimate> {
