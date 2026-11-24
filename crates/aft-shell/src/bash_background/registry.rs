@@ -20034,7 +20034,10 @@ mod tests {
             "target did not survive daemon loss"
         );
         let restarted = BgTaskRegistry::default();
-        restarted.replay_session(storage.path(), "session").unwrap();
+        test_support::without_named_task_scope(|| {
+            restarted.replay_session(storage.path(), "session")
+        })
+        .unwrap();
         assert_eq!(read_task(&paths.json).unwrap().status, BgTaskStatus::Killed);
         assert!(
             super::super::process::live_process_group_members(pgid)
@@ -25769,7 +25772,10 @@ mod tests {
         assert_eq!(fs::metadata(&paths.exit).unwrap().len(), 0);
 
         let restarted = BgTaskRegistry::new(Arc::new(Mutex::new(None)));
-        restarted.replay_session(storage.path(), session).unwrap();
+        test_support::without_named_task_scope(|| {
+            restarted.replay_session(storage.path(), session)
+        })
+        .unwrap();
 
         let persisted = read_task(&paths.json).unwrap();
         assert_eq!(persisted.status, BgTaskStatus::Killed);

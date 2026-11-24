@@ -2518,6 +2518,7 @@ pub fn find_call_sites(function: &str) -> Vec<CallSite> {
         "../aft-index/src",
         "../aft-inspect/src",
         "../aft-parse/src",
+        "../aft-shell/src",
         "../aft-subc/src",
         "../aft-tools/src",
     ]
@@ -2658,6 +2659,7 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         let file = registry_file_key(
             path.strip_prefix(&tools_dir)
                 .or_else(|_| path.strip_prefix(&engine_dir))
+                .or_else(|_| path.strip_prefix(&shell_dir))
                 .or_else(|_| path.strip_prefix(&index_dir))
                 .or_else(|_| path.strip_prefix(&edit_dir))
                 .or_else(|_| path.strip_prefix(&subc_dir))

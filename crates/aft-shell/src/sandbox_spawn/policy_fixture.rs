@@ -80,7 +80,10 @@ impl PinnedConfig for SandboxFixture {
 impl SandboxHost for SandboxFixture {
     fn access_policy(&self, _: &str) -> Result<AccessPolicy, Response> {
         let config = self.config();
-        let home = crate::production_storage::account_home().unwrap();
+        let home = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap_or_default();
         Ok(AccessPolicy::from_config(
             &config,
             &self.storage_dir(),

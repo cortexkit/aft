@@ -2,6 +2,25 @@ use super::*;
 use crate::bash_background::persistence::{task_paths, write_task};
 use std::io::Write;
 
+#[cfg(all(test, unix))]
+pub(super) fn without_named_task_scope<T>(run: impl FnOnce() -> T) -> T {
+    // These replay fixtures start plain process groups. Resolve the absence
+    // of a named scope independently of the test host's cgroup mounts.
+    #[cfg(target_os = "linux")]
+    {
+        let mount = tempfile::tempdir().unwrap();
+        let current = mount.path().join("system.slice/replay-fixture.service");
+        std::fs::create_dir_all(&current).unwrap();
+        crate::bash_background::task_scope::with_local_recovery_mount_for_test(
+            current,
+            mount.path().to_path_buf(),
+            run,
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    run()
+}
+
 #[path = "memory_test_fixture.rs"]
 pub mod memory;
 
