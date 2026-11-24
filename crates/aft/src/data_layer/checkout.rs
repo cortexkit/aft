@@ -59,6 +59,8 @@ pub(crate) use refresh::RefreshCounts;
 pub(crate) mod resume;
 pub(crate) mod staged_records;
 mod status_view;
+mod stored_records;
+use stored_records::StoredRecords;
 mod text_build;
 use text_build::TextBuild;
 #[cfg(test)]
@@ -729,17 +731,14 @@ impl Change {
     }
 }
 
-/// What the call graph reads from one changed path, extracted the first
-/// time a call-graph refresh (or a publication of the changes) needs it
-/// rather than when the change is recorded: recording an edit only reads
-/// the file and indexes its text, so an edit tool's call returns without
-/// parsing the file, and a burst of edits to one file is parsed once, by
-/// the refresh that follows it.
+/// What the call graph reads from one changed path, prepared during refresh.
+/// Recording an edit only reads the file and indexes its text, so a burst
+/// of edits to one file is handled once, by the refresh that follows it.
 struct ChangeContent {
     /// The bytes the recording read, with what they are parsed as, until
     /// they are extracted; `None` once extracted, or when there is nothing
     /// to extract.
-    source: Mutex<Option<RecordedSource>>,
+    source: Mutex<Option<Arc<RecordedSource>>>,
     extracted: std::sync::OnceLock<Extracted>,
 }
 
@@ -772,29 +771,40 @@ impl ChangeContent {
             return Self::nothing();
         }
         Arc::new(Self {
-            source: Mutex::new(Some(RecordedSource {
+            source: Mutex::new(Some(Arc::new(RecordedSource {
                 path: record.path.clone(),
                 language: record.language.clone(),
                 content: record.content,
                 bytes,
-            })),
+            }))),
             extracted: std::sync::OnceLock::new(),
         })
     }
 
-    /// What the call graph reads from the file, extracting it now if no
-    /// one has yet; the bytes are let go once extracted. An extraction that
-    /// panics leaves them, so the next refresh extracts them again.
-    fn get(&self) -> &Extracted {
+    /// Loads or extracts the record once. Clone the source handle so no
+    /// source lock is held during I/O, but keep the bytes until success so
+    /// a refresh can retry an extraction that panicked.
+    fn extract(&self, stored: &StoredRecords) {
         self.extracted.get_or_init(|| {
-            let mut source = self
+            let source = self
                 .source
                 .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let extracted = source.as_ref().map_or(Extracted::Nothing, extract_recorded);
-            *source = None;
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let extracted = source.as_deref().map_or(Extracted::Nothing, |source| {
+                extract_recorded(source, stored)
+            });
+            *self
+                .source
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             extracted
-        })
+        });
+    }
+
+    /// Updates extract their changes before handing them to later stages.
+    fn get(&self) -> &Extracted {
+        self.peek().expect("the refresh extracted this change")
     }
 
     /// What the call graph reads from the file, if it was extracted.
@@ -2102,27 +2112,6 @@ impl Checkout {
             retired_checkouts: delta.as_ref().map_or(0, |delta| delta.retired_checkouts),
             ..BuildReport::default()
         }))
-    }
-
-    /// The content records the family's newest generation stores, for a
-    /// build's scan to read instead of parsing those files again. A
-    /// segment this build cannot use is left out: its files are parsed.
-    fn stored_records(&self) -> Result<StoredRecords, DataError> {
-        let snapshot = self.family.snapshot().map_err(DataError::store)?;
-        let known = known_sections();
-        let mut segments = Vec::new();
-        for entry in snapshot.manifest().segments() {
-            match snapshot.open_shared_segment(entry.id, &known, &self.layer.cache) {
-                Ok(segment) => segments.push(segment),
-                Err(error) if error.is_unusable_file() => {}
-                Err(error) => return Err(DataError::store(error)),
-            }
-        }
-        Ok(StoredRecords {
-            _snapshot: Some(snapshot),
-            segments,
-            pending: self.ready_change_records(),
-        })
     }
 
     /// A cold scan can reuse content already extracted by an aborted update.
@@ -4772,38 +4761,6 @@ struct BuildSink {
     reused: std::sync::atomic::AtomicUsize,
     /// Records found among those an earlier attempt of the build staged.
     resumed: std::sync::atomic::AtomicUsize,
-}
-
-/// The content records the family stores, which a build reads instead of
-/// parsing a file again: a record's key names its content, language and
-/// extractor version, so the stored one is what extraction would give.
-#[derive(Default)]
-struct StoredRecords {
-    /// Held so the segments' files stay on disk while the build reads them.
-    _snapshot: Option<Snapshot>,
-    /// Newest last.
-    segments: Vec<Arc<Segment>>,
-    /// Encoded parses computed by pending changes, keyed exactly as a stored
-    /// content record. They need not be published just to avoid parsing twice.
-    pending: HashMap<String, Arc<EncodedRecord>>,
-}
-
-impl StoredRecords {
-    /// The stored record with `key`, from the newest segment holding it. A
-    /// segment that fails to read counts as not holding it, so the file is
-    /// parsed instead.
-    fn record(&self, key: RecordKey) -> Option<ContentRecord> {
-        if let Some(record) = self.pending.get(&key.digest().to_string()) {
-            if let Ok(record) = record.decode() {
-                return Some(record);
-            }
-        }
-        self.segments.iter().rev().find_map(|segment| {
-            let content = ContentSegment::open(segment).ok().flatten()?;
-            let ordinal = content.find(key).ok().flatten()?;
-            content.record(ordinal).ok()
-        })
-    }
 }
 
 /// One record a scan staged: its key, where it lies, and what reading the
