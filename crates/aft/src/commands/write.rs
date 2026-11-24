@@ -268,7 +268,7 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
         );
     }
     if let Some(original) = original {
-        edit::attach_edit_diff(&mut result, &req.params, file, original, final_content);
+        edit::render_edit_diff(&mut result, &req.params, file, original, final_content);
     }
     Response::success(&req.id, result)
 }
@@ -276,6 +276,48 @@ pub fn handle_write(req: &RawRequest, ctx: &AppContext) -> Response {
 #[cfg(test)]
 mod audit_regressions {
     use super::*;
+
+    #[test]
+    fn write_reports_one_validated_path_and_no_rolled_back_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("example.ts");
+        std::fs::write(&path, "const value = 0;\n").unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(root.clone()),
+                storage_dir: Some(root.join("state")),
+                format_on_edit: false,
+                ..Default::default()
+            },
+        );
+        let reports = |content: &str| {
+            let req = serde_json::from_value(serde_json::json!({
+                "id": "display", "command": "write", "file": "example.ts", "content": content,
+            }))
+            .unwrap();
+            edit::REPORTED_FILES.with(|capture| *capture.borrow_mut() = Some(Vec::new()));
+            let reply = handle_write(&req, &ctx);
+            let files = edit::REPORTED_FILES.with(|capture| capture.borrow_mut().take().unwrap());
+            assert!(reply.success, "{reply:?}");
+            assert!(reply.data["metadata"]["diff"].is_string(), "{reply:?}");
+            files
+        };
+        let successful = reports("const value = 1;\n");
+        let rolled_back = reports("const value = {;\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "const value = 1;\n"
+        );
+        assert_eq!(
+            (successful, rolled_back),
+            (
+                vec![(path.to_string_lossy().into_owned(), "modified")],
+                vec![]
+            )
+        );
+    }
 
     #[test]
     fn backup_cancelled_rollback_restores_prior_success() {

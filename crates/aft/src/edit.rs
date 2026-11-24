@@ -8,6 +8,11 @@
 pub(crate) type FileReporter =
     fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str, Option<(&str, Option<&str>)>);
 static FILE_REPORTER: std::sync::OnceLock<FileReporter> = std::sync::OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    pub(crate) static REPORTED_FILES: std::cell::RefCell<Option<Vec<(String, &'static str)>>> =
+        const { std::cell::RefCell::new(None) };
+}
 pub(crate) fn register_file_reporter(reporter: FileReporter) {
     let _ = FILE_REPORTER.set(reporter);
 }
@@ -33,6 +38,12 @@ pub(crate) fn report_file_with_input_paths(
     change: &'static str,
     input_paths: Option<(&str, Option<&str>)>,
 ) {
+    #[cfg(test)]
+    REPORTED_FILES.with(|capture| {
+        if let Some(files) = capture.borrow_mut().as_mut() {
+            files.push((file.to_string(), change));
+        }
+    });
     if let Some(reporter) = FILE_REPORTER.get() {
         reporter(file, old_path, before, after, change, input_paths);
     }
@@ -1504,7 +1515,6 @@ pub fn no_change_response(id: &str) -> crate::protocol::Response {
 
 /// Supply the unified patch consumed by host diff views, independently of diff counts.
 pub fn attach_mutation_diff(result: &mut serde_json::Value, file: &str, before: &str, after: &str) {
-    crate::edit::report_file(file, None, Some(before), Some(after), "modified");
     let mut budget = DiffBudget::new(1);
     result["metadata"] = serde_json::json!({ "diff": budget.render(file, before, after) });
     budget.finish(result);
@@ -1846,6 +1856,16 @@ pub(crate) fn attach_edit_diff(
     after: &str,
 ) {
     crate::edit::report_file(file, None, Some(before), Some(after), "modified");
+    render_edit_diff(result, params, file, before, after);
+}
+
+pub(crate) fn render_edit_diff(
+    result: &mut serde_json::Value,
+    params: &serde_json::Value,
+    file: &str,
+    before: &str,
+    after: &str,
+) {
     if wants_diff(params) {
         let mut budget = DiffBudget::new(1);
         let (patch, info) = response_diff(params, file, before, after, &mut budget);
