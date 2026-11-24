@@ -152,11 +152,33 @@ fn apply_with_write_policy(
 
 const MAX_SESSION_READ_TASKS: usize = 500;
 
+#[cfg(test)]
+thread_local! {
+    static SESSION_READ_BUFFER_PEAK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tracks, in tests, the most task candidates held at once while scanning.
+fn record_session_read_buffer(_buffered: usize) {
+    #[cfg(test)]
+    SESSION_READ_BUFFER_PEAK.with(|peak| peak.set(peak.get().max(_buffered)));
+}
+
+#[cfg(test)]
+fn reset_session_read_buffer_peak() {
+    SESSION_READ_BUFFER_PEAK.with(|peak| peak.set(0));
+}
+
+#[cfg(test)]
+fn session_read_buffer_peak() -> usize {
+    SESSION_READ_BUFFER_PEAK.with(std::cell::Cell::get)
+}
+
 fn session_task_read_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
     use aft::bash_background::persistence::{
         readable_task_file_names, validate_task_id, TaskLayout,
     };
-    let mut tasks = std::collections::BTreeMap::new();
+    let mut tasks = std::collections::HashMap::<String, (std::time::SystemTime, TaskLayout)>::new();
+    let mut ranked = std::collections::BTreeSet::<(std::cmp::Reverse<std::time::SystemTime>, String)>::new();
     for entry in std::fs::read_dir(root)
         .map_err(|error| format!("cannot enumerate session task reads: {error}"))?
     {
@@ -181,20 +203,37 @@ fn session_task_read_paths(root: &Path) -> Result<Vec<PathBuf>, String> {
             continue;
         };
         let modified = metadata.modified().unwrap_or(std::time::UNIX_EPOCH);
-        tasks
-            .entry(task.to_string())
-            .and_modify(|value: &mut (std::time::SystemTime, TaskLayout)| {
-                if modified > value.0 {
-                    *value = (modified, layout);
-                }
-            })
-            .or_insert((modified, layout));
+        // Keep only the best ids seen so far. An id's entries can arrive in any
+        // order, so a held id moves to its newest entry; an evicted id can
+        // return only with a newer entry that again ranks within the budget.
+        if let Some(held) = tasks.get_mut(task) {
+            if modified > held.0 {
+                ranked.remove(&(std::cmp::Reverse(held.0), task.to_string()));
+                ranked.insert((std::cmp::Reverse(modified), task.to_string()));
+                *held = (modified, layout);
+            }
+            continue;
+        }
+        let key = (std::cmp::Reverse(modified), task.to_string());
+        if ranked.len() >= MAX_SESSION_READ_TASKS {
+            if !ranked.last().is_some_and(|worst| key < *worst) {
+                continue;
+            }
+            if let Some((_, evicted)) = ranked.pop_last() {
+                tasks.remove(&evicted);
+            }
+        }
+        ranked.insert(key);
+        tasks.insert(task.to_string(), (modified, layout));
+        record_session_read_buffer(tasks.len());
     }
-    let mut tasks = tasks.into_iter().collect::<Vec<_>>();
-    tasks.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then_with(|| a.0.cmp(&b.0)));
-    // Old tasks beyond this snapshot stay unreadable; never substitute a parent
-    // directory grant when a session has more saved commands than the budget.
-    tasks.truncate(MAX_SESSION_READ_TASKS);
+    // Newest first, ties by id. Old tasks beyond this snapshot stay unreadable;
+    // never substitute a parent directory grant when a session has more saved
+    // commands than the budget.
+    let tasks = ranked
+        .into_iter()
+        .filter_map(|(_, task)| tasks.remove(&task).map(|value| (task, value)))
+        .collect::<Vec<_>>();
     let mut paths = Vec::new();
     for (task, (_, layout)) in tasks {
         for name in readable_task_file_names(layout) {
@@ -754,6 +793,66 @@ mod session_read_tests {
         assert_eq!(
             session_task_read_paths(&session).unwrap().len(),
             MAX_SESSION_READ_TASKS - 1
+        );
+    }
+
+    /// Mixed directory and flat layouts above the budget: the selection keeps
+    /// the newest task ids (ties broken by id), takes each id's layout from its
+    /// newest entry, and never buffers more than the budget while scanning.
+    #[test]
+    fn session_task_read_selection_is_bounded_while_scanning() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = temp.path().canonicalize().unwrap();
+        let id = |index: usize| format!("bash-{index:016x}");
+        let time = |index: usize| filetime::FileTime::from_unix_time(1_000 + (index / 2) as i64, 0);
+        let old = filetime::FileTime::from_unix_time(10, 0);
+        let total = MAX_SESSION_READ_TASKS + 101;
+        let mut session = PathBuf::new();
+        for index in 0..total {
+            let task = create_task_layout(&storage, "session", &id(index)).unwrap();
+            session = task.paths.session_dir.clone();
+            match index % 3 {
+                // Directory layout only.
+                0 => {
+                    std::fs::write(&task.paths.stdout, "output").unwrap();
+                    filetime::set_file_mtime(&task.paths.dir, time(index)).unwrap();
+                }
+                // Flat layout: a newer readable file and an older stray one.
+                1 => {
+                    std::fs::remove_dir_all(&task.paths.dir).unwrap();
+                    let stdout = session.join(format!("{}.stdout", id(index)));
+                    std::fs::write(&stdout, "output").unwrap();
+                    filetime::set_file_mtime(&stdout, time(index)).unwrap();
+                    let stray = session.join(format!("{}.old", id(index)));
+                    std::fs::write(&stray, "old").unwrap();
+                    filetime::set_file_mtime(&stray, old).unwrap();
+                }
+                // Both layouts; the newer flat file decides the layout.
+                _ => {
+                    std::fs::write(&task.paths.stdout, "output").unwrap();
+                    filetime::set_file_mtime(&task.paths.dir, old).unwrap();
+                    let stdout = session.join(format!("{}.stdout", id(index)));
+                    std::fs::write(&stdout, "output").unwrap();
+                    filetime::set_file_mtime(&stdout, time(index)).unwrap();
+                }
+            }
+        }
+        // Ids 101 and 100 share the boundary timestamp; the lower id wins.
+        let mut expected = (102..total).chain([100]).collect::<Vec<_>>();
+        expected.sort_by(|a, b| time(*b).cmp(&time(*a)).then_with(|| id(*a).cmp(&id(*b))));
+        let expected = expected
+            .into_iter()
+            .map(|index| match index % 3 {
+                0 => session.join(id(index)).join("io/stdout"),
+                _ => session.join(format!("{}.stdout", id(index))),
+            })
+            .collect::<Vec<_>>();
+        reset_session_read_buffer_peak();
+        assert_eq!(session_task_read_paths(&session).unwrap(), expected);
+        assert!(
+            session_read_buffer_peak() <= MAX_SESSION_READ_TASKS,
+            "buffered {} task candidates",
+            session_read_buffer_peak()
         );
     }
 }
