@@ -1,4 +1,5 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
+import * as fs from "node:fs";
 import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -174,6 +175,30 @@ describe("listPiSessionsFromDir", () => {
         "valid 0",
       ]);
     } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("reads only the transcript head when its metadata is complete", () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-pi-sessions-head-"));
+    const fullReadSpy = spyOn(fs, "readFileSync");
+    const headReadSpy = spyOn(fs, "readSync");
+    try {
+      const id = "019e6307-0749-4000-9000-300000000000";
+      writeFileSync(
+        join(root, `${id}.jsonl`),
+        `${[
+          JSON.stringify({ type: "session", id }),
+          JSON.stringify({ type: "message", message: { role: "user", content: "head title" } }),
+        ].join("\n")}\n${"irrelevant tail\n".repeat(20_000)}`,
+      );
+
+      expect(listPiSessionsFromDir(root).map((session) => session.title)).toEqual(["head title"]);
+      expect(fullReadSpy).not.toHaveBeenCalled();
+      expect(headReadSpy).toHaveBeenCalled();
+    } finally {
+      fullReadSpy.mockRestore();
+      headReadSpy.mockRestore();
       rmSync(root, { recursive: true, force: true });
     }
   });

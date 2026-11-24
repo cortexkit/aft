@@ -1,4 +1,13 @@
-import { type Dirent, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  type Dirent,
+  closeSync,
+  existsSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
@@ -27,6 +36,7 @@ interface SqliteDatabase {
 }
 
 const MAX_RECENT_SESSIONS = 5;
+const PI_SESSION_HEAD_BYTES = 64 * 1024;
 
 export function listRecentSessions(adapter: HarnessAdapter): RecentSession[] {
   try {
@@ -123,10 +133,14 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
     const sessions: RecentSession[] = [];
     for (const file of files) {
       try {
-        const parsed = parsePiSessionJsonl(
-          readFileSync(file.filePath, "utf8"),
-          basename(file.filePath),
-        );
+        const filename = basename(file.filePath);
+        const head = parsePiSessionJsonl(readPiSessionHead(file.filePath), filename);
+        // Preserve late titles in older logs, but avoid the full read when the
+        // head already contains both the session id and a real user title.
+        const parsed =
+          head && head.title !== head.id
+            ? head
+            : parsePiSessionJsonl(readFileSync(file.filePath, "utf8"), filename);
         if (!parsed) continue;
         sessions.push({ ...parsed, lastActivity: file.mtimeMs });
         if (sessions.length >= MAX_RECENT_SESSIONS) break;
@@ -137,6 +151,17 @@ export function listPiSessionsFromDir(sessionsDir: string): RecentSession[] {
     return sessions;
   } catch {
     return [];
+  }
+}
+
+function readPiSessionHead(filePath: string): string {
+  const descriptor = openSync(filePath, "r");
+  try {
+    const buffer = Buffer.allocUnsafe(PI_SESSION_HEAD_BYTES);
+    const bytesRead = readSync(descriptor, buffer, 0, buffer.length, 0);
+    return buffer.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    closeSync(descriptor);
   }
 }
 
