@@ -46,6 +46,8 @@ The `data` payload is:
       "planes": {"search": 0, "semantic": 0, "symbols": 0, "callgraph": 0, "callgraph_projection": 0, "inspect": 0, "pending_install": 0, "exact_memo": 0, "compression_filters": 0, "bash": 0, "lsp": 0, "parser_pool": 0},
       "exact_memo": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "entries": 0, "candidates": 0, "file_digests": 0, "descriptors": 0, "lifecycle_keys": 0, "literal_presence_entries": 0, "payload_budget_bytes": 8388608, "not_estimated": ["in_flight_verifiers_and_detached_readers"]},
       "compression_filters": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "filters": 0, "command_keywords": 0, "not_estimated": ["compiled_regex_automata"]},
+      "lsp": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "event_channel_items": 0, "event_channel_bytes": 0},
+      "inspect": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "oxc_fact_entries": 0, "oxc_fact_payload_bytes": 0},
       "semantic_worker_bytes": 0,
       "semantic_overlay_bytes": 0,
       "attributed_bytes": 0,
@@ -59,6 +61,7 @@ The `data` payload is:
     "allocator_slack_bytes": 0,
     "allocator_slack_label": "address-space slack: allocator-mapped bytes minus in-use bytes; includes free pages already returned to the OS, so it is not resident memory",
     "sqlite_bytes": 0,
+    "reusable_parser_pools": {"status": "ready", "bytes_status": "partial", "estimated_bytes": 0, "threads_with_parsers": 0, "parsers": 0},
     "shared_semantic_base_bytes": 0,
     "semantic_arena_bytes": 0,
     "semantic_resident_chunks": 0,
@@ -68,8 +71,9 @@ The `data` payload is:
     "total_attributed_bytes": 0,
     "unattributed_bytes": 0,
     "last_relief_at_ms": null,
+    "last_relief_source": null,
     "last_relief_allocator_accounting_bytes": 0,
-    "last_relief_allocator_accounting_source": "glibc_mallinfo2_size_allocated_drop",
+    "last_relief_allocator_accounting_source": "jemalloc_stats_resident_drop",
     "last_relief_rss_drop_bytes": null,
     "last_relief_phys_footprint_drop_bytes": null
   }
@@ -114,6 +118,35 @@ The regex library does not expose engine allocation sizes, so compiled engines
 remain an explicit estimation gap, not a guessed per-pattern byte count.
 The root's `attributed_bytes` includes both cache estimates, plus the bash and
 LSP estimates now also exposed in each root row's `planes` JSON object.
+
+Each root's `lsp` object itemizes the in-process estimate already included in
+`planes.lsp`. `manager_bytes` counts the manager, client and startup records;
+`document_store_bytes` covers metadata in all of its per-server document stores;
+`diagnostic_store_bytes` covers its shared store of reports from **all** servers.
+`pending_event_bytes` counts pending diagnostic observations, startup deliveries,
+events deferred during startup, and queued watched changes. `event_channel_items`
+and `event_channel_bytes` report the separate reader-to-manager event queue at
+sample time without consuming it. `push_pull_bytes` counts the per-file Rust
+push/pull caches, their diagnostic vector elements, and markers for reports
+whose source content is unproven. These estimates omit nested event and push/pull
+payloads (such as strings and JSON), client I/O and pending requests, other
+manager maps, and container overhead. Child server resident set size (RSS) is
+separate in `lsp_children`: it is not part of AFT's own footprint.
+
+The root's `inspect.oxc_fact_payload_bytes` counts the OXC facts retained in
+Inspect's cache, and is already included in `planes.inspect`. It estimates
+the fact records, top-level strings and paths, and occupied slots in their
+collections. Nested strings and collections, spare capacity, and cache indexes
+are not included. The census reads a running subtotal, not the fact records
+or source files. SQLite bytes are attributed separately, at process level.
+
+`process.reusable_parser_pools` counts worker threads with retained parsers and
+their language-specific parser entries. Its `estimated_bytes` includes the Rust
+pool objects and occupied map slots, once for the process, not once per root.
+This is a partial lower estimate: tree-sitter's native parser allocations, hash
+table spare capacity, empty pools, other parser instances and retained syntax
+trees are not measured. `planes.parser_pool` refers to root-owned parsers and
+does not include these shared pools.
 
 With views enabled, a root serves semantic search from its checkout view.
 `semantic_overlay_bytes` is that view's own overlay (replacement entries not
@@ -162,7 +195,23 @@ holds:
 The block cache every checkout reads through is shared, so it is counted once,
 in `process.data_layer_block_cache_bytes` (with `data_layer_block_cache`:
 `resident_bytes` of block data within `budget_bytes`, block and hit counts);
-its figure is the cached blocks plus the cache's lookup tables.
+its figure includes cached blocks and lookup tables, decoded call-graph slices,
+and the shared symbol-table registry. The symbol-table fields distinguish:
+
+- `symbol_table_keep_set_budget_bytes`: the 64 MiB payload budget for the
+  strong references kept for later use. `symbol_table_budget_bytes` is an alias.
+- `symbol_table_keep_set_payload_bytes`: estimated payload inside that set.
+  `symbol_table_kept_bytes` is an alias.
+- `symbol_table_live_outside_keep_set_payload_bytes`: estimated payload of
+  tables held only by root symbol caches or in-flight readers. This payload
+  is outside the keep-set budget; demoting a table does not free its readers.
+- `symbol_table_registry_bookkeeping_bytes`: estimated weak-slot map and
+  strong-reference keep-set bookkeeping. Weak slots may outlive their payload.
+
+`symbol_table_bytes` is the two payload figures plus bookkeeping, excluding
+the budget. It is already included in the process block-cache estimate, not an
+additional number to add. If the symbol-table lock is busy, the cache estimate
+is partial and omits the symbol-table counters.
 
 Every data-layer figure is measured, not estimated from counts: the census
 walks the live structures and adds up what each part owns on the heap, from
@@ -193,26 +242,32 @@ as `retained_slack_bytes` in status and as `allocator_slack_bytes` (tagged
 without a footprint (Linux) RSS minus attributed bytes minus allocator slack;
 because slack includes pages already returned, that RSS fallback can read low.
 
-The `last_relief_*` fields describe the latest periodic allocator relief pass.
-There is no single "freed" number because the two sides disagree:
+The `last_relief_*` fields separate the relief request, allocator accounting and
+observed process memory. On macOS, `last_relief_at_ms` is the monotonic timestamp
+of the latest completed request, in milliseconds since allocator telemetry began;
+`last_relief_source` identifies `cold_build_stage`, `build_pool_job`, or
+`all_roots_idle` (or `memory_comparison` / `explicit` in probes). Both are null
+until a request has been recorded. On Linux, `last_relief_source` is `periodic`
+once a pass has been scheduled; the timestamp can refer to a pass still running.
 
 - `last_relief_allocator_accounting_bytes` is what the allocator's own
   accounting says; `last_relief_allocator_accounting_source` names it. On Linux
-  (`glibc_mallinfo2_size_allocated_drop`) it is the drop in
-  `mallinfo2().arena + hblkhd`, which misses the pages `malloc_trim` returns
-  with madvise and so often reads near zero. On macOS
+  (`jemalloc_stats_resident_drop`) it is the drop in jemalloc `stats.resident`,
+  not kernel RSS. On macOS
   (`malloc_zone_pressure_relief_return`) it is the byte count
   `malloc_zone_pressure_relief` returns.
 - `last_relief_rss_drop_bytes` is the observed RSS drop across the pass
-  (floored at zero; null before the first pass). On Linux this is the figure
-  that shows what the trim actually returned.
+  (floored at zero), or null when there are no before/after readings.
 - `last_relief_phys_footprint_drop_bytes` is the observed footprint drop
   (macOS only). macOS relief lowers the footprint right away but can leave the
   pages in RSS until the kernel reclaims them, so there it is the better
-  observable.
+  observable when measured. Cold-build and build-pool requests take no
+  allocator statistics or before/after memory readings: both drop fields are
+  null even if libmalloc reported returning bytes.
 
-The periodic relief pass triggers on at least 1 GiB of slack, at most once
-every five minutes. Because slack does not fall when pages are returned by
+There is no periodic relief pass on macOS. On Linux the periodic pass triggers
+on at least 1 GiB of allocator address-space slack, at most once every five
+minutes. Because slack does not fall when pages are returned by
 madvise, a daemon that once crossed the line keeps running a pass every five
 minutes; that cadence is bounded and each pass returns what was freed since the
 last one, so the trigger was left as is.
