@@ -162,6 +162,8 @@ jobs:
               tools-to-subc-two-hop.json) path="aft-tools -> helper -> aft-subc" ;;
               tools-to-facade.json) path="aft-tools -> agent-file-tools" ;;
               subc-to-facade.json) path="aft-subc -> agent-file-tools" ;;
+              edit-to-engine-dev.json) path="aft-edit -> aft-engine" ;;
+              edit-to-inspect-dev.json) path="aft-edit -> aft-inspect" ;;
               *) echo "::error::Dependency direction fixture $fixture has no expected path"; exit 1 ;;
             esac
             pair="${path%% -> *} -> ${path##* -> }"
