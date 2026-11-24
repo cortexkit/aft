@@ -1647,7 +1647,8 @@ impl DataCheckout {
         feature = "test-hooks",
         not(all(target_os = "windows", target_arch = "aarch64"))
     ))]
-    pub(crate) fn grammar_driver_running_for_test(&self) -> bool {
+    #[doc(hidden)]
+    pub fn grammar_driver_running_for_test(&self) -> bool {
         self.work.grammar_driving.load(Ordering::Acquire)
     }
 

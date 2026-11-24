@@ -149,7 +149,8 @@ pub(super) fn extract(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod extraction_probe {
+#[doc(hidden)]
+pub mod extraction_probe {
     #[derive(Clone, Copy, PartialEq)]
     pub enum TestExtraction {
         Failure,
@@ -186,7 +187,8 @@ pub(super) fn extraction_for_test(source: &[u8]) -> Option<TestExtraction> {
     feature = "test-hooks",
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
-pub(crate) fn override_extraction_for_test(source: &[u8], outcome: TestExtraction) -> impl Drop {
+#[doc(hidden)]
+pub fn override_extraction_for_test(source: &[u8], outcome: TestExtraction) -> impl Drop {
     struct Guard(aft_store::ids::ContentKey);
     impl Drop for Guard {
         fn drop(&mut self) {

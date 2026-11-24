@@ -70,7 +70,8 @@ pub mod symbol_prewarm_measure;
     feature = "test-hooks",
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
-pub(crate) mod test_gates;
+#[doc(hidden)]
+pub mod test_gates;
 #[doc(hidden)]
 pub mod todo_counts;
 pub mod trace_measure;

@@ -16,12 +16,22 @@ use std::collections::{BTreeMap, HashMap};
 use tree_sitter::Node;
 
 #[cfg(all(
+    any(test, feature = "test-support"),
+    feature = "wasm-grammars",
+    feature = "test-hooks",
+    not(all(target_os = "windows", target_arch = "aarch64"))
+))]
+#[doc(hidden)]
+pub mod test_fixture;
+
+#[cfg(all(
     test,
     feature = "wasm-grammars",
     feature = "test-hooks",
     not(all(target_os = "windows", target_arch = "aarch64"))
 ))]
 pub(crate) mod tests {
+    pub(crate) use super::test_fixture::{ready, tree, FIXTURE};
     use super::*;
     use crate::parser::LangId;
 

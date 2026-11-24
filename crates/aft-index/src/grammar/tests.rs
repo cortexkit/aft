@@ -7,7 +7,9 @@ use super::test_seams::*;
 use super::*;
 use crate::grammar::PRODUCTION_MANIFEST;
 
-const WASM: &[u8] = include_bytes!("../../tests/fixtures/grammars/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm");
+const WASM: &[u8] = include_bytes!(
+    "../luau/fixtures/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm"
+);
 
 #[test]
 fn luau_s4_same_storage_root_preserves_retry_budget() {

@@ -575,18 +575,25 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `SiteResolution::protected_count_for_test` | test-support accessor | `aft-index` | Inspect tests still count the exact protected targets. |
 | `SiteResolution::shares_resolution_for_test` | test-support accessor | `aft-index` | Verify the sites share the same allocation without exposing it. |
 | `SiteResolution::line_for_test` | test-support accessor | `aft-index` | Use the stored site’s line in the mixed-source test. |
-| `DiskMeasurement::expire_for_test` | test-support visibility widened | `aft-index` | Expire the actual checkout disk measurement in the composed status test. |
+| `DiskMeasurement::expire_for_test` | test-support visibility widened | `aft-index` | Expire cached checkout disk usage before measuring status polling. |
 | `PackFingerprint::backend` | test-support visibility widened | `aft-index` | Read the fixture’s backend fingerprint component. |
 | `RequestFiles::keep_read` | visibility widened | `aft-index` | Keep the request-file lease test on the real retention code. |
-| `DataCheckout::request_refresh` | visibility widened | `aft-index` | Exercise real checkout refresh admission through the established test bridge. |
-| `DataCheckout::configure_meaning` | visibility widened | `aft-index` | Apply the actual embedding configuration in the composed test. |
-| `DataCheckout::meaning_status` | visibility widened | `aft-index` | Read the actual meaning plane status through the existing test bridge. |
+| `DataCheckout::request_refresh` | visibility widened | `aft-index` | Let `DataCheckoutTestExt` schedule work on the actual index checkout. |
+| `DataCheckout::configure_meaning` | visibility widened | `aft-index` | Apply the embedding configuration on the actual checkout under test. |
+| `DataCheckout::meaning_status` | visibility widened | `aft-index` | Let `DataCheckoutTestExt` read the index’s embedding status. |
 | `Checkout::retry_grammar_gaps` | visibility widened | `aft-index` | Exercise real grammar lag recovery through the test bridge. |
 | `Checkout::has_unpublished_luau_changes` | visibility widened | `aft-index` | Test the existing pending Luau update state. |
 | `Checkout::publish_text_first` | visibility widened | `aft-index` | Test the existing independent text publication. |
 | `VectorPlane::cached_snapshot` | visibility widened | `aft-index` | Test reuse of the real cached embedding snapshot. |
 | `SearchIndex::search_grep_profiled_with_filters` | visibility widened | `aft-index` | Keep the existing profiling test on the real grep path. |
 | `SearchIndex::search_grep_profiled_with_filters_and_query_in_order` | visibility widened | `aft-index` | Preserve ordered grep’s existing phase observations. |
+
+| `luau` | visibility widened | `aft-index` | Let the composed inspect test use the index-owned Luau fixture. |
+| `luau::test_fixture::{FIXTURE, ready, tree}` | test-support fixture | `aft-index` | Compile the same Luau source and pinned grammar bytes for both test binaries. |
+| `data_layer::test_gates` | test-hook visibility widened | `aft-index` | Preserve deterministic grammar retry and publication controls in the engine bridge. |
+| `data_layer::grammar::extraction_probe` | test-hook visibility widened | `aft-index` | Keep typed extraction outcomes available in existing conformance cases. |
+| `data_layer::grammar::override_extraction_for_test` | test-hook visibility widened | `aft-index` | Trigger exactly the existing extraction fault for those cases. |
+| `DataCheckout::grammar_driver_running_for_test` | test-hook visibility widened | `aft-index` | Check the original grammar driver lifecycle from the facade tests. |
 
 ## Visibility widened for cross-crate callers
 

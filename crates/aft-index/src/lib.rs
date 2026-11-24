@@ -23,7 +23,8 @@ pub mod grep_executor;
 #[doc(hidden)]
 pub mod large_read;
 pub mod local_embed;
-mod luau;
+#[doc(hidden)]
+pub mod luau;
 pub mod memory_census;
 pub mod ort_pin;
 pub mod search_b2;

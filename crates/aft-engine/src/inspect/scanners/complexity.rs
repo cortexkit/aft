@@ -354,8 +354,8 @@ fn language_spec(language: LangId) -> Option<LanguageSpec> {
 ))]
 #[test]
 fn luau_s3_complexity_spec_scores_the_fixture() {
-    let source = crate::luau::tests::FIXTURE;
-    let tree = crate::luau::tests::tree(source);
+    let source = aft_index::luau::test_fixture::FIXTURE;
+    let tree = aft_index::luau::test_fixture::tree(source);
     let functions = collect_functions(
         tree.root_node(),
         source,
