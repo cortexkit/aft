@@ -750,7 +750,12 @@ class WindowsUnitWorkflowTests(unittest.TestCase):
         for command in commands:
             self.assertEqual(cargo_test_execution_lines(command), [], command)
         audit = next(step for step in archive["steps"] if step.get("name") == "Audit native engine compiler inputs (Windows)")
-        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
+        lines = audit["run"].splitlines()
+        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(lines[-4:-2])))
+        self.assertEqual(lines[-2:], [
+            "python crates/aft-engine/checks/github-fixture-copies.py",
+            "python crates/aft-engine/checks/shell-fixture-copies.py",
+        ])
         self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
         python = next(i for i, step in enumerate(archive["steps"]) if step.get("uses") == "actions/setup-python@v6")
         tls = next(i for i, step in enumerate(archive["steps"]) if "--probe tls" in step.get("run", ""))
@@ -969,7 +974,12 @@ class MacOSUnitWorkflowTests(unittest.TestCase):
             self.assertIn('--config "$LIBTEST_CARGO_CONFIG"', command)
         audit = next(step for step in job["steps"] if step.get("name") == "Audit native compiler inputs (macOS)")
         self.assertIn(audit["run"], build_steps)
-        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(audit["run"].splitlines()[-2:])))
+        lines = audit["run"].splitlines()
+        self.assertIsNotNone(ENGINE_SOURCE_AUDIT.fullmatch("\n".join(lines[-4:-2])))
+        self.assertEqual(lines[-2:], [
+            "python3 crates/aft-engine/checks/github-fixture-copies.py",
+            "python3 crates/aft-engine/checks/shell-fixture-copies.py",
+        ])
         self.assertEqual(audit["env"]["CARGO_TARGET_DIR"], "${{ env.AFT_CI_TARGET_DIR }}")
         archive = next(command for command in build_steps if "nextest archive" in command)
         self.assertIn("--timings", archive)

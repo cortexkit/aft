@@ -91,6 +91,7 @@ jobs:
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/github-fixture-copies.py
+          python3 crates/aft-engine/checks/shell-fixture-copies.py
       - name: Audit packaged library test inputs
         run: |
           cargo check --locked -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-github -p aft-index -p aft-inspect -p aft-shell -p aft-tools -p aft-subc --lib \
@@ -961,6 +962,7 @@ jobs:
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json --config "$LIBTEST_CARGO_CONFIG" > "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/source-inputs.py "$RUNNER_TEMP/aft-engine-build.jsonl"
           python3 crates/aft-engine/checks/github-fixture-copies.py
+          python3 crates/aft-engine/checks/shell-fixture-copies.py
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
@@ -1742,6 +1744,7 @@ jobs:
           cargo test --locked --workspace --no-run --features wasm-grammars,test-hooks --message-format=json > "$env:RUNNER_TEMP/aft-engine-build.jsonl"
           python crates/aft-engine/checks/source-inputs.py "$env:RUNNER_TEMP/aft-engine-build.jsonl"
           python crates/aft-engine/checks/github-fixture-copies.py
+          python crates/aft-engine/checks/shell-fixture-copies.py
         env:
           CARGO_TARGET_DIR: ${{ env.AFT_CI_TARGET_DIR }}
 
