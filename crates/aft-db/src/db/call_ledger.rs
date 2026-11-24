@@ -760,7 +760,7 @@ pub(crate) fn scope_end_committed() {
 /// principal's JSON form, the ledger by its short id (`direct`,
 /// `reserved:<module>`, `unverified`). `None` when the owner is not a
 /// principal, in which case the ledger holds no rows for it.
-pub(crate) fn ledger_scope(key: &super::access_grants::ScopeKey) -> Option<ScopeIdentity> {
+pub fn ledger_scope(key: &super::access_grants::ScopeKey) -> Option<ScopeIdentity> {
     let owner = match serde_json::from_str(&key.owner).ok()? {
         subc_protocol::Principal::Direct => "direct".to_string(),
         subc_protocol::Principal::Reserved { module_id } => format!("reserved:{module_id}"),

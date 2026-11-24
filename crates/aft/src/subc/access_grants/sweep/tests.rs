@@ -422,3 +422,43 @@ async fn saved_grant_sweep_permissions_list_size_1650() {
     }
     println!("permissions_list_size rows=1650 legacy_reply_bytes={} sourced_before_sweep_bytes={} remaining_rows=50 after_sweep_bytes={}", serde_json::to_vec(&legacy).unwrap().len(), serde_json::to_vec(&before).unwrap().len(), serde_json::to_vec(&after).unwrap().len());
 }
+
+/// The sweep finds a scope's ledger rows through `call_ledger::ledger_scope`,
+/// while the live scope-end handler and admission use `subc::principal_id`. If
+/// the two owner spellings drift apart, the sweep settles nothing for that
+/// scope without any error, so pin them to each other.
+#[test]
+fn sweep_ledger_owner_matches_the_live_principal_id() {
+    use subc_protocol::Principal;
+    let principals = [
+        Principal::Direct,
+        Principal::Unverified,
+        Principal::Reserved {
+            module_id: "prefrontal".into(),
+        },
+        Principal::Reserved {
+            module_id: "prefrontal-core".into(),
+        },
+        Principal::Reserved {
+            module_id: "basal".into(),
+        },
+    ];
+    for principal in principals {
+        let key = store::ScopeKey {
+            owner: store::owner_key(&principal),
+            scope_ref: "scope".into(),
+            epoch: 9,
+        };
+        let ledger = crate::db::call_ledger::ledger_scope(&key)
+            .unwrap_or_else(|| panic!("no ledger scope for {principal:?}"));
+        assert_eq!(
+            Some(ledger.owner),
+            crate::subc::principal_id(&Some(principal.clone())),
+            "{principal:?}"
+        );
+        assert_eq!(
+            (ledger.scope_ref.as_str(), ledger.scope_epoch),
+            ("scope", 9)
+        );
+    }
+}
