@@ -304,7 +304,7 @@ fn canonical_slog_target(target: &str) -> std::borrow::Cow<'_, str> {
         Some(("aft_db", module))
             if matches!(
                 module.split("::").next(),
-                Some("persisted_format" | "reader_floor" | "root_identity")
+                Some("persisted_format" | "reader_floor" | "root_cache" | "root_identity")
             ) =>
         {
             format!("aft_engine::{module}").into()
@@ -3563,6 +3563,7 @@ pub mod tests {
         for (new, old) in [
             ("aft_edit::edit::apply", "aft_engine::edit::apply"),
             ("aft_index::search_index", "aft_engine::search_index"),
+            ("aft_db::root_cache", "aft_engine::root_cache"),
             ("aft_inspect::lsp::transport", "aft_engine::lsp::transport"),
             ("aft_github::github_read", "aft_engine::github_read"),
             ("aft_shell::bash_background", "aft_engine::bash_background"),

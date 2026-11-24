@@ -1421,7 +1421,7 @@ impl SemanticIndexLock {
     ) -> std::io::Result<Self> {
         let dir = storage_dir.join("semantic").join(project_key);
         let path = dir.join("cache.lock");
-        let access = crate::root_cache::ArtifactAccess::for_root(project_root);
+        let access = aft_db::root_cache::ArtifactAccess::for_root(project_root);
         if !access.allows_write(project_key, &path) {
             return Ok(Self { _guard: None });
         }
@@ -8308,7 +8308,7 @@ impl SemanticIndex {
     pub fn write_to_disk(&self, storage_dir: &Path, project_key: &str) -> bool {
         let dir = storage_dir.join("semantic").join(project_key);
         let data_path = dir.join("semantic.bin");
-        let access = crate::root_cache::ArtifactAccess::for_root(&self.project_root);
+        let access = aft_db::root_cache::ArtifactAccess::for_root(&self.project_root);
         if !access.allows_write(project_key, &data_path) {
             return false;
         }
@@ -8895,7 +8895,7 @@ impl SemanticIndex {
         expected_fingerprint: Option<&str>,
     ) -> Option<Self> {
         debug_assert!(current_canonical_root.is_absolute());
-        crate::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
+        aft_db::root_cache::check_cache_access(&storage_dir.join("semantic")).ok()?;
         crate::private_storage::tighten_open_dir(
             storage_dir,
             &storage_dir.join("semantic").join(project_key),
@@ -12494,7 +12494,7 @@ Connection: close
         write_rust_file(&source, "borrow_only_symbol");
         let project_key = "shared-artifact-key".to_string();
         let storage = tempfile::tempdir().expect("storage");
-        crate::root_cache::configure_artifact_access(project.path(), &project_key, true);
+        aft_db::root_cache::configure_artifact_access(project.path(), &project_key, true);
 
         let _lock = SemanticIndexLock::acquire(storage.path(), &project_key, project.path())
             .expect("borrow-only lock downgrade");
@@ -14346,7 +14346,7 @@ public class Greeter {
         let index = SemanticIndex::new(project.path().to_path_buf(), 384);
         assert_eq!(index.status_label(&SemanticIndexStatus::ready()), "ready");
         let mut mass_refresh = SemanticIndexStatus::ready();
-        for ordinal in 0..crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES {
+        for ordinal in 0..aft_base::semantic_status::SEMANTIC_MASS_REFRESH_MIN_FILES {
             mass_refresh.add_refreshing_file(project.path().join(format!("file_{ordinal}.rs")));
         }
         assert_eq!(index.status_label(&mass_refresh), "refreshing");
@@ -14378,7 +14378,7 @@ public class Greeter {
     fn status_label_reports_refreshing_only_for_a_mass_refresh() {
         let project = tempfile::tempdir().expect("tempdir");
         let index = SemanticIndex::new(project.path().to_path_buf(), 3);
-        let threshold = crate::context::SEMANTIC_MASS_REFRESH_MIN_FILES;
+        let threshold = aft_base::semantic_status::SEMANTIC_MASS_REFRESH_MIN_FILES;
         let paths = (0..threshold)
             .map(|ordinal| project.path().join(format!("file_{ordinal}.rs")))
             .collect::<Vec<_>>();

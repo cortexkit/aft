@@ -786,7 +786,7 @@ fn download_via_hf_hub(cache_dir: &std::path::Path) -> Result<(PathBuf, PathBuf)
     // hf-hub creates missing folders with a recursive mkdir. Re-prove the
     // cache root right before the hand-off so a vanished cache volume refuses
     // the download instead of letting it land on the main disk.
-    crate::root_cache::prepare_third_party_cache_dir(cache_dir)?;
+    aft_db::root_cache::prepare_third_party_cache_dir(cache_dir)?;
     slog_info!(
         "downloading all-MiniLM-L6-v2 ({}) to {}",
         MINILM_REPO,
@@ -830,7 +830,7 @@ mod tests {
             cache_dir: Some(volume.clone()),
             ..Default::default()
         };
-        let warning = crate::root_cache::prepare_cache_root_for_test(&mut config);
+        let warning = aft_db::root_cache::prepare_cache_root_for_test(&mut config);
         assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
         let models = config.semantic.local_cache_dir.clone().unwrap();
         // Windows cannot remove a folder its open cache lease still holds.
@@ -841,7 +841,7 @@ mod tests {
         let error = super::resolve_model_files(Some(&models)).unwrap_err();
 
         assert!(
-            error.starts_with(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            error.starts_with(aft_db::root_cache::CACHE_DIR_UNAVAILABLE),
             "{error}"
         );
         assert_eq!(
@@ -872,7 +872,7 @@ mod tests {
             cache_dir: Some(cache.clone()),
             ..Default::default()
         };
-        let warning = crate::root_cache::prepare_cache_root(&mut config);
+        let warning = aft_db::root_cache::prepare_cache_root(&mut config);
         assert!(warning.is_none(), "cache root not enrolled: {warning:?}");
         let models = config.semantic.local_cache_dir.clone().unwrap();
         drop(config);
@@ -882,7 +882,7 @@ mod tests {
         let error = super::resolve_model_files(Some(&models)).unwrap_err();
 
         assert!(
-            error.starts_with(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            error.starts_with(aft_db::root_cache::CACHE_DIR_UNAVAILABLE),
             "{error}"
         );
         assert_eq!(std::fs::read_dir(&cache).unwrap().count(), 0);
@@ -991,7 +991,7 @@ mod tests {
             cache_dir: Some(volume.clone()),
             ..Default::default()
         };
-        assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+        assert!(aft_db::root_cache::prepare_cache_root_for_test(&mut config).is_none());
         let models = config.semantic.local_cache_dir.clone().unwrap();
         let snapshot = models.join("models--Qdrant--all-MiniLM-L6-v2-onnx/snapshots/fixture");
         std::fs::create_dir_all(&snapshot).unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
 
         let error = build_model.embed(corpus.clone()).unwrap_err();
         assert!(
-            error.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE),
+            error.contains(aft_db::root_cache::CACHE_DIR_UNAVAILABLE),
             "{error}"
         );
         assert_eq!(

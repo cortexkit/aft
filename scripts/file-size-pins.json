@@ -31,7 +31,7 @@
     "lines": 10764,
     "reason": "Split semantic search command responsibilities pending; AFT crate split lane."
   },
-  "crates/aft-engine/src/semantic_index.rs": {
+  "crates/aft-index/src/semantic_index.rs": {
     "lines": 10554,
     "reason": "Split semantic indexing by area pending; AFT crate split lane."
   },
@@ -59,7 +59,7 @@
     "lines": 7107,
     "reason": "Split backup storage and recovery pending; AFT crate split lane."
   },
-  "crates/aft-engine/src/data_layer/checkout.rs": {
+  "crates/aft-index/src/data_layer/checkout.rs": {
     "lines": 6397,
     "reason": "Split checkout lifecycle and storage pending; AFT crate split lane."
   },

@@ -463,7 +463,7 @@ pub fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe>
     let [root] = scope.roots.as_slice() else {
         return None;
     };
-    if crate::context::confinement::active() || root.ignored_target {
+    if aft_db::read_fence::active() || root.ignored_target {
         return None;
     }
     let deadline = crate::bounded_io::deadline_before_io_timeout(
@@ -500,7 +500,7 @@ pub fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe>
     static WORKER: std::sync::OnceLock<Option<IgnoreProbeWorker>> = std::sync::OnceLock::new();
     let worker = WORKER.get_or_init(IgnoreProbeWorker::new).as_ref()?;
     let scope = scope.clone();
-    let fence = crate::context::confinement::capture().without_floor_disclosure();
+    let fence = aft_db::read_fence::capture().without_floor_disclosure();
     let alloc_label = crate::alloc_trace::carry();
     let cancellation = crate::executor::current_job_cancellation();
     // Do not retain the request's mutable failure/skip collectors in work that
@@ -512,7 +512,7 @@ pub fn start_scope_ignored_probe(scope: &GrepScope) -> Option<IgnoredScopeProbe>
     worker.start(deadline, move |cancelled| {
         let _alloc_label = alloc_label.enter();
         let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
-        crate::context::confinement::inherit(fence, || {
+        aft_db::read_fence::inherit(fence, || {
             crate::bounded_io::with_budget(Some(budget), || {
                 scope_ignored_entries_cancellable(&scope, cancelled)
             })
@@ -1814,7 +1814,7 @@ fn scope_ignored_entries_cancellable(
         return None;
     };
     if cancelled.load(Ordering::Acquire)
-        || crate::context::confinement::active()
+        || aft_db::read_fence::active()
         || root.ignored_target
     {
         return None;
@@ -4095,7 +4095,7 @@ mod tests {
             per_root_max: 10,
         };
         assert_eq!(scope_ignored_entries(&scope).unwrap().names, [".agents/"]);
-        crate::context::confinement::with_root(&ctx, "ignore-disclosure", || {
+        aft_db::read_fence::with_root(&ctx, "ignore-disclosure", || {
             TARGET_WALK_BUILDERS.with(|count| count.set(0));
             assert!(scope_ignored_entries(&scope).is_none());
             TARGET_WALK_BUILDERS.with(|count| assert_eq!(count.get(), 0));

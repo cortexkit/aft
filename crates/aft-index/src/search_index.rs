@@ -1695,7 +1695,7 @@ impl SearchIndexSnapshot {
         let deadline = make_deadline();
         let io_budget = crate::bounded_io::capture();
         let alloc_label = crate::alloc_trace::carry();
-        let floor_disclosure = crate::context::confinement::capture();
+        let floor_disclosure = aft_db::read_fence::capture();
         let verification_claims = AtomicUsize::new(0);
         let claim_verification = || {
             let Some(max_files) = max_files else {
@@ -2478,7 +2478,7 @@ impl SearchMatcher {
 
 fn search_candidate_file(
     file: &FileEntry,
-    floor_disclosure: &crate::context::confinement::Fence,
+    floor_disclosure: &aft_db::read_fence::Fence,
     matcher: &SearchMatcher,
     max_results: usize,
     stop_after: usize,
@@ -3606,7 +3606,7 @@ fn project_walk_builder_pruned(
     // The named root itself is always admitted (depth 0), so an explicitly
     // targeted walk inside a worktree still reads it.
     let worktrees = crate::project_content::NestedWorktreeBoundary::for_root(search_root);
-    crate::context::apply_project_ignore_rules(
+    aft_base::project_walk::apply_project_ignore_rules(
         &mut builder,
         search_root,
         if crate::data_layer::read_fence::active() {
@@ -4516,7 +4516,7 @@ fn collect_ignore_rule_files(
     builder.same_file_system(true).hidden(false);
     // Same rules as the project walk, so rule files inside ignored trees
     // (which cannot change what is indexed) are not discovered.
-    crate::context::apply_project_ignore_rules(
+    aft_base::project_walk::apply_project_ignore_rules(
         &mut builder,
         root,
         if crate::data_layer::read_fence::active() {
@@ -4575,7 +4575,7 @@ pub(crate) fn count_ignore_rule_discovery_dirs(root: &Path) -> usize {
     let mut dirs = 0usize;
     let mut builder = WalkBuilder::new(root);
     builder.same_file_system(true).hidden(false);
-    crate::context::apply_project_ignore_rules(
+    aft_base::project_walk::apply_project_ignore_rules(
         &mut builder,
         root,
         if crate::data_layer::read_fence::active() {

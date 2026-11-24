@@ -847,7 +847,7 @@ fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback()
         cache_dir: Some(cache.clone()),
         ..Default::default()
     };
-    assert!(crate::root_cache::prepare_cache_root_for_test(&mut config).is_none());
+    assert!(aft_db::root_cache::prepare_cache_root_for_test(&mut config).is_none());
     let names = || {
         let mut names = std::fs::read_dir(&durable)
             .unwrap()
@@ -859,7 +859,7 @@ fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback()
     let before = names();
     let registry = GrammarRegistry::with_test_options(TestOptions {
         manifest: PRODUCTION_MANIFEST.clone(),
-        storage_root: crate::root_cache::cache_root(&config),
+        storage_root: aft_db::root_cache::cache_root(&config),
         clock: Arc::new(FakeClock::default()),
         transport: Script::new([success()]),
         queries: vec!["(chunk) @root".into()],
@@ -871,7 +871,7 @@ fn grammar_configured_cache_uses_flat_artifact_domain_without_durable_fallback()
     assert!(stored_path(&cache.join("aft"), &PRODUCTION_MANIFEST).is_file());
     assert!(!durable.join("grammars").exists());
     assert_eq!(names(), before);
-    assert!(crate::root_cache::CACHE_DOMAINS.contains(&"grammars"));
+    assert!(aft_db::root_cache::CACHE_DOMAINS.contains(&"grammars"));
 }
 
 #[test]

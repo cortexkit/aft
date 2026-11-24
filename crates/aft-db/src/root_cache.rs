@@ -27,20 +27,23 @@ use std::sync::{Arc, Mutex, OnceLock, TryLockError, Weak};
 use std::time::{Duration, Instant};
 
 use crate::fs_lock;
-pub use aft_db::artifact_publish_epoch::ArtifactPublishEpoch;
+pub use crate::artifact_publish_epoch::ArtifactPublishEpoch;
 
 #[cfg(test)]
 #[path = "root_cache_paths_tests.rs"]
 mod cache_paths_tests;
-#[cfg(test)]
-pub(crate) use crate::reader_floor::prepare_cache_root_for_test;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use crate::reader_floor::prepare_cache_root_for_test;
 
 use crate::cache_location as location;
 pub use crate::cache_location::CACHE_DOMAINS;
 pub use crate::process_identity::process_start_time_ms;
-pub(crate) use location::canonical_root;
-#[cfg(test)]
-pub(crate) use location::markers::sweep_all_read_markers;
+#[doc(hidden)]
+pub use location::canonical_root;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use location::markers::sweep_all_read_markers;
 pub use location::markers::{
     ReadMarker, ReadMarkerMetadata, ReadMarkerSweep, READ_MARKER_CROSS_HOST_STALE_MS,
     READ_MARKER_TOUCH_INTERVAL_MS,
@@ -60,7 +63,8 @@ pub use location::{
     unavailable_warning,
 };
 use location::{canonical_process_lease_dir, existing_ancestor};
-pub(crate) use location::{
+#[doc(hidden)]
+pub use location::{
     check_cache_access, identity_storage_root, prepare_third_party_cache_dir,
 };
 
@@ -89,7 +93,7 @@ pub struct WriterLease {
     guard: Mutex<fs_lock::LockGuard>,
 }
 
-impl aft_db::standing_publication_lease::StandingPublicationLease for WriterLease {
+impl crate::standing_publication_lease::StandingPublicationLease for WriterLease {
     fn verify(&self) -> io::Result<bool> {
         WriterLease::verify(self)
     }
@@ -436,7 +440,8 @@ impl WriterLease {
     }
 
     /// Keep preparation and both contention waits within the same retry budget.
-    pub(crate) fn acquire_shared_until(
+    #[doc(hidden)]
+    pub fn acquire_shared_until(
         domain: RootCacheDomain,
         cache_dir: &Path,
         key: &str,

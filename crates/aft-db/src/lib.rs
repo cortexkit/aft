@@ -52,15 +52,25 @@ pub mod access_policy;
 pub mod artifact_publish_epoch;
 #[doc(hidden)]
 pub mod build_breaker;
+#[doc(hidden)]
+pub mod cache_location;
 pub mod db;
+#[doc(hidden)]
+pub mod fs_lock;
 #[doc(hidden)]
 pub mod path_filters;
 #[doc(hidden)]
+pub mod path_identity;
+#[doc(hidden)]
 pub mod persisted_format;
+#[doc(hidden)]
+pub mod production_storage;
 #[doc(hidden)]
 pub mod read_fence;
 #[doc(hidden)]
 pub mod reader_floor;
+#[doc(hidden)]
+pub mod root_cache;
 #[doc(hidden)]
 pub mod root_identity;
 pub mod sandbox_profile;

@@ -251,7 +251,7 @@ impl OnnxReranker {
     fn for_model(
         model: &'static AllowedModel,
         cache_dir: Option<PathBuf>,
-        lease: Option<std::sync::Weak<crate::root_cache::CacheLease>>,
+        lease: Option<std::sync::Weak<aft_db::root_cache::CacheLease>>,
     ) -> Self {
         Self::with_loader(
             fingerprint_for(model),
@@ -462,7 +462,7 @@ pub fn shared_onnx_reranker(model: Option<&str>) -> Result<Arc<OnnxReranker>, St
 pub fn shared_onnx_reranker_in(
     model: Option<&str>,
     cache_dir: Option<PathBuf>,
-    lease: Option<std::sync::Weak<crate::root_cache::CacheLease>>,
+    lease: Option<std::sync::Weak<aft_db::root_cache::CacheLease>>,
 ) -> Result<Arc<OnnxReranker>, String> {
     static DEFAULT_BACKENDS: OnceLock<Mutex<HashMap<&'static str, Arc<OnnxReranker>>>> =
         OnceLock::new();
@@ -561,7 +561,7 @@ pub fn provision_model_files_in(
     // folders with a recursive mkdir, so re-prove the root right before the
     // hand-off; a vanished cache volume refuses instead of downloading onto
     // the main disk.
-    crate::root_cache::prepare_third_party_cache_dir(cache_dir)?;
+    aft_db::root_cache::prepare_third_party_cache_dir(cache_dir)?;
     crate::slog_info!(
         "downloading rerank model {} ({}@{}) to {}",
         model.name,

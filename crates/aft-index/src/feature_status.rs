@@ -205,7 +205,7 @@ pub fn observed_index_status(
         };
     }
     if let Some(reason) = ctx.cache_unavailable_reason() {
-        return IndexObservation::unavailable(crate::root_cache::cache_status_code(&reason));
+        return IndexObservation::unavailable(aft_db::root_cache::cache_status_code(&reason));
     }
     // Configure forces every index off for a HOME root (degraded mode). That
     // is not the user's resolved choice, so report it as unavailable with its
@@ -352,13 +352,13 @@ fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
 /// Classify a failed semantic build into a named cause.
 pub fn semantic_failure_cause(ctx: &dyn IndexHost, message: &str) -> &'static str {
     if let Some(reason) = ctx.cache_unavailable_reason() {
-        return crate::root_cache::cache_status_code(&reason);
+        return aft_db::root_cache::cache_status_code(&reason);
     }
-    if message.contains(crate::root_cache::CACHE_DIR_BUSY) {
-        return crate::root_cache::CACHE_DIR_BUSY;
+    if message.contains(aft_db::root_cache::CACHE_DIR_BUSY) {
+        return aft_db::root_cache::CACHE_DIR_BUSY;
     }
-    if message.contains(crate::root_cache::CACHE_DIR_UNAVAILABLE) {
-        return crate::root_cache::CACHE_DIR_UNAVAILABLE;
+    if message.contains(aft_db::root_cache::CACHE_DIR_UNAVAILABLE) {
+        return aft_db::root_cache::CACHE_DIR_UNAVAILABLE;
     }
     if crate::semantic_admission::is_not_opened_status(message) {
         return cause::SEMANTIC_NOT_OPENED;

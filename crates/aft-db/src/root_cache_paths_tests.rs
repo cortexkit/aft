@@ -2,11 +2,26 @@ use super::prepare_cache_root_for_test as prepare_cache_root;
 use super::*;
 use crate::config::Config;
 
+fn cache_fixture() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let temp = tempfile::tempdir().unwrap();
+    let storage = temp.path().join("aft");
+    let cache = temp.path().join("cache");
+    fs::create_dir(&cache).unwrap();
+    let mut config = Config {
+        storage_dir: Some(storage.clone()),
+        cache_dir: Some(cache),
+        ..Config::default()
+    };
+    assert!(prepare_cache_root(&mut config).is_none());
+    let cache = cache_root(&config);
+    (temp, storage, cache)
+}
+
 #[cfg(unix)]
 #[test]
 fn cache_file_creation_keeps_the_open_parent_after_ancestor_retarget() {
     use std::io::Write;
-    let (temp, storage, cache, _project, _ctx) = fixture(true);
+    let (temp, storage, cache) = cache_fixture();
     let directory = cache.join("views/scope");
     crate::private_storage::create_dir_all(&directory).unwrap();
     let parent = crate::root_cache::pin_cache_path(&directory.join("payload"))
@@ -165,7 +180,7 @@ fn cache_root_unavailable_preserves_requested_location_without_fallback() {
 
 #[test]
 fn cache_root_reader_floor_refusals_cover_external_artifacts() {
-    let (_temp, storage, cache, _project, _ctx) = fixture(true);
+    let (_temp, storage, cache) = cache_fixture();
     use crate::persisted_format::{self, PersistedStore, UnsupportedPersistedFormat};
     let refusal = UnsupportedPersistedFormat::floor(
         PersistedStore::SearchIndex,

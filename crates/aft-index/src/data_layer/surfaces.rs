@@ -503,7 +503,7 @@ pub(crate) fn disclose_parse_gaps(
     if !cfg!(feature = "wasm-grammars") || view.current_state().skipped_parses().is_empty() {
         return;
     }
-    let fence = crate::context::confinement::capture();
+    let fence = aft_db::read_fence::capture();
     let mut gaps = Vec::new();
     let mut lines = Vec::new();
     let mut count = 0;
