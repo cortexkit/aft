@@ -610,6 +610,8 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `watcher_backend::readiness` | visibility widened | `aft-index` | Let inspect supply the existing native store-readiness watcher. |
 | `NativeReadinessWatcherFactory` | visibility widened | `aft-index` | Feed native events to the lower call graph’s readiness capability. |
 
+| `WatcherCountersSnapshot::fsevents_stream_creations_total` | visibility widened | `aft-index` | Let the macOS configuration test count streams on the real watcher. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

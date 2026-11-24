@@ -55,7 +55,8 @@ pub struct WatcherCountersSnapshot {
     pub exclusion_planning: Option<WatcherExclusionPlanningSnapshot>,
     /// Successful native stream allocations over this root's process lifetime,
     /// including its auxiliary paths and config-file fallback watch.
-    pub(crate) fsevents_stream_creations_total: u64,
+    #[doc(hidden)]
+    pub fsevents_stream_creations_total: u64,
     #[doc(hidden)]
     pub raw_events_total: u64,
     #[doc(hidden)]
