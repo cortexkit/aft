@@ -5867,8 +5867,8 @@ impl Checkout {
                 // A recorded parse gap has no TODO record. The grammar driver
                 // retries transient gaps; a TODO query must not wait for a
                 // publication that cannot contain this file's markers yet.
-                if view.current_state().skipped_parses().contains_key(path) {
-                    return Ok(PathTodos::Unextracted);
+                if let Some(reason) = view.current_state().skipped_parses().get(path) {
+                    return Ok(grammar::todo_parse_gap(reason));
                 }
                 let published = !view.published.state.skipped_parses().contains_key(path)
                     && view.published.state.get(path).is_some_and(|published| {
@@ -5906,9 +5906,8 @@ impl Checkout {
                         note_source_work(&self.root, |work| work.todo_decodes += 1);
                         PathTodos::Recorded(stored.todos().map_err(DataError::store)?)
                     }
-                    Extracted::GrammarGap(_) | Extracted::Nothing | Extracted::ConversionFailed => {
-                        PathTodos::Unextracted
-                    }
+                    Extracted::GrammarGap(reason) => grammar::todo_parse_gap(reason),
+                    Extracted::Nothing | Extracted::ConversionFailed => PathTodos::Unextracted,
                 })
             })
             .collect()

@@ -417,11 +417,23 @@ fn survey(
         {
             continue;
         }
+        let downloaded = downloaded_language(&record.path);
         let gap = (!view.planes().callgraph)
-            .then(|| downloaded_language(&record.path))
+            .then_some(downloaded)
             .flatten()
             .map(super::grammar::meaning_callgraph_off_reason)
-            .or_else(|| state.skipped_parses().get(&record.path).cloned());
+            .or_else(|| {
+                // Built-in chunking can embed text without a call-graph parse;
+                // downloaded grammars need a valid stored outline instead.
+                state
+                    .skipped_parses()
+                    .get(&record.path)
+                    .filter(|reason| {
+                        downloaded.is_some()
+                            || reason.as_str() != super::grammar::INVALID_UTF8_REASON
+                    })
+                    .cloned()
+            });
         let admitted = gap.is_none() && applicable < max_files;
         if gap.is_none() {
             applicable += 1;

@@ -421,17 +421,32 @@ fn align_callback_counts_as_set(expected: &Value, actual: &mut Value) {
     *found = reference.clone();
 }
 
+fn align_intended_deltas(name: &str, reference: &Value, found: &mut Value) {
+    // Inspect no longer counts the extra line at EOF (3dfbb334a8).
+    const LOC: &str = "/summary/metrics/loc";
+    let (pointer, before, after) = match name {
+        "clean/inspect-dead-code" => (LOC, 10, 7),
+        "invalid-utf8/inspect-dead-code" => (LOC, 14, 10),
+        // Callers no longer scans an empty parse for invalid UTF-8 (fcf16967fe).
+        "invalid-utf8/callers" => ("/scanned_files", 3, 2),
+        _ => return,
+    };
+    assert_eq!(reference.pointer(pointer), Some(&json!(before)), "{name}");
+    let actual = found
+        .pointer_mut(pointer)
+        .expect("expected field to compare");
+    assert_eq!(*actual, json!(after), "{name}");
+    *actual = json!(before);
+}
+
 fn compare_recordings(expected: &str, actual: &str) -> Vec<String> {
     assert_eq!(expected.lines().count(), actual.lines().count());
     expected
         .lines()
         .zip(actual.lines())
         .filter_map(|(expected, actual)| {
-            if expected == actual {
-                return None;
-            }
             if expected.starts_with('#') || actual.starts_with('#') {
-                return Some(format!("header: {expected}"));
+                return (expected != actual).then(|| format!("header: {expected}"));
             }
             let (reference_name, reference_response) = expected.split_once('\t').unwrap();
             let (name, response) = actual.split_once('\t').unwrap();
@@ -439,6 +454,7 @@ fn compare_recordings(expected: &str, actual: &str) -> Vec<String> {
             let reference: Value = serde_json::from_str(reference_response).unwrap();
             let mut found: Value = serde_json::from_str(response).unwrap();
             align_callback_counts_as_set(&reference, &mut found);
+            align_intended_deltas(name, &reference, &mut found);
             (serde_json::to_string(&found).unwrap() != reference_response).then(|| name.to_string())
         })
         .collect()

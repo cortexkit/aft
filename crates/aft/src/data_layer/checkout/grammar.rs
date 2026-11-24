@@ -11,6 +11,16 @@ fn gap_language(path: &[u8], reason: &str) -> Option<&'static str> {
         .then_some(language)
 }
 
+pub(super) fn todo_parse_gap(reason: &str) -> PathTodos {
+    if reason == crate::data_layer::grammar::INVALID_UTF8_REASON {
+        // The TODO count never reads non-UTF-8 input. A call-graph gap does
+        // not make its TODO count incomplete.
+        PathTodos::Unrecorded
+    } else {
+        PathTodos::Unextracted
+    }
+}
+
 impl Checkout {
     /// Re-read unavailable grammar members even when stat and content are
     /// unchanged. A ready event is not a filesystem edit.
