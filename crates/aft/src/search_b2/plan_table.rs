@@ -454,20 +454,15 @@ impl PlanTable {
 /// drift from the other.
 pub const PINNED_PLAN_TABLE_JSON: &str = include_str!("../../assets/search-plan-table.pinned.json");
 
-/// Load and verify the pinned plan table at startup against the running table.
-pub fn verify_pinned_plan_table_at_startup() -> Result<(), PlanTableError> {
-    let running = PlanTable::running_table();
-    let pinned = PlanTable::from_json(PINNED_PLAN_TABLE_JSON)?;
-    running.verify_against(&pinned)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn running_table_matches_pinned_json() {
-        verify_pinned_plan_table_at_startup()
+        let pinned = PlanTable::from_json(PINNED_PLAN_TABLE_JSON).expect("parse pinned plan table");
+        PlanTable::running_table()
+            .verify_against(&pinned)
             .expect("pinned plan-table.json must match running table");
     }
 

@@ -35,8 +35,7 @@ pub use evidence_descriptor::{
 };
 pub use generation_token::GenerationToken;
 pub use plan_table::{
-    verify_pinned_plan_table_at_startup, LanePlanEntry, PlanTable, PlanTableError, SearchLaneKind,
-    SearchShape, PINNED_PLAN_TABLE_JSON,
+    LanePlanEntry, PlanTable, PlanTableError, SearchLaneKind, SearchShape, PINNED_PLAN_TABLE_JSON,
 };
 
 /// Immutable request input passed to a registered lane callback.
@@ -1514,7 +1513,7 @@ fn handle_split_search<'a>(
     let lexical_ready = if external.is_some() {
         true
     } else {
-        search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
+        search_index_ready(ctx)
     };
     let patterns = match external {
         Some(corpus) => match corpus.collect(compiled, include_tests) {
@@ -2344,7 +2343,7 @@ fn handle_semantic_search_inner(
     let semantic_status_snapshot = sampled.unwrap_or(semantic_status_snapshot);
     let mut warnings = Vec::new();
 
-    let lexical_ready = search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET);
+    let lexical_ready = search_index_ready(ctx);
     // Ordinary roots retain the index-lane refusal policy. Parent children
     // may still be warming their first indexes, so their reader engines use
     // the existing bounded exact/lexical fallback instead.
@@ -8507,14 +8506,6 @@ fn semantic_index_loaded_with_budget(ctx: &AppContext) -> Result<bool, ()> {
     Ok(semantic_index.is_some())
 }
 
-fn search_index_ready_with_budget(ctx: &AppContext, _wait_budget: Duration) -> bool {
-    if crate::commands::data_search::DataText::ready(ctx).is_some() {
-        return true;
-    }
-
-    false
-}
-
 /// Ranks every semantic chunk against `query_vector` with no enumeration
 /// limit, for the recall audit's per-target semantic coverage. It applies the
 /// same test-file filter as the live lane so ranks are comparable with it.
@@ -8613,7 +8604,7 @@ fn data_meaning_search(
 }
 
 fn search_index_ready(ctx: &AppContext) -> bool {
-    search_index_ready_with_budget(ctx, INTERACTIVE_ARTIFACT_READ_BUDGET)
+    crate::commands::data_search::DataText::ready(ctx).is_some()
 }
 
 fn embed_query(query: &str, ctx: &AppContext) -> Result<Vec<f32>, String> {

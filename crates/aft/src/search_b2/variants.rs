@@ -31,28 +31,6 @@ pub fn generate_variants(input: Token<'_>) -> Vec<TokenVariant> {
     variants
 }
 
-/// Returns only admitted variants, preserving their original generation order.
-pub fn contributing_variants(
-    generated: &[TokenVariant],
-    admitted_variants: &[String],
-) -> Vec<String> {
-    let admitted = admitted_variants
-        .iter()
-        .map(String::as_str)
-        .collect::<HashSet<_>>();
-    generated
-        .iter()
-        .filter(|variant| admitted.contains(variant.text.as_str()))
-        .map(|variant| variant.text.clone())
-        .collect()
-}
-
-/// Renders the variants footer only when at least one variant admitted a result.
-pub fn variants_footer(generated: &[TokenVariant], admitted_variants: &[String]) -> Option<String> {
-    let contributing = contributing_variants(generated, admitted_variants);
-    (!contributing.is_empty()).then(|| format!("variants applied: {}", contributing.join(", ")))
-}
-
 fn variants_for_token(token: &str) -> Vec<String> {
     let words = parse_words(token);
     if words.is_empty() {
