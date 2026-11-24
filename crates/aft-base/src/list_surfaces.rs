@@ -1514,9 +1514,15 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
     },
     ExclusionEntry {
         file: "commands/read.rs",
-        enclosing_item: "handle_streaming_range_read",
+        enclosing_item: "handle_streaming_range_read, render_text_read",
         location_or_primitive: "bounded streamed line window",
         reason: "limits bytes retained while reading a selected text line; truncated content and scan gaps are disclosed by the read response, not a cut to a list of files or result records",
+    },
+    ExclusionEntry {
+        file: "commands/read/unranged.rs",
+        enclosing_item: "scan, push",
+        location_or_primitive: "bounded unranged text window",
+        reason: "retains only the text prefix needed to render the output window; the read response discloses content truncation and reports the exact line count",
     },
     ExclusionEntry {
         file: "commands/lsp_diagnostics.rs",

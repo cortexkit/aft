@@ -27,6 +27,8 @@ use crate::github_read::{
 use crate::protocol::{RawRequest, Response};
 use crate::response_finalize::{DispatchOutcome, PendingResponse};
 
+mod unranged;
+
 const DEFAULT_LIMIT: u32 = 2000;
 const MAX_LINE_LENGTH: usize = 2000;
 const MAX_BYTES: usize = 50 * 1024; // 50KB output cap
@@ -35,6 +37,10 @@ const MAX_DIRECTORY_ENTRIES: usize = 1000;
 const MAX_DIRECTORY_SCAN: usize = 10_000;
 const BINARY_SAMPLE_BYTES: usize = 4 * 1024;
 const MEDIA_MAGIC_BYTES: usize = 16;
+#[cfg(test)]
+thread_local! {
+    static UNRANGED_READ_RETENTION: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
 const MAX_INLINE_BASE64_BYTES: usize = 9 * 1024 * 1024 / 2; // 4.5 MiB encoded payload cap
 const MAX_INLINE_IMAGE_DIMENSION: u32 = 1024;
 const MIN_FITTED_IMAGE_DIMENSION: u32 = 256;
@@ -2120,22 +2126,10 @@ fn handle_text_or_binary_read(
         .then(|| crate::hashline::snapshot::read_source(path).ok())
         .flatten()
         .filter(|source| source.has_complete_bytes());
-    let fallback_bytes;
-    let raw_bytes = if let Some(source) = &read_source {
-        source.bytes()
-    } else {
-        fallback_bytes = match crate::bounded_io::read(path, None) {
-            Ok(b) => b,
-            Err(e) => {
-                return Response::error(
-                    &req.id,
-                    "io_error",
-                    format!("read: failed to read file: {}", e),
-                );
-            }
-        };
-        &fallback_bytes
+    let Some(source) = read_source else {
+        return unranged::read(req, path, limit);
     };
+    let raw_bytes = source.bytes();
 
     let byte_size = raw_bytes.len();
 
@@ -2169,39 +2163,36 @@ fn handle_text_or_binary_read(
     };
 
     #[cfg(test)]
-    let skip_render = read_source.is_some() && !LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
+    let skip_render = !LEGACY_HASHLINE_READ.with(|legacy| legacy.get());
     #[cfg(not(test))]
-    let skip_render = read_source.is_some();
+    let skip_render = true;
     let response = render_text_read(
         req,
         content,
+        unranged::count_lines(raw_bytes),
         byte_size,
         start_line,
         explicit_end_line,
         limit,
         skip_render,
     );
-    if let Some(source) = read_source {
-        *captured_source = Some(CapturedRead {
-            path: path.to_path_buf(),
-            source,
-        });
-    }
+    *captured_source = Some(CapturedRead {
+        path: path.to_path_buf(),
+        source,
+    });
     response
 }
 
 fn render_text_read(
     req: &RawRequest,
     content: &str,
+    total_lines: u32,
     byte_size: usize,
     start_line: u32,
     explicit_end_line: Option<u64>,
     limit: u32,
     skip_render: bool,
 ) -> Response {
-    let lines: Vec<&str> = content.lines().collect();
-    let total_lines = lines.len() as u32;
-
     let end_line = explicit_end_line.map(|v| v as u32).unwrap_or_else(|| {
         start_line
             .saturating_add(limit)
@@ -2212,10 +2203,10 @@ fn render_text_read(
     // Clamp to actual line count. `.max(start_idx)` keeps the slice below
     // from panicking; inverted windows were already refused above, so it
     // never turns a real request into an empty one.
-    let start_idx = (start_line.saturating_sub(1) as usize).min(lines.len());
-    let end_idx = (end_line as usize).min(lines.len()).max(start_idx);
+    let start_idx = (start_line.saturating_sub(1) as usize).min(total_lines as usize);
+    let end_idx = (end_line as usize).min(total_lines as usize).max(start_idx);
 
-    if start_idx >= lines.len() {
+    if start_idx >= total_lines as usize {
         return Response::success(
             &req.id,
             serde_json::json!({
@@ -2240,7 +2231,12 @@ fn render_text_read(
 
     let line_num_width = format!("{}", end_idx).len();
 
-    for (i, line) in lines[start_idx..end_idx].iter().enumerate() {
+    for (i, line) in content
+        .lines()
+        .skip(start_idx)
+        .take(end_idx - start_idx)
+        .enumerate()
+    {
         let line_num = start_idx + i + 1; // 1-based
         let (display_text, truncated_line) = if line.len() > MAX_LINE_LENGTH {
             // Find a safe UTF-8 boundary at or before MAX_LINE_LENGTH to avoid
@@ -2248,7 +2244,7 @@ fn render_text_read(
             let safe_end = line.floor_char_boundary(MAX_LINE_LENGTH);
             (&line[..safe_end], true)
         } else {
-            (*line, false)
+            (line, false)
         };
         let display_size = line_num_width
             + 2
@@ -2816,6 +2812,30 @@ mod tests {
 
     use crate::config::Config;
     use crate::context::default_language_provider_factory;
+
+    #[test]
+    fn edit_review_opus_7_unranged_read_retains_only_the_rendered_window() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("many-lines.txt");
+        let line = "🦀".repeat(250) + "\r\n";
+        let content = line.repeat(10_000);
+        std::fs::write(&file, &content).unwrap();
+        let req = serde_json::from_value(serde_json::json!({"id":"retention", "command":"read"}))
+            .unwrap();
+        super::UNRANGED_READ_RETENTION.with(|retention| retention.set((0, 0)));
+        let response =
+            super::handle_text_or_binary_read(&req, &file, content.len() as u64, false, &mut None);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["total_lines"], 10_000);
+        assert_eq!(response.data["lines_read"], 50);
+        assert_eq!(response.data["truncated"], true);
+        let (lines, bytes) = super::UNRANGED_READ_RETENTION.with(|retention| retention.get());
+        assert!((50..=56).contains(&lines), "retained {lines} lines");
+        assert!(
+            (50_000..=100_000).contains(&bytes),
+            "retained {bytes} bytes"
+        );
+    }
 
     #[test]
     fn github_read_response_preserves_engine_text_and_attachment_metadata() {
