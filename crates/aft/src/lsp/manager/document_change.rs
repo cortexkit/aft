@@ -70,7 +70,7 @@ impl LspManager {
             let version = self
                 .documents
                 .get(&key)
-                .map_or(0, DocumentStore::next_open_version);
+                .map_or(FIRST_VERSION, DocumentStore::next_open_version);
             let mut sync_order = None;
             if let Some(client) = self.clients.get_mut(&key) {
                 let send = client.send_notification_ordered::<DidOpenTextDocument>(

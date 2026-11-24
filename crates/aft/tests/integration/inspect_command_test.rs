@@ -2939,7 +2939,7 @@ fn review_python_background_pull_preserves_queued_rust_alert_once() {
         // publication would be dropped before alert ingestion.
         server_kind: ServerKind::Rust, root: rust_key.root.clone(),
         method: "textDocument/publishDiagnostics".into(),
-        params: Some(json!({"uri":file_uri(&rust),"version":0,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
+        params: Some(json!({"uri":file_uri(&rust),"version":1,"diagnostics":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":"queued Rust alert"}]})),
     });
     // Do not drain here: the background completion must consume the queued Rust
     // publication while applying the Python response, then retain the Rust

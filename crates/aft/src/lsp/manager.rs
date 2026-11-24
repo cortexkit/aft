@@ -25,7 +25,7 @@ use crate::lsp::diagnostics::{
     from_lsp_diagnostics, DiagnosticEntry, DiagnosticsStore, StoredDiagnostic,
 };
 use crate::lsp::document::{
-    file_content_hash, read_file_content, DiskSnapshot, DocumentEntry, DocumentStore,
+    file_content_hash, read_file_content, DiskSnapshot, DocumentEntry, DocumentStore, FIRST_VERSION,
 };
 use crate::lsp::position::{uri_for_path, uri_to_path};
 use crate::lsp::pull_params::{
@@ -2352,7 +2352,7 @@ impl LspManager {
                     .get(key)
                     .and_then(|store| store.version(path))
             })
-            .map_or(0, |version| version + 1);
+            .map_or(FIRST_VERSION, |version| version + 1);
         reservation
             .notification_versions
             .insert(path.to_path_buf(), version);
@@ -2765,7 +2765,7 @@ impl LspManager {
                 let version = self
                     .documents
                     .get(key)
-                    .map_or(0, DocumentStore::next_open_version);
+                    .map_or(FIRST_VERSION, DocumentStore::next_open_version);
                 let content = initial_content
                     .as_ref()
                     .expect("content is loaded when any server needs didOpen");
@@ -2913,7 +2913,7 @@ impl LspManager {
     /// against the exact version that this notification carried.
     ///
     /// Returns `Vec<(ServerKey, target_version)>` for sent notifications or
-    /// versions reserved for startup replay. New documents start at version 0;
+    /// versions reserved for startup replay. A fresh server starts at version 1;
     /// coalesced startup edits can make the first didOpen carry a later version.
     /// A reserved version is not evidence of analysis: post-edit observation
     /// still requires diagnostics matching that version. Servers that do not
@@ -3760,7 +3760,7 @@ impl LspManager {
             let version = self
                 .documents
                 .get(&key)
-                .map_or(0, DocumentStore::next_open_version);
+                .map_or(FIRST_VERSION, DocumentStore::next_open_version);
             let Some(client) = self.clients.get_mut(&key) else {
                 continue;
             };
@@ -12411,12 +12411,12 @@ mod current_content_diagnostics_tests {
             root: file.parent().unwrap().to_path_buf(),
         };
         let mut manager = LspManager::new();
-        manager
+        let version = manager
             .documents
             .entry(key.clone())
             .or_default()
             .open(file.clone());
-        publish(&mut manager, &key, &file, Some(0));
+        publish(&mut manager, &key, &file, Some(version));
         assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
         (temp, manager, key, file)
     }
@@ -12433,7 +12433,7 @@ mod current_content_diagnostics_tests {
 
     #[test]
     fn diagnostics_late_and_unversioned_reports_do_not_certify_current_content() {
-        for version in [Some(0), None] {
+        for version in [Some(FIRST_VERSION), None] {
             let (_temp, mut manager, key, file) = fixture();
             std::fs::write(&file, "fixed!\n").unwrap();
             manager.documents.get_mut(&key).unwrap().bump_version(&file);
@@ -12452,8 +12452,8 @@ mod current_content_diagnostics_tests {
     fn diagnostics_matching_version_and_content_remain_authoritative() {
         let (_temp, mut manager, key, file) = fixture();
         std::fs::write(&file, "fixed!\n").unwrap();
-        manager.documents.get_mut(&key).unwrap().bump_version(&file);
-        publish(&mut manager, &key, &file, Some(1));
+        let version = manager.documents.get_mut(&key).unwrap().bump_version(&file);
+        publish(&mut manager, &key, &file, version);
         assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
         assert!(manager.has_authoritative_report_for_file(&file));
     }
@@ -12487,11 +12487,12 @@ mod current_content_diagnostics_tests {
     fn diagnostics_reopen_does_not_accept_an_earlier_open_version() {
         let (_temp, mut manager, key, file) = fixture();
         let store = manager.documents.get_mut(&key).unwrap();
-        store.close(&file);
-        assert_eq!(store.open(file.clone()), 1);
-        publish(&mut manager, &key, &file, Some(0));
+        let closed = store.close(&file).unwrap();
+        let reopened = store.open(file.clone());
+        assert_eq!(reopened, closed + 1);
+        publish(&mut manager, &key, &file, Some(closed));
         assert_eq!(manager.authoritative_diagnostic_reports().count(), 0);
-        publish(&mut manager, &key, &file, Some(1));
+        publish(&mut manager, &key, &file, Some(reopened));
         assert_eq!(manager.authoritative_diagnostic_reports().count(), 1);
     }
 

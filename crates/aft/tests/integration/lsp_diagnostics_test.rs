@@ -2533,8 +2533,8 @@ fn post_edit_rejects_publish_with_stale_version() {
     }
 
     // Pre-warm: do one regular write so the server is up. Use the first
-    // call (which sends didOpen with version 0) to seed state — but with
-    // STALE_VERSION on, the fake publishes version=-1 which won't match
+    // call (which sends didOpen with version 1) to seed state — but with
+    // STALE_VERSION on, the fake publishes version=0 which won't match
     // any wait. Use a long enough timeout that the wait actually drains.
     let outcome =
         ctx.lsp_notify_and_collect_diagnostics(file, "fn main() {}\n", Duration::from_millis(800));

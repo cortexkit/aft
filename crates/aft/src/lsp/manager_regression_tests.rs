@@ -1420,7 +1420,7 @@ fn per_file_pulls_close_temporary_documents_at_each_open_version() {
     )
     .unwrap();
     std::fs::create_dir(root.join("src")).unwrap();
-    for (name, initial_version) in [("lib.rs", 0), ("other.rs", 1)] {
+    for (name, initial_version) in [("lib.rs", 1), ("other.rs", 2)] {
         let file = root.join("src").join(name);
         std::fs::write(&file, "pub fn f() {}\n").unwrap();
         let results =
@@ -1465,7 +1465,7 @@ fn per_file_pulls_close_temporary_documents_at_each_open_version() {
         })
         .collect::<Vec<_>>();
     manager.close_documents_opened_for_pulls(&file, &results);
-    assert_eq!(manager.documents[&key].version(&file), Some(3));
+    assert_eq!(manager.documents[&key].version(&file), Some(4));
 }
 
 #[test]

@@ -83,7 +83,7 @@ fn test_notify_file_changed_sends_did_open() {
 
     let opened = custom_event(&mut manager, "custom/documentOpened");
     assert_eq!(opened["uri"], expected_uri);
-    assert_eq!(opened["version"], 0);
+    assert_eq!(opened["version"], 1);
 }
 
 #[test]
@@ -98,14 +98,14 @@ fn test_notify_file_changed_twice_sends_did_change() {
         .expect("first notify");
     let opened = custom_event(&mut manager, "custom/documentOpened");
     assert_eq!(opened["uri"], expected_uri);
-    assert_eq!(opened["version"], 0);
+    assert_eq!(opened["version"], 1);
 
     manager
         .notify_file_changed_default(&main_rs, "fn main() { println!(\"two\"); }\n")
         .expect("second notify");
     let changed = custom_event(&mut manager, "custom/documentChanged");
     assert_eq!(changed["uri"], expected_uri);
-    assert_eq!(changed["version"], 1);
+    assert_eq!(changed["version"], 2);
 }
 
 #[test]
@@ -114,11 +114,11 @@ fn test_document_store_version_tracking() {
     let path = temp_dir.path().join("demo.rs");
     let mut store = DocumentStore::new();
 
-    assert_eq!(store.open(path.clone()), 0);
-    assert_eq!(store.version(&path), Some(0));
-    assert_eq!(store.bump_version(&path), Some(1));
+    assert_eq!(store.open(path.clone()), 1);
+    assert_eq!(store.version(&path), Some(1));
     assert_eq!(store.bump_version(&path), Some(2));
-    assert_eq!(store.version(&path), Some(2));
+    assert_eq!(store.bump_version(&path), Some(3));
+    assert_eq!(store.version(&path), Some(3));
 }
 
 #[test]
@@ -127,9 +127,9 @@ fn test_document_store_close_and_reopen() {
     let path = temp_dir.path().join("demo.rs");
     let mut store = DocumentStore::new();
 
-    assert_eq!(store.open(path.clone()), 0);
-    assert_eq!(store.close(&path), Some(0));
-    assert!(!store.is_open(&path));
     assert_eq!(store.open(path.clone()), 1);
-    assert_eq!(store.version(&path), Some(1));
+    assert_eq!(store.close(&path), Some(1));
+    assert!(!store.is_open(&path));
+    assert_eq!(store.open(path.clone()), 2);
+    assert_eq!(store.version(&path), Some(2));
 }
