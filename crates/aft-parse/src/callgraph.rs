@@ -22,6 +22,9 @@ use crate::symbols::{Range, Symbol, SymbolKind};
 
 mod live_cache;
 use live_cache::LiveCache;
+mod macro_body;
+#[cfg(test)]
+mod macro_body_tests;
 
 // ---------------------------------------------------------------------------
 // Core types
@@ -1144,7 +1147,7 @@ fn split_macro_body_calls(
     bodies: &[crate::calls::RustMacroBody],
 ) -> (Vec<crate::calls::CallTuple>, HashMap<String, Vec<CallSite>>) {
     let mut body_calls: HashMap<String, Vec<CallSite>> = HashMap::new();
-    if bodies.is_empty() {
+    if bodies.is_empty() || raw_calls.is_empty() {
         return (raw_calls, body_calls);
     }
     let symbol_ranges = symbols
@@ -1156,41 +1159,21 @@ fn split_macro_body_calls(
             )
         })
         .collect::<Vec<_>>();
-    // For each template, the items it defines itself.
-    let body_symbols = bodies
+    let arm_ranges = bodies
         .iter()
-        .map(|body| {
-            symbol_ranges
-                .iter()
-                .copied()
-                .filter(|(start, end)| body.byte_start <= *start && *end <= body.byte_end)
-                .collect::<Vec<_>>()
-        })
+        .map(|body| (body.byte_start, body.byte_end))
         .collect::<Vec<_>>();
 
+    let owners = macro_body::owners(&raw_calls, &arm_ranges, &symbol_ranges);
     let mut ordinary = Vec::with_capacity(raw_calls.len());
-    for call in raw_calls {
-        let (_, _, _, call_start, call_end) = call;
-        // Templates can nest; the innermost one holding the call owns it.
-        let innermost = bodies
-            .iter()
-            .enumerate()
-            .filter(|(_, body)| body.byte_start <= call_start && call_end <= body.byte_end)
-            .min_by_key(|(_, body)| body.byte_end - body.byte_start);
-        let Some((body_index, body)) = innermost else {
+    for (call, owner) in raw_calls.into_iter().zip(owners) {
+        let Some(body_index) = owner else {
             ordinary.push(call);
             continue;
         };
-        let inside_defined_item = body_symbols[body_index]
-            .iter()
-            .any(|(start, end)| *start <= call_start && call_end <= *end);
-        if inside_defined_item {
-            ordinary.push(call);
-            continue;
-        }
         let (full, short, line, byte_start, byte_end) = call;
         body_calls
-            .entry(format!("{}!", body.name))
+            .entry(format!("{}!", bodies[body_index].name))
             .or_default()
             .push(CallSite {
                 kind: CallSiteKind::Call,
