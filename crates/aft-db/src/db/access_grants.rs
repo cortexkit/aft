@@ -570,14 +570,25 @@ pub fn saved_scope_batch(
 }
 
 /// A definite daemon end and its saved-row cleanup commit together. The
-/// cleanup matches the live scope-end handler's: `end_scope_grants` plus the
-/// code-mode owner rows it removes separately.
+/// cleanup matches the live scope-end handler's: `end_scope_grants`, the
+/// code-mode owner rows, and the call-ledger settlement of calls that never
+/// started. The sweep only sees ends that no AFT process was watching, so no
+/// in-process waiter holds those calls; runners read the settlements through
+/// `late_results`, as after any restart. One transaction keeps a failed step
+/// retryable: until it commits, the scope's grants keep it in the sweep.
 pub fn end_saved_scope(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<usize> {
-    let tx = conn.unchecked_transaction()?;
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let deleted = end_scope_rows(&tx, key)?;
     crate::db::codemode_owners::end(&tx, key)?;
+    let ledger = crate::db::call_ledger::ledger_scope(key);
+    if let Some(scope) = &ledger {
+        crate::db::call_ledger::end_scope_in(&tx, scope, crate::db::call_ledger::now_ms())?;
+    }
     tx.commit()?;
     aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Grants);
+    if ledger.is_some() {
+        crate::db::call_ledger::scope_end_committed();
+    }
     Ok(deleted)
 }
 
@@ -1268,9 +1279,25 @@ mod tests {
         assert!(!authorized(&conn, &head, &worker).unwrap());
     }
 
-    /// Rows a scope end leaves for the ended epoch, and the launch parameters a
-    /// later epoch of the same scope would receive.
-    type EndOutcome = (Vec<(&'static str, i64)>, Option<serde_json::Value>);
+    /// Rows a scope end leaves for the ended epoch, the launch parameters a
+    /// later epoch of the same scope would receive, the ledger state of each
+    /// call, and the late-results entries the calls' runner reads afterwards
+    /// as (call key, kind, reason).
+    type EndOutcome = (
+        Vec<(&'static str, i64)>,
+        Option<serde_json::Value>,
+        Vec<(&'static str, crate::db::call_ledger::State)>,
+        Vec<(String, String, String)>,
+    );
+
+    /// How the live scope-end handler identifies the scope in the call ledger.
+    fn live_ledger_scope() -> crate::db::call_ledger::ScopeIdentity {
+        crate::db::call_ledger::ScopeIdentity {
+            owner: "reserved:prefrontal".into(),
+            scope_ref: "worker".into(),
+            scope_epoch: 5,
+        }
+    }
 
     fn end_with(end: impl Fn(&Connection, &ScopeKey)) -> EndOutcome {
         use crate::access_policy::ApprovalMode;
@@ -1307,7 +1334,41 @@ mod tests {
             &[(grant, None)],
         )
         .unwrap();
+        use crate::db::call_ledger::{self as ledger, Key, State};
+        const CARRIER: &str = "reserved:runner";
+        let calls = [
+            ("prepared", State::Prepared),
+            ("authorized", State::Authorized),
+            ("started", State::DispatchStarted),
+        ];
+        for (call_key, state) in calls {
+            let key = Key {
+                carrier: CARRIER.into(),
+                call_key: call_key.into(),
+            };
+            ledger::admit(&conn, &key, "digest", Some(&live_ledger_scope()), state).unwrap();
+        }
         end(&conn, &scope);
+        let states = calls
+            .map(|(call_key, _)| {
+                let key = Key {
+                    carrier: CARRIER.into(),
+                    call_key: call_key.into(),
+                };
+                (call_key, ledger::get(&conn, &key).unwrap().unwrap().state)
+            })
+            .to_vec();
+        let page = ledger::tests::page(&conn, CARRIER, None, None, ledger::now_ms(), 1 << 20);
+        let mut entries: Vec<(String, String, String)> = page["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let field = |name: &str| entry[name].as_str().unwrap_or_default().to_string();
+                (field("call_key"), field("kind"), field("reason"))
+            })
+            .collect();
+        entries.sort();
         let left = [
             "access_grants",
             "access_launch_params",
@@ -1333,17 +1394,59 @@ mod tests {
             &Config::default(),
         )
         .unwrap();
-        (left, launch_params(&conn, &policy(6)).unwrap())
+        (
+            left,
+            launch_params(&conn, &policy(6)).unwrap(),
+            states,
+            entries,
+        )
     }
 
     #[test]
     fn sweep_scope_end_cleans_the_same_rows_as_the_live_scope_end() {
-        let live = end_with(|conn, key| end_scope_grants(conn, key).unwrap());
+        // The live handler's database steps, in its order.
+        let live = end_with(|conn, key| {
+            end_scope_grants(conn, key).unwrap();
+            crate::db::codemode_owners::end(conn, key).unwrap();
+            crate::db::call_ledger::end_scope(
+                conn,
+                &live_ledger_scope(),
+                crate::db::call_ledger::now_ms(),
+            )
+            .unwrap();
+        });
         let sweep = end_with(|conn, key| {
             end_saved_scope(conn, key).unwrap();
         });
         assert!(live.0.iter().all(|(_, count)| *count == 0), "{live:?}");
         assert_eq!(live.1, None);
+        use crate::db::call_ledger::State;
+        assert_eq!(
+            live.2,
+            [
+                ("prepared", State::Settled),
+                ("authorized", State::Settled),
+                ("started", State::DispatchStarted),
+            ]
+        );
+        let settled = |call_key: &str| {
+            (
+                call_key.to_string(),
+                "not_started".to_string(),
+                "scope_ended".to_string(),
+            )
+        };
+        // The runner's late_results read returns both never-started calls as
+        // settled by the scope end, and nothing for the call already running.
+        assert_eq!(
+            live.3
+                .iter()
+                .filter(|(_, kind, _)| kind == "not_started")
+                .cloned()
+                .collect::<Vec<_>>(),
+            [settled("authorized"), settled("prepared")]
+        );
+        assert!(live.3.iter().all(|(call_key, _, _)| call_key != "started"));
         assert_eq!(sweep, live);
     }
 

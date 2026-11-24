@@ -707,6 +707,19 @@ pub fn unsettled_scopes(
 /// The remote service applies its own pairing-qualified scope ends.
 pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite::Result<Vec<Key>> {
     let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let keys = end_scope_in(&tx, scope, now)?;
+    tx.commit()?;
+    scope_end_committed();
+    Ok(keys)
+}
+
+/// [`end_scope`] inside the caller's transaction. Call
+/// [`scope_end_committed`] once that transaction commits.
+pub(crate) fn end_scope_in(
+    tx: &Connection,
+    scope: &ScopeIdentity,
+    now: i64,
+) -> rusqlite::Result<Vec<Key>> {
     let keys = {
         let mut statement = tx.prepare("SELECT carrier,call_key FROM call_ledger WHERE owner=?1 AND scope_ref=?2 AND scope_epoch=?3 AND carrier NOT GLOB 'remote#*' AND state IN ('Prepared','Authorized')")?;
         let rows = statement.query_map(
@@ -721,9 +734,9 @@ pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for key in &keys {
-        if let Some(row) = get(&tx, key)? {
+        if let Some(row) = get(tx, key)? {
             settle_row(
-                &tx,
+                tx,
                 &row,
                 &not_started(key, "scope_ended"),
                 "not_started",
@@ -733,10 +746,31 @@ pub fn end_scope(conn: &Connection, scope: &ScopeIdentity, now: i64) -> rusqlite
             )?;
         }
     }
-    tx.commit()?;
+    Ok(keys)
+}
+
+/// Wakes late-result publishers and held-call watchers after a committed
+/// scope-end settlement.
+pub(crate) fn scope_end_committed() {
     settled();
     aft_base::scope_watch_events::changed(aft_base::scope_watch_events::Source::Held);
-    Ok(keys)
+}
+
+/// The ledger's identity for a grant scope. Grant tables key the owner by the
+/// principal's JSON form, the ledger by its short id (`direct`,
+/// `reserved:<module>`, `unverified`). `None` when the owner is not a
+/// principal, in which case the ledger holds no rows for it.
+pub(crate) fn ledger_scope(key: &super::access_grants::ScopeKey) -> Option<ScopeIdentity> {
+    let owner = match serde_json::from_str(&key.owner).ok()? {
+        subc_protocol::Principal::Direct => "direct".to_string(),
+        subc_protocol::Principal::Reserved { module_id } => format!("reserved:{module_id}"),
+        subc_protocol::Principal::Unverified => "unverified".to_string(),
+    };
+    Some(ScopeIdentity {
+        owner,
+        scope_ref: key.scope_ref.clone(),
+        scope_epoch: key.epoch,
+    })
 }
 
 /// Settles an unsettled row inside the caller's transaction. A settlement
