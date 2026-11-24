@@ -100,7 +100,7 @@ mod tests {
             &crate::config::Config::default(),
         )
         .unwrap();
-        use crate::test_bridge::search_misc::InspectCacheTestExt as _;
+        use aft_inspect::inspect::compatibility_test::InspectCacheTest as _;
         cache
             .store_tier2_aggregate(
                 crate::inspect::job::JobKey::for_project_category(

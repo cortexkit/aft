@@ -2,7 +2,7 @@
 use super::*;
 use crate::bash_background::persistence::{task_paths, write_task};
 use crate::context::{App, AppContext};
-use crate::test_bridge::search_misc::InspectManagerTestExt as _;
+use aft_inspect::inspect::compatibility_test::InspectManagerTest as _;
 use std::sync::{MutexGuard, OnceLock};
 
 pub struct BusyRoot {

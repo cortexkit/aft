@@ -13096,7 +13096,7 @@ mod status_emitter_tests {
 mod health_warming_honesty_tests {
     use super::*;
     use crate::parser::TreeSitterProvider;
-    use crate::test_bridge::search_misc::InspectManagerTestExt as _;
+    use aft_inspect::inspect::compatibility_test::InspectManagerTest as _;
 
     fn ctx_with_config(config: Config) -> AppContext {
         AppContext::new(Box::new(TreeSitterProvider::new()), config)
