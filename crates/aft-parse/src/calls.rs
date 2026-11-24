@@ -1,7 +1,7 @@
 //! Shared call-site extraction helpers.
 //!
-//! Extracted from `commands/zoom.rs` so both the zoom command and the
-//! call-graph engine can reuse the same AST-walking logic.
+//! `aft_zoom` and call-graph extraction use the same syntax walkers to
+//! identify call sites.
 
 use std::collections::{BTreeSet, HashSet};
 
