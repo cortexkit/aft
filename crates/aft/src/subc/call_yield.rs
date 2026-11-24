@@ -502,6 +502,7 @@ pub(super) fn recover_watches(ctx: Arc<crate::context::AppContext>) {
                 budget,
                 false,
                 Some(signal.clone()),
+                None,
             )
         });
         if let crate::response_finalize::DispatchOutcome::Immediate(response) = outcome {

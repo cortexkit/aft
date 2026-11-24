@@ -136,6 +136,7 @@ pub(super) struct WriterFrame {
     pub(super) frame: Frame,
     body_storage: WriterFrameBody,
     pub(super) tool_response_trace: Option<ToolResponseWriteTrace>,
+    pub(super) held_reply: bool,
     /// Keep the recipient policy after retention consumes result_projection.
     response_policy: Option<ToolResponsePolicy>,
     result_projection: Option<(ToolResponsePolicy, usize, Option<ToolCallResult>)>,
@@ -168,6 +169,7 @@ impl WriterFrame {
             frame,
             body_storage: WriterFrameBody::Owned,
             tool_response_trace: None,
+            held_reply: false,
             response_policy: None,
             result_projection: None,
             prepared_projection: None,
@@ -183,6 +185,7 @@ impl WriterFrame {
             frame,
             body_storage: WriterFrameBody::SharedPush(body),
             tool_response_trace: None,
+            held_reply: false,
             response_policy: None,
             result_projection: None,
             prepared_projection: None,
@@ -668,6 +671,7 @@ fn enqueue_writer_item(
 ) {
     let queue_depth = metrics.writer_queued.fetch_add(1, Ordering::Relaxed) + 1;
     item.mark_enqueued(queue_depth, metrics.writer_active.load(Ordering::Relaxed));
+    metrics.mark_shell_reply_queued(item.frame());
     permit.send(item);
 }
 

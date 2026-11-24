@@ -11183,7 +11183,7 @@ impl BgTaskRegistry {
     pub(crate) fn hard_kill_remaining(&self, task_id: &str, session_id: &str) -> Option<Duration> {
         let task = self.task_for_session(task_id, session_id)?;
         let state = task.lock_state().ok()?;
-        if state.metadata.status.is_terminal() {
+        if state.metadata.status.is_terminal() || state.metadata.remote.is_some() {
             return None;
         }
         let timeout_ms = state.metadata.timeout_ms?;

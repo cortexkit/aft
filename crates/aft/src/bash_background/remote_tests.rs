@@ -6095,7 +6095,7 @@ fn exec_remote_bash_restart_replays_uncheckpointed_output() {
     );
 }
 
-fn persist_accepted_with_snapshot(
+pub(super) fn persist_accepted_with_snapshot(
     dir: &Path,
     connection: PathBuf,
     command: &str,

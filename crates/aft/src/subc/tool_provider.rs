@@ -3777,6 +3777,7 @@ impl LedgerEdge {
                         body.get("held").is_some() && body.get("isError").is_none()
                     });
                 if permission_hold {
+                    outgoing.held_reply = true;
                     if let Some(call) = edge
                         .calls
                         .lock()

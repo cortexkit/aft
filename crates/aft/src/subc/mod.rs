@@ -3898,6 +3898,7 @@ async fn teardown_installed_route(
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, &mut root_channels.channels, channel) {
         metrics.completion_delivery.route_closed(channel);
+        metrics.close_shell_reply_route(channel);
         let defer_quiesce = goodbye_grace && !root_channels.contains_key(&identity.root);
         if defer_quiesce {
             // Publish the route removal without enabling extra background
@@ -6641,6 +6642,7 @@ where
         writer: writer_result,
         input_ended,
     } = close_daemon_connection(reader_rx, reader_task, writer_task).await;
+    dispatch_path_metrics.close_shell_reply_connection(writer_result.is_err());
     log::debug!("subc attach: connection closed; daemon input ended first: {input_ended}");
     log::info!(
         "subc exit phase=loop_teardown elapsed_ms={}",
@@ -6759,6 +6761,7 @@ where
                 continue;
             }
             queued.project_tool_result().map_err(|error| {
+                metrics.close_shell_reply_connection(true);
                 subc_transport::FrameIoError::Io(io::Error::other(error.to_string()))
             })?;
             let measure = queued.tool_response_trace.is_some();
@@ -6780,6 +6783,7 @@ where
                 Ok(write_timing) => write_timing,
                 Err(error) => {
                     queued.finish_ack_write(false);
+                    metrics.close_shell_reply_connection(true);
                     if let Some(trace) = queued.tool_response_trace.as_ref() {
                         trace.note_write_failure(&error.to_string());
                     }
@@ -6787,7 +6791,7 @@ where
                 }
             };
             queued.finish_ack_write(true);
-            metrics.tool_replied(queued.frame());
+            metrics.tool_replied(queued.frame(), queued.held_reply);
 
             if let (Some(trace), Some(dequeued), Some(write_timing)) =
                 (queued.tool_response_trace.take(), dequeued, write_timing)
@@ -10276,47 +10280,6 @@ async fn hold_for_consent(
     }
 }
 
-/// Return bash_watch's normal synchronous wait window for the deadline warning.
-/// The warning uses this value only; the handler still owns and enforces the wait.
-fn bash_watch_warning_wait_ms(
-    arguments: &Value,
-    worker: bool,
-    worker_limit_ms: u64,
-    primary_cap_ms: u64,
-) -> Option<u64> {
-    let arguments = arguments.get("params").unwrap_or(arguments);
-    let requested = match arguments
-        .get("timeout_ms")
-        .or_else(|| arguments.get("timeoutMs"))
-    {
-        None | Some(Value::Null) => None,
-        Some(value) => {
-            let requested = value.as_u64().or_else(|| {
-                value
-                    .as_str()
-                    .and_then(|raw| raw.trim().parse::<u64>().ok())
-            })?;
-            if requested == 0 {
-                return None;
-            }
-            Some(requested)
-        }
-    };
-    let background = arguments
-        .get("background")
-        .and_then(crate::subc_translate::model_boolean)
-        .unwrap_or(false);
-    Some(if worker && background {
-        worker_limit_ms
-    } else if worker {
-        requested.unwrap_or(worker_limit_ms).min(worker_limit_ms)
-    } else {
-        requested
-            .unwrap_or(crate::commands::bash_watch::DEFAULT_PRIMARY_WATCH_TIMEOUT_MS)
-            .min(primary_cap_ms)
-    })
-}
-
 // Direct decoder fixtures use the build's default HELLO capabilities. The live
 // loop passes the snapshot of the actual HELLO sent on that connection instead.
 #[cfg(test)]
@@ -10908,7 +10871,7 @@ async fn handle_tool_call_with_capabilities(
     if bare_name == "bash_watch" {
         if let Some(ctx) = executor.actor_context(&identity.root) {
             let worker_limit_ms = crate::commands::bash_orchestrate::worker_wait_max_ms(&ctx);
-            if let Some(wait_ms) = bash_watch_warning_wait_ms(
+            if let Some(wait_ms) = health::bash_watch_warning_wait_ms(
                 &arguments,
                 role.is_worker(),
                 worker_limit_ms,
@@ -11449,6 +11412,11 @@ async fn handle_tool_call_with_capabilities(
         // them for its whole life.
         let secret_scopes = Some(secret_consent::call_scopes(&identity_for_run));
         let fetch_reply_deadline = reply_budget.deadline;
+        let watch_timing = if bare_name == "bash_watch" {
+            metrics.watch_reply_timing(route_id, frame.header.corr)
+        } else {
+            None
+        };
         let job: crate::context::ExecutorJob = Box::new(move |ctx| {
             let _io = crate::bounded_io::enter(Some(io_budget.clone()));
             let _fetch_deadline = secret_consent::FetchReplyDeadline::enter(fetch_reply_deadline);
@@ -11551,6 +11519,7 @@ async fn handle_tool_call_with_capabilities(
                                 reply_budget,
                                 carrier_read_only::restricted(&identity_for_run),
                                 watch_yield,
+                                watch_timing,
                             )
                         } else {
                             crate::commands::lsp_navigation::handle_lsp_navigation_deferred_with_reply_deadline(
