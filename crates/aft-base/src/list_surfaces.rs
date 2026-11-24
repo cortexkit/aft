@@ -144,6 +144,11 @@ pub static LIST_SURFACES: &[SurfaceEntry] = &[
                 kind: ReasonKind::Bounding,
                 predicate_name: "depth_cut_inside_requested, truncated",
             },
+            ReasonEntry {
+                reason: Reason::Budget,
+                kind: ReasonKind::Bounding,
+                predicate_name: "MACRO_VIA_ENTRY_LIMIT, macro_via_entries",
+            },
         ],
     },
     SurfaceEntry {

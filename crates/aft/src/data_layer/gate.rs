@@ -259,14 +259,14 @@ pub(crate) fn compare_readers(
                 &mut || {
                     show(
                         &ours
-                            .ref_sites_named(kind, name, 50)
+                            .ref_sites_named(name, &[(kind, 50)])
                             .map_err(|e| e.to_string()),
                     )
                 },
                 &mut || {
                     show(
                         &theirs
-                            .ref_sites_named(kind, name, 50)
+                            .ref_sites_named(name, &[(kind, 50)])
                             .map_err(|e| e.to_string()),
                     )
                 },

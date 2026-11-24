@@ -75,6 +75,24 @@ fn kind_bound_table_test_for_registered_surfaces() {
             expected_is_at_least: true,
             expected_unit: Unit::Items,
         },
+        // Callers: macro-template entry limit cut -> Budget, AtLeast, unit items
+        TableTestCase {
+            surface_id: "payload.callers",
+            causes: &[Reason::Budget],
+            expected_selected_reason: Reason::Budget,
+            expected_causes_order: &[Reason::Budget],
+            expected_is_at_least: true,
+            expected_unit: Unit::Items,
+        },
+        // Callers: macro cut with depth and hub cap -> Depth > Budget > Cap, AtLeast
+        TableTestCase {
+            surface_id: "payload.callers",
+            causes: &[Reason::Cap, Reason::Budget, Reason::Depth],
+            expected_selected_reason: Reason::Depth,
+            expected_causes_order: &[Reason::Depth, Reason::Budget, Reason::Cap],
+            expected_is_at_least: true,
+            expected_unit: Unit::Items,
+        },
         // Call tree: cap only -> Exact, Selecting, unit items
         TableTestCase {
             surface_id: "payload.tree",

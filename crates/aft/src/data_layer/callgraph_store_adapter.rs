@@ -785,11 +785,26 @@ pub fn callers_result(
     }
 
     let is_rust = target.representative.lang == crate::parser::LangId::Rust;
-    let via_entries = if is_rust {
-        macro_via_entries(store, &target, include_tests, &listed)?
+    // Template calls and unanalyzed mentions of the name are read in one
+    // pass over the files that use it. Each asks for one more row than it
+    // keeps, which tells an exact answer from a cut one.
+    let (template_calls, mention_rows) = if is_rust {
+        let mut rows = store.ref_sites_named(
+            &target.representative.name,
+            &[
+                (MACRO_BODY_CALL_REF_KIND, MACRO_VIA_ENTRY_LIMIT + 1),
+                (MACRO_MENTION_REF_KIND, MACRO_MENTION_COUNT_LIMIT + 1),
+            ],
+        )?;
+        let mentions = rows.pop().unwrap_or_default();
+        (rows.pop().unwrap_or_default(), mentions)
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    let MacroVia {
+        entries: via_entries,
+        capped: via_capped,
+    } = macro_via_entries(store, &target, include_tests, &listed, template_calls)?;
     let via_count = via_entries.len();
     let unknown_macro_callers = via_entries
         .iter()
@@ -800,18 +815,24 @@ pub fn callers_result(
     for (file, entry) in via_entries {
         groups.entry(file).or_default().push(entry);
     }
-    let macro_note = if is_rust {
-        unanalyzed_macro_note(store, &target.representative.name, include_tests)?
-    } else {
-        None
-    };
+    let macro_note =
+        unanalyzed_macro_note(&target.representative.name, include_tests, mention_rows);
 
-    let callers_list_envelope = build_callgraph_envelope(
-        Unit::Items,
-        shown + via_count,
-        post_filter_count + via_count,
-        truncated.max(usize::from(depth_limited)),
-    );
+    let depth_cut = truncated.max(usize::from(depth_limited));
+    let callers_list_envelope = if via_capped {
+        Some(build_callers_macro_cut_envelope(
+            shown + via_count,
+            post_filter_count + via_count,
+            depth_cut,
+        ))
+    } else {
+        build_callgraph_envelope(
+            Unit::Items,
+            shown + via_count,
+            post_filter_count + via_count,
+            depth_cut,
+        )
+    };
 
     let unresolved_callers = if post_filter_count + via_count == 0 {
         let (total, sites) = store.unresolved_call_sites_named(
@@ -881,19 +902,30 @@ pub fn callers_result(
 /// Templates, invocations and the target are all matched by name only, so
 /// every entry is marked name-resolved. When several symbols share the
 /// target's name no entries are produced, because nothing tells which of them
-/// a template calls. Only macros defined in the project have template refs,
-/// and the entry count is capped at `MACRO_VIA_ENTRY_LIMIT` by the queries.
+/// a template calls. Only macros defined in the project have template refs.
+/// At most `MACRO_VIA_ENTRY_LIMIT` entries are listed; `capped` says more
+/// rows may exist past that, so the count is a lower bound.
+struct MacroVia {
+    entries: Vec<(String, StoreCallerEntry)>,
+    capped: bool,
+}
+
+/// `template_calls` are the target name's template call rows, fetched with
+/// one more than `MACRO_VIA_ENTRY_LIMIT` so a cut shows.
 fn macro_via_entries(
     store: &impl CallGraphRead,
     target: &ResolvedStoreSymbol,
     include_tests: bool,
     listed: &HashSet<(String, u32)>,
-) -> StoreAdapterResult<Vec<(String, StoreCallerEntry)>> {
+    template_calls: Vec<crate::callgraph_store::StoreRefSite>,
+) -> StoreAdapterResult<MacroVia> {
+    let none = MacroVia {
+        entries: Vec::new(),
+        capped: false,
+    };
     let name = &target.representative.name;
-    let template_calls =
-        store.ref_sites_named(MACRO_BODY_CALL_REF_KIND, name, MACRO_VIA_ENTRY_LIMIT)?;
     if template_calls.is_empty() {
-        return Ok(Vec::new());
+        return Ok(none);
     }
     let namesakes = store
         .nodes_matching(name)?
@@ -901,7 +933,7 @@ fn macro_via_entries(
         .filter(|node| node.name == *name && !target.nodes.contains(node))
         .count();
     if namesakes > 0 {
-        return Ok(Vec::new());
+        return Ok(none);
     }
 
     let name_match = |symbol: String, line: u32, via: Option<String>, test_status_unknown: bool| {
@@ -917,7 +949,8 @@ fn macro_via_entries(
     };
     let mut entries = Vec::new();
     let mut macros = BTreeSet::new();
-    for site in template_calls {
+    let mut capped = template_calls.len() > MACRO_VIA_ENTRY_LIMIT;
+    for site in template_calls.into_iter().take(MACRO_VIA_ENTRY_LIMIT) {
         let Some(macro_name) = site.local_name else {
             continue;
         };
@@ -931,11 +964,17 @@ fn macro_via_entries(
         macros.insert(macro_name);
     }
     for macro_name in macros {
-        let remaining = MACRO_VIA_ENTRY_LIMIT.saturating_sub(entries.len());
-        if remaining == 0 {
+        if capped {
             break;
         }
-        for site in store.ref_sites_named("call", &macro_name, remaining)? {
+        let remaining = MACRO_VIA_ENTRY_LIMIT.saturating_sub(entries.len());
+        // One row more than fits tells whether invocations are left out.
+        let sites = store
+            .ref_sites_named(&macro_name, &[("call", remaining + 1)])?
+            .pop()
+            .unwrap_or_default();
+        capped = sites.len() > remaining;
+        for site in sites.into_iter().take(remaining) {
             if (!include_tests && (is_test_file(&site.file) || site.is_test == Some(true)))
                 || listed.contains(&(site.file.clone(), site.line))
             {
@@ -951,21 +990,24 @@ fn macro_via_entries(
             ));
         }
     }
-    Ok(entries)
+    Ok(MacroVia { entries, capped })
 }
 
 /// A note naming where the target's name occurs inside Rust macro token trees
 /// that could not be parsed as Rust. Calls there are invisible to the call
 /// graph, so without the note an empty or short caller list would read as
-/// complete when it may not be.
+/// complete when it may not be. `rows` are the name's mention rows, fetched
+/// with one more than `MACRO_MENTION_COUNT_LIMIT`.
 fn unanalyzed_macro_note(
-    store: &impl CallGraphRead,
     name: &str,
     include_tests: bool,
-) -> StoreAdapterResult<Option<StoreMacroNote>> {
-    // One more than the limit tells an exact count from a lower bound.
-    let rows =
-        store.ref_sites_named(MACRO_MENTION_REF_KIND, name, MACRO_MENTION_COUNT_LIMIT + 1)?;
+    rows: Vec<crate::callgraph_store::StoreRefSite>,
+) -> Option<StoreMacroNote> {
+    // The fetch stopped at one more than the limit, so more rows than the
+    // limit means more mentions may exist past it. Judge that on the rows
+    // as fetched: test files and repeated lines dropped below must not make
+    // a cut count read as exact.
+    let mentions_is_lower_bound = rows.len() > MACRO_MENTION_COUNT_LIMIT;
     let mut seen = BTreeSet::new();
     let mut sites = Vec::new();
     for row in rows {
@@ -977,9 +1019,8 @@ fn unanalyzed_macro_note(
         }
     }
     if sites.is_empty() {
-        return Ok(None);
+        return None;
     }
-    let mentions_is_lower_bound = sites.len() > MACRO_MENTION_COUNT_LIMIT;
     sites.truncate(MACRO_MENTION_COUNT_LIMIT);
     let mentions = sites.len();
     sites.truncate(MACRO_MENTION_SHOWN);
@@ -994,14 +1035,14 @@ fn unanalyzed_macro_note(
     } else {
         sites.join(", ")
     };
-    Ok(Some(StoreMacroNote {
+    Some(StoreMacroNote {
         message: format!(
             "{count} {noun} of `{name}` inside macros could not be analyzed (one location per file): {listed}"
         ),
         mentions,
         mentions_is_lower_bound,
         sites,
-    }))
+    })
 }
 
 pub fn call_tree_result(

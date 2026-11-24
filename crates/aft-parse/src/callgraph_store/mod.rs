@@ -354,18 +354,17 @@ pub trait CallGraphRead {
     fn outgoing_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn resolved_self_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreCallSite>>;
     fn unresolved_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>>;
-    /// Raw ref rows of `kind` whose short name is `short_name`, resolved or
-    /// not, at most `limit` of them in file and line order. `callers` uses it
-    /// to find macro invocations and macro facts by name. Stores that keep no
-    /// such rows answer with none.
+    /// Raw ref rows whose short name is `short_name`, resolved or not, for
+    /// each `(kind, limit)` asked: at most `limit` rows of that kind, in file
+    /// and line order. `callers` uses it to find macro invocations and macro
+    /// facts by name, every kind in one pass. Stores without such rows: none.
     fn ref_sites_named(
         &self,
-        kind: &str,
         short_name: &str,
-        limit: usize,
-    ) -> Result<Vec<StoreRefSite>> {
-        let _ = (kind, short_name, limit);
-        Ok(Vec::new())
+        kinds: &[(&str, usize)],
+    ) -> Result<Vec<Vec<StoreRefSite>>> {
+        let _ = short_name;
+        Ok(vec![Vec::new(); kinds.len()])
     }
     /// The calls written inside the `macro_rules!` template that `node`, a
     /// macro owner (`name!`), defines, resolved or not, in source order.
@@ -1549,11 +1548,10 @@ impl<T: CallGraphRead + ?Sized> CallGraphRead for Arc<T> {
     }
     fn ref_sites_named(
         &self,
-        kind: &str,
         short_name: &str,
-        limit: usize,
-    ) -> Result<Vec<StoreRefSite>> {
-        (**self).ref_sites_named(kind, short_name, limit)
+        kinds: &[(&str, usize)],
+    ) -> Result<Vec<Vec<StoreRefSite>>> {
+        (**self).ref_sites_named(short_name, kinds)
     }
     fn macro_template_calls_of(&self, node: &StoreNode) -> Result<Vec<StoreUnresolvedCall>> {
         (**self).macro_template_calls_of(node)

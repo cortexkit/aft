@@ -652,3 +652,114 @@ fn adapter_call_tree_shares_store_node_budget_and_gap() {
     assert!(text.contains(crate::callgraph::CALL_TREE_WORK_GAP));
     drop((store, dir));
 }
+
+/// The call graph of a Rust crate made of `files`, held in memory.
+fn rust_memory_graph(
+    files: &[(String, String)],
+) -> (
+    tempfile::TempDir,
+    crate::data_layer::query::SliceReader<crate::data_layer::query::MemorySlices>,
+) {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[package]\nname = \"macro-caps\"\n",
+    )
+    .unwrap();
+    for (file, source) in files {
+        let path = dir.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, source).unwrap();
+    }
+    let reader = crate::data_layer::trace_measure::memory_reader(dir.path());
+    (dir, reader)
+}
+
+/// A target called from a `macro_rules!` template invoked `invocations`
+/// times, each from its own function.
+fn template_callers(invocations: usize) -> serde_json::Value {
+    let mut source = String::from(
+        "pub fn template_target() {}\n\
+         macro_rules! run_template {\n    ($x:expr) => {\n        template_target();\n        $x\n    };\n}\n",
+    );
+    for index in 0..invocations {
+        source.push_str(&format!(
+            "pub fn caller_{index}() {{ run_template!({index}); }}\n"
+        ));
+    }
+    let (_dir, reader) = rust_memory_graph(&[("src/lib.rs".to_string(), source)]);
+    let result =
+        callers_result(&reader, Path::new("src/lib.rs"), "template_target", 1, true).unwrap();
+    serde_json::to_value(result).unwrap()
+}
+
+/// Macro-template callers stop at `MACRO_VIA_ENTRY_LIMIT`. When more exist,
+/// the answer must say its total is a lower bound, not give the listed
+/// count as the exact total.
+#[test]
+fn callgraph_macro_template_callers_past_the_limit_report_a_lower_bound() {
+    let value = template_callers(MACRO_VIA_ENTRY_LIMIT + 10);
+    let envelope = &value["callers_list_envelope"];
+    assert_eq!(envelope["shown"], MACRO_VIA_ENTRY_LIMIT, "{value}");
+    assert_eq!(envelope["total"]["kind"], "at_least", "{value}");
+    assert_eq!(envelope["reason"], "budget", "{value}");
+    let text = crate::subc_format::format_callgraph("callers", &value, false);
+    assert!(
+        text.contains(&format!(
+            "shown {MACRO_VIA_ENTRY_LIMIT} of ≥{MACRO_VIA_ENTRY_LIMIT} items (budget)"
+        )),
+        "{text}"
+    );
+
+    // One invocation fewer than fills the limit with the template call is
+    // listed in full, and its total stays exact.
+    let value = template_callers(MACRO_VIA_ENTRY_LIMIT - 1);
+    let envelope = &value["callers_list_envelope"];
+    assert_eq!(envelope["total"]["kind"], "exact", "{value}");
+    assert_eq!(envelope["total"]["value"], MACRO_VIA_ENTRY_LIMIT, "{value}");
+    assert_eq!(value["total_callers"], MACRO_VIA_ENTRY_LIMIT, "{value}");
+}
+
+/// The unanalyzed-macro note counts mentions exactly only when the lookup
+/// saw all of them. Mentions in test files dropped after the lookup must
+/// not turn a cut count into an exact one.
+#[test]
+fn callgraph_unanalyzed_macro_mentions_past_the_limit_report_a_lower_bound() {
+    let mention = "pub fn f() {\n    my_dsl! { when ready then dsl_target @ 3 }\n}\n";
+    let mut files = vec![
+        (
+            "src/lib.rs".to_string(),
+            "pub fn dsl_target() {}\n".to_string(),
+        ),
+        // Sorts before every other mention, so the lookup's window holds it.
+        ("src/a_test.rs".to_string(), mention.to_string()),
+    ];
+    for index in 0..=MACRO_MENTION_COUNT_LIMIT {
+        files.push((format!("src/dsl/m{index:03}.rs"), mention.to_string()));
+    }
+    let (_dir, reader) = rust_memory_graph(&files);
+    let note = callers_result(&reader, Path::new("src/lib.rs"), "dsl_target", 1, false)
+        .unwrap()
+        .macro_note
+        .expect("mentions inside macros are noted");
+    assert!(note.mentions_is_lower_bound, "{note:?}");
+    assert!(
+        note.message.starts_with(&format!(
+            "{MACRO_MENTION_COUNT_LIMIT}+ mentions of `dsl_target`"
+        )),
+        "{note:?}"
+    );
+
+    // Fewer mentions than the limit are counted exactly, test files left out.
+    files.truncate(5);
+    let (_dir, reader) = rust_memory_graph(&files);
+    let note = callers_result(&reader, Path::new("src/lib.rs"), "dsl_target", 1, false)
+        .unwrap()
+        .macro_note
+        .expect("mentions inside macros are noted");
+    assert!(!note.mentions_is_lower_bound, "{note:?}");
+    assert!(
+        note.message.starts_with("3 mentions of `dsl_target`"),
+        "{note:?}"
+    );
+}
