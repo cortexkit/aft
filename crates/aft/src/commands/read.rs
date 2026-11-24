@@ -1057,7 +1057,7 @@ pub(crate) fn github_read_engine(ctx: &AppContext) -> Arc<GithubReadEngine> {
     }));
     drop(engines);
     // The cache works through the context's own connection when it has one.
-    engine.attach_resident_connection(ctx.db_for_path(&database_path).as_ref());
+    engine.attach_resident_connection(ctx.app().db_for_path(&database_path).as_ref());
     engine
 }
 
