@@ -2513,7 +2513,10 @@ pub fn find_call_sites(function: &str) -> Vec<CallSite> {
         "src",
         "../aft-base/src",
         "../aft-db/src",
+        "../aft-edit/src",
         "../aft-engine/src",
+        "../aft-index/src",
+        "../aft-inspect/src",
         "../aft-parse/src",
         "../aft-subc/src",
         "../aft-tools/src",
@@ -2608,20 +2611,22 @@ pub(super) fn enclosing_item(lines: &[&str], target: usize) -> String {
 pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let tools_dir = manifest_path("../aft-tools/src");
     let engine_dir = manifest_path("../aft-engine/src");
+    let index_dir = manifest_path("../aft-index/src");
+    let edit_dir = manifest_path("../aft-edit/src");
     let subc_dir = manifest_path("../aft-subc/src");
     let parse_dir = manifest_path("../aft-parse/src");
     let base_dir = manifest_path("../aft-base/src");
     let mut paths = collect_rs_files(&tools_dir.join("commands"));
-    paths.extend(collect_rs_files(&engine_dir.join("search_state")));
-    paths.extend(collect_rs_files(&engine_dir.join("search_index")));
-    paths.push(engine_dir.join("data_layer/callgraph_store_adapter.rs"));
+    paths.extend(collect_rs_files(&index_dir.join("search_state")));
+    paths.extend(collect_rs_files(&index_dir.join("search_index")));
+    paths.push(index_dir.join("data_layer/callgraph_store_adapter.rs"));
     paths.push(engine_dir.join("bash_background/scoped_tasks.rs"));
     paths.push(engine_dir.join("bash_changed_files.rs"));
     paths.push(tools_dir.join("run_tool_call.rs"));
     paths.push(tools_dir.join("subc_format.rs"));
     paths.push(tools_dir.join("tool_output.rs"));
     paths.push(engine_dir.join("output_store.rs"));
-    paths.push(engine_dir.join("file_read_exact.rs"));
+    paths.push(edit_dir.join("file_read_exact.rs"));
     paths.push(subc_dir.join("subc/bind_log.rs"));
     paths.push(subc_dir.join("subc/diagnostics_findings.rs"));
     paths.push(engine_dir.join("runtime_drain.rs"));
@@ -2652,6 +2657,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         let file = registry_file_key(
             path.strip_prefix(&tools_dir)
                 .or_else(|_| path.strip_prefix(&engine_dir))
+                .or_else(|_| path.strip_prefix(&index_dir))
+                .or_else(|_| path.strip_prefix(&edit_dir))
                 .or_else(|_| path.strip_prefix(&subc_dir))
                 .or_else(|_| path.strip_prefix(&parse_dir))
                 .or_else(|_| path.strip_prefix(&base_dir))

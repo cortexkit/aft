@@ -63,13 +63,15 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     let manifest = crate::test_helpers::manifest_dir();
     let tools_dir = manifest.join("../aft-tools/src");
     let engine_dir = manifest.join("../aft-engine/src");
+    let index_dir = manifest.join("../aft-index/src");
+    let edit_dir = manifest.join("../aft-edit/src");
     let subc_dir = manifest.join("../aft-subc/src");
     let base_dir = manifest.join("../aft-base/src");
     let parse_dir = manifest.join("../aft-parse/src");
     let mut files_to_scan = collect_rs_files(&tools_dir.join("commands"));
-    files_to_scan.extend(collect_rs_files(&engine_dir.join("search_state")));
-    files_to_scan.extend(collect_rs_files(&engine_dir.join("search_index")));
-    files_to_scan.push(engine_dir.join("data_layer/callgraph_store_adapter.rs"));
+    files_to_scan.extend(collect_rs_files(&index_dir.join("search_state")));
+    files_to_scan.extend(collect_rs_files(&index_dir.join("search_index")));
+    files_to_scan.push(index_dir.join("data_layer/callgraph_store_adapter.rs"));
     files_to_scan.push(engine_dir.join("bash_background/scoped_tasks.rs"));
     files_to_scan.push(tools_dir.join("run_tool_call.rs"));
     files_to_scan.push(tools_dir.join("subc_format.rs"));
@@ -77,16 +79,16 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
     files_to_scan.push(subc_dir.join("subc/diagnostics_findings.rs"));
     // Remote downloads and the emergency rendered-reply ceiling also cut
     // bytes and must remain registered even though they are not list payloads.
-    files_to_scan.push(engine_dir.join("url_fetch.rs"));
+    files_to_scan.push(base_dir.join("url_fetch.rs"));
     files_to_scan.push(tools_dir.join("response_finalize.rs"));
     files_to_scan.push(tools_dir.join("tool_output.rs"));
     files_to_scan.push(engine_dir.join("output_store.rs"));
-    files_to_scan.push(engine_dir.join("file_read_exact.rs"));
+    files_to_scan.push(edit_dir.join("file_read_exact.rs"));
     files_to_scan.push(engine_dir.join("runtime_drain.rs"));
     files_to_scan.push(engine_dir.join("parent_search/mod.rs"));
     files_to_scan.push(parse_dir.join("parser/todo_markers.rs"));
     files_to_scan.push(parse_dir.join("parser/dead_code_facts.rs"));
-    files_to_scan.push(engine_dir.join("edit.rs"));
+    files_to_scan.push(edit_dir.join("edit.rs"));
     files_to_scan.push(engine_dir.join("bash_permissions/scan.rs"));
     files_to_scan.extend(collect_rs_files(&base_dir.join("compress")));
 
@@ -115,6 +117,8 @@ pub fn discover_list_cutting_sites() -> Vec<DiscoveredCut> {
         let rel_path = registry_file_key(
             file.strip_prefix(&tools_dir)
                 .or_else(|_| file.strip_prefix(&engine_dir))
+                .or_else(|_| file.strip_prefix(&index_dir))
+                .or_else(|_| file.strip_prefix(&edit_dir))
                 .or_else(|_| file.strip_prefix(&subc_dir))
                 .or_else(|_| file.strip_prefix(&base_dir))
                 .or_else(|_| file.strip_prefix(&parse_dir))
