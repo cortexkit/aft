@@ -1,8 +1,14 @@
 {
+  "slice_class": "engine_unwired",
   "targeted_mechanism": "none",
   "kind": "harness",
-  "slice_class": "non_ranking",
   "fixtures": [
-    "harness-goldens"
-  ]
+    "crates/aft/tests/integration/tool_call_parity_test.rs",
+    "crates/aft/src/commands/semantic_search/mod.rs",
+    "crates/aft-base/src/ort_pin.rs"
+  ],
+  "slices": [
+    "batch-24"
+  ],
+  "note": "The ranking fence hits are crates/aft/src/commands/semantic_search/mod.rs and crates/aft-base/src/ort_pin.rs (issue #1493). The search lane status footer now says when the meaning lane is paused for low disk space or waiting for the ONNX Runtime download, and an invalid cached ONNX Runtime is repaired instead of refused. Query routing, lane plans, scoring and ranked rows are unchanged; ranked rows must remain byte-identical to the committed reference."
 }
