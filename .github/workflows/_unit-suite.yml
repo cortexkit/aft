@@ -93,9 +93,10 @@ jobs:
           python3 crates/aft-engine/checks/github-fixture-copies.py
       - name: Audit packaged library test inputs
         run: |
-          cargo check --locked -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-index -p aft-inspect -p aft-tools -p aft-subc --lib \
+          cargo check --locked -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-github -p aft-index -p aft-inspect -p aft-tools -p aft-subc --lib \
             --features aft-base/test-hooks,aft-base/test-support,aft-db/test-hooks,aft-db/test-support \
             --features aft-edit/test-hooks,aft-edit/test-support,aft-index/test-hooks,aft-index/test-support \
+            --features aft-github/test-hooks,aft-github/test-support \
             --features aft-inspect/test-hooks,aft-inspect/test-support \
             --features aft-engine/test-support,aft-engine/test-hooks,aft-tools/test-support,aft-tools/test-hooks,aft-subc/test-hooks,aft-subc/test-runner-notice-fixtures \
             --message-format=json > "$RUNNER_TEMP/aft-engine-packaged-build.jsonl"
@@ -552,9 +553,10 @@ jobs:
         run: cargo build --features wasm-grammars -p agent-file-tools --bin aft
       - name: Run worker broker host policy and rendered socket rule regressions
         run: |
-          broker=(--features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-subc --lib -- gh_shim)
+          broker=(--features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-github -p aft-subc --lib -- gh_shim)
           seatbelt=(--features wasm-grammars,test-hooks -p aft-tools --lib -- gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition)
           broker_listing="$(cargo test "${broker[@]}" --list)"
+          [[ "$broker_listing" == *"gh_shim_worker_broker::tests::gh_shim_broker_reply_shapes_keep_the_decoder_contract: test"* ]] || { echo 'missing aft-github worker broker regression' >&2; exit 1; }
           [[ "$broker_listing" == *"subc::gh_relay_wait::gh_shim_relay_tests::cancellation_and_drain_interrupt_the_reply_wait_with_one_terminal: test"* ]] || { echo 'missing aft-subc worker broker regression' >&2; exit 1; }
           seatbelt_listing="$(cargo test "${seatbelt[@]}" --list)"
           [[ "$seatbelt_listing" == *"gh_shim_broker_seatbelt_root_uses_the_shared_namespace_definition: test"* ]] || { echo 'missing aft-tools seatbelt regression' >&2; exit 1; }

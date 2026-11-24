@@ -862,16 +862,18 @@ class EngineUnwiredGateTests(unittest.TestCase):
                 self.assertEqual(resolved["slice_class"], "engine_unwired")
                 self.assertFalse(missing_ranking)
 
-        path = "crates/aft-inspect/src/lib.rs"
-        self.assertTrue((root / path).is_file())
         descriptor = json.loads(descriptor_path.with_name("crate-split-step5.json").read_text())
         self.assertIn("harness-goldens", descriptor["fixtures"])
-        derived, missing_ranking = resolve_descriptor(None, [path])
-        self.assertEqual(derived["slice_class"], "ranking")
-        self.assertTrue(missing_ranking)
-        resolved, missing_ranking = resolve_descriptor(descriptor, [path])
-        self.assertEqual(resolved["slice_class"], "engine_unwired")
-        self.assertFalse(missing_ranking)
+        for crate in ("aft-inspect", "aft-github"):
+            path = f"crates/{crate}/src/lib.rs"
+            with self.subTest(path=path):
+                self.assertTrue((root / path).is_file())
+                derived, missing_ranking = resolve_descriptor(None, [path])
+                self.assertEqual(derived["slice_class"], "ranking")
+                self.assertTrue(missing_ranking)
+                resolved, missing_ranking = resolve_descriptor(descriptor, [path])
+                self.assertEqual(resolved["slice_class"], "engine_unwired")
+                self.assertFalse(missing_ranking)
 
     def test_engine_unwired_rejects_a_non_ranking_diff_class(self) -> None:
         result = self.gate(self.score, ["scripts/telemetry/cost-gate.sh"])

@@ -18,7 +18,7 @@ SPEC = importlib.util.spec_from_file_location("workflow_gates", Path(__file__).w
 assert SPEC is not None and SPEC.loader is not None
 parser = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(parser)
-SPLIT_CRATES = ("aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc")
+SPLIT_CRATES = ("aft-edit", "aft-index", "aft-inspect", "aft-github", "aft-engine", "aft-tools", "aft-subc")
 PACKAGES = ["aft-tokenizer", "aft-secret-rules", "aft-store", "aft-base", "aft-db", "aft-parse", *SPLIT_CRATES, "agent-file-tools"]
 
 
@@ -136,7 +136,7 @@ with pathlib.Path("events").open("a") as log:
         return events
 
     def test_partial_publish_skips_existing_crates_and_continues_in_order(self):
-        already = (*PACKAGES[:2], "aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools")
+        already = (*PACKAGES[:2], "aft-edit", "aft-index", "aft-inspect", "aft-github", "aft-engine", "aft-tools")
         result, events = self.run_publish(already=already)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(events, self.publish_trace(PACKAGES, already=already))
@@ -154,22 +154,28 @@ with pathlib.Path("events").open("a") as log:
     def test_engine_only_tag_retries_without_tools_or_daemon(self):
         result, events = self.run_publish(tag="v0.68.0", split_crates=("aft-engine",))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-edit", "aft-index", "aft-inspect", "aft-tools", "aft-subc")]))
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-edit", "aft-index", "aft-inspect", "aft-github", "aft-tools", "aft-subc")]))
 
     def test_pre_edit_tag_retries_without_edit(self):
         result, events = self.run_publish(split_crates=("aft-engine", "aft-tools", "aft-subc"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-edit", "aft-index", "aft-inspect")]))
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-edit", "aft-index", "aft-inspect", "aft-github")]))
 
     def test_pre_index_tag_retries_without_index(self):
         result, events = self.run_publish(split_crates=("aft-edit", "aft-engine", "aft-tools", "aft-subc"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-index", "aft-inspect")]))
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-index", "aft-inspect", "aft-github")]))
 
     def test_pre_inspect_tag_retries_without_inspect(self):
         result, events = self.run_publish(split_crates=("aft-edit", "aft-index", "aft-engine", "aft-tools", "aft-subc"))
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name != "aft-inspect"]))
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name not in ("aft-inspect", "aft-github")]))
+
+    def test_pre_github_tag_retries_without_github(self):
+        legacy_crates = tuple(name for name in SPLIT_CRATES if name != "aft-github")
+        result, events = self.run_publish(split_crates=legacy_crates)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(events, self.publish_trace([name for name in PACKAGES if name != "aft-github"]))
 
     def test_engine_tag_without_its_engine_manifest_cannot_publish(self):
         result, events = self.run_publish(tag="v0.68.0", split_crates=("aft-engine",), missing=("aft-engine",))
@@ -198,6 +204,10 @@ aft-index = { path = "../aft-index", version = "1.2.3" }
             ("aft-inspect", "crates/aft-engine/Cargo.toml", '''
 [dependencies]
 aft-inspect = { path = "../aft-inspect", version = "1.2.3" }
+'''),
+            ("aft-github", "crates/aft-engine/Cargo.toml", '''
+[dependencies]
+aft-github = { path = "../aft-github", version = "1.2.3" }
 '''),
             ("aft-tools", "Cargo.toml", '[workspace]\nmembers = ["crates/aft-tools"]\n'),
             ("aft-subc", "crates/aft-engine/Cargo.toml", '''

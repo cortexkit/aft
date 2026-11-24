@@ -19,7 +19,7 @@ import sys
 import tomllib
 
 missing = {}
-for crate in ("aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc"):
+for crate in ("aft-edit", "aft-index", "aft-inspect", "aft-github", "aft-engine", "aft-tools", "aft-subc"):
     manifest = Path("crates") / crate / "Cargo.toml"
     if not manifest.is_file():
         missing[crate] = manifest
@@ -95,6 +95,11 @@ if [[ -f crates/aft-inspect/Cargo.toml ]]; then
   sleep 30
   cargo publish --package aft-inspect \
     || { ec=$?; cargo publish --package aft-inspect --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
+fi
+if [[ -f crates/aft-github/Cargo.toml ]]; then
+  sleep 30
+  cargo publish --package aft-github \
+    || { ec=$?; cargo publish --package aft-github --dry-run 2>&1 | grep -q "already exists" && true || exit $ec; }
 fi
 if [[ -f crates/aft-engine/Cargo.toml ]]; then
   sleep 30

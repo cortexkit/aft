@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
-PACKAGED_CRATES = ("aft-edit", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc")
+PACKAGED_CRATES = ("aft-edit", "aft-github", "aft-index", "aft-inspect", "aft-engine", "aft-tools", "aft-subc")
 CRATES = ("aft-base", "aft-db", "aft-parse", *PACKAGED_CRATES)
 lexer = runpy.run_path(str(ROOT / "scripts/check-file-sizes.py"))
 tokens, group_end = lexer["tokens"], lexer["group_end"]

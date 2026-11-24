@@ -203,7 +203,7 @@ jobs:
 
       - name: ARM64 compile with Pulley
         run: |
-          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-index -p aft-inspect --features test-hooks --tests --target aarch64-pc-windows-msvc
+          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-github -p aft-index -p aft-inspect --features test-hooks --tests --target aarch64-pc-windows-msvc
           cargo tree --features wasm-grammars --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path

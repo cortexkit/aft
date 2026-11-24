@@ -226,7 +226,7 @@ cargo fmt --check 2>&1 || { echo "Error: cargo fmt --check failed (run 'cargo fm
 echo "  crates.io package sizes..."
 crate_limit=$((10 * 1024 * 1024))
 crate_dir=$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')/package
-release_crates=(aft-tokenizer aft-secret-rules aft-store aft-base aft-db aft-parse aft-edit aft-index aft-inspect aft-engine aft-tools aft-subc agent-file-tools)
+release_crates=(aft-tokenizer aft-secret-rules aft-store aft-base aft-db aft-parse aft-edit aft-index aft-inspect aft-github aft-engine aft-tools aft-subc agent-file-tools)
 # Package the crates in one command: a crate whose path dependency is not on
 # crates.io yet (aft-store before its first release) only packages when cargo
 # resolves that dependency from the other packages in the same run, as the
