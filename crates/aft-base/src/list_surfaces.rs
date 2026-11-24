@@ -602,6 +602,12 @@ pub static EXCLUSIONS: &[ExclusionEntry] = &[
         reason: "Process-local display pull copies have bounded count, bytes and retention; early pressure eviction is counted in bus health and missing records return the protocol's unknown refusal, not a truncated tool result.",
     },
     ExclusionEntry {
+        file: "subc/rich_ui/session_reads.rs",
+        enclosing_item: "versions::remember",
+        location_or_primitive: "MAX_VERSIONS, pop_back",
+        reason: "Internal file classification cache only; evicted versions are revalidated in full and no file result is shortened.",
+    },
+    ExclusionEntry {
         file: "subc/rich_ui/display.rs",
         enclosing_item: "register",
         location_or_primitive: "calls.len() >= 64",
