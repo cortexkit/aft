@@ -65,11 +65,16 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft-engine/src/search_index.rs",
     "crates/aft-engine/src/search_index/exact_lane.rs",
     "crates/aft-engine/src/search_state/",
+    "crates/aft-index/src/search_index.rs",
+    "crates/aft-index/src/search_index/exact_lane.rs",
+    "crates/aft-index/src/search_state/",
     "crates/aft/src/query_shape.rs",
     "crates/aft-base/src/query_shape.rs",
     "crates/aft/src/semantic_index.rs",
     "crates/aft-engine/src/semantic_index.rs",
+    "crates/aft-index/src/semantic_index.rs",
     "crates/aft-base/src/ort_pin.rs",
+    "crates/aft-index/src/ort_pin.rs",
     "crates/aft/src/embed/",
     "crates/aft/src/lib.rs",
     "crates/aft-tools/src/lib.rs",
@@ -78,11 +83,13 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft-db/src/lib.rs",
     "crates/aft-parse/src/lib.rs",
     "crates/aft-edit/src/lib.rs",
+    "crates/aft-index/src/lib.rs",
     # The shape router, lane plans and token variants decide which lanes a
     # query runs and which candidates they produce, so a change there moves
     # search results just as a scoring change does.
     "crates/aft/src/search_b2/",
     "crates/aft-engine/src/search_b2/",
+    "crates/aft-index/src/search_b2/",
     # The semantic index chunks each file on the symbols parser.rs extracts:
     # its grammars, queries and extractors decide which symbols exist and
     # which lines each one spans, and those lines become the chunk text that

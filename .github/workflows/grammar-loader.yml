@@ -38,10 +38,10 @@ jobs:
           if cmake --version; then exit 1; fi
           rm -f "$AFT_NO_CMAKE_MARKER"
           cargo check --locked -p agent-file-tools
-          listing="$(cargo test --locked -p agent-file-tools -p aft-engine -p aft-base -p aft-db --features test-hooks --lib -- grammar_disabled_ --list)"
+          listing="$(cargo test --locked -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-index --features test-hooks --lib -- grammar_disabled_ --list)"
           [[ "$listing" == *"grammar_disabled_build_refuses_without_touching_storage: test"* ]] || { echo 'missing disabled grammar build test' >&2; exit 1; }
-          cargo test --locked -p agent-file-tools -p aft-engine -p aft-base -p aft-db --features test-hooks --lib -- grammar_disabled_
-          args=(--locked -p aft-engine --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact)
+          cargo test --locked -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-index --features test-hooks --lib -- grammar_disabled_
+          args=(--locked -p aft-index --features test-hooks --lib -- data_layer::content::tests::grammar_unavailable_survives_the_content_record_boundary --exact)
           listing="$(cargo test "${args[@]}" --list)"
           [[ "$listing" == *"grammar_unavailable_survives_the_content_record_boundary: test"* ]] || { echo 'missing grammar content boundary test' >&2; exit 1; }
           cargo test "${args[@]}"
@@ -110,9 +110,10 @@ jobs:
 
       - name: Loader state and compile tests
         run: |
-          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-edit -p aft-tools --lib -- grammar_)
+          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-base -p aft-db -p aft-edit -p aft-index -p aft-tools --lib -- grammar_)
           listing="$(cargo test "${args[@]}" --list)"
           [[ "$listing" == *"extract::tests::grammar_refactor_body_failures_are_not_silently_unchanged_or_conflict_free: test"* ]] || { echo 'missing aft-edit grammar loader tests' >&2; exit 1; }
+          [[ "$listing" == *"grammar::runtime::tests::grammar_engine_is_fixed_to_pulley_on_every_platform: test"* ]] || { echo 'missing aft-index grammar loader tests' >&2; exit 1; }
           [[ "$listing" == *"commands::grammar_tests::luau_s4_round4_non_luau_failures_preserve_main_search_contract: test"* ]] || { echo 'missing aft-tools grammar loader tests' >&2; exit 1; }
           cargo test "${args[@]}"
       - name: Process restart and concurrent publication
@@ -127,18 +128,19 @@ jobs:
           if [[ "$RUNNER_OS" != macOS ]]; then
             export AFT_S4_NO_LUAU_PARITY=luau-ci
           fi
-          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-tools --lib -- luau_s)
+          args=(--locked --features wasm-grammars,test-hooks -p agent-file-tools -p aft-engine -p aft-index -p aft-tools --lib -- luau_s)
           listing="$(cargo test "${args[@]}" --list)"
+          [[ "$listing" == *"luau::tests::luau_s3_symbols_and_content_record_use_the_builtin_extraction_path: test"* ]] || { echo 'missing aft-index Luau extraction tests' >&2; exit 1; }
           [[ "$listing" == *"commands::grammar_tests::luau_s4_round4_non_luau_failures_preserve_main_search_contract: test"* ]] || { echo 'missing aft-tools Luau extraction tests' >&2; exit 1; }
           cargo test "${args[@]}"
-      # The no-Luau parity half needs a second, feature-less debug build of the
-      # whole crate. On GitHub's macOS runners that third build would push the
+      # The no-Luau parity half needs a second debug build of aft-index without
+      # wasm-grammars. On GitHub's macOS runners that third build would push the
       # job past its time limit, and the parity it checks doesn't depend on the
       # OS, so it runs on Linux and Windows; macOS still runs every Luau test.
       - name: No-Luau index-store parity
         if: runner.os != 'macOS' && matrix.os != 'windows-11-arm'
         run: |
-          args=(--locked -p aft-engine --features test-hooks --lib -- luau_s4_no_luau_luaurc_parity)
+          args=(--locked -p aft-index --features test-hooks --lib -- luau_s4_no_luau_luaurc_parity)
           listing="$(cargo test "${args[@]}" --list)"
           [[ "$listing" == *"luau_s4_no_luau_luaurc_parity: test"* ]] || { echo 'missing no-Luau index-store parity test' >&2; exit 1; }
           AFT_S4_NO_LUAU_PARITY=luau-ci cargo test "${args[@]}"
@@ -200,7 +202,7 @@ jobs:
 
       - name: ARM64 compile with Pulley
         run: |
-          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine --features test-hooks --tests --target aarch64-pc-windows-msvc
+          cargo check --features wasm-grammars --locked -p agent-file-tools -p aft-base -p aft-db -p aft-edit -p aft-engine -p aft-index --features test-hooks --tests --target aarch64-pc-windows-msvc
           cargo tree --features wasm-grammars --locked -p agent-file-tools --target aarch64-pc-windows-msvc --edges normal,build --prefix none > grammar-arm-dependencies.txt
           python3 - <<'PY'
           from pathlib import Path

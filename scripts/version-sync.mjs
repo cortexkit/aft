@@ -262,6 +262,7 @@ const basePath = join(root, "crates", "aft-base", "Cargo.toml");
 const dbPath = join(root, "crates", "aft-db", "Cargo.toml");
 const parsePath = join(root, "crates", "aft-parse", "Cargo.toml");
 const editPath = join(root, "crates", "aft-edit", "Cargo.toml");
+const indexPath = join(root, "crates", "aft-index", "Cargo.toml");
 const enginePath = join(root, "crates", "aft-engine", "Cargo.toml");
 const toolsPath = join(root, "crates", "aft-tools", "Cargo.toml");
 const subcPath = join(root, "crates", "aft-subc", "Cargo.toml");
@@ -269,6 +270,7 @@ results.push(updateCargoToml(basePath, version, dryRun));
 results.push(updateCargoToml(dbPath, version, dryRun));
 results.push(updateCargoToml(parsePath, version, dryRun));
 results.push(updateCargoToml(editPath, version, dryRun));
+results.push(updateCargoToml(indexPath, version, dryRun));
 results.push(updateCargoToml(enginePath, version, dryRun));
 results.push(updateCargoToml(toolsPath, version, dryRun));
 results.push(updateCargoToml(subcPath, version, dryRun));
@@ -281,7 +283,10 @@ results.push(updateCargoPathDep(parsePath, "aft-store", version, dryRun));
 for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store"]) {
   results.push(updateCargoPathDep(editPath, dep, version, dryRun));
 }
-for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules"]) {
+for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-parse", "aft-store", "secret-rules"]) {
+  results.push(updateCargoPathDep(indexPath, dep, version, dryRun));
+}
+for (const dep of ["aft-base", "aft-db", "aft-edit", "aft-index", "aft-parse", "aft-store", "aft-tokenizer", "secret-rules"]) {
   results.push(updateCargoPathDep(enginePath, dep, version, dryRun));
 }
 for (const dep of ["aft-base", "aft-db", "aft-parse", "aft-store", "secret-rules"]) {
