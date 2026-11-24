@@ -303,12 +303,15 @@ struct GithubReadEngineState {
     flights: BTreeMap<GithubReadFlightSlot, Vec<GithubReadFlightWaiter>>,
 }
 
+/// Which repository a shorthand (`issue://42`) read in one checkout resolved
+/// to last. Repository resolution depends on the checkout, not on who reads,
+/// so the key carries no identity and the map grows only with distinct
+/// resources read, not with sessions.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct ShortResourceAlias {
     kind: GithubResourceKind,
     number: u64,
     working_directory: PathBuf,
-    authentication_identity_hash: [u8; 32],
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -320,11 +323,13 @@ struct CacheSlot {
 }
 
 /// A resolved resource can share a flight across equivalent explicit forms.
-/// An unresolved short form stays scoped to its worktree until GitHub resolves it.
+/// A shorthand read stays in its own flight, keyed by checkout and reader,
+/// because the repository it names is only known once `gh` answers: the
+/// last-seen alias may be stale (the checkout's default repository changed).
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GithubReadFlightSlot {
     Resolved(CacheSlot),
-    Unresolved(ShortResourceAlias),
+    Unresolved(ShortResourceAlias, [u8; 32]),
 }
 
 struct GithubReadFlightWaiter {
@@ -524,9 +529,16 @@ impl GithubReadEngine {
     }
 
     fn flight_slot_for_request(&self, request: &GithubReadRequest) -> GithubReadFlightSlot {
-        self.resolved_cache_slot(request)
-            .map(GithubReadFlightSlot::Resolved)
-            .unwrap_or_else(|| GithubReadFlightSlot::Unresolved(short_alias(request)))
+        let identity = &request.effective_authentication_identity;
+        match &request.resource.repository {
+            Some(repository) => {
+                GithubReadFlightSlot::Resolved(cache_slot(&request.resource, repository, identity))
+            }
+            None => GithubReadFlightSlot::Unresolved(
+                short_alias(request),
+                authentication_identity_hash(identity),
+            ),
+        }
     }
 
     fn defer_fetch(
@@ -786,9 +798,6 @@ fn short_alias(request: &GithubReadRequest) -> ShortResourceAlias {
         kind: request.resource.kind,
         number: request.resource.number,
         working_directory: request.working_directory.clone(),
-        authentication_identity_hash: authentication_identity_hash(
-            &request.effective_authentication_identity,
-        ),
     }
 }
 
@@ -1621,6 +1630,113 @@ mod tests {
             }
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// Holds its first fetch until released. A shorthand read resolves to
+    /// `team/new`, the checkout's current default repository.
+    struct RepositoryFetcher {
+        calls: AtomicUsize,
+        started: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    }
+
+    impl GithubFetcher for RepositoryFetcher {
+        fn fetch(&self, request: &GithubFetchRequest) -> Result<GithubDocument, GithubReadError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self.started.send(());
+            if let Some(release) = self.release.lock().take() {
+                release.recv().expect("release live fetch");
+            }
+            Ok(GithubDocument {
+                repository: request
+                    .resource
+                    .repository
+                    .clone()
+                    .unwrap_or_else(|| "team/new".to_string()),
+                kind: GithubDocumentKind::Issue,
+                number: request.resource.number,
+                title: "fixture".to_string(),
+                state: "OPEN".to_string(),
+                ..GithubDocument::default()
+            })
+        }
+    }
+
+    fn fetched_text(start: GithubReadStart) -> String {
+        match start {
+            GithubReadStart::Deferred(deferred) => wait_for(deferred).unwrap().content,
+            GithubReadStart::Immediate(_) => panic!("live reads must be deferred"),
+        }
+    }
+
+    #[test]
+    fn a_stale_shorthand_alias_does_not_join_another_repositorys_live_fetch() {
+        let (started_tx, started_rx) = std::sync::mpsc::sync_channel(8);
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        let fetcher = Arc::new(RepositoryFetcher {
+            calls: AtomicUsize::new(0),
+            started: started_tx,
+            release: Mutex::new(Some(release_rx)),
+        });
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            fetcher.clone(),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        // An earlier shorthand read here resolved to team/old; the checkout's
+        // default repository has since changed to team/new.
+        let shorthand =
+            GithubReadRequest::parse("issue://42", "/fixture", "identity", None).unwrap();
+        engine
+            .state
+            .lock()
+            .aliases
+            .insert(short_alias(&shorthand), "team/old".to_string());
+
+        let explicit = engine
+            .start(
+                &enabled_gh_read(),
+                GithubReadRequest::parse("issue://team/old/42", "/fixture", "identity", None)
+                    .unwrap(),
+                GithubReadSelector::default(),
+            )
+            .unwrap();
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("explicit live fetch started");
+        let shorthand = engine
+            .start(&enabled_gh_read(), shorthand, GithubReadSelector::default())
+            .unwrap();
+        release_tx.send(()).expect("release the explicit fetch");
+
+        assert!(fetched_text(explicit).contains("Repository: team/old\n"));
+        assert!(fetched_text(shorthand).contains("Repository: team/new\n"));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shorthand_aliases_do_not_grow_with_sessions() {
+        let engine = GithubReadEngine::new(
+            Arc::new(MemoryCache::default()),
+            Arc::new(FixtureFetcher::default()),
+            Arc::new(CountingDownloader::default()),
+            Arc::new(FixtureClock::new(2_000)),
+        );
+        for session in 0..100 {
+            let request = GithubReadRequest::parse(
+                "issue://1",
+                "/fixture",
+                format!("session:{session}"),
+                None,
+            )
+            .unwrap();
+            let start = engine
+                .start(&enabled_gh_read(), request, GithubReadSelector::default())
+                .unwrap();
+            fetched_text(start);
+        }
+        assert_eq!(engine.state.lock().aliases.len(), 1);
     }
 
     /// A gated fetcher whose live fetch stays running until the test lets it
