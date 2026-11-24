@@ -501,7 +501,7 @@ impl Guard {
 
 #[test]
 fn production_engine_sources_do_not_reach_the_upper_crate() {
-    let manifest = crate::test_helpers::manifest_dir();
+    let manifest = aft_base::test_support::manifest_dir();
     let root = manifest.join("src");
     let crates = manifest.join("..");
     let scope = Scope::default();

@@ -35,6 +35,10 @@ use crate::cold_build_limiter;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
+mod projection_fleet;
+pub use projection_fleet::DeadCodeSnapshotCensus;
+use projection_fleet::{dead_code_snapshot_census, projection_fleet, ProjectionSlot};
+
 fn inspect_category_is_off(
     config: &crate::config::InspectConfig,
     category: InspectCategory,
