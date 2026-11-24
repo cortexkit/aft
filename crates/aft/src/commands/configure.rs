@@ -8004,6 +8004,11 @@ mod tests {
     #[test]
     fn configure_refuses_nixfmt_under_other_language_keys() {
         let temp = tempfile::tempdir().unwrap();
+        // With a Cargo.toml in the project root, auto-detection would offer
+        // rustfmt for Rust; the is_empty() assertion below then also pins
+        // that refusing nixfmt contributes nothing rather than falling back
+        // to the detected formatter.
+        std::fs::write(temp.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
         let mut config = Config {
             project_root: Some(temp.path().to_path_buf()),
             ..Config::default()

@@ -6968,12 +6968,14 @@ const NIX_OUTLINE_DEPTH: usize = 1;
 /// Every child of a wide binding copies the parent name into two fields
 /// (`parent` and the one-element `scope_chain`), so a file with one long
 /// parent name and many small children retains about 2 × name length ×
-/// child count bytes: quadratically more than the file itself, which cold
-/// indexing would pay for a file even under the scanner's read limit. Four
-/// MiB per file — the read limit itself — leaves every real file whole (a
-/// normal outline keeps a small multiple of the file's own attr-path
-/// bytes) and caps the pathological one; past the bound the walk stops
-/// emitting, so the outline keeps its leading, exact portion.
+/// child count bytes — a factor that grows with `NIX_OUTLINE_DEPTH` as
+/// children copy the whole scope chain — quadratically more than the file
+/// itself, which cold indexing would pay for a file even under the
+/// scanner's read limit. Four MiB per file — the read limit itself —
+/// leaves every real file whole (a normal outline keeps a small multiple
+/// of the file's own attr-path bytes) and caps the pathological one; past
+/// the bound the walk stops emitting, so the outline keeps its leading,
+/// exact portion.
 const NIX_OUTLINE_NAME_BUDGET: usize = 4 << 20;
 
 /// Read an `attrpath` node as the dotted name written in the source.

@@ -2850,7 +2850,13 @@ mod tests {
 
         // nixfmt formats only Nix: the same value under another language's
         // key must contribute no candidate, not run nixfmt over that file.
+        // The Cargo.toml below makes auto-detection a live rustfmt candidate,
+        // so a refusal that silently fell through to detection instead of
+        // contributing nothing would surface rustfmt and trip is_empty().
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"t\"\n").unwrap();
         let mut cross = crate::config::Config::default();
+        cross.project_root = Some(root.path().to_path_buf());
         cross
             .formatter
             .insert("rust".to_string(), "nixfmt".to_string());
@@ -2861,7 +2867,7 @@ mod tests {
                 std::path::Path::new("lib.rs"),
             )
             .is_empty(),
-            "nixfmt must be refused for Rust"
+            "nixfmt must be refused for Rust, without falling back to rustfmt"
         );
     }
 
