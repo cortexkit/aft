@@ -958,7 +958,7 @@ fn auto_migrate_user_config_with_reader(
         Ok(path) => path,
         Err(error) => {
             return not_migrated(
-                format!("resolve source at /: {error}"),
+                format!("resolve source at {}: {error}", source.display()),
                 translation.as_ref(),
                 &text,
             )
@@ -971,7 +971,10 @@ fn auto_migrate_user_config_with_reader(
     };
     if actual.ends_with(Path::new(".cortexkit").join("aft.jsonc")) {
         return not_migrated(
-            "refused to replace a project settings file at /".to_string(),
+            format!(
+                "refused to replace a project settings file at {}",
+                actual.display()
+            ),
             translation.as_ref(),
             &text,
         );
@@ -992,7 +995,7 @@ fn auto_migrate_user_config_with_reader(
         Ok(metadata) => metadata.permissions(),
         Err(error) => {
             return not_migrated(
-                format!("inspect source at /: {error}"),
+                format!("inspect source at {}: {error}", actual.display()),
                 translation.as_ref(),
                 &text,
             )
@@ -1004,7 +1007,7 @@ fn auto_migrate_user_config_with_reader(
         LockAttempt::Busy => return None,
         LockAttempt::Failed(error) => {
             return not_migrated(
-                format!("lock source at /: {error}"),
+                format!("lock source at {}: {error}", actual.display()),
                 translation.as_ref(),
                 &text,
             );
@@ -1021,7 +1024,7 @@ fn auto_migrate_user_config_with_reader(
         Ok(text) => text,
         Err(error) => {
             return not_migrated(
-                format!("read source at /: {error}"),
+                format!("read source at {}: {error}", actual.display()),
                 translation.as_ref(),
                 &text,
             )
@@ -1036,11 +1039,12 @@ fn auto_migrate_user_config_with_reader(
         Ok(_) => return None,
         Err(error) => return not_migrated(error, translation.as_ref(), &text),
     };
-    let backup = match write_backup(&backup_dir(), &text) {
+    let backup_dir = backup_dir();
+    let backup = match write_backup(&backup_dir, &text) {
         Ok(backup) => backup,
         Err(error) => {
             return not_migrated(
-                format!("write old copy at /: {error}"),
+                format!("write old copy at {}: {error}", backup_dir.display()),
                 translation.as_ref(),
                 &text,
             );
@@ -1058,7 +1062,7 @@ fn auto_migrate_user_config_with_reader(
     };
     if let Err(error) = publish() {
         let cleanup = fs::remove_file(&backup);
-        let mut reason = format!("publish settings at /: {error}");
+        let mut reason = format!("publish settings at {}: {error}", target.display());
         if let Err(error) = cleanup {
             reason.push_str(&format!("; could not remove {}: {error}", backup.display()));
         }
@@ -1068,7 +1072,7 @@ fn auto_migrate_user_config_with_reader(
     // yet. Keep the backup if syncing fails, and don't remove a legacy source.
     if let Err(error) = crate::durability::sync_dir(parent) {
         return not_migrated(
-            format!("publish settings at /: {error}"),
+            format!("publish settings at {}: {error}", target.display()),
             translation.as_ref(),
             &text,
         );

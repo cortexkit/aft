@@ -1470,3 +1470,28 @@ fn stale_migration_lock_removal_cannot_take_a_fresh_lock() {
     drop(first);
     assert!(!lock.exists(), "the holder's lock is released on drop");
 }
+
+#[test]
+fn config_migration_failure_reason_names_the_settings_file() {
+    let _release = feature_config::override_running_release_for_test((0, 64));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aft.jsonc");
+    fs::write(&path, TRANSLATED_USER_FILE).unwrap();
+    let outcome = auto_migrate_user_config_with_writer(&path, |_, _, _, _| {
+        Err(io::Error::other("injected publish failure"))
+    })
+    .expect("reported failure");
+    let UserConfigMigration::NotMigrated { reason, notice, .. } = &outcome else {
+        panic!("a failed publish must be reported: {outcome:?}");
+    };
+    let target = fs::canonicalize(&path).unwrap();
+    assert!(!reason.contains(" at /:"), "{reason}");
+    assert!(
+        reason.contains(&format!(
+            "publish settings at {}: injected publish failure",
+            target.display()
+        )),
+        "{reason}"
+    );
+    assert!(!notice.contains(" at /:"), "{notice}");
+}
