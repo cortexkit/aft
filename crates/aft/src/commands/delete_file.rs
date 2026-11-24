@@ -441,7 +441,9 @@ fn handle_delete_file_with_skip(
                 }
                 Err(DeleteError::Failed(resp)) => skipped.push(serde_json::json!({
                     "file": file,
-                    "reason": resp.data.get("message").and_then(|v| v.as_str()).unwrap_or("delete failed"),
+                    "reason": batch_reason(
+                        resp.data.get("message").and_then(|v| v.as_str()).unwrap_or("delete failed"),
+                    ),
                     "details": resp.data,
                 })),
             }
@@ -523,6 +525,33 @@ enum DeleteError {
 impl From<Response> for DeleteError {
     fn from(response: Response) -> Self {
         DeleteError::Failed(response)
+    }
+}
+
+/// A failed target's reason for its `skipped_files` entry. The failure
+/// message is written for single-file mode, so it starts with the command
+/// name and names the path. Batch output already prints the path before the
+/// reason, so both are dropped here: the reason for a missing file reads
+/// "file not found", not the path twice. Only the first quoted path is
+/// removed; a path that itself contains a quote leaves the message as it was
+/// up to that point, which is still readable.
+fn batch_reason(message: &str) -> String {
+    let message = message.strip_prefix("delete_file: ").unwrap_or(message);
+    if message.starts_with("file not found: ") {
+        return "file not found".to_string();
+    }
+    let Some(open) = message.find('\'') else {
+        return message.to_string();
+    };
+    let Some(len) = message[open + 1..].find('\'') else {
+        return message.to_string();
+    };
+    let before = message[..open].trim_end();
+    let after = message[open + len + 2..].trim_start();
+    match (before.is_empty(), after.starts_with([':', '.'])) {
+        (true, _) => after.to_string(),
+        (false, true) => format!("{before}{after}"),
+        (false, false) => format!("{before} {after}"),
     }
 }
 
