@@ -12,12 +12,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(backups: bool) -> Self {
-        let root = tempfile::tempdir().unwrap();
+        Self::start(backups, tempfile::tempdir().unwrap(), "project")
+    }
+
+    fn start(backups: bool, root: tempfile::TempDir, project: &str) -> Self {
         let home = root.path().join("home");
         let xdg_data = root.path().join("xdg-data");
-        let project = root.path().join("project");
-        fs::create_dir(&project).unwrap();
-        fs::create_dir(&home).unwrap();
+        let project = root.path().join(project);
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&home).unwrap();
         fs::create_dir(&xdg_data).unwrap();
         let aft = AftProcess::spawn_with_env(&[
             ("HOME", home.as_os_str()),
@@ -109,8 +112,13 @@ fn cortexkit_data_file_tools_apply_normal_access_and_keep_exceptions() {
 
 #[test]
 fn cortexkit_data_recursive_delete_refuses_first_protected_entry_before_mutating() {
+    // System-temp trees have an independent SQLite guard, so place the project
+    // outside that tier to exercise the CortexKit data floor in both delete walks.
+    let parent = crate::test_helpers::manifest_dir().join("../../target/scratch/cortexkit-data");
+    fs::create_dir_all(&parent).unwrap();
     for backups in [true, false] {
-        let mut f = Fixture::new(backups);
+        let root = tempfile::tempdir_in(&parent).unwrap();
+        let mut f = Fixture::start(backups, root, "home/.local/share/cortexkit/module");
         let tree = f.roots()[0].join("module/tree");
         let ordinary = tree.join("notes.txt");
         let protected = tree.join("nested/caps.db");
