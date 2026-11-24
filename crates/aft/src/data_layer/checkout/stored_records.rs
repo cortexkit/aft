@@ -1,6 +1,6 @@
 //! Content lookup shared by cold builds and call-graph refreshes.
 
-use super::{known_sections, Checkout, DataError};
+use super::{known_sections, Checkout, DataError, Extracted};
 use aft_store::content::{ContentRecord, ContentSegment, EncodedRecord, RecordKey};
 use aft_store::family::Snapshot;
 use aft_store::segment::Segment;
@@ -47,6 +47,27 @@ impl Checkout {
         let mut stored = self.family_records()?;
         stored.pending = self.ready_change_records();
         Ok(stored)
+    }
+
+    /// A cold scan can reuse content already extracted by an aborted update.
+    /// Reading this cache must not start parsing: a batch rejected before
+    /// extraction should reach the cold scan unparsed. The scan looks up each
+    /// record by its on-disk content and extractor key.
+    fn ready_change_records(&self) -> HashMap<String, Arc<EncodedRecord>> {
+        #[cfg(feature = "test-hooks")]
+        if std::env::var_os("PROBE_SKIP_HANDOFF").is_some() {
+            return HashMap::new();
+        }
+        self.live
+            .read()
+            .expect("no panics while holding it")
+            .changes
+            .values()
+            .filter_map(|change| match change.content.peek() {
+                Some(Extracted::Parse(key, _, record)) => Some((key.clone(), Arc::clone(record))),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Opens the newest generation before extracting any files. Unusable

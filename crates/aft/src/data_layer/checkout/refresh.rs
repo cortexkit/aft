@@ -4,6 +4,8 @@ use crate::data_layer::refresh_probe;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
+#[cfg(all(test, target_os = "linux"))]
+mod reuse_measure;
 #[cfg(test)]
 mod tests;
 
@@ -82,7 +84,9 @@ impl Checkout {
             Some(&self.root),
         );
         checkpoint()?;
-        let result = self.refresh_inner(by_build, guard);
+        let result = self.refresh_inner(by_build, guard, || {
+            self.family_records().unwrap_or_default()
+        });
         self.touch_memory();
         self.note_outcome("refresh", &result);
         result
@@ -92,6 +96,7 @@ impl Checkout {
         &self,
         by_build: bool,
         guard: &RefreshMemory,
+        open_records: impl FnOnce() -> StoredRecords,
     ) -> Result<Option<UpdateStats>, DataError> {
         let (published, state, changes, covered, invalidated) = {
             let live = self.live.read().expect("no panics while holding it");
@@ -145,7 +150,7 @@ impl Checkout {
             .values()
             .any(|change| change.content.peek().is_none())
         {
-            self.family_records().unwrap_or_default()
+            open_records()
         } else {
             StoredRecords::default()
         };

@@ -2114,27 +2114,6 @@ impl Checkout {
         }))
     }
 
-    /// A cold scan can reuse content already extracted by an aborted update.
-    /// Reading this cache must not start parsing: a batch rejected before
-    /// extraction should reach the cold scan unparsed. The scan looks up each
-    /// record by its on-disk content and extractor key.
-    fn ready_change_records(&self) -> HashMap<String, Arc<EncodedRecord>> {
-        #[cfg(feature = "test-hooks")]
-        if std::env::var_os("PROBE_SKIP_HANDOFF").is_some() {
-            return HashMap::new();
-        }
-        self.live
-            .read()
-            .expect("no panics while holding it")
-            .changes
-            .values()
-            .filter_map(|change| match change.content.peek() {
-                Some(Extracted::Parse(key, _, record)) => Some((key.clone(), Arc::clone(record))),
-                _ => None,
-            })
-            .collect()
-    }
-
     /// Waits up to [`WRITER_WAIT`] for the store's writer, and refuses it
     /// below the free-disk floor. The store itself refuses it, before
     /// anything is written, when a newer build wrote a file the newest
@@ -5912,6 +5891,7 @@ impl Checkout {
             .filter_map(|segment| ContentSegment::open(segment).transpose())
             .collect::<Result<Vec<_>, _>>()
             .map_err(DataError::store)?;
+        let stored = std::cell::OnceCell::new();
         paths
             .iter()
             .map(|path| {
@@ -5954,6 +5934,10 @@ impl Checkout {
                 };
                 if *content != record.content {
                     return Ok(PathTodos::Missing);
+                }
+                if change.peek().is_none() {
+                    change
+                        .extract(stored.get_or_init(|| self.family_records().unwrap_or_default()));
                 }
                 Ok(match change.get() {
                     Extracted::Parse(_, _, stored)

@@ -233,6 +233,14 @@ fn refresh_reuses_config_comment_markers_without_parsing() {
         .unwrap();
     let (change, recorded) = changed_source(&checkout, path);
     let before = parses_of_for_test(source);
+    let markers = checkout
+        .todo_markers(
+            &checkout.view().unwrap(),
+            &[path.as_bytes().to_vec()],
+            u64::MAX,
+        )
+        .unwrap();
+    assert!(matches!(markers.as_slice(), [PathTodos::Recorded(Some(_))]));
     checkout.refresh_callgraph().unwrap().unwrap();
     assert_eq!(
         parses_of_for_test(source),
