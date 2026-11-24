@@ -204,8 +204,11 @@ fn cached_symbol_count(path: &Path, job: &crate::inspect::InspectJob) -> usize {
         .unwrap_or(0)
 }
 
+/// Same rule as `source_text::count_lines_bounded`: a trailing newline ends
+/// the last line rather than starting another, and an empty file has no lines.
 fn line_count_bytes(content: &[u8]) -> usize {
-    content.iter().filter(|byte| **byte == b'\n').count() + 1
+    let newlines = content.iter().filter(|byte| **byte == b'\n').count();
+    newlines + usize::from(content.last().is_some_and(|byte| *byte != b'\n'))
 }
 
 fn aggregate_metrics(project_root: &Path, per_file: &[FileMetric]) -> serde_json::Value {
@@ -317,6 +320,19 @@ mod tests {
     use std::sync::{Arc, RwLock};
 
     use super::*;
+
+    #[test]
+    fn metrics_line_count_matches_the_bounded_line_counter() {
+        for (content, expected) in [
+            (b"".as_slice(), 0),
+            (b"\n".as_slice(), 1),
+            (b"a".as_slice(), 1),
+            (b"a\nb\n".as_slice(), 2),
+            (b"a\nb".as_slice(), 2),
+        ] {
+            assert_eq!(line_count_bytes(content), expected, "{content:?}");
+        }
+    }
 
     #[test]
     fn audit05_metrics_read_tracking_is_root_opt_in() {

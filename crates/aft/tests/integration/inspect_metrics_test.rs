@@ -143,7 +143,8 @@ fn inspect_metrics_loc_totals_match_known_fixture() {
     let payload = metrics_payload(&job);
 
     assert_eq!(payload["files"], 3);
-    assert_eq!(payload["loc"], 7);
+    // 2 + 3 + 1: a trailing newline ends a line, it does not start one.
+    assert_eq!(payload["loc"], 6);
 }
 
 #[test]
