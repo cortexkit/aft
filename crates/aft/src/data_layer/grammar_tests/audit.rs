@@ -68,7 +68,7 @@ fn fixture(ready: bool) -> Fixture {
     let root = dir.join("project");
     std::fs::create_dir_all(&root).unwrap();
     let storage = dir.join("storage");
-    write(&dir, "clock", "0");
+    replace_polled(&dir, "clock", "0");
     let ctx = context(&root, &storage);
     crate::grammar::configure(&ctx.config());
     let registry = crate::grammar::registry("luau").unwrap();
@@ -510,8 +510,8 @@ fn readiness(before_gap_publication: bool) {
         assert!(f.registry.wait_until_settled(Duration::from_secs(30)));
     }
     assert_eq!(f.registry.request_count(), 1);
-    write(&f.dir, "transport", &f.wasm);
-    write(&f.dir, "clock", "30000");
+    replace_polled(&f.dir, "transport", &f.wasm);
+    replace_polled(&f.dir, "clock", "30000");
     // No command or explicit request drives this transition: the checkout's
     // maintenance thread observes the paused clock's newly due retry.
     until(
@@ -906,8 +906,8 @@ fn todo_gaps(terminal: bool) {
     if !terminal {
         assert!(f.registry.wait_until_settled(Duration::from_secs(30)));
         assert_eq!(f.registry.request_count(), 1);
-        write(&f.dir, "transport", &f.wasm);
-        write(&f.dir, "clock", "30000");
+        replace_polled(&f.dir, "transport", &f.wasm);
+        replace_polled(&f.dir, "clock", "30000");
         until(
             || {
                 runtime.view().filter(|view| {
@@ -1014,8 +1014,8 @@ fn publication_retry() {
     assert!(f.registry.wait_until_settled(Duration::from_secs(30)));
     assert_eq!(f.registry.request_count(), 1);
     let publication = test_gates::hold(&f.root, test_gates::Point::DeltaPublication);
-    write(&f.dir, "transport", &f.wasm);
-    write(&f.dir, "clock", "30000");
+    replace_polled(&f.dir, "transport", &f.wasm);
+    replace_polled(&f.dir, "clock", "30000");
     publication.wait_entered();
     assert_eq!(f.registry.request_count(), 2);
     let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
@@ -1122,8 +1122,8 @@ fn todos_during_publication(deferred: bool) {
     runtime.wait_for_memory_profile_idle_for_test();
     assert!(f.registry.wait_until_settled(Duration::from_secs(30)));
     let publication = test_gates::hold(&f.root, test_gates::Point::DeltaPublication);
-    write(&f.dir, "transport", &f.wasm);
-    write(&f.dir, "clock", "30000");
+    replace_polled(&f.dir, "transport", &f.wasm);
+    replace_polled(&f.dir, "clock", "30000");
     publication.wait_entered();
     let publication = if deferred {
         let low = crate::disk_floor::set_free_space_for_test(&f.storage, 1 << 30, 1 << 40);
