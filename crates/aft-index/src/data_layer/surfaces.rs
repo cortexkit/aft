@@ -672,7 +672,8 @@ fn report_of_inner(checkout: &DataCheckout, cached_only: bool) -> DataStoreRepor
 /// while the fill is under way (with how many files it has accounted for)
 /// or before it has learned the model; failed when no fill could start.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MeaningReport {
+#[doc(hidden)]
+pub struct MeaningReport {
     pub(crate) plane: MeaningPlane,
     /// A fill round is queued or running.
     pub(crate) filling: bool,
@@ -826,7 +827,8 @@ impl MeaningReport {
     /// `embedded_chunks`/`total_chunks`, with the fill's file counts beside
     /// them (see [`SemanticFillHealth`] for which are present when). A
     /// failed plane reports `degraded`, as health reports a failed index.
-    pub(crate) fn health(&self) -> SemanticHealthComponentSnapshot {
+    #[doc(hidden)]
+    pub fn health(&self) -> SemanticHealthComponentSnapshot {
         let nonzero = |count: usize| (count > 0).then_some(count);
         let mut fill = SemanticFillHealth {
             filling: self.filling.then_some(true),

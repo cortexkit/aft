@@ -84,6 +84,7 @@ pub use aft_db::build_breaker;
 pub mod cache_freshness;
 pub mod cache_location;
 pub mod callgraph;
+#[cfg(test)]
 pub(crate) use aft_base::clock;
 pub use aft_base::cold_build_limiter;
 pub use aft_base::compress;
@@ -109,6 +110,7 @@ pub mod db;
 pub use aft_base::developer_tools;
 pub(crate) use aft_base::dir_identity;
 pub use aft_base::disk_floor;
+#[cfg(test)]
 pub(crate) use aft_base::durability;
 pub mod edit;
 #[cfg(test)]
@@ -172,6 +174,7 @@ pub use aft_base::jsonc;
 pub use aft_base::jsonc_edit;
 pub mod lang_id;
 pub use aft_base::language;
+#[cfg(test)]
 pub(crate) use aft_base::large_read_counts;
 #[doc(hidden)]
 pub use aft_index::large_read;
@@ -290,7 +293,6 @@ use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;
 pub(crate) use aft_base::walk_boundary;
-pub(crate) use aft_base::watcher_markers;
 pub use aft_base::write_counters;
 pub use aft_index::url_fetch;
 pub use aft_index::watcher;

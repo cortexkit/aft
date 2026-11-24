@@ -491,15 +491,19 @@ fn plain_relative(path: &str) -> bool {
 
 /// What one caller file contributes to the dead-code snapshot.
 #[derive(Debug, Default)]
-pub(crate) struct FileProjection {
+#[doc(hidden)]
+pub struct FileProjection {
     /// Its outbound calls, as `snapshot` lists them for this caller file
     /// (in no particular order).
-    pub(crate) outbound_calls: Vec<CallgraphOutboundCall>,
+    #[doc(hidden)]
+    pub outbound_calls: Vec<CallgraphOutboundCall>,
     /// Members an unknown receiver in this file keeps alive: target file
     /// (absolute, as the snapshot names files), symbol, and seed class.
-    pub(crate) unknown_live: Vec<(PathBuf, String, SeedClass)>,
+    #[doc(hidden)]
+    pub unknown_live: Vec<(PathBuf, String, SeedClass)>,
     /// Its Go package initialization group, when it has callers.
-    pub(crate) go_initializers: Option<GoInitializerGroup>,
+    #[doc(hidden)]
+    pub go_initializers: Option<GoInitializerGroup>,
 }
 
 /// The call-site information that affects liveness and its finding labels.

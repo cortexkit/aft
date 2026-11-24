@@ -295,6 +295,14 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `GraphIdentity::fragment` | visibility widened | `aft-index` | Compare the stored fragment identity used for dead-code reuse. |
 | `GraphIdentity::digest` | visibility widened | `aft-index` | Compare the stored graph digest used for dead-code reuse. |
 
+| `FileProjection` | visibility widened | `aft-index` | Give the dead-code scanner the existing per-file graph facts. |
+| `FileProjection::outbound_calls` | visibility widened | `aft-index` | Retain the call records used by dead-code analysis. |
+| `FileProjection::unknown_live` | visibility widened | `aft-index` | Retain the unresolved-target seeds used by dead-code analysis. |
+| `FileProjection::go_initializers` | visibility widened | `aft-index` | Retain the Go initializer groups used by dead-code analysis. |
+| `MeaningReport` | visibility widened | `aft-index` | Let composition read health from the emitted meaning plane. |
+| `MeaningReport::health` | visibility widened | `aft-index` | Keep the same semantic health projection in composition. |
+| `WatcherRescanInterval::raw_events` | visibility widened | `aft-index` | Report the raw event count from the completed rescan interval. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

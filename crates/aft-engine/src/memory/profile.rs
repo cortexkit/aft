@@ -1,4 +1,3 @@
-pub(crate) use aft_base::memory::profile::admitted;
 pub use aft_base::memory::profile::{
     current, current_effective, effective, EffectiveMemory, MemoryMode, MemoryProfile,
 };

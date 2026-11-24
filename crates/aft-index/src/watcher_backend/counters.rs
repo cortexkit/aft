@@ -155,7 +155,8 @@ pub struct WatcherCounters {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WatcherRescanInterval {
-    pub(crate) raw_events: u64,
+    #[doc(hidden)]
+    pub raw_events: u64,
 }
 
 pub(crate) struct DirectoryArrivalGuard<'a>(&'a WatcherCounters);
