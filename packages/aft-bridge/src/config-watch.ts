@@ -256,6 +256,12 @@ function readTextOrNull(path: string): string | null {
 
 /** How often the watches are checked against the directories on disk. */
 const CONFIG_WATCH_REVALIDATE_MS = 2_000;
+/**
+ * Longest gap between those checks. While nothing changes the gap doubles up
+ * to this, so an idle host is not woken every 2 s; any watch event brings it
+ * back to {@link CONFIG_WATCH_REVALIDATE_MS}.
+ */
+const CONFIG_WATCH_REVALIDATE_IDLE_MAX_MS = 30_000;
 /** How many times a rejected text is re-checked without a new event. */
 const CONFIG_WATCH_REJECTED_RETRIES = 3;
 /** Longest a stream of events may postpone a check. */
@@ -472,6 +478,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
             const current = watchers.get(dir);
             if (current && current.watcher === watcher) current.stale = true;
           }
+          wakeRevalidation();
           schedule();
         });
         if (identityOf(dir) !== identity) {
@@ -484,6 +491,7 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
           entry.watcher.close();
           if (watchers.get(dir) === entry) watchers.delete(dir);
           // Re-arm on the next check rather than going silent.
+          wakeRevalidation();
           schedule();
         });
         watchers.set(dir, entry);
@@ -507,24 +515,45 @@ export function watchAftConfigFiles(options: WatchAftConfigFilesOptions): () => 
     }
     return moved;
   }
-  recheckAfterArming = revalidate();
-  if (options.checkAtStart) check();
   // Some platforms stop reporting on a deleted or replaced directory without
   // an error; a periodic check re-arms such a watch. Moving a watch (for
   // example once `.cortexkit/` is created) may reveal a file, so it checks.
-  const revalidateTimer = setInterval(() => {
+  // The check backs off while nothing moves, except while a symlink target is
+  // polled by content because its directory could not be watched.
+  let revalidateDelay = CONFIG_WATCH_REVALIDATE_MS;
+  let revalidateTimer: ReturnType<typeof setTimeout> | null = null;
+  const armRevalidation = (): void => {
+    if (revalidateTimer) clearTimeout(revalidateTimer);
+    revalidateTimer = setTimeout(revalidateTick, revalidateDelay);
+    revalidateTimer.unref?.();
+  };
+  function revalidateTick(): void {
+    revalidateTimer = null;
     if (stopped) return;
     const moved = revalidate();
     if (moved || recheckAfterArming) schedule();
     recheckAfterArming = moved;
-  }, CONFIG_WATCH_REVALIDATE_MS);
-  revalidateTimer.unref?.();
+    revalidateDelay =
+      moved || fallbackSeen.size > 0
+        ? CONFIG_WATCH_REVALIDATE_MS
+        : Math.min(revalidateDelay * 2, CONFIG_WATCH_REVALIDATE_IDLE_MAX_MS);
+    armRevalidation();
+  }
+  /** A watch event ends the idle back-off: check again at the base interval. */
+  function wakeRevalidation(): void {
+    if (stopped || revalidateDelay === CONFIG_WATCH_REVALIDATE_MS) return;
+    revalidateDelay = CONFIG_WATCH_REVALIDATE_MS;
+    armRevalidation();
+  }
+  recheckAfterArming = revalidate();
+  if (options.checkAtStart) check();
+  armRevalidation();
 
   return () => {
     stopped = true;
     if (timer) clearTimeout(timer);
     if (retryTimer) clearTimeout(retryTimer);
-    clearInterval(revalidateTimer);
+    if (revalidateTimer) clearTimeout(revalidateTimer);
     for (const entry of watchers.values()) entry.watcher.close();
     watchers.clear();
   };
