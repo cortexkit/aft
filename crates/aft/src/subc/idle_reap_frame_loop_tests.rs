@@ -9,6 +9,19 @@
 
 use super::test_support::{test_ctx, test_root};
 use super::*;
+
+#[test]
+fn idle_maintenance_never_probes_an_evicted_root() {
+    let (_dir, root) = test_root("idle-probe-evicted");
+    let mut meta = RootMeta::new(Instant::now());
+    meta.idle_artifacts_evicted = true;
+    let mut probe = RootPresenceProbe::new();
+    probe.request(&HashMap::from([(root, meta)]));
+    assert_eq!(
+        probe.next_generation, 0,
+        "an idle root started a presence thread"
+    );
+}
 use crate::context::pending_restore_work;
 use std::collections::BTreeSet;
 

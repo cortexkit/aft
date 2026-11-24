@@ -65,35 +65,49 @@ impl RootPresence {
     }
 }
 
-/// Runs directory checks off the frame loop, at most one at a time.
+/// Runs directory checks off the frame loop, at most one at a time and at
+/// most once a second.
 pub(super) struct RootPresenceProbe {
-    latest: Arc<parking_lot::Mutex<RootPresence>>,
+    latest: Arc<parking_lot::Mutex<Arc<RootPresence>>>,
     in_flight: Arc<AtomicBool>,
     next_generation: u64,
     seen_generation: u64,
+    next_at: tokio::time::Instant,
 }
 
 impl RootPresenceProbe {
     pub(super) fn new() -> Self {
         Self {
-            latest: Arc::new(parking_lot::Mutex::new(RootPresence::default())),
+            latest: Arc::default(),
             in_flight: Arc::new(AtomicBool::new(false)),
             next_generation: 0,
             seen_generation: 0,
+            next_at: tokio::time::Instant::now(),
         }
     }
 
     /// Publication in progress reads as no new observation, never a miss.
-    pub(super) fn latest(&mut self) -> RootPresence {
+    pub(super) fn latest(&mut self) -> Arc<RootPresence> {
         let Some(presence) = self.latest.try_lock() else {
-            return RootPresence::default();
+            return Arc::default();
         };
         self.seen_generation = presence.generation;
-        presence.clone()
+        Arc::clone(&presence)
     }
 
     /// A probe stuck on a hung filesystem only delays deletion detection.
-    pub(super) fn request(&mut self, roots: Vec<ProjectRootId>) {
+    /// Roots whose idle artifacts are already evicted are not probed.
+    pub(super) fn request(&mut self, live_roots: &HashMap<ProjectRootId, RootMeta>) {
+        let now = tokio::time::Instant::now();
+        if now < self.next_at || self.in_flight.load(Ordering::Acquire) {
+            return;
+        }
+        self.next_at = now + std::time::Duration::from_secs(1);
+        let roots: Vec<_> = live_roots
+            .iter()
+            .filter(|(_, meta)| !meta.idle_artifacts_evicted)
+            .map(|(root, _)| root.clone())
+            .collect();
         // Do not overwrite a finished sample before it has been read: an
         // unknown sample between two misses must interrupt deletion proof.
         if roots.is_empty()
@@ -109,7 +123,7 @@ impl RootPresenceProbe {
             .name("aft-root-presence".to_owned())
             .spawn(move || {
                 let presence = RootPresence::probe(generation, &roots);
-                *latest.lock() = presence;
+                *latest.lock() = Arc::new(presence);
                 in_flight.store(false, Ordering::Release);
             });
         if spawned.is_ok() {

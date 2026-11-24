@@ -244,6 +244,12 @@ impl LspChildRegistry {
             .collect()
     }
 
+    pub(crate) fn has_children_without_waiting(&self) -> bool {
+        self.inner
+            .try_lock()
+            .is_ok_and(|children| !children.is_empty())
+    }
+
     fn tracked_children(&self) -> Vec<(u32, TrackedChild)> {
         self.inner
             .lock()

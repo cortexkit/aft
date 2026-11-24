@@ -1293,7 +1293,7 @@ pub fn prune_retention_sweep_observed(
 /// minute, or a few seconds after a sweep skipped for lack of the mutex.
 pub fn maybe_spawn_retention(
     db: Option<std::sync::Arc<std::sync::Mutex<crate::db::TrackedConnection>>>,
-    guard: RetentionGuard,
+    guard: impl FnOnce() -> RetentionGuard,
 ) {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1307,6 +1307,7 @@ pub fn maybe_spawn_retention(
     }
     *next_due = Some(Instant::now() + crate::db::maintenance_interval());
     drop(next_due);
+    let guard = guard();
     if let Err(error) = std::thread::Builder::new()
         .name("aft-retention".into())
         .spawn(move || {

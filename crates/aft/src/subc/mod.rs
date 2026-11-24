@@ -1543,6 +1543,7 @@ struct RootMeta {
     diagnostics_on_edit: bool,
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
+    idle_release_context: std::sync::Weak<AppContext>,
     unbound_quiesced: bool,
     goodbye_quiesce_at: Option<tokio::time::Instant>,
     consecutive_missing_sweeps: u8,
@@ -1941,6 +1942,7 @@ impl RootMeta {
             diagnostics_on_edit: false,
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
+            idle_release_context: std::sync::Weak::new(),
             unbound_quiesced: false,
             goodbye_quiesce_at: None,
             consecutive_missing_sweeps: 0,
@@ -1961,6 +1963,7 @@ impl RootMeta {
     fn reactivate_bound(&mut self) {
         self.note_activity();
         self.idle_artifacts_evicted = false;
+        self.idle_release_context = std::sync::Weak::new();
         self.unbound_quiesced = false;
         self.goodbye_quiesce_at = None;
         self.teardown_persist_submitted_at = None;
@@ -2416,7 +2419,6 @@ fn reap_idle_roots_with_presence(
     let pending_bind_roots = roots_with_bind_in_flight(pending_binds, live_roots);
     let mut census = ReapBlockerCensus::default();
     let mut candidates = Vec::new();
-    let mut evicted_contexts: Option<Option<HashMap<ProjectRootId, Arc<AppContext>>>> = None;
 
     for (root_id, meta) in live_roots.iter_mut() {
         let deleted = presence.update_absence(root_id, meta);
@@ -2513,15 +2515,8 @@ fn reap_idle_roots_with_presence(
             // output filters stay while background task records remain, and
             // an evicted root is not reaped again, so retry here once the
             // records are gone.
-            // One non-waiting snapshot of the actors serves every evicted root
-            // in this sweep.
             if meta.idle_artifacts_evicted && !has_bound_route && meta.unbound_quiesced {
-                let contexts = evicted_contexts.get_or_insert_with(|| {
-                    executor
-                        .try_actor_entries()
-                        .map(|entries| entries.into_iter().collect::<HashMap<_, _>>())
-                });
-                if let Some(ctx) = contexts.as_ref().and_then(|contexts| contexts.get(root_id)) {
+                if let Some(ctx) = meta.idle_release_context.upgrade() {
                     ctx.retry_deferred_idle_release();
                 }
             }
@@ -2725,6 +2720,7 @@ fn reap_idle_roots_with_presence(
         } else {
             if let Some(meta) = live_roots.get_mut(&root_id) {
                 meta.idle_artifacts_evicted = true;
+                meta.idle_release_context = Arc::downgrade(&ctx);
                 meta.teardown_persist_submitted_at = None;
                 meta.ttl_retention_logged = None;
             }
@@ -2766,24 +2762,7 @@ fn reap_idle_roots_with_presence(
 /// each child's cwd from the kernel, stats reclaim markers and signals process
 /// groups; `killpg` has been seen to sit in the kernel for over a minute, so
 /// none of it runs on the frame loop.
-fn spawn_orphaned_lsp_child_reap(registry: crate::lsp::child_registry::LspChildRegistry) {
-    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
-    if IN_FLIGHT.swap(true, Ordering::AcqRel) {
-        return;
-    }
-    let spawned = std::thread::Builder::new()
-        .name("aft-lsp-child-reap".to_owned())
-        .spawn(move || {
-            let reaped = registry.reap_children_with_gone_cwd_or_reclaimed_root();
-            if reaped > 0 {
-                log::warn!("subc attach: reaped {reaped} orphaned LSP child process group(s)");
-            }
-            IN_FLIGHT.store(false, Ordering::Release);
-        });
-    if spawned.is_err() {
-        IN_FLIGHT.store(false, Ordering::Release);
-    }
-}
+mod maintenance_probes;
 
 /// Terminate a deleted root's background tasks on their own thread: each kill
 /// waits out a signal grace period. `in_flight` is cleared when it finishes.
@@ -4920,6 +4899,7 @@ where
     let mut next_drain_at = tokio::time::Instant::now() + DRAIN_TICK_PERIOD;
     let mut next_maintenance_at = next_drain_at;
     let mut root_presence = RootPresenceProbe::new();
+    let mut orphaned_children = maintenance_probes::OrphanedChildrenProbe::new();
     let standing_actor = Arc::new(
         standing::StandingActor::new(Arc::clone(&shared_app), Arc::clone(&executor))
             .with_startup_storage_dir(storage_dir),
@@ -6430,7 +6410,7 @@ where
                 dispatch_path_metrics.mark_frame_loop_step("logging::maybe_sweep_logs", "", 0);
                 crate::logging::maybe_sweep_logs();
                 dispatch_path_metrics.mark_frame_loop_step("compression_events::maybe_spawn_retention", "", 0);
-                let retention_registries = shared_app.try_memory_contexts().map(|contexts| {
+                let retention_registries = || shared_app.try_memory_contexts().map(|contexts| {
                     contexts
                         .into_iter()
                         .map(|(_, context)| context.bash_background().clone())
@@ -6446,7 +6426,7 @@ where
                     );
                 }
                 dispatch_path_metrics.mark_frame_loop_step("spawn_orphaned_lsp_child_reap", "", 0);
-                spawn_orphaned_lsp_child_reap(shared_app.lsp_child_registry());
+                orphaned_children.request(shared_app.lsp_child_registry());
                 dispatch_path_metrics.mark_frame_loop_step("reap_idle_lsp_servers", "", 0);
                 let now = Instant::now();
                 reap_idle_lsp_servers(now, &live_roots, &executor);
@@ -6461,7 +6441,7 @@ where
                     &dispatch_path_metrics,
                     &presence,
                 );
-                root_presence.request(live_roots.keys().cloned().collect());
+                root_presence.request(&live_roots);
                 for root_id in &reap.forgotten_deleted_roots {
                     dispatch_path_metrics.mark_frame_loop_step("purge_deleted_root_residents", "", 0);
                     bg_unacked_keys_by_root.remove(root_id);
