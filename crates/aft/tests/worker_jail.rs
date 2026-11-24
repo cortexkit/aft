@@ -33,6 +33,9 @@ mod aft_binary;
 mod executable_cache;
 #[path = "helpers/subc_fake.rs"]
 mod subc_fake;
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+#[path = "helpers/subc_pin.rs"]
+mod subc_pin;
 #[path = "../src/test_gate.rs"]
 mod test_gate;
 #[path = "helpers/worker_gh_read.rs"]
@@ -724,6 +727,8 @@ impl Jail {
             command.env("SCCACHE_SERVER_UDS", uds);
         }
         configure(&base, &mut command);
+        #[cfg(all(target_os = "linux", feature = "test-hooks"))]
+        subc_pin::prepare_within(&command, &base).expect("prepare worker fixture pin");
         let child = command.spawn().unwrap();
         let (mut stream, _) = tokio::time::timeout(Duration::from_secs(20), listener.accept())
             .await
@@ -1508,6 +1513,22 @@ async fn relaxed_denies_ssh_reads_including_aliases() {
         );
         assert!(!reply.contains("private-key-sentinel"), "{reply}");
     }
+}
+
+#[cfg(all(target_os = "linux", feature = "test-hooks"))]
+#[tokio::test]
+async fn worker_fixture_reuses_prepared_linux_image() {
+    use std::os::unix::fs::MetadataExt;
+
+    let jail = Jail::start_with_profile(None, None, true, "off", false).await;
+    let images = jail.data.join("cortexkit/aft/cache/aft/run/aft-images");
+    let image = std::fs::read_dir(images).unwrap().next().unwrap().unwrap();
+    let pin = image.path().join("aft");
+    assert!(
+        pin.metadata().unwrap().nlink() > 1,
+        "the child published its own copy at {} instead of using the shared seed",
+        pin.display(),
+    );
 }
 
 #[tokio::test]

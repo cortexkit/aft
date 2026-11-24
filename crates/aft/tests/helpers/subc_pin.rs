@@ -14,24 +14,44 @@ pub(crate) fn prepare(command: &Command) -> io::Result<()> {
     else {
         return Ok(());
     };
-    let lookup = |name: &str| -> Option<OsString> {
-        match command.get_envs().find(|(key, _)| *key == name) {
-            Some((_, value)) => value.map(OsString::from),
-            None => std::env::var_os(name),
-        }
-    };
-    let storage = aft::storage_path::storage_dir_from_test_environment(&lookup);
+    let storage = command_storage_dir(command);
     // The detach fixture also uses the legacy cache-dir override during
     // its busy-index test. Do not seed any storage inherited from the runner.
     if storage != data.join("cortexkit/aft") && storage != data.join("aft") {
         return Ok(());
     }
+    seed(command, &storage)
+}
+
+/// Seed a fixture that owns the entire directory tree containing its storage.
+pub(crate) fn prepare_within(command: &Command, fixture: &Path) -> io::Result<()> {
+    let storage = command_storage_dir(command);
+    if !storage.strip_prefix(fixture).is_ok_and(|relative| {
+        relative
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    }) {
+        return Err(io::Error::other("module storage is outside the fixture"));
+    }
+    seed(command, &storage)
+}
+
+fn command_storage_dir(command: &Command) -> std::path::PathBuf {
+    aft::storage_path::storage_dir_from_test_environment(&|name: &str| -> Option<OsString> {
+        match command.get_envs().find(|(key, _)| *key == name) {
+            Some((_, value)) => value.map(OsString::from),
+            None => std::env::var_os(name),
+        }
+    })
+}
+
+fn seed(command: &Command, storage: &Path) -> io::Result<()> {
     let binary = Path::new(command.get_program());
     let parent = binary.parent().expect("cached fixture image has a parent");
     // aft_binary() publishes the executable in a private cache directory
     // outside the isolated projects and their shell write grants. Sharing a
     // seed there also covers nextest's separate processes for each test.
-    aft::pinned_executable::prepare_fixture_pin(binary, &parent.join("startup-pin-seed"), &storage)
+    aft::pinned_executable::prepare_fixture_pin(binary, &parent.join("startup-pin-seed"), storage)
 }
 
 #[cfg(test)]
