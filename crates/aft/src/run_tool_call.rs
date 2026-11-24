@@ -745,7 +745,11 @@ impl RepeatObservation {
     /// afterward would make identical results appear different forever and
     /// silently prevent the breaker from firing.
     pub(crate) fn observe(self, app_ctx: &AppContext, response: &mut Response, text: &mut String) {
-        let output_hash = crate::response_finalize::repeat_breaker::output_hash(text);
+        let output_hash = if self.call.is_reset_only() {
+            0
+        } else {
+            crate::response_finalize::repeat_breaker::output_hash(text)
+        };
         if let Some(intervention) =
             app_ctx
                 .repeat_breaker()

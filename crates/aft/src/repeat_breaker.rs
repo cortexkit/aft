@@ -11,11 +11,15 @@ pub struct RepeatCall(RepeatObservation);
 impl RepeatCall {
     pub fn new(tool: &str, input: &Value) -> Self {
         let normalized = crate::tool_gate::canonical_tool_name(tool).unwrap_or(tool);
-        Self(RepeatObservation {
+        let mut observation = RepeatObservation {
             tool: normalized.to_string(),
-            semantic_key: semantic_key(normalized, input),
+            semantic_key: String::new(),
             mutating: crate::host_tool_names::tool_call_is_mutating(tool, input),
-        })
+        };
+        if !observation.is_reset_only() {
+            observation.semantic_key = semantic_key(normalized, input);
+        }
+        Self(observation)
     }
 }
 
@@ -153,6 +157,18 @@ mod tests {
                 .unwrap()
                 .count,
             3
+        );
+    }
+
+    #[test]
+    fn repeat_reset_does_not_serialize_mutation_content() {
+        let args = serde_json::json!({ "filePath": "data.txt", "content": "x".repeat(8 << 20) });
+        let call = RepeatCall::new("write", &args);
+        assert!(call.mutating);
+        assert_eq!(
+            call.semantic_key.len(),
+            0,
+            "reset-only calls need no input key bytes"
         );
     }
 
