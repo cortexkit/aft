@@ -21588,8 +21588,8 @@ mod tests {
 
     /// The optional SQLite schema probe for one finished task runs off the
     /// shared watchdog: while that probe is held, another task's exit is still
-    /// observed and its completion delivered. The held task publishes (with the
-    /// same notice it always had) once its probe returns.
+    /// observed and its completion delivered. The held task publishes its own
+    /// completion notice once its probe returns.
     #[test]
     #[cfg(unix)]
     fn held_db_hint_probe_does_not_delay_another_tasks_completion() {
