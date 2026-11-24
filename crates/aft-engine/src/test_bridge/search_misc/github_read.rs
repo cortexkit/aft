@@ -10,7 +10,7 @@ pub trait GithubReadDeferredTestExt {
 
 impl GithubReadDeferredTestExt for GithubReadDeferred {
     fn late_answer_for_test(&self) -> &GithubReadLateAnswer {
-        self.late_answer_for_test()
+        self.late_answer_fixture()
     }
 }
 
@@ -20,6 +20,6 @@ pub trait GithubReadEngineTestExt {
 
 impl GithubReadEngineTestExt for GithubReadEngine {
     fn flights_empty_for_test(&self) -> bool {
-        self.flights_empty_for_test()
+        self.flights_empty_fixture()
     }
 }
