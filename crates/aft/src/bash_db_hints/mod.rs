@@ -110,6 +110,9 @@ pub(crate) struct HintJob {
     // not when the session's retained task history is eventually collected.
     launch: std::sync::Mutex<Option<(SpawnPlan, HashMap<String, String>)>>,
     result: OnceLock<Option<String>>,
+    /// Set once a helper thread has been started to finish this job, so the
+    /// watchdog starts at most one.
+    background_started: std::sync::atomic::AtomicBool,
 }
 
 impl HintJob {
@@ -143,6 +146,7 @@ impl HintJob {
                     pipeline,
                     launch: std::sync::Mutex::new(None),
                     result: OnceLock::new(),
+                    background_started: std::sync::atomic::AtomicBool::new(false),
                 };
             }
         }
@@ -154,7 +158,36 @@ impl HintJob {
             pipeline,
             launch: std::sync::Mutex::new(launch),
             result: OnceLock::new(),
+            background_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether finishing this job may still launch a schema probe for a
+    /// command that ended with `exit_code`. A job that cannot probe finishes
+    /// at once, so only these are worth finishing off the watchdog thread.
+    pub(crate) fn may_probe(&self, exit_code: Option<i64>) -> bool {
+        self.result.get().is_none()
+            && self.enabled
+            && self.cli.is_some()
+            && self.target.is_some()
+            && !(exit_code == Some(0) && !self.pipeline)
+    }
+
+    /// Claim the one helper thread that finishes this job; false when one
+    /// was already started.
+    pub(crate) fn claim_background_finish(&self) -> bool {
+        !self.background_started.swap(true, Ordering::SeqCst)
+    }
+
+    /// End the job without a hint, so nothing waits for a helper thread that
+    /// stopped before finishing it.
+    pub(crate) fn abandon(&self) {
+        let _ = self.result.set(None);
+    }
+
+    /// Give the claim back after the helper thread could not be started.
+    pub(crate) fn release_background_finish(&self) {
+        self.background_started.store(false, Ordering::SeqCst);
     }
 
     pub(crate) fn finish(&self, output: &str, exit_code: Option<i64>) -> Option<&str> {
@@ -1020,6 +1053,7 @@ mod a02_lifecycle_tests {
                 HashMap::from([("KEY".into(), "value".into())]),
             ))),
             result: OnceLock::new(),
+            background_started: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(
             job.finish_with_output(

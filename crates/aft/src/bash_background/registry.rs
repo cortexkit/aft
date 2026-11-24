@@ -1508,7 +1508,7 @@ pub(crate) struct RegistryInner {
     memory_monitors: Mutex<HashMap<String, super::memory_limit::Monitor>>,
     task_scopes: super::task_scope::TaskScopes,
     #[cfg(unix)]
-    db_hint_jobs:
+    pub(crate) db_hint_jobs:
         Mutex<HashMap<String, (std::sync::Weak<BgTask>, Arc<crate::bash_db_hints::HintJob>)>>,
     #[cfg(unix)]
     db_schema_hints: AtomicBool,
@@ -21564,6 +21564,73 @@ mod tests {
         wait_for_task_temp_cleanup(&registry, &task);
         assert!(!scratch.exists(), "finished hint leaked task scratch");
         assert!(!scratch.with_extension("owner").exists());
+    }
+
+    /// The optional SQLite schema probe for one finished task runs off the
+    /// shared watchdog: while that probe is held, another task's exit is still
+    /// observed and its completion delivered. The held task publishes (with the
+    /// same notice it always had) once its probe returns.
+    #[test]
+    #[cfg(unix)]
+    fn held_db_hint_probe_does_not_delay_another_tasks_completion() {
+        let registry = BgTaskRegistry::default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        fs::write(root.join("store.db"), b"").unwrap();
+        let (ran, probing, release) = (root.join("ran"), root.join("probing"), root.join("release"));
+        let sqlite = root.join("sqlite3");
+        // The first run is the command (a schema miss); the second is the probe,
+        // which announces itself and waits for the test to release it.
+        crate::executable_cache::write_executable(
+            &sqlite,
+            format!(
+                "#!/bin/sh\nif [ ! -e '{ran}' ]; then : > '{ran}'; echo 'Error: in prepare, no such column: missing' >&2; exit 1; fi\n: > '{probing}'\n{gate}\nexit 1\n",
+                ran = ran.display(),
+                probing = probing.display(),
+                gate = crate::test_gate::gate(&format!("'{}'", release.display()), "sleep 0.02"),
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let spawn = |command: &str| {
+            registry
+                .spawn(
+                    SpawnPlan::Unsandboxed,
+                    command,
+                    "session".into(),
+                    root.clone(),
+                    HashMap::new(),
+                    super::super::HardKill::Default,
+                    None,
+                    root.clone(),
+                    8,
+                    true,
+                    false,
+                    Some(root.clone()),
+                )
+                .unwrap()
+        };
+        let slow = spawn(&format!("'{}' store.db 'SELECT missing FROM tasks'", sqlite.display()));
+        // This task ends only once the other task's probe is running.
+        let other = spawn(&format!(
+            "{}; echo other-done",
+            crate::test_gate::gate(&format!("'{}'", probing.display()), "sleep 0.02")
+        ));
+        let mut delivered = Vec::new();
+        let mut wait_for = |task_id: &str, failure: &str| {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !delivered.iter().any(|notice: &BgCompletion| notice.task_id == task_id) {
+                assert!(Instant::now() < deadline, "{failure}");
+                delivered.extend(registry.drain_completions());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            delivered.iter().map(|notice| notice.task_id.clone()).collect::<Vec<_>>()
+        };
+        let seen = wait_for(&other, "a held probe delayed another task's completion");
+        assert!(probing.exists());
+        assert!(!seen.contains(&slow), "published before its probe returned");
+        fs::write(&release, b"").unwrap();
+        wait_for(&slow, "the probed task never published after its probe returned");
     }
 
     #[test]

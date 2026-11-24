@@ -551,6 +551,10 @@ pub(super) fn run_pass(
         if leave_to_reader_wake(registry, &task, pass_cause, awaiting_reader) {
             continue;
         }
+        #[cfg(unix)]
+        if defer_for_db_hint(registry, &task) {
+            continue;
+        }
         let _ = registry.poll_task(&task);
         registry.scan_task_watch_output(&task);
         if task.kill_in_flight() {
@@ -588,6 +592,73 @@ pub(super) fn run_pass(
             retire_terminal_task(registry, &task, pass_cause, awaiting_reader);
         }
     }
+}
+
+/// Whether this pass should leave `task` for a later one because its optional
+/// SQLite schema probe is running on a helper thread. Publishing the exit
+/// renders the hint, and the probe may take up to its own time limit (1.5 s),
+/// so it must not run on the watchdog thread that every task and root shares.
+/// The helper wakes the watchdog when the probe returns, and the next pass
+/// publishes the task with the hint already computed. If the helper cannot be
+/// started, the task publishes now, as before.
+#[cfg(unix)]
+fn defer_for_db_hint(registry: &BgTaskRegistry, task: &std::sync::Arc<BgTask>) -> bool {
+    let Some(job) = registry.inner.db_hint_jobs.lock().ok().and_then(|jobs| {
+        jobs.get(&task.task_id)
+            .map(|(_, job)| std::sync::Arc::clone(job))
+    }) else {
+        return false;
+    };
+    if !job.may_probe(None) {
+        return false;
+    }
+    // Only a command that has exited has the output the probe depends on.
+    let Ok(Some(marker)) = super::persistence::read_exit_marker(&task.paths) else {
+        return false;
+    };
+    let exit_code = match marker {
+        super::persistence::ExitMarker::Code(code) => Some(i64::from(code)),
+        _ => None,
+    };
+    if !job.may_probe(exit_code) {
+        return false;
+    }
+    if !job.claim_background_finish() {
+        return true;
+    }
+    let Some(buffer) = task.lock_state().ok().map(|state| state.buffer.clone()) else {
+        job.release_background_finish();
+        return false;
+    };
+    let wake = registry.inner.wake_tx.clone();
+    let worker_job = std::sync::Arc::clone(&job);
+    let started = thread::Builder::new()
+        .name("aft-db-hint-probe".into())
+        .spawn(move || {
+            let finished = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker_job.finish_with_output(
+                    || {
+                        buffer
+                            .read_combined_head_tail(
+                                super::output::COMPRESS_INPUT_CAP_BYTES,
+                                super::output::COMPRESS_INPUT_HEAD_BYTES,
+                                super::output::COMPRESS_INPUT_TAIL_BYTES,
+                            )
+                            .text
+                    },
+                    exit_code,
+                );
+            }));
+            if finished.is_err() {
+                worker_job.abandon();
+            }
+            let _ = wake.try_send(());
+        });
+    if started.is_err() {
+        job.release_background_finish();
+        return false;
+    }
+    true
 }
 
 /// Record which pass observed `task` terminal (if publishing it did not
