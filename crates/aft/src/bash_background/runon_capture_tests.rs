@@ -42,6 +42,27 @@ fn start_runon(ctx: &crate::context::AppContext, daemon: &Daemon) -> String {
     response.data["task_id"].as_str().unwrap().into()
 }
 
+fn start_prefix_editor(
+    ctx: &crate::context::AppContext,
+    daemon: &Daemon,
+    workdir: &Path,
+) -> String {
+    let mut policy = launch(daemon.connection.clone());
+    policy.params.remote_exec.as_mut().unwrap().legacy_commands =
+        Some(serde_json::json!(["touch"]));
+    let response = handle_with_policy(
+        ctx,
+        Some(policy),
+        serde_json::json!({
+            "command": format!("touch .editor-started; {EDIT}"),
+            "workdir": workdir,
+            "compressed": false,
+        }),
+    );
+    assert!(response.success, "{response:?}");
+    response.data["task_id"].as_str().unwrap().into()
+}
+
 fn start_log_capture(root: &Path) -> RemoteLaunchLogCapture {
     let capture = Arc::new(Mutex::new(Vec::new()));
     remote_launch_log_captures()
@@ -120,6 +141,84 @@ async fn runon_capture_waits_for_foreground_edit_in_a_checkout_subdirectory() {
         .parse()
         .unwrap();
     assert!((1..3000).contains(&ms), "{wait}");
+}
+
+#[tokio::test]
+async fn runon_capture_waits_for_foreground_local_fallback() {
+    let refused = daemon(Script::KnownRefused, "exec-remote/v1").await;
+    let capture = daemon(Script::CaptureCheckout { gated: false }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = remote_test_context(dir.path());
+    let local = start_prefix_editor(&ctx, &refused, dir.path());
+    refused.wait_for_requests("exec.run", 1).await;
+    wait_for("the fallback editor to start", || {
+        dir.path().join(".editor-started").exists().then_some(())
+    })
+    .await;
+
+    let logs = start_log_capture(dir.path());
+    let wait = set_test_cap(dir.path(), Duration::from_secs(10));
+    let job = start_runon(&ctx, &capture);
+    tokio::select! {
+        _ = wait.wait_started() => {},
+        _ = capture.wait_for_requests("exec.run", 1) => panic!("runner skipped the foreground fallback"),
+    }
+    fs::write(dir.path().join(".release-editor"), "").unwrap();
+    let finished = terminal(ctx.bash_background(), &local).await;
+    assert_eq!(finished.exit_code, Some(0), "{finished:?}");
+    let done = terminal(ctx.bash_background(), &job).await;
+    assert!(
+        done.output_preview.contains("edited before capture"),
+        "{done:?}"
+    );
+    assert_warning(&done, false);
+    assert!(logs.lock().unwrap().iter().any(|line| {
+        line.contains("runon: foreground capture wait ")
+            && line.contains(&job)
+            && line.contains(&local)
+            && line.contains("cap_hit=false")
+    }));
+}
+
+#[tokio::test]
+async fn runon_capture_does_not_wait_or_warn_after_fallback_spawn_failure() {
+    let refused = daemon(
+        Script::GatedPreStartRefusal {
+            reason: "unreachable",
+            detail: None,
+        },
+        "exec-remote/v1",
+    )
+    .await;
+    let capture = daemon(Script::CaptureCheckout { gated: false }, "exec-remote/v1").await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let ctx = remote_test_context(&root);
+    let workdir = root.join("editor");
+    fs::create_dir(&workdir).unwrap();
+    let local = start_prefix_editor(&ctx, &refused, &workdir);
+    refused.wait_for_requests("exec.run", 1).await;
+    // Leave the checkout intact, but make the local spawn fail in its workdir.
+    fs::remove_dir(workdir).unwrap();
+    refused.acceptance_gate.notify_one();
+    let failed = terminal(ctx.bash_background(), &local).await;
+    assert_eq!(failed.child_pid, None, "{failed:?}");
+    assert!(
+        failed
+            .output_preview
+            .contains("failed to spawn background bash command"),
+        "{failed:?}"
+    );
+
+    let logs = start_log_capture(&root);
+    let _cap = set_test_cap(&root, Duration::from_millis(100));
+    let job = start_runon(&ctx, &capture);
+    assert_warning(&terminal(ctx.bash_background(), &job).await, false);
+    assert!(!logs
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|line| line.contains("foreground capture wait")));
 }
 
 #[tokio::test]
