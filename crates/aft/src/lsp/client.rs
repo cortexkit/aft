@@ -495,7 +495,7 @@ impl From<LspEvent> for ReceivedLspEvent {
 pub(crate) enum LspEventSender {
     Standalone(Sender<LspEvent>),
     Managed {
-        sender: Sender<ReceivedLspEvent>,
+        sender: super::event_ingress::EventIngress,
         instance: ServerInstanceId,
     },
 }
@@ -1025,6 +1025,7 @@ pub struct LspClient {
     state: ServerState,
     child: Child,
     child_process: super::child_registry::TrackedProcess,
+    _event_ingress: Option<super::event_ingress::EventIngressLease>,
     // Held until the child exits or Drop kills/reaps it, including failed handshakes.
     _rust_analyzer_permit: Option<RustAnalyzerPermit>,
     // Drop runs after the process group has been killed and reaped.
@@ -1344,6 +1345,16 @@ impl LspClient {
         let rust_check_begin_times = Arc::new(Mutex::new(HashMap::new()));
         let reader_check_begin_times = Arc::clone(&rust_check_begin_times);
 
+        let event_ingress = match &event_tx {
+            LspEventSender::Managed { sender, instance } => Some(sender.register(
+                *instance,
+                super::roots::ServerKey {
+                    kind: kind.clone(),
+                    root: root.clone(),
+                },
+            )),
+            LspEventSender::Standalone(_) => None,
+        };
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
@@ -1471,6 +1482,7 @@ impl LspClient {
             state: ServerState::Starting,
             child,
             child_process,
+            _event_ingress: event_ingress,
             child_pid,
             writer,
             pending,

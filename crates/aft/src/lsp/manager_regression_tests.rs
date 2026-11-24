@@ -965,12 +965,25 @@ fn rejected_close_preserves_open_document_and_diagnostics() {
 }
 
 fn lifecycle_fake_client(manager: &LspManager, key: &ServerKey) -> LspClient {
+    lifecycle_fake_client_with_env(manager, key, [])
+}
+
+fn lifecycle_fake_client_with_env<'a>(
+    manager: &LspManager,
+    key: &ServerKey,
+    env: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> LspClient {
+    let env = [("AFT_FAKE_LSP_DISABLE_PUSH", "1")]
+        .into_iter()
+        .chain(env)
+        .map(|(key, value)| (key.into(), value.into()))
+        .collect();
     let mut client = LspClient::spawn_with_reclaim_root(
         key.kind.clone(),
         key.root.clone(),
         &crate::fake_lsp_test_helper::fake_server_binary(),
         &[],
-        &HashMap::from([("AFT_FAKE_LSP_DISABLE_PUSH".into(), "1".into())]),
+        &env,
         LspEventSender::Managed {
             sender: manager.event_tx.clone(),
             instance: ServerInstanceId::next(),
@@ -982,6 +995,56 @@ fn lifecycle_fake_client(manager: &LspManager, key: &ServerKey) -> LspClient {
     .unwrap();
     client.initialize(&key.root, None).unwrap();
     client
+}
+
+#[test]
+fn review_gpt5_event_overflow_preserves_response_and_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let file = root.join("index.ts");
+    std::fs::write(&file, "export const n = 1;\n").unwrap();
+    let key = ServerKey {
+        kind: ServerKind::Biome,
+        root,
+    };
+    let mut manager = LspManager::new();
+    let mut client =
+        lifecycle_fake_client_with_env(&manager, &key, [("AFT_FAKE_LSP_HOVER_EVENT_BURST", "129")]);
+    manager
+        .diagnostics
+        .publish(key.clone(), file.clone(), Vec::new());
+    client
+        .send_request::<lsp_types::request::HoverRequest>(idle_hover_params(&file))
+        .unwrap();
+    assert!(
+        manager.event_rx.len() <= EVENT_CAP,
+        "retained {} ordinary events",
+        manager.event_rx.len()
+    );
+    let instance = client.instance;
+    manager.clients.insert(key.clone(), client);
+    let drained = manager.drain_events_bounded(1);
+    assert!(drained.diagnostics_changed);
+    assert!(!manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&key, &file));
+    manager
+        .clients
+        .get_mut(&key)
+        .unwrap()
+        .send_request::<lsp_types::request::HoverRequest>(idle_hover_params(&file))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !manager.event_tx.exit_pending_for_test(instance) {
+        manager.ingress_rx.recv_deadline(deadline).unwrap();
+    }
+    assert_eq!(manager.event_rx.len(), EVENT_CAP);
+    let drained = manager.drain_events();
+    assert!(drained
+        .events
+        .iter()
+        .any(|event| matches!(event, LspEvent::ServerExited { .. })));
+    assert!(!manager.clients.contains_key(&key));
 }
 
 fn reject_fixture_writes(client: &mut LspClient, file: &Path) {

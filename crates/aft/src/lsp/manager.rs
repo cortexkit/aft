@@ -12,6 +12,7 @@ use lsp_types::{
     DidSaveTextDocumentParams, FileChangeType, FileEvent, TextDocumentIdentifier, TextDocumentItem,
 };
 
+use super::event_ingress::{EventIngress, EVENT_CAP};
 use crate::alert_state::AcceptedDiagnosticSnapshot;
 use crate::config::Config;
 use crate::lsp::child_registry::LspChildRegistry;
@@ -90,6 +91,7 @@ mod document_change;
 mod document_close;
 #[path = "manager/document_pull_lifetime.rs"]
 mod document_pull_lifetime;
+mod event_drain;
 mod memory;
 mod shutdown;
 use memory::DiagnosticMergeCache;
@@ -967,6 +969,7 @@ pub(crate) struct PostEditDiagnosticsWait {
     pre_snapshot: HashMap<ServerKey, PreEditSnapshot>,
     responses_at_start: HashMap<ServerKey, u64>,
     event_rx: Receiver<ReceivedLspEvent>,
+    ingress_rx: Receiver<()>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
     deadline: std::time::Instant,
@@ -989,6 +992,7 @@ impl PostEditDiagnosticsWait {
 
         crossbeam_channel::select! {
             recv(self.event_rx) -> event => event.ok(),
+            recv(self.ingress_rx) -> _ => None,
             recv(self.wake_rx) -> _ => None,
             default(remaining) => None,
         }
@@ -1001,6 +1005,7 @@ impl PostEditDiagnosticsWait {
 /// caller re-checks at once instead of sleeping a fixed interval.
 pub(crate) struct LspEventWait {
     event_rx: Receiver<ReceivedLspEvent>,
+    ingress_rx: Receiver<()>,
     wake_rx: Receiver<()>,
     waiter_id: u64,
 }
@@ -1016,6 +1021,7 @@ impl LspEventWait {
         }
         crossbeam_channel::select! {
             recv(self.event_rx) -> event => event.ok(),
+            recv(self.ingress_rx) -> _ => None,
             recv(self.wake_rx) -> _ => None,
             default(remaining) => None,
         }
@@ -1094,8 +1100,9 @@ pub struct LspManager {
     /// Events applied at startup release, awaiting outward delivery exactly once.
     ready_startup_events: std::collections::VecDeque<StartupEventDelivery>,
     /// Unified event channel — all server reader threads send here.
-    event_tx: Sender<ReceivedLspEvent>,
+    event_tx: EventIngress,
     event_rx: Receiver<ReceivedLspEvent>,
+    ingress_rx: Receiver<()>,
     /// One-slot wake channels for post-edit waits that released the manager
     /// mutex. Drains notify them after handling an event, so a waiter cannot
     /// sleep through a diagnostics update consumed by another drain path.
@@ -1405,7 +1412,7 @@ pub(crate) fn format_retry_delay(delay: Duration) -> String {
 
 impl LspManager {
     pub fn new() -> Self {
-        let (event_tx, event_rx) = unbounded();
+        let (event_tx, event_rx, ingress_rx) = EventIngress::new();
         Self {
             capacity: Arc::default(),
             capacity_slots: HashMap::new(),
@@ -1434,6 +1441,7 @@ impl LspManager {
             ready_startup_events: Default::default(),
             event_tx,
             event_rx,
+            ingress_rx,
             post_edit_waiters: HashMap::new(),
             next_post_edit_waiter_id: 0,
             binary_overrides: HashMap::new(),
@@ -2050,6 +2058,12 @@ impl LspManager {
             return;
         }
         for event in reservation.deferred_events {
+            if self.ready_startup_events.len() >= EVENT_CAP
+                && !matches!(event.event, LspEvent::ServerExited { .. })
+            {
+                self.event_tx.record_drop(&event);
+                continue;
+            }
             // A receipt from a reader that no longer owns the key was dropped
             // by `handle_event`; like the normal drain, it is not delivered.
             let Ok(published_file) = self.handle_event(&event) else {
@@ -2070,9 +2084,12 @@ impl LspManager {
                     pid,
                 }
             });
-            self.ready_startup_events
-                .push_back(StartupEventDelivery { event, published });
+            if self.ready_startup_events.len() < EVENT_CAP {
+                self.ready_startup_events
+                    .push_back(StartupEventDelivery { event, published });
+            }
         }
+        self.apply_ingress_overflows();
         reservation.signal.finish();
         // A post-edit wait parked on this start must re-check: the server
         // is now either running or gone.
@@ -4097,203 +4114,6 @@ impl LspManager {
         self.clients.len()
     }
 
-    /// Drain all pending LSP events. Call from the main loop.
-    pub fn drain_events(&mut self) -> DrainedLspEvents {
-        self.drain_events_bounded(usize::MAX)
-    }
-
-    /// Whether LSP events are waiting to be drained. Cheap channel peek for
-    /// the maintenance scheduler's skip probe.
-    pub fn has_pending_events(&self) -> bool {
-        !self.event_rx.is_empty()
-            || !self.pending_diagnostic_observations.is_empty()
-            || !self.ready_startup_events.is_empty()
-            || (!self.is_quiesced()
-                && self.pending_watched_changes.keys().any(|key| {
-                    !self.starting.contains_key(key)
-                        && self
-                            .clients
-                            .get(key)
-                            .is_some_and(LspClient::has_watched_file_registration)
-                }))
-    }
-
-    pub fn drain_events_bounded(&mut self, max_events: usize) -> DrainedLspEvents {
-        self.drain_events_inner(max_events, false)
-    }
-
-    fn drain_events_inner(
-        &mut self,
-        max_events: usize,
-        preserve_pull_observations: bool,
-    ) -> DrainedLspEvents {
-        let now = Instant::now();
-        for cache in self.watched_lifecycle.values_mut() {
-            cache.expire(now);
-        }
-        self.publish_completed_starts();
-        let mut events = Vec::new();
-        let mut instances = Vec::new();
-        let mut processed = 0;
-        let mut deferred_pull_events = Vec::new();
-        let mut accepted_snapshots = if preserve_pull_observations {
-            Vec::new()
-        } else {
-            std::mem::take(&mut self.pending_diagnostic_observations)
-        };
-        let mut diagnostics_changed = !accepted_snapshots.is_empty();
-        while processed < max_events {
-            if !preserve_pull_observations {
-                if let Some(delivery) = self.ready_startup_events.pop_front() {
-                    processed += 1;
-                    diagnostics_changed |= delivery.published.is_some();
-                    if let Some(ref published) = delivery.published {
-                        if self.startup_publish_is_current(published) {
-                            if let Some(snapshot) =
-                                self.accepted_snapshot_for_file(&published.key, &published.file)
-                            {
-                                accepted_snapshots.push(snapshot);
-                            }
-                        }
-                    }
-                    instances.push(delivery.event.instance);
-                    events.push(delivery.event.event);
-                    continue;
-                }
-            }
-            let Ok(event) = self.event_rx.try_recv() else {
-                break;
-            };
-            processed += 1;
-            if preserve_pull_observations
-                && matches!(event.event, LspEvent::DocumentDiagnosticsPulled { .. })
-            {
-                if self.accept_event_instance(&event.event, event.instance) {
-                    deferred_pull_events.push(event);
-                }
-                continue;
-            }
-            if !self.admit_event(&event) {
-                continue;
-            }
-            if self.defer_startup_event(&event) {
-                continue;
-            }
-            // `handle_ready_event` returns the file of a stored publish; the
-            // snapshot reuses it instead of parsing the payload again.
-            if let Some(file) = self.handle_ready_event(&event) {
-                diagnostics_changed = true;
-                if let Some(snapshot) = self.accepted_live_publish_snapshot(&event.event, &file) {
-                    accepted_snapshots.push(snapshot);
-                }
-            }
-            instances.push(event.instance);
-            events.push(event.event);
-        }
-        for event in deferred_pull_events {
-            let _ = self.event_tx.send(event);
-        }
-        let has_more = processed >= max_events
-            && (!self.event_rx.is_empty()
-                || (!preserve_pull_observations && !self.ready_startup_events.is_empty()));
-        self.send_due_rust_saves();
-        let mut promoted_reports = Vec::new();
-        for (key, client) in &mut self.clients {
-            if client.uses_analysis_progress() {
-                // Keep old certified entries as warm snapshots. Only replacement
-                // publications are provisional; fresh inspect separately gates
-                // the producer because analysis can change dependent files too.
-                let mut no_run = false;
-                let promoted = self.diagnostics.promote_provisional_reports(
-                    key,
-                    |file, epoch, published_at| {
-                        let certified =
-                            client.analysis_progress_certifies(file, epoch, published_at);
-                        no_run |= certified && !client.analysis_progress_covered_by_end(epoch);
-                        certified
-                    },
-                );
-                if !promoted.is_empty() {
-                    diagnostics_changed = true;
-                    if self.diagnostics.has_authoritative_report_for_server(key) {
-                        client.note_certified_diagnostics(no_run);
-                    }
-                }
-                promoted_reports.extend(promoted.into_iter().map(|file| (key.clone(), file)));
-            }
-        }
-        // A provisional publication was deliberately absent from live alert
-        // ingestion. Deliver its version-checked snapshot once it is certified.
-        for (key, file) in promoted_reports {
-            if let Some(snapshot) = self.accepted_snapshot_for_file(&key, &file) {
-                accepted_snapshots.push(snapshot);
-            }
-        }
-        let mut completed_checks = Vec::new();
-        for (key, client) in &mut self.clients {
-            if client.rust_check_completed_current(Instant::now(), FLYCHECK_PUBLISH_SETTLE)
-                && !client.diagnostics_are_provisional()
-            {
-                if let Some(check) = client
-                    .completed_rust_check
-                    .as_mut()
-                    .and_then(|cache| cache.complete())
-                {
-                    completed_checks.push((key.clone(), check));
-                }
-            }
-        }
-        for (key, check) in completed_checks {
-            for (file, compiler) in &check.diagnostics {
-                let Some(hash) = check.content_hash(file) else {
-                    continue;
-                };
-                let document = self.documents.get(&key).and_then(|store| store.entry(file));
-                if document.is_some_and(|document| document.content_hash != Some(hash)) {
-                    continue;
-                }
-                // A bounded inspect can close and reopen a document before a
-                // delayed compiler push arrives. Its old or absent version is
-                // not document authority, but the completed check's verified
-                // inputs prove which bytes its compiler diagnostics describe.
-                self.latest_push_for_pull_servers
-                    .insert((key.clone(), file.clone()), compiler.clone());
-                // The completed check's verified inputs match these rows to
-                // the file's content.
-                self.unproven_rust_compiler_reports
-                    .remove(&(key.clone(), file.clone()));
-                let pulled = self.latest_pull_for_rust.get(&(key.clone(), file.clone()));
-                let merged =
-                    union_of_diagnostics(pulled.cloned().unwrap_or_default(), compiler.clone());
-                let version = document.map(|document| document.version);
-                self.diagnostics.publish_full_with_provisional(
-                    key.clone(),
-                    file.clone(),
-                    merged,
-                    None,
-                    version,
-                    false,
-                );
-                self.diagnostics.certify_content(&key, file, Some(hash));
-                if pulled.is_some() {
-                    self.diagnostics.mark_document_pull(&key, file);
-                }
-                diagnostics_changed = true;
-                if let Some(snapshot) = self.accepted_snapshot_for_file(&key, file) {
-                    accepted_snapshots.push(snapshot);
-                }
-            }
-        }
-        DrainedLspEvents {
-            events,
-            instances,
-            processed,
-            diagnostics_changed,
-            accepted_snapshots,
-            has_more,
-        }
-    }
-
     /// Send the rust-analyzer saves that are due: deferred saves for changes
     /// the file watcher reported, and saves that started no check run and
     /// may be sent again (see [`LspClient::take_rust_save_to_send`]). Runs
@@ -4652,6 +4472,7 @@ impl LspManager {
                 })
                 .collect(),
             event_rx: self.event_rx.clone(),
+            ingress_rx: self.ingress_rx.clone(),
             wake_rx,
             waiter_id,
             deadline: std::time::Instant::now() + timeout,
@@ -4795,6 +4616,7 @@ impl LspManager {
         self.post_edit_waiters.insert(waiter_id, wake_tx);
         LspEventWait {
             event_rx: self.event_rx.clone(),
+            ingress_rx: self.ingress_rx.clone(),
             wake_rx,
             waiter_id,
         }
@@ -6462,12 +6284,20 @@ impl LspManager {
     }
 
     fn drain_events_for_file(&mut self, file_path: &Path) -> bool {
+        self.apply_ingress_overflows();
         let mut saw_file_diagnostics = self.ready_startup_events.iter().any(|delivery| {
             delivery.published.as_ref().is_some_and(|published| {
                 published.file.as_path() == file_path && self.startup_publish_is_current(published)
             })
         });
-        while let Ok(event) = self.event_rx.try_recv() {
+        for _ in 0..EVENT_CAP * 2 {
+            let Some(event) = self
+                .event_tx
+                .take_exit()
+                .or_else(|| self.event_rx.try_recv().ok())
+            else {
+                break;
+            };
             if matches!(
                 self.handle_event(&event).ok().flatten(),
                 Some(ref published_file) if published_file.as_path() == file_path
@@ -6475,6 +6305,7 @@ impl LspManager {
                 saw_file_diagnostics = true;
             }
         }
+        self.apply_ingress_overflows();
         saw_file_diagnostics
     }
 
@@ -6657,7 +6488,7 @@ impl LspManager {
     /// only the exit report that receipt was meant to log.
     fn admit_event(&mut self, receipt: &ReceivedLspEvent) -> bool {
         if self.accept_event_instance(&receipt.event, receipt.instance) {
-            return true;
+            return !self.event_tx.predates_overflow(receipt);
         }
         self.consume_pending_exit_report(receipt);
         false
@@ -6684,7 +6515,13 @@ impl LspManager {
         // events until replay commits document versions, save write times,
         // and rust-analyzer check-begin counts.
         if let Some(reservation) = self.starting.get_mut(&event_key) {
-            reservation.deferred_events.push(receipt.clone());
+            if matches!(receipt.event, LspEvent::ServerExited { .. })
+                || reservation.deferred_events.len() < EVENT_CAP
+            {
+                reservation.deferred_events.push(receipt.clone());
+            } else {
+                self.event_tx.record_drop(receipt);
+            }
             true
         } else {
             false
@@ -6695,6 +6532,7 @@ impl LspManager {
     /// `Ok(None)` covers both a deferred startup event and one that stored
     /// no publish.
     fn handle_event(&mut self, receipt: &ReceivedLspEvent) -> Result<Option<PathBuf>, ()> {
+        self.apply_ingress_overflows();
         if !self.admit_event(receipt) {
             return Err(());
         }
@@ -8463,7 +8301,7 @@ struct PreparedSpawn {
     binary: PathBuf,
     args: Vec<String>,
     env: HashMap<String, String>,
-    event_tx: Sender<ReceivedLspEvent>,
+    event_tx: EventIngress,
     child_registry: LspChildRegistry,
     reclaim_root: PathBuf,
     initialization_options: Option<serde_json::Value>,

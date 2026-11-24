@@ -623,6 +623,7 @@ pub(crate) fn main() -> io::Result<()> {
     // last published for them from its own analysis, for the emulated check.
     let mut analysis_opens = 0usize;
     let dynamic_pull = std::env::var_os("AFT_FAKE_LSP_DYNAMIC_PULL").is_some();
+    let mut hover_burst_sent = false;
     let mut client_dynamic_pull = false;
     let mut client_disables_pull = false;
     let mut diagnostic_registered = false;
@@ -1050,6 +1051,18 @@ pub(crate) fn main() -> io::Result<()> {
                     }
                 }
                 "textDocument/hover" => {
+                    if let Ok(count) = std::env::var("AFT_FAKE_LSP_HOVER_EVENT_BURST") {
+                        let uri = document_uri(&params);
+                        for _ in 0..count.parse::<usize>().unwrap() {
+                            write_publish_diagnostics(&mut writer, uri.clone(), opened_diagnostics())?;
+                        }
+                        write_response(&mut writer, id, Value::Null)?;
+                        if hover_burst_sent {
+                            break;
+                        }
+                        hover_burst_sent = true;
+                        continue;
+                    }
                     // AFT_FAKE_LSP_HOVER_DELAY_SIGNAL=<path> is written when a
                     // hover arrives and AFT_FAKE_LSP_HOVER_DELAY_MS=<ms> holds
                     // the reply, so a test can act while AFT waits on a slow
