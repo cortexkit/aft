@@ -109,7 +109,8 @@ pub fn visit_lines(
 }
 
 /// Bytes read per step from a large file.
-pub(crate) const STEP_BYTES: usize = 1024 * 1024;
+#[doc(hidden)]
+pub const STEP_BYTES: usize = 1024 * 1024;
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
@@ -133,7 +134,8 @@ thread_local! {
 /// Fail one raw-line scan at `site` after it consumes its first chunk. The
 /// assertion prevents a regression test from passing without reaching the read.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -152,7 +154,8 @@ pub(crate) fn with_line_scan_failure<T>(site: Site, work: impl FnOnce() -> T) ->
 
 /// Run `work` with `tap` called after every step or raw-line chunk on this thread.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_step_tap<T>(tap: impl FnMut(u64) + 'static, work: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_step_tap<T>(tap: impl FnMut(u64) + 'static, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -181,7 +184,8 @@ pub(crate) fn with_reserve_limit<T>(bytes: usize, work: impl FnOnce() -> T) -> T
 /// Run `work` with a different step size and large-file threshold on this
 /// thread.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_test_steps<T>(step: usize, large: u64, work: impl FnOnce() -> T) -> T {
+#[doc(hidden)]
+pub fn with_test_steps<T>(step: usize, large: u64, work: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -1075,7 +1079,8 @@ pub(crate) fn site_names() -> impl Iterator<Item = &'static str> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn widest_health_for_test() -> serde_json::Value {
+#[doc(hidden)]
+pub fn widest_health_for_test() -> serde_json::Value {
     summarize_health_sites(
         site_names()
             .map(|site| HealthSite {

@@ -1027,7 +1027,8 @@ pub(crate) const PATH_ORDER_BATCH_FILES: usize = 256;
 /// 4,096 lines are ever searched twice. Keeping batches 256 files wide (rather
 /// than narrowing them while the cap still needs many lines) keeps a scan of
 /// many files with few matches each as fast as before.
-pub(crate) const PATH_ORDER_BATCH_ROW_BUDGET: usize = 1 << 20;
+#[doc(hidden)]
+pub const PATH_ORDER_BATCH_ROW_BUDGET: usize = 1 << 20;
 
 /// Most lines one file of a path-ordered batch of `batch_files` files keeps:
 /// its share of `row_budget` (at least one line), and never more than the
@@ -1051,7 +1052,8 @@ pub(crate) fn path_order_file_allowance(
 /// are held at once (kept plus not yet taken) whenever that number grows.
 ///
 /// Returns whether matching lines exist past the ones kept from this batch.
-pub(crate) fn keep_path_ordered_batch<T>(
+#[doc(hidden)]
+pub fn keep_path_ordered_batch<T>(
     kept: &mut Vec<T>,
     max_results: usize,
     allowance: usize,
@@ -1098,7 +1100,8 @@ pub(crate) fn note_path_order_held_rows(search_root: &Path, rows: usize) {
 /// Test-only record of the most rows a path-ordered scan held at once, by
 /// search root.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod path_order_held_rows_for_test;
+#[doc(hidden)]
+pub mod path_order_held_rows_for_test;
 
 #[derive(Clone, Debug)]
 #[doc(hidden)]
@@ -3332,7 +3335,8 @@ fn union_sorted_ids(left: &[u32], right: &[u32]) -> Vec<u32> {
     merged
 }
 
-pub(crate) fn decompose_grep_pattern(pattern: &CompiledPattern) -> RegexQuery {
+#[doc(hidden)]
+pub fn decompose_grep_pattern(pattern: &CompiledPattern) -> RegexQuery {
     let raw_pattern = pattern.raw_pattern_for_trigrams();
     match pattern {
         CompiledPattern::Regex {
@@ -5018,7 +5022,8 @@ pub(crate) fn bounded_grep_line_text(line: &str) -> String {
 /// in the whole line (only a sequence cut by the prefix end, at most its last
 /// 3 bytes, can decode differently). A line longer than that prefix therefore
 /// always has more than `GREP_MAX_LINE_CHARS` characters and is cut.
-pub(crate) fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
+#[doc(hidden)]
+pub fn bounded_grep_line_text_bytes(line: &[u8]) -> String {
     const PREFIX_BYTES: usize = (GREP_MAX_LINE_CHARS + 2) * 4;
     let prefix = &line[..line.len().min(PREFIX_BYTES)];
     bounded_grep_line_text(&String::from_utf8_lossy(prefix))
@@ -7340,4 +7345,5 @@ mod streamed_scan_tests {
     }
 }
 #[cfg(any(test, feature = "test-hooks", feature = "test-support"))]
-pub(crate) mod fixture_build;
+#[doc(hidden)]
+pub mod fixture_build;

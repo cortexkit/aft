@@ -499,7 +499,8 @@ fn retain_reuse_files(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_lane_pause_clock<T>(
+#[doc(hidden)]
+pub fn with_lane_pause_clock<T>(
     start_ms: u64,
     run: impl FnOnce(std::sync::Arc<std::sync::atomic::AtomicU64>) -> T,
 ) -> T {
@@ -732,7 +733,8 @@ fn check_remote_backend_for_root(
 
 /// Start a controlled in-flight probe so command tests need no network route.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn start_remote_backend_probe_for_test(
+#[doc(hidden)]
+pub fn start_remote_backend_probe_for_test(
     root: &Path,
     base_url: &str,
     probe: fn(&str) -> Result<(), String>,
@@ -820,7 +822,8 @@ pub(crate) fn note_embedding_backend_build_failure(project_root: &Path, error: &
 
 /// Called on every exit path of a cold-build retry loop so a parked status
 /// never outlives the loop that would have retried it.
-pub(crate) fn clear_embedding_backend_retry_status(project_root: &Path) {
+#[doc(hidden)]
+pub fn clear_embedding_backend_retry_status(project_root: &Path) {
     clear_embedding_backend_build_failure(project_root);
 }
 
@@ -850,7 +853,8 @@ pub fn embedding_backend_build_health(project_root: &Path) -> Option<EmbeddingBa
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Path, reason: &str) {
+#[doc(hidden)]
+pub fn record_embedding_backend_build_failure_for_test(project_root: &Path, reason: &str) {
     record_embedding_backend_build_failure(
         project_root,
         &format!("{TRANSIENT_EMBEDDING_MARKER}{reason}"),
@@ -861,7 +865,8 @@ pub(crate) fn record_embedding_backend_build_failure_for_test(project_root: &Pat
 /// no parallel test can claim the address. Dropping a temporary listener would
 /// release the port before the asynchronous backend probe connects to it.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
+#[doc(hidden)]
+pub fn reserved_refused_backend_for_test() -> (tokio::net::TcpSocket, std::net::SocketAddr) {
     let socket = tokio::net::TcpSocket::new_v4().expect("create backend socket");
     socket
         .bind(std::net::SocketAddr::from((
@@ -1361,7 +1366,8 @@ impl QueryBudget {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_query_budget_for_test<R>(timeout_ms: u64, action: impl FnOnce() -> R) -> R {
+#[doc(hidden)]
+pub fn with_query_budget_for_test<R>(timeout_ms: u64, action: impl FnOnce() -> R) -> R {
     struct Reset(Option<u64>);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -1669,7 +1675,8 @@ fn log_fingerprint_mismatch(cached: Option<&SemanticIndexFingerprint>, expected:
     }
 }
 
-pub(crate) mod local_embedding_provider;
+#[doc(hidden)]
+pub mod local_embedding_provider;
 use local_embedding_provider::LocalEmbeddingProvider;
 
 impl LocalEmbeddingProvider for LocalEmbedder {
@@ -1913,11 +1920,8 @@ pub fn query_embed_health_snapshot(root: &Path) -> QueryEmbedHealthSnapshot {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn record_query_embed_observation_for_test(
-    root: &Path,
-    elapsed_ms: u64,
-    timed_out: bool,
-) {
+#[doc(hidden)]
+pub fn record_query_embed_observation_for_test(root: &Path, elapsed_ms: u64, timed_out: bool) {
     record_query_embed_observation(Some(root), elapsed_ms, timed_out);
 }
 
@@ -2668,7 +2672,8 @@ pub const QUERY_EMBEDDING_TIMEOUT_MARKER_SUFFIX: &str = "]";
 /// and the parser below stay in lockstep. `pub(crate)` so the classification
 /// test in `semantic_search` can construct a marked error without duplicating
 /// the format string.
-pub(crate) fn query_embedding_timeout_marker(timeout_ms: u64) -> String {
+#[doc(hidden)]
+pub fn query_embedding_timeout_marker(timeout_ms: u64) -> String {
     format!("{QUERY_EMBEDDING_TIMEOUT_MARKER_PREFIX}{timeout_ms}{QUERY_EMBEDDING_TIMEOUT_MARKER_SUFFIX}")
 }
 
@@ -10456,7 +10461,8 @@ impl SemanticVectors {}
 /// not a semantic source, no chunks for an oversized file, and an error for
 /// bytes a build could not read or parse (the fill records it as failed).
 /// Chunk paths are left relative to the checkout root.
-pub(crate) fn chunk_view_file(
+#[doc(hidden)]
+pub fn chunk_view_file(
     project_root: &Path,
     rel_path: &Path,
     bytes: &[u8],

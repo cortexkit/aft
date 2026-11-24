@@ -267,7 +267,8 @@ pub struct ChildSearch {
 
 /// The words a parent folder's `aft_search` names a child with, when the
 /// child's repository store holds no vectors for any of its files.
-pub(crate) const NO_VECTORS: &str = "no semantic view has been published for this repository yet";
+#[doc(hidden)]
+pub const NO_VECTORS: &str = "no semantic view has been published for this repository yet";
 
 /// Each of `children` (child roots of the parent folder `parent` that `ctx`
 /// is bound to) for the parent's `aft_search`, in the order of `children`:

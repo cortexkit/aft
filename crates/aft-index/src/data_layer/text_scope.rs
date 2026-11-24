@@ -313,7 +313,8 @@ fn modified_at(mtime_ns: i64) -> SystemTime {
 /// What tests use to run grep and glob the way they ran before the data
 /// layer, in a process that runs it, and to see whether a call read it.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod test_hooks {
+#[doc(hidden)]
+pub mod test_hooks {
     use std::cell::Cell;
 
     thread_local! {

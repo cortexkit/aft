@@ -6210,7 +6210,8 @@ fn call_graph_holds_for_test() -> &'static std::sync::Mutex<std::collections::Ha
 /// drops, so a test can look at a checkout whose text serves while its call
 /// graph is building.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
+#[doc(hidden)]
+pub fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
     call_graph_holds_for_test()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -6220,7 +6221,8 @@ pub(crate) fn hold_call_graph_for_test(root: &Path) -> CallGraphHold {
 
 /// See [`hold_call_graph_for_test`].
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct CallGraphHold(PathBuf);
+#[doc(hidden)]
+pub struct CallGraphHold(PathBuf);
 
 /// Roots whose builds wait before they publish, each with whether a build
 /// is waiting now.

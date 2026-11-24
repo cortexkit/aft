@@ -139,7 +139,8 @@ pub struct StoreIncompleteNote {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn empty_receiver_note(
+#[doc(hidden)]
+pub fn empty_receiver_note(
     store: &impl CallGraphRead,
     target: &StoreNode,
     count: usize,
@@ -562,7 +563,8 @@ fn unknown_test_caller_count(sites: &[StoreCallSite]) -> usize {
         .count()
 }
 
-pub(crate) fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
+#[doc(hidden)]
+pub fn test_filter_note_for_count(count: usize, include_tests: bool) -> Option<String> {
     (!include_tests && count > 0).then(|| {
         TEST_FILTER_NOTE
             .replace("{count}", &count.to_string())
@@ -3610,7 +3612,8 @@ fn absolute_file(store: &impl CallGraphRead, file: &Path) -> PathBuf {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod trace_budget_fixture;
+#[doc(hidden)]
+pub mod trace_budget_fixture;
 
 #[cfg(test)]
 pub(crate) mod trace_to_tests {

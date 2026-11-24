@@ -117,7 +117,8 @@ pub fn build(root: &Path, threads: usize) -> Result<Built, String> {
 /// The data layer's call graph of the checkout at `root`, held in memory,
 /// for tests of the commands built on it.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn memory_reader(root: &Path) -> super::query::SliceReader<super::query::MemorySlices> {
+#[doc(hidden)]
+pub fn memory_reader(root: &Path) -> super::query::SliceReader<super::query::MemorySlices> {
     let built = build(root, 2).unwrap_or_else(|error| panic!("build {}: {error}", root.display()));
     let mut slices = super::query::MemorySlices::default();
     for (path, file) in &built.resolved {

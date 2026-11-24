@@ -39,7 +39,8 @@ use aft_store::family::NewerFormat;
 pub(crate) const OFF: &str = "off";
 #[doc(hidden)]
 pub const BUILDING: &str = "building";
-pub(crate) const READY: &str = "ready";
+#[doc(hidden)]
+pub const READY: &str = "ready";
 pub(crate) const UNAVAILABLE: &str = "unavailable";
 
 /// Why a plane is off or unavailable.
@@ -47,7 +48,8 @@ pub(crate) const UNAVAILABLE: &str = "unavailable";
 pub mod reason {
     /// Nothing has queried the root yet, so its checkout is not bound and
     /// nothing is built.
-    pub(crate) const NOT_BOUND: &str = "not_bound";
+    #[doc(hidden)]
+    pub const NOT_BOUND: &str = "not_bound";
     /// The family store could not be opened for the checkout.
     #[doc(hidden)]
     pub const BIND_FAILED: &str = "bind_failed";
@@ -432,7 +434,8 @@ pub fn disclose_index_gaps(
 }
 
 /// Adds only host-owned grammar diagnostics, preserving gap-free responses.
-pub(crate) fn disclose_parse_gaps(
+#[doc(hidden)]
+pub fn disclose_parse_gaps(
     view: &super::checkout::CheckoutView,
     roots: &[PathBuf],
     response: &mut crate::protocol::Response,

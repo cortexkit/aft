@@ -211,7 +211,8 @@ impl<'a> Roots<'a> {
 
 /// `path` with `.` components dropped and `..` applied, without reading the
 /// file system.
-pub(crate) fn normalize(path: &Path) -> PathBuf {
+#[doc(hidden)]
+pub fn normalize(path: &Path) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.components() {
         match component {
@@ -247,7 +248,8 @@ fn owning_manifest_dir(project_root: &Path, file: &Path) -> Option<PathBuf> {
 /// examples, its build script, and test or bench targets that turn the test
 /// harness off. Empty when the manifest cannot be read or declares no
 /// `[package]`.
-pub(crate) fn rust_program_roots(directory: &Path) -> BTreeSet<PathBuf> {
+#[doc(hidden)]
+pub fn rust_program_roots(directory: &Path) -> BTreeSet<PathBuf> {
     let mut roots = BTreeSet::new();
     let Some(manifest) = std::fs::read_to_string(directory.join("Cargo.toml"))
         .ok()

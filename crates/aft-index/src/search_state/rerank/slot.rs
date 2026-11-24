@@ -18,7 +18,8 @@ use crate::config::{Config, RerankBackendKind, SearchConfig, SemanticBackendConf
 
 /// Most build attempts for one set of inputs before the slot gives up until
 /// the inputs change again.
-pub(crate) const MAX_BUILD_ATTEMPTS: u32 = 6;
+#[doc(hidden)]
+pub const MAX_BUILD_ATTEMPTS: u32 = 6;
 /// Wait before the second attempt; each later wait doubles, up to
 /// `MAX_BUILD_BACKOFF`.
 pub(crate) const BUILD_BACKOFF: Duration = Duration::from_secs(2);
@@ -221,7 +222,8 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The production constructor. Runs on the slot's build thread.
-pub(crate) fn build_backend(inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
+#[doc(hidden)]
+pub fn build_backend(inputs: &BuildInputs) -> Result<Option<SelectedBackend>, String> {
     if inputs.cache_unavailable {
         return Err(aft_db::root_cache::CACHE_DIR_UNAVAILABLE.into());
     }

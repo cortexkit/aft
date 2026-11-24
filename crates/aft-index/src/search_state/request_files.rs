@@ -484,7 +484,8 @@ thread_local! {
 
 /// Run `run` with requests on this thread reading without a set.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn without_request_files_for_test<R>(run: impl FnOnce() -> R) -> R {
+#[doc(hidden)]
+pub fn without_request_files_for_test<R>(run: impl FnOnce() -> R) -> R {
     OFF_FOR_TEST.with(|off| off.set(true));
     let result = run();
     OFF_FOR_TEST.with(|off| off.set(false));
@@ -602,7 +603,8 @@ mod matching_line_completion_tests {
 /// through the set or through a phase's own read. Probes are keyed by a root
 /// so tests running at once on other roots do not see each other's reads.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod read_probe {
+#[doc(hidden)]
+pub mod read_probe {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, OnceLock};
@@ -645,7 +647,8 @@ pub(crate) mod read_probe {
         }
     }
 
-    pub(crate) fn record_disk_read(path: &Path) {
+    #[doc(hidden)]
+    pub fn record_disk_read(path: &Path) {
         for (root, reads) in probes().lock().iter() {
             if path.starts_with(root) {
                 *reads.lock().entry(path.to_path_buf()).or_default() += 1;

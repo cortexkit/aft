@@ -268,4 +268,5 @@ fn files_accounted(coverage: &Coverage) -> usize {
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "meaning_query_test_support.rs"]
-pub(crate) mod test_support;
+#[doc(hidden)]
+pub mod test_support;

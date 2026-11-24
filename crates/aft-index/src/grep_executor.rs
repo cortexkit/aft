@@ -85,7 +85,8 @@ pub fn with_ignore_probe_state_for_test<R>(
 
 /// Records that a fallback filesystem walk started on this thread.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn note_fallback_walk_for_test() {
+#[doc(hidden)]
+pub fn note_fallback_walk_for_test() {
     FALLBACK_WALKS.with(|walks| walks.set(walks.get() + 1));
 }
 
@@ -101,7 +102,8 @@ fn fallback_walk_limit() -> usize {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
+#[doc(hidden)]
+pub fn with_walk_limit<R>(limit: usize, run: impl FnOnce() -> R) -> R {
     struct Restore(usize);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -149,10 +151,8 @@ fn fallback_walk_sort_metadata_delay() -> Duration {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_fallback_walk_budget_for_test<R>(
-    budget: Duration,
-    run: impl FnOnce() -> R,
-) -> R {
+#[doc(hidden)]
+pub fn with_fallback_walk_budget_for_test<R>(budget: Duration, run: impl FnOnce() -> R) -> R {
     struct Restore(Duration);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -164,10 +164,8 @@ pub(crate) fn with_fallback_walk_budget_for_test<R>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_fallback_walk_entry_delay_for_test<R>(
-    delay: Duration,
-    run: impl FnOnce() -> R,
-) -> R {
+#[doc(hidden)]
+pub fn with_fallback_walk_entry_delay_for_test<R>(delay: Duration, run: impl FnOnce() -> R) -> R {
     struct Restore(Duration);
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -179,7 +177,8 @@ pub(crate) fn with_fallback_walk_entry_delay_for_test<R>(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn with_fallback_walk_sort_metadata_delay_for_test<R>(
+#[doc(hidden)]
+pub fn with_fallback_walk_sort_metadata_delay_for_test<R>(
     delay: Duration,
     run: impl FnOnce() -> R,
 ) -> R {
@@ -667,7 +666,8 @@ fn path_batch_order_for_test(search_root: &Path) -> Option<bool> {
 /// fallback batch finish: when set for a search root, the batch's files are
 /// searched one at a time, forward or reversed, instead of in parallel.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod scan_order_for_test {
+#[doc(hidden)]
+pub mod scan_order_for_test {
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -811,11 +811,8 @@ fn resolve_grep_scope_for_root(
 /// scope is resolved, without that resolution or its path checks, so tests
 /// can show what the search itself does with a starting path.
 #[cfg(all(unix, any(test, feature = "test-support")))]
-pub(crate) fn grep_root_for_test(
-    ctx: &impl IndexHost,
-    search_root: &Path,
-    pattern: &str,
-) -> GrepResult {
+#[doc(hidden)]
+pub fn grep_root_for_test(ctx: &impl IndexHost, search_root: &Path, pattern: &str) -> GrepResult {
     let pattern = match crate::pattern_compile::compile(
         pattern,
         crate::pattern_compile::CompileOpts::default(),
@@ -2095,7 +2092,8 @@ fn diagnose_scope_counts_unbounded(
 }
 
 /// Bounded project walk used when the trigram index is unavailable (grep/glob fallback).
-pub(crate) fn bounded_fallback_walk_files(
+#[doc(hidden)]
+pub fn bounded_fallback_walk_files(
     filter_root: &Path,
     search_root: &Path,
     filters: &PathFilters,
@@ -3560,7 +3558,8 @@ fn line_details_with_next(
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod grep_test_fixture;
+#[doc(hidden)]
+pub mod grep_test_fixture;
 #[cfg(test)]
 use grep_test_fixture::literal;
 

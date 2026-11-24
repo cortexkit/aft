@@ -28,7 +28,8 @@ pub const WATCHER_DISPATCH_CHANNEL_CAPACITY: usize = 1024;
     test,
     feature = "test-support"
 ))]
-pub(crate) const WATCHER_EXCLUSION_LIMIT: usize = 8;
+#[doc(hidden)]
+pub const WATCHER_EXCLUSION_LIMIT: usize = 8;
 /// How deep below the root a bare ecosystem name is still enumerated. A
 /// gitignore pattern like `node_modules` matches at every depth, but an
 /// exclusion is one exact path, so the copies that exist have to be found. The
@@ -671,7 +672,8 @@ impl WatcherExclusion {
     test,
     feature = "test-support"
 ))]
-pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<PathBuf> {
+#[doc(hidden)]
+pub fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<PathBuf> {
     exclusions
         .iter()
         .map(|exclusion| exclusion.path.clone())
@@ -688,7 +690,8 @@ pub(crate) fn watcher_exclusion_paths(exclusions: &[WatcherExclusion]) -> Vec<Pa
     test,
     feature = "test-support"
 ))]
-pub(crate) struct WatcherExclusionPaths {
+#[doc(hidden)]
+pub struct WatcherExclusionPaths {
     lasting: Vec<WatcherExclusion>,
     external: BTreeSet<PathBuf>,
     #[cfg(any(target_os = "macos", target_os = "linux", test))]
@@ -1184,7 +1187,8 @@ fn watcher_boundary_metadata(path: &Path) -> std::io::Result<fs::Metadata> {
     feature = "test-support"
 ))]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct WatcherExclusionPlan {
+#[doc(hidden)]
+pub struct WatcherExclusionPlan {
     /// Exclusions to install, best first.
     pub(crate) selected: Vec<WatcherExclusion>,
     /// The next candidates that lost a slot to the cap, best first. Named in
@@ -1199,7 +1203,8 @@ pub(crate) struct WatcherExclusionPlan {
     feature = "test-support"
 ))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ExclusionPlanUnavailable {
+#[doc(hidden)]
+pub enum ExclusionPlanUnavailable {
     CapacityDeadline,
     IoDeadline,
     SpawnFailed,
@@ -1249,7 +1254,8 @@ const EXCLUSION_PLAN_MAX_ATTEMPTS: u32 = 8;
     feature = "test-support"
 ))]
 #[derive(Default)]
-pub(crate) struct WatcherExclusionRetry {
+#[doc(hidden)]
+pub struct WatcherExclusionRetry {
     generation: Option<u64>,
     consumed: bool,
     attempts: u32,
@@ -1262,7 +1268,8 @@ pub(crate) struct WatcherExclusionRetry {
     test,
     feature = "test-support"
 ))]
-pub(crate) enum WatcherExclusionUpdate {
+#[doc(hidden)]
+pub enum WatcherExclusionUpdate {
     Planned(WatcherExclusionPlan),
     Reduced,
 }
@@ -1530,7 +1537,8 @@ fn exclusion_walk_skips_git_directory(path: &Path) -> bool {
     test,
     feature = "test-support"
 ))]
-pub(crate) fn derive_watcher_exclusion_plan(
+#[doc(hidden)]
+pub fn derive_watcher_exclusion_plan(
     root: &Path,
     matcher: &SharedGitignore,
     max_paths: Option<usize>,
@@ -1596,7 +1604,8 @@ impl Drop for ForcedExclusionFailure {
     any(test, feature = "test-support"),
     any(target_os = "linux", target_os = "macos")
 ))]
-pub(crate) fn force_exclusion_failure_for_test(root: &Path) -> ForcedExclusionFailure {
+#[doc(hidden)]
+pub fn force_exclusion_failure_for_test(root: &Path) -> ForcedExclusionFailure {
     let root = root.canonicalize().unwrap();
     forced_exclusion_failures()
         .lock()

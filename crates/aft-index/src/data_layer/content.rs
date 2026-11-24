@@ -327,7 +327,8 @@ fn note_parsed_for_test(source: &[u8]) {
 
 /// How many times extraction has parsed `source`'s content so far.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn parses_of_for_test(source: &[u8]) -> usize {
+#[doc(hidden)]
+pub fn parses_of_for_test(source: &[u8]) -> usize {
     let key = aft_store::ids::ContentKey::of(source);
     PARSED_FOR_TEST
         .lock()
@@ -810,7 +811,8 @@ pub fn symbol_from_outline(symbol: &OutlineSymbol) -> Option<crate::symbols::Sym
 /// Adds Rust trait members from stored call-graph symbols to a navigation
 /// table. The record itself stays unchanged, so existing publications need no
 /// rebuild just to expose members they already contain.
-pub(crate) fn complete_rust_outline(
+#[doc(hidden)]
+pub fn complete_rust_outline(
     symbols: Vec<OutlineSymbol>,
     surface: &aft_store::content::Surface,
 ) -> Vec<OutlineSymbol> {

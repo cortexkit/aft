@@ -29,7 +29,8 @@ static LIVE_CAPTURE_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(any(test, feature = "test-support"))]
 #[path = "synapse_route_fixture.rs"]
-pub(crate) mod route_fixture;
+#[doc(hidden)]
+pub mod route_fixture;
 
 #[cfg(test)]
 #[path = "synapse_route_tests.rs"]
@@ -305,7 +306,8 @@ pub fn lane_pause_for_root(root: &Path) -> Option<LanePause> {
 
 /// A fill that waits on another root's lane pause reports the same planned
 /// downtime in health, even though it made no request of its own.
-pub(crate) fn share_lane_pause(root: &Path, pause: &LanePause) {
+#[doc(hidden)]
+pub fn share_lane_pause(root: &Path, pause: &LanePause) {
     lane_pauses()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -410,7 +412,8 @@ impl fmt::Display for SynapseEmbeddingError {
 impl std::error::Error for SynapseEmbeddingError {}
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod pause_test_support {
+#[doc(hidden)]
+pub mod pause_test_support {
     use super::*;
     use std::sync::{atomic::AtomicU64, Arc, Mutex};
 

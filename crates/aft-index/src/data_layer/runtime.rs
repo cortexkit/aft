@@ -525,7 +525,8 @@ fn build_holds_for_test() -> &'static std::sync::Mutex<std::collections::HashSet
 /// Holds every build of the checkout at `root` before it starts, until the
 /// returned guard drops, so a test can look at a checkout that is building.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn hold_builds_for_test(root: &Path) -> BuildHold {
+#[doc(hidden)]
+pub fn hold_builds_for_test(root: &Path) -> BuildHold {
     build_holds_for_test()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -535,7 +536,8 @@ pub(crate) fn hold_builds_for_test(root: &Path) -> BuildHold {
 
 /// See [`hold_builds_for_test`].
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) struct BuildHold(PathBuf);
+#[doc(hidden)]
+pub struct BuildHold(PathBuf);
 
 #[cfg(any(test, feature = "test-support"))]
 impl Drop for BuildHold {
@@ -2419,10 +2421,8 @@ thread_local! {
 
 /// Compare the former epoch-or-age refresh policy on the same retained engines.
 #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
-pub(crate) fn with_memory_figure_baseline_for_test<T>(
-    baseline: bool,
-    measure: impl FnOnce() -> T,
-) -> T {
+#[doc(hidden)]
+pub fn with_memory_figure_baseline_for_test<T>(baseline: bool, measure: impl FnOnce() -> T) -> T {
     struct Reset(bool);
     impl Drop for Reset {
         fn drop(&mut self) {
@@ -2434,12 +2434,14 @@ pub(crate) fn with_memory_figure_baseline_for_test<T>(
 }
 
 #[cfg(all(any(test, feature = "test-support"), target_os = "linux"))]
-pub(crate) fn memory_profile_layer_for_test() -> Arc<DataLayer> {
+#[doc(hidden)]
+pub fn memory_profile_layer_for_test() -> Arc<DataLayer> {
     layer()
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn memory_figure_walks_for_test() -> usize {
+#[doc(hidden)]
+pub fn memory_figure_walks_for_test() -> usize {
     MEMORY_FIGURE_WALKS.with(std::cell::Cell::get)
 }
 

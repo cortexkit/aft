@@ -331,6 +331,102 @@ Modules with an engine compatibility path keep that path for tool, daemon and fa
 | `data_layer::meaning` | visibility widened | `aft-index` | Keep the preexisting embedding test fixtures available through the engine bridge. |
 | `data_layer::meaning::use_constant_vectors` | test-support visibility widened | `aft-index` | Preserve the deterministic embedding fixture for parity checks. |
 
+### Index test bridge
+
+| Item | Kind | Owning crate | Reason |
+|---|---|---|---|
+| `data_layer::meaning_query::test_support` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::outline::tables` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::outline::Prewarm` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::outline::prewarm` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::outline::already_claimed_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::outline::record_reads` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::outline::StoredOutline` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::callgraph_store_adapter::trace_budget_fixture` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::callgraph_store_adapter::empty_receiver_note` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::callgraph_store_adapter::test_filter_note_for_count` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `grep_executor::grep_test_fixture` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::bounded_fallback_walk_files` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::scan_order_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::grep_root_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::with_walk_limit` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::with_fallback_walk_budget_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::with_fallback_walk_entry_delay_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::with_fallback_walk_sort_metadata_delay_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `grep_executor::note_fallback_walk_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `semantic_index::local_embedding_provider` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::with_query_budget_for_test` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::with_lane_pause_clock` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::chunk_view_file` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::query_embedding_timeout_marker` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::clear_embedding_backend_retry_status` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::reserved_refused_backend_for_test` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::start_remote_backend_probe_for_test` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::record_embedding_backend_build_failure_for_test` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `semantic_index::record_query_embed_observation_for_test` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `synapse_embed::pause_test_support` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `synapse_embed::route_fixture` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `synapse_embed::share_lane_pause` | visibility widened | `aft-index` | Keep the existing embedding observation or fixture available to the engine test bridge. |
+| `search_state::rerank::remote` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::synapse` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::fixture` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::onnx` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::DEFAULT_TIMEOUT_MS` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::DEFAULT_TOP_N` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::MAX_TIMEOUT_MS` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::MAX_TOP_N` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::MIN_TIMEOUT_MS` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::note_io` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::io_on_this_thread` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::request_files::read_probe` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_state::request_files::without_request_files_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_state::request_files::record_disk_read` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_index::fixture_build` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_index::PATH_ORDER_BATCH_ROW_BUDGET` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_index::decompose_grep_pattern` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_index::keep_path_ordered_batch` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_index::bounded_grep_line_text_bytes` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `search_index::path_order_held_rows_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `data_layer::meaning::fill_with_constant_vectors_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::meaning::waiting` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::meaning::hold_model_loads_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::meaning::fail_model_loads_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::meaning::fill_without_model_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::surfaces::NOT_BOUND` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::surfaces::READY` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::surfaces::disclose_parse_gaps` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::runtime::memory_profile_layer_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::runtime::memory_figure_walks_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::runtime::with_memory_figure_baseline_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::runtime::BuildHold` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::runtime::hold_builds_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::content::complete_rust_outline` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::content::parses_of_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::callgraph_roots::normalize` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::callgraph_roots::rust_program_roots` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::trace_measure::memory_reader` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::parent::NO_VECTORS` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::text_scope::test_hooks` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `large_read::STEP_BYTES` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `large_read::with_line_scan_failure` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `large_read::with_step_tap` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `large_read::with_test_steps` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `large_read::widest_health_for_test` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `watcher_filter::WATCHER_EXCLUSION_LIMIT` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::WatcherExclusionPlan` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::ExclusionPlanUnavailable` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::derive_watcher_exclusion_plan` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::watcher_exclusion_paths` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::WatcherExclusionPaths` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::WatcherExclusionRetry` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::WatcherExclusionUpdate` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `watcher_filter::force_exclusion_failure_for_test` | visibility widened | `aft-index` | Keep the existing watcher planning or event observation available to the engine test bridge. |
+| `search_state::rerank::slot::MAX_BUILD_ATTEMPTS` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `search_state::rerank::slot::build_backend` | visibility widened | `aft-index` | Keep the existing rerank configuration, fixture, or observation available to the engine test bridge. |
+| `memory_census::rollup_snapshot` | visibility widened | `aft-index` | Keep the existing search fixture or observation available to the engine test bridge. |
+| `data_layer::checkout::CallGraphHold` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+| `data_layer::checkout::hold_call_graph_for_test` | visibility widened | `aft-index` | Keep the existing index-store fixture or observation available to the engine test bridge. |
+
 ## Visibility widened for cross-crate callers
 
 | Item | Kind | Owning crate | Reason |

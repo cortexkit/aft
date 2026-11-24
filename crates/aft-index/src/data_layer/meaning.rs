@@ -732,7 +732,8 @@ fn constant_vectors_for_test() -> &'static Mutex<std::collections::HashMap<PathB
 /// Embed constant, correctly sized rows without model or network work, while
 /// still exercising meaning search's fill, publication and follow-up jobs.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn fill_with_constant_vectors_for_test(root: &Path, dimensions: usize) -> impl Drop {
+#[doc(hidden)]
+pub fn fill_with_constant_vectors_for_test(root: &Path, dimensions: usize) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -752,7 +753,8 @@ fn model_free_dimensions_for_test(root: &Path) -> Option<usize> {
 /// loading the model, until the returned guard drops: for a test whose
 /// embedding backend serves one session only, which its query must have.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn fill_without_model_for_test(root: &Path, dimensions: usize) -> impl Drop {
+#[doc(hidden)]
+pub fn fill_without_model_for_test(root: &Path, dimensions: usize) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -773,7 +775,8 @@ fn model_holds_for_test() -> &'static Mutex<std::collections::HashSet<PathBuf>> 
 /// Holds every model load of a fill under `root` until the returned guard
 /// drops, so a test can look at a plane that is being read back.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn hold_model_loads_for_test(root: &Path) -> impl Drop {
+#[doc(hidden)]
+pub fn hold_model_loads_for_test(root: &Path) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -829,7 +832,8 @@ fn model_failure_for_test(root: &Path) -> Option<String> {
 /// Makes every model load of a fill under `root` fail with `error`, until
 /// the returned guard drops.
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
+#[doc(hidden)]
+pub fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
     struct Release(PathBuf);
     impl Drop for Release {
         fn drop(&mut self) {
@@ -843,7 +847,8 @@ pub(crate) fn fail_model_loads_for_test(root: &Path, error: &str) -> impl Drop {
 /// Whether `coverage` leaves files waiting for vectors that a fill would
 /// embed.
 #[must_use]
-pub(crate) fn waiting(coverage: &Coverage) -> bool {
+#[doc(hidden)]
+pub fn waiting(coverage: &Coverage) -> bool {
     !coverage.pending.is_empty()
 }
 

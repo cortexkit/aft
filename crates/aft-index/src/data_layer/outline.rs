@@ -16,7 +16,8 @@
 //! the checkout's recorded stat evidence still proves a file's content, by
 //! the rule the store's own binds trust, the file is not read either.
 
-pub(crate) mod tables;
+#[doc(hidden)]
+pub mod tables;
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock, Weak};
@@ -31,7 +32,8 @@ use crate::data_layer::host::IndexHost;
 use crate::parser::{SharedSymbolCache, SymbolCache};
 
 /// One file's outline as its stored content record holds it.
-pub(crate) struct StoredOutline {
+#[doc(hidden)]
+pub struct StoredOutline {
     /// The content the symbols were extracted from.
     pub(crate) content: ContentKey,
     pub(crate) symbols: Vec<OutlineSymbol>,
@@ -39,7 +41,8 @@ pub(crate) struct StoredOutline {
 
 /// What one prewarm did with the checkout's files.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Prewarm {
+#[doc(hidden)]
+pub struct Prewarm {
     /// Already in the cache for the file's current modification time.
     pub(crate) cached: u64,
     /// Filled from their records.
@@ -68,7 +71,8 @@ enum Outcome {
 /// # Errors
 ///
 /// When a record cannot be read.
-pub(crate) fn prewarm(
+#[doc(hidden)]
+pub fn prewarm(
     view: &CheckoutView,
     cache: &SharedSymbolCache,
     generation: u64,
@@ -307,7 +311,8 @@ pub(crate) fn note_record_read() {
 }
 
 #[cfg(all(any(test, feature = "test-support"), unix))]
-pub(crate) fn record_reads() -> u64 {
+#[doc(hidden)]
+pub fn record_reads() -> u64 {
     RECORD_READS.with(std::cell::Cell::get)
 }
 
@@ -483,10 +488,7 @@ impl Drop for Claim {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn already_claimed_for_test(
-    cache: &SharedSymbolCache,
-    generation: u64,
-    root: &Path,
-) -> bool {
+#[doc(hidden)]
+pub fn already_claimed_for_test(cache: &SharedSymbolCache, generation: u64, root: &Path) -> bool {
     Claim::take(cache, generation, root).is_none()
 }

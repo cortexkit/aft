@@ -1,4 +1,3 @@
-
 #[test]
 fn worker_only_edits_with_tier2_enabled_do_not_refresh_the_callgraph() {
     use crate::inspect::tier2_scheduler::{

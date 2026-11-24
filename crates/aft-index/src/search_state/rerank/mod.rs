@@ -1,11 +1,15 @@
 //! Reranker backend contracts, configuration and per-context installation state.
 
-pub(crate) mod fixture;
-pub(crate) mod onnx;
-pub(crate) mod remote;
+#[doc(hidden)]
+pub mod fixture;
+#[doc(hidden)]
+pub mod onnx;
+#[doc(hidden)]
+pub mod remote;
 #[doc(hidden)]
 pub mod slot;
-pub(crate) mod synapse;
+#[doc(hidden)]
+pub mod synapse;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -15,16 +19,21 @@ use crate::config::{RerankBackendKind, SearchConfig};
 /// How many entries at the head of the canonical list are reranked when the
 /// config does not say. Chosen so a cross-encoder answers within the default
 /// deadline on a laptop CPU; entries below it keep their fused order.
-pub(crate) const DEFAULT_TOP_N: usize = 20;
+#[doc(hidden)]
+pub const DEFAULT_TOP_N: usize = 20;
 /// The reranked prefix never reaches past the first block of the canonical
 /// list. That block holds every candidate found within the shallowest
 /// retrieval depth, which every request observes, so its contents are the same
 /// whatever `topK` and `offset` a request asks for.
-pub(crate) const MAX_TOP_N: usize = super::BLOCK_DEPTHS[0];
+#[doc(hidden)]
+pub const MAX_TOP_N: usize = super::BLOCK_DEPTHS[0];
 /// Per-call scoring budget when the config does not set one.
-pub(crate) const DEFAULT_TIMEOUT_MS: u64 = 1_500;
-pub(crate) const MIN_TIMEOUT_MS: u64 = 50;
-pub(crate) const MAX_TIMEOUT_MS: u64 = 15_000;
+#[doc(hidden)]
+pub const DEFAULT_TIMEOUT_MS: u64 = 1_500;
+#[doc(hidden)]
+pub const MIN_TIMEOUT_MS: u64 = 50;
+#[doc(hidden)]
+pub const MAX_TIMEOUT_MS: u64 = 15_000;
 /// Names the candidate-text construction used by the search tool. Bump it
 /// whenever that construction changes, so memoized orders and recorded fixture
 /// scores made with the old text are never reused.
@@ -199,7 +208,8 @@ thread_local! {
 }
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn io_on_this_thread() -> usize {
+#[doc(hidden)]
+pub fn io_on_this_thread() -> usize {
     IO_ON_THIS_THREAD.with(std::cell::Cell::get)
 }
 
@@ -207,7 +217,8 @@ pub(crate) fn io_on_this_thread() -> usize {
 /// the marks on their own thread to prove the search path's backend
 /// selection never reaches one; in normal builds it does nothing.
 #[inline]
-pub(crate) fn note_io() {
+#[doc(hidden)]
+pub fn note_io() {
     #[cfg(any(test, feature = "test-support"))]
     IO_ON_THIS_THREAD.with(|count| count.set(count.get() + 1));
 }
