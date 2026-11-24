@@ -754,26 +754,46 @@ fn wait_on_pty_reader_gate_for_test(task_id: &str) {
 /// Detects the DSR cursor-position query `\x1b[6n` (4 bytes) in a byte stream
 /// delivered in arbitrary chunks. A `read()` may return as little as one byte,
 /// so the 4-byte needle can split across ANY number of reads. We keep a rolling
-/// carry of the last 3 bytes seen and prepend it to each new chunk before
-/// scanning. Crucially the carry is taken from the COMBINED (carry + chunk)
-/// buffer, not just the chunk's own tail — that is what lets detection survive
-/// more than two reads (e.g. `\x1b`, `[`, `6`, `n` arriving as four reads).
+/// carry of the last 3 bytes of the whole stream (not just the last chunk's
+/// own tail, which is what lets detection survive more than two reads, e.g.
+/// `\x1b`, `[`, `6`, `n` arriving as four reads). Each read is searched in
+/// place and only the seam between the carry and the read is copied, into a
+/// small stack buffer, so scanning does not allocate.
 #[derive(Default)]
 struct DsrScanner {
-    carry: Vec<u8>,
+    carry: [u8; DSR_CARRY_OVER],
+    carry_len: usize,
 }
 
 impl DsrScanner {
+    const NEEDLE: &'static [u8; 4] = b"\x1b[6n";
+
     fn scan(&mut self, chunk: &[u8]) -> bool {
-        let mut combined = Vec::with_capacity(self.carry.len() + chunk.len());
-        combined.extend_from_slice(&self.carry);
-        combined.extend_from_slice(chunk);
-        let detected = combined.windows(4).any(|w| w == b"\x1b[6n");
-        // Carry the last 3 bytes of the combined stream forward: a 4-byte
-        // needle straddling this boundary keeps at most 3 bytes on this side.
-        let start = combined.len().saturating_sub(DSR_CARRY_OVER);
-        self.carry.clear();
-        self.carry.extend_from_slice(&combined[start..]);
+        // A needle that starts in the carry ends within the chunk's first
+        // three bytes.
+        let mut seam = [0_u8; 2 * DSR_CARRY_OVER];
+        let head = chunk.len().min(DSR_CARRY_OVER);
+        seam[..self.carry_len].copy_from_slice(&self.carry[..self.carry_len]);
+        seam[self.carry_len..self.carry_len + head].copy_from_slice(&chunk[..head]);
+        let detected = seam[..self.carry_len + head]
+            .windows(Self::NEEDLE.len())
+            .any(|window| window == Self::NEEDLE)
+            || chunk
+                .windows(Self::NEEDLE.len())
+                .any(|window| window == Self::NEEDLE);
+        // Carry the last 3 bytes of the stream forward: a 4-byte needle
+        // straddling this boundary keeps at most 3 bytes on this side.
+        if chunk.len() >= DSR_CARRY_OVER {
+            self.carry
+                .copy_from_slice(&chunk[chunk.len() - DSR_CARRY_OVER..]);
+            self.carry_len = DSR_CARRY_OVER;
+        } else {
+            let total = self.carry_len + chunk.len();
+            let keep = total.min(DSR_CARRY_OVER);
+            let tail = &seam[total - keep..total];
+            self.carry[..keep].copy_from_slice(tail);
+            self.carry_len = keep;
+        }
         detected
     }
 }
@@ -1138,6 +1158,19 @@ mod tests {
         assert_eq!(scan_chunks(&[b"hello"]), 0);
         // Partial-but-never-completed sequence must not fire.
         assert_eq!(scan_chunks(&[b"\x1b[6", b"x"]), 0);
+    }
+
+    #[test]
+    fn dsr_scan_does_not_allocate_per_read() {
+        let mut scanner = DsrScanner::default();
+        let chunk = vec![b'x'; 8192];
+        scanner.scan(&chunk);
+        let (_, allocations) = crate::test_allocations::count(|| {
+            for _ in 0..16 {
+                scanner.scan(&chunk);
+            }
+        });
+        assert_eq!(allocations, 0, "each scanned read allocated");
     }
 
     #[test]
