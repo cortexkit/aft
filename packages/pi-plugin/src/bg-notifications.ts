@@ -153,6 +153,7 @@ export const sessionBgStates: Map<string, SessionBgState> = new Map();
 export const SESSION_BG_STATE_IDLE_TTL_MS = 60 * 60 * 1000;
 const DEBOUNCE_STEP_MS = 200;
 const DEBOUNCE_CAP_MS = 1000;
+const WAKE_SESSION_CHANGED = Symbol("wake session changed");
 const MAX_WAKE_SEND_ATTEMPTS = 5;
 const UNKNOWN_COMPLETION_TTL_MS = 5000;
 const UNKNOWN_COMPLETION_CAP = 32;
@@ -738,7 +739,7 @@ async function triggerWakeIfPending(
       const liveSession = getActiveSessionId() ?? drainContext.sessionID;
       if (liveSession && drainContext.sessionID && drainContext.sessionID !== liveSession) {
         logDroppedForeignSessionFrame(drainContext, drainContext.sessionID, liveSession);
-        return;
+        return WAKE_SESSION_CHANGED;
       }
       const ackTargetIds = deliveredCompletions.map((completion) => completion.task_id);
       const ackKeys = deliveredCompletions.map(bashAckKey);
@@ -1104,7 +1105,7 @@ function scheduleWake(
     reminder: string,
     completions: readonly BashAckTarget[],
     patternMatches?: readonly PatternMatchEntry[],
-  ) => Promise<void>,
+  ) => Promise<void | typeof WAKE_SESSION_CHANGED>,
   onSendFailure: (err: unknown, hardStopped: boolean) => void,
   includeDeferredCompletions = true,
 ): void {
@@ -1171,7 +1172,19 @@ function scheduleWake(
     const ackTargetIds = completionAcks.map(bashAckKey);
     markDelivering(state, ackTargetIds);
     void sendWake(reminder, completionAcks, pendingPatternMatches)
-      .then(() => {
+      .then((delivery) => {
+        if (delivery === WAKE_SESSION_CHANGED) {
+          // The owner session changed before delivery. Restore the exact
+          // pending snapshot, but do not retry while another session is active.
+          clearDelivering(state, ackTargetIds);
+          state.pendingCompletions = [...pending, ...state.pendingCompletions];
+          state.pendingLongRunning = [...pendingLongRunning, ...state.pendingLongRunning];
+          state.pendingPatternMatches = [...pendingPatternMatches, ...state.pendingPatternMatches];
+          state.retryDelayMs = null;
+          state.wakeRetryAttempts = 0;
+          state.wakeHardStopped = false;
+          return;
+        }
         state.retryDelayMs = null;
         state.wakeRetryAttempts = 0;
         state.wakeHardStopped = false;
