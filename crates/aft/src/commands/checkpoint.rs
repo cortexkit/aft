@@ -29,6 +29,11 @@ pub fn handle_checkpoint(req: &RawRequest, ctx: &AppContext) -> Response {
 mod tests {
     use super::*;
 
+    thread_local! {
+        pub(super) static BEFORE_CREATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     #[test]
     fn edit_review_gpt_5_checkpoint_does_not_rewrite_matching_file() {
         use std::{
@@ -202,6 +207,56 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn edit_review_opus_12_deleted_tracked_files_make_an_empty_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("tracked.txt");
+        let ctx = test_context(root.path());
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "empty", "command": "checkpoint", "name": "empty",
+        }))
+        .unwrap();
+        std::fs::write(&path, b"original").unwrap();
+        ctx.backup()
+            .lock()
+            .snapshot(request.session(), &path, "tracked")
+            .unwrap();
+        std::fs::remove_file(&path).unwrap();
+
+        let explicit: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "explicit", "command": "checkpoint", "name": "explicit", "files": [path],
+        }))
+        .unwrap();
+        let response = handle_checkpoint(&explicit, &ctx);
+        assert_eq!(response.data["code"], "file_not_found", "{response:?}");
+        let response = handle_checkpoint(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        assert_eq!(response.data["file_count"], 0);
+        assert_eq!(response.data["skipped"].as_array().unwrap().len(), 1);
+        assert!(response.data.get("requested_count").is_none());
+    }
+
+    #[test]
+    fn edit_review_opus_8_checkpoint_creation_does_not_hold_backup_mutex() {
+        let root = tempfile::tempdir().unwrap();
+        let ctx = std::sync::Arc::new(test_context(root.path()));
+        let path = root.path().join("tracked.txt");
+        std::fs::write(&path, b"tracked").unwrap();
+        let request: RawRequest = serde_json::from_value(serde_json::json!({
+            "id": "create", "command": "checkpoint", "name": "unlocked", "files": [path],
+        }))
+        .unwrap();
+        BEFORE_CREATE.with(|hook| {
+            let ctx = ctx.clone();
+            hook.replace(Some(Box::new(move || {
+                assert!(ctx.backup().try_lock().is_some());
+            })));
+        });
+        let response = handle_checkpoint(&request, &ctx);
+        assert!(response.success, "{response:?}");
+        BEFORE_CREATE.with(|hook| assert!(hook.borrow().is_none()));
+    }
 }
 
 fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response, Response> {
@@ -242,10 +297,18 @@ fn handle_checkpoint_impl(req: &RawRequest, ctx: &AppContext) -> Result<Response
     // like with like against the snapshot count.
     let requested_count = validated_files.len();
 
-    let backup = ctx.backup().lock();
     let mut checkpoint_store = ctx.checkpoint().lock();
 
-    match checkpoint_store.create(req.session(), name, validated_files, &backup) {
+    #[cfg(test)]
+    if let Some(hook) = tests::BEFORE_CREATE.with(|hook| hook.replace(None)) {
+        hook();
+    }
+    let checkpoint = if explicit_request {
+        checkpoint_store.create_for_files(req.session(), name, validated_files)
+    } else {
+        checkpoint_store.create_for_tracked_files(req.session(), name, validated_files)
+    };
+    match checkpoint {
         Ok(info) => {
             let storage_path = info
                 .storage_path

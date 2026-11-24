@@ -633,7 +633,15 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: &BackupStore,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, Some(backup_store), None)
+        let explicit_request = !files.is_empty();
+        self.create_impl(
+            session,
+            name,
+            files,
+            Some(backup_store),
+            None,
+            explicit_request,
+        )
     }
 
     /// Checkpoint exactly `files`, with no fallback to the backup store's
@@ -645,7 +653,19 @@ impl CheckpointStore {
         name: &str,
         files: Vec<PathBuf>,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, None, None)
+        let explicit_request = !files.is_empty();
+        self.create_impl(session, name, files, None, None, explicit_request)
+    }
+
+    /// Snapshot a previously authorized tracked set without reacquiring the
+    /// backup store. An all-unreadable tracked set still makes an empty checkpoint.
+    pub(crate) fn create_for_tracked_files(
+        &mut self,
+        session: &str,
+        name: &str,
+        files: Vec<PathBuf>,
+    ) -> Result<CheckpointInfo, AftError> {
+        self.create_impl(session, name, files, None, None, false)
     }
 
     pub(crate) fn create_from_captures(
@@ -656,7 +676,15 @@ impl CheckpointStore {
         backup_store: &BackupStore,
         captures: &mut HashMap<PathBuf, CapturedRegularFile>,
     ) -> Result<CheckpointInfo, AftError> {
-        self.create_impl(session, name, files, Some(backup_store), Some(captures))
+        let explicit_request = !files.is_empty();
+        self.create_impl(
+            session,
+            name,
+            files,
+            Some(backup_store),
+            Some(captures),
+            explicit_request,
+        )
     }
 
     fn create_impl(
@@ -666,12 +694,12 @@ impl CheckpointStore {
         files: Vec<PathBuf>,
         backup_store: Option<&BackupStore>,
         mut captures: Option<&mut HashMap<PathBuf, CapturedRegularFile>>,
+        explicit_request: bool,
     ) -> Result<CheckpointInfo, AftError> {
         let _mutation_lock = self.acquire_mutation_lock()?;
         validate_checkpoint_name(name)?;
         self.run_process_maintenance_once_locked()?;
         self.hydrate_session_locked(session)?;
-        let explicit_request = !files.is_empty();
         let file_list = match backup_store {
             Some(backup_store) if files.is_empty() => backup_store.try_tracked_files(session)?,
             _ => files,
