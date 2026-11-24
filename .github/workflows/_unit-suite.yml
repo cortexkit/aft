@@ -854,7 +854,12 @@ jobs:
         run: python3 scripts/ci-macos-integration-archive.py list --output "$AFT_CI_ARCHIVE_DIR/macos-integration-inventory.json"
 
       - name: Capture doctest inventory
-        run: cargo test --features wasm-grammars --workspace --doc -- --list > "$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt" 2>&1
+        run: |
+          inventory="$AFT_CI_ARCHIVE_DIR/macos-doctest-inventory.txt"
+          if ! cargo test --features wasm-grammars --workspace --doc -- --list > "$inventory" 2> "$inventory.stderr"; then
+            cat "$inventory.stderr" >&2
+            exit 1
+          fi
         env:
           CARGO_TERM_COLOR: never
 
@@ -873,6 +878,7 @@ jobs:
             ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-nextest.tar.zst
             ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-integration-inventory.json
             ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-doctest-inventory.txt
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-doctest-inventory.txt.stderr
           compression-level: 0
           if-no-files-found: error
 
@@ -1436,7 +1442,12 @@ jobs:
       - uses: ./.github/actions/setup-nextest
 
       - name: Capture watcher inventory for the split proof
-        run: cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt" 2>&1
+        run: |
+          inventory="$AFT_CI_ARCHIVE_DIR/macos-watcher-inventory.txt"
+          if ! cargo test --features wasm-grammars --features test-hooks -p agent-file-tools --features test-timing-hooks --test watcher_integration -- --list > "$inventory" 2> "$inventory.stderr"; then
+            cat "$inventory.stderr" >&2
+            exit 1
+          fi
         env:
           CARGO_TERM_COLOR: never
 
@@ -1466,7 +1477,9 @@ jobs:
         uses: ./.github/actions/upload-artifact-retry
         with:
           name: macos-watcher-inventory
-          path: ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt
+          path: |
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt
+            ${{ env.AFT_CI_ARCHIVE_DIR }}/macos-watcher-inventory.txt.stderr
           if-no-files-found: warn
 
   unit-macos-conformance:

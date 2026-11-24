@@ -961,7 +961,7 @@ class UnitShardPartitionCountTests(unittest.TestCase):
             "os": os,
             "sys": __import__("sys"),
             "NextestEntry": object,
-            "run_command": lambda command, merge_stderr=True: list_calls.append(command) or "",
+            "run_command": lambda command: list_calls.append(command) or "",
             "parse_nextest_list": lambda output, kinds=None, matching_tests_only=False: [],
         }
         exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), namespace)
@@ -994,12 +994,12 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         proof["partition_nextest_entries"](["cargo", "nextest", "list"])
         self.assertEqual([call[-1] for call in calls], ["hash:1/3", "hash:2/3", "hash:3/3"])
 
-    def test_proof_cargo_list_ignores_msvc_linker_warnings(self) -> None:
+    def test_proof_cargo_list_captures_stdout_separately_from_diagnostics(self) -> None:
         import ast
 
-        # The wasm-grammars build makes MSVC print LNK4217 warnings for the Wasm
-        # runtime's C API between cargo's `Running` line and the test names.
-        wanted_functions = {"parse_cargo_list", "suite_name_from_artifact"}
+        wanted_functions = {
+            "capture_command", "run_cargo_list", "parse_cargo_list", "suite_name_from_artifact"
+        }
         nodes = [
             node
             for node in ast.parse(PROOF_TEXT).body
@@ -1018,32 +1018,54 @@ class UnitShardPartitionCountTests(unittest.TestCase):
         with unittest.mock.patch.dict(sys.modules, {module.__name__: module}):
             exec(compile(ast.Module(body=nodes, type_ignores=[]), "rust-test-inventory-proof.py", "exec"), module.__dict__)
         namespace = module.__dict__
-        output = (
-            "     Running unittests src\\lib.rs (target\\debug\\deps\\agent_file_tools-0123abcd.exe)\n"
-            "         LINK : warning LNK4217: symbol 'wasm_engine_delete' defined in 'libwasmtime_c_api.rlib' is imported\n"
-            # Cargo's unused-dependency manifest lint ends with a bare `help:` line.
+        stdout = (
+            "parser::tests::parses: test\n"
+            "\n"
+            "1 test, 0 benchmarks\n"
+            "0 tests, 0 benchmarks\n"
+            "src/lib.rs - documented (line 1): test\n"
+            "1 test, 0 benchmarks\n"
+        )
+        stderr = (
+            # The hosted Windows manifest lint ends with an unindented help line.
             "warning: unused dependency `rustc-demangle`\n"
             "  --> crates\\aft-base\\Cargo.toml:39:1\n"
             "   |\n"
             "   = note: `cargo::unused_dependencies` is set to `warn` by default\n"
             "help: consider removing the dependency on `rustc-demangle`\n"
-            "parser::tests::parses: test\n"
-            "\n"
-            "1 test, 0 benchmarks\n"
+            "     Running unittests src\\lib.rs (target\\debug\\deps\\aft_engine-0123abcd.exe)\n"
+            "         LINK : warning LNK4217: symbol 'wasm_engine_delete' is imported\n"
+            "     Running unittests src\\main.rs (target\\debug\\deps\\aft-1234abcd.exe)\n"
+            "   Doc-tests aft_engine\n"
         )
-        entries = namespace["parse_cargo_list"](output)
-        self.assertEqual([(entry.kind, entry.name) for entry in entries], [("lib", "parser::tests::parses")])
+        command = ["cargo", "test", "--", "--list"]
+        completed = subprocess.CompletedProcess(command, 0, stdout, stderr)
+        with unittest.mock.patch("subprocess.run", return_value=completed) as run:
+            entries = namespace["run_cargo_list"](command)
+        self.assertEqual(run.call_args.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(run.call_args.kwargs["stderr"], subprocess.PIPE)
+        self.assertEqual(
+            [(entry.kind, entry.suite, entry.name) for entry in entries],
+            [("lib", "aft_engine", "parser::tests::parses"),
+             ("doc", "aft_engine", "src/lib.rs - documented (line 1)")],
+        )
+        with self.assertRaisesRegex(RuntimeError, "unrecognized cargo list line: unexpected"):
+            namespace["parse_cargo_list"]("unexpected\n" + stdout, stderr)
+        with self.assertRaisesRegex(RuntimeError, "unrecognized cargo list line: help:"):
+            namespace["parse_cargo_list"]("help: consider removing the dependency\n" + stdout, stderr)
+        with self.assertRaisesRegex(RuntimeError, "lists 1 tests, expected 2"):
+            namespace["parse_cargo_list"](stdout.replace("1 test,", "2 tests,", 1), stderr)
 
     def test_inventory_proof_resolves_bash_before_starting_it(self) -> None:
         import ast
         import types
 
-        wanted = {"resolve_shell_command", "run_command"}
+        wanted = {"resolve_shell_command", "capture_command", "run_command"}
         nodes: list[ast.stmt] = [
             node for node in ast.parse(PROOF_TEXT).body
             if isinstance(node, ast.FunctionDef) and node.name in wanted
         ]
-        self.assertEqual(len(nodes), 2)
+        self.assertEqual(len(nodes), len(wanted))
         run = unittest.mock.Mock(return_value=types.SimpleNamespace(returncode=0, stdout="", stderr=""))
         which = unittest.mock.Mock(return_value="C:/Program Files/Git/bin/bash.exe")
         namespace = {

@@ -34,10 +34,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 HASH_SUFFIX_RE = re.compile(r"-[0-9a-f]+(?:\.exe)?$")
 RUNNING_RE = re.compile(r"^\s*Running (.+) \((.+)\)$")
-COUNT_RE = re.compile(r"^\d+ tests?, \d+ benchmarks$")
+COUNT_RE = re.compile(r"^(\d+) tests?, \d+ benchmarks?$")
 TEST_LINE_RE = re.compile(r"^(.*): test$")
-# A rustc diagnostic's source excerpt: `8845 |  code` and `|  ^^^ label` lines.
-WARNING_EXCERPT_RE = re.compile(r"^(?:\d+\s*)?\|\s")
 
 
 @dataclass(frozen=True)
@@ -77,18 +75,13 @@ def resolve_shell_command(command: list[str]) -> list[str]:
     return [executable, *command[1:]]
 
 
-def run_command(command: list[str], merge_stderr: bool = True) -> str:
+def capture_command(command: list[str]) -> subprocess.CompletedProcess[str]:
     command = resolve_shell_command(command)
     completed = subprocess.run(
         command,
         cwd=ROOT,
         stdout=subprocess.PIPE,
-        # Cargo writes each `Running ...` suite boundary to stderr but writes
-        # that suite's test names to stdout. Merge the streams to preserve their
-        # ordering, then let the parser ignore ordinary compile progress. JSON
-        # listings keep stderr apart, because replayed compiler warnings would
-        # otherwise precede the JSON document.
-        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         # Cargo and test binaries write UTF-8. Without an explicit encoding,
         # Windows decodes with the locale code page (cp1252), which has no
@@ -100,63 +93,32 @@ def run_command(command: list[str], merge_stderr: bool = True) -> str:
         # below when a CI environment exports CARGO_TERM_COLOR=always.
         env={**os.environ, "CARGO_TERM_COLOR": "never"},
     )
-    filtered_output = completed.stdout or ""
     if completed.returncode != 0:
         sys.stderr.write(f"command failed ({completed.returncode}): {' '.join(command)}\n")
-        sys.stderr.write(filtered_output)
+        sys.stderr.write(completed.stdout or "")
         sys.stderr.write(completed.stderr or "")
         sys.exit(completed.returncode)
-    return filtered_output
+    return completed
+
+
+def run_command(command: list[str]) -> str:
+    return capture_command(command).stdout
 
 def suite_name_from_artifact(artifact_path: str) -> str:
-    artifact = Path(artifact_path).name
+    artifact = artifact_path.replace("\\", "/").rsplit("/", 1)[-1]
     return HASH_SUFFIX_RE.sub("", artifact)
 
 
-def parse_cargo_list(output: str) -> list[CargoEntry]:
-    current_kind: str | None = None
-    current_suite: str | None = None
-    current_source: str | None = None
-    entries: list[CargoEntry] = []
-
-    for raw_line in output.splitlines():
-        line = raw_line.rstrip("\n")
+def parse_cargo_list(stdout: str, stderr: str) -> list[CargoEntry]:
+    # Cargo runs the harnesses in order, writing their names to stderr. Each
+    # harness writes one listing and count to stdout, even when it has no tests.
+    # Read only the suite labels from stderr; diagnostics are not test output.
+    suites: list[tuple[str, str, str]] = []
+    for line in stderr.splitlines():
         stripped = line.strip()
-        if not stripped or stripped.startswith(
-            (
-                "Compiling ",
-                "Checking ",
-                "Finished `",
-                "Blocking waiting for file lock",
-                "Updating ",
-                "Downloading ",
-                "Downloaded ",
-                "Locking ",
-                "Adding ",
-            )
-        ):
-            continue
-
-        # Compiler warnings (for example the macOS linker's `__eh_frame section too
-        # large` note once the lib test binary passes 16 MB of unwind data) print
-        # a `warning:` line plus `-->`, source-excerpt, `|` and `= note:`
-        # continuation lines before the listing. sccache prints its own
-        # `sccache: warning:` lines when its server restarts mid-build. None of
-        # them carry test entries. The MSVC linker also prints `LINK : warning
-        # LNK4217` lines for the Wasm runtime's C API when the wasm-grammars
-        # feature is on. Cargo's own manifest lints (such as an unused
-        # dependency) end with a bare `help:` line instead of `= help:`.
-        if (
-            stripped.startswith(("warning:", "= note:", "= help:", "help:", "sccache: ", "--> ", "...", "LINK : warning "))
-            or stripped == "|"
-            or WARNING_EXCERPT_RE.match(stripped)
-        ):
-            continue
-
         if stripped.startswith("Doc-tests "):
-            current_kind = "doc"
-            current_suite = stripped.removeprefix("Doc-tests ")
-            current_source = current_suite
+            suite = stripped.removeprefix("Doc-tests ")
+            suites.append(("doc", suite, suite))
             continue
 
         running_match = RUNNING_RE.match(line)
@@ -171,42 +133,56 @@ def parse_cargo_list(output: str) -> list[CargoEntry]:
                 is_library = unit_source == "src/lib.rs" or unit_source.endswith("/src/lib.rs")
                 kind = "lib" if is_library else "bin"
                 source = unit_source
-            current_kind = kind
-            current_suite = suite
-            current_source = source
+            suites.append((kind, suite, source))
+
+    entries: list[CargoEntry] = []
+    suite_index = 0
+    listed = 0
+    for line in stdout.splitlines():
+        stripped = line.strip()
+        if not stripped:
             continue
+        if suite_index == len(suites):
+            raise RuntimeError(f"cargo list has output without a suite label: {line}")
+        kind, suite, source = suites[suite_index]
+        if count := COUNT_RE.fullmatch(stripped):
+            expected = int(count.group(1))
+            if expected != listed:
+                raise RuntimeError(f"cargo list for {kind} {suite} lists {listed} tests, expected {expected}")
+            suite_index += 1
+            listed = 0
+        elif test_match := TEST_LINE_RE.fullmatch(stripped):
+            entries.append(CargoEntry(kind, suite, source, test_match.group(1)))
+            listed += 1
+        else:
+            raise RuntimeError(f"unrecognized cargo list line: {line}")
 
-        if COUNT_RE.match(stripped):
-            continue
-
-        test_match = TEST_LINE_RE.match(stripped)
-        if test_match and current_kind and current_suite and current_source:
-            entries.append(
-                CargoEntry(
-                    kind=current_kind,
-                    suite=current_suite,
-                    source=current_source,
-                    name=test_match.group(1),
-                )
-            )
-            continue
-
-        raise RuntimeError(f"unrecognized cargo list line: {line}")
-
+    if suite_index != len(suites):
+        raise RuntimeError(f"cargo list has {suite_index} complete suites for {len(suites)} labels")
     return entries
 
 
+def run_cargo_list(command: list[str]) -> list[CargoEntry]:
+    output = capture_command(command)
+    return parse_cargo_list(output.stdout, output.stderr)
+
+
+def read_cargo_list(path: str) -> list[CargoEntry]:
+    return parse_cargo_list(
+        Path(path).read_text(encoding="utf-8"), Path(f"{path}.stderr").read_text(encoding="utf-8")
+    )
+
+
 def verify_cargo_list_windows_source_paths() -> None:
-    output = (
+    stderr = (
         "    Updating crates.io index\n"
         "    Downloading serde v1.0.0\n"
         "    Locking 1 package to latest compatible version\n"
         "Running unittests src\\lib.rs (target/debug/deps/aft-0123456789abcdef.exe)\n"
-        "library_path_case: test\n"
         "Running unittests src\\main.rs (target/debug/deps/aft-0123456789abcdef.exe)\n"
-        "binary_path_case: test\n"
     )
-    entries = parse_cargo_list(output)
+    stdout = "library_path_case: test\n1 test, 0 benchmarks\nbinary_path_case: test\n1 test, 0 benchmarks\n"
+    entries = parse_cargo_list(stdout, stderr)
     actual = {(entry.kind, entry.suite, entry.name) for entry in entries}
     expected = {
         ("lib", "aft", "library_path_case"),
@@ -290,7 +266,7 @@ def partition_nextest_entries(
             command_args.extend(["--partition", partition])
         entries.append(
             parse_nextest_list(
-                run_command(command_args, merge_stderr=False),
+                run_command(command_args),
                 allowed_suite_kinds,
                 matching_tests_only=True,
             )
@@ -346,15 +322,15 @@ def verify_split_archives(
     integration_entries = parse_nextest_list(integration_source_output, {"test"})
 
     lib_archive_all = parse_nextest_list(
-        run_command(archive_command(lib_archive_path), merge_stderr=False),
+        run_command(archive_command(lib_archive_path)),
         {"lib", "bin", "test"},
     )
     bin_archive_all = parse_nextest_list(
-        run_command(archive_command(bin_archive_path), merge_stderr=False),
+        run_command(archive_command(bin_archive_path)),
         {"lib", "bin", "test"},
     )
     integration_archive_all = parse_nextest_list(
-        run_command(archive_command(integration_archive_path), merge_stderr=False),
+        run_command(archive_command(integration_archive_path)),
         {"lib", "bin", "test"},
     )
     lib_archive_entries = [entry for entry in lib_archive_all if entry.kind == "lib"]
@@ -440,12 +416,10 @@ def verify_split_archives(
     )
     integration_partitions = partition_nextest_entries(integration_command)
 
-    watcher_output = Path(watcher_inventory_path).read_text()
     watcher_entries = [
-        entry for entry in parse_cargo_list(watcher_output) if entry.kind == "test"
+        entry for entry in read_cargo_list(watcher_inventory_path) if entry.kind == "test"
     ]
-    doc_output = Path(doc_inventory_path).read_text()
-    doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
+    doc_entries = [entry for entry in read_cargo_list(doc_inventory_path) if entry.kind == "doc"]
     all_entries: list[NextestEntry | CargoEntry] = [
         *unit_entries,
         *integration_entries,
@@ -647,8 +621,9 @@ if any(
 
 
 run_command(["bash", str(ROOT / "scripts/check-cmake.sh")])
-baseline_output = run_command(["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--", "--list"])
-baseline_entries = parse_cargo_list(baseline_output)
+baseline_entries = run_cargo_list(
+    ["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--", "--list"]
+)
 
 unit_bin_command = [
     "cargo",
@@ -667,7 +642,7 @@ unit_bin_command = [
     "json",
     "--cargo-quiet",
 ]
-unit_bin_output = run_command(unit_bin_command, merge_stderr=False)
+unit_bin_output = run_command(unit_bin_command)
 unit_bin_entries = parse_nextest_list(unit_bin_output, {"lib", "bin"})
 unit_bin_partition_command = [
     *unit_bin_command,
@@ -677,7 +652,7 @@ unit_bin_partition_command = [
     "--skip",
     "panic_hook_preserves_default_backtrace_behavior_and_persists",
 ]
-unit_bin_partition_output = run_command(unit_bin_partition_command, merge_stderr=False)
+unit_bin_partition_output = run_command(unit_bin_partition_command)
 unit_bin_shardable_entries = parse_nextest_list(
     unit_bin_partition_output, {"lib", "bin"}, matching_tests_only=True
 )
@@ -704,10 +679,10 @@ serial_unit_keys = {entry.key for entry in serial_tls_entries + serial_backtrace
 doc_baseline_entries = [entry for entry in baseline_entries if entry.kind == "doc"]
 doc_entries: list[CargoEntry] = []
 if doc_baseline_entries:
-    doc_output = run_command(
+    doc_list = run_cargo_list(
         ["cargo", "test", "--workspace", "--features", "wasm-grammars,test-hooks", "--doc", "--", "--list"]
     )
-    doc_entries = [entry for entry in parse_cargo_list(doc_output) if entry.kind == "doc"]
+    doc_entries = [entry for entry in doc_list if entry.kind == "doc"]
 
 nextest_command = [
     "cargo",
@@ -724,7 +699,7 @@ nextest_command = [
     "json",
     "--cargo-quiet",
 ]
-nextest_output = run_command(nextest_command, merge_stderr=False)
+nextest_output = run_command(nextest_command)
 nextest_entries = parse_nextest_list(nextest_output)
 nextest_shardable_entries = parse_nextest_list(nextest_output, matching_tests_only=True)
 nextest_partitions = partition_nextest_entries(nextest_command)
@@ -746,11 +721,10 @@ if archive_path:
             "-T",
             "json",
         ],
-        merge_stderr=False,
     )
     archive_entries = parse_nextest_list(archive_output, {"lib", "bin", "test"})
 
-watcher_output = run_command([
+watcher_list = run_cargo_list([
     "cargo",
     "test",
     "--features",
@@ -762,7 +736,7 @@ watcher_output = run_command([
     "--",
     "--list",
 ])
-watcher_entries = [entry for entry in parse_cargo_list(watcher_output) if entry.kind == "test"]
+watcher_entries = [entry for entry in watcher_list if entry.kind == "test"]
 
 baseline_by_bucket = Counter(entry.kind for entry in baseline_entries)
 coverage: dict[str, list[str]] = {}

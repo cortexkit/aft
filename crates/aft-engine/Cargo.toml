@@ -174,20 +174,16 @@ markup5ever_rcdom = "0.38"
 # Keep protocol and transport pinned in lockstep: the transport Frame codec and
 # the protocol's control bodies must agree on the wire-v2 epoch envelope. Tokio
 # runs only at the --subc transport edge; AFT's command core stays synchronous.
-cortexkit-persona = "=0.3.0"
 cortexkit-role-tool-provider = "=0.15.18"
 cortexkit-role-llm-runner = "=0.8.53"
 cortexkit-role-tool-display = "=0.1.14"
 cortexkit-role-agent-data = "=0.3.3"
-cortexkit-role-user-commands = "=0.1.4"
 cortexkit-project-identity = "=0.1.5"
 cortexkit-agent-identity = "=0.1.1"
 cortexkit-bus-client = "=0.1.15"
 cortexkit-bus-naming = "=0.4.6"
 async-nats = { version = "0.50", default-features = false, features = ["jetstream", "ring"] }
-jsonschema = { version = "0.33", default-features = false }
 schemars = "1"
-serde_path_to_error = "0.1"
 subc-protocol = "=0.37.4"
 subc-control = "=0.42.2"
 subc-transport = "=0.18.0"
@@ -202,14 +198,10 @@ vt100 = "0.16"
 vte = "0.15"
 jsonc-parser = { version = "0.33", features = ["cst"] }
 
-[target.'cfg(unix)'.dependencies]
-signal-hook = "0.3"
-
 [target.'cfg(target_os = "linux")'.dependencies]
 tikv-jemallocator = { version = "=0.6.1", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 tikv-jemalloc-ctl = { version = "=0.6.1", features = ["stats"] }
 tikv-jemalloc-sys = "=0.6.1"
-landlock = "=0.4.5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 fsevent-sys = "4.1"
@@ -246,3 +238,6 @@ async-trait = "0.1"
 tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 filetime = "0.2"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+landlock = "=0.4.5"
