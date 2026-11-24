@@ -142,6 +142,8 @@ pub(super) fn start_for_speech(
         Some(run_scopes),
         #[cfg(test)]
         None,
+        #[cfg(test)]
+        None,
     )
 }
 impl ScopeDescribes {
@@ -206,6 +208,7 @@ pub(super) fn start(
         None,
         Some(run_scopes),
         None,
+        None,
     )
 }
 
@@ -215,6 +218,25 @@ fn start_with_scope_source<F, Fut>(
     executor: Arc<Executor>,
     interval: Duration,
     scope_source: F,
+) -> (
+    ScopeDescribes,
+    mpsc::UnboundedReceiver<EndedScope>,
+    JoinHandle<()>,
+)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Vec<ScopeStamp>> + Send,
+{
+    start_with_scope_source_and_notifier(control, executor, interval, scope_source, None)
+}
+
+#[cfg(test)]
+fn start_with_scope_source_and_notifier<F, Fut>(
+    control: Arc<readiness::DaemonControl>,
+    executor: Arc<Executor>,
+    interval: Duration,
+    scope_source: F,
+    unnotified_source: Option<Notify>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -239,9 +261,11 @@ where
         None,
         None,
         None,
+        unnotified_source,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn start_with_scope_source_impl<F, Fut>(
     control: Arc<readiness::DaemonControl>,
     executor: Arc<Executor>,
@@ -250,6 +274,7 @@ fn start_with_scope_source_impl<F, Fut>(
     speech: Option<Arc<crate::gh_shim_speech::service::Service>>,
     run_scopes: Option<Arc<super::run_scope::RunScopes>>,
     #[cfg(test)] test_grant_sweep: Option<TestGrantSweep>,
+    #[cfg(test)] unnotified_source: Option<Notify>,
 ) -> (
     ScopeDescribes,
     mpsc::UnboundedReceiver<EndedScope>,
@@ -321,21 +346,33 @@ where
         let mut next_backstop = tokio::time::Instant::now() + scope_watch::BACKSTOP;
         let mut inventory = scope_watch::Inventory::default();
         let mut indexed = IndexedScopes::default();
-        let mut inventory_revision = scope_watch::revisions();
+        let notifier = scope_watch::notifier();
+        #[cfg(test)]
+        let notifier = unnotified_source.as_ref().unwrap_or(notifier);
+        let revisions = || {
+            // An isolated fake inventory never publishes a revision. Other
+            // tests' process-wide changes must not hide its missing hint.
+            #[cfg(test)]
+            if unnotified_source.is_some() {
+                return [0; 4];
+            }
+            scope_watch::revisions()
+        };
+        let mut inventory_revision = revisions();
         let mut refresh = scope_watch::Refresh::new();
         let mut verifications = scope_watch::Verifications::default();
         let mut watches = scope_watch::Watches::new(control.metrics.clone());
         loop {
             #[cfg(test)]
             iterations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let changed = scope_watch::notifier().notified();
+            let changed = notifier.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if scope_watch::revisions() != inventory_revision {
+            if revisions() != inventory_revision {
                 refresh.changed();
             }
             if refresh.due() {
-                inventory_revision = scope_watch::revisions();
+                inventory_revision = revisions();
                 let mut refreshed = scope_source().await;
                 refreshed.retain_unread(&inventory);
                 indexed.refresh(&inventory, &refreshed);
@@ -542,7 +579,7 @@ where
                 Some(stamp) = closes.recv() => {
                     // An idle route needs no RPC; parked consent asks still
                     // need a scope-end determination even without a process.
-                    inventory_revision = scope_watch::revisions();
+                    inventory_revision = revisions();
                     let mut current = scope_source().await;
                     current.retain_unread(&inventory);
                     indexed.refresh(&inventory, &current);
@@ -567,7 +604,7 @@ where
                     if refresh.due() { continue; }
                     if verifications.deadline().is_some_and(|due| due <= tokio::time::Instant::now()) { continue; }
                     if tokio::time::Instant::now() >= next_backstop {
-                        let now = scope_watch::revisions();
+                        let now = revisions();
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
                         watches.health.drift_repairs += refreshed.warn_drift(&inventory, inventory_revision, now);
@@ -579,7 +616,7 @@ where
                     }
                     let scan_due = tokio::time::Instant::now() >= next_scan;
                     if scan_due {
-                        inventory_revision = scope_watch::revisions();
+                        inventory_revision = revisions();
                         let mut refreshed = scope_source().await;
                         refreshed.retain_unread(&inventory);
                         indexed.refresh(&inventory, &refreshed);

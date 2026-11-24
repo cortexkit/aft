@@ -1122,11 +1122,12 @@ async fn scope_watch_five_minute_backstop_repairs_unnotified_membership() {
     let (control, pending, mut frames) = control(&["scope.describe", "scope.watch"]);
     let scopes = Arc::new(StdMutex::new(vec![stamp(0)]));
     let source = scopes.clone();
-    let (_handle, _ended, worker) = start_with_scope_source(
+    let (_handle, _ended, worker) = start_with_scope_source_and_notifier(
         control.clone(),
         Arc::new(Executor::new()),
         Duration::from_secs(60),
         move || std::future::ready(source.lock().unwrap().clone()),
+        Some(Notify::new()),
     );
     let watch = request(&mut frames, "scope.watch").await;
     snapshot(&pending, &watch);

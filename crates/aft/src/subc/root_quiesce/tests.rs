@@ -36,9 +36,7 @@ impl Attach {
         }
     }
 
-    fn add(&mut self, root: &ProjectRootId, ctx: &Arc<AppContext>, route: RouteChannel) {
-        ctx.mark_subc_bound();
-        assert!(self.executor.register_actor(root.clone(), ctx.clone()));
+    fn add_route(&mut self, root: &ProjectRootId, route: RouteChannel) {
         self.live
             .insert(root.clone(), RootMeta::new(Instant::now()));
         self.epochs.insert(route.channel, route.epoch);
@@ -46,7 +44,7 @@ impl Attach {
             &mut self.routes,
             &mut self.roots.channels,
             route,
-            route_identity(root, "grace-session"),
+            route_identity(root, &session(route)),
         );
     }
 
@@ -121,7 +119,7 @@ impl Attach {
         self.completion(
             RouteBindCompletion {
                 route,
-                identity: route_identity(root, "grace-session"),
+                identity: route_identity(root, &session(route)),
                 bind_root_id: root.clone(),
                 inserted_new_actor: false,
                 expected_snapshot_id: None,
@@ -201,6 +199,10 @@ fn success() -> Response {
     Response::success("grace-bind", json!({}))
 }
 
+fn session(route: RouteChannel) -> String {
+    format!("grace-session-{}", route.channel)
+}
+
 #[tokio::test(start_paused = true)]
 async fn attach_goodbye_rebind_preserves_configure_and_watcher() {
     let _env = crate::test_env::hermetic_git_env_guard();
@@ -210,8 +212,10 @@ async fn attach_goodbye_rebind_preserves_configure_and_watcher() {
     let mut attach = Attach::new();
     let first = route_key(1, 1);
     let next = route_key(2, 1);
-    attach.add(&root, &ctx, first);
-    let response = configure(&ctx, &root, storage.path());
+    ctx.mark_subc_bound();
+    assert!(attach.executor.register_actor(root.clone(), ctx.clone()));
+    attach.add_route(&root, first);
+    let response = configure(&ctx, &root, storage.path(), session(first));
     assert!(response.success, "{response:?}");
     assert!(!ctx.configure_tail_idle());
     crate::commands::configure::ensure_project_watcher(&ctx);
@@ -244,15 +248,19 @@ async fn attach_goodbye_rebind_preserves_configure_and_watcher() {
     attach.close();
 }
 
-fn configure(ctx: &AppContext, root: &ProjectRootId, storage: &Path) -> Response {
+fn configure(
+    ctx: &AppContext,
+    root: &ProjectRootId,
+    storage: &Path,
+    session_id: String,
+) -> Response {
     let req = RawRequest {
         id: "grace-bind".into(),
         command: "configure".into(),
-        session_id: None,
+        session_id: Some(session_id),
         lsp_hints: None,
         params: json!({
             "project_root": root.as_path(), "storage_dir": storage, "harness": "opencode",
-            "session_id": "grace-session",
             "config": [{"tier": "user", "source": "/user/aft.jsonc", "doc": json!({
                 "indexes": {"trigram": false, "semantic": false, "callgraph": false},
             }).to_string()}],
@@ -265,32 +273,38 @@ fn configure(ctx: &AppContext, root: &ProjectRootId, storage: &Path) -> Response
 async fn attach_goodbye_expiry_is_once_per_root_and_duplicate_goodbye_does_not_extend_it() {
     let (_dir_a, a) = test_root("goodbye-expiry-a");
     let (_dir_b, b) = test_root("goodbye-expiry-b");
-    let (ctx_a, ctx_b) = (test_ctx(), test_ctx());
     let mut attach = Attach::new();
     let first = route_key(1, 1);
     let second = route_key(2, 1);
-    attach.add(&a, &ctx_a, first);
-    attach.add(&b, &ctx_b, second);
-    let generation = ctx_a.configure_generation();
+    attach.add_route(&a, first);
+    attach.add_route(&b, second);
 
     attach.goodbye(first, true).await;
     tokio::time::advance(Duration::from_secs(30)).await;
     attach.goodbye(first, true).await;
     attach.goodbye(second, true).await;
     attach.settle(false);
-    assert!(!ctx_a.subc_unbound_quiesced());
-    assert!(!ctx_b.subc_unbound_quiesced());
+    assert!(!attach.live[&a].unbound_quiesced);
+    assert!(!attach.live[&b].unbound_quiesced);
     tokio::time::advance(Duration::from_secs(30)).await;
     attach.settle(false);
-    assert!(ctx_a.subc_unbound_quiesced());
     assert!(attach.live[&a].goodbye_quiesce_at.is_none());
     assert!(attach.live[&a].unbound_quiesced);
-    assert!(!ctx_b.subc_unbound_quiesced());
-    assert_eq!(ctx_a.configure_generation(), generation + 1);
+    assert!(!attach.live[&b].unbound_quiesced);
+    attach
+        .live
+        .get_mut(&a)
+        .unwrap()
+        .maintenance_queued_kinds
+        .push_back(MaintenanceDrainKind::Lsp);
     tokio::time::advance(Duration::from_secs(30)).await;
     attach.settle(false);
-    assert_eq!(ctx_a.configure_generation(), generation + 1);
-    assert!(ctx_b.subc_unbound_quiesced());
+    assert_eq!(
+        attach.live[&a].maintenance_queued_kinds.len(),
+        1,
+        "a consumed grace must not quiesce again"
+    );
+    assert!(attach.live[&b].unbound_quiesced);
     assert!(attach.live[&b].goodbye_quiesce_at.is_none());
 }
 
@@ -301,7 +315,9 @@ async fn attach_goodbye_due_with_queued_ack_keeps_root_bound() {
     let mut attach = Attach::new();
     let first = route_key(1, 1);
     let next = route_key(2, 1);
-    attach.add(&root, &ctx, first);
+    ctx.mark_subc_bound();
+    assert!(attach.executor.register_actor(root.clone(), ctx.clone()));
+    attach.add_route(&root, first);
     let generation = ctx.configure_generation();
     attach.goodbye(first, true).await;
     tokio::time::advance(GOODBYE_QUIESCE_GRACE - Duration::from_secs(1)).await;
@@ -331,18 +347,17 @@ async fn attach_goodbye_due_with_queued_ack_keeps_root_bound() {
 #[tokio::test(start_paused = true)]
 async fn attach_goodbye_due_while_bind_pending_quiesces_as_soon_as_bind_fails() {
     let (_dir, root) = test_root("goodbye-bind-failure-race");
-    let ctx = test_ctx();
     let mut attach = Attach::new();
     let first = route_key(1, 1);
     let next = route_key(2, 1);
-    attach.add(&root, &ctx, first);
+    attach.add_route(&root, first);
     attach.goodbye(first, true).await;
     tokio::time::advance(GOODBYE_QUIESCE_GRACE - Duration::from_secs(1)).await;
     attach.begin_bind(&root, next);
     tokio::time::advance(Duration::from_secs(1)).await;
     attach.settle(false);
     assert!(
-        !ctx.subc_unbound_quiesced(),
+        !attach.live[&root].unbound_quiesced,
         "a pending bind protects ACK publication"
     );
     attach
@@ -353,7 +368,7 @@ async fn attach_goodbye_due_while_bind_pending_quiesces_as_soon_as_bind_fails() 
         )
         .await;
     assert!(
-        ctx.subc_unbound_quiesced(),
+        attach.live[&root].unbound_quiesced,
         "failure must not wait for another tick"
     );
     assert!(attach.live[&root].goodbye_quiesce_at.is_none());
@@ -364,23 +379,85 @@ async fn attach_goodbye_due_while_bind_pending_quiesces_as_soon_as_bind_fails() 
 async fn attach_shutdown_and_drain_consume_grace_without_waiting() {
     for draining in [false, true] {
         let (_dir, root) = test_root("goodbye-exit");
-        let ctx = test_ctx();
         let mut attach = Attach::new();
         let route = route_key(1, 1);
-        attach.add(&root, &ctx, route);
+        attach.add_route(&root, route);
         attach.goodbye(route, true).await;
         assert!(attach.live[&root].goodbye_quiesce_at.is_some());
-        assert!(!ctx.subc_unbound_quiesced());
+        assert!(!attach.live[&root].unbound_quiesced);
         if draining {
             attach.settle(true);
         } else {
             attach.close();
         }
-        assert!(ctx.subc_unbound_quiesced());
+        assert!(attach.live[&root].unbound_quiesced);
         assert!(attach.live[&root].goodbye_quiesce_at.is_none());
-        let generation = ctx.configure_generation();
         tokio::time::advance(GOODBYE_QUIESCE_GRACE).await;
         attach.settle(false);
-        assert_eq!(ctx.configure_generation(), generation);
+        assert!(attach.live[&root].goodbye_quiesce_at.is_none());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn attach_goodbye_burst_replay() {
+    let _env = crate::test_env::hermetic_git_env_guard();
+    for grace in [false, true] {
+        let (_dir, root) = test_root("goodbye-burst");
+        let storage = tempfile::tempdir().unwrap();
+        std::fs::write(root.as_path().join("fixture.rs"), "fn fixture() {}\n").unwrap();
+        let ctx = test_ctx();
+        ctx.set_progress_sender(Some(Arc::new(Box::new(|_| {}))));
+        let mut attach = Attach::new();
+        assert!(attach.executor.register_actor(root.clone(), ctx.clone()));
+        let mut quiesces = 0;
+        let mut cancelled_configure_tails = 0;
+        let mut watcher_starts = 0;
+        let mut watcher = None;
+        let mut config_publications = 0;
+        let mut warning_walks = 0;
+        for channel in 1..=4 {
+            let route = route_key(channel, 1);
+            attach.begin_bind(&root, route);
+            let generation = ctx.configure_generation();
+            let (response, records) = crate::logging::capture_log_lines(|| {
+                configure(&ctx, &root, storage.path(), session(route))
+            });
+            assert!(response.success, "{response:?}");
+            config_publications += usize::from(ctx.configure_generation() != generation);
+            warning_walks += records
+                .iter()
+                .filter(|line| line.contains("configure warning files walked:"))
+                .count();
+            attach.configure_ready(&root, route, response).await;
+            attach.ack().await;
+            assert!(attach.routes.contains_key(&route));
+            crate::commands::configure::ensure_project_watcher(&ctx);
+            let current_watcher = ctx.watcher_runtime_thread_id_for_test().expect("watcher");
+            watcher_starts += usize::from(watcher != Some(current_watcher));
+            watcher = Some(current_watcher);
+            assert!(ctx.wait_for_project_applicability(Duration::from_secs(5)));
+            let tail_was_queued = !ctx.configure_tail_idle();
+            attach.goodbye(route, grace).await;
+            quiesces += usize::from(attach.live[&root].unbound_quiesced);
+            cancelled_configure_tails += usize::from(tail_was_queued && ctx.configure_tail_idle());
+            tokio::time::advance(Duration::from_millis(250)).await;
+            attach.settle(false);
+        }
+        let lsp = crate::lsp::manager::applicability_metrics(root.as_path());
+        // The synchronous warning-walk test hook lets this replay count actual
+        // disk walks in the captured records, not just pending warnings.
+        let warning_walks = std::env::var_os("AFT_TEST_CONFIGURE_FORCE_SYNCHRONOUS_DEFERRED_WALK")
+            .is_some()
+            .then_some(warning_walks);
+        println!("burst grace={grace} binds=4 goodbyes=4 quiesces={quiesces} cancelled_configure_tails={cancelled_configure_tails} watcher_starts={watcher_starts} config_publications={config_publications} warning_disk_walks={warning_walks:?} lsp_full_walks={}", lsp.full_walks);
+        if grace {
+            assert_eq!(quiesces, 0);
+            assert_eq!(cancelled_configure_tails, 0);
+            assert_eq!(watcher_starts, 1);
+        } else {
+            assert_eq!(quiesces, 4);
+            assert!(cancelled_configure_tails > 0);
+        }
+        attach.close();
     }
 }
