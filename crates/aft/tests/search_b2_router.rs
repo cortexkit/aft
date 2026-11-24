@@ -92,7 +92,7 @@ fn router_golden_pins_precedence_delimiters_and_exact_input() {
 
 #[test]
 fn filename_detection_delegates_to_the_existing_exemption_authority() {
-    let router_source = include_str!("../../aft-engine/src/search_b2/router.rs");
+    let router_source = include_str!("../../aft-index/src/search_b2/router.rs");
     let authority_source = include_str!("../../aft-base/src/query_shape.rs");
     assert!(router_source.contains("query_shape::pre_tier_exempt(token)"));
     assert!(authority_source.contains("static FILENAME_EXEMPTION_RE"));
