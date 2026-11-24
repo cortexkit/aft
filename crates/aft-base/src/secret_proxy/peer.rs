@@ -46,8 +46,8 @@ fn running(pid: i32) -> bool {
     !matches!(fields.as_bytes().first(), Some(b'Z' | b'X'))
 }
 
-/// Counts process-table walks on this thread, so a test can check that a
-/// liveness check with a living leader does not enumerate every process.
+// Counts process-table walks on this thread, so a test can check that a
+// liveness check with a living leader does not enumerate every process.
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 thread_local! {
     pub(super) static PROCESS_TABLE_WALKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
