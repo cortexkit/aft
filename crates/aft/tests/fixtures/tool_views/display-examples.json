@@ -415,11 +415,11 @@
         {
           "change": "modified",
           "location": "outside_project",
-          "diffOmitted": true
+          "diff": "--- /outside/a.rs\n+++ /outside/a.rs\n@@ -1 +1 @@\n-old\n+new\n"
         }
       ]
     },
-    "jcs": "{\"files\":[{\"change\":\"modified\",\"diffOmitted\":true,\"location\":\"outside_project\"}],\"location\":\"outside_project\",\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
+    "jcs": "{\"files\":[{\"change\":\"modified\",\"diff\":\"--- /outside/a.rs\\n+++ /outside/a.rs\\n@@ -1 +1 @@\\n-old\\n+new\\n\",\"location\":\"outside_project\"}],\"location\":\"outside_project\",\"revision\":1,\"schema\":\"aft/files-detail/1\"}"
   },
   {
     "kind": "record",

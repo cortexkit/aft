@@ -46,6 +46,7 @@ pub(crate) struct Capture {
     capture_key: String,
     tool: String,
     root: PathBuf,
+    write_input_path: Option<PathBuf>,
     began: Option<Instant>,
     processing_ms: u64,
     held_at: Option<Instant>,
@@ -54,7 +55,6 @@ pub(crate) struct Capture {
     finished: bool,
     files: Vec<FileChange>,
     file_snapshot: Option<(Value, Option<Value>)>,
-    masker: Option<crate::log_redact::SecretValues>,
     bash: Option<BashBodies>,
     terminal_bash: Option<BashBodies>,
     deferred: bool,
@@ -71,6 +71,8 @@ struct FileChange {
     path: PathBuf,
     initial_path: PathBuf,
     old_path: Option<PathBuf>,
+    input_path: Option<PathBuf>,
+    initial_input_path: Option<PathBuf>,
     before: Option<String>,
     after: Option<String>,
     change: &'static str,
@@ -234,6 +236,11 @@ pub(in crate::subc) fn register(
                 capture_key: key(ledger_key),
                 tool: call.name.clone(),
                 root: route.project_root.clone(),
+                write_input_path: if call.name == "write" {
+                    absolute_input_path(call.arguments.get("path").and_then(Value::as_str))
+                } else {
+                    None
+                },
                 began: None,
                 processing_ms: 0,
                 held_at: None,
@@ -242,7 +249,6 @@ pub(in crate::subc) fn register(
                 finished: false,
                 files: Vec::new(),
                 file_snapshot: None,
-                masker: None,
                 bash: None,
                 terminal_bash: None,
                 deferred: false,
@@ -282,6 +288,7 @@ pub(crate) fn file(
     before: Option<&str>,
     after: Option<&str>,
     change: &'static str,
+    input_paths: Option<(&str, Option<&str>)>,
 ) {
     ACTIVE.with(|slot| {
         let active = slot.borrow();
@@ -290,6 +297,10 @@ pub(crate) fn file(
         };
         let Ok(mut capture) = capture.lock() else {
             return;
+        };
+        let (input_path, old_input_path) = match input_paths {
+            Some((path, old)) => (absolute_input_path(Some(path)), absolute_input_path(old)),
+            None => (capture.write_input_path.clone(), None),
         };
         let path = PathBuf::from(file);
         let path = if path.is_absolute() {
@@ -312,6 +323,7 @@ pub(crate) fn file(
             entry.after = after.map(str::to_owned);
             entry.exists_after = change != "deleted";
             entry.path = path;
+            entry.input_path = input_path;
             if change != "modified" {
                 entry.change = change;
                 if entry.old_path.is_none() {
@@ -321,6 +333,12 @@ pub(crate) fn file(
         } else {
             capture.files.push(FileChange {
                 initial_path: old_path.as_ref().unwrap_or(&path).clone(),
+                initial_input_path: if old_path.is_some() {
+                    old_input_path
+                } else {
+                    input_path.clone()
+                },
+                input_path,
                 path,
                 old_path,
                 before: before.map(str::to_owned),
@@ -331,6 +349,10 @@ pub(crate) fn file(
             });
         }
     });
+}
+
+fn absolute_input_path(path: Option<&str>) -> Option<PathBuf> {
+    path.map(PathBuf::from).filter(|path| path.is_absolute())
 }
 
 fn relative(root: &Path, path: &Path) -> Option<String> {
@@ -393,66 +415,32 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
             .as_ref()
             .map(|path| relative(&capture.root, path));
         let mut entry = json!({"change":change.change});
+        let outside = path.is_none() || old_path.as_ref().is_some_and(Option::is_none);
+        let old_path = old_path.flatten().filter(|_| change.change == "moved");
+        if outside {
+            record["location"] = json!("outside_project");
+            entry["location"] = json!("outside_project");
+        } else {
+            entry["path"] = json!(path);
+            if let Some(old_path) = &old_path {
+                entry["oldPath"] = json!(old_path);
+            }
+        }
         if let (Some(before), Some(after)) = (change.before.as_deref(), change.after.as_deref()) {
             let counts = crate::edit::compute_diff_counts(before, after);
             added += counts["additions"].as_u64().unwrap_or(0);
             removed += counts["deletions"].as_u64().unwrap_or(0);
+            if capture.tool == "edit" {
+                edit_hunks::diff(&mut hunks, before, after);
+            } else {
+                let relative_paths = path
+                    .as_deref()
+                    .filter(|_| !outside)
+                    .map(|path| (old_path.as_deref().unwrap_or(path), path));
+                entry["diff"] = json!(unified_diff(&change, before, after, relative_paths));
+            }
         } else {
             known = false;
-        }
-        if path.is_none() || old_path.as_ref().is_some_and(Option::is_none) {
-            record["location"] = json!("outside_project");
-            entry["location"] = json!("outside_project");
-            entry["diffOmitted"] = json!(true);
-        } else {
-            entry["path"] = json!(path);
-            if change.change == "moved" {
-                if let Some(old_path) = old_path {
-                    entry["oldPath"] = json!(old_path);
-                }
-            }
-            if let (Some(masker), Some(before), Some(after)) = (
-                &capture.masker,
-                change.before.as_deref(),
-                change.after.as_deref(),
-            ) {
-                if capture.tool == "edit" {
-                    edit_hunks::diff(&mut hunks, masker, before, after);
-                } else {
-                    let path = entry["path"].as_str().unwrap();
-                    let diff = if change.change == "moved" && before == after {
-                        format!(
-                            "rename from {}\nrename to {path}\n",
-                            entry["oldPath"].as_str().unwrap()
-                        )
-                    } else {
-                        let old = if change.change == "created" {
-                            "/dev/null".into()
-                        } else {
-                            format!(
-                                "a/{}",
-                                entry.get("oldPath").and_then(Value::as_str).unwrap_or(path)
-                            )
-                        };
-                        let new = if change.change == "deleted" {
-                            "/dev/null".into()
-                        } else {
-                            format!("b/{path}")
-                        };
-                        similar::TextDiff::from_lines(before, after)
-                            .unified_diff()
-                            .header(&old, &new)
-                            .to_string()
-                    };
-                    entry["diff"] = json!(masker.redact(&diff));
-                }
-            } else {
-                // Diffs are masked with the secret values this agent has
-                // resolved (`capture.masker`). Without that list, generic
-                // credential patterns could miss a secret pasted into the
-                // file, so the diff is left out and only counts are kept.
-                entry["diffOmitted"] = json!(true);
-            }
         }
         files.push(entry);
     }
@@ -480,6 +468,45 @@ fn file_bodies(capture: &Capture, success: bool) -> (Value, Option<Value>) {
         detail
     };
     (record, detail)
+}
+
+fn unified_diff(
+    change: &FileChange,
+    before: &str,
+    after: &str,
+    relative_paths: Option<(&str, &str)>,
+) -> String {
+    // Use the call's absolute spellings for display, not the resolved paths
+    // used to track mutations. A relative input has no absolute spelling.
+    let old_abs = change
+        .initial_input_path
+        .as_ref()
+        .unwrap_or(&change.initial_path);
+    let new_abs = change.input_path.as_ref().unwrap_or(&change.path);
+    if change.change == "moved" && before == after {
+        return match relative_paths {
+            Some((old, new)) => format!("rename from {old}\nrename to {new}\n"),
+            None => format!(
+                "rename from {}\nrename to {}\n",
+                old_abs.display(),
+                new_abs.display()
+            ),
+        };
+    }
+    let old = match (change.change, relative_paths) {
+        ("created", _) => "/dev/null".into(),
+        (_, Some((old, _))) => format!("a/{old}").into(),
+        (_, None) => old_abs.to_string_lossy(),
+    };
+    let new = match (change.change, relative_paths) {
+        ("deleted", _) => "/dev/null".into(),
+        (_, Some((_, new))) => format!("b/{new}").into(),
+        (_, None) => new_abs.to_string_lossy(),
+    };
+    similar::TextDiff::from_lines(before, after)
+        .unified_diff()
+        .header(&old, &new)
+        .to_string()
 }
 
 pub(crate) use edit_hunks::capture_no_match as edit_no_match;
@@ -1129,6 +1156,7 @@ pub(crate) fn bash_terminal(
             capture_key: display.capture_key.clone(),
             tool: "bash".into(),
             root: PathBuf::new(),
+            write_input_path: None,
             began: None,
             processing_ms: 0,
             held_at: None,
@@ -1137,7 +1165,6 @@ pub(crate) fn bash_terminal(
             finished: false,
             files: Vec::new(),
             file_snapshot: None,
-            masker: None,
             bash: None,
             terminal_bash: Some(bodies),
             deferred: true,

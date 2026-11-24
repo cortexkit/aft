@@ -5,7 +5,8 @@
 
 #![cfg_attr(test, allow(clippy::items_after_test_module))]
 
-pub(crate) type FileReporter = fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str);
+pub(crate) type FileReporter =
+    fn(&str, Option<&str>, Option<&str>, Option<&str>, &'static str, Option<(&str, Option<&str>)>);
 static FILE_REPORTER: std::sync::OnceLock<FileReporter> = std::sync::OnceLock::new();
 pub(crate) fn register_file_reporter(reporter: FileReporter) {
     let _ = FILE_REPORTER.set(reporter);
@@ -21,8 +22,19 @@ pub(crate) fn report_file(
     after: Option<&str>,
     change: &'static str,
 ) {
+    report_file_with_input_paths(file, old_path, before, after, change, None);
+}
+
+pub(crate) fn report_file_with_input_paths(
+    file: &str,
+    old_path: Option<&str>,
+    before: Option<&str>,
+    after: Option<&str>,
+    change: &'static str,
+    input_paths: Option<(&str, Option<&str>)>,
+) {
     if let Some(reporter) = FILE_REPORTER.get() {
-        reporter(file, old_path, before, after, change);
+        reporter(file, old_path, before, after, change, input_paths);
     }
 }
 

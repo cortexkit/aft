@@ -1356,7 +1356,16 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
     }
 
     for result in &applied {
-        crate::edit::report_file(
+        let input_paths = match &resolved[result.index].hunk {
+            Hunk::Add { path, .. } | Hunk::Delete { path } => (path.as_str(), None),
+            Hunk::Update {
+                path, move_path, ..
+            } => match move_path {
+                Some(dest) => (dest.as_str(), Some(path.as_str())),
+                None => (path.as_str(), None),
+            },
+        };
+        crate::edit::report_file_with_input_paths(
             &result.display_path.to_string_lossy(),
             result
                 .move_path
@@ -1373,6 +1382,7 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                     _ => "modified",
                 }
             },
+            Some(input_paths),
         );
     }
     let root = project_root_for_relative_paths(ctx);
