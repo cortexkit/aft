@@ -1,6 +1,9 @@
 use super::*;
 
-fn read_captured_content(path: &Path, metadata: &std::fs::Metadata) -> std::io::Result<Vec<u8>> {
+pub(super) fn read_captured_content(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> std::io::Result<Vec<u8>> {
     refuse_storage_path_with_metadata(path, Some(metadata)).map_err(std::io::Error::other)?;
     #[cfg(any(test, feature = "test-support"))]
     {

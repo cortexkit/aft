@@ -178,6 +178,7 @@ use crate::watcher_filter::WatcherJoinOutcome;
 use crate::watcher_filter::{SharedGitignore, WatcherDispatchEvent, WatcherThreadHandle};
 
 use crate::data_layer::ignore_rules as gitignore_state;
+mod edit_diagnostics;
 #[path = "context_executor.rs"]
 mod executor_adapter;
 #[path = "context_index_host.rs"]

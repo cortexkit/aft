@@ -15,6 +15,7 @@ use sha2::{Digest, Sha256};
 
 #[cfg(any(test, feature = "test-support"))]
 mod bridge_fixture;
+mod capture_reads;
 pub mod latency;
 #[cfg(test)]
 #[path = "agent_data/ordinary_backup_format_tests.rs"]
@@ -26,6 +27,9 @@ mod status_inventory;
 #[cfg(test)]
 mod status_inventory_tests;
 
+use capture_reads::read_captured_content;
+#[cfg(any(test, feature = "test-support"))]
+pub use capture_reads::{capture_read_count, reset_capture_read_count};
 pub(crate) use status_inventory::StatusInventory;
 
 pub use crate::config::{DEFAULT_MAX_BACKUP_FILE_SIZE, DEFAULT_MAX_UNDO_DEPTH};
