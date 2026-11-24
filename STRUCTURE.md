@@ -10,8 +10,13 @@ it stays current and this document does not list them.
 crates/aft/            `agent-file-tools`: the `aft` binary and library facade, auxiliary binaries, examples, integration tests
 crates/aft-tools/      `aft-tools`: native CLI, tool-call pipeline, and command handlers
 crates/aft-subc/       `aft-subc`: Subc daemon integration and tool catalog assets
-crates/aft-engine/     Shared runtime: project contexts, indexes, edit engines, LSP, watchers, shell runtime
-crates/aft-base/       Shared foundation: protocol, config, executor, bash compression, secrets, locks, URL fetch
+crates/aft-engine/     Runtime composition: project contexts, lifecycle, coordination and compatibility paths
+crates/aft-edit/       Edits, formatting, hashline, imports, patches, backups and checkpoints
+crates/aft-index/      Search, indexes, embeddings, runtime grammars and file watchers
+crates/aft-inspect/    Inspection, language servers and alert state
+crates/aft-github/     GitHub reads, the gh shim and the worker broker client and protocol
+crates/aft-shell/      Shell tasks, sandbox spawning, remote execution and worker broker provisioning
+crates/aft-base/       Shared foundation: protocol, config, executor, bash compression, secrets and locks
 crates/aft-db/         SQLite stores (`aft.db`), access policy, sandbox profile, write ledger
 crates/aft-parse/      Syntax parsing, grammars, imports, fuzzy/line matchers, call-graph resolution
 crates/aft-store/      Index store formats: segments, family lifecycle, text, content records, call graph, vectors
@@ -53,7 +58,7 @@ example targets are in `crates/aft/examples/`.
 entry). The tool-call pipeline shared by standalone and daemon mode lives in
 `run_tool_call.rs`, `subc_translate.rs`, `subc_format.rs`,
 `response_finalize.rs`, `bounded_io_command.rs` and `tool_output.rs`.
-`data_layer.rs` adapts the engine's `data_layer/` and exposes the
+`data_layer.rs` adapts the runtime's index layer and exposes the
 `trace_measure::run` runner in `trace_measure_run.rs`.
 
 `aft-subc` (library `aft_subc`) owns `subc/`: daemon binds, trust, tool-provider
@@ -68,42 +73,34 @@ fixtures.
 
 ## `crates/aft-engine/src/`
 
-Top-level `.rs` files include `context.rs`, `edit.rs` and `backup.rs`. A
-directory with the same name holds the module's submodules (`edit/`, `backup/`,
-`sandbox_spawn/`, ...). Other engine directories include:
+`context.rs` and `context/` hold `AppContext` and its coordination logic.
+Other composition modules cover configuration reloads, database opening,
+runtime status and shutdown, parent-folder sessions (`parent_search/`), and
+page snapshots (`page_collect/`). The engine also wires bash rewrites into the
+context and coordinates the shell change journal with file watchers.
 
-```text
-agent_data/        Session undo and checkpoint data carried through engram's session door
-bash_background/   Background, PTY and remote task registry, watchdog, pattern watches, persistence
-bash_db_hints/     Schema hints when a database CLI fails on an unknown table or column
-bash_permissions/  Permission scan of parsed bash commands
-bash_rewrite/      Rewrites simple bash commands into AFT tool calls
-data_layer/        AFT's side of the index store: checkouts, runtime pools, incremental call graph, meaning fill, parent index state
-exec_remote/       Client for the daemon's remote execution capability (`runon`)
-gh_shim_relay/     Daemon-side relay for governed `gh` bot writes
-gh_shim_speech/    Launch-bound bot-write authority
-github_read/       `issue://` and `pr://` fetch, normalize, render, fallback cache
-grammar/           Downloaded-grammar re-export and runtime tests
-hashline/          Hashline edit engine: scan, snapshot, syntax, apply, transaction, recovery, oracle
-inspect/           `aft_inspect` categories, scanners, Oxc liveness engine, tier-2 scheduler
-lsp/               Language-server client, registry, roots, diagnostics, child processes
-page_collect/      Page and referenced-file snapshots for sealed HTML page bundles
-parent_search/     Parent-folder sessions: child repo discovery, background worker, external search
-patch/             `apply_patch` parser, matcher, applier
-search_b2/         `aft_search` query router, lane contracts and token variants
-search_state/      Search-owned state, candidate memoization, and rerankers shared with the runtime
-watcher/           Project file watcher
-watcher_backend/   Native watcher backends (FSEvents, inotify, Windows)
-```
+Re-exports and adapters preserve `aft_engine::` paths. Compatibility
+directories such as `callgraph_store/`, `db/`, `executor/` and `secret/` also
+keep tests. See the [engine boundary table](crates/aft-engine/BOUNDARY.md) for
+the owner and purpose of each port, compatibility adapter and other
+cross-crate item.
 
-Compatibility directories `callgraph_store/`, `imports/`, `executor/`, `db/`,
-`secret/`, and `secret_proxy/` re-export the split crates and also hold tests;
-their implementations live in the crates named above.
+Composed behavior and source guards are tested in the engine. Upper-crate
+tests reach engine fixtures through `aft_engine::test_bridge` with the
+`test-support` feature. The engine does not depend on the facade, tools, or
+daemon crates.
 
-Unit tests live with the engine, handlers, or daemon code they exercise. The
-upper crates can reach engine fixtures and observers through
-`aft_engine::test_bridge` with the `test-support` feature. The engine does not
-depend on the facade, tools, or daemon crates.
+## Area crates
+
+Area implementations and their unit tests live below the engine, in:
+
+| Source directory | Main modules |
+|---|---|
+| `crates/aft-edit/src/` | `edit/`, `hashline/`, `patch/`, `imports/`, `agent_data/` and `backup/` |
+| `crates/aft-index/src/` | `data_layer/` for the index store, `search_b2/` and `search_state/` for search, embeddings, `grammar/` and `watcher_backend/` |
+| `crates/aft-inspect/src/` | `inspect/` for scanners and background diagnostic refresh, `lsp/` for language-server processes and diagnostics, `alert_state.rs` |
+| `crates/aft-github/src/` | `github_read/`, `gh_shim/`, `gh_shim_relay/`, `gh_shim_speech/` and the broker client in `gh_shim_worker_broker.rs` |
+| `crates/aft-shell/src/` | `bash_background/`, `bash_rewrite/`, `bash_permissions/`, `sandbox_spawn/`, `exec_remote/` and broker provisioning in `gh_shim_worker_broker.rs` |
 
 ## `packages/`
 
@@ -134,27 +131,27 @@ tests are `*.test.ts`.
 - **Runner catalog (presets, per-tool tags, capabilities):** `crates/aft-subc/src/subc/tool_provider.rs`; the catalog goldens regenerate with `cargo test -p aft-subc --lib regenerate_tool_provider_catalog -- --ignored`.
 - **Rust command handler:** `crates/aft-tools/src/commands/[name].rs`, exported from `commands/mod.rs` and dispatched from `main.rs`.
 - **Management operation (no agent tool):** `crates/aft-tools/src/commands/[operation].rs`, for example `health_digest.rs`.
-- **Shared engine logic:** `crates/aft-engine/src/[domain].rs` (or `crates/aft-base/src/[domain].rs` for cross-crate primitives), outside command handlers.
+- **Shared runtime logic:** put area behavior in the area crate, context coordination in `crates/aft-engine/src/`, and shared primitives in `crates/aft-base/src/`, outside command handlers.
 - **Import language:** implement `ImportSyntax` in `crates/aft-parse/src/imports/` and register it in `imports/mod.rs` (`syntax_for`).
 - **Bash output compressor:** `crates/aft-base/src/compress/[tool].rs`, implementing `Compressor`; declare it and add it to `compressors_in_dispatch_order()` in `crates/aft-base/src/compress/mod.rs`. For a declarative filter, add `crates/aft-base/src/compress/builtin_filters/[tool].toml` and list it in `builtin_filters.rs`.
-- **Bash rewrite rule:** `crates/aft-engine/src/bash_rewrite/rules.rs` (implements `RewriteRule`), with its decision class in `catalog.rs` and dispatch in `dispatch.rs`.
-- **Inspect scanner:** `crates/aft-engine/src/inspect/scanners/[scan].rs`, registered in `scanners/mod.rs`.
-- **LSP behavior:** `crates/aft-engine/src/lsp/[module].rs`.
-- **Patch parsing or matching:** `crates/aft-engine/src/patch/`.
-- **Hashline apply or repair rule:** `crates/aft-engine/src/hashline/apply/`. For oracle vectors, use `hashline/oracle/`.
-- **Sandbox rules:** `crates/aft-db/src/sandbox_profile.rs` (profile), `crates/aft-engine/src/sandbox_spawn.rs` (spawn policy), `crates/aft-tools/src/cli/sandbox_launch/` (Seatbelt and Landlock backends).
+- **Bash rewrite rule:** `crates/aft-shell/src/bash_rewrite/rules.rs` (implements `RewriteRule`), with its decision class in `catalog.rs`; context dispatch lives in `crates/aft-engine/src/bash_rewrite/dispatch.rs`.
+- **Inspect scanner:** `crates/aft-inspect/src/inspect/scanners/[scan].rs`, registered in `scanners/mod.rs`.
+- **LSP behavior:** `crates/aft-inspect/src/lsp/[module].rs`.
+- **Patch parsing or matching:** `crates/aft-edit/src/patch/`.
+- **Hashline apply or repair rule:** `crates/aft-edit/src/hashline/apply/`. Reference input/output fixtures live in `hashline/oracle/`.
+- **Sandbox rules:** `crates/aft-db/src/sandbox_profile.rs` (profile), `crates/aft-shell/src/sandbox_spawn.rs` (spawn policy), `crates/aft-tools/src/cli/sandbox_launch/` (Seatbelt and Landlock backends).
 - **Access policy and grants:** `crates/aft-db/src/access_policy.rs`; per-call route policy in `crates/aft-subc/src/subc/call_policy.rs`; remote folder grants and consent in `crates/aft-subc/src/subc/remote_consent.rs` and `crates/aft-db/src/db/remote_grant_rows.rs`.
 - **Session trust for a new runner or reserved module:** the exact (module, harness) pair in `HARNESS_SCOPED_FIRST_PARTY_MODULES` (`crates/aft-subc/src/subc/mod.rs`).
-- **Agent child environment, git hooks:** `crates/aft-engine/src/agent_child_env.rs`.
-- **`gh` shim routing:** `crates/aft-engine/src/gh_shim.rs`. GitHub read rendering: `crates/aft-engine/src/github_read/`.
-- **Alerts:** `crates/aft-engine/src/alert_state.rs` (ingest), `crates/aft-tools/src/alert_render.rs` (reminder text), `crates/aft-base/src/alert_records.rs` (SQLite records).
+- **Agent child environment, git hooks:** `crates/aft-shell/src/agent_child_env.rs`.
+- **`gh` shim routing:** `crates/aft-github/src/gh_shim.rs`. GitHub read rendering: `crates/aft-github/src/github_read/`.
+- **Alerts:** `crates/aft-inspect/src/alert_state.rs` (ingest), `crates/aft-tools/src/alert_render.rs` (reminder text), `crates/aft-base/src/alert_records.rs` (SQLite records).
 - **List truncation surface:** `crates/aft-base/src/list_surfaces/[surface].rs`, registered in `crates/aft-base/src/list_surfaces.rs`.
-- **Build breaker domain:** `crates/aft-engine/src/build_breaker.rs`.
-- **Semantic embedding backend:** `crates/aft-engine/src/semantic_index.rs`, `crates/aft-engine/src/synapse_embed.rs`, and the backend config in `crates/aft-base/src/config.rs`.
-- **Index store format (a section, record or lifecycle rule):** `crates/aft-store/src/`. How AFT builds, refreshes or reads it: `crates/aft-engine/src/data_layer/` and `crates/aft-engine/src/inspect/data_sources.rs`; command read adapters: `crates/aft-tools/src/commands/data_callgraph.rs` and `crates/aft-tools/src/commands/data_search.rs`.
-- **Call-graph resolution rule:** `crates/aft-parse/src/callgraph_store/` (dispatch, bindings, facts); bump `EXTRACTOR_VERSION` in `crates/aft-engine/src/data_layer/content.rs` when stored records change.
-- **Downloaded grammar:** `crates/aft-parse/src/grammar/` (manifest, download, runtime); language selection in `crates/aft-parse/src/parser/grammar_selection.rs`, engine integration in `crates/aft-engine/src/data_layer/grammar.rs`. Grammar identity also participates in record keys (`data_layer/content.rs`).
-- **Standing root keys:** `crates/aft-engine/src/scoped_key.rs` and `crates/aft-db/src/db/standing_roots.rs`.
+- **Build breaker domain:** `crates/aft-db/src/build_breaker.rs`.
+- **Semantic embedding backend:** `crates/aft-index/src/semantic_index.rs`, `crates/aft-index/src/synapse_embed.rs`, and the backend config in `crates/aft-base/src/config.rs`.
+- **Index store format (a section, record or lifecycle rule):** `crates/aft-store/src/`. How AFT builds, refreshes or reads it: `crates/aft-index/src/data_layer/` and `crates/aft-inspect/src/inspect/data_sources.rs`; command read adapters: `crates/aft-tools/src/commands/data_callgraph.rs` and `crates/aft-tools/src/commands/data_search.rs`.
+- **Call-graph resolution rule:** `crates/aft-parse/src/callgraph_store/` (dispatch, bindings, facts); bump `EXTRACTOR_VERSION` in `crates/aft-index/src/data_layer/content.rs` when stored records change.
+- **Downloaded grammar:** `crates/aft-parse/src/grammar/` (manifest, download, runtime); language selection in `crates/aft-parse/src/parser/grammar_selection.rs`, index integration in `crates/aft-index/src/data_layer/grammar.rs`. Grammar identity also participates in record keys (`data_layer/content.rs`).
+- **Standing root keys:** `crates/aft-db/src/scoped_key.rs` and `crates/aft-db/src/db/standing_roots.rs`.
 - **Windows path normalization:** `crates/aft-base/src/windows_path.rs`.
 - **Bridge export:** `packages/aft-bridge/src/[module].ts`, re-exported from `src/index.ts`.
 - **CLI command:** `packages/aft-cli/src/commands/[command].ts`, dispatched from `src/index.ts`.

@@ -36,11 +36,28 @@ missing connection file fails loudly rather than falling back to standalone.
 
 ## Rust crate boundary
 
-`aft-engine` (`crates/aft-engine/src/`) owns project runtime state (`AppContext`),
-search and index maintenance, edits, language servers, watchers and shell
-execution. It uses the shared foundation, database and parsing crates and
-the index formats in `aft-store`. It does not depend on `aft-tools`, `aft-subc`,
-or `agent-file-tools`.
+`aft-engine` (`crates/aft-engine/src/`) composes the project runtime. Its
+`AppContext` binds the area implementations to each project's configuration and
+lifecycle. The engine keeps runtime coordination and the re-exports and adapters
+that preserve existing `aft_engine::` paths. It does not depend on `aft-tools`,
+`aft-subc`, or `agent-file-tools`.
+
+Below the engine, five area crates own the implementations:
+
+| Area crate | Owns | Allowed dependencies on other areas |
+|---|---|---|
+| `aft-edit` | File edits, formatting, patches, hashline, imports, backups and checkpoints | None |
+| `aft-index` | Search, index maintenance, embeddings, runtime grammars and file watchers | `aft-edit` |
+| `aft-inspect` | Inspection, language servers and alert state | `aft-index`, `aft-edit` |
+| `aft-github` | GitHub reads, the `gh` shim and the worker broker client and protocol | `aft-edit` |
+| `aft-shell` | Shell execution, sandbox spawning, task tracking and worker broker provisioning | `aft-github`, `aft-inspect`, `aft-index`, `aft-edit` |
+
+Areas can use shared foundation, database, parsing and index-format code from
+`aft-base`, `aft-db`, `aft-parse` and `aft-store`, and the standalone
+`aft-tokenizer` and `aft-secret-rules` libraries. Areas do not import
+`AppContext`; the engine supplies the narrow interfaces they need. The
+[engine boundary table](crates/aft-engine/BOUNDARY.md) records the owners and
+reasons for these interfaces, compatibility paths and other cross-crate items.
 
 The three packages above the engine are:
 
@@ -60,10 +77,11 @@ The three packages above the engine are:
   `aft::data_layer::trace_measure::run`. The install command remains
   `cargo install agent-file-tools`.
 
-Unit tests live with the code they exercise. Tests that need daemon state live
-in `aft-subc` or the facade's integration targets. Daemon tests that need handler
-fixtures use `aft-tools/test-support`, and upper-layer tests can reach engine
-fixtures through `aft_engine::test_bridge` with `aft-engine/test-support`.
+Unit tests live with the code they exercise; tests of composed area behavior
+live in `aft-engine`. Tests that need daemon state live in `aft-subc` or the
+facade's integration targets. Daemon tests that need handler fixtures use
+`aft-tools/test-support`, and upper-layer tests can reach engine fixtures
+through `aft_engine::test_bridge` with `aft-engine/test-support`.
 
 ## Subsystems
 
@@ -139,8 +157,8 @@ drains that must never block reads). Jobs are classed `Interactive` or
 `Maintenance` so maintenance cannot starve tool calls; the maintenance queue is
 bounded and idempotent drains coalesce. Long work checks a `JobCancellation`
 token at phase boundaries. Process-wide heavy builds share slots through
-`crates/aft-base/src/cold_build_limiter.rs`, and `build_breaker.rs` suspends a
-build domain that keeps crashing.
+`crates/aft-base/src/cold_build_limiter.rs`, and
+`crates/aft-db/src/build_breaker.rs` suspends a build domain that keeps crashing.
 
 **Index store.** Text search, the call graph and meaning search live in one
 index store per repository (`indexes.trigram`, `indexes.callgraph`,
@@ -157,10 +175,11 @@ manifest is the commit record of each publication, readers lease the
 generation they read, and cleanup never removes a file a live lease or the
 newest manifest names.
 
-`crates/aft-engine/src/data_layer/` is AFT's side. A checkout binds to its
-published state and rescans against disk before serving. A new worktree starts
-from the sibling checkout whose state differs least and processes only the
-files that differ; farther than a quarter of its paths, it builds cold, still
+`crates/aft-index/src/data_layer/` builds and reads checkout state using those
+formats. A checkout binds to its published state and rescans against disk
+before serving. A new worktree starts from the sibling checkout whose state
+differs least and processes only the files that differ; farther than a quarter
+of its paths, it builds cold, still
 reusing stored records. Builds, refreshes and meaning-search fill run in small
 process-wide pools (`data_layer/runtime.rs`); under the daemon the root's executor admits
 each job, so an unbound root starts nothing. A first build publishes text
@@ -321,32 +340,32 @@ ledger, access grants, standing roots, GitHub cache, breaker rows) lives in
 | Subc edge (binds, trust, push, drain) | `crates/aft-subc/src/subc/` |
 | Tool-call pipeline | `crates/aft-tools/src/` (`run_tool_call.rs`, `subc_translate.rs`, `subc_format.rs`, `response_finalize.rs`, `bounded_io_command.rs`, `tool_output.rs`, `commands/tool_call.rs`), `crates/aft-base/src/list_surfaces/` |
 | Tool-provider role | `crates/aft-subc/src/subc/` (`tool_provider.rs`, `remote_policy.rs`, `keepalive.rs`), `crates/aft-db/src/db/call_ledger.rs`, `crates/aft-db/src/db/catalog_edit_modes.rs` |
-| Remote calls (federated) | `crates/aft-subc/src/subc/` (`remote_calls.rs`, `remote_call_service.rs`, `remote_consent.rs`, `remote_bash.rs`), `crates/aft-engine/src/sandbox_spawn/remote.rs`, `crates/aft-db/src/db/remote_grant_rows.rs`, `crates/aft-db/src/db/remote_audit_rows.rs` |
+| Remote calls (federated) | `crates/aft-subc/src/subc/` (`remote_calls.rs`, `remote_call_service.rs`, `remote_consent.rs`, `remote_bash.rs`), `crates/aft-shell/src/sandbox_spawn/remote.rs`, `crates/aft-db/src/db/remote_grant_rows.rs`, `crates/aft-db/src/db/remote_audit_rows.rs` |
 | Scopes, runs, code mode | `crates/aft-subc/src/subc/` (`scope_describe.rs`, `run_scope.rs`, `codemode.rs`, `flow_read.rs`) |
 | Access policy, consent, grants | `crates/aft-db/src/access_policy.rs`, `crates/aft-subc/src/subc/` (`call_policy.rs`, `consent.rs`, `access_grants.rs`), `crates/aft-db/src/db/access_grants.rs` |
 | Command handlers | `crates/aft-tools/src/commands/` |
-| Executor | `crates/aft-base/src/executor/`, `crates/aft-base/src/cold_build_limiter.rs`, `crates/aft-engine/src/build_breaker.rs` |
+| Executor | `crates/aft-base/src/executor/`, `crates/aft-base/src/cold_build_limiter.rs`, `crates/aft-db/src/build_breaker.rs` |
 | Runtime state | `crates/aft-engine/src/context.rs` (`AppContext`) |
 | Index store formats | `crates/aft-store/` |
-| Index store in AFT | `crates/aft-engine/src/data_layer/` (checkout, runtime, incremental, meaning), `crates/aft-engine/src/inspect/data_sources.rs`; `crates/aft-tools/src/` adapters (`data_layer.rs`, `commands/data_callgraph.rs`, `commands/data_search.rs`) |
-| Text search | `crates/aft-engine/src/grep_executor.rs`, `crates/aft-engine/src/data_layer/text_scope.rs` |
-| Semantic search | `crates/aft-tools/src/commands/semantic_search/`; `crates/aft-engine/src/` (`search_b2/`, `search_state/`, `synapse_embed.rs`, `semantic_index.rs`, `data_layer/vectors.rs`) |
-| Call graph | `crates/aft-parse/src/callgraph_store/` (resolver), `crates/aft-engine/src/data_layer/callgraph.rs`, `crates/aft-tools/src/commands/data_callgraph.rs`, `crates/aft-parse/src/callgraph.rs`, `crates/aft-parse/src/calls.rs` |
-| Parent-folder sessions | `crates/aft-tools/src/commands/parent_query/`; `crates/aft-engine/src/` (`parent_search/`, `data_layer/parent_session.rs`, `data_layer/parent_query.rs`, `data_layer/parent.rs`) |
-| Standing roots | `crates/aft-engine/src/standing_roots.rs`, `crates/aft-engine/src/scoped_key.rs`, `crates/aft-subc/src/subc/standing.rs`, `crates/aft-db/src/db/standing_roots.rs` |
-| Parsing and symbols | `crates/aft-parse/src/parser.rs`, `crates/aft-parse/src/grammar/`, `crates/aft-engine/src/grammar/`, `crates/aft-base/src/symbols.rs`, `crates/aft-base/src/language.rs`, `crates/aft-parse/src/imports/` |
-| Edit, patch, hashline | `crates/aft-engine/src/` (`edit.rs`, `format.rs`, `patch/`, `hashline/`), `crates/aft-parse/src/fuzzy_match.rs` |
-| Bash | `crates/aft-engine/src/` (`bash_rewrite/`, `bash_permissions/`, `bash_background/`, `bash_db_hints/`, `sandbox_spawn.rs`, `agent_child_env.rs`), `crates/aft-db/src/sandbox_profile.rs`, `crates/aft-base/src/pty_render.rs` |
-| Remote execution, secrets | `crates/aft-engine/src/exec_remote/`, `crates/aft-engine/src/bash_background/remote.rs`, `crates/aft-base/src/secret/`, `crates/aft-base/src/secret_proxy/`, `crates/aft-subc/src/subc/secret_consent.rs` |
+| Index store in AFT | `crates/aft-index/src/data_layer/` (checkout, runtime, incremental, meaning), `crates/aft-inspect/src/inspect/data_sources.rs`; `crates/aft-tools/src/` adapters (`data_layer.rs`, `commands/data_callgraph.rs`, `commands/data_search.rs`) |
+| Text search | `crates/aft-index/src/grep_executor.rs`, `crates/aft-index/src/data_layer/text_scope.rs` |
+| Semantic search | `crates/aft-tools/src/commands/semantic_search/`; `crates/aft-index/src/` (`search_b2/`, `search_state/`, `synapse_embed.rs`, `semantic_index.rs`, `data_layer/vectors.rs`) |
+| Call graph | `crates/aft-parse/src/callgraph_store/` (resolver), `crates/aft-index/src/data_layer/callgraph.rs`, `crates/aft-tools/src/commands/data_callgraph.rs`, `crates/aft-parse/src/callgraph.rs`, `crates/aft-index/src/calls.rs` |
+| Parent-folder sessions | `crates/aft-tools/src/commands/parent_query/`, `crates/aft-engine/src/parent_search/`, `crates/aft-index/src/data_layer/` (`parent_session.rs`, `parent_query.rs`, `parent.rs`) |
+| Standing roots | `crates/aft-db/src/` (`standing_roots.rs`, `scoped_key.rs`, `db/standing_roots.rs`), `crates/aft-subc/src/subc/standing.rs` |
+| Parsing and symbols | `crates/aft-parse/src/` (`parser.rs`, `grammar/`, `imports/`), `crates/aft-index/src/grammar/`, `crates/aft-base/src/` (`symbols.rs`, `language.rs`) |
+| Edit, patch, hashline | `crates/aft-edit/src/` (`edit.rs`, `format.rs`, `patch/`, `hashline/`), `crates/aft-parse/src/fuzzy_match.rs` |
+| Bash | `crates/aft-shell/src/` (`bash_rewrite/`, `bash_permissions/`, `bash_background/`, `bash_db_hints/`, `sandbox_spawn.rs`, `agent_child_env.rs`), `crates/aft-engine/src/bash_rewrite/` (context wiring), `crates/aft-db/src/sandbox_profile.rs`, `crates/aft-base/src/pty_render.rs` |
+| Remote execution, secrets | `crates/aft-shell/src/` (`exec_remote/`, `bash_background/remote.rs`, `secret_proxy/`), `crates/aft-base/src/secret/`, `crates/aft-subc/src/subc/secret_consent.rs` |
 | Output compression | `crates/aft-base/src/compress/` |
-| Inspect | `crates/aft-engine/src/inspect/`, `crates/aft-tools/src/commands/inspect.rs` |
-| LSP | `crates/aft-engine/src/lsp/` |
+| Inspect | `crates/aft-inspect/src/inspect/`, `crates/aft-tools/src/commands/inspect.rs` |
+| LSP | `crates/aft-inspect/src/lsp/` |
 | Config | `crates/aft-base/src/config.rs`, `crates/aft-base/src/config_resolve.rs`, `crates/aft-base/src/feature_config.rs`, `crates/aft-base/src/config_fix.rs`, `crates/aft-base/src/subc_config.rs` |
-| GitHub | `crates/aft-engine/src/` (`gh_shim.rs`, `gh_shim_relay/`, `gh_shim_speech/`, `github_read/`), `crates/aft-db/src/db/github_read_cache.rs` |
+| GitHub | `crates/aft-github/src/` (`gh_shim.rs`, `gh_shim_relay/`, `gh_shim_speech/`, `github_read/`), `crates/aft-shell/src/gh_shim_worker_broker.rs` (provisioning), `crates/aft-db/src/db/github_read_cache.rs` |
 | Apps: display records, page bundles | `crates/aft-subc/src/subc/` (`rich_ui/`, `tool_views.rs`), `crates/aft-engine/src/page_collect/`, `crates/aft-db/src/db/rich_ui.rs` |
-| Backups, checkpoints | `crates/aft-engine/src/` (`backup.rs`, `checkpoint.rs`, `agent_data/`), `crates/aft-db/src/db/backups.rs` |
-| Health, alerts | `crates/aft-engine/src/` (`status_snapshot.rs`, `alert_state.rs`), `crates/aft-tools/src/` (`alert_render.rs`, `commands/health_digest.rs`), `crates/aft-subc/src/subc/health.rs`, `crates/aft-base/src/` (`alert_records.rs`, `fleet_status.rs`, `memory.rs`) |
-| Watcher | `crates/aft-engine/src/` (`watcher/`, `watcher_backend/`, `watcher_filter.rs`) |
+| Backups, checkpoints | `crates/aft-edit/src/` (`backup.rs`, `checkpoint.rs`, `agent_data/`), `crates/aft-db/src/db/backups.rs` |
+| Health, alerts | `crates/aft-engine/src/status_snapshot.rs`, `crates/aft-inspect/src/alert_state.rs`, `crates/aft-tools/src/` (`alert_render.rs`, `commands/health_digest.rs`), `crates/aft-subc/src/subc/health.rs`, `crates/aft-base/src/` (`alert_records.rs`, `fleet_status.rs`, `memory.rs`) |
+| Watcher | `crates/aft-index/src/` (`watcher/`, `watcher_backend/`, `watcher_filter.rs`), `crates/aft-engine/src/bash_changed_files.rs` (coordinates the shell journal with the watcher) |
 | Persistence | `crates/aft-db/src/db/` |
 
 Paths in the table start at the repository root unless grouped under a source
