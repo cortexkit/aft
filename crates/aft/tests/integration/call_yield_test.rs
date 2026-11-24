@@ -6,6 +6,7 @@
 //! answered twice.
 
 use super::*;
+use cortexkit_role_tool_provider::call_yield::{PERSON_MESSAGE, URGENT_NOTICE};
 use std::path::Path;
 
 const SESSION: &str = "yield-session";
@@ -132,6 +133,10 @@ async fn bind_scoped(
 }
 
 async fn request(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64, body: Value) {
+    request_bytes(stream, channel, corr, &serde_json::to_vec(&body).unwrap()).await;
+}
+
+async fn request_bytes(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64, body: &[u8]) {
     send_frame(
         stream,
         Frame::build(
@@ -140,7 +145,7 @@ async fn request(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64, bo
             channel,
             1,
             corr,
-            serde_json::to_vec(&body).unwrap(),
+            body.to_vec(),
         )
         .unwrap(),
     )
@@ -166,7 +171,11 @@ async fn call(
 }
 
 async fn send_yield(stream: &mut tokio::net::TcpStream, channel: u16, corr: u64, key: &str) {
-    send_yield_reason(stream, channel, corr, key, "person_message").await;
+    send_yield_reason(stream, channel, corr, key, PERSON_MESSAGE).await;
+}
+
+fn yield_body(key: &str, reason: &str) -> Value {
+    json!({"name": "tool.yield", "arguments": {"call_key": key, "reason": reason}})
 }
 
 async fn send_yield_reason(
@@ -176,13 +185,7 @@ async fn send_yield_reason(
     key: &str,
     reason: &str,
 ) {
-    request(
-        stream,
-        channel,
-        corr,
-        json!({"name": "tool.yield", "arguments": {"call_key": key, "reason": reason}}),
-    )
-    .await;
+    request(stream, channel, corr, yield_body(key, reason)).await;
 }
 
 /// Frames read off the connection, kept so a test can wait for one frame
@@ -384,7 +387,7 @@ async fn yield_until_accepted(
     first_corr: u64,
     key: &str,
 ) -> (u64, Instant) {
-    yield_reason_until_accepted(stream, inbox, channel, first_corr, key, "person_message").await
+    yield_reason_until_accepted(stream, inbox, channel, first_corr, key, PERSON_MESSAGE).await
 }
 
 async fn yield_reason_until_accepted(
@@ -395,11 +398,23 @@ async fn yield_reason_until_accepted(
     key: &str,
     reason: &str,
 ) -> (u64, Instant) {
+    let body = serde_json::to_vec(&yield_body(key, reason)).unwrap();
+    yield_request_until_accepted(stream, inbox, channel, first_corr, key, &body).await
+}
+
+async fn yield_request_until_accepted(
+    stream: &mut tokio::net::TcpStream,
+    inbox: &mut Inbox,
+    channel: u16,
+    first_corr: u64,
+    key: &str,
+    request: &[u8],
+) -> (u64, Instant) {
     let until = Instant::now() + Duration::from_secs(15);
     let mut corr = first_corr;
     loop {
         let sent = Instant::now();
-        send_yield_reason(stream, channel, corr, key, reason).await;
+        request_bytes(stream, channel, corr, request).await;
         let reply = answer(
             &inbox
                 .reply(
@@ -429,17 +444,54 @@ async fn yield_reason_until_accepted(
     }
 }
 
+#[test]
+fn yielded_foreground_bash_answers_at_once_and_completes_to_its_session() {
+    let request = yield_body(&unique("yield-bash"), PERSON_MESSAGE);
+    assert_foreground_bash_handoff("call-yield-bash", serde_json::to_vec(&request).unwrap());
+}
+
+#[test]
+fn published_urgent_notice_vector_hands_back_waiting_head_bash() {
+    let vectors: Value =
+        serde_json::from_str(cortexkit_role_tool_provider::vectors::CALL_YIELD_JSON).unwrap();
+    let case = vectors["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|case| {
+            case["valid"] == true && case["request"]["arguments"]["reason"] == URGENT_NOTICE
+        })
+        .expect("the published vectors include a valid urgent_notice request");
+    assert_foreground_bash_handoff(
+        "call-yield-published-urgent",
+        serde_json::to_vec(&case["request"]).unwrap(),
+    );
+}
+
+#[test]
+fn thalamus_urgent_notice_wire_sample_hands_back_waiting_head_bash() {
+    // Replay a captured Claude Code runner request verbatim, including its slash-delimited key.
+    let request = br#"{
+  "arguments": {
+    "call_key": "msg_standin_0001/toolu_standin_0001_0",
+    "reason": "urgent_notice"
+  },
+  "name": "tool.yield"
+}
+"#;
+    assert_foreground_bash_handoff("call-yield-thalamus-urgent", request.to_vec());
+}
+
 /// A head's foreground `bash` waiting for its command hands back on
 /// `tool.yield`: the call answers within the contract's five seconds with
 /// the task id, the command keeps running, a second yield is
 /// `unknown_call`, and the command's completion reaches the launching
 /// session's route as a notice, and no other route.
-#[test]
-fn yielded_foreground_bash_answers_at_once_and_completes_to_its_session() {
+fn assert_foreground_bash_handoff(test_name: &'static str, request: Vec<u8>) {
     run_subc_bridge_test_with_dispatch(
-        "call-yield-bash",
+        test_name,
         Duration::from_secs(90),
-        |input| async move {
+        move |input| async move {
             let (mut daemon, _) = open_fake_daemon_session_with_ops(input, &[]).await;
             let root = daemon.root1.clone();
             write_config(&root);
@@ -477,7 +529,8 @@ fn yielded_foreground_bash_answers_at_once_and_completes_to_its_session() {
             .await;
             let mut inbox = Inbox::default();
             wait_for_ledger(stream, &mut inbox, 1, 900).await;
-            let key = unique("yield-bash");
+            let parsed: Value = serde_json::from_slice(&request).unwrap();
+            let key = parsed["arguments"]["call_key"].as_str().unwrap();
             let pid_path = root.join("yield-bash.pid");
             let release = root.join("yield-bash.release");
             call(
@@ -485,13 +538,14 @@ fn yielded_foreground_bash_answers_at_once_and_completes_to_its_session() {
                 1,
                 100,
                 "bash",
-                &key,
-                json!({"command": held_command(&pid_path, &release), "timeout": 60_000}),
+                key,
+                json!({"command": held_command(&pid_path, &release), "timeout": 60_000, "wait": true}),
             )
             .await;
             let pid = read_pid(&pid_path).await;
 
-            let (_, yielded_at) = yield_until_accepted(stream, &mut inbox, 1, 200, &key).await;
+            let (_, yielded_at) =
+                yield_request_until_accepted(stream, &mut inbox, 1, 200, key, &request).await;
             let reply = inbox
                 .reply(
                     stream,
@@ -517,7 +571,7 @@ fn yielded_foreground_bash_answers_at_once_and_completes_to_its_session() {
             assert!(alive(pid), "a yield never stops the command");
 
             // The call has its final frame: a repeat finds no open call.
-            send_yield(stream, 1, 300, &key).await;
+            request_bytes(stream, 1, 300, &request).await;
             assert_eq!(
                 answer(
                     &inbox
@@ -564,15 +618,24 @@ fn yielded_foreground_bash_answers_at_once_and_completes_to_its_session() {
     );
 }
 
+#[test]
+fn yielded_bash_watch_ends_with_what_it_has_seen_and_leaves_the_task_running() {
+    assert_bash_watch_handoff("call-yield-watch", PERSON_MESSAGE);
+}
+
+#[test]
+fn urgent_notice_hands_back_waiting_head_bash_watch_without_stopping_its_task() {
+    assert_bash_watch_handoff("call-yield-urgent-watch", URGENT_NOTICE);
+}
+
 /// A head's `bash_watch` waiting on a running task hands back on
 /// `tool.yield` the way a watch whose limit passed ends: it reports how long
 /// it waited and that the command still runs. The task is left running.
-#[test]
-fn yielded_bash_watch_ends_with_what_it_has_seen_and_leaves_the_task_running() {
+fn assert_bash_watch_handoff(test_name: &'static str, reason: &'static str) {
     run_subc_bridge_test_with_dispatch(
-        "call-yield-watch",
+        test_name,
         Duration::from_secs(90),
-        |input| async move {
+        move |input| async move {
             let (mut daemon, _) = open_fake_daemon_session_with_ops(input, &[]).await;
             let root = daemon.root1.clone();
             write_config(&root);
@@ -623,7 +686,7 @@ fn yielded_bash_watch_ends_with_what_it_has_seen_and_leaves_the_task_running() {
             .await;
             tokio::time::sleep(Duration::from_millis(300)).await;
             let (_, yielded_at) =
-                yield_until_accepted(stream, &mut inbox, 1, 500, &watch_key).await;
+                yield_reason_until_accepted(stream, &mut inbox, 1, 500, &watch_key, reason).await;
             let reply = inbox
                 .reply(stream, 1, 400, Duration::from_secs(5), "handed-back watch")
                 .await;
@@ -719,12 +782,13 @@ fn other_calls_are_not_yieldable_and_finished_calls_are_unknown() {
             for (corr, reason, expected) in [
                 (102, "runner_restart", "tool_not_yieldable"),
                 (103, "unrecognized", "reason_not_supported"),
+                (106, URGENT_NOTICE, "tool_not_yieldable"),
             ] {
                 send_yield_reason(stream, 1, corr, &read_key, reason).await;
                 assert_eq!(
                     answer(
                         &inbox
-                            .reply(stream, 1, corr, Duration::from_secs(5), "restart refusal")
+                            .reply(stream, 1, corr, Duration::from_secs(5), "yield refusal")
                             .await
                     ),
                     json!({"answer":"not_yieldable", "reason":expected})
