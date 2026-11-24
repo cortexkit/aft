@@ -123,6 +123,7 @@ pub struct TransactionEnvelope {
     pub files: Vec<FileOutcome>,
     /// Present exactly when the undo journal retained at least one record.
     pub op_id: Option<String>,
+    pub(crate) backup_skipped_reason: Option<crate::backup::BackupSkippedReason>,
     pub stop_reason: Option<&'static str>,
     pub registers_committed: bool,
     pub preview: bool,
@@ -331,6 +332,7 @@ pub fn preview_transaction(plan: TransactionPlan) -> TransactionEnvelope {
         complete: true,
         files,
         op_id: None,
+        backup_skipped_reason: None,
         stop_reason: None,
         registers_committed: false,
         preview: true,
@@ -395,12 +397,16 @@ pub fn execute_transaction(
     let success = applied > 0;
     let complete = applied == planned_primary && planned_primary > 0;
     let summary_text = summary_counts(&files);
+    let backup_skipped_reason = ctx
+        .backups
+        .skipped_reason_for_operation(ctx.session, &op_id, None);
 
     TransactionEnvelope {
         success,
         complete,
         files,
         op_id: journaled.then_some(op_id),
+        backup_skipped_reason,
         stop_reason,
         registers_committed,
         preview: false,
@@ -2310,7 +2316,7 @@ mod tests {
         assert_eq!(fs::read(&dest2).unwrap(), b"s2\n");
         assert!(!src2.exists());
         assert_eq!(
-            disabled.skipped_reason_after(SESSION, None),
+            envelope.backup_skipped_reason,
             Some(crate::backup::BackupSkippedReason::Disabled)
         );
     }

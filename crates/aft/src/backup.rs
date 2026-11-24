@@ -4529,27 +4529,6 @@ impl BackupStore {
             .map(|skip| skip.reason)
     }
 
-    pub fn latest_skipped_order(&self, session: &str) -> Option<u128> {
-        self.skipped_backups
-            .get(session)?
-            .iter()
-            .map(|skip| skip.order)
-            .max()
-    }
-
-    pub fn skipped_reason_after(
-        &self,
-        session: &str,
-        order: Option<u128>,
-    ) -> Option<BackupSkippedReason> {
-        self.skipped_backups
-            .get(session)?
-            .iter()
-            .filter(|skip| order.is_none_or(|order| skip.order > order))
-            .max_by_key(|skip| skip.order)
-            .map(|skip| skip.reason)
-    }
-
     pub fn latest_skipped_reason_for_undo(
         &self,
         session: &str,

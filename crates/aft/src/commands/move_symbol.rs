@@ -796,6 +796,7 @@ pub fn handle_move_symbol(req: &RawRequest, ctx: &AppContext) -> Response {
     if let Some(validation) = validation {
         result["output"] = serde_json::json!(validation.summary());
     }
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, None);
     Response::success(&req.id, result)
 }
 

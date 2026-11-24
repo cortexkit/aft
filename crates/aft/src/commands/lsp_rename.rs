@@ -166,7 +166,17 @@ pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
         }
     };
 
-    match apply_workspace_edit(&workspace_edit, ctx, req.session(), &req.id) {
+    apply_rename_response(&workspace_edit, ctx, req.session(), &req.id)
+}
+
+fn apply_rename_response(
+    workspace_edit: &WorkspaceEdit,
+    ctx: &AppContext,
+    session: &str,
+    req_id: &str,
+) -> Response {
+    let op_id = crate::backup::new_op_id();
+    match apply_workspace_edit(workspace_edit, ctx, session, req_id, &op_id) {
         Ok(changes) => {
             let total_files = changes.len();
             let total_edits: usize = changes.iter().map(|change| change.edits).sum();
@@ -180,15 +190,14 @@ pub fn handle_lsp_rename(req: &RawRequest, ctx: &AppContext) -> Response {
                 })
                 .collect();
 
-            Response::success(
-                &req.id,
-                serde_json::json!({
-                    "renamed": true,
-                    "changes": changes_json,
-                    "total_files": total_files,
-                    "total_edits": total_edits,
-                }),
-            )
+            let mut result = serde_json::json!({
+                "renamed": true,
+                "changes": changes_json,
+                "total_files": total_files,
+                "total_edits": total_edits,
+            });
+            crate::edit::attach_backup_skipped_reason(&mut result, ctx, session, &op_id, None);
+            Response::success(req_id, result)
         }
         Err(resp) => resp,
     }
@@ -199,8 +208,8 @@ fn apply_workspace_edit(
     ctx: &AppContext,
     session: &str,
     req_id: &str,
+    op_id: &str,
 ) -> Result<Vec<FileChange>, Response> {
-    let op_id = crate::backup::new_op_id();
     let file_changes = collect_workspace_edit_changes(edit, ctx, req_id)?;
     if file_changes.is_empty() {
         return Err(Response::error(
@@ -214,7 +223,7 @@ fn apply_workspace_edit(
         ctx,
         file_changes.keys().map(|path| path.as_path()),
     );
-    let rollback = snapshot_affected_files(&file_changes, session, ctx, &op_id)
+    let rollback = snapshot_affected_files(&file_changes, session, ctx, op_id)
         .map_err(|err| Response::error(req_id, "lsp_error", format!("rename failed: {err}")))?;
     let result = apply_collected_changes(&file_changes, &rollback.captures, ctx);
 
@@ -725,6 +734,42 @@ fn utf16_column_to_byte(line: &str, character: u32) -> usize {
 #[cfg(test)]
 mod rollback_tests {
     use super::*;
+
+    #[test]
+    fn lsp_rename_reports_its_own_backup_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let file = root.join("source.ts");
+        std::fs::write(&file, "const before = 1;\n").unwrap();
+        let config = crate::config::Config {
+            project_root: Some(root.clone()),
+            storage_dir: Some(root.join("storage")),
+            ..Default::default()
+        };
+        let ctx = AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
+        ctx.backup().lock().set_policy(crate::backup::BackupPolicy {
+            enabled: false,
+            ..Default::default()
+        });
+        let uri = crate::lsp::position::uri_for_path(&file).unwrap();
+        let edit = WorkspaceEdit {
+            changes: Some(HashMap::from([(
+                uri,
+                vec![lsp_types::TextEdit {
+                    range: Range::new(
+                        lsp_types::Position::new(0, 6),
+                        lsp_types::Position::new(0, 12),
+                    ),
+                    new_text: "after".into(),
+                }],
+            )])),
+            ..Default::default()
+        };
+        let result = apply_rename_response(&edit, &ctx, "rename-session", "rename");
+        assert!(result.success, "{result:?}");
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "const after = 1;\n");
+        assert_eq!(result.data["backup_skipped_reason"], "disabled");
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, AppContext, RenameRollback) {
         let dir = tempfile::tempdir().unwrap();

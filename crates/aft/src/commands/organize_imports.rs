@@ -306,6 +306,7 @@ pub fn handle_organize_imports(req: &RawRequest, ctx: &AppContext) -> Response {
 
     write_result.append_lsp_diagnostics_to(&mut result);
     write_result.append_reformatted_excerpt_to(&mut result);
+    edit::attach_backup_skipped_reason(&mut result, ctx, req.session(), &op_id, Some(&path));
     Response::success(&req.id, result)
 }
 

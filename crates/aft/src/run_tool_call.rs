@@ -892,17 +892,6 @@ fn run_tool_call_with_origin(
             // Keep these clocks on the diagnostic path, not in response text.
             let outline_started =
                 (prepared.request.command == "outline" && phase_trace.is_some()).then(Instant::now);
-            let backup_bookkeeping = !is_read_only_request(&prepared.request);
-            let skipped_before = backup_bookkeeping
-                .then(|| {
-                    app_ctx.backup().lock().latest_skipped_order(
-                        ctx.session_id
-                            .as_deref()
-                            .unwrap_or(crate::protocol::DEFAULT_SESSION_ID),
-                    )
-                })
-                .flatten();
-            let outline_backup_before = outline_started.map(|at| at.elapsed());
             let (watcher_pending, callgraph_pending) =
                 crate::response_finalize::query_pending(app_ctx, &prepared.request.command);
             // URL fetch times ride on the slow-call line of the commands that
@@ -926,27 +915,6 @@ fn run_tool_call_with_origin(
                 &mut response,
                 callgraph_pending.as_ref(),
             );
-            if backup_bookkeeping
-                && response.success
-                && response.data.get("backup_skipped_reason").is_none()
-            {
-                let session = ctx
-                    .session_id
-                    .as_deref()
-                    .unwrap_or(crate::protocol::DEFAULT_SESSION_ID);
-                if let Some(reason) = app_ctx
-                    .backup()
-                    .lock()
-                    .skipped_reason_after(session, skipped_before)
-                {
-                    if let Some(object) = response.data.as_object_mut() {
-                        object.insert(
-                            "backup_skipped_reason".to_string(),
-                            Value::String(reason.as_str().to_string()),
-                        );
-                    }
-                }
-            }
             let outline_after = outline_after_started.map(|at| at.elapsed());
             let url_fetch_times = url_fetch_times.and_then(|scope| scope.finish());
             if let Some(trace) = phase_trace.as_mut() {
@@ -968,11 +936,10 @@ fn run_tool_call_with_origin(
                         shape.push(' ');
                         shape.push_str(&times.render());
                     }
-                    if let Some(before) = outline_backup_before {
+                    if let Some(handler) = outline_handler {
                         shape.push_str(&format!(
-                            " outline_backup_before_ms={:.3} outline_handler_ms={:.3} outline_after_ms={:.3}",
-                            before.as_secs_f64() * 1000.0,
-                            outline_handler.unwrap_or_default().as_secs_f64() * 1000.0,
+                            " outline_handler_ms={:.3} outline_after_ms={:.3}",
+                            handler.as_secs_f64() * 1000.0,
                             outline_after.unwrap_or_default().as_secs_f64() * 1000.0,
                         ));
                     }
