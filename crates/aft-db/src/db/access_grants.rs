@@ -479,10 +479,11 @@ pub fn end_scope_grants(conn: &Connection, key: &ScopeKey) -> rusqlite::Result<(
 /// handler and the background sweep so both leave the same rows behind.
 /// Returns how many grants were deleted.
 fn end_scope_rows(tx: &rusqlite::Transaction<'_>, key: &ScopeKey) -> rusqlite::Result<usize> {
-    // The tombstone keeps a late catalog from reviving the scope.
+    // The tombstone keeps a late catalog from reviving the scope. Nothing
+    // reads an ended scope's configuration, so the tombstone drops it.
     tx.execute(
         "INSERT INTO access_scopes(owner,scope_ref,epoch,config,ended) VALUES (?1,?2,?3,'{}',1)
-        ON CONFLICT(owner,scope_ref,epoch) DO UPDATE SET ended=1",
+        ON CONFLICT(owner,scope_ref,epoch) DO UPDATE SET ended=1, config='{}'",
         params![key.owner, key.scope_ref, key.epoch.to_string()],
     )?;
     let mut deleted_grants = 0;
@@ -1339,5 +1340,36 @@ mod tests {
         assert!(live.0.iter().all(|(_, count)| *count == 0), "{live:?}");
         assert_eq!(live.1, None);
         assert_eq!(sweep, live);
+    }
+
+    #[test]
+    fn ended_scope_tombstone_drops_its_configuration() {
+        for sweep in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let conn = crate::db::open(&dir.path().join("aft.db")).unwrap();
+            let key = ScopeKey {
+                owner: "owner".into(),
+                scope_ref: "run".into(),
+                epoch: 3,
+            };
+            register_scope(&conn, &key, None, &Config::default()).unwrap();
+            if sweep {
+                end_saved_scope(&conn, &key).unwrap();
+            } else {
+                end_scope_grants(&conn, &key).unwrap();
+            }
+            let (config, ended): (String, i64) = conn
+                .query_row(
+                    "SELECT config, ended FROM access_scopes WHERE owner='owner' AND scope_ref='run' AND epoch='3'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!((config.as_str(), ended), ("{}", 1), "sweep={sweep}");
+            assert!(scope_ended(&conn, &key).unwrap());
+            // A late registration of the ended identity cannot revive it.
+            register_scope(&conn, &key, None, &Config::default()).unwrap();
+            assert!(scope_config(&conn, &key).unwrap().is_none());
+        }
     }
 }
