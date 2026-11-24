@@ -4023,9 +4023,7 @@ mod idle_lsp_tests {
     use crate::config::Config;
     use crate::context::AppContext;
     use crate::lsp::child_registry::LspChildRegistry;
-    use crate::lsp::client::LspClient;
     use crate::lsp::registry::ServerKind;
-    use std::collections::HashMap;
     use std::path::Path;
     use std::time::{Duration, Instant};
 

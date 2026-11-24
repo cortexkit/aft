@@ -30,7 +30,7 @@ use aft_base::{
     test_env, test_support, walk_profile,
 };
 #[cfg(test)]
-use aft_index::{watcher_backend, watcher_filter};
+use aft_index::watcher_filter;
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]

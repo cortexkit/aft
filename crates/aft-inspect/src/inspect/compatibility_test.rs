@@ -2,7 +2,11 @@ use std::path::Path;
 
 use super::oxc_engine::OxcEngineResult;
 use super::scanners::{cycles, dead_code, source_text, unused_exports};
-use super::{InspectJob, InspectResult};
+use crate::inspect;
+
+use super::cache::{InspectCache, InspectCacheError, Tier2ContributionUpdates};
+use super::manager::{InspectBuilderState, InspectManager, MetricsWaitForTest};
+use super::{FileContribution, InspectCategory, InspectJob, InspectResult};
 
 pub const TIER2_CONTRIBUTION_CACHE_VERSION: u32 = super::cache::TIER2_CONTRIBUTION_CACHE_VERSION;
 pub const TODOS_NO_INDEX_STORE: &str = super::data_sources::TODOS_NO_INDEX_STORE;
@@ -27,6 +31,24 @@ pub fn run_cycles_scan_with_oxc(
 
 pub fn read_source_is_disclosed(path: &Path) -> bool {
     source_text::read_source_text(path).is_ok()
+}
+
+pub fn apply_contribution_upserts(
+    cache: &InspectCache,
+    category: InspectCategory,
+    upserts: Vec<FileContribution>,
+    config: &crate::config::Config,
+) -> Result<String, InspectCacheError> {
+    cache
+        .apply_contribution_updates_for_config(
+            category,
+            Tier2ContributionUpdates {
+                upserts,
+                ..Default::default()
+            },
+            config,
+        )
+        .map(|(hash, _)| hash)
 }
 
 pub trait InspectManagerTest {

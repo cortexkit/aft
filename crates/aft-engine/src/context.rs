@@ -4369,7 +4369,7 @@ impl AppContext {
     }
 
     pub fn mark_subc_bound(&self) {
-        self.lsp().resume();
+        self.lsp().resume_for_composition();
         self.subc_lifecycle.mark_bound();
         // Idle release holds the lifecycle gate while clearing the pools. Once
         // mark_bound returns, an earlier release has finished and later releases

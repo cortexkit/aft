@@ -240,8 +240,6 @@ pub mod production_storage;
 pub mod project_content;
 pub use aft_base::project_walk;
 pub use aft_base::protocol;
-#[cfg(test)]
-pub(crate) use aft_base::walk_profile;
 #[doc(hidden)]
 pub mod provisional_identity_retry;
 pub use aft_base::pty_render;
@@ -266,7 +264,6 @@ pub mod secret_proxy;
 pub use aft_index::semantic_admission;
 pub use aft_index::semantic_index;
 pub mod setup_plan;
-pub(crate) use aft_base::shared_timer;
 #[doc(hidden)]
 pub mod shell_env_provider;
 pub use aft_base::shell_format;
@@ -295,7 +292,6 @@ pub(crate) mod test_storage;
 pub use aft_base::tool_call_result;
 pub use aft_base::tool_gate;
 pub use aft_base::tool_path;
-pub(crate) use aft_base::tool_progress;
 use aft_base::view_storage_reserve;
 #[allow(unused_imports)]
 pub(crate) use aft_base::volume;

@@ -1,9 +1,7 @@
 use std::path::Path;
 
 use crate::inspect::oxc_engine::OxcEngineResult;
-use crate::inspect::{
-    self, InspectCache, InspectCategory, InspectJob, InspectManager, InspectResult,
-};
+use crate::inspect::{self, InspectCache, InspectCategory, InspectJob, InspectResult};
 
 pub use crate::inspect::scanners::todos::{
     outcomes_for_test, todos_job, uncached_aggregate_for_test,
@@ -12,6 +10,7 @@ pub use crate::inspect::{
     filter_payload_for_scope_for_test, InspectBuilderState, MetricsWaitForTest,
 };
 
+pub use inspect::compatibility_test::{InspectCacheTest, InspectManagerTest};
 pub use inspect::compatibility_test::{TIER2_CONTRIBUTION_CACHE_VERSION, TODOS_NO_INDEX_STORE};
 
 pub fn contribution_set_hash_for_version_for_test(

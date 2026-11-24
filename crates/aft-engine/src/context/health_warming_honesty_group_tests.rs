@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod health_warming_honesty_tests {
     use super::*;
+    use crate::test_bridge::search_misc::InspectManagerTestExt as _;
     use crate::parser::TreeSitterProvider;
 
     fn ctx_with_config(config: Config) -> AppContext {

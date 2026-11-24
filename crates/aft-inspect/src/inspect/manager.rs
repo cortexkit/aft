@@ -879,8 +879,7 @@ impl InspectManager {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn non_expiring_metrics_wait_for_test(&self) -> MetricsWaitForTest {
+    pub(crate) fn non_expiring_metrics_wait_for_test(&self) -> MetricsWaitForTest {
         let (release_tx, release_rx) = bounded(1);
         let control = Arc::new(MetricsWaitControlForTest {
             non_expiring: true,
@@ -1167,8 +1166,7 @@ impl InspectManager {
         }
     }
 
-    #[doc(hidden)]
-    pub fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
+    pub(crate) fn tier2_builder_state(&self, category: InspectCategory) -> InspectBuilderState {
         let key = JobKey::for_project_category(category);
         if let Ok(states) = self.builder_states.lock() {
             if let Some(entry) = states.get(&key) {
@@ -1193,8 +1191,7 @@ impl InspectManager {
         self.tier2_builder_state_detail_at(category, unix_millis_now())
     }
 
-    #[doc(hidden)]
-    pub fn dead_code_build_is_pending(&self) -> bool {
+    pub(crate) fn dead_code_build_is_pending(&self) -> bool {
         self.builder_states.lock().ok().is_some_and(|states| {
             states
                 .get(&JobKey::for_project_category(InspectCategory::DeadCode))
@@ -1229,8 +1226,7 @@ impl InspectManager {
 
     /// Marks a dead-code pass as waiting for its call graph, or no longer.
     #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
+    pub(crate) fn set_dead_code_waiting_for_callgraph_for_test(&self, waiting: bool) {
         if waiting {
             self.dead_code_callgraph_waits
                 .fetch_add(1, Ordering::SeqCst);
@@ -1579,8 +1575,7 @@ impl InspectManager {
     /// Hold the in-flight job map for the duration of `while_held`, so a test
     /// can prove a caller does not wait for it.
     #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
+    pub(crate) fn hold_in_flight_lock_for_test(&self, while_held: impl FnOnce()) {
         let _held = self
             .in_flight
             .lock()
@@ -1589,8 +1584,7 @@ impl InspectManager {
     }
 
     #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
+    pub(crate) fn set_tier2_in_flight_for_test(&self, category: InspectCategory, in_flight: bool) {
         let key = JobKey::for_project_category(category);
         let mut jobs = self
             .in_flight
@@ -2120,7 +2114,7 @@ impl InspectManager {
                 }
             },
             #[cfg(windows)]
-            &crate::watcher_backend::readiness::NativeReadinessWatcherFactory,
+            &aft_index::watcher_backend::readiness::NativeReadinessWatcherFactory,
         );
         match watcher {
             Ok(watcher) => {

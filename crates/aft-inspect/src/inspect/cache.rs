@@ -48,8 +48,7 @@ use super::job::{
 };
 
 #[derive(Debug, Default)]
-#[doc(hidden)]
-pub struct Tier2ContributionUpdates {
+pub(crate) struct Tier2ContributionUpdates {
     pub upserts: Vec<FileContribution>,
     pub deletes: Vec<PathBuf>,
     pub metadata_updates: Vec<(PathBuf, FileFreshness)>,
@@ -626,8 +625,7 @@ pub struct ReadonlyInspectCache {
 
 impl InspectCache {
     #[cfg(any(test, feature = "test-support"))]
-    #[doc(hidden)]
-    pub fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
+    pub(crate) fn legacy_estimated_memory_for_test(&self) -> crate::memory::MemoryEstimate {
         let memory = match self.memory.try_read() {
             Ok(memory) => memory,
             Err(_) => return crate::memory::MemoryEstimate::busy(),
@@ -1181,8 +1179,7 @@ impl InspectCache {
         self.store_memory_aggregate(key, aggregate, Some(contribution_set_hash))
     }
 
-    #[doc(hidden)]
-    pub fn apply_contribution_updates_for_config(
+    pub(crate) fn apply_contribution_updates_for_config(
         &self,
         category: InspectCategory,
         updates: Tier2ContributionUpdates,
@@ -1324,8 +1321,7 @@ impl InspectCache {
         }
     }
 
-    #[doc(hidden)]
-    pub fn latest_aggregate_any_hash(
+    pub(crate) fn latest_aggregate_any_hash(
         &self,
         category: InspectCategory,
     ) -> Result<Option<serde_json::Value>, InspectCacheError> {
@@ -1384,8 +1380,7 @@ impl InspectCache {
         Ok(last_full_run)
     }
 
-    #[doc(hidden)]
-    pub fn store_tier2_aggregate(
+    pub(crate) fn store_tier2_aggregate(
         &self,
         key: JobKey,
         contribution_set_hash: &str,

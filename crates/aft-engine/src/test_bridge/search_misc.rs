@@ -361,7 +361,7 @@ pub trait LspManagerTestExt {
 
 impl LspManagerTestExt for crate::lsp::manager::LspManager {
     fn resume(&self) {
-        self.resume();
+        self.resume_for_composition();
     }
 }
 
@@ -371,7 +371,7 @@ pub trait LspClientTestExt {
 
 impl LspClientTestExt for crate::lsp::client::LspClient {
     fn child_pid(&self) -> u32 {
-        self.child_pid()
+        crate::lsp::test_support::child_pid_for_test(self)
     }
 }
 

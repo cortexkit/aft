@@ -93,16 +93,14 @@ mod tests {
                 }),
             ));
         }
-        let (hash, _) = cache
-            .apply_contribution_updates_for_config(
-                crate::inspect_category::InspectCategory::DeadCode,
-                crate::inspect::cache::Tier2ContributionUpdates {
-                    upserts,
-                    ..Default::default()
-                },
-                &crate::config::Config::default(),
-            )
-            .unwrap();
+        let hash = crate::inspect::compatibility_test::apply_contribution_upserts(
+            &cache,
+            crate::inspect_category::InspectCategory::DeadCode,
+            upserts,
+            &crate::config::Config::default(),
+        )
+        .unwrap();
+        use crate::test_bridge::search_misc::InspectCacheTestExt as _;
         cache
             .store_tier2_aggregate(
                 crate::inspect::job::JobKey::for_project_category(

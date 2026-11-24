@@ -84,6 +84,7 @@ impl Drop for BackgroundDocumentPullPause {
     }
 }
 
+mod composition;
 #[path = "manager/document_pull_lifetime.rs"]
 mod document_pull_lifetime;
 
@@ -6179,8 +6180,7 @@ impl LspManager {
         }
     }
 
-    #[doc(hidden)]
-    pub fn resume(&self) {
+    pub(crate) fn resume(&self) {
         self.quiesced
             .store(false, std::sync::atomic::Ordering::Release);
     }
