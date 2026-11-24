@@ -29,7 +29,8 @@ struct IncompleteWalk {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum InvalidationCause {
+#[doc(hidden)]
+pub enum InvalidationCause {
     ContentOnlyBatch,
     CreateRemoveRename,
     SelectionInput,

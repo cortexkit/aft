@@ -107,7 +107,8 @@ fn rust_analyzer_capacity() -> &'static Arc<RustAnalyzerCapacity> {
 /// Count before spawning or switching an existing analyzer to worker policy so
 /// both admission paths contribute. The process-wide counter outlives the roots
 /// whose requests were refused.
-pub(crate) fn rust_analyzer_capacity_refusals() -> u64 {
+#[doc(hidden)]
+pub fn rust_analyzer_capacity_refusals() -> u64 {
     rust_analyzer_capacity().refusals.load(Ordering::Relaxed)
 }
 

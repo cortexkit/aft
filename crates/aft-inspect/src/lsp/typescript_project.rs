@@ -513,7 +513,8 @@ pub(crate) fn path_affects_typescript_selection(path: &Path) -> bool {
 }
 
 /// Forget the memoized choices when any of `paths` can change them.
-pub(crate) fn invalidate_typescript_selection<'a>(paths: impl IntoIterator<Item = &'a Path>) {
+#[doc(hidden)]
+pub fn invalidate_typescript_selection<'a>(paths: impl IntoIterator<Item = &'a Path>) {
     if paths.into_iter().any(path_affects_typescript_selection) {
         clear_typescript_selection();
     }

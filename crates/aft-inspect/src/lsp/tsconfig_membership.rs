@@ -23,7 +23,8 @@ const TS_JS_EXTENSIONS: &[&str] = &[
 /// tsconfig once and lets callers suppress diagnostics for files that the build
 /// would not check.
 #[derive(Default)]
-pub(crate) struct TsconfigMembershipCache {
+#[doc(hidden)]
+pub struct TsconfigMembershipCache {
     projects: HashMap<PathBuf, Option<ResolvedTsConfig>>,
     canonical_files: HashMap<PathBuf, PathBuf>,
     file_projects: HashMap<PathBuf, Option<PathBuf>>,

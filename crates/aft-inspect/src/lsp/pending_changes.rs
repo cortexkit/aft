@@ -220,7 +220,8 @@ pub fn send_or_queue_lsp_change(
 /// Queue even when the manager is free. A caller with an expired diagnostics
 /// budget must not spend another handshake or stdin-write budget delivering
 /// the change itself; the coalesced helper reads the latest disk contents.
-pub(crate) fn queue_lsp_change(
+#[doc(hidden)]
+pub fn queue_lsp_change(
     manager: &Arc<parking_lot::Mutex<LspManager>>,
     slot: &PendingLspChangeSlot,
     config: Arc<Config>,

@@ -1,5 +1,12 @@
 pub use aft_inspect::inspect::*;
 
+pub mod job {
+    #[cfg(test)]
+    pub(crate) use aft_db::path_identity::canonicalize_normalized;
+    pub(crate) use aft_db::path_identity::normalize_path;
+    pub use aft_inspect::inspect::job::*;
+}
+
 #[doc(hidden)]
 pub mod diagnostics_category {
     use std::time::Instant;

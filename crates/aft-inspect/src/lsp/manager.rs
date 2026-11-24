@@ -1325,7 +1325,8 @@ struct StartFailure {
 /// App-owned admission state. Weak slots and manager references do not retain
 /// a closed root, and the mutex makes slot checks and reservations atomic.
 #[derive(Default)]
-pub(crate) struct ServerCapacity {
+#[doc(hidden)]
+pub struct ServerCapacity {
     slots: Vec<std::sync::Weak<()>>,
     managers: Vec<std::sync::Weak<parking_lot::Mutex<LspManager>>>,
 }
@@ -1379,7 +1380,8 @@ fn next_transient_backoff(previous: Option<Duration>) -> Duration {
 
 /// A retry delay in whole seconds, rounded up so a pending retry never reads
 /// as "after 0s": `45s`, `2m`, `4m 30s`.
-pub(crate) fn format_retry_delay(delay: Duration) -> String {
+#[doc(hidden)]
+pub fn format_retry_delay(delay: Duration) -> String {
     let seconds = delay.as_secs() + u64::from(delay.subsec_nanos() > 0);
     match (seconds / 60, seconds % 60) {
         (0, seconds) => format!("{seconds}s"),
@@ -9481,7 +9483,8 @@ pub(crate) type WatchedFileStamps = HashMap<PathBuf, WatchedFileStamp>;
 
 /// Capture disk observations before taking the LSP manager lock. Queued changes
 /// carry these observations through delivery and startup replay without new I/O.
-pub(crate) fn capture_watched_file_stamps<'a>(
+#[doc(hidden)]
+pub fn capture_watched_file_stamps<'a>(
     paths: impl IntoIterator<Item = &'a PathBuf>,
 ) -> WatchedFileStamps {
     paths
@@ -9995,7 +9998,8 @@ impl WatcherForwardBacklog {
         );
     }
 
-    pub(crate) fn merge_with_stamps(
+    #[doc(hidden)]
+    pub fn merge_with_stamps(
         &mut self,
         paths: &[PathBuf],
         reload_all_rust: bool,
@@ -10093,7 +10097,8 @@ impl WatcherForwardBacklog {
 /// `AppContext::lsp_forward_queued_watcher_changes`); the helper then finds
 /// nothing left and clears it. `pause` is held only by tests, to keep the
 /// helper waiting.
-pub(crate) fn run_watcher_forward_helper(
+#[doc(hidden)]
+pub fn run_watcher_forward_helper(
     manager: &Arc<parking_lot::Mutex<LspManager>>,
     slot: &WatcherForwardSlot,
     pause: &parking_lot::Mutex<()>,
@@ -10119,7 +10124,8 @@ pub(crate) fn run_watcher_forward_helper(
 }
 
 /// Start [`spawn_watcher_rust_workspace_reload`] for each returned server.
-pub(crate) fn spawn_watcher_rust_workspace_reloads(
+#[doc(hidden)]
+pub fn spawn_watcher_rust_workspace_reloads(
     manager: &Arc<parking_lot::Mutex<LspManager>>,
     reloads: Vec<(ServerKey, Vec<PathBuf>)>,
 ) {
@@ -10305,14 +10311,17 @@ pub fn walk_applicable_area(
 
 pub use super::applicability_cache::ApplicabilityMetrics;
 
-pub(crate) use super::applicability_cache::InvalidationCause;
+#[doc(hidden)]
+pub use super::applicability_cache::InvalidationCause;
 
-pub(crate) fn applicability_metrics(root: &Path) -> ApplicabilityMetrics {
+#[doc(hidden)]
+pub fn applicability_metrics(root: &Path) -> ApplicabilityMetrics {
     super::applicability_cache::shared()
         .metrics(&crate::path_identity::canonicalize_normalized(root))
 }
 
-pub(crate) fn invalidate_applicability_walk(root: &Path, cause: InvalidationCause) {
+#[doc(hidden)]
+pub fn invalidate_applicability_walk(root: &Path, cause: InvalidationCause) {
     let root = crate::path_identity::canonicalize_normalized(root);
     // Invalidate selectors before waking a new scan, even when forwarding the
     // watcher events to a busy language-server manager has to be queued.
@@ -10320,7 +10329,8 @@ pub(crate) fn invalidate_applicability_walk(root: &Path, cause: InvalidationCaus
     super::applicability_cache::shared().invalidate(&root, cause);
 }
 
-pub(crate) fn invalidate_applicability_walk_with_trigger(
+#[doc(hidden)]
+pub fn invalidate_applicability_walk_with_trigger(
     root: &Path,
     cause: InvalidationCause,
     trigger_path: Option<&Path>,
@@ -10336,7 +10346,8 @@ pub(crate) fn invalidate_applicability_walk_with_trigger(
     );
 }
 
-pub(crate) fn invalidate_applicability_batch(
+#[doc(hidden)]
+pub fn invalidate_applicability_batch(
     root: &Path,
     paths: &[PathBuf],
     content_only: bool,
