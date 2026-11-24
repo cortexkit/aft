@@ -358,6 +358,7 @@ dependencies = [
  "tokio",
  "toml",
  "tree-sitter",
+ "tree-sitter-rust",
  "url",
  "wasmtime",
  "wasmtime-c-api-impl",

@@ -493,7 +493,7 @@ struct Work {
     many_since: parking_lot::Mutex<Option<Instant>>,
     #[cfg(test)]
     publication_delay: parking_lot::Mutex<Duration>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     publications_started: std::sync::atomic::AtomicUsize,
     /// A rescan is queued or running.
     rescanning: Arc<AtomicBool>,
@@ -846,9 +846,10 @@ impl Work {
             *requested = (*requested).max(publish);
             return true;
         }
+        #[cfg(any(test, feature = "test-support"))]
+        self.publications_started.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
         {
-            self.publications_started.fetch_add(1, Ordering::SeqCst);
             let delay = *self.publication_delay.lock();
             std::thread::sleep(delay);
         }
@@ -1561,7 +1562,7 @@ impl DataCheckout {
             many_since: parking_lot::Mutex::new(None),
             #[cfg(test)]
             publication_delay: parking_lot::Mutex::new(Duration::ZERO),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             publications_started: std::sync::atomic::AtomicUsize::new(0),
             rescanning: Arc::new(AtomicBool::new(false)),
             retry: std::sync::Mutex::default(),

@@ -1,11 +1,15 @@
 //! Project indexes, search execution, and filesystem watchers.
 
 // Keep local module paths for implementations shared with the lower crates.
+#[cfg(test)]
+use aft_base::search_hot_path_measurements as search_test_counts;
 #[allow(unused_imports)]
 use aft_base::*;
 use aft_db::{
     build_breaker, db, fs_lock, path_identity, persisted_format, root_identity, write_ledger,
 };
+#[cfg(test)]
+use aft_edit::imports;
 use aft_edit::{edit, format};
 use aft_parse::{callgraph, callgraph_extractor, parser};
 

@@ -1864,9 +1864,8 @@ pub mod fixtures;
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::fixtures::*;
     use std::path::Path;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use serde_json::json;
 

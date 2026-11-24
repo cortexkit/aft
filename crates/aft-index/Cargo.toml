@@ -100,5 +100,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 ring = "0.17"
 rcgen = "0.13"
 tokio = { version = "1", features = ["test-util"] }
+tree-sitter-rust = "0.24"
 tempfile = "3"
 filetime = "0.2"
