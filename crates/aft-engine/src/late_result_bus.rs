@@ -1,7 +1,5 @@
 use std::{path::PathBuf, sync::Arc};
 
-use aft_shell::late_result_bus::LedgerDatabase;
-
 use crate::{context::App, db::TrackedConnection};
 
 pub use aft_shell::late_result_bus::*;

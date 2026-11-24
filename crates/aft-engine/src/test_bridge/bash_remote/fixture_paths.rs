@@ -1,4 +1,5 @@
 pub mod bash_background {
+    pub use aft_shell::test_bridge::bash_background::*;
     #[cfg(unix)]
     pub mod push_projection_fixture {
         pub use crate::shell_test_fixtures::push_projection::{busy_root, BusyRoot};
@@ -6,6 +7,7 @@ pub mod bash_background {
 }
 
 pub mod bash_rewrite {
+    pub use aft_shell::test_bridge::bash_rewrite::*;
     pub mod dispatch {
         use crate::bash_rewrite::dispatch::{self, RewriteDispatch};
         use crate::context::AppContext;

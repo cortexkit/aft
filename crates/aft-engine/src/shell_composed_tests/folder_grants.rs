@@ -53,13 +53,13 @@ fn folder_revoke_racing_a_spawn_stops_the_command_once_registered() {
     let session = "folder-race";
     let spawn = || {
         let _scope = crate::access_policy::scope_guard(Some(worker.clone()));
-        crate::sandbox_spawn::with_spawn_plan_for_test(plan.clone(), || {
-            crate::bash_background::spawn(
+        with_spawn_plan_for_test(plan.clone(), || {
+            aft_shell::test_bridge::bash_background::spawn(
                 "folder-race",
                 session,
                 "sleep 30",
                 crate::bash_background::BashShell::Bash,
-                crate::bash_background::registry::resolve_posix_shell(),
+                resolve_posix_shell(),
                 Some(project.path().to_path_buf()),
                 None,
                 crate::bash_background::HardKill::After(Duration::from_secs(60)),
@@ -84,14 +84,7 @@ fn folder_revoke_racing_a_spawn_stops_the_command_once_registered() {
 
     let kept = task_id(&spawn());
     let registry = ctx.bash_background();
-    let recorded = registry
-        .task_for_session(&kept, session)
-        .unwrap()
-        .lock_state()
-        .unwrap()
-        .metadata
-        .folder_grants
-        .clone();
+    let recorded = recorded_folder_grants(registry, &kept, session);
     assert_eq!(
         recorded,
         Some(TaskFolderGrants {
@@ -128,3 +121,8 @@ fn folder_revoke_racing_a_spawn_stops_the_command_once_registered() {
     );
     registry.kill(&kept, session).unwrap();
 }
+use crate::bash_background::BgTaskStatus;
+use aft_shell::test_bridge::{
+    folder_grants::*, resolve_posix_shell, with_spawn_plan_for_test, SpawnPlanTestExt as _,
+};
+use std::sync::Arc;

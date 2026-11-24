@@ -1,4 +1,8 @@
-fn scope(name: &str, epoch: u64) -> ScopeKey {
+use super::*;
+#[cfg(unix)]
+use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
+
+pub fn scope(name: &str, epoch: u64) -> ScopeKey {
     ScopeKey {
         owner: "owner".into(),
         scope_ref: name.into(),
@@ -7,7 +11,7 @@ fn scope(name: &str, epoch: u64) -> ScopeKey {
 }
 
 #[cfg(unix)]
-fn wait_terminal(
+pub fn wait_terminal(
     registry: &BgTaskRegistry,
     task_id: &str,
     session: &str,
@@ -30,7 +34,7 @@ fn wait_terminal(
 /// aft.db with a registered worker scope holding a saved grant for each of
 /// `paths`.
 #[cfg(unix)]
-fn grant_database(
+pub fn grant_database(
     dir: &Path,
     scope: &ScopeKey,
     paths: &[&Path],
@@ -53,4 +57,20 @@ fn grant_database(
         .unwrap();
     }
     Arc::new(Mutex::new(conn))
+}
+
+#[cfg(all(unix, feature = "test-support"))]
+pub fn recorded_folder_grants(
+    registry: &BgTaskRegistry,
+    task: &str,
+    session: &str,
+) -> Option<TaskFolderGrants> {
+    registry
+        .task_for_session(task, session)
+        .unwrap()
+        .lock_state()
+        .unwrap()
+        .metadata
+        .folder_grants
+        .clone()
 }

@@ -27,7 +27,14 @@ pub mod secret_proxy;
 pub mod shell_env_provider;
 pub mod windows_shell;
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_bridge;
+
 pub use aft_base::{slog_debug, slog_error, slog_info, slog_warn};
+
+#[cfg(all(test, unix))]
+use aft_base::executable_cache;
 
 #[cfg(unix)]
 use aft_base::posix_spawn;

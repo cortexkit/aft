@@ -62,7 +62,7 @@ test_methods! { AppContextTestExt for AppContext {
     fn try_build_status_snapshot(&self) -> Option<crate::protocol::StatusPayload>;
     fn validate_read_path_without_approval(&self, req_id: &str, session_id: &str, path: &Path) -> Result<PathBuf, crate::protocol::Response>;
     #[cfg(unix)]
-    fn escalation_grants(&self) -> &parking_lot::Mutex<crate::test_bridge::bash_remote::sandbox_spawn::EscalationGrantStore>;
+    fn escalation_grants(&self) -> &Arc<aft_shell::sandbox_spawn::EscalationGrantState>;
     fn callgraph_executor_for_test(&self) -> Option<crate::executor::RootMaintenanceExecutor>;
     fn note_launch_restore_attempt(&self);
     fn launch_restore_attempts(&self) -> usize;

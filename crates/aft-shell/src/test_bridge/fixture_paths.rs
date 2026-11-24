@@ -1,7 +1,7 @@
 pub mod bash_background {
+    use crate::bash_background::SpawnHost;
     use crate::bash_background::{self as engine, BashShell, HardKill, RemoteLaunch};
     use crate::bash_permissions::PermissionAsk;
-    use crate::context::AppContext;
     use crate::protocol::Response;
     use crate::sandbox_spawn::HostEscalationAttempt;
     use std::{collections::HashMap, path::PathBuf};
@@ -15,7 +15,7 @@ pub mod bash_background {
         workdir: Option<PathBuf>,
         env: Option<HashMap<String, String>>,
         hard_kill: HardKill,
-        ctx: &AppContext,
+        ctx: &dyn SpawnHost,
         require_background_flag: bool,
         notify_on_completion: bool,
         compressed: bool,
@@ -127,7 +127,6 @@ pub mod bash_background {
         }
     }
 
-
     pub mod frames {
         pub fn registered() -> bool {
             crate::bash_background::frames::registered()
@@ -165,11 +164,11 @@ pub mod sandbox_spawn {
 
     #[cfg(target_os = "linux")]
     pub mod remote {
-        use crate::context::AppContext;
+        use crate::sandbox_spawn::SandboxHost;
         use std::path::{Path, PathBuf};
 
         pub fn prepare_with_launcher(
-            ctx: &AppContext,
+            ctx: &dyn SandboxHost,
             folder: &Path,
             workdir: PathBuf,
             command: String,
@@ -202,7 +201,7 @@ pub mod bash_rewrite {
     pub mod rules {
         pub fn ls_request(
             command: &str,
-            ctx: &crate::context::AppContext,
+            ctx: &dyn crate::bash_rewrite::RewriteHost,
         ) -> Option<serde_json::Value> {
             crate::bash_rewrite::rules::ls_request(command, ctx)
         }

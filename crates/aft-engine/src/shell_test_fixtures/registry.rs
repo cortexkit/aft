@@ -1,7 +1,4 @@
-use crate::bash_background::registry::BgTask;
-use aft_shell::bash_background::registry::test_support::{
-    create_wait_fixture, mark_fixture_terminal,
-};
+use aft_shell::test_bridge::BgTask;
 use std::sync::Arc;
 
 pub use aft_shell::bash_background::registry::test_support::*;

@@ -286,6 +286,8 @@ pub use aft_base::task_watch_lines;
 pub use aft_base::task_watches;
 pub use aft_edit::symbol_diff;
 pub use aft_index::synapse_embed;
+#[cfg(test)]
+mod shell_composed_tests;
 #[cfg(any(test, feature = "test-support"))]
 mod shell_test_fixtures;
 #[cfg(any(test, feature = "test-support"))]

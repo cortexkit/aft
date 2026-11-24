@@ -1,4 +1,10 @@
 use crate::bash_background::task_scope;
+
+pub const LINUX_SCOPE_ENV: &str = crate::bash_background::registry::LINUX_SCOPE_ENV;
+
+pub fn matches_membership(task_id: &str, membership: &str) -> bool {
+    task_scope::matches_membership(task_id, membership)
+}
 use std::path::PathBuf;
 
 pub fn with_local_recovery_mount_for_test<T>(

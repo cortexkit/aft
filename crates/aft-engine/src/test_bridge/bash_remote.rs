@@ -2,10 +2,6 @@ pub fn record_service(root: &Path) -> std::sync::Arc<crate::gh_shim_speech::serv
     crate::gh_shim_speech::service::record_service(root)
 }
 
-mod sandbox;
-
-pub use sandbox::*;
-
 pub mod registry_support {
     pub use crate::shell_test_fixtures::registry::*;
 }
@@ -20,3 +16,11 @@ pub use speech::*;
 
 mod fixture_paths;
 pub use fixture_paths::*;
+use std::path::Path;
+
+pub use aft_shell::test_bridge::*;
+
+#[cfg(unix)]
+mod busy_root_ext;
+#[cfg(unix)]
+pub use busy_root_ext::*;

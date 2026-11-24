@@ -1,6 +1,6 @@
+use super::fixture::*;
 use super::*;
 use crate::access_policy::{AccessGrant, AccessOperation, GrantKind};
-
 
 fn grants(name: &str, paths: &[&str]) -> TaskFolderGrants {
     TaskFolderGrants {
@@ -127,7 +127,6 @@ fn folder_revoke_stops_only_commands_whose_sandbox_held_the_folder() {
 }
 
 /// Wait for a command to end and return its snapshot.
-
 
 /// A grant revoked while AFT was down is checked when the command is
 /// restored: the command holding it stops, one whose grant is still saved

@@ -31,7 +31,7 @@ pub fn successful_spawn_response(
     session_id: &str,
     task_id: &str,
     pty: bool,
-    ctx: &crate::context::AppContext,
+    ctx: &dyn background::SpawnHost,
 ) -> crate::protocol::Response {
     background::successful_spawn_response(request_id, session_id, task_id, pty, ctx)
 }
@@ -52,7 +52,6 @@ pub fn recovered_bash_frame(
 ) -> Option<frames::RecoveredFrame> {
     frames::recovered_bash_frame(snapshot, key, root, scope)
 }
-
 
 pub fn worker_scope(stamp: &subc_protocol::scope::ScopeStamp) -> bool {
     crate::gh_shim_relay::worker_scope(stamp)
@@ -148,15 +147,37 @@ pub fn with_spawn_plan_for_test<T>(plan: sandbox_engine::SpawnPlan, run: impl Fn
     sandbox_engine::with_spawn_plan_for_test(plan, run)
 }
 
+mod sandbox;
+pub use sandbox::*;
+
+mod fixture_paths;
+pub use fixture_paths::*;
+
+#[path = "test_bridge/display_data.rs"]
+pub mod bus;
+
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod folder_grants {
+    pub use crate::bash_background::registry::folder_grants::{
+        fixture::{grant_database, recorded_folder_grants, scope, wait_terminal},
+        TaskFolderGrants, FOLDER_ACCESS_REVOKED_REASON,
+    };
+
+    pub fn after_record_for_test(hook: impl FnOnce() + 'static) {
+        crate::bash_background::registry::folder_grants::after_record_for_test(hook);
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub mod task_scope;
 
 pub use crate::bash_background::buffer::buffer_types::BgBuffer;
 pub use crate::bash_background::persistence::test_faults::{with_task_io_fault, TaskIoFault};
-pub use crate::bash_background::registry::task_types::{BgTask, BgTaskState, TaskRuntime};
 pub use crate::bash_background::registry::return_files::return_types::{
     ReturnOutcome, ReturnedPath,
 };
+pub use crate::bash_background::registry::task_types::{BgTask, BgTaskState, TaskRuntime};
 pub use crate::bash_parse::LITERAL_APPEND_CASES;
 pub use crate::windows_shell::testable_types::{CandidateFailure, PipedAttemptError, WindowsShell};
 
@@ -264,7 +285,6 @@ pub fn snapshots_built(registry: &registry::BgTaskRegistry) -> u64 {
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
-
 #[cfg(target_os = "linux")]
 pub mod git_policy_bench_support {
     pub use crate::sandbox_spawn::git_policy_bench_support::*;
@@ -278,7 +298,6 @@ pub mod git_policy_cache_support {
 pub mod secrets_support {
     pub use crate::bash_background::secrets::test_support::*;
 }
-
 
 pub fn remote_running(job_id: String) -> background::scoped_tasks::scoped_tasks_types::Remote {
     background::scoped_tasks::remote_running(job_id)
@@ -323,3 +342,10 @@ mod scheduler_ext;
 pub use scheduler_ext::*;
 
 pub use registry::remote::remote_types::{DrainingRetryTestExt, KeyedSubmissionTestExt};
+
+pub fn cleanup_expired(
+    harness: &Path,
+    retention: std::time::Duration,
+) -> crate::output_store::CleanupReport {
+    crate::output_store::cleanup_expired(harness, retention)
+}

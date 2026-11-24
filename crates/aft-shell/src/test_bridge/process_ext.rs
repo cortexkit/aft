@@ -665,8 +665,9 @@ pub trait ToolLaunchPolicyTestExt {
         program: &std::ffi::OsStr,
         args: &[std::ffi::OsString],
     ) -> Result<std::process::Command, String>;
-    fn resolve(ctx: &crate::context::AppContext)
-        -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
+    fn resolve(
+        ctx: &dyn crate::sandbox_spawn::SandboxHost,
+    ) -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
     fn unconfined_for_test() -> crate::sandbox_spawn::ToolLaunchPolicy<'static>;
     #[cfg(unix)]
     fn shared(&self) -> std::rc::Rc<crate::sandbox_spawn::RequestToolLaunch>;
@@ -681,7 +682,7 @@ impl ToolLaunchPolicyTestExt for crate::sandbox_spawn::ToolLaunchPolicy<'_> {
         self.command(program, args)
     }
     fn resolve(
-        ctx: &crate::context::AppContext,
+        ctx: &dyn crate::sandbox_spawn::SandboxHost,
     ) -> crate::sandbox_spawn::ToolLaunchPolicy<'static> {
         Self::resolve(ctx)
     }
@@ -754,9 +755,11 @@ pub trait EscalationGrantStoreTestExt {
 }
 
 #[cfg(unix)]
-impl EscalationGrantStoreTestExt for crate::sandbox_spawn::EscalationGrantStore {
+impl EscalationGrantStoreTestExt
+    for crate::sandbox_spawn::escalation_grant_type::EscalationGrantInspection<'_>
+{
     fn len_for_test(&self) -> usize {
-        Self::len_for_test(self)
+        self.count()
     }
 }
 

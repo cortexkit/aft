@@ -6,14 +6,72 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::context::AppContext;
 use crate::protocol::Response;
+use crate::{
+    config::Config,
+    pinned_config::PinnedConfig,
+    sandbox_spawn::{EscalationGrantState, SandboxHost},
+};
+use std::sync::Arc;
 
-use super::{BashShell, BgTaskStatus, HardKill};
+use super::{BashShell, BgTaskRegistry, BgTaskStatus, HardKill, SpawnHost, TaskRegistryAccess};
 
 const MAX: usize = 8;
 
-fn context(project: &Path, storage: &Path) -> AppContext {
+struct SlotFixture {
+    config: Arc<Config>,
+    registry: BgTaskRegistry,
+    grants: Arc<EscalationGrantState>,
+}
+
+impl PinnedConfig for SlotFixture {
+    fn config(&self) -> Arc<Config> {
+        self.config.clone()
+    }
+}
+
+impl TaskRegistryAccess for SlotFixture {
+    fn bash_background(&self) -> &BgTaskRegistry {
+        &self.registry
+    }
+}
+
+impl SandboxHost for SlotFixture {
+    fn access_policy(&self, _: &str) -> Result<crate::access_policy::AccessPolicy, Response> {
+        panic!("a slot-limit launch should not ask for a native sandbox profile")
+    }
+    fn storage_dir(&self) -> PathBuf {
+        self.config.storage_dir.clone().unwrap()
+    }
+    fn escalation_grants(&self) -> &Arc<EscalationGrantState> {
+        &self.grants
+    }
+    #[cfg(target_os = "linux")]
+    fn pin_config(&self) -> Box<dyn crate::sandbox_spawn::ConfigPin + '_> {
+        panic!("a slot-limit launch should not prepare a remote shell")
+    }
+}
+
+impl SpawnHost for SlotFixture {
+    fn is_daemon_mode(&self) -> bool {
+        false
+    }
+    fn reload_released_filter_registry(&self) {}
+    fn start_changed_files(
+        &self,
+        _: &str,
+        _: &crate::sandbox_spawn::SpawnPlan,
+    ) -> Option<Arc<crate::bash_changed_files::Capture>> {
+        assert_eq!(
+            self.config.bash.changed_files,
+            crate::config::BashChangedFiles::Off
+        );
+        None
+    }
+    fn check_spawn_folder_revocation(&self, _: &str, _: &str) {}
+}
+
+fn context(project: &Path, storage: &Path) -> SlotFixture {
     let mut config = crate::config::Config {
         project_root: Some(project.to_path_buf()),
         storage_dir: Some(storage.to_path_buf()),
@@ -22,12 +80,16 @@ fn context(project: &Path, storage: &Path) -> AppContext {
         ..crate::config::Config::default()
     };
     config.sandbox.profile.head = crate::config::SandboxMode::Off;
-    AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config)
+    SlotFixture {
+        config: Arc::new(config),
+        registry: BgTaskRegistry::default(),
+        grants: Arc::default(),
+    }
 }
 
 /// Launches `command` the way the bash tool does: `background` marks a
 /// background launch, otherwise it is an ordinary foreground command.
-fn launch(ctx: &AppContext, session: &str, command: &str, background: bool) -> Response {
+fn launch(ctx: &SlotFixture, session: &str, command: &str, background: bool) -> Response {
     super::spawn(
         "req-slot-limit",
         session,
@@ -58,7 +120,7 @@ fn task_id(response: &Response) -> String {
 
 /// Fills every background slot of `ctx` with long sleeps, spread over two
 /// sessions to show the slots are shared by the sessions of one root.
-fn fill_background_slots(ctx: &AppContext) -> Vec<(String, String)> {
+fn fill_background_slots(ctx: &SlotFixture) -> Vec<(String, String)> {
     (0..MAX)
         .map(|i| {
             let session = if i % 2 == 0 { "session-a" } else { "session-b" };
@@ -68,14 +130,14 @@ fn fill_background_slots(ctx: &AppContext) -> Vec<(String, String)> {
         .collect()
 }
 
-fn kill_all(ctx: &AppContext, tasks: &[(String, String)]) {
+fn kill_all(ctx: &SlotFixture, tasks: &[(String, String)]) {
     for (task_id, session) in tasks {
         let _ = ctx.bash_background().kill(task_id, session);
     }
 }
 
 fn wait_terminal(
-    ctx: &AppContext,
+    ctx: &SlotFixture,
     task_id: &str,
     session: &str,
 ) -> super::registry::BgTaskSnapshot {

@@ -31,7 +31,7 @@ pub fn cleanup_expired(
     harness: &Path,
     retention: std::time::Duration,
 ) -> crate::output_store::CleanupReport {
-    crate::output_store::cleanup_expired(harness, retention)
+    aft_shell::test_bridge::cleanup_expired(harness, retention)
 }
 
 pub fn watcher_path_is_infra_skip_under(root: &Path, path: &Path) -> bool {

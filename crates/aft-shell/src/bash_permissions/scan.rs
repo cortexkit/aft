@@ -1516,6 +1516,21 @@ fn same_external_target(
 
 #[cfg(test)]
 mod tests {
+    struct ScannerFixture(std::sync::Arc<crate::config::Config>);
+
+    impl crate::pinned_config::PinnedConfig for ScannerFixture {
+        fn config(&self) -> std::sync::Arc<crate::config::Config> {
+            self.0.clone()
+        }
+    }
+
+    impl crate::bash_background::TaskRegistryAccess for ScannerFixture {
+        fn bash_background(&self) -> &crate::bash_background::BgTaskRegistry {
+            panic!("these scanner cases do not inspect task artifacts")
+        }
+    }
+
+    impl super::PermissionScanHost for ScannerFixture {}
     use super::*;
 
     fn directory_paths(command: &str, cwd: &Path) -> Vec<PathBuf> {
@@ -2503,14 +2518,11 @@ mod tests {
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project_root.clone()),
-                bash_permissions: true,
-                ..crate::config::Config::default()
-            },
-        );
+        let ctx = ScannerFixture(std::sync::Arc::new(crate::config::Config {
+            project_root: Some(project_root.clone()),
+            bash_permissions: true,
+            ..crate::config::Config::default()
+        }));
 
         let asks = scan_with_cwd("echo test 2>/dev/null", &ctx, &project_root);
 
@@ -2540,14 +2552,11 @@ mod tests {
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project_root.clone()),
-                bash_permissions: true,
-                ..crate::config::Config::default()
-            },
-        );
+        let ctx = ScannerFixture(std::sync::Arc::new(crate::config::Config {
+            project_root: Some(project_root.clone()),
+            bash_permissions: true,
+            ..crate::config::Config::default()
+        }));
 
         let asks = scan_with_cwd("some-command 2>/dev/stderr", &ctx, &project_root);
 
@@ -2750,14 +2759,11 @@ mod tests {
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project_root.clone()),
-                bash_permissions: true,
-                ..crate::config::Config::default()
-            },
-        );
+        let ctx = ScannerFixture(std::sync::Arc::new(crate::config::Config {
+            project_root: Some(project_root.clone()),
+            bash_permissions: true,
+            ..crate::config::Config::default()
+        }));
 
         let asks = scan_with_cwd("cat /etc/hosts", &ctx, &project_root);
 
@@ -2779,14 +2785,11 @@ mod tests {
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
 
-        let ctx = AppContext::new(
-            Box::new(crate::parser::TreeSitterProvider::new()),
-            crate::config::Config {
-                project_root: Some(project_root.clone()),
-                bash_permissions: true,
-                ..crate::config::Config::default()
-            },
-        );
+        let ctx = ScannerFixture(std::sync::Arc::new(crate::config::Config {
+            project_root: Some(project_root.clone()),
+            bash_permissions: true,
+            ..crate::config::Config::default()
+        }));
 
         let git = scan_with_cwd("git status", &ctx, &project_root);
         let echo = scan_with_cwd("echo hello", &ctx, &project_root);

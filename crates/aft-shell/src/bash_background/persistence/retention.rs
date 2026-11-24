@@ -74,7 +74,8 @@ pub fn maybe_spawn_retention(
 }
 
 #[cfg(test)]
-pub(crate) fn prune_retention_sweep_observed(
+#[doc(hidden)]
+pub fn prune_retention_sweep_observed(
     db: &Arc<Mutex<TrackedConnection>>,
     now_ms: i64,
     registries: Option<&[BgTaskRegistry]>,
@@ -84,7 +85,8 @@ pub(crate) fn prune_retention_sweep_observed(
 }
 
 #[cfg(test)]
-pub(crate) fn prune_retention_once_observed(
+#[doc(hidden)]
+pub fn prune_retention_once_observed(
     db: &Arc<Mutex<TrackedConnection>>,
     now_ms: i64,
     registries: Option<&[BgTaskRegistry]>,

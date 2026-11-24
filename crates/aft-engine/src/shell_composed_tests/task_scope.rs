@@ -20,15 +20,15 @@ fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
         .spawn_with_shell_in_slot_typed(
             SpawnPlan::Unsandboxed,
             "echo ready; sleep 60",
-            super::super::BashShell::Bash,
+            BashShell::Bash,
             PathBuf::from("/bin/bash"),
             "second-root".into(),
             root.path().to_owned(),
             HashMap::from([(LINUX_SCOPE_ENV.into(), "1".into())]),
-            super::super::HardKill::After(Duration::from_secs(90)),
+            HardKill::After(Duration::from_secs(90)),
             None,
             root.path().to_owned(),
-            super::super::TaskSlot::Background { max: 8 },
+            TaskSlot::Background { max: 8 },
             false,
             false,
             Some(root.path().to_owned()),
@@ -36,17 +36,27 @@ fn task_scope_actor_created_after_daemon_attach_has_named_membership() {
         )
         .unwrap();
     let _stop = StopOnDrop::new(id.clone());
-    let task = registry.task(&id).unwrap();
+    let task = registry.test_task(&id).unwrap();
     until(|| {
-        std::fs::read_to_string(&task.paths.stdout)
+        std::fs::read_to_string(&task.paths().stdout)
             .unwrap_or_default()
             .contains("ready")
     });
-    let pid = task.lock_state().unwrap().metadata.child_pid.unwrap();
+    let pid = task.lock_state().unwrap().metadata().child_pid.unwrap();
     let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
     registry.kill(&id, "second-root").unwrap();
     assert!(
-        super::super::task_scope::matches_membership(&id, &text),
+        matches_membership(&id, &text),
         "new actor missed the shared daemon fact: {text}"
     );
 }
+use crate::bash_background::{BashShell, HardKill, TaskSlot};
+use crate::sandbox_spawn::SpawnPlan;
+use aft_shell::bash_background::registry::test_support::scopes::{
+    require_manager, until, StopOnDrop,
+};
+use aft_shell::test_bridge::{
+    task_scope::{matches_membership, LINUX_SCOPE_ENV},
+    BgTaskRegistryTestExt as _, BgTaskTestExt as _,
+};
+use std::{collections::HashMap, path::PathBuf, time::Duration};

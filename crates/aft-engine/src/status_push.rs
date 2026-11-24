@@ -586,9 +586,9 @@ mod tests {
     }
 
     use super::*;
-    use crate::bash_background::push_projection_fixture::busy_root;
     use crate::persisted_format::{self, PersistedStore, UnsupportedPersistedFormat};
     use crate::protocol::StatusChangedFrame;
+    use crate::shell_test_fixtures::push_projection::busy_root;
     use std::path::PathBuf;
 
     #[test]

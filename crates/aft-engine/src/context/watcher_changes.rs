@@ -9,18 +9,20 @@ use crate::watcher_backend::counters::WatcherCounters;
 #[path = "inspect_diagnostics_host.rs"]
 mod inspect_diagnostics_host;
 
-impl WatcherChangeSink for Journal {
+struct JournalSink(Arc<Journal>);
+
+impl WatcherChangeSink for JournalSink {
     fn event_for_root(
         &self,
         event: &notify::Event,
         root: &std::path::Path,
         matcher: &crate::watcher_filter::SharedGitignore,
     ) {
-        Journal::event_for_root(self, event, root, matcher);
+        self.0.event_for_root(event, root, matcher);
     }
 
     fn gap(&self) {
-        Journal::gap(self);
+        self.0.gap();
     }
 }
 
@@ -53,9 +55,12 @@ pub struct BashChanges(Arc<WatcherCounters>);
 impl BashChanges {
     fn journal(sink: &Arc<dyn WatcherChangeSink>) -> Arc<Journal> {
         let sink: Arc<dyn Any + Send + Sync> = sink.clone();
-        sink.downcast().unwrap_or_else(|_| {
-            panic!("WatcherCounters::bash_changes must hold a Bash change journal")
-        })
+        sink.downcast::<JournalSink>()
+            .unwrap_or_else(|_| {
+                panic!("WatcherCounters::bash_changes must hold a Bash change journal")
+            })
+            .0
+            .clone()
     }
 
     #[cfg(test)]
@@ -65,7 +70,11 @@ impl BashChanges {
 
     #[doc(hidden)]
     pub fn get_or_init(&self, init: impl FnOnce() -> Arc<Journal>) -> Arc<Journal> {
-        Self::journal(self.0.bash_changes().get_or_init(|| init()))
+        Self::journal(
+            self.0
+                .bash_changes()
+                .get_or_init(|| Arc::new(JournalSink(init()))),
+        )
     }
 }
 

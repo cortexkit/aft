@@ -43,7 +43,8 @@ async fn status_kv_publishes_exact_segment_even_when_holder_refuses() {
         tokio::task::yield_now().await;
     }
     assert_eq!(client.stopped_route().unwrap().session, session);
-    let before = status::test_value(session).unwrap()["generation"]
+    let before = aft_shell::test_bridge::bus::late_result_bus::status::test_value(session).unwrap()
+        ["generation"]
         .as_u64()
         .unwrap();
     client.publish(

@@ -164,7 +164,7 @@ pub struct ProviderApprovalSnapshot {
 
 #[cfg(unix)]
 pub fn save_provider_approval(ctx: &dyn SandboxHost, id: &str, snapshot: ProviderApprovalSnapshot) {
-    let mut store = ctx.escalation_grants().lock();
+    let mut store = ctx.escalation_grants().inner_lock();
     if let Some(grant) = store.grants.get_mut(id) {
         grant.provider_snapshot = Some(snapshot);
     }
@@ -184,7 +184,7 @@ fn provider_grant_expiry_timer(owner: std::sync::Weak<EscalationGrantState>) {
             let Some(owner) = owner.upgrade() else {
                 return;
             };
-            let mut store = owner.lock();
+            let mut store = owner.inner_lock();
             let payloads = store.take_unclaimable_payloads(Instant::now());
             let next = store
                 .grants
@@ -214,7 +214,7 @@ pub fn frozen_provider_approval(
     principal: &AuthenticatedPrincipal,
     input: &HashMap<String, String>,
 ) -> Option<ProviderApprovalSnapshot> {
-    let store = ctx.escalation_grants().lock();
+    let store = ctx.escalation_grants().inner_lock();
     let grant = store.grants.get(id)?;
     if grant.consumed || grant.expires_at <= Instant::now() || grant.principal != *principal {
         return None;
@@ -929,7 +929,7 @@ fn mint_host_escalation_grant_at(
             return Err(error);
         }
     };
-    let mut store = ctx.escalation_grants().lock();
+    let mut store = ctx.escalation_grants().inner_lock();
     let unclaimable = store.take_unclaimable_payloads(now);
     let grant_id = loop {
         let mut random = [0_u8; 16];
@@ -1015,7 +1015,7 @@ fn consume_host_escalation_grant_at(
     now: Instant,
 ) -> Result<PreparedTask, EscalationRefusal> {
     let (digest, session_dir, task_id, preflight) = {
-        let mut store = ctx.escalation_grants().lock();
+        let mut store = ctx.escalation_grants().inner_lock();
         let checked = check_escalation_grant(&mut store, principal, attempt, now);
         let unclaimable = store.take_unclaimable_payloads(now);
         drop(store);
@@ -10184,7 +10184,7 @@ mod policy_tests {
         let layout = crate::shell_env_provider::PreflightLayout::create().unwrap();
         let path = layout.path().to_path_buf();
         let id = "esc_provider_layout".to_owned();
-        ctx.escalation_grants().lock().grants.insert(
+        ctx.escalation_grants().inner_lock().grants.insert(
             id.clone(),
             EscalationGrant {
                 principal: AuthenticatedPrincipal::FirstParty,
@@ -10224,7 +10224,7 @@ mod policy_tests {
             !path.exists(),
             "the expiry timer must release unused provider scratch"
         );
-        assert!(ctx.escalation_grants().lock().grants[&id]
+        assert!(ctx.escalation_grants().inner_lock().grants[&id]
             .provider_snapshot
             .is_none());
     }
@@ -11556,7 +11556,7 @@ mod policy_tests {
         let environment =
             ChildEnvironment::from([(OsString::from("ONLY"), OsString::from("snapshot"))]);
         let bundle_exists = |grant_id: &str| {
-            let store = ctx.escalation_grants().lock();
+            let store = ctx.escalation_grants().inner_lock();
             let grant = &store.grants[grant_id];
             grant.session_dir.join(&grant.task_id).exists()
                 || grant
@@ -11605,7 +11605,7 @@ mod policy_tests {
             Some("digest_mismatch")
         );
         assert!(!bundle_exists(&fresh), "refused payload bundle was kept");
-        assert_eq!(ctx.escalation_grants().lock().len_for_test(), 2);
+        assert_eq!(ctx.escalation_grants().inner_lock().len_for_test(), 2);
     }
 
     #[cfg(unix)]
@@ -11695,12 +11695,12 @@ mod policy_tests {
             None,
         );
         assert_eq!(plan.refusal_code(), Some("sandbox_escalation_denied"));
-        assert!(ctx.escalation_grants().lock().grants.is_empty());
+        assert!(ctx.escalation_grants().inner_lock().grants.is_empty());
     }
 
     #[cfg(unix)]
     fn grant_task_paths(ctx: &dyn SandboxHost, grant_id: &str) -> (PathBuf, String) {
-        let store = ctx.escalation_grants().lock();
+        let store = ctx.escalation_grants().inner_lock();
         let grant = store.grants.get(grant_id).unwrap();
         (grant.session_dir.clone(), grant.task_id.clone())
     }

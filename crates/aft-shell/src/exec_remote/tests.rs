@@ -861,7 +861,6 @@ fn cwd_symlink_escape_is_rejected() {
     .is_err());
 }
 
-
 #[test]
 fn absent_metadata_stays_absent_and_remote_changes_stay_listed() {
     let before = TerminalRecord::new(

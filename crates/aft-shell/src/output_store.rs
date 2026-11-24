@@ -347,7 +347,8 @@ mod cleanup_report {
         pub complete: bool,
     }
 }
-pub(crate) use cleanup_report::CleanupReport;
+#[doc(hidden)]
+pub use cleanup_report::CleanupReport;
 
 struct CleanupCursor {
     sessions: ReadDir,

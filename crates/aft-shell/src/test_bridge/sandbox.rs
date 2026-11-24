@@ -1,9 +1,8 @@
 #[cfg(unix)]
 use crate::bash_background::persistence::ResolvedTask;
-use crate::context::AppContext;
 use crate::sandbox_spawn::{
-    self, AuthenticatedPrincipal, HostEscalationAttempt, RequestedSandboxTier, SandboxRequirement,
-    SandboxTaskKind, SpawnPlan,
+    self, AuthenticatedPrincipal, HostEscalationAttempt, RequestedSandboxTier, SandboxHost,
+    SandboxRequirement, SandboxTaskKind, SpawnPlan,
 };
 use std::path::Path;
 #[cfg(unix)]
@@ -12,7 +11,7 @@ use std::{collections::HashMap, path::PathBuf};
 pub type ChildEnvironment = sandbox_spawn::ChildEnvironment;
 
 pub fn resolve_command_sandbox_spawn(
-    ctx: &AppContext,
+    ctx: &dyn SandboxHost,
     principal: &AuthenticatedPrincipal,
     requested_tier: RequestedSandboxTier,
     task_kind: SandboxTaskKind,

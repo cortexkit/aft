@@ -81,19 +81,19 @@ pub(crate) fn for_spawn() -> Option<TaskFolderGrants> {
     SPAWN.with(|slot| slot.borrow().clone())
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! {
     static AFTER_RECORD: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
 }
 
 /// Run `hook` on this thread once a spawn has recorded its folder grants and
 /// before it registers the task: the moment a racing revoke can slip in.
-#[cfg(all(test, unix))]
+#[cfg(all(any(test, feature = "test-support"), unix))]
 pub(crate) fn after_record_for_test(hook: impl FnOnce() + 'static) {
     AFTER_RECORD.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn run_after_record_hook() {
     if let Some(hook) = AFTER_RECORD.with(|slot| slot.borrow_mut().take()) {
         hook();
@@ -272,3 +272,7 @@ impl BgTaskRegistry {
 #[cfg(test)]
 #[path = "folder_grants_tests.rs"]
 mod tests;
+
+#[cfg(any(test, feature = "test-support"))]
+#[path = "folder_grant_fixture.rs"]
+pub(crate) mod fixture;

@@ -1521,7 +1521,7 @@ pub fn spawn_with_secrets(
     } else {
         None
     };
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     registry::folder_grants::run_after_record_hook();
     let _folder_grants = registry::folder_grants::spawn_guard(recorded_folder_grants.clone());
     // The watchdog compresses this task's output through the shared filter
@@ -2388,8 +2388,6 @@ mod legacy_root_task_repair_tests {
     }
 }
 
-#[cfg(all(test, unix))]
-pub(crate) use registry::push_projection_fixture;
 #[doc(hidden)]
 pub mod progress;
 #[doc(hidden)]
