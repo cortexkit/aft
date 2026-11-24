@@ -511,7 +511,12 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .map(|row| (row["loc"].as_u64().unwrap() as usize, row["file"].as_str().unwrap().to_string()))
+            .map(|row| {
+                (
+                    row["loc"].as_u64().unwrap() as usize,
+                    row["file"].as_str().unwrap().to_string(),
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(rows, oracle);
         assert_eq!(aggregate["files"], 30);

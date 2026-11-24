@@ -1153,14 +1153,23 @@ mod tests {
         let source_scan = scan_file(root, &source).unwrap().unwrap();
         let data_scan = scan_file(root, &data).unwrap().unwrap();
         assert_eq!(source_scan.contribution.functions.len(), 1);
-        assert_eq!(data_scan.contribution.language_skipped.as_deref(), Some("json"));
+        assert_eq!(
+            data_scan.contribution.language_skipped.as_deref(),
+            Some("json")
+        );
         assert_eq!(
             cache_freshness::hash_file_if_small_count_for_debug(),
             0,
             "freshness must hash the bytes already read, and never a data file"
         );
-        assert_eq!(super::super::source_text::source_read_count_for_debug(&source), 1);
-        assert_eq!(super::super::source_text::source_read_count_for_debug(&data), 0);
+        assert_eq!(
+            super::super::source_text::source_read_count_for_debug(&source),
+            1
+        );
+        assert_eq!(
+            super::super::source_text::source_read_count_for_debug(&data),
+            0
+        );
         // The freshness still proves the content it was computed from.
         assert_eq!(
             source_scan.freshness,

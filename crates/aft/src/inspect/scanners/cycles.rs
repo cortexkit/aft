@@ -582,7 +582,8 @@ impl CycleGraph {
                     })
             })
             .collect::<Vec<_>>();
-        components.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
+        components
+            .sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         let count = components.len();
         let largest = components.first().map_or(0, Vec::len);
         let reports = components
