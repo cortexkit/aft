@@ -137,6 +137,40 @@ async fn settings_review_classifies_live_and_restart_fields() {
     }
 }
 
+#[tokio::test]
+async fn settings_review_classifies_harness_overrides_like_their_root_field() {
+    let schema = Arc::new(
+        Schema::new(crate::config_live::schema::settings_declaration()).unwrap(),
+    );
+    let candidate = ConfigLayerSnapshot::file(
+        "aft",
+        ConfigLayer::User,
+        "/config/aft.jsonc",
+        Some(
+            br#"{"harnesses":{"pi":{"format_on_edit":false,"disabled_tools":["search"]}}}"#
+                .to_vec(),
+        ),
+    );
+    let request = ConfigReviewRequest::new(0, vec![candidate], None);
+    let reply = review::response(&schema, &frame(FrameType::Request, 8, json!(request)))
+        .await
+        .unwrap()
+        .unwrap();
+    let response: ConfigReviewReply = serde_json::from_slice(&reply.body).unwrap();
+    assert!(response.refusals.is_empty(), "{:?}", response.refusals);
+    for (path, kind) in [
+        ("/harnesses/pi/disabled_tools", ApplyKind::ModuleRestart),
+        ("/harnesses/pi/format_on_edit", ApplyKind::Live),
+    ] {
+        let field = response
+            .fields
+            .iter()
+            .find(|field| field.path.starts_with(path))
+            .unwrap_or_else(|| panic!("{path} missing from the review"));
+        assert_eq!(field.apply, kind, "{path}");
+    }
+}
+
 fn frame(kind: FrameType, corr: u64, body: Value) -> Frame {
     Frame::build(
         kind,
