@@ -1269,6 +1269,51 @@ fn grep_explicit_gitignored_file_is_searched() {
 }
 
 #[test]
+fn review_search_grep_explicit_file_honors_request_filters() {
+    let project = setup_project(&[
+        ("captures/log.txt", "needle in a gitignored capture\n"),
+        (".gitignore", "captures/\n"),
+    ]);
+    let mut aft = AftProcess::spawn();
+    configure(&mut aft, project.path());
+
+    for path in [
+        "captures/log.txt".into(),
+        project.path().join("captures/log.txt"),
+    ] {
+        for (include, exclude, expected) in [
+            (vec!["*.txt"], vec![], 1),
+            (vec!["*.rs"], vec![], 0),
+            (vec![], vec!["*.txt"], 0),
+            (vec![], vec![], 1),
+        ] {
+            let response = send(
+                &mut aft,
+                json!({
+                    "id": "grep-explicit-request-filters",
+                    "command": "grep",
+                    "pattern": "needle",
+                    "path": path,
+                    "include": include,
+                    "exclude": exclude,
+                }),
+            );
+            assert_eq!(response["success"], true, "{response:?}");
+            assert_eq!(
+                response["total_matches"], expected,
+                "{include:?} {exclude:?}: {response:?}"
+            );
+            assert_eq!(
+                response["no_files_matched_scope"],
+                expected == 0,
+                "{response}"
+            );
+        }
+    }
+    assert!(aft.shutdown().success());
+}
+
+#[test]
 fn grep_aftignore_excludes_from_directory_search() {
     // .aftignore excludes paths from AFT's directory walk, layered on .gitignore.
     let project = setup_project(&[

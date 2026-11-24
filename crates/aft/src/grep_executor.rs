@@ -828,11 +828,12 @@ pub(crate) fn scope_has_files(scope: &GrepScope, filters: &PathFilters) -> Optio
         if !crate::data_layer::read_fence::admits_walk_root(&root.search_root) {
             continue;
         }
-        // An explicitly-named existing file is always in scope (it's searched
-        // directly even if gitignored / .aftignored), so don't report it as
-        // "no files matched scope".
+        // Naming a file overrides ignore files, not request path filters.
         if crate::bounded_io::metadata(&root.search_root).is_ok_and(|m| m.is_file()) {
-            return Some(true);
+            if explicit_file_matches(&root.filter_root, &root.search_root, filters) {
+                return Some(true);
+            }
+            continue;
         }
         match bounded_scope_has_files(
             &root.filter_root,
@@ -1087,6 +1088,16 @@ fn resolve_roots(
     }
 }
 
+fn explicit_file_matches(filter_root: &Path, file: &Path, filters: &PathFilters) -> bool {
+    // A file used as its own filter root would have an empty relative path.
+    let base = if filter_root == file {
+        file.parent().unwrap_or(file)
+    } else {
+        filter_root
+    };
+    filters.matches(base, file)
+}
+
 fn execute_root_profiled(
     ctx: &impl IndexHost,
     pattern: &CompiledPattern,
@@ -1116,8 +1127,7 @@ fn execute_root_profiled(
         } else {
             IndexStatus::Fallback
         };
-        let result = if (root.authorized_task_artifact
-            && !filters.matches(&root.filter_root, &root.search_root))
+        let result = if !explicit_file_matches(&root.filter_root, &root.search_root, filters)
             || params
                 .path_exclusion
                 .is_some_and(|exclude| exclude(&root.search_root, project_root))
@@ -1980,8 +1990,7 @@ fn diagnose_scope_counts_unbounded(
     }
     if search_root.is_file() {
         counts.examined = 1;
-        let root = search_root.parent().unwrap_or(search_root);
-        if filters.matches(root, search_root) {
+        if explicit_file_matches(filter_root, search_root, filters) {
             counts.eligible = 1;
         } else {
             counts.filtered = 1;
