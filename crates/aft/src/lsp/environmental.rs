@@ -46,8 +46,7 @@ fn is_environmental_message(message: &str, code: &str) -> bool {
     }
 
     // Known TS codes for config / project setup (not per-line source defects).
-    matches!(code, "18003" | "TS18003" | "6053" | "TS6053")
-        || lower.contains("no inputs were found in config file")
+    matches!(code, "18003" | "TS18003") || lower.contains("no inputs were found in config file")
 }
 
 fn message_contains_schema_fetch_failure(lower: &str) -> bool {
@@ -152,6 +151,17 @@ mod tests {
             Some("TS2322"),
             Some("typescript"),
         )));
+    }
+
+    #[test]
+    fn ts6053_missing_reference_is_a_source_error() {
+        for code in ["6053", "TS6053"] {
+            assert!(!is_environmental_diagnostic(&stored(
+                "File 'missing.d.ts' not found.",
+                Some(code),
+                Some("typescript"),
+            )));
+        }
     }
 
     #[test]
