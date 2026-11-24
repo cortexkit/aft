@@ -410,7 +410,7 @@ fn display_versioned_bash_pin_publishes_the_legacy_rich_record_and_tail() {
 #[test]
 fn bash_tail_matches_occipital_line_bytes_without_inferring_tone_from_text() {
     let fixture = include_bytes!(
-        "../../../../tests/fixtures/tool_views/phone-reader-tool-tail-v1/03-records.json"
+        "../../../../tests/fixtures/tool_views/phone-reader-tool-tail-v3/03-records.json"
     );
     let mut expected: Value = serde_json::from_slice(fixture).unwrap();
     let mut metadata = task();
