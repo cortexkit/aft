@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -55,6 +55,9 @@ struct TopFileMetric {
 }
 
 static METRICS_MEMO: OnceLock<Tier1FileMemo<CachedFileMetric>> = OnceLock::new();
+
+/// Rows in `top_files_by_loc`.
+const TOP_FILES_LIMIT: usize = 20;
 
 #[cfg(debug_assertions)]
 static FILE_READS: super::read_counts::FileReadCounts = super::read_counts::FileReadCounts::new();
@@ -234,26 +237,29 @@ fn line_count_bytes(content: &[u8]) -> usize {
 fn aggregate_metrics(project_root: &Path, per_file: &[FileMetric]) -> serde_json::Value {
     let mut totals = MetricCounts::default();
     let mut by_language = BTreeMap::<&'static str, MetricCounts>::new();
-    let mut top_files = Vec::with_capacity(per_file.len());
     let symbols_counted_files = per_file.iter().filter(|file| file.symbols_counted).count();
+    // Only the top rows are reported, so keep a bounded heap during the same
+    // pass instead of building, then sorting, a row for every file.
+    let mut top_files = BinaryHeap::<RankedTopFile>::with_capacity(TOP_FILES_LIMIT + 1);
 
     for file in per_file {
         totals.add_file(file);
         by_language.entry(file.language).or_default().add_file(file);
-        top_files.push(TopFileMetric {
-            file: display_path(project_root, &file.path),
-            loc: file.loc,
-            symbol_count: file.symbol_count,
-        });
+        if top_files.len() == TOP_FILES_LIMIT
+            && top_files.peek().is_some_and(|worst| file.loc < worst.0.loc)
+        {
+            continue;
+        }
+        top_files.push(RankedTopFile(top_file_row(project_root, file)));
+        if top_files.len() > TOP_FILES_LIMIT {
+            top_files.pop();
+        }
     }
-
-    top_files.sort_by(|left, right| {
-        right
-            .loc
-            .cmp(&left.loc)
-            .then_with(|| left.file.cmp(&right.file))
-    });
-    top_files.truncate(20);
+    let top_files = top_files
+        .into_sorted_vec()
+        .into_iter()
+        .map(|ranked| ranked.0)
+        .collect::<Vec<_>>();
 
     serde_json::json!({
         "files": totals.file_count,
@@ -268,6 +274,49 @@ fn aggregate_metrics(project_root: &Path, per_file: &[FileMetric]) -> serde_json
         "top_files_by_loc": top_files,
     })
 }
+
+fn top_file_row(project_root: &Path, file: &FileMetric) -> TopFileMetric {
+    #[cfg(test)]
+    TOP_FILE_ROWS_BUILT.with(|built| built.set(built.get() + 1));
+    TopFileMetric {
+        file: display_path(project_root, &file.path),
+        loc: file.loc,
+        symbol_count: file.symbol_count,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TOP_FILE_ROWS_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Report order: more lines first, then file name. A row that ranks earlier
+/// compares as smaller, so the max-heap's top is the row to evict.
+struct RankedTopFile(TopFileMetric);
+
+impl Ord for RankedTopFile {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .0
+            .loc
+            .cmp(&self.0.loc)
+            .then_with(|| self.0.file.cmp(&other.0.file))
+    }
+}
+
+impl PartialOrd for RankedTopFile {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RankedTopFile {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for RankedTopFile {}
 
 fn display_path(project_root: &Path, path: &Path) -> String {
     path.strip_prefix(project_root)
@@ -429,6 +478,63 @@ mod tests {
             9,
             "waiting does not finish more files"
         );
+    }
+
+    fn file_metric(root: &Path, name: &str, loc: usize) -> FileMetric {
+        FileMetric {
+            path: root.join(name),
+            language: "rust",
+            symbol_count: 0,
+            symbols_counted: true,
+            loc,
+        }
+    }
+
+    #[test]
+    fn metrics_top_files_match_a_full_sort_with_ties_at_the_cutoff() {
+        let root = Path::new("/project");
+        // 30 files over three LOC values, so the 20-row cutoff falls inside a
+        // tie and the file name decides which tied rows stay.
+        let per_file = (0..30)
+            .rev()
+            .map(|index| file_metric(root, &format!("f{index:02}.rs"), 10 * (index % 3 + 1)))
+            .collect::<Vec<_>>();
+        let mut oracle = per_file
+            .iter()
+            .map(|file| (file.loc, display_path(root, &file.path)))
+            .collect::<Vec<_>>();
+        oracle.sort_by(|left, right| right.0.cmp(&left.0).then_with(|| left.1.cmp(&right.1)));
+        oracle.truncate(TOP_FILES_LIMIT);
+
+        let aggregate = aggregate_metrics(root, &per_file);
+        let rows = aggregate["top_files_by_loc"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| (row["loc"].as_u64().unwrap() as usize, row["file"].as_str().unwrap().to_string()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows, oracle);
+        assert_eq!(aggregate["files"], 30);
+        assert_eq!(aggregate["loc"], 10 * (10 + 20 + 30));
+    }
+
+    #[test]
+    fn metrics_top_files_build_rows_only_for_candidates() {
+        let root = Path::new("/project");
+        // Descending LOC: once the first 20 rows are kept, no later file can
+        // enter the preview, so none of them needs a row.
+        let per_file = (0..1_000)
+            .map(|index| file_metric(root, &format!("f{index:04}.rs"), 1_000 - index))
+            .collect::<Vec<_>>();
+        TOP_FILE_ROWS_BUILT.with(|built| built.set(0));
+        let aggregate = aggregate_metrics(root, &per_file);
+        assert_eq!(
+            TOP_FILE_ROWS_BUILT.with(std::cell::Cell::get),
+            TOP_FILES_LIMIT,
+            "a preview row was built for a file that could not enter it"
+        );
+        assert_eq!(aggregate["top_files_by_loc"][0]["loc"], 1_000);
+        assert_eq!(aggregate["files"], 1_000);
     }
 
     #[test]
