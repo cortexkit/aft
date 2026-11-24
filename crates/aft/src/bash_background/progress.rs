@@ -261,7 +261,11 @@ fn read_batch(
             };
             continue;
         }
-        let bytes = &page.bytes[..page.bytes.len().min(FRAME_BYTES)];
+        // Show the whole page that was read: taking less would re-read the
+        // rest on every later tick and let previews fall ever further behind
+        // fast output. `accept` still frames it in `FRAME_BYTES` pieces, and
+        // the pump stops at the call's byte budget.
+        let bytes = &page.bytes[..];
         cursor.offset += bytes.len() as u64;
         let mask = |from, text: &mut String| {
             *text = registry.masked_status_page(task_id, artifact, from, text.as_bytes());
@@ -346,6 +350,53 @@ mod tests {
             .iter()
             .all(|frame| frame.chunk.len() <= FRAME_BYTES && frame.chunk.ends_with('\n')));
         assert!(pump.tick.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bash_progress_consumes_each_page_it_reads() {
+        use std::io::Write;
+        let registry = BgTaskRegistry::new(std::sync::Arc::new(std::sync::Mutex::new(None)));
+        let dir = tempfile::tempdir().unwrap();
+        let task_id = registry
+            .spawn(
+                crate::sandbox_spawn::SpawnPlan::Unsandboxed,
+                "sleep 30",
+                "session".into(),
+                dir.path().to_path_buf(),
+                std::collections::HashMap::new(),
+                crate::bash_background::HardKill::After(Duration::from_secs(60)),
+                None,
+                dir.path().to_path_buf(),
+                10,
+                true,
+                false,
+                Some(dir.path().to_path_buf()),
+            )
+            .unwrap();
+        let task = registry.task_for_test(&task_id).unwrap();
+        let output = "progress line\n".repeat(4096);
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&task.paths.stdout)
+            .unwrap()
+            .write_all(output.as_bytes())
+            .unwrap();
+        let mut streams = [StreamCursor::default(), StreamCursor::default()];
+
+        let batch = read_batch(&registry, &task_id, "session", &mut streams);
+
+        // One tick shows every line of the page it read, so a later tick
+        // never reads the same bytes again.
+        assert_eq!(streams[0].offset, output.len() as u64);
+        let shown: String = batch
+            .lines
+            .iter()
+            .filter(|(kind, _)| *kind == "stdout")
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert_eq!(shown, output);
+        let _ = registry.kill(&task_id, "session");
     }
 
     #[test]
