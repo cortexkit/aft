@@ -12350,17 +12350,17 @@ impl BgTaskRegistry {
                 super::watchdog::MarkerReadReason::PoisonedProbe,
             ),
         };
-        let marker = match polled {
-            Ok(Some(marker)) => marker,
-            // A killed PTY's waiter can reap the process even when a full
-            // disk prevents it from writing its exit marker.
-            _ if Self::pty_kill_observed(task) => ExitMarker::Killed,
-            Ok(None) => {
+        // A PTY's waiter can reap the process even when a full disk prevents
+        // it from writing its exit marker; its observed outcome then stands.
+        let observed = (!matches!(polled, Ok(Some(_)))).then(|| Self::pty_waiter_exit(task));
+        let marker = match (polled, observed.flatten()) {
+            (Ok(Some(marker)), _) | (_, Some(marker)) => marker,
+            (Ok(None), None) => {
                 #[cfg(unix)]
                 self.reap_adopted_child(task);
                 return Ok(());
             }
-            Err(error) => {
+            (Err(error), None) => {
                 #[cfg(unix)]
                 self.reap_adopted_child(task);
                 return Err(format!("failed to read exit marker: {error}"));
@@ -14721,14 +14721,10 @@ impl BgTaskRegistry {
                 if pty.reader_eof.load(Ordering::SeqCst) {
                     PtyOutputDrainPoll::Ready
                 } else {
-                    PtyOutputDrainPoll::Incomplete(
-                        "PTY output may be incomplete: output capture failed before EOF",
-                    )
+                    PtyOutputDrainPoll::Incomplete(pty_capture::CAPTURE_FAILED)
                 }
             } else if Instant::now() >= deadline {
-                PtyOutputDrainPoll::Incomplete(
-                    "PTY output may be incomplete: output drain deadline expired before EOF",
-                )
+                PtyOutputDrainPoll::Incomplete(pty_capture::DRAIN_EXPIRED)
             } else {
                 PtyOutputDrainPoll::Pending
             };
@@ -14747,12 +14743,11 @@ impl BgTaskRegistry {
         #[cfg(any(windows, test))]
         let output_incomplete = match self.poll_windows_pty_output_drain(task)? {
             PtyOutputDrainPoll::Pending => return Ok(()),
-            PtyOutputDrainPoll::Ready => None,
+            PtyOutputDrainPoll::Ready => self.pty_capture_gap(task),
             PtyOutputDrainPoll::Incomplete(reason) => Some(reason),
         };
         #[cfg(not(any(windows, test)))]
-        let output_incomplete: Option<&str> = None;
-        let mut pty_reader_done = None;
+        let output_incomplete = self.pty_capture_gap(task);
         // The PTY runtime leaves the task under the lock and is dropped after
         // it is released: dropping it closes the pseudoterminal, which on
         // Windows can wait for conhost, and that must not hold the state lock.
@@ -14850,23 +14845,7 @@ impl BgTaskRegistry {
                         state.child_exit_observed = true;
                     }
                 }
-                TaskRuntime::Pty(runtime) => {
-                    pty_reader_done = runtime
-                        .as_ref()
-                        .filter(|runtime| {
-                            #[cfg(any(windows, test))]
-                            {
-                                runtime.output_drain.is_none()
-                            }
-                            #[cfg(not(any(windows, test)))]
-                            {
-                                let _ = runtime;
-                                true
-                            }
-                        })
-                        .map(|runtime| Arc::clone(&runtime.reader_done));
-                    retired_pty_runtime = runtime.take();
-                }
+                TaskRuntime::Pty(runtime) => retired_pty_runtime = runtime.take(),
             }
             state.detached = true;
         }
@@ -14874,14 +14853,6 @@ impl BgTaskRegistry {
             close_pty_master(runtime.master.take());
             drop(runtime);
         }
-
-        if let Some(reader_done) = pty_reader_done {
-            let deadline = Instant::now() + Duration::from_millis(200);
-            while !reader_done.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        }
-
         // One final scan runs before terminal notification routing so bytes
         // printed immediately before exit can win over the exit safety net.
         self.scan_watches_then_post_terminal(task)
@@ -18402,6 +18373,10 @@ impl Drop for BootstrapGateGuard<'_> {
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "pty_lifecycle_tests.rs"]
+mod pty_lifecycle_tests;
+
 #[cfg(test)]
 fn random_slug() -> String {
     // 8 bytes = 64-bit entropy → `bash-{16hex}`, matching the documented contract
@@ -18447,6 +18422,7 @@ mod pty_replay;
 #[path = "adopted_identity.rs"]
 mod adopted_identity;
 mod kill_state;
+mod pty_capture;
 use kill_state::KillStateSave;
 
 #[path = "completion_queue.rs"]

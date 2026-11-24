@@ -74,6 +74,10 @@ pub struct CompletionCoordinator {
     /// reader and the waiter are done). Until then a periodic watchdog pass
     /// leaves an exited task to that wake.
     pub(crate) woken: AtomicBool,
+    /// The outcome the waiter observed when it reaped the process. The exit
+    /// marker file normally records it; this copy lets the task finish when
+    /// writing that file failed.
+    pub(crate) observed_exit: std::sync::OnceLock<super::persistence::ExitMarker>,
 }
 
 impl CompletionCoordinator {
@@ -88,6 +92,7 @@ impl CompletionCoordinator {
             remaining: AtomicU8::new(2),
             wake_tx,
             woken: AtomicBool::new(false),
+            observed_exit: std::sync::OnceLock::new(),
         }
     }
 

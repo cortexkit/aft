@@ -674,6 +674,15 @@ pub(crate) fn spawn_reader(
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        #[cfg(test)]
+                        if capture_error.is_none()
+                            && pty_fault_injected_for_test(
+                                &coordinator.task_id,
+                                PtyFaultForTest::CaptureWrite,
+                            )
+                        {
+                            capture_error = Some(io::Error::other("injected capture failure"));
+                        }
                         if capture_error.is_none() {
                             if let Err(error) =
                                 file.write_all(&buf[..n]).and_then(|()| file.flush())
@@ -748,6 +757,73 @@ fn wait_on_pty_reader_gate_for_test(task_id: &str) {
         .and_then(|gates| gates.lock().unwrap().remove(task_id));
     if let Some(release) = gate {
         let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+    }
+}
+
+/// Faults a test can inject into one PTY task's reader or waiter, keyed by
+/// task id so parallel tests do not collide.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum PtyFaultForTest {
+    /// Every write to the task's output capture fails.
+    CaptureWrite,
+    /// Writing the task's exit marker fails.
+    ExitMarkerWrite,
+}
+
+#[cfg(test)]
+static PTY_FAULTS: std::sync::OnceLock<
+    Mutex<std::collections::HashSet<(String, PtyFaultForTest)>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn inject_pty_fault_for_test(task_id: &str, fault: PtyFaultForTest) {
+    PTY_FAULTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert((task_id.to_string(), fault));
+}
+
+#[cfg(test)]
+fn pty_fault_injected_for_test(task_id: &str, fault: PtyFaultForTest) -> bool {
+    PTY_FAULTS.get().is_some_and(|faults| {
+        faults
+            .lock()
+            .unwrap()
+            .contains(&(task_id.to_string(), fault))
+    })
+}
+
+/// Senders told when `bash_write` starts writing to a task's terminal, keyed
+/// by task id.
+#[cfg(test)]
+static PTY_WRITE_STARTS: std::sync::OnceLock<
+    Mutex<HashMap<String, crossbeam_channel::Sender<()>>>,
+> = std::sync::OnceLock::new();
+
+/// Returns a receiver that gets one message when a write to `task_id`'s
+/// terminal starts.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn watch_pty_write_start_for_test(task_id: &str) -> crossbeam_channel::Receiver<()> {
+    let (started_tx, started_rx) = crossbeam_channel::bounded(1);
+    PTY_WRITE_STARTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .insert(task_id.to_string(), started_tx);
+    started_rx
+}
+
+#[cfg(test)]
+pub(crate) fn note_pty_write_started_for_test(task_id: &str) {
+    let started = PTY_WRITE_STARTS
+        .get()
+        .and_then(|starts| starts.lock().unwrap().remove(task_id));
+    if let Some(started) = started {
+        let _ = started.try_send(());
     }
 }
 
@@ -834,7 +910,18 @@ pub(crate) fn spawn_waiter(
             }
         };
 
-        if let Err(error) = write_exit_marker(&mut exit_file, &marker) {
+        #[cfg(test)]
+        let written = if pty_fault_injected_for_test(
+            &coordinator.task_id,
+            PtyFaultForTest::ExitMarkerWrite,
+        ) {
+            Err(io::Error::other("injected exit marker failure"))
+        } else {
+            write_exit_marker(&mut exit_file, &marker)
+        };
+        #[cfg(not(test))]
+        let written = write_exit_marker(&mut exit_file, &marker);
+        if let Err(error) = written {
             crate::slog_warn!(
                 "PTY waiter for {}:{} failed to write exit marker: {error}",
                 coordinator.session_id,
@@ -842,6 +929,7 @@ pub(crate) fn spawn_waiter(
             );
         }
         drop(exit_file);
+        let _ = coordinator.observed_exit.set(marker);
         exit_observed.store(true, Ordering::SeqCst);
         coordinator.signal_one_done();
     })
