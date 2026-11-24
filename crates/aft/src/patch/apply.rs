@@ -22,30 +22,35 @@ pub fn seek_sequence(
         .map(|sequence_match| sequence_match.found)
 }
 
+#[cfg(test)]
+thread_local! {
+    static FILE_LINE_REF_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn line_refs(lines: &[String]) -> Vec<&str> {
+    #[cfg(test)]
+    FILE_LINE_REF_BUILDS.with(|count| count.set(count.get() + 1));
     lines.iter().map(String::as_str).collect()
 }
 
 fn seek_sequence_tiered_strings(
-    lines: &[String],
+    lines: &[&str],
     pattern: &[String],
     start_index: usize,
     eof: bool,
 ) -> Result<Option<SequenceMatch>, &'static str> {
-    let line_refs = line_refs(lines);
     let pattern_refs: Vec<&str> = pattern.iter().map(String::as_str).collect();
-    seek_sequence_tiered_checked(&line_refs, &pattern_refs, start_index, eof)
+    seek_sequence_tiered_checked(lines, &pattern_refs, start_index, eof)
 }
 
 fn seek_sequence_strings(
-    lines: &[String],
+    lines: &[&str],
     pattern: &[String],
     start_index: usize,
     eof: bool,
 ) -> Option<usize> {
-    let line_refs = line_refs(lines);
     let pattern_refs: Vec<&str> = pattern.iter().map(String::as_str).collect();
-    seek_sequence(&line_refs, &pattern_refs, start_index, eof)
+    seek_sequence(lines, &pattern_refs, start_index, eof)
 }
 
 fn inline_code(value: &str) -> String {
@@ -158,6 +163,7 @@ pub fn apply_update_chunks(
         original_lines.pop();
     }
 
+    let line_refs = line_refs(&original_lines);
     let mut replacements: Vec<(usize, usize, Vec<String>)> = Vec::new();
     let mut line_index = 0;
 
@@ -169,7 +175,6 @@ pub fn apply_update_chunks(
             .as_ref()
             .filter(|context| !context.is_empty());
         if let Some(context) = change_context {
-            let line_refs = line_refs(&original_lines);
             let context_pattern = [context.as_str()];
             let Some(context_match) =
                 seek_sequence_tiered_checked(&line_refs, &context_pattern, line_index, false)
@@ -184,7 +189,7 @@ pub fn apply_update_chunks(
             let insertion_idx = if change_context.is_some() {
                 line_index
             } else {
-                original_lines.len()
+                line_refs.len()
             };
             replacements.push((insertion_idx, 0, chunk.new_lines.clone()));
             continue;
@@ -192,13 +197,9 @@ pub fn apply_update_chunks(
 
         let mut pattern = chunk.old_lines.clone();
         let mut new_slice = chunk.new_lines.clone();
-        let mut matched = seek_sequence_tiered_strings(
-            &original_lines,
-            &pattern,
-            line_index,
-            chunk.is_end_of_file,
-        )
-        .map_err(ambiguous)?;
+        let mut matched =
+            seek_sequence_tiered_strings(&line_refs, &pattern, line_index, chunk.is_end_of_file)
+                .map_err(ambiguous)?;
 
         if matched.is_none() && pattern.last().is_some_and(String::is_empty) {
             pattern.pop();
@@ -206,7 +207,7 @@ pub fn apply_update_chunks(
                 new_slice.pop();
             }
             matched = seek_sequence_tiered_strings(
-                &original_lines,
+                &line_refs,
                 &pattern,
                 line_index,
                 chunk.is_end_of_file,
@@ -224,15 +225,9 @@ pub fn apply_update_chunks(
                 .cloned()
                 .collect();
             let already_applied = !new_slice_trimmed.is_empty()
-                && seek_sequence_strings(
-                    &original_lines,
-                    &new_slice_trimmed,
-                    0,
-                    chunk.is_end_of_file,
-                )
-                .is_some();
+                && seek_sequence_strings(&line_refs, &new_slice_trimmed, 0, chunk.is_end_of_file)
+                    .is_some();
 
-            let line_refs = line_refs(&original_lines);
             let pattern_refs: Vec<&str> = pattern.iter().map(String::as_str).collect();
             let nearest_miss =
                 render_nearest_miss(&line_refs, &pattern_refs, original_content.len());
@@ -276,6 +271,20 @@ pub fn apply_update_chunks(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_chunks_builds_file_line_refs_once() {
+        let first = context_chunk("start", &["old"], &["new"]);
+        let mut last = context_chunk("end", &["before"], &["after"]);
+        last.is_end_of_file = true;
+        FILE_LINE_REF_BUILDS.with(|count| count.set(0));
+        assert_eq!(
+            apply_update_chunks("start\nold\nkeep\nend\nbefore\n", "f.txt", &[first, last])
+                .unwrap(),
+            "start\nnew\nkeep\nend\nafter\n"
+        );
+        assert_eq!(FILE_LINE_REF_BUILDS.with(std::cell::Cell::get), 1);
+    }
 
     fn chunk(old_lines: &[&str], new_lines: &[&str]) -> UpdateFileChunk {
         UpdateFileChunk {
