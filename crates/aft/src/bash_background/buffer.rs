@@ -347,10 +347,16 @@ impl BgBuffer {
     }
 
     pub(super) fn stderr_reader(&self) -> Option<impl io::BufRead> {
-        self.source(StreamKind::Stderr)?
-            .open()
-            .ok()
-            .map(io::BufReader::new)
+        let source = self.source(StreamKind::Stderr)?;
+        #[cfg(test)]
+        record_stderr_scan(source.path(), 0, true);
+        source.open().ok().map(|file| {
+            io::BufReader::new(ScanReader {
+                inner: file,
+                #[cfg(test)]
+                path: source.path().to_path_buf(),
+            })
+        })
     }
 
     /// Notice redaction needs contiguous input: a head/tail join could cut an
@@ -501,6 +507,47 @@ pub(crate) fn tail_read_count(path: &Path) -> usize {
         .lock()
         .ok()
         .and_then(|reads| reads.get(path).copied())
+        .unwrap_or_default()
+}
+
+/// A stderr capture opened for a whole-stream scan. Tests count its opens and
+/// the bytes read through it.
+struct ScanReader<R> {
+    inner: R,
+    #[cfg(test)]
+    path: PathBuf,
+}
+
+impl<R: io::Read> io::Read for ScanReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let read = self.inner.read(buf)?;
+        #[cfg(test)]
+        record_stderr_scan(&self.path, read as u64, false);
+        Ok(read)
+    }
+}
+
+#[cfg(test)]
+static STDERR_SCANS: OnceLock<Mutex<std::collections::HashMap<PathBuf, (usize, u64)>>> =
+    OnceLock::new();
+
+#[cfg(test)]
+fn record_stderr_scan(path: &Path, bytes: u64, opened: bool) {
+    if let Ok(mut scans) = STDERR_SCANS.get_or_init(Default::default).lock() {
+        let entry = scans.entry(path.to_path_buf()).or_default();
+        entry.0 += usize::from(opened);
+        entry.1 += bytes;
+    }
+}
+
+/// Opens of `path` for a stderr scan, and the bytes read through them.
+#[cfg(test)]
+pub(crate) fn take_stderr_scans(path: &Path) -> (usize, u64) {
+    STDERR_SCANS
+        .get_or_init(Default::default)
+        .lock()
+        .ok()
+        .and_then(|mut scans| scans.remove(path))
         .unwrap_or_default()
 }
 

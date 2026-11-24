@@ -1126,6 +1126,8 @@ struct TerminalOutputCache {
     stderr_path: Option<String>,
     artifact_access: ArtifactRecoveryAccess,
     recovery: Option<RecoveryContext>,
+    /// Computed once with the render, so status polls never rescan stderr.
+    read_only_note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1189,6 +1191,7 @@ fn terminal_output_cache_estimated_bytes(cache: &TerminalOutputCache) -> u64 {
             cache.artifact_access.task_id.len(),
         ))
         .saturating_add(recovery_bytes)
+        .saturating_add(optional_string_bytes(cache.read_only_note.as_ref()))
 }
 
 fn completion_estimated_bytes(completion: &BgCompletion) -> u64 {
@@ -3193,6 +3196,7 @@ impl BgTaskRegistry {
                 stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
                 artifact_access,
                 recovery: None,
+                read_only_note: None,
             };
         }
 
@@ -3236,6 +3240,7 @@ impl BgTaskRegistry {
         };
         normalize_piped_display_output(&mut rendered.output_preview);
         append_pipeline_warning(&mut rendered, metadata, paths);
+        rendered.read_only_note = source_read_only_note_for(metadata, buffer);
         rendered
     }
 
@@ -9662,7 +9667,7 @@ impl BgTaskRegistry {
                 snapshot.output_preview = format!("{note}\n{}", snapshot.output_preview);
             }
         }
-        append_source_read_only_note(&mut snapshot.output_preview, &metadata, &buffer);
+        push_read_only_note(&mut snapshot.output_preview, cache.read_only_note.as_deref());
         Some((snapshot, resolved.paths))
     }
 
@@ -10771,9 +10776,7 @@ impl BgTaskRegistry {
         if let Some(cache) = self.ensure_terminal_output_cache(task) {
             let mut output_preview = cache.output_preview.clone();
             self.append_db_hint(&task.task_id, &mut output_preview);
-            if let Ok(state) = task.lock_state() {
-                append_source_read_only_note(&mut output_preview, &state.metadata, &state.buffer);
-            }
+            push_read_only_note(&mut output_preview, cache.read_only_note.as_deref());
             let envelope = append_bash_output_envelope(&cache, &mut output_preview);
             snapshot.output_preview = output_preview;
             snapshot.bash_output_list_envelope = envelope;
@@ -12149,8 +12152,9 @@ impl BgTaskRegistry {
                 if let Some(note) = rendered_execution_note(&state.metadata) {
                     output_preview = format!("{note}\n{output_preview}");
                 }
-                append_source_read_only_note(&mut output_preview, &state.metadata, &state.buffer);
             }
+            let note = cache.as_ref().and_then(|cache| cache.read_only_note.as_deref());
+            push_read_only_note(&mut output_preview, note);
             self.append_db_hint(&task.task_id, &mut output_preview);
             let bash_output_list_envelope = cache
                 .as_ref()
@@ -14938,9 +14942,8 @@ impl BgTaskRegistry {
                     output_preview = format!("{note}\n{output_preview}");
                 }
                 append_remote_report(&mut output_preview, metadata);
-                if let Some(buffer) = render_buffer {
-                    append_source_read_only_note(&mut output_preview, metadata, buffer);
-                }
+                let note = render.and_then(|cache| cache.read_only_note.as_deref());
+                push_read_only_note(&mut output_preview, note);
                 if metadata.status == BgTaskStatus::Failed
                     || metadata.status == BgTaskStatus::FateUnknown
                 {
@@ -16245,6 +16248,7 @@ fn render_compressed_with_recovery(
         stderr_path,
         artifact_access,
         recovery: Some(recovery),
+        read_only_note: None,
     }
 }
 
@@ -16533,6 +16537,7 @@ fn render_structured_output(
             stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
             artifact_access,
             recovery: None,
+            read_only_note: None,
         });
     }
 
@@ -16550,6 +16555,7 @@ fn render_structured_output(
         stderr_path: buffer.stderr_path().map(|path| path.display().to_string()),
         artifact_access,
         recovery: None,
+        read_only_note: None,
     })
 }
 
@@ -16575,6 +16581,7 @@ fn render_raw_passthrough(
             stderr_path,
             artifact_access,
             recovery: None,
+            read_only_note: None,
         };
     }
 
@@ -16604,6 +16611,7 @@ fn render_raw_passthrough(
         stderr_path,
         artifact_access,
         recovery: Some(recovery),
+        read_only_note: None,
     }
 }
 
@@ -18399,40 +18407,11 @@ pub(crate) mod completion_queue;
 
 use completion_preview::{append_remote_report, rendered_execution_note};
 
-fn append_source_read_only_note(output: &mut String, metadata: &PersistedTask, buffer: &BgBuffer) {
-    use std::io::BufRead;
-
-    let source_read_only = metadata
-        .remote
-        .as_ref()
-        .and_then(|remote| remote.terminal.as_ref())
-        .and_then(|terminal| terminal.source_read_only())
-        == Some(true);
-    let failed = metadata.exit_code.is_some_and(|code| code != 0)
-        || matches!(
-            metadata.status,
-            BgTaskStatus::Killed | BgTaskStatus::TimedOut
-        );
-    if !source_read_only || !failed {
-        return;
-    }
-    let (Some(root), Some(reader)) = (metadata.project_root.as_deref(), buffer.stderr_reader())
-    else {
-        return;
-    };
-    if let Some(note) = crate::exec_remote::read_only_note::source_read_only_note(
-        source_read_only,
-        failed,
-        reader.lines().map_while(Result::ok),
-        &metadata.workdir,
-        root,
-    ) {
-        if !output.is_empty() && !output.ends_with('\n') {
-            output.push('\n');
-        }
-        output.push_str(&note);
-    }
-}
+#[path = "read_only_status.rs"]
+mod read_only_status;
+#[cfg(test)]
+use read_only_status::append_source_read_only_note;
+use read_only_status::{push_read_only_note, source_read_only_note_for};
 
 #[cfg(all(test, unix))]
 #[path = "spawn_tests.rs"]
