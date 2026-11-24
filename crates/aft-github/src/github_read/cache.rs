@@ -245,7 +245,8 @@ impl GithubReadLateAnswer {
 
 impl GithubReadDeferred {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn late_answer_for_test(&self) -> &GithubReadLateAnswer {
+    #[doc(hidden)]
+    pub fn late_answer_for_test(&self) -> &GithubReadLateAnswer {
         &self.late
     }
 
@@ -350,7 +351,8 @@ pub struct GithubReadEngine {
 
 impl GithubReadEngine {
     #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn flights_empty_for_test(&self) -> bool {
+    #[doc(hidden)]
+    pub fn flights_empty_for_test(&self) -> bool {
         self.state.lock().flights.is_empty()
     }
 

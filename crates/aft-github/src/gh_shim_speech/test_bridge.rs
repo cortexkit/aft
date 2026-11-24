@@ -524,6 +524,23 @@ pub trait RedeemedTestExt {
     fn launch(&self) -> &Option<gh_shim_speech::model::LaunchAuthority>;
 }
 
+impl gh_shim_ticket::Redeemed {
+    pub fn without_scope_for_test(
+        session_id: String,
+        task_id: String,
+        project_root: String,
+    ) -> Self {
+        Self {
+            session_id,
+            task_id,
+            project_root,
+            read_repository: None,
+            launch: None,
+            lifecycle_scope: None,
+        }
+    }
+}
+
 impl RedeemedTestExt for gh_shim_ticket::Redeemed {
     fn launch(&self) -> &Option<gh_shim_speech::model::LaunchAuthority> {
         &self.launch

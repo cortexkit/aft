@@ -615,8 +615,9 @@ fn queue_terminal_marker(speech: Arc<SpeechTicket>) {
 }
 
 /// Number of live tickets; lets tests prove a ticket was dropped.
-#[cfg(all(test, unix))]
-pub(crate) fn live_count_for_task(task_id: &str) -> usize {
+#[cfg(all(unix, feature = "test-support"))]
+#[doc(hidden)]
+pub fn live_count_for_task(task_id: &str) -> usize {
     registry()
         .iter()
         .filter(|entry| matches!(&entry.owner, Owner::Task(id) if id == task_id))
@@ -907,6 +908,62 @@ impl Drop for ScopedTicket {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minting_reads_the_fallback_scope_only_when_no_lifecycle_scope_is_set() {
+        use crate::gh_shim_speech::{service, Code, Refusal};
+        use std::cell::Cell;
+        use subc_protocol::{scope::ScopeKind, Principal};
+
+        let storage = tempfile::tempdir().unwrap();
+        service::record_service(storage.path());
+        let scope = |name: &str| {
+            ScopeStamp::new(
+                Principal::Reserved {
+                    module_id: "prefrontal".into(),
+                },
+                name,
+                1,
+                ScopeKind::Worker,
+            )
+            .with_attributes(
+                subc_protocol::scope::ScopeAttributes::new()
+                    .with_agent_id(Some("agent".into()))
+                    .with_delegates(true),
+            )
+            .with_owner_authorized(true)
+        };
+        let recorded = scope("recorded");
+        let fallback = scope("fallback");
+        for (lifecycle, expected_calls, expected) in [
+            (Some(recorded.clone()), 0, recorded),
+            (None, 1, fallback.clone()),
+        ] {
+            let calls = Cell::new(0);
+            let session = "scope-laziness-session";
+            let seed = service::LaunchSeed {
+                launch: Err(Refusal::new(
+                    Code::AuthorityUnavailable,
+                    "test_has_no_launch",
+                )),
+                lifecycle,
+                session: session.into(),
+                harness: "fixture".into(),
+                project_root: "/project".into(),
+            };
+            let ticket = service::with_launch(Some(seed), storage.path(), || {
+                PendingTicket::issue_with_scope(session, "/project", &|| {
+                    calls.set(calls.get() + 1);
+                    Some(fallback.clone())
+                })
+            });
+            assert_eq!(calls.get(), expected_calls);
+            let redeemed = redeem(ticket.value().unwrap()).unwrap();
+            assert_eq!(redeemed.session_id, session);
+            assert_eq!(redeemed.project_root, "/project");
+            assert_eq!(redeemed.lifecycle_scope, Some(expected));
+        }
+    }
 
     #[test]
     fn ticket_captures_the_authenticated_launch_scope_before_routes_change() {

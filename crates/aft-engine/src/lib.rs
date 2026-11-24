@@ -138,6 +138,8 @@ pub use aft_db::fs_lock;
 pub use aft_edit::file_read_exact;
 pub use aft_edit::format;
 pub use aft_github::gh_shim;
+#[cfg(test)]
+mod gh_shim_composed_tests;
 pub use aft_github::gh_shim_relay;
 pub use aft_parse::fuzzy_match;
 #[doc(hidden)]

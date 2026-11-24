@@ -1,104 +1,9 @@
-use std::collections::VecDeque;
+use super::composed_test_driver::*;
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
 
 use super::*;
-
-/// Which fake module a recorded call went to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum Target {
-    Plexus,
-}
-
-/// Fake plexus. Every call's body is recorded; replies are scripted and
-/// default to a completed reply.
-/// `scoped` says whether this fake can open its plexus route under a scope.
-#[derive(Default)]
-struct FakeTransport {
-    calls: Mutex<Vec<(Target, String, Value)>>,
-    plexus_replies: Mutex<VecDeque<Result<Value, TransportError>>>,
-    scoped: bool,
-    plexus_scopes: Mutex<Vec<Option<ScopeSelector>>>,
-    read_binding: Mutex<Option<Result<String, String>>>,
-    read_roots: Mutex<Vec<String>>,
-}
-
-impl FakeTransport {
-    fn scoped() -> Self {
-        Self {
-            scoped: true,
-            ..Self::default()
-        }
-    }
-
-    /// The scope each plexus call's route was opened under, in call order.
-    fn plexus_scopes(&self) -> Vec<Option<ScopeSelector>> {
-        self.plexus_scopes.lock().unwrap().clone()
-    }
-
-    fn push_plexus(&self, reply: Result<Value, TransportError>) {
-        self.plexus_replies.lock().unwrap().push_back(reply);
-    }
-
-    fn calls(&self) -> Vec<(Target, String, Value)> {
-        self.calls.lock().unwrap().clone()
-    }
-
-    fn count(&self, target: Target) -> usize {
-        self.calls()
-            .iter()
-            .filter(|(called, _, _)| *called == target)
-            .count()
-    }
-}
-
-impl RelayTransport for FakeTransport {
-    fn read_repository(&self, ticket: &crate::gh_shim_ticket::Redeemed) -> Result<String, String> {
-        let project_root = &ticket.project_root;
-        self.read_roots
-            .lock()
-            .unwrap()
-            .push(project_root.to_string());
-        self.read_binding
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or_else(|| Ok("cortexkit/aft".into()))
-    }
-    async fn plexus(
-        &self,
-        _project_root: &str,
-        session: &str,
-        scope: Option<&ScopeSelector>,
-        body: Value,
-    ) -> Result<Value, TransportError> {
-        assert!(
-            scope.is_none() || self.scoped,
-            "the relay asked a transport that cannot open scoped routes for one"
-        );
-        self.plexus_scopes.lock().unwrap().push(scope.cloned());
-        self.calls
-            .lock()
-            .unwrap()
-            .push((Target::Plexus, session.to_string(), body));
-        let scripted = self.plexus_replies.lock().unwrap().pop_front();
-        scripted.unwrap_or_else(|| {
-            Ok(json!({"repo_binding_generation": 1, "result": {"status": "completed"}}))
-        })
-    }
-
-    fn opens_scoped_routes(&self) -> bool {
-        self.scoped
-    }
-}
-
-fn golden() -> Value {
-    serde_json::from_str(include_str!(
-        "../../fixtures/plexus/seen-marker-reaction.json"
-    ))
-    .unwrap()
-}
 
 #[test]
 fn gh_shim_shared_relay_unknown_operation_is_not_bot_speech() {
@@ -117,40 +22,8 @@ fn gh_shim_shared_relay_unknown_operation_is_not_bot_speech() {
     assert!(transport.calls().is_empty());
 }
 
-fn envelope() -> Value {
-    golden()["request"]["request"].clone()
-}
-
 fn run(transport: &FakeTransport, operation: &str, params: Value) -> (RelayReply, Vec<String>) {
     run_with_scopes(transport, operation, params, &RouteScopes::default())
-}
-
-fn run_with_scopes<T: RelayTransport>(
-    transport: &T,
-    operation: &str,
-    params: Value,
-    route_scopes: &RouteScopes,
-) -> (RelayReply, Vec<String>) {
-    let lines = Mutex::new(Vec::new());
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    let reply = runtime.block_on(relay_transport_contract(
-        transport,
-        RelayCall {
-            operation,
-            params: &params,
-            first_party: true,
-            route_scopes,
-        },
-        &|line| lines.lock().unwrap().push(line.to_string()),
-    ));
-    (reply, lines.into_inner().unwrap())
-}
-
-fn bot_params(ticket: &str, nonce: &str) -> Value {
-    json!({"ticket": ticket, "request_nonce": nonce, "request": envelope()})
 }
 
 /// A worker's request that names the head agent's session in every
@@ -271,136 +144,6 @@ async fn closing_one_route_blocks_its_key_but_not_other_route_keys() {
     same_key.await;
 }
 
-/// A ticket issued to a background bash command spawned for an agent session
-/// relays as that session. The exact plexus body is checked, and plexus's
-/// expected request and reply come from its own fixture file.
-#[cfg(unix)]
-#[test]
-fn agent_session_bash_ticket_relays_to_that_session_with_exact_bodies() {
-    let storage = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    let mut config = crate::config::Config {
-        project_root: Some(project.path().to_path_buf()),
-        storage_dir: Some(storage.path().to_path_buf()),
-        experimental_bash_background: true,
-        ..crate::config::Config::default()
-    };
-    config.sandbox.profile.head = crate::config::SandboxMode::Off;
-    config.github.shim = true;
-    let ctx =
-        crate::context::AppContext::new(Box::new(crate::parser::TreeSitterProvider::new()), config);
-    let seen = project.path().join("seen-ticket");
-    let command = format!(
-        "printf %s \"$AFT_GH_SHIM_TICKET\" > '{}'; sleep 2",
-        seen.display()
-    );
-    let response = crate::bash_background::spawn(
-        "req-relay",
-        "ses-agent",
-        &command,
-        crate::bash_background::BashShell::Bash,
-        std::path::PathBuf::from("/bin/sh"),
-        None,
-        None,
-        crate::bash_background::HardKill::After(std::time::Duration::from_millis(30_000)),
-        &ctx,
-        true,
-        false,
-        false,
-        false,
-        24,
-        80,
-        Vec::new(),
-        false,
-        None,
-        None,
-    );
-    assert!(response.success, "spawn failed: {:?}", response.data);
-    let task_id = response.data["task_id"].as_str().unwrap().to_string();
-    let started = std::time::Instant::now();
-    let ticket = loop {
-        if let Ok(text) = std::fs::read_to_string(&seen) {
-            if !text.is_empty() {
-                break text;
-            }
-        }
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    };
-
-    let golden = golden();
-    let transport = FakeTransport::scoped();
-    transport.push_plexus(Ok(golden["success"].clone()));
-    let nonce = golden["request"]["request_nonce"].as_str().unwrap();
-    let (reply, lines) = run_with_scopes(
-        &transport,
-        BOT_REQUEST_OPERATION,
-        bot_params(&ticket, nonce),
-        &scopes_for("ses-agent", Some(delegating_stamp())),
-    );
-
-    assert_eq!(reply, RelayReply::relayed(golden["success"].clone()));
-    let calls = transport.calls();
-    assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0, Target::Plexus);
-    assert_eq!(calls[0].1, "ses-agent");
-    // The fixture request still carries an `assertion` field. AFT's write is
-    // that request with `assertion` removed and `op` set to `bot_request`.
-    let mut expected_arguments = golden["request"].clone();
-    expected_arguments["op"] = json!("bot_request");
-    expected_arguments
-        .as_object_mut()
-        .unwrap()
-        .remove("assertion");
-    assert_eq!(
-        calls[0].2,
-        json!({"name": "github", "arguments": expected_arguments})
-    );
-    assert_eq!(lines.len(), 1);
-    assert!(
-        lines[0].contains(&format!("task={task_id}")),
-        "{}",
-        lines[0]
-    );
-
-    // A ticket from the shared default session is never issued.
-    let default = crate::bash_background::spawn(
-        "req-default",
-        crate::protocol::DEFAULT_SESSION_ID,
-        &format!(
-            "printf %s \"${{AFT_GH_SHIM_TICKET:-none}}\" > '{}'",
-            project.path().join("default-ticket").display()
-        ),
-        crate::bash_background::BashShell::Bash,
-        std::path::PathBuf::from("/bin/sh"),
-        None,
-        None,
-        crate::bash_background::HardKill::After(std::time::Duration::from_millis(30_000)),
-        &ctx,
-        true,
-        false,
-        false,
-        false,
-        24,
-        80,
-        Vec::new(),
-        false,
-        None,
-        None,
-    );
-    assert!(default.success);
-    let default_path = project.path().join("default-ticket");
-    let started = std::time::Instant::now();
-    while !default_path.exists() {
-        assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    assert_eq!(std::fs::read_to_string(&default_path).unwrap(), "none");
-
-    let _ = ctx.bash_background().kill(&task_id, "ses-agent");
-}
-
 #[test]
 fn an_ended_commands_ticket_no_longer_redeems() {
     let pending = crate::gh_shim_ticket::PendingTicket::issue("ses-ended", "/p");
@@ -442,9 +185,12 @@ fn bindings_read_is_relayed_under_the_same_ticket_gate() {
     assert_eq!(reply.data["refusal_code"], "ticket_unknown");
     assert!(transport.calls().is_empty());
 
-    let live = crate::bash_background::registry::with_scope_spawn(Some(delegating_stamp()), || {
-        crate::gh_shim_ticket::ScopedTicket::issue("ses-bindings", "call-b", "/p")
-    });
+    let live = crate::gh_shim_ticket::ScopedTicket::issue_with_scope(
+        "ses-bindings",
+        "call-b",
+        "/p",
+        &|| Some(delegating_stamp()),
+    );
     let bindings = json!({
         "repo_binding_generation": 3,
         "bindings": [{"repository": "org/repo", "app_handle_id": "aft-alfonso", "agent_id": "agent-fixture"}],
@@ -533,28 +279,6 @@ fn facade_reply_prefers_direct_fields_over_inner_result_content() {
     }
 }
 
-/// A Prefrontal-owned stamp as the daemon puts it on a head's tool route.
-fn stamp(agent: Option<&str>, delegates: bool, owner_authorized: bool) -> ScopeStamp {
-    ScopeStamp::new(
-        subc_protocol::Principal::Reserved {
-            module_id: "prefrontal".to_string(),
-        },
-        "head-ref-1",
-        7,
-        subc_protocol::scope::ScopeKind::Head,
-    )
-    .with_attributes(
-        subc_protocol::scope::ScopeAttributes::new()
-            .with_agent_id(agent.map(str::to_string))
-            .with_delegates(delegates),
-    )
-    .with_owner_authorized(owner_authorized)
-}
-
-fn delegating_stamp() -> ScopeStamp {
-    stamp(Some("agent-fixture"), true, true)
-}
-
 #[test]
 fn prefrontal_relay_and_secret_scope_admission_refuses_other_owners() {
     use subc_protocol::{scope::ScopeKind, Principal};
@@ -605,9 +329,12 @@ fn authority_never_widens_across_reconnect() {
 #[tokio::test]
 async fn call_ticket_must_not_adopt_a_rebound_agent() {
     let original = delegating_stamp();
-    let live = crate::bash_background::registry::with_scope_spawn(Some(original.clone()), || {
-        crate::gh_shim_ticket::ScopedTicket::issue("audit-call-rebind", "call", "/p")
-    });
+    let live = crate::gh_shim_ticket::ScopedTicket::issue_with_scope(
+        "audit-call-rebind",
+        "call",
+        "/p",
+        &|| Some(original.clone()),
+    );
     let redeemed = crate::gh_shim_ticket::redeem(live.value().unwrap()).unwrap();
     assert_eq!(redeemed.launch.unwrap().authority, original);
     let mut replacement = delegating_stamp();
@@ -639,9 +366,12 @@ async fn call_ticket_must_not_adopt_a_rebound_agent() {
 #[tokio::test]
 async fn legacy_call_without_origin_rejects_disagreeing_session_routes() {
     let original = delegating_stamp();
-    let ticket = crate::bash_background::registry::with_scope_spawn(Some(original.clone()), || {
-        crate::gh_shim_ticket::ScopedTicket::issue("legacy-call-mixed-routes", "call", "/p")
-    });
+    let ticket = crate::gh_shim_ticket::ScopedTicket::issue_with_scope(
+        "legacy-call-mixed-routes",
+        "call",
+        "/p",
+        &|| Some(original.clone()),
+    );
     let launch = crate::gh_shim_ticket::redeem(ticket.value().unwrap())
         .unwrap()
         .launch
@@ -689,8 +419,8 @@ fn background_ticket(
         project_root: "/project".into(),
     };
     let ticket = crate::gh_shim_speech::service::with_launch(Some(seed), root, || {
-        crate::bash_background::registry::with_scope_spawn(Some(stamp.clone()), || {
-            crate::gh_shim_ticket::PendingTicket::issue(session, "/project")
+        crate::gh_shim_ticket::PendingTicket::issue_with_scope(session, "/project", &|| {
+            Some(stamp.clone())
         })
     });
     crate::gh_shim_ticket::speech_for_ticket(ticket.value().unwrap())
@@ -875,12 +605,6 @@ async fn posting_admission_recorded_end_wins_over_live_rebind_and_partner_seams(
     assert!(!answer.ok);
     assert_eq!(answer.data["reason"], "ended_previously");
     assert!(transport.calls().is_empty());
-}
-
-fn scopes_for(session: &str, stamp: Option<ScopeStamp>) -> RouteScopes {
-    let mut scopes = RouteScopes::default();
-    scopes.push(session, stamp);
-    scopes
 }
 
 /// A delegating scope on the session's route sends the write under that scope,
@@ -2058,10 +1782,11 @@ async fn worker_and_parented_ephemeral_writes_have_the_same_specific_refusal() {
             ));
             worker.parent_state = Some(ParentState::Linked);
         }
-        let ticket =
-            crate::bash_background::registry::with_scope_spawn(Some(worker.clone()), || {
-                crate::gh_shim_ticket::PendingTicket::issue("worker-run-post", "/project")
-            });
+        let ticket = crate::gh_shim_ticket::PendingTicket::issue_with_scope(
+            "worker-run-post",
+            "/project",
+            &|| Some(worker.clone()),
+        );
         let mut params = bot_params(ticket.value().unwrap(), "worker-run-write");
         params["request"]["metadata"]["agent_id"] = json!("agent-fixture");
         let transport = FakeTransport::scoped();
@@ -2801,13 +2526,12 @@ async fn real_route_open_policy_refusal_never_acquires_the_outage_retry_marker()
 
 #[tokio::test(start_paused = true)]
 async fn shim_binding_version_check_retries_only_a_pre_send_outage_once() {
-    let live = crate::bash_background::registry::with_scope_spawn(Some(delegating_stamp()), || {
-        crate::gh_shim_ticket::ScopedTicket::issue(
-            "ses-binding-outage",
-            "call-binding-outage",
-            "/p",
-        )
-    });
+    let live = crate::gh_shim_ticket::ScopedTicket::issue_with_scope(
+        "ses-binding-outage",
+        "call-binding-outage",
+        "/p",
+        &|| Some(delegating_stamp()),
+    );
     let redeemed = crate::gh_shim_ticket::redeem(live.value().unwrap()).unwrap();
     let unavailable = TransportError::Unavailable("connection refused".into());
     let bindings = json!({"repo_binding_generation": 3, "bindings": []});

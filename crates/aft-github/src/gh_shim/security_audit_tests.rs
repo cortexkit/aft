@@ -844,9 +844,11 @@ fn worker_stamp_never_posts_even_without_a_jail_or_with_a_head_route_rebound() {
             .with_delegates(true),
     )
     .with_owner_authorized(true);
-    let pending = crate::bash_background::registry::with_scope_spawn(Some(worker.clone()), || {
-        crate::gh_shim_ticket::PendingTicket::issue("worker-policy", "/does-not-exist")
-    });
+    let pending = crate::gh_shim_ticket::PendingTicket::issue_with_scope(
+        "worker-policy",
+        "/does-not-exist",
+        &|| Some(worker.clone()),
+    );
     let mut head = worker;
     head.kind = subc_protocol::scope::ScopeKind::Head;
     head.scope_epoch = 99;
@@ -872,31 +874,6 @@ fn worker_stamp_never_posts_even_without_a_jail_or_with_a_head_route_rebound() {
         reply.data["refusal_code"],
         crate::gh_shim_speech::WORKER_WRITE_CODE
     );
-}
-
-#[test]
-fn audit_worker_marker_is_injected_from_daemon_jail_state_not_inherited() {
-    let _lock = crate::test_env::process_env_lock();
-    let root = tempfile::tempdir().unwrap();
-    let mut config = crate::config::Config::default();
-    config.github.shim = false;
-    config.git.co_author = "off".into();
-    let mut environment = std::collections::HashMap::new();
-    crate::sandbox_spawn::with_worker_jail(true, || {
-        crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
-    })
-    .unwrap();
-    assert_eq!(
-        environment
-            .get(crate::gh_shim_paths::GH_SHIM_WORKER_ENV)
-            .map(String::as_str),
-        Some("1")
-    );
-    crate::sandbox_spawn::with_worker_jail(false, || {
-        crate::agent_child_env::inject(&config, root.path(), &mut environment, None)
-    })
-    .unwrap();
-    assert!(!environment.contains_key(crate::gh_shim_paths::GH_SHIM_WORKER_ENV));
 }
 
 #[test]
@@ -970,33 +947,6 @@ fn audit_ticket_snapshot_uses_primary_config_not_worktree_override() {
             .as_deref(),
         Some("cortexkit/aft")
     );
-}
-
-#[cfg(unix)]
-#[test]
-fn audit_head_child_adapters_do_not_inherit_worker_markers() {
-    let _lock = crate::test_env::process_env_lock();
-    let _marker = Env::set(
-        crate::gh_shim_paths::GH_SHIM_WORKER_ENV,
-        Some(OsStr::new("1")),
-    );
-    let mut child = Command::new("/bin/sh");
-    child.args(["-c", "printf '%s' \"${AFT_GH_SHIM_WORKER-unset}\""]);
-    crate::agent_child_env::apply_to_command(&mut child, &std::collections::HashMap::new());
-    assert_eq!(child.output().unwrap().stdout, b"unset");
-    let root = tempfile::tempdir().unwrap();
-    let (pty, _) = crate::sandbox_spawn::pty_command_for_plan(
-        &crate::sandbox_spawn::SpawnPlan::Unsandboxed,
-        OsStr::new("/bin/sh"),
-        &[],
-        &root.path().join("task"),
-        root.path(),
-        &std::collections::HashMap::new(),
-    )
-    .unwrap();
-    assert!(pty
-        .iter_full_env_as_str()
-        .all(|(key, _)| key != crate::gh_shim_paths::GH_SHIM_WORKER_ENV));
 }
 
 /// A worker shell carries a read broker, never a write ticket. Every

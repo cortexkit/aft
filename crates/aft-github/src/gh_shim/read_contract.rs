@@ -5,13 +5,15 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub(crate) const MAX_REPLY_BYTES: u64 = 1_048_576;
+#[doc(hidden)]
+pub const MAX_REPLY_BYTES: u64 = 1_048_576;
 
 // Pagination; native renderers' content/run filters; ordinary repository REST
 // filters. Query language, URL/method selection and header keys are not authority
 // that a worker GET may delegate to the upstream provider.
 #[cfg(unix)]
-pub(crate) const WORKER_GET_QUERY_KEYS: &[&str] = &[
+#[doc(hidden)]
+pub const WORKER_GET_QUERY_KEYS: &[&str] = &[
     // Shared list pagination.
     "page",
     "per_page",
@@ -45,7 +47,8 @@ const MAX_WORKER_QUERY_VALUE_BYTES: usize = 4096;
 
 #[derive(Debug)]
 #[cfg(unix)]
-pub(crate) struct WorkerReadRefusal {
+#[doc(hidden)]
+pub struct WorkerReadRefusal {
     pub code: &'static str,
     pub key: Option<String>,
     pub message: String,
@@ -53,7 +56,8 @@ pub(crate) struct WorkerReadRefusal {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields, tag = "action")]
-pub(crate) enum Request {
+#[doc(hidden)]
+pub enum Request {
     #[serde(rename = "github.repo.get")]
     Get { repository: String, args: GetArgs },
     #[serde(rename = "github.search.code")]
@@ -71,7 +75,8 @@ pub(crate) enum Request {
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
-pub(crate) enum Accept {
+#[doc(hidden)]
+pub enum Accept {
     #[default]
     #[serde(rename = "application/vnd.github+json")]
     Json,
@@ -85,7 +90,8 @@ pub(crate) enum Accept {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct GetArgs {
+#[doc(hidden)]
+pub struct GetArgs {
     pub path: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub query: BTreeMap<String, String>,
@@ -95,7 +101,8 @@ pub(crate) struct GetArgs {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct SearchArgs {
+#[doc(hidden)]
+pub struct SearchArgs {
     pub q: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub page: Option<u64>,
@@ -105,7 +112,8 @@ pub(crate) struct SearchArgs {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct LogArgs {
+#[doc(hidden)]
+pub struct LogArgs {
     pub job_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub offset: Option<u64>,
@@ -117,7 +125,8 @@ impl Request {
     /// Decode once at the worker boundary. Keep a slash-containing reference in
     /// its one API segment; no other encoded separator or second decode is valid.
     #[cfg(unix)]
-    pub(crate) fn canonicalize_worker_path(&mut self) -> Result<(), WorkerReadRefusal> {
+    #[doc(hidden)]
+    pub fn canonicalize_worker_path(&mut self) -> Result<(), WorkerReadRefusal> {
         let Self::Get { args, .. } = self else {
             return Ok(());
         };
@@ -193,7 +202,8 @@ impl Request {
     /// Extra policy for the new worker broker only. Existing head/operator
     /// executor paths retain their query behavior and call validate instead.
     #[cfg(unix)]
-    pub(crate) fn validate_worker_query(&self) -> Result<(), WorkerReadRefusal> {
+    #[doc(hidden)]
+    pub fn validate_worker_query(&self) -> Result<(), WorkerReadRefusal> {
         let Self::Get { args, .. } = self else {
             return Ok(());
         };

@@ -387,7 +387,7 @@ pub async fn relay<T: RelayTransport>(
         transport,
         call,
         log,
-        #[cfg(test)]
+        #[cfg(any(test, all(unix, feature = "test-support")))]
         None,
     )
     .await
@@ -395,7 +395,7 @@ pub async fn relay<T: RelayTransport>(
 
 // This fixture exercises the existing awaited scoped transport, not posting
 // admission or the SDK reserved-send API. Authority tests use relay.
-#[cfg(test)]
+#[cfg(any(test, all(unix, feature = "test-support")))]
 async fn relay_transport_contract<T: RelayTransport>(
     transport: &T,
     call: RelayCall<'_>,
@@ -414,7 +414,7 @@ async fn relay_inner<T: RelayTransport>(
     transport: &T,
     call: RelayCall<'_>,
     log: &(dyn Fn(&str) + Send + Sync),
-    #[cfg(test)] wire_fixture: Option<Option<ScopeStamp>>,
+    #[cfg(any(test, all(unix, feature = "test-support")))] wire_fixture: Option<Option<ScopeStamp>>,
 ) -> RelayReply {
     let params = call.params;
     let nonce = params
@@ -597,7 +597,7 @@ async fn relay_inner<T: RelayTransport>(
                 // but it cannot replace the authority captured in the ticket.
                 let check_launch =
                     !captured_background && !worker_write_refused(&redeemed, stamp.as_ref());
-                #[cfg(test)]
+                #[cfg(any(test, all(unix, feature = "test-support")))]
                 let check_launch = check_launch && wire_fixture.is_none();
                 if check_launch {
                     use crate::gh_shim_speech::{Code, Refusal};
@@ -614,7 +614,7 @@ async fn relay_inner<T: RelayTransport>(
                         ));
                     }
                 }
-                #[cfg(test)]
+                #[cfg(any(test, all(unix, feature = "test-support")))]
                 let stamp = wire_fixture.clone().unwrap_or(stamp);
                 let (reply, taken) = bot_request(
                     transport,
@@ -622,7 +622,7 @@ async fn relay_inner<T: RelayTransport>(
                     stamp.as_ref(),
                     params,
                     call.route_scopes,
-                    #[cfg(test)]
+                    #[cfg(any(test, all(unix, feature = "test-support")))]
                     wire_fixture.is_some(),
                 )
                 .await;
@@ -942,7 +942,7 @@ async fn bot_request<T: RelayTransport>(
     stamp: Option<&ScopeStamp>,
     params: &Value,
     routes: &RouteScopes,
-    #[cfg(test)] wire_contract: bool,
+    #[cfg(any(test, all(unix, feature = "test-support")))] wire_contract: bool,
 ) -> (RelayReply, &'static str) {
     if worker_write_refused(redeemed, stamp) {
         return (
@@ -1032,7 +1032,7 @@ async fn bot_request<T: RelayTransport>(
     }
     // Protocol fixtures deliberately omit authority capture. Production writes
     // of every ticket kind use the captured policy and repository ceiling below.
-    #[cfg(test)]
+    #[cfg(any(test, all(unix, feature = "test-support")))]
     if wire_contract {
         let session = redeemed.session_id.as_str();
         let selector = scope_selector(_stamp);
@@ -1638,14 +1638,7 @@ struct RouteLeases {
     pause: std::sync::Mutex<Option<Arc<LeaseTestPause>>>,
 }
 
-#[cfg(any(
-    test,
-    all(
-        feature = "test-support",
-        debug_assertions,
-        any(target_os = "linux", target_os = "macos")
-    )
-))]
+#[cfg(test)]
 #[derive(Default)]
 struct LeaseTestPause {
     acquired: tokio::sync::Notify,
@@ -2145,7 +2138,11 @@ impl RelayTransport for SubcRelayTransport {
 #[path = "../gh_shim/plexus_bindings_contract.rs"]
 pub(crate) mod bindings_contract;
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) mod bindings_fixture;
+#[doc(hidden)]
+pub mod bindings_fixture;
+#[cfg(any(test, all(unix, feature = "test-support")))]
+#[doc(hidden)]
+pub mod composed_test_driver;
 #[cfg(any(
     test,
     all(
@@ -2154,7 +2151,8 @@ pub(crate) mod bindings_fixture;
         any(target_os = "linux", target_os = "macos")
     )
 ))]
-pub(crate) mod daemon_fixture;
+#[doc(hidden)]
+pub mod daemon_fixture;
 #[cfg(test)]
 pub(crate) mod tests;
 

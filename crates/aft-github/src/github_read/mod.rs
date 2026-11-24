@@ -52,6 +52,7 @@ pub use resource::{
 };
 
 #[cfg(any(test, feature = "test-support"))]
-pub(crate) fn stale_thread_note_for_test() -> &'static str {
+#[doc(hidden)]
+pub fn stale_thread_note_for_test() -> &'static str {
     thread_text::STALE
 }

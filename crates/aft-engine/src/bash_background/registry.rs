@@ -26197,19 +26197,15 @@ mod tests {
         .with_owner_authorized(true);
         let store = crate::gh_shim_speech::store::Store::new(&path);
         store
-            .capture(&AuthorityRecord {
-                incarnation: "cancel-inc".into(),
-                minting_run: "minting-process".into(),
-                harness: "test".into(),
-                session_id: "session".into(),
-                task_id: task_id.clone(),
-                project_root: dir.path().display().to_string(),
-                launch: LaunchAuthority::classic(scope, None).unwrap(),
-                policy: None,
-                bindings: Default::default(),
-                seal: None,
-                ineligible_reason: None,
-            })
+            .test_capture(&AuthorityRecord::unsealed_for_test(
+                "cancel-inc".into(),
+                "minting-process".into(),
+                "test".into(),
+                "session".into(),
+                task_id.clone(),
+                dir.path().display().to_string(),
+                LaunchAuthority::classic(scope, None).unwrap(),
+            ))
             .unwrap();
         let (reached, release) = install_kill_signal_gate_for_test(&task_id);
         let killing = registry.clone();
@@ -26218,7 +26214,7 @@ mod tests {
         reached
             .recv_timeout(Duration::from_secs(10))
             .expect("kill reached its pre-signal gate");
-        let marker_before_signal = store.get("cancel-inc");
+        let marker_before_signal = store.test_get("cancel-inc");
         release.send(()).unwrap();
         let result = killer.join().unwrap().unwrap();
         assert_eq!(result.info.status, BgTaskStatus::Killed);
@@ -28302,14 +28298,11 @@ mod tests {
         pending.bind_task(&task_id);
         assert_eq!(
             crate::gh_shim_ticket::redeem(&ticket),
-            Some(crate::gh_shim_ticket::Redeemed {
-                session_id: session.to_string(),
-                task_id: task_id.clone(),
-                project_root: "/project".to_string(),
-                read_repository: None,
-                launch: None,
-                lifecycle_scope: None,
-            }),
+            Some(crate::gh_shim_ticket::Redeemed::without_scope_for_test(
+                session.to_string(),
+                task_id.clone(),
+                "/project".to_string(),
+            )),
             "a running task's ticket redeems to its own session"
         );
 
