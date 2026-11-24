@@ -3671,9 +3671,8 @@ fn outline_member_is_public(member: &OutlineEntry, language: Option<LangId>) -> 
     }
 }
 
-// Trait declarations are containers in the symbol table, but their required
-// signatures have no symbols. Add them only to broad API previews; focused
-// outlines keep their established product-member listing.
+// Broad API previews use source-spelled trait method signatures; the
+// navigation symbols may already have supplied rows for those methods.
 fn add_trait_member_previews(
     node: tree_sitter::Node<'_>,
     source: &str,
@@ -3764,7 +3763,7 @@ fn push_trait_member_preview(
     previews.push((range, methods));
 }
 
-/// Append each collected trait's method rows to the outline entry for that
+/// Merge each collected trait's method rows into the outline entry for that
 /// trait. A trait with no entry (for example one inside collapsed test code)
 /// gets nothing.
 fn apply_trait_member_previews(
@@ -3789,7 +3788,21 @@ fn apply_trait_member_previews(
     }
     for (range, methods) in previews {
         if let Some(entry) = find_trait(entries, range) {
-            entry.members.extend(methods.iter().cloned());
+            for method in methods {
+                if let Some(existing) = entry.members.iter_mut().find(|existing| {
+                    existing.kind == method.kind
+                        && existing.name == method.name
+                        && (existing.range.end_line, existing.range.end_col)
+                            == (method.range.end_line, method.range.end_col)
+                }) {
+                    *existing = method.clone();
+                } else {
+                    entry.members.push(method.clone());
+                }
+            }
+            entry
+                .members
+                .sort_by_key(|member| (member.range.start_line, member.range.start_col));
         }
     }
 }
@@ -5918,6 +5931,9 @@ macro_rules! not_parsed { () => { trait InMacro { fn never(); } } }
         let text = multi_file_text(&[rs]);
         assert!(
             text.contains(".fn first(&self); 2:2")
+                && text.matches(".fn first(&self)").count() == 1
+                && text.matches(".fn second(&self)").count() == 1
+                && text.matches(".fn third(&self)").count() == 1
                 && text.contains("(1 more)")
                 && !text.contains("fourth"),
             "{text}"
