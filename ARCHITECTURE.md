@@ -154,9 +154,12 @@ independent of sessions.
 **Edit, patch, and hashline.** `edit.rs` holds the shared snapshot, mutate,
 diff, and validate path used by `write`, `edit`, symbol edits, and refactors;
 `format.rs` runs formatters and type checkers when configured. `patch/` parses
-and applies `apply_patch` hunks (add, delete, update, move) with fuzzy matching
-and all-or-nothing writes. With `edit_mode: "hashline"`, `read` renders tagged
-lines and `edit` accepts a single patch addressed by those tags; `hashline/`
+and applies `apply_patch` hunks (add, delete, update, move) with fuzzy matching.
+An invalid patch is rejected before execution. File replacements are atomic,
+but execution is not atomic across the patch: if a hunk fails, successful
+changes are kept, with snapshots available to the `aft_safety` undo action.
+With `edit_mode: "hashline"`, `read` renders tagged lines and `edit` accepts
+a single patch addressed by those tags; `hashline/`
 scans, verifies, composes, and applies it as a two-phase transaction
 (`commands/hashline.rs`). Mutations record undo snapshots before writing (see
 Backups).
