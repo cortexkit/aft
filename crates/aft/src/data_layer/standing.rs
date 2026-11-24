@@ -5,8 +5,9 @@
 //! layer: one build publishes both, through the family store's own writer,
 //! and nothing is written to today's search cache or call-graph store. For
 //! the meaning (`semantic`) kind, `aft index` fills the checkout's meaning
-//! plane (`surfaces::fill_root`); a running AFT's standing passes still
-//! build today's semantic index for it.
+//! plane (`surfaces::fill_root`). A running AFT's standing passes build
+//! nothing for that kind: they maintain only text and the call graph, and
+//! leave the meaning kind's strict-verification flag set.
 //!
 //! A standing root has no watcher, so each standing pass binds its checkout
 //! again: the bind's scan compares every file with the publication, and the
