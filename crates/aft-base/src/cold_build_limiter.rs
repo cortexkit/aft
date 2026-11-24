@@ -30,39 +30,25 @@ pub fn try_acquire() -> Option<ColdBuildPermit> {
     GLOBAL_COLD_BUILD_LIMITER.try_acquire()
 }
 
-/// Block until a build slot is free, then take it.
-///
-/// For build sites with no reschedule path (search-index builds spawn once per
-/// configure): skipping would strand the index, so past-cap work waits instead.
-/// Production captures showed concurrent per-root builds starving dispatch
-/// while CPU sat idle; waiting serializes that pressure at the source. Only
-/// call from dedicated background threads, never the dispatch thread or an
-/// executor worker.
-/// A permit bounds local build CPU and memory pressure, not backend latency.
-/// A build that yields it during model I/O must separately bound its retained
-/// batches and avoid blocking on a shared gate while holding a cold slot.
-pub fn acquire_blocking(kind: &str) -> ColdBuildPermit {
+/// Hold a global build slot for a limiter test.
+#[cfg(test)]
+fn acquire_blocking(kind: &str) -> ColdBuildPermit {
     acquire_blocking_while(kind, || true).expect("unconditional cold-build admission")
 }
 
-/// Wait for a build slot while `admitted` remains true. The predicate is checked
-/// before every attempt, so a root that becomes unbound does not consume a slot
-/// after spending time queued behind the process-wide cap.
-pub fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option<ColdBuildPermit> {
+#[cfg(test)]
+fn acquire_blocking_while(kind: &str, admitted: impl Fn() -> bool) -> Option<ColdBuildPermit> {
     acquire_blocking_while_with_limiter(&GLOBAL_COLD_BUILD_LIMITER, kind, admitted)
 }
 
-#[rustfmt::skip]
-test_support_visibility! {
-
-pub(crate) fn acquire_blocking_while_with_limiter(
+#[cfg(any(test, feature = "test-support"))]
+pub fn acquire_blocking_while_with_limiter(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
     admitted: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
     let request = ColdBuildAdmissionRequest::new(kind, ColdBuildAdmissionClass::Maintenance);
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, || false)
-}
+    acquire_blocking_while_inner(limiter, kind, &request, admitted, || false)
 }
 
 /// Identify the source of a cold-build request without exposing a limiter knob.
@@ -204,7 +190,7 @@ pub fn acquire_blocking_while_cancellable_with_limiter(
     admitted: impl Fn() -> bool,
     cancelled: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled)
+    acquire_blocking_while_inner(limiter, kind, &request, admitted, cancelled)
 }
 
 /// A Standing permit preserves the lifecycle admission epoch captured before
@@ -229,7 +215,7 @@ pub fn acquire_standing_while_cancellable_with_limiter(
     cancelled: impl Fn() -> bool,
 ) -> Option<StandingColdBuildPermit> {
     let request = ColdBuildAdmissionRequest::new(request_id, ColdBuildAdmissionClass::Standing);
-    acquire_blocking_while_inner(limiter, kind, Some(&request), admitted, cancelled).map(|permit| {
+    acquire_blocking_while_inner(limiter, kind, &request, admitted, cancelled).map(|permit| {
         StandingColdBuildPermit {
             _permit: permit,
             admission_epoch,
@@ -240,12 +226,12 @@ pub fn acquire_standing_while_cancellable_with_limiter(
 fn acquire_blocking_while_inner(
     limiter: &Arc<ColdBuildLimiter>,
     kind: &str,
-    request: Option<&ColdBuildAdmissionRequest>,
+    request: &ColdBuildAdmissionRequest,
     admitted: impl Fn() -> bool,
     cancelled: impl Fn() -> bool,
 ) -> Option<ColdBuildPermit> {
-    let waiter = request.map(|request| AdmissionWaiter::register(limiter, request, kind));
-    let ticket = waiter.as_ref().map(|waiter| waiter.census_id);
+    let waiter = AdmissionWaiter::register(limiter, request, kind);
+    let ticket = Some(waiter.census_id);
     let started = Instant::now();
     let mut logged = false;
     loop {
@@ -255,34 +241,20 @@ fn acquire_blocking_while_inner(
         // Standing yields to any already-queued interactive or ordinary
         // maintenance contender. Returning None keeps it resumable; callers
         // use the same path again at the next checkpoint without priority tags.
-        if request.is_some_and(|request| request.class == ColdBuildAdmissionClass::Standing)
+        if request.class == ColdBuildAdmissionClass::Standing
             && limiter.has_non_standing_waiters()
         {
             return None;
         }
         let revoked_after_acquire = std::cell::Cell::new(false);
-        let permit = match request {
-            Some(request) => limiter.try_acquire_classified(request, kind, ticket, || {
-                let still_admitted = admitted()
-                    && !cancelled()
-                    && (request.class != ColdBuildAdmissionClass::Standing
-                        || !limiter.has_non_standing_waiters());
-                revoked_after_acquire.set(!still_admitted);
-                still_admitted
-            }),
-            None => limiter.try_acquire().and_then(|permit| {
-                // A request can become unbound or cancelled after the pre-attempt
-                // check but before the permit is acquired. Recheck while owning
-                // the slot; dropping the permit returns it before any build starts.
-                if admitted() && !cancelled() {
-                    Some(permit)
-                } else {
-                    revoked_after_acquire.set(true);
-                    drop(permit);
-                    None
-                }
-            }),
-        };
+        let permit = limiter.try_acquire_classified(request, kind, ticket, || {
+            let still_admitted = admitted()
+                && !cancelled()
+                && (request.class != ColdBuildAdmissionClass::Standing
+                    || !limiter.has_non_standing_waiters());
+            revoked_after_acquire.set(!still_admitted);
+            still_admitted
+        });
         if revoked_after_acquire.get() {
             return None;
         }
@@ -296,20 +268,13 @@ fn acquire_blocking_while_inner(
                 );
             }
             if logged {
-                match request {
-                    Some(request) => crate::slog_info!(
-                        "{} cold-build slot acquired after {}ms wait: request={} kind={}",
-                        request.class.label(),
-                        wait_ms,
-                        request.request_id,
-                        kind
-                    ),
-                    None => crate::slog_info!(
-                        "maintenance build slot acquired after {}ms wait: {}",
-                        wait_ms,
-                        kind
-                    ),
-                }
+                crate::slog_info!(
+                    "{} cold-build slot acquired after {}ms wait: request={} kind={}",
+                    request.class.label(),
+                    wait_ms,
+                    request.request_id,
+                    kind
+                );
             }
             return Some(permit);
         }
@@ -318,20 +283,13 @@ fn acquire_blocking_while_inner(
             if let Some(observer) = limiter.refusal_observer.lock().unwrap().as_ref() {
                 let _ = observer.send(kind.to_owned());
             }
-            match request {
-                Some(request) => crate::slog_info!(
-                    "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
-                    request.class.label(),
-                    limiter.limit(),
-                    request.request_id,
-                    kind
-                ),
-                None => crate::slog_info!(
-                    "maintenance build queued behind concurrency cap ({}): {}",
-                    limiter.limit(),
-                    kind
-                ),
-            }
+            crate::slog_info!(
+                "{} cold-build request queued behind concurrency cap ({}): request={} kind={}",
+                request.class.label(),
+                limiter.limit(),
+                request.request_id,
+                kind
+            );
             logged = true;
         }
         std::thread::sleep(Duration::from_millis(100));
@@ -715,9 +673,7 @@ impl ColdBuildLimiter {
     }
     }
 
-    /// O(1) waiter-set inspection used by Standing before its initial permit
-    /// and every checkpoint reacquisition. The counters are maintained by RAII
-    /// waiters and therefore need no scheduler-state lock on this hot path.
+    /// Snapshot holders and queued requests under the admission lock.
     pub fn census(&self) -> ColdBuildLimiterCensus {
         let now_ms = unix_millis_now();
         let state = self
@@ -767,6 +723,8 @@ impl ColdBuildLimiter {
         Ok((count, first))
     }
 
+    /// Standing-root builds check these RAII counters before each acquisition
+    /// without taking the admission lock.
     pub(crate) fn has_non_standing_waiters(&self) -> bool {
         self.waiting_by_class[ColdBuildAdmissionClass::InspectTriggered.index()]
             .load(Ordering::Acquire)
