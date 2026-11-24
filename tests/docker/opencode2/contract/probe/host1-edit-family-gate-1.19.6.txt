@@ -1,8 +1,8 @@
 OpenCode 1 edit-family selector capture
-run_id: oc1-1.19.5-20261116T154212279Z-t7-parity
-source_sha: 75b22b343e10020aacc91081112493b7ba8c5263
-binary: opencode-ai@1.19.5 (linux-x64)
-binary_sha256: 7df4e4136301f16589b0f30bf91a61380fca5f8ef22dd36570f5ebe1d4ec802c
+run_id: oc1-1.19.6-20261123T174921686Z-t7-parity
+source_sha: d1cddbd231e294d279d49e6cc16040fb2051abba
+binary: opencode-ai@1.19.6 (linux-x64)
+binary_sha256: aab0a58cd7fc5a1f17495b76c08e79989d331653d8b63156aca2f6e9e36d1173
 isolation: throwaway HOME and all XDG roots; no host service started for the bundle inspection
 bundle: opencode-ai/bin/opencode.exe (temporary prefix <capture-root>)
 
