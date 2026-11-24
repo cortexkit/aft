@@ -1036,17 +1036,17 @@ fn reuse_or_walk_index_memory<S: PartialEq>(
     walk: impl FnOnce() -> crate::memory::MemoryEstimate,
 ) -> (crate::memory::MemoryEstimate, Instant, bool) {
     if let (Some(shape), Some(previous)) = (shape.as_ref(), cached.as_ref()) {
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let age = previous.measured_at.elapsed();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let age = memory_walk_now_for_test().saturating_duration_since(previous.measured_at);
         if &previous.shape == shape && age < HEALTH_MEMORY_REUSE_INTERVAL {
             return (previous.estimate.clone(), previous.measured_at, false);
         }
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     let measured_at = Instant::now();
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     let measured_at = memory_walk_now_for_test();
     let estimate = walk();
     // A walk that found its index locked is never reused, so the next rollup
@@ -11077,9 +11077,9 @@ impl AppContext {
         let semantic_shape = self.semantic_memory_shape();
         let trigram_shape = self.trigram_memory_shape();
         let symbol_shape = self.symbol_memory_shape();
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "test-support")))]
         let now = Instant::now();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         let now = memory_walk_now_for_test();
         let mut walks = self.health_memory_walk.lock();
         let mut walked_any = false;

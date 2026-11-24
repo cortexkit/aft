@@ -186,11 +186,16 @@ fn resolve_secret_fetch(
         authorization,
         labels.to_vec(),
         {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-support"))]
             {
-                url::Url::parse(file).ok().and_then(|url| url.port())
+                // Only an installed fake vault maps a fixture's ephemeral port to HTTPS/443.
+                if TEST_FETCH_VAULT.with(|slot| slot.borrow().is_some()) {
+                    url::Url::parse(file).ok().and_then(|url| url.port())
+                } else {
+                    None
+                }
             }
-            #[cfg(not(test))]
+            #[cfg(not(any(test, feature = "test-support")))]
             {
                 None
             }
