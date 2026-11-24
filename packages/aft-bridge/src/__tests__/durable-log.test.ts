@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import {
   chmodSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -167,5 +168,79 @@ describe("durable plugin logging", () => {
 
     expect(readFileSync(path, "utf8")).toBe("after\n");
     if (process.platform !== "win32") expect(modeOf(join(root, "storage", "logs"))).toBe(0o700);
+  });
+
+  // Every OpenCode and Pi process appends to the same plugin log. Two sinks on
+  // one path stand in for two processes here.
+  test("rotation follows the shared file's real size, not one writer's own count", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const path = join(root, "logs", "aft-plugin.log");
+    const a = new RotatingLogSink(path, { maxBytes: 1000 });
+    const b = new RotatingLogSink(path, { maxBytes: 1000 });
+    const line = (name: string) => `${name.padEnd(99, ".")}\n`;
+    const write = async (sink: RotatingLogSink, name: string) => {
+      sink.append(line(name));
+      await sink.drain();
+      expect(statSync(path).size).toBeLessThanOrEqual(1000);
+    };
+
+    for (let i = 0; i < 9; i++) await write(a, `A${i}`);
+    await write(b, "B0");
+    await write(a, "A9");
+    await write(a, "A10");
+    await write(b, "B1");
+
+    // B's next line must not rotate again over the backup A just made.
+    expect(readFileSync(`${path}.1`, "utf8").startsWith(line("A0"))).toBe(true);
+    expect(readFileSync(path, "utf8")).toBe(line("A9") + line("A10") + line("B1"));
+  });
+
+  test("writers that rotate at the same moment keep the backup and every new line", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const path = join(root, "logs", "aft-plugin.log");
+    mkdirSync(join(root, "logs"));
+    const full = `${"x".repeat(99)}\n`;
+    for (let round = 0; round < 20; round++) {
+      writeFileSync(path, full.repeat(10));
+      rmSync(`${path}.1`, { force: true });
+      const sinks = Array.from({ length: 4 }, () => new RotatingLogSink(path, { maxBytes: 1000 }));
+      for (const [index, sink] of sinks.entries()) sink.append(`round ${round} sink ${index}\n`);
+      await Promise.all(sinks.map((sink) => sink.drain()));
+
+      expect(readFileSync(`${path}.1`, "utf8")).toBe(full.repeat(10));
+      const live = readFileSync(path, "utf8").split("\n").filter(Boolean).sort();
+      expect(live).toEqual(sinks.map((_, index) => `round ${round} sink ${index}`));
+      expect(readdirSync(join(root, "logs")).sort()).toEqual([
+        "aft-plugin.log",
+        "aft-plugin.log.1",
+      ]);
+    }
+  });
+
+  test("a failed write pauses the log instead of turning it off", async () => {
+    const root = mkdtempSync(join(tmpdir(), "aft-durable-log-"));
+    cleanup.push(root);
+    const storage = join(root, "storage");
+    const path = join(storage, "logs", "aft-plugin.log");
+    const sink = new RotatingLogSink(path, { retryDelayMs: 0 });
+    const stderrWrite = spyOn(process.stderr, "write").mockImplementation(() => true);
+    try {
+      // The storage folder is briefly a file, so the first write cannot create it.
+      writeFileSync(storage, "obstacle");
+      sink.append("lost line\n");
+      await sink.drain();
+      rmSync(storage, { force: true });
+      sink.append("later line\n");
+      await sink.drain();
+
+      expect(readFileSync(path, "utf8")).toBe(
+        "[aft-plugin] durable log resumed after a write failure; dropped 10 bytes.\nlater line\n",
+      );
+      expect(stderrWrite).toHaveBeenCalledTimes(1);
+    } finally {
+      stderrWrite.mockRestore();
+    }
   });
 });
