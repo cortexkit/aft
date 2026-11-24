@@ -95,3 +95,12 @@ crates/aft/src/subc/tool_views/*.json text eol=lf
 # The settings schema is compared byte-for-byte with the generated editor
 # schema, so it must stay LF on every platform.
 assets/aft.schema.json text eol=lf
+
+# Package-local fixture copies must retain the originals' checkout bytes.
+crates/aft-shell/fixtures/bash/synapse-cargo-test/** text eol=lf
+crates/aft-shell/fixtures/gh_shim/** -text
+crates/aft-shell/fixtures/status-kv/** -text
+crates/aft-github/fixtures/gh_shim/** -text
+crates/aft-github/fixtures/gh_shim/plexus-contract/** text eol=lf
+crates/aft-github/fixtures/gh_shim/plexus-bindings-contract/** text eol=lf
+crates/aft-github/fixtures/test-vectors/** -text
