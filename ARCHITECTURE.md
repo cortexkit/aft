@@ -198,8 +198,10 @@ not wired yet, so none resolve today.
 **Inspect.** `aft_inspect` (`commands/inspect.rs`, `inspect/`) reports
 diagnostics, metrics, and TODOs (tier 1) and cross-file categories such as dead
 code, unused exports, duplicates, and cycles (tier 2). JS/TS liveness uses the
-Oxc engine in `inspect/oxc_engine/`. Tier-2 results are cached and refreshed in
-the background (`inspect/tier2_scheduler.rs`); an inspect call blocks until the
+Oxc engine in `inspect/oxc_engine/`. Tier-2 results are cached per file and
+computed only when an `aft_inspect` call asks for them; the background
+scheduler (`inspect/tier2_scheduler.rs`, named for its former role) refreshes
+only the status bar's TODO count. An inspect call blocks until the
 analysis is current and returns one terminal result (`FRESH`, `PARTIAL` with
 named gaps, `INTERRUPTED`, or `PHASE-FAILED`), tracked by `inspect/phase_log.rs`.
 `scope` narrows what is reported and which files get diagnostics; cross-file

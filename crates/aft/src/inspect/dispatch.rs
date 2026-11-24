@@ -189,7 +189,7 @@ fn dispatch_category(job: InspectJob) -> InspectResult {
             let started = Instant::now();
             InspectResult::failed(
                 &job,
-                format!("inspect category '{other}' is not active in v0.33"),
+                format!("inspect category '{other}' is not active"),
                 started.elapsed(),
             )
         }

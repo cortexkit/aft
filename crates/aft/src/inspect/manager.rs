@@ -1478,7 +1478,7 @@ impl InspectManager {
         let wait_budget = deadline.saturating_duration_since(wait_started);
         if !category.is_active() {
             return JobOutcome::Failed {
-                message: format!("inspect category '{category}' is disabled in v0.33"),
+                message: format!("inspect category '{category}' is disabled"),
             };
         }
         if Self::category_needs_heavy_root_work(category) && !self.heavy_root_work_allowed() {
@@ -1537,9 +1537,7 @@ impl InspectManager {
             return Err(format!("inspect.categories.{} is off", category.as_str()));
         }
         if !category.is_active() {
-            return Err(format!(
-                "inspect category '{category}' is disabled in v0.33"
-            ));
+            return Err(format!("inspect category '{category}' is disabled"));
         }
         if Self::category_needs_heavy_root_work(category) && !self.heavy_root_work_allowed() {
             return Err(Self::heavy_root_work_block_message(category));
@@ -2729,7 +2727,7 @@ impl InspectManager {
         if !job.category.is_active() {
             let result = InspectResult::failed(
                 &job,
-                format!("inspect category '{}' is disabled in v0.33", job.category),
+                format!("inspect category '{}' is disabled", job.category),
                 started.elapsed(),
             );
             log_tier2_benchmark_category_end(&result);
@@ -3950,7 +3948,7 @@ impl Default for InspectManager {
 fn validate_tier2_read_category(category: InspectCategory) -> Result<(), JobOutcome> {
     if !category.is_active() {
         return Err(JobOutcome::Failed {
-            message: format!("inspect category '{category}' is disabled in v0.33"),
+            message: format!("inspect category '{category}' is disabled"),
         });
     }
     if !category.is_tier2() {

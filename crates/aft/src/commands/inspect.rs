@@ -3269,7 +3269,7 @@ fn add_section(section: &str, categories: &mut BTreeSet<InspectCategory>) -> Res
         .map_err(|error| format!("inspect: {error}"))?;
     if !category.is_active() {
         return Err(format!(
-            "inspect: category '{category}' is registered but disabled in v0.33"
+            "inspect: category '{category}' is registered but disabled"
         ));
     }
     categories.insert(category);
