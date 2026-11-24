@@ -13,6 +13,8 @@ pub(crate) fn process_start_time(pid: i32) -> Option<u64> {
 }
 
 fn session_pids(session: i32) -> Vec<i32> {
+    #[cfg(test)]
+    super::PROCESS_TABLE_WALKS.with(|walks| walks.set(walks.get() + 1));
     pids_by_type(ProcFilter::All)
         .unwrap_or_default()
         .into_iter()
@@ -23,6 +25,13 @@ fn session_pids(session: i32) -> Vec<i32> {
 }
 
 pub(crate) fn session_alive(session: i32) -> bool {
+    // A session leader cannot leave its session, so a running leader settles
+    // the question without walking the process table. Only a leader that has
+    // exited needs the walk, to find a descendant still in the session.
+    let leader_running = pidinfo::<BSDInfo>(session, 0).is_ok_and(|info| info.pbi_status != 5);
+    if leader_running && unsafe { libc::getsid(session) } == session {
+        return true;
+    }
     !session_pids(session).is_empty()
 }
 
