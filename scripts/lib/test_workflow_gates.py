@@ -1089,6 +1089,46 @@ class UnitShardPartitionCountTests(unittest.TestCase):
             namespace["run_command"](["bash", "scripts/check-cmake.sh"])
         run.assert_called_once()
 
+    def test_systemd_scope_gate_checks_each_owner_and_counts_only_its_parent_harness(self) -> None:
+        workflow = workflow_gates.parse_workflow(str(REPO_ROOT / ".github/workflows/tests.yml"))
+        step = next(
+            step for step in workflow["jobs"]["unit-linux-task-scopes"]["steps"]
+            if step.get("name") == "Run every user-manager test, with no skips"
+        )
+        self.assertEqual(step["run"], "bash scripts/check-systemd-task-scopes.sh")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            cargo = folder / "cargo"
+            cargo.write_text('''#!/usr/bin/env bash
+set -euo pipefail
+if [[ $1 == --version ]]; then echo 'cargo fixture'; exit 0; fi
+case "$*" in
+  *' -p aft-engine --lib '*) count=20 ;;
+  *' -p aft-tools --lib '*) count=1 ;;
+  *) echo "unexpected test selection: $*" >&2; exit 9 ;;
+esac
+if [[ $* == *' --list' ]]; then
+  if [[ ${EMPTY_TASK_SCOPE_FIXTURE:-0} == 1 && $count == 1 ]]; then count=0; fi
+  for ((i=0; i<count; i++)); do printf 'task_scope_case_%s: test\n' "$i"; done
+else
+  if [[ $count == 20 ]]; then
+    echo 'test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 19 filtered out'
+  fi
+  printf 'test result: ok. %s passed; 0 failed; 0 ignored; 0 measured; 0 filtered out\n' "$count"
+fi
+''')
+            cargo.chmod(0o755)
+            env = {**os.environ, "PATH": str(folder) + os.pathsep + os.environ["PATH"],
+                   "RUNNER_TEMP": str(folder), "EMPTY_TASK_SCOPE_FIXTURE": "0"}
+            command = ["bash", "-c", step["run"]]
+            result = subprocess.run(command, cwd=REPO_ROOT, env=env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("Systemd task-scope gate passed: 21 tests ran, zero skipped", result.stdout)
+            result = subprocess.run(command, cwd=REPO_ROOT, env={**env, "EMPTY_TASK_SCOPE_FIXTURE": "1"},
+                                    capture_output=True, text=True, timeout=10)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("aft-tools: expected 1 systemd user-manager tests, found 0", result.stderr)
+
     def test_proof_remaps_every_archive_list_and_partition_to_the_consumer(self) -> None:
         import ast
 
