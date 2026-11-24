@@ -21,6 +21,7 @@ import {
   readFileSync,
   readlinkSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -168,6 +169,25 @@ describe("cleanupAbandonedOnnxAttempts", () => {
       expect(readFileSync(join(mac, "libonnxruntime.dylib"), "utf8")).toBe("mac runtime");
     },
   );
+
+  test("install lock leaves empty and partial fresh claims alone", () => {
+    const lockPath = join(onnxBaseDir, ".aft-onnx-installing");
+    for (const unfinished of ["", "999999999", "999999999\n2026-"]) {
+      writeFileSync(lockPath, unfinished);
+      expect(acquireLock(lockPath)).toBe(false);
+      expect(readFileSync(lockPath, "utf8")).toBe(unfinished);
+    }
+  });
+
+  test("install lock does not reclaim an old lock from a live owner", () => {
+    const lockPath = join(onnxBaseDir, ".aft-onnx-installing");
+    const owner = `${process.pid}\n2020-01-01T00:00:00.000Z\n`;
+    writeFileSync(lockPath, owner);
+    utimesSync(lockPath, 1, 1);
+
+    expect(acquireLock(lockPath)).toBe(false);
+    expect(readFileSync(lockPath, "utf8")).toBe(owner);
+  });
 
   test("Windows install lock reclaims a fresh lock whose owner PID is already dead", () => {
     const lockPath = join(onnxBaseDir, ".aft-onnx-installing");

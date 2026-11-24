@@ -941,18 +941,18 @@ function acquireLock(lockPath: string): boolean {
   let lockMtimeMs = 0;
   try {
     const raw = readFileSync(lockPath, "utf8");
-    const firstLine = raw.split(/\r?\n/, 1)[0]?.trim() ?? "";
-    const parsed = Number.parseInt(firstLine, 10);
-    if (Number.isFinite(parsed) && parsed > 0) owningPid = parsed;
+    const record = /^(\d+)\r?\n[^\r\n]+\r?\n$/.exec(raw);
+    const parsed = Number(record?.[1]);
+    if (Number.isSafeInteger(parsed) && parsed > 0) owningPid = parsed;
     lockMtimeMs = statSync(lockPath).mtimeMs;
   } catch {
     return tryClaim();
   }
 
   const age = Date.now() - lockMtimeMs;
-  const ageWithinFresh = Math.abs(age) < STALE_LOCK_MS;
   const ownerAlive = owningPid !== null && isProcessAlive(owningPid);
-  if (ownerAlive && ageWithinFresh) {
+  // Exclusive creation makes the file visible before its owner record is written.
+  if (ownerAlive || (owningPid === null && age < STALE_LOCK_MS)) {
     return false;
   }
 
