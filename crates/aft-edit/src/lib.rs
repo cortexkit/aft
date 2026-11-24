@@ -24,11 +24,11 @@ pub(crate) use aft_base::{
     task_temp_reads, tool_path, tool_progress, walk_boundary, write_intent,
 };
 #[cfg(test)]
-pub(crate) use aft_base::{clock, executable_cache, test_env, test_support};
+pub(crate) use aft_base::{clock, test_env, test_support};
+#[cfg(all(test, unix))]
+pub(crate) use aft_base::{executable_cache, process_identity, test_gate};
 #[cfg(windows)]
 pub(crate) use aft_base::{policy_path, windows_path};
-#[cfg(all(test, unix))]
-pub(crate) use aft_base::{process_identity, test_gate};
 pub(crate) use aft_db::{access_policy, persisted_format, reader_floor, write_ledger};
 pub(crate) use aft_parse::{fuzzy_match, line_matcher, parser};
 
