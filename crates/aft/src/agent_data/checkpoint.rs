@@ -1,6 +1,7 @@
 //! Checkpoints carry their historical bytes and a separate cut-time baseline.
 
 use super::*;
+use crate::agent_data::registry::ExportPaths;
 use crate::agent_data::{
     DropCounts, ExpectedState, FileRecord, ImportedGuard, ProjectRegistry, SnapshotGroup,
 };
@@ -16,7 +17,16 @@ impl CheckpointStore {
         registry: &dyn ProjectRegistry,
         drops: &mut DropCounts,
     ) -> Result<Vec<SnapshotGroup>, String> {
-        let _lock = self
+        self.export_portable_checkpoints_with_paths(session, &mut ExportPaths::new(registry), drops)
+    }
+
+    pub(crate) fn export_portable_checkpoints_with_paths(
+        &mut self,
+        session: &str,
+        registry: &mut ExportPaths<'_>,
+        drops: &mut DropCounts,
+    ) -> Result<Vec<SnapshotGroup>, String> {
+        let lock = self
             .acquire_mutation_lock()
             .map_err(|error| error.to_string())?;
         // Check stored lengths before hydration, which otherwise reads every blob.
@@ -78,6 +88,9 @@ impl CheckpointStore {
         }
         self.hydrate_session_locked(session)
             .map_err(|error| error.to_string())?;
+        // Hydration owns its bytes and finishes under the lock; another process
+        // may replace the persisted state but cannot change this snapshot.
+        drop(lock);
         let mut groups = Vec::new();
         let mut bytes = 0u64;
         let mut entries = 0usize;
@@ -115,7 +128,7 @@ impl CheckpointStore {
                         }
                     };
                     let reply = registry.resolve(path)?;
-                    let key = match crate::agent_data::registry::export_path(path, &reply) {
+                    let key = match crate::agent_data::registry::export_path(path, reply) {
                         Ok(key) => key,
                         Err(drop) => {
                             reason = Some(drop.reason());

@@ -136,6 +136,70 @@ impl super::ProjectRegistry for Registry {
 }
 
 #[test]
+fn edit_review_gpt_6_portable_exports_resolve_each_path_once_without_checkpoint_lock() {
+    use crate::{backup::BackupStore, checkpoint::CheckpointStore};
+    use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+    #[derive(Debug)]
+    struct CountingRegistry {
+        root: std::path::PathBuf,
+        lock: Option<std::path::PathBuf>,
+        calls: AtomicUsize,
+    }
+    impl super::ProjectRegistry for CountingRegistry {
+        fn resolve(&self, _: &Path) -> Result<ResolveReply, String> {
+            self.calls.fetch_add(1, Relaxed);
+            if let Some(lock) = &self.lock {
+                let _guard = crate::fs_lock::try_acquire(lock, std::time::Duration::ZERO)
+                    .expect("registry resolution must not hold the checkpoint mutation lock");
+            }
+            Ok(resolution(&self.root))
+        }
+        fn enumerate(&self) -> Result<EnumerateReply, String> {
+            Ok(enumeration(&[&self.root]))
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().canonicalize().unwrap();
+    let file = project.join("file.txt");
+    let mut backup = BackupStore::new();
+    backup.set_storage_dir(project.join("backup"), 72);
+    let mut checkpoints = CheckpointStore::unbound_in_for_test(&project.join("storage"));
+    for (version, after) in [("one", b"second".as_slice()), ("two", b"third".as_slice())] {
+        if !file.exists() {
+            std::fs::write(&file, b"first").unwrap();
+        }
+        checkpoints
+            .create_for_files("session", version, vec![file.clone()])
+            .unwrap();
+        backup
+            .snapshot_with_op("session", &file, "edit", Some(version))
+            .unwrap();
+        std::fs::write(&file, after).unwrap();
+        backup.record_post_mutation_states();
+    }
+    let mut drops = super::DropCounts::default();
+    let mut registry = CountingRegistry {
+        root: project,
+        lock: Some(checkpoints.lock_path_for_test().to_path_buf()),
+        calls: AtomicUsize::new(0),
+    };
+    let groups = checkpoints
+        .export_portable_checkpoints("session", &registry, &mut drops)
+        .unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(registry.calls.swap(0, Relaxed), 1);
+    registry.lock = None;
+    let groups = backup
+        .export_portable_undo("session", &registry, &mut drops)
+        .unwrap();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(registry.calls.load(Relaxed), 1);
+    assert!(drops.0.is_empty());
+}
+
+#[test]
 fn imported_undo_preserves_destination_commit() {
     use super::{ExpectedState, FileRecord, SnapshotGroup};
     use crate::backup::BackupStore;

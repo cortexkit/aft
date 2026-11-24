@@ -1,7 +1,31 @@
+use std::collections::{hash_map::Entry, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use cortexkit_project_identity::{EnumerateReply, Presence, ResolveReply, RootKey, RootRecord};
 use serde::{Deserialize, Serialize};
+
+/// Registry answers are shared by the history exports in one snapshot.
+/// Each use still performs `export_path`'s filesystem safety checks.
+pub(crate) struct ExportPaths<'a> {
+    registry: &'a dyn super::ProjectRegistry,
+    resolved: HashMap<PathBuf, ResolveReply>,
+}
+
+impl<'a> ExportPaths<'a> {
+    pub(crate) fn new(registry: &'a dyn super::ProjectRegistry) -> Self {
+        Self {
+            registry,
+            resolved: HashMap::new(),
+        }
+    }
+
+    pub(crate) fn resolve(&mut self, path: &Path) -> Result<&ResolveReply, String> {
+        Ok(match self.resolved.entry(path.to_path_buf()) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(self.registry.resolve(path)?),
+        })
+    }
+}
 
 /// The registry, not a Git remote or a pathname suffix, assigns these keys.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
