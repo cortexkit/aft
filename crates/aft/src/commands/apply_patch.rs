@@ -85,6 +85,7 @@ struct AppliedHunkResult {
     before: String,
     after: String,
     delete_lines: Option<usize>,
+    rollback_skipped_reason: Option<&'static str>,
 }
 
 struct DiffEntry {
@@ -98,6 +99,7 @@ struct DiffEntry {
     hunk_count: usize,
     syntax_error_line: Option<usize>,
     syntax_skipped_reason: Option<&'static str>,
+    rollback_skipped_reason: Option<&'static str>,
 }
 
 fn path_string(path: &Path) -> String {
@@ -496,12 +498,28 @@ fn write_patched_file(
     Ok(PatchedFile {
         final_content,
         snapshot_taken,
+        rollback_skipped_reason: write_result.rollback_skipped_reason,
     })
 }
 
 struct PatchedFile {
     final_content: String,
     snapshot_taken: bool,
+    rollback_skipped_reason: Option<&'static str>,
+}
+
+struct UpdateFailure {
+    message: String,
+    rollback_skipped_reason: Option<&'static str>,
+}
+
+impl From<String> for UpdateFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            rollback_skipped_reason: None,
+        }
+    }
 }
 
 fn delete_file_with_backup(
@@ -783,6 +801,7 @@ fn apply_add(
         before: String::new(),
         after: written.final_content,
         delete_lines: None,
+        rollback_skipped_reason: None,
     })
 }
 
@@ -816,6 +835,7 @@ fn apply_delete(
         before,
         after: String::new(),
         delete_lines: Some(deletions),
+        rollback_skipped_reason: None,
     })
 }
 
@@ -833,7 +853,7 @@ fn apply_update(
     target_created_in_call: bool,
     write_warnings: &mut Vec<String>,
     admission: &PatchAdmission,
-) -> Result<AppliedHunkResult, String> {
+) -> Result<AppliedHunkResult, UpdateFailure> {
     let original = edit::mutation::read_regular_text(&resolved.source.abs)
         .map_err(|error| format!("failed to read file: {error}"))?;
     let new_content = apply_update_chunks(&original, &path_string(&resolved.source.abs), chunks)?;
@@ -876,6 +896,7 @@ fn apply_update(
             before: original,
             after: written.final_content,
             delete_lines: None,
+            rollback_skipped_reason: written.rollback_skipped_reason,
         })
     }
 }
@@ -893,7 +914,7 @@ fn apply_move_update(
     dest_created_in_call: bool,
     write_warnings: &mut Vec<String>,
     admission: &PatchAdmission,
-) -> Result<AppliedHunkResult, String> {
+) -> Result<AppliedHunkResult, UpdateFailure> {
     let dest_existed = dest.abs.exists();
     if dest_existed
         && !is_symlink_leaf(&resolved.source.abs)
@@ -902,7 +923,9 @@ fn apply_move_update(
             .zip(fs::canonicalize(&dest.abs).ok())
             .is_some_and(|(source, dest)| source == dest)
     {
-        return Err("move: source and destination are the same file".to_string());
+        return Err("move: source and destination are the same file"
+            .to_string()
+            .into());
     }
     let dest_snapshot = if dest_existed {
         Some(
@@ -931,9 +954,16 @@ fn apply_move_update(
             if !dest_existed && dest.abs.exists() {
                 let _ = edit::remote_links::unlink(&dest.abs);
             }
-            return Err(error);
+            return Err(error.into());
         }
     };
+    if let Some(reason) = written.rollback_skipped_reason {
+        return Err(UpdateFailure {
+            message: "move: destination changed before syntax rollback; source was not removed"
+                .to_string(),
+            rollback_skipped_reason: Some(reason),
+        });
+    }
     let dest_snapshot_taken = written.snapshot_taken;
 
     let source_snapshot_taken = if backed_paths.contains(&resolved.source.abs) {
@@ -961,7 +991,8 @@ fn apply_move_update(
                 Err(restore_error) => {
                     format!("{error}; destination rollback failed: {restore_error}")
                 }
-            });
+            }
+            .into());
         }
         backed_paths.insert(resolved.source.abs.clone());
         true
@@ -988,7 +1019,8 @@ fn apply_move_update(
             Err(restore_error) => {
                 format!("{message}; destination rollback failed: {restore_error}")
             }
-        });
+        }
+        .into());
     }
     admission.written(&resolved.source.abs);
     ctx.lsp_notify_watched_config_file(&resolved.source.abs, FileChangeType::DELETED);
@@ -1002,6 +1034,7 @@ fn apply_move_update(
         before: original,
         after: written.final_content,
         delete_lines: None,
+        rollback_skipped_reason: None,
     })
 }
 
@@ -1129,6 +1162,7 @@ fn metadata_files(
             }
             entry.last_kind = applied_hunk.kind;
             entry.after = applied_hunk.after.clone();
+            entry.rollback_skipped_reason = applied_hunk.rollback_skipped_reason;
             entry.hunk_count += 1;
         } else {
             entries.push((
@@ -1144,6 +1178,7 @@ fn metadata_files(
                     hunk_count: 1,
                     syntax_error_line: None,
                     syntax_skipped_reason: None,
+                    rollback_skipped_reason: applied_hunk.rollback_skipped_reason,
                 },
             ));
         }
@@ -1209,6 +1244,11 @@ fn metadata_files(
                 value[edit::CREATED_SYNTAX_ERROR_LINE_FIELD] = json!(line);
             }
             edit::append_syntax_skipped_reason(&mut value, entry.syntax_skipped_reason);
+            if let Some(reason) = entry.rollback_skipped_reason {
+                value["syntax_valid"] = json!(false);
+                value["rolled_back"] = json!(false);
+                value["rollback_skipped_reason"] = json!(reason);
+            }
             value
         })
         .collect::<Vec<_>>();
@@ -1334,8 +1374,12 @@ fn apply_patch(req: &RawRequest, ctx: &AppContext, resolved: &[ResolvedHunk]) ->
                         applied.push(result);
                     }
                     Err(error) => {
-                        output_lines.push(format!("Failed to update {path}: {error}"));
-                        add_failure(&mut failures, path, error);
+                        output_lines.push(format!("Failed to update {path}: {}", error.message));
+                        let mut failure = json!({ "path": path, "error": error.message });
+                        if let Some(reason) = error.rollback_skipped_reason {
+                            failure["rollback_skipped_reason"] = json!(reason);
+                        }
+                        failures.push(failure);
                     }
                 }
             }
@@ -1473,6 +1517,122 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires rustfmt; run explicitly to measure batch lock retention"]
+    fn measure_formatter_backed_patch_admission_extension() {
+        let temp = tempfile::tempdir().unwrap();
+        let ctx = AppContext::new(
+            Box::new(crate::parser::TreeSitterProvider::new()),
+            crate::config::Config {
+                project_root: Some(temp.path().to_path_buf()),
+                storage_dir: Some(temp.path().join("state")),
+                format_on_edit: true,
+                formatter_timeout_secs: 30,
+                formatter: [("rust".to_string(), "rustfmt".to_string())].into(),
+                ..Default::default()
+            },
+        );
+        let mut patch = "*** Begin Patch\n".to_string();
+        for index in 0..64 {
+            fs::write(
+                temp.path().join(format!("file{index}.rs")),
+                "fn value()->i32{1}\n",
+            )
+            .unwrap();
+            patch.push_str(&format!("*** Update File: file{index}.rs\n@@\n-fn value()->i32{{1}}\n+fn value()->i32{{2}}\n"));
+        }
+        patch.push_str("*** End Patch");
+        let req = RawRequest {
+            id: "patch-admission-measurement".into(),
+            command: "apply_patch".into(),
+            params: json!({"patch_text": patch, "validate": "off"}),
+            lsp_hints: None,
+            session_id: None,
+        };
+        edit::BATCH_SYNTAX_HOLD_TIMES.with(|times| *times.borrow_mut() = Some(Vec::new()));
+        let response = handle_apply_patch(&req, &ctx);
+        let times = edit::BATCH_SYNTAX_HOLD_TIMES.with(|times| times.borrow_mut().take().unwrap());
+        assert!(response.success, "{response:?}");
+        for index in 0..64 {
+            let content = fs::read_to_string(temp.path().join(format!("file{index}.rs"))).unwrap();
+            assert_eq!(content, "fn value() -> i32 {\n    2\n}\n");
+        }
+        assert_eq!(times.len(), 64);
+        eprintln!(
+            "Patch admission extension: {} rustfmt-backed updates, total {:?}, max {:?}",
+            times.len(),
+            times.iter().sum::<std::time::Duration>(),
+            times.iter().max().unwrap()
+        );
+    }
+
+    #[test]
+    fn patch_syntax_rollback_conflict_preserves_later_bytes_and_move_source() {
+        for with_move in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let source = temp.path().join("before.ts");
+            let destination = temp.path().join("after.ts");
+            let target = if with_move { &destination } else { &source };
+            let original = "const value = 1;\n";
+            let invalid = "const value = {;\n";
+            let later = "const value = 2;\n";
+            fs::write(&source, original).unwrap();
+            if with_move {
+                fs::write(&destination, "const previous = 0;\n").unwrap();
+            }
+            let ctx = AppContext::new(
+                Box::new(crate::parser::TreeSitterProvider::new()),
+                crate::config::Config {
+                    project_root: Some(temp.path().to_path_buf()),
+                    storage_dir: Some(temp.path().join("state")),
+                    format_on_edit: false,
+                    ..Default::default()
+                },
+            );
+            let move_directive = if with_move {
+                "*** Move to: after.ts\n"
+            } else {
+                ""
+            };
+            let req = RawRequest {
+                id: "patch-rollback-conflict".into(),
+                command: "apply_patch".into(),
+                params: json!({"patch_text": format!(
+                    "*** Begin Patch\n*** Update File: before.ts\n{move_directive}@@\n-{original}+{invalid}*** End Patch"
+                )}),
+                lsp_hints: None,
+                session_id: None,
+            };
+            let hook_target = target.clone();
+            edit::BEFORE_SYNTAX_ROLLBACK.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move || {
+                    assert_eq!(fs::read_to_string(&hook_target).unwrap(), invalid);
+                    fs::write(&hook_target, later).unwrap();
+                }));
+            });
+            let response = serde_json::to_value(handle_apply_patch(&req, &ctx)).unwrap();
+            assert_eq!(fs::read_to_string(target).unwrap(), later);
+            if with_move {
+                assert_eq!(fs::read_to_string(&source).unwrap(), original);
+                assert_eq!(response["success"], false, "{response}");
+                assert_eq!(
+                    response["failures"][0]["rollback_skipped_reason"],
+                    "file_changed"
+                );
+                assert_eq!(
+                    response["failures"][0]["error"],
+                    "move: destination changed before syntax rollback; source was not removed"
+                );
+            } else {
+                assert_eq!(response["success"], true, "{response}");
+                let file = &response["metadata"]["files"][0];
+                assert_eq!(file["syntax_valid"], false);
+                assert_eq!(file["rolled_back"], false);
+                assert_eq!(file["rollback_skipped_reason"], "file_changed");
+            }
+        }
+    }
+
+    #[test]
     fn case_only_patch_move_keeps_one_directory_entry() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("project");
@@ -1585,6 +1745,7 @@ mod tests {
                 before: "before\n".into(),
                 after: String::new(),
                 delete_lines: Some(1),
+                rollback_skipped_reason: None,
             }];
             let (_, files, _) = metadata_files(&applied, Some(&root), &HashMap::new());
             assert_eq!(files.len(), 1);
@@ -1615,6 +1776,7 @@ mod tests {
                 before: "original\n".into(),
                 after: after.into(),
                 delete_lines: None,
+                rollback_skipped_reason: None,
             })
             .collect();
         edit::A03_DIFF_CONSTRUCTIONS.with(|count| count.set(0));

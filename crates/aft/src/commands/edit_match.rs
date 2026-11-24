@@ -498,6 +498,7 @@ fn handle_append_with_open(
             // rollback (handled by the shared write pipeline only). Surface
             // false until/unless append gains the same rollback flow.
             rolled_back: false,
+            rollback_skipped_reason: None,
             lsp_outcome,
             final_text: None,
             write_warnings: Vec::new(),
@@ -2212,6 +2213,7 @@ fn handle_single_file_edit_match(
     if let Some(valid) = write_result.syntax_valid {
         result["syntax_valid"] = serde_json::json!(valid);
     }
+    write_result.append_rollback_skipped_to(&mut result);
 
     if let Some(ref reason) = write_result.format_skipped_reason {
         result["format_skipped_reason"] = serde_json::json!(reason);
@@ -2247,8 +2249,9 @@ fn handle_single_file_edit_match(
     // The match was satisfied (replacements > 0) but no net change landed.
     // Pi/OpenCode UIs use this to render "matched but no change" instead of
     // a bare `+0/-0` that looks like a tool failure (see GitHub #45).
+    let rollback_skipped = write_result.rollback_skipped_reason.is_some();
     let final_content = write_result.final_content(&path).unwrap_or(&new_source);
-    if source == final_content {
+    if !rollback_skipped && source == final_content {
         result["no_op"] = serde_json::json!(true);
     }
 

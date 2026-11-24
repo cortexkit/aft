@@ -2156,6 +2156,8 @@ pub struct WriteResult {
     /// pre-write content. The on-disk file is the original; `syntax_valid`
     /// reports the would-have-been-written status (Some(false)).
     pub rolled_back: bool,
+    /// The syntax verdict did not authorize overwriting a later revision.
+    pub(crate) rollback_skipped_reason: Option<&'static str>,
     /// Per-edit LSP diagnostics outcome (v0.17.3). Carries the verified-fresh
     /// diagnostics PLUS per-server status (pending/exited) so the response
     /// can report `complete: bool` honestly.
@@ -2184,6 +2186,13 @@ pub fn format_validation_errors(errors: &[format::ValidationError]) -> String {
 }
 
 impl WriteResult {
+    pub(crate) fn append_rollback_skipped_to(&self, result: &mut serde_json::Value) {
+        if let Some(reason) = self.rollback_skipped_reason {
+            result["rollback_skipped_reason"] = serde_json::json!(reason);
+            result["rolled_back"] = serde_json::json!(false);
+        }
+    }
+
     /// Return the validated final text only while the live path still has the
     /// same identity. LSP notifications may wait, so response rendering checks
     /// again rather than assuming the file stayed unchanged during that wait.
@@ -2340,6 +2349,12 @@ pub(crate) fn created_file_syntax_error_notice(first_error_line: u64) -> String 
 thread_local! {
     static FULL_VALIDATION_START_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    pub(crate) static BEFORE_SYNTAX_ROLLBACK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+    #[cfg(test)]
+    pub(crate) static BATCH_SYNTAX_HOLD_TIMES: std::cell::RefCell<Option<Vec<std::time::Duration>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Run `f` with a one-shot hook that fires on this thread when
@@ -2488,8 +2503,10 @@ pub(crate) fn write_format_validate_bytes_observed(
     )
 }
 
-/// The caller owns admission for all affected files. Release a completed file
-/// immediately after its write, before invoking formatters or language servers.
+/// The caller holds the writer locks for all affected files through the syntax
+/// verdict. Hard-link aliases can share a lock key, so releasing and reacquiring
+/// one while holding another would deadlock. Release the completed file before
+/// any later checks or language-server work.
 pub(crate) fn write_format_validate_admitted(
     tool_policy: &dyn crate::edit::tool_launcher::ToolLauncher,
     path: &Path,
@@ -2497,7 +2514,7 @@ pub(crate) fn write_format_validate_admitted(
     config: &Config,
     params: &serde_json::Value,
     created: bool,
-    after_write: &dyn Fn(),
+    after_syntax: &dyn Fn(),
 ) -> Result<WriteResult, AftError> {
     write_format_validate_impl(
         tool_policy,
@@ -2509,7 +2526,7 @@ pub(crate) fn write_format_validate_admitted(
         None,
         created,
         None,
-        Some(after_write),
+        Some(after_syntax),
     )
 }
 
@@ -2528,7 +2545,7 @@ fn write_format_validate_impl(
     captured_original: Option<&str>,
     syntax_checked_by_caller: bool,
     file_locks: Option<Vec<mutation::FileLock>>,
-    after_write: Option<&dyn Fn()>,
+    after_syntax: Option<&dyn Fn()>,
 ) -> Result<WriteResult, AftError> {
     // A file this call creates has no prior content: it cannot be rolled back
     // to anything, so an invalid result is kept and reported through
@@ -2562,9 +2579,8 @@ fn write_format_validate_impl(
         .warnings;
     drop(file_locks);
     crate::tool_progress::report();
-    if let Some(after_write) = after_write {
-        after_write();
-    }
+    #[cfg(test)]
+    let admission_extended = after_syntax.map(|_| std::time::Instant::now());
     drop(write_phase);
 
     // Step 2: Format (before validate so we validate the formatted content)
@@ -2609,26 +2625,61 @@ fn write_format_validate_impl(
                 )
             }
         });
+    let mut rollback_skipped_reason = None;
     let rolled_back = if was_syntax_valid == Some(true) && syntax_valid == Some(false) {
         if let Some(original) = pre_write_content.as_ref() {
-            let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
-            let rollback = atomic_write_source(path, original.as_bytes()).map_err(|e| {
-                AftError::InvalidRequest {
-                    message: format!("failed to roll back invalid edit: {}", e),
-                }
-            })?;
-            for warning in rollback.warnings {
-                if !write_warnings.contains(&warning) {
-                    write_warnings.push(warning);
+            #[cfg(test)]
+            {
+                let hook = BEFORE_SYNTAX_ROLLBACK.with(|slot| slot.borrow_mut().take());
+                if let Some(hook) = hook {
+                    hook();
                 }
             }
-            true
+            let _rollback_admission = after_syntax
+                .is_none()
+                .then(|| mutation::lock_files(&[path]));
+            let current = ObservedFinalText::read(path);
+            if !final_text
+                .as_ref()
+                .zip(current.as_ref())
+                .is_some_and(|(observed, current)| {
+                    (formatted || observed.text == content)
+                        && current.text == observed.text
+                        && current.version == observed.version
+                })
+            {
+                final_text = current;
+                rollback_skipped_reason = Some("file_changed");
+                false
+            } else {
+                let _phase = crate::logging::time_edit_phase(crate::logging::EditPhase::Write);
+                let rollback = atomic_write_source(path, original.as_bytes()).map_err(|e| {
+                    AftError::InvalidRequest {
+                        message: format!("failed to roll back invalid edit: {}", e),
+                    }
+                })?;
+                for warning in rollback.warnings {
+                    if !write_warnings.contains(&warning) {
+                        write_warnings.push(warning);
+                    }
+                }
+                true
+            }
         } else {
             false
         }
     } else {
         false
     };
+    if let Some(after_syntax) = after_syntax {
+        #[cfg(test)]
+        BATCH_SYNTAX_HOLD_TIMES.with(|times| {
+            if let Some(times) = times.borrow_mut().as_mut() {
+                times.push(admission_extended.unwrap().elapsed());
+            }
+        });
+        after_syntax();
+    }
 
     // Step 4: Full validation (type checker) — only when requested
     // Explicit param overrides config. Valid values: "syntax" | "full" | "off".
@@ -2650,7 +2701,7 @@ fn write_format_validate_impl(
     } else if rolled_back {
         final_text = ObservedFinalText::read(path);
     }
-    let reformatted_excerpt = if rolled_back {
+    let reformatted_excerpt = if rolled_back || rollback_skipped_reason.is_some() {
         None
     } else {
         final_text
@@ -2672,6 +2723,7 @@ fn write_format_validate_impl(
         validation_errors,
         validate_skipped_reason,
         rolled_back,
+        rollback_skipped_reason,
         lsp_outcome: None,
         reformatted_excerpt,
         final_text,
