@@ -61,7 +61,9 @@ pub fn handle_outline(req: &RawRequest, ctx: &AppContext) -> Response {
 }
 
 fn handle_outline_with_snapshot(req: &RawRequest, ctx: &AppContext) -> Response {
-    let mut response = crate::bounded_io_command::command(req, ctx, handle_outline_inner);
+    let mut response = crate::context::confinement::with_floor_disclosure(|| {
+        crate::bounded_io_command::command(req, ctx, handle_outline_inner)
+    });
     super::url_output::redact_url_cache_paths(req, ctx, &mut response);
     super::read_manifest::normalize_response_content_files(ctx, &mut response.data);
     response
@@ -3148,6 +3150,9 @@ where
             if file_type.is_symlink() {
                 return false;
             }
+            if outline_walk_denied_data(entry.path()) {
+                return false;
+            }
             if !file_type.is_dir() {
                 return confined.as_ref().map_or(true, |confined| {
                     !file_type.is_file()
@@ -3318,6 +3323,9 @@ fn collect_outline_files_breadth_first_with_device_lookup(
             if file_type.is_symlink() {
                 continue;
             }
+            if outline_walk_denied_data(&entry.path()) {
+                continue;
+            }
             if file_type.is_dir() {
                 child_directories.push(entry.path());
             } else if file_type.is_file() {
@@ -3378,6 +3386,16 @@ fn collect_outline_files_breadth_first_with_device_lookup(
         }
     }
     entries_examined
+}
+
+fn outline_walk_denied_data(path: &Path) -> bool {
+    if crate::context::confinement::active()
+        || !crate::project_content::is_cortexkit_data_read_denied(path)
+    {
+        return false;
+    }
+    crate::context::confinement::capture().record_matched_floor(path);
+    true
 }
 
 fn should_skip_directory(path: &Path) -> bool {

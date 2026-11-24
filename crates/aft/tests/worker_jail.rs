@@ -1979,7 +1979,7 @@ async fn cortexkit_settings_file_tools_and_relaxed_shell_are_open_for_head_and_w
         }
         for (relative, refusal) in [
             (
-                ".local/share/cortexkit/other-module/x.jsonc",
+                ".local/share/cortexkit/signing/x.jsonc",
                 "never open files in the CortexKit data folder",
             ),
             (

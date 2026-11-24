@@ -1,7 +1,11 @@
 use super::*;
 
 pub fn handle_semantic_search(req: &RawRequest, ctx: &AppContext) -> Response {
-    crate::bounded_io::with_skip_disclosure(|| handle_semantic_search_with_disclosure(req, ctx))
+    crate::bounded_io::with_skip_disclosure(|| {
+        crate::context::confinement::with_floor_disclosure(|| {
+            handle_semantic_search_with_disclosure(req, ctx)
+        })
+    })
 }
 
 fn handle_semantic_search_with_disclosure(req: &RawRequest, ctx: &AppContext) -> Response {

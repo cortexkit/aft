@@ -113,6 +113,7 @@ pub mod memory;
 pub mod memory_profile;
 pub mod registration;
 
+pub mod cortexkit_data;
 pub mod native_stat;
 pub mod ndjson_text;
 pub mod no_follow_file;

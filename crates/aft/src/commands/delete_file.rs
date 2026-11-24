@@ -1206,14 +1206,26 @@ fn delete_directory(
             ),
         )
     })?;
+    let policy = ctx.access_policy(&req.id)?;
+    let entry_denial = |entry: &Path| policy.cortexkit_tree_entry_denial(entry);
     if let Some(reason) = no_backup {
         return delete_directory_without_backups(
-            req, ctx, path, original, op_id, &boundary, reason,
+            req,
+            ctx,
+            path,
+            original,
+            op_id,
+            &boundary,
+            reason,
+            &entry_denial,
         );
     }
 
-    let manifest = match walk_tree(path, &boundary, budget) {
+    let manifest = match walk_tree(path, &boundary, budget, &entry_denial) {
         Ok(manifest) => manifest,
+        Err(CollectError::DeniedFloor(message)) => {
+            return Err(Response::error(&req.id, "denied_floor", message).into());
+        }
         Err(CollectError::OverBudget(exceeded)) => {
             return Err(over_budget_response(req, original, exceeded, budget).into());
         }
@@ -1499,6 +1511,7 @@ fn delete_directory_without_backups(
     op_id: &str,
     boundary: &crate::walk_boundary::DeviceBoundary,
     reason: crate::backup::BackupSkippedReason,
+    entry_denial: &dyn Fn(&Path) -> Option<String>,
 ) -> Result<serde_json::Value, DeleteError> {
     let mut manifest = TreeManifest::default();
     let identity = std::fs::symlink_metadata(path)
@@ -1511,16 +1524,21 @@ fn delete_directory_without_backups(
     });
     let mut mounts = Vec::new();
     let mut visits = 0;
-    collect_for_unbacked_delete(path, boundary, &mut manifest, &mut mounts, &mut visits).map_err(|e| {
-        Response::error_with_data(
-            req.id.clone(),
-            if e.kind() == std::io::ErrorKind::Interrupted { "request_cancelled" } else { "io_error" },
-            format!(
-                "delete_file: failed to walk directory '{}': {}",
-                original, e
+    collect_for_unbacked_delete(
+        path, boundary, &mut manifest, &mut mounts, &mut visits, entry_denial,
+    )
+    .map_err(|error| match error {
+            CollectError::DeniedFloor(message) => Response::error(&req.id, "denied_floor", message),
+            CollectError::OverBudget(_) => unreachable!("the unbacked walk has no backup budget"),
+            CollectError::Io(e) => Response::error_with_data(
+                req.id.clone(),
+                if e.kind() == std::io::ErrorKind::Interrupted { "request_cancelled" } else { "io_error" },
+                format!(
+                    "delete_file: failed to walk directory '{}': {}",
+                    original, e
+                ),
+                serde_json::json!({"complete": false, "files_deleted": 0, "remaining_root": original, "remaining_entries": null}),
             ),
-            serde_json::json!({"complete": false, "files_deleted": 0, "remaining_root": original, "remaining_entries": null}),
-        )
     })?;
     if !mounts.is_empty() {
         log_refusal(
@@ -1618,19 +1636,23 @@ fn collect_for_unbacked_delete(
     manifest: &mut TreeManifest,
     mounts: &mut Vec<String>,
     visits: &mut usize,
-) -> std::io::Result<()> {
+    entry_denial: &dyn Fn(&Path) -> Option<String>,
+) -> Result<(), CollectError> {
     for entry in std::fs::read_dir(dir)? {
         *visits += 1;
         if crate::executor::current_job_cancellation().is_some_and(|token| {
             token.cancel_already_requested()
                 || (*visits % 64 == 1 && token.cancel_requested_before_commit())
         }) {
-            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted).into());
         }
         let entry = entry?;
         #[cfg(test)]
         DELETE_OPERATIONS.with(|ops| ops.borrow_mut().entries += 1);
         let path = entry.path();
+        if let Some(message) = entry_denial(&path) {
+            return Err(CollectError::DeniedFloor(message));
+        }
         // Neither `DirEntry::file_type` nor `DirEntry::metadata` follows
         // symlinks. The identity lets the delete refuse an entry that was
         // replaced after this walk instead of unlinking it by name.
@@ -1643,7 +1665,14 @@ fn collect_for_unbacked_delete(
                     kind: NodeKind::Directory,
                     identity,
                 });
-                collect_for_unbacked_delete(&path, boundary, manifest, mounts, visits)?;
+                collect_for_unbacked_delete(
+                    &path,
+                    boundary,
+                    manifest,
+                    mounts,
+                    visits,
+                    entry_denial,
+                )?;
             } else {
                 mounts.push(path.display().to_string());
             }

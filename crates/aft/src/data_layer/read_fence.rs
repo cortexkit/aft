@@ -105,11 +105,12 @@ impl Fence {
 
     pub(crate) fn record_source_exclusion(&self, path: &Path) {
         if self.floor_omissions.is_some()
-            && (crate::project_content::storage_root_for_path(
-                path,
-                &crate::access_policy::StoragePaths,
-            )
-            .is_some()
+            && (crate::project_content::is_cortexkit_data_read_denied(path)
+                || crate::project_content::storage_root_for_path(
+                    path,
+                    &crate::access_policy::StoragePaths,
+                )
+                .is_some()
                 || crate::db::file_identity::is_live_sqlite_file(path))
         {
             self.record_floor(path);
@@ -118,11 +119,12 @@ impl Fence {
 
     pub(crate) fn record_matched_source_exclusion(&self, path: &Path) {
         if self.floor_omissions.is_some()
-            && (crate::project_content::storage_root_for_path(
-                path,
-                &crate::access_policy::StoragePaths,
-            )
-            .is_some()
+            && (crate::project_content::is_cortexkit_data_read_denied(path)
+                || crate::project_content::storage_root_for_path(
+                    path,
+                    &crate::access_policy::StoragePaths,
+                )
+                .is_some()
                 || crate::db::file_identity::is_live_sqlite_file(path))
         {
             self.record_matched_floor(path);
@@ -196,7 +198,12 @@ pub(crate) fn with_floor_disclosure(run: impl FnOnce() -> Response) -> Response 
             // Other commands own their skip order, completeness and rendering.
             // Preserve their uncapped floor report: search/grep's 20-name cap
             // and result-list trailer do not belong on these response surfaces.
-            response.data["skipped_files"] = serde_json::json!(omissions.paths.iter().map(|path| serde_json::json!({"file":path.display().to_string(),"reason":"denied_floor"})).collect::<Vec<_>>());
+            let skipped = omissions.paths.iter().map(|path| serde_json::json!({"file":path.display().to_string(),"reason":"denied_floor"}));
+            if let Some(existing) = response.data["skipped_files"].as_array_mut() {
+                existing.extend(skipped);
+            } else {
+                response.data["skipped_files"] = Value::Array(skipped.collect());
+            }
             response.data["complete"] = serde_json::json!(false);
         }
     }

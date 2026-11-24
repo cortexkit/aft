@@ -61,6 +61,7 @@ mod privacy_spawn_test;
 mod remote_shell_test;
 // Stands in shell scripts for Apple's developer-tools launcher.
 #[cfg(unix)]
+mod cortexkit_data_policy_test;
 mod developer_tools_git_test;
 // Syscall census of store durability; uses dyld interposition, so macOS only.
 #[cfg(target_os = "macos")]
