@@ -5024,44 +5024,8 @@ pub fn lang_label(lang: LangId) -> &'static str {
     }
 }
 
-pub fn lang_from_label(label: &str) -> Option<LangId> {
-    match label {
-        "typescript" => Some(LangId::TypeScript),
-        "tsx" => Some(LangId::Tsx),
-        "javascript" => Some(LangId::JavaScript),
-        "python" => Some(LangId::Python),
-        "rust" => Some(LangId::Rust),
-        "go" => Some(LangId::Go),
-        "c" => Some(LangId::C),
-        "cpp" => Some(LangId::Cpp),
-        "cuda" => Some(LangId::Cuda),
-        "metal" => Some(LangId::Metal),
-        "zig" => Some(LangId::Zig),
-        "csharp" => Some(LangId::CSharp),
-        "bash" => Some(LangId::Bash),
-        "html" => Some(LangId::Html),
-        "markdown" => Some(LangId::Markdown),
-        "solidity" => Some(LangId::Solidity),
-        "scss" => Some(LangId::Scss),
-        "vue" => Some(LangId::Vue),
-        "json" => Some(LangId::Json),
-        "scala" => Some(LangId::Scala),
-        "java" => Some(LangId::Java),
-        "ruby" => Some(LangId::Ruby),
-        "kotlin" => Some(LangId::Kotlin),
-        "swift" => Some(LangId::Swift),
-        "php" => Some(LangId::Php),
-        "lua" => Some(LangId::Lua),
-        "perl" => Some(LangId::Perl),
-        "yaml" => Some(LangId::Yaml),
-        "pascal" => Some(LangId::Pascal),
-        "r" => Some(LangId::R),
-        "groovy" => Some(LangId::Groovy),
-        "objc" => Some(LangId::ObjC),
-        "toml" => Some(LangId::Toml),
-        _ => None,
-    }
-}
+mod language;
+pub use language::lang_from_label;
 
 pub fn normalize_file_path(project_root: &Path, path: &Path) -> Result<PathBuf> {
     let full_path = if path.is_relative() {

@@ -72,7 +72,7 @@
     "reason": "Split inspection scheduling and coordination pending; AFT crate split lane."
   },
   "crates/aft-parse/src/callgraph_store/mod.rs": {
-    "lines": 5510,
+    "lines": 5474,
     "reason": "Split callgraph storage operations pending; AFT crate split lane."
   },
   "crates/aft/src/commands/inspect.rs": {

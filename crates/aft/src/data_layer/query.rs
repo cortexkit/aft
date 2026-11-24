@@ -26,6 +26,53 @@ use crate::parser::LangId;
 mod impact_budget_tests {
     use super::*;
 
+    #[test]
+    fn audit_resolution_luau_callers_count_luau_unresolved_sites() {
+        use crate::data_layer::{callgraph::resolve_checkout, incremental_tests::checkout};
+
+        let root = tempfile::tempdir().unwrap();
+        let inputs = checkout(
+            &[(
+                "calls.ts",
+                "function target() {}\nfunction caller() { unknown.missing(); }\n",
+            )],
+            &[],
+        );
+        let (_, parse) = inputs.parses.read("calls.ts").unwrap();
+        let mut parse = (*parse).clone();
+        let mut resolutions = resolve_checkout(&inputs, 1).unwrap();
+        parse.language = "luau".into();
+        // Model an already stored Luau record without downloading its grammar.
+        let mut slices = MemorySlices::default();
+        slices.insert(FileSlice::build(
+            "calls.luau",
+            "test",
+            &parse,
+            &resolutions.remove("calls.ts").unwrap(),
+        ));
+        let reader = SliceReader::new(slices, root.path().to_path_buf(), "test".into());
+        assert_eq!(
+            reader
+                .unresolved_call_site_count(LangId::Luau, true)
+                .unwrap(),
+            1
+        );
+        let result = crate::data_layer::callgraph_store_adapter::callers_result(
+            &reader,
+            &root.path().join("calls.luau"),
+            "target",
+            1,
+            true,
+        )
+        .unwrap();
+        assert_eq!(result.total_callers, 0);
+        let note = result
+            .incomplete
+            .expect("Luau caller answer must report incomplete coverage");
+        assert_eq!(note.unresolved_call_sites, 1);
+        assert!(note.incomplete_reason.contains("Luau"));
+    }
+
     fn graph() -> (tempfile::TempDir, SliceReader<MemorySlices>) {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
