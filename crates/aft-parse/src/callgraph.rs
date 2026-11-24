@@ -47,8 +47,7 @@ static RUST_WORKSPACE_CRATE_CACHE: LazyLock<RwLock<RustWorkspaceCrateCache>> =
 
 // Cold builds retain one resolver memo across every staged reference window. The
 // entry and retained-weight ceilings keep that speedup inside the bounded-build
-// working-set contract: at most 9 MiB of estimated keys/values are retained here,
-// plus 4 MiB for canonical probe identities owned by the same snapshot.
+// working-set contract: at most 9 MiB of estimated keys and values are retained.
 const MODULE_RESOLUTION_MEMO_MAX_ENTRIES: usize = 32_768;
 const MODULE_RESOLUTION_MEMO_MAX_RETAINED_BYTES: usize = 3 * 1024 * 1024;
 const JSON_VALUE_MEMO_MAX_ENTRIES: usize = 8_192;
