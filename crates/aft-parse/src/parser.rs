@@ -6975,7 +6975,9 @@ const NIX_OUTLINE_DEPTH: usize = 1;
 /// leaves every real file whole (a normal outline keeps a small multiple
 /// of the file's own attr-path bytes) and caps the pathological one; past
 /// the bound the walk stops emitting, so the outline keeps its leading,
-/// exact portion.
+/// exact portion. The cap bounds retained name bytes, not total record
+/// bytes: per-symbol overhead is uncharged and stays a linear factor of
+/// the file size — what is ruled out is the super-linear name copy.
 const NIX_OUTLINE_NAME_BUDGET: usize = 4 << 20;
 
 /// Read an `attrpath` node as the dotted name written in the source.
