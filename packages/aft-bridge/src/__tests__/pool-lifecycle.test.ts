@@ -282,10 +282,12 @@ describe("BridgePool lifecycle", () => {
   });
 
   test("LRU eviction skips bridges with pending requests", () => {
-    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity, maxPoolSize: 1 });
+    const { logger, messages } = makeLogger();
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity, maxPoolSize: 1, logger });
     const first = pool.getBridge("/project/pending-eviction");
     (first as unknown as { pending: Map<string, unknown> }).pending.set("1", {});
 
+    pool.getBridge("/project/new-entry");
     pool.getBridge("/project/new-entry");
 
     const entries = (
@@ -293,6 +295,11 @@ describe("BridgePool lifecycle", () => {
     ).bridges;
     expect(Array.from(entries.values()).some((entry) => entry.bridge === first)).toBe(true);
     expect(pool.size).toBe(2);
+    expect(
+      messages.filter(
+        (message) => message.startsWith("warn:") && message.includes("maxPoolSize=1"),
+      ),
+    ).toHaveLength(1);
   });
 
   test("LRU eviction skips outstanding background tasks and evicts next candidate", () => {
@@ -350,6 +357,32 @@ describe("BridgePool lifecycle", () => {
     expect(Array.from(entries.values()).some((entry) => entry.bridge === pending)).toBe(true);
     expect(Array.from(entries.values()).some((entry) => entry.bridge === background)).toBe(true);
     expect(pool.size).toBe(3);
+  });
+
+  test("cleanup shrinks a busy overflow once a bridge becomes idle", () => {
+    const pool = new BridgePool("/fake/aft", { idleTimeoutMs: Infinity, maxPoolSize: 1 });
+    const first = pool.getBridge("/project/overflow-first");
+    (first as unknown as { pending: Map<string, unknown> }).pending.set("1", {});
+    const second = pool.getBridge("/project/overflow-second");
+    expect(pool.size).toBe(2);
+
+    (first as unknown as { pending: Map<string, unknown> }).pending.clear();
+    const entries = (
+      pool as unknown as { bridges: Map<string, { bridge: BinaryBridge; lastUsed: number }> }
+    ).bridges;
+    let lastUsed = 1;
+    for (const entry of entries.values()) entry.lastUsed = lastUsed++;
+    let firstShutdowns = 0;
+    (first as unknown as { shutdown: () => Promise<void> }).shutdown = async () => {
+      firstShutdowns += 1;
+    };
+
+    (pool as unknown as { cleanup(): void }).cleanup();
+
+    expect(firstShutdowns).toBe(1);
+    expect(pool.size).toBe(1);
+    expect(Array.from(entries.values()).some((entry) => entry.bridge === first)).toBe(false);
+    expect(Array.from(entries.values()).some((entry) => entry.bridge === second)).toBe(true);
   });
 
   test("cleanup retires a bridge when the on-disk binary hash changes", async () => {
