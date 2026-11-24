@@ -809,7 +809,7 @@ class EngineUnwiredGateTests(unittest.TestCase):
                 "search_state/mod.rs", "semantic_index.rs", "parser.rs",
             )
         ]
-        moves += [(source + "lib.rs", f"crates/{crate}/src/lib.rs") for crate in ("aft-base", "aft-db", "aft-parse")]
+        moves += [(source + "lib.rs", f"crates/{crate}/src/lib.rs") for crate in ("aft-base", "aft-db", "aft-parse", "aft-shell")]
         moves += [
             (source + "search_b2/" + file, tools + "commands/semantic_search/planner/" + file)
             for file in ("lane_plan.rs", "readiness.rs")

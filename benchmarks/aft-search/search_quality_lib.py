@@ -86,6 +86,7 @@ RANKING_FENCE_PREFIXES = (
     "crates/aft-index/src/lib.rs",
     "crates/aft-inspect/src/lib.rs",
     "crates/aft-github/src/lib.rs",
+    "crates/aft-shell/src/lib.rs",
     # The shape router, lane plans and token variants decide which lanes a
     # query runs and which candidates they produce, so a change there moves
     # search results just as a scoring change does.
