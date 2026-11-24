@@ -250,9 +250,11 @@ mod idle_root_retention_tests;
 #[cfg(test)]
 mod ledger_lane_tests;
 mod perf_sweep;
+mod root_quiesce;
 mod route_census;
 mod route_delivery;
 use crate::bash_background::registry::RouteDeliverySessions;
+use root_quiesce::{quiesce_connection_roots, quiesce_unbound_root, QuiescedLsp};
 #[cfg(test)]
 use route_delivery::sync_all_callgraph_refresh_policies as sync_bg_live_delivery_sessions;
 mod secret_consent;
@@ -1542,6 +1544,7 @@ struct RootMeta {
     active_bash_waits: usize,
     idle_artifacts_evicted: bool,
     unbound_quiesced: bool,
+    goodbye_quiesce_at: Option<tokio::time::Instant>,
     consecutive_missing_sweeps: u8,
     /// The newest [`RootPresence`] generation already counted in
     /// `consecutive_missing_sweeps`, so a probe result is counted once even
@@ -1939,6 +1942,7 @@ impl RootMeta {
             active_bash_waits: 0,
             idle_artifacts_evicted: false,
             unbound_quiesced: false,
+            goodbye_quiesce_at: None,
             consecutive_missing_sweeps: 0,
             presence_generation_seen: 0,
             reclaim_kill_in_flight: None,
@@ -1958,6 +1962,7 @@ impl RootMeta {
         self.note_activity();
         self.idle_artifacts_evicted = false;
         self.unbound_quiesced = false;
+        self.goodbye_quiesce_at = None;
         self.teardown_persist_submitted_at = None;
         self.ttl_retention_logged = None;
     }
@@ -2056,6 +2061,13 @@ fn due_maintenance_jobs_with_tail_limits(
                 Some(ctx) => INITIAL_MAINTENANCE_DRAIN_KINDS
                     .into_iter()
                     .filter(|kind| {
+                        // While no route is bound, finish configure work the
+                        // bind already scheduled without discovering new jobs.
+                        if meta.goodbye_quiesce_at.is_some()
+                            && *kind != MaintenanceDrainKind::ConfigureTail
+                        {
+                            return false;
+                        }
                         if meta.unbound_quiesced && !matches!(kind, MaintenanceDrainKind::Lsp) {
                             return false;
                         }
@@ -2083,7 +2095,7 @@ fn due_maintenance_jobs_with_tail_limits(
                         }
                     })
                     .collect(),
-                None if meta.unbound_quiesced => Vec::new(),
+                None if meta.unbound_quiesced || meta.goodbye_quiesce_at.is_some() => Vec::new(),
                 // No context handle (actor gone mid-tick): enqueue everything.
                 None => INITIAL_MAINTENANCE_DRAIN_KINDS.to_vec(),
             };
@@ -2251,150 +2263,6 @@ fn allocator_pressure_relief_after_idle_sweep(
     {
         None
     }
-}
-
-/// Who stops a root's running language servers once the root is quiesced.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum QuiescedLsp {
-    /// Detach the clients and shut them down on a background thread. Right for
-    /// a route that closes while the module keeps running: nothing else would
-    /// stop those servers.
-    ReapInBackground,
-    /// Refuse new starts but leave the clients in the manager, because the
-    /// caller's exit phase shuts down every manager's servers together under
-    /// one shared budget right after the module loop returns.
-    LeaveForExitSweep,
-}
-
-fn quiesce_unbound_root(
-    root_id: &ProjectRootId,
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    executor: &Arc<Executor>,
-) {
-    quiesce_unbound_root_with(root_id, live_roots, executor, QuiescedLsp::ReapInBackground);
-}
-
-fn quiesce_unbound_root_with(
-    root_id: &ProjectRootId,
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    executor: &Arc<Executor>,
-    lsp: QuiescedLsp,
-) {
-    let Some(meta) = live_roots.get_mut(root_id) else {
-        return;
-    };
-
-    let ctx = executor.actor_context(root_id);
-    if let Some(ctx) = ctx.as_ref() {
-        // Close lifecycle admission before touching scheduler queues. A running
-        // ConfigureTail cannot release gates, install a watcher, or reserve a
-        // callgraph build after this transition becomes visible.
-        ctx.mark_subc_unbound();
-        // Parent folders have no local build progress to retain. Their watcher
-        // owns exclusion retries independently of the child-reader session, so
-        // release both lifetimes when the final route closes.
-        if crate::parent_search::release_context(ctx) || ctx.root_too_broad() {
-            ctx.stop_watcher_runtime();
-            ctx.invalidate_artifacts_after_watcher_gap();
-        }
-        match lsp {
-            QuiescedLsp::ReapInBackground => {
-                // Detach under the root's manager lock before allowing a
-                // rebind. The reaper owns only the old clients, never servers
-                // a new route starts.
-                let clients = ctx.lsp().quiesce();
-                crate::lsp::manager::LspManager::spawn_idle_lsp_reap(clients);
-            }
-            QuiescedLsp::LeaveForExitSweep => ctx.lsp().close_start_admission(),
-        }
-        ctx.bash_background().clear_live_delivery_sessions();
-    }
-    // A bind replayed by the identity retry is this root's bind in flight.
-    // Cancel it as route teardown cancels a route's own pending bind: queued,
-    // it is removed; running, it stops at its next checkpoint before the
-    // commit seal and publishes nothing. One that already sealed finishes, and
-    // its completion quiesces the root again (`finish_identity_replay`).
-    if let Some(replay) = meta.identity_replay.as_ref() {
-        let outcome = executor.cancel_job(root_id, replay);
-        log::debug!(
-            "subc attach: cancelled identity retry bind for quiescing root {} ({outcome:?})",
-            root_id.as_path().display()
-        );
-    }
-    let cancelled = if root_id.as_path().is_dir() {
-        executor.cancel_queued_root_maintenance(root_id)
-    } else {
-        executor.cancel_root_maintenance(root_id)
-    };
-    // Ordinary projects keep their watcher and resident artifacts across brief
-    // unbinds, so a reconnect can replay observed changes without re-reading the
-    // entire checkout. Parent folders and broad roots were stopped above.
-    // Queued maintenance is dropped immediately, but running project builds and
-    // inspect jobs retain a 120-second abandonment grace: their cancellation
-    // checks stop them after that grace, or as soon as the checkout disappears.
-    // The idle-TTL reaper stops project watchers later and marks their cached
-    // artifacts for verification because changes after shutdown were not seen.
-    let discarded = ctx
-        .map(|ctx| crate::commands::configure::cancel_deferred_configure_maintenance(&ctx))
-        .unwrap_or(0);
-    meta.unbound_quiesced = true;
-    meta.maintenance_queued_kinds.clear();
-    meta.maintenance_pending = meta.maintenance_jobs_in_flight > 0;
-    log::info!(
-        "subc attach: quiesced unbound root {} (cancelled {} queued or running maintenance job(s), cancelled {} configure maintenance job(s)); cause=goodbye_unbound",
-        root_id.as_path().display(),
-        cancelled,
-        discarded
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
-fn quiesce_connection_roots(
-    live_roots: &mut HashMap<ProjectRootId, RootMeta>,
-    pending_binds: &mut HashMap<RouteChannel, PendingBind>,
-    routes: &mut HashMap<RouteChannel, RouteIdentity>,
-    root_channels: &mut RootChannels,
-    installed_route_epochs: &mut HashMap<u16, u32>,
-    route_bash_cancels: &mut HashMap<RouteChannel, bash::RouteBashCancel>,
-    active_tool_calls: &ActiveToolCalls,
-    executor: &Arc<Executor>,
-    delivery: &RouteDeliverySessions,
-    lsp: QuiescedLsp,
-) {
-    cancel_all_active_tool_calls(active_tool_calls, executor, "connection teardown");
-    for cancel in route_bash_cancels.values() {
-        cancel.token.cancel();
-    }
-    route_bash_cancels.clear();
-
-    let mut roots = live_roots.keys().cloned().collect::<HashSet<_>>();
-    for pending in pending_binds.values_mut() {
-        pending.cancelled = true;
-        roots.insert(pending.bind_root_id.clone());
-        let _ = executor.cancel_job(&pending.bind_root_id, &pending.cancellation);
-    }
-
-    // A connection exit abandons every installed route at once. Close lifecycle
-    // admission before cancelling maintenance so no deferred worker can restore
-    // root activity after the loop-owned route tables disappear.
-    for root_id in roots {
-        if live_roots.contains_key(&root_id) {
-            quiesce_unbound_root_with(&root_id, live_roots, executor, lsp);
-        } else if let Some(ctx) = executor.actor_context(&root_id) {
-            ctx.mark_subc_unbound();
-            executor.cancel_queued_root_maintenance(&root_id);
-            crate::commands::configure::cancel_deferred_configure_maintenance(&ctx);
-        }
-    }
-
-    for route in routes.values() {
-        installed_routes::status_unbound(route);
-        runner_notices::route_unbound(route);
-    }
-    routes.clear();
-    route_delivery::publish_sessions(delivery, routes);
-    root_channels.clear();
-    installed_route_epochs.clear();
 }
 
 /// Per-channel epoch watermarks for roots reclaimed without a client Goodbye.
@@ -2668,6 +2536,19 @@ fn reap_idle_roots_with_presence(
             .get(root_id)
             .is_some_and(|channels| !channels.is_empty());
         let has_pending_bind = pending_bind_roots.contains(root_id);
+
+        if deletion_confirmed
+            && meta.goodbye_quiesce_at.is_some()
+            && !root_quiesce::has_live_route_bind(root_id, pending_binds)
+        {
+            root_quiesce::quiesce_root(
+                root_id,
+                meta,
+                executor,
+                QuiescedLsp::ReapInBackground,
+                "root_reclaim",
+            );
+        }
 
         // A connected route is not activity. Release only resident handles;
         // keep the actor and watcher so its next call takes the normal reload
@@ -4030,6 +3911,7 @@ async fn teardown_installed_route(
     executor: &Arc<Executor>,
     channel: RouteChannel,
     cancellation_reason: &str,
+    goodbye_grace: bool,
     replacement_root: Option<&ProjectRootId>,
     installed_route_epochs: &mut HashMap<u16, u32>,
     routes: &mut HashMap<RouteChannel, RouteIdentity>,
@@ -4152,7 +4034,7 @@ async fn teardown_installed_route(
     }
     let migrated =
         push::migrate_retry_buffer_to_push_buffer(metrics, retry_buffer, channel, push_buffer);
-    if let Some(identity) = routes.get(&channel) {
+    if let Some(identity) = routes.get(&channel).filter(|_| !goodbye_grace) {
         let has_pending_bind = pending_binds
             .values()
             .any(|pending| pending.bind_root_id == identity.root);
@@ -4175,14 +4057,21 @@ async fn teardown_installed_route(
     delay_route_detach_for_test(lifecycle_probe).await;
     if let Some(identity) = remove_route_channel(routes, &mut root_channels.channels, channel) {
         metrics.completion_delivery.route_closed(channel);
-        route_delivery::sync_route_change(
-            executor,
-            delivery,
-            routes,
-            root_channels,
-            &identity.root,
-            metrics,
-        );
+        let defer_quiesce = goodbye_grace && !root_channels.contains_key(&identity.root);
+        if defer_quiesce {
+            // Publish the route removal without enabling extra background
+            // refresh for a root whose only routes were workers.
+            route_delivery::publish_sessions(delivery, routes);
+        } else {
+            route_delivery::sync_route_change(
+                executor,
+                delivery,
+                routes,
+                root_channels,
+                &identity.root,
+                metrics,
+            );
+        }
         if let Some(probe) = lifecycle_probe {
             probe.route_detached(channel, &identity.session);
         }
@@ -4207,6 +4096,11 @@ async fn teardown_installed_route(
             );
         }
         if let Some(meta) = live_roots.get_mut(&identity.root) {
+            if defer_quiesce {
+                meta.goodbye_quiesce_at.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + root_quiesce::GOODBYE_QUIESCE_GRACE
+                });
+            }
             meta.route_activity.remove(&channel);
             let idle_for = meta.last_touched.elapsed();
             meta.note_activity();
@@ -4227,7 +4121,9 @@ async fn teardown_installed_route(
                 identity.session
             );
         }
-        if root_channels.release_if_unbound(&identity.root, pending_binds, replacement_root) {
+        if !defer_quiesce
+            && root_channels.release_if_unbound(&identity.root, pending_binds, replacement_root)
+        {
             quiesce_unbound_root(&identity.root, live_roots, executor);
         }
     } else {
@@ -5427,6 +5323,14 @@ where
             {
                 break Err(error);
             }
+            root_quiesce::settle_goodbye_quiesces(
+                tokio::time::Instant::now(),
+                false,
+                &mut live_roots,
+                &pending_binds,
+                &mut root_channels,
+                &executor,
+            );
 
             dispatch_path_metrics.mark_frame_loop_step(
                 "push::drain_retry_buffers_for_bound_routes",
@@ -5723,6 +5627,7 @@ where
                             &executor,
                             channel,
                             "Goodbye",
+                            drain_progress.is_none(),
                             None,
                             &mut installed_route_epochs,
                             &mut routes,
@@ -6279,7 +6184,8 @@ where
                                 // Opening the window is what detaches foreground
                                 // bash waits: each checks it on its next poll.
                                  scope_describe_task.abort();
-                                 module_drain.begin(until);
+                                  module_drain.begin(until);
+                                  root_quiesce::settle_goodbye_quiesces(tokio::time::Instant::now(), true, &mut live_roots, &pending_binds, &mut root_channels, &executor);
                                  gh_relay_requests.drain();
                                 drain_progress = Some(drain::DrainProgress {
                                     until,
@@ -7589,9 +7495,13 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             completion.inserted_new_actor,
         );
-        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
-            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
-        }
+        root_quiesce::quiesce_after_bind_failure(
+            &completion.bind_root_id,
+            live_roots,
+            pending_binds,
+            root_channels,
+            executor,
+        );
         remove_installed_route(installed_route_epochs, route_id);
         return Ok(());
     };
@@ -7620,9 +7530,13 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
-        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
-            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
-        }
+        root_quiesce::quiesce_after_bind_failure(
+            &completion.bind_root_id,
+            live_roots,
+            pending_binds,
+            root_channels,
+            executor,
+        );
         log::debug!(
             "subc attach: discarded completed RouteBind for cancelled route {} root {}",
             completion.route,
@@ -7650,9 +7564,13 @@ async fn handle_route_bind_completion(
             &completion.bind_root_id,
             inserted_new_actor,
         );
-        if root_channels.release_if_unbound(&completion.bind_root_id, pending_binds, None) {
-            quiesce_unbound_root(&completion.bind_root_id, live_roots, executor);
-        }
+        root_quiesce::quiesce_after_bind_failure(
+            &completion.bind_root_id,
+            live_roots,
+            pending_binds,
+            root_channels,
+            executor,
+        );
         let message = response_message(response, fallback);
         let fatal = response_is_fatal_panic(response);
         let error_code = route_bind_error_code_for_configure_response(response);
@@ -8212,6 +8130,7 @@ async fn handle_control_request(
                         executor,
                         route_key(route_channel, installed_epoch),
                         "higher-epoch RouteBind",
+                        false,
                         None,
                         installed_route_epochs,
                         routes,
@@ -8346,6 +8265,7 @@ async fn handle_control_request(
                     executor,
                     route_key(route_channel, installed_epoch),
                     "higher-epoch RouteBind",
+                    false,
                     Some(&replacement_root),
                     installed_route_epochs,
                     routes,
@@ -12310,7 +12230,7 @@ fn run_configure_tail_maintenance(ctx: &AppContext) -> MaintenanceJobOutcome {
 /// exclusive writer barrier once configure asks to change the root. The
 /// root's meta keeps the bind's cancellation while it is in flight, so
 /// maintenance defers the root as for any bind in flight and quiescing the
-/// root cancels it (`quiesce_unbound_root_with`).
+/// root cancels it (`root_quiesce::quiesce_root`).
 ///
 /// Like a route bind, a replay whose configure commits then runs the
 /// standing half of the bind (`StandingActor::begin_session_bind`) before
@@ -22405,6 +22325,7 @@ mod terminal_lifecycle_tests {
                         &executor,
                         route,
                         "higher-epoch RouteBind",
+                        false,
                         Some(&root),
                         &mut HashMap::from([(route.channel, route.epoch)]),
                         &mut routes,

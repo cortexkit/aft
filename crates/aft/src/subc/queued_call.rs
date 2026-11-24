@@ -385,6 +385,7 @@ mod tests {
             &executor,
             route,
             "Goodbye",
+            true,
             None,
             &mut HashMap::from([(41, 1)]),
             &mut routes,
