@@ -32,6 +32,9 @@ use crate::callgraph_store::{
     MAX_DELTA_BYTES,
 };
 use crate::cold_build_limiter;
+use shared_flight::{builder_attempt_terminal, BuilderAttemptTerminal};
+
+mod shared_flight;
 
 const DEFAULT_SOFT_DEADLINE: Duration = Duration::from_secs(1);
 
@@ -67,6 +70,7 @@ type Tier2PermitSlot = Arc<Mutex<Option<cold_build_limiter::ColdBuildPermit>>>;
 #[derive(Clone)]
 struct Waiter {
     tx: WaiterTx,
+    cancellation: Option<crate::executor::JobCancellation>,
 }
 
 #[derive(Default)]
@@ -375,7 +379,7 @@ fn run_tier2_pass_with_deadline<T>(
     action: impl FnOnce() -> T,
 ) -> (T, bool) {
     let cancellation = crate::executor::JobCancellation::new().with_root(project_root);
-    let parent_cancellation = crate::executor::current_job_cancellation();
+    let parent_cancelled = shared_flight::current();
     let deadline_cancellation = cancellation.clone();
     let root = project_root.to_path_buf();
     let timed_out = Arc::new(AtomicBool::new(false));
@@ -384,10 +388,7 @@ fn run_tier2_pass_with_deadline<T>(
     let timer = std::thread::spawn(move || {
         let deadline = Instant::now() + timeout;
         loop {
-            if parent_cancellation
-                .as_ref()
-                .is_some_and(|token| token.cancel_requested_before_commit())
-            {
+            if parent_cancelled() {
                 deadline_cancellation.request_cancel();
                 return;
             }
@@ -422,41 +423,6 @@ fn run_tier2_pass_with_deadline<T>(
     let _ = done_tx.send(());
     let _ = timer.join();
     (result, timed_out.load(Ordering::Acquire))
-}
-
-enum BuilderAttemptTerminal {
-    Succeeded,
-    CacheWriterLeaseWait,
-    /// The published call graph view's database was locked.
-    ViewBusyWait,
-    Failed(String),
-    Inconclusive,
-}
-
-fn builder_attempt_terminal(outcome: &JobOutcome) -> BuilderAttemptTerminal {
-    match outcome {
-        JobOutcome::Fresh { payload }
-            if payload["status"] == "pending" && payload["code"] == "callgraph_building" =>
-        {
-            BuilderAttemptTerminal::ViewBusyWait
-        }
-        JobOutcome::Fresh { payload } if payload["status"] == "pending" => {
-            BuilderAttemptTerminal::Inconclusive
-        }
-        JobOutcome::Fresh { payload } if callgraph_unavailable_payload(payload) => {
-            BuilderAttemptTerminal::Failed("callgraph_unavailable".to_string())
-        }
-        JobOutcome::Fresh { .. } => BuilderAttemptTerminal::Succeeded,
-        JobOutcome::Failed { message } if message.contains("writer_lease_timeout:") => {
-            BuilderAttemptTerminal::CacheWriterLeaseWait
-        }
-        JobOutcome::Failed { message } => {
-            BuilderAttemptTerminal::Failed(builder_failure_terminal(message))
-        }
-        JobOutcome::Stale { .. } | JobOutcome::Pending { .. } => {
-            BuilderAttemptTerminal::Inconclusive
-        }
-    }
 }
 
 fn callgraph_unavailable_payload(payload: &Value) -> bool {
@@ -995,10 +961,7 @@ impl InspectManager {
             "explicit inspect Tier-2 run",
             request,
             || self.heavy_root_work_allowed(),
-            || {
-                crate::executor::current_job_cancellation()
-                    .is_some_and(|token| token.cancel_requested_before_commit())
-            },
+            shared_flight::current(),
         )?;
         permits.insert(job.project_root.clone(), permit.downgrade());
         Some(Arc::new(Mutex::new(Some(permit))))
@@ -2434,14 +2397,14 @@ impl InspectManager {
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
         if let Some(registration) = in_flight.get_mut(key) {
-            registration.waiters.push(Waiter { tx: waiter_tx });
+            registration.waiters.push(Waiter::new(waiter_tx));
             self.in_flight_changed.notify_all();
             return Ok(false);
         }
 
         in_flight.insert(
             key.clone(),
-            InFlightRegistration::new(vec![Waiter { tx: waiter_tx }]),
+            InFlightRegistration::new(vec![Waiter::new(waiter_tx)]),
         );
         drop(in_flight);
         self.record_flight_start(key);
@@ -2455,9 +2418,13 @@ impl InspectManager {
         self.record_flight_start(&job.key);
         let manager = Arc::clone(self);
         let pool = Arc::clone(&self.pool);
-        let cancellation = crate::executor::current_job_cancellation();
+        // The flight serves every caller that joins it, so it runs under its
+        // own token (the root's lifecycle, not this caller's request) and
+        // stops only when all joined callers are cancelled.
+        let cancellation = crate::executor::current_job_cancellation().map(|token| token.fresh());
         pool.spawn_fifo(move || {
             let _cancellation = cancellation.map(crate::executor::install_job_cancellation);
+            let _callers = shared_flight::enter(&manager, job.key.clone());
             let _flight = manager.tier2_flight_exit_guard(job.key.clone());
             let result = manager.tier2_run_with_reuse_job_result_catching(job, options, None);
             manager.route_tier2_reuse_completion(result);
@@ -2791,14 +2758,16 @@ impl InspectManager {
                     self.data_layer_dead_code
                         .inventory(&job.project_root)
                         .unwrap_or_else(|| {
-                            super::inventory::InspectInventory::collect(&job.project_root, || {
-                                !crate::executor::current_job_cancelled()
-                            })
+                            let cancelled = shared_flight::current();
+                            super::inventory::InspectInventory::collect(
+                                &job.project_root,
+                                move || !cancelled(),
+                            )
                         }),
                 )
             });
         let _inventory = inventory.install();
-        if crate::executor::current_job_cancelled() {
+        if shared_flight::cancelled() {
             return InspectResult::failed(
                 &job,
                 "tier2 pass cancelled before incremental scan",
@@ -3631,13 +3600,13 @@ impl InspectManager {
             .lock()
             .map_err(|_| "inspect in-flight map lock poisoned".to_string())?;
         if let Some(registration) = in_flight.get_mut(&key) {
-            registration.waiters.push(Waiter { tx: waiter_tx });
+            registration.waiters.push(Waiter::new(waiter_tx));
             return Ok(());
         }
 
         in_flight.insert(
             key.clone(),
-            InFlightRegistration::new(vec![Waiter { tx: waiter_tx }]),
+            InFlightRegistration::new(vec![Waiter::new(waiter_tx)]),
         );
         drop(in_flight);
         self.record_flight_start(&key);
@@ -10417,5 +10386,136 @@ mod tier2_unreadable_source_tests {
         assert!(published);
         assert!(waiters.is_some());
         assert!(!manager.tier2_any_in_flight());
+    }
+}
+
+#[cfg(test)]
+mod shared_flight_cancellation_tests {
+    use super::*;
+    use crate::cold_build_limiter::{
+        test_limiter, try_acquire_classified_with_limiter, ColdBuildAdmissionClass,
+        ColdBuildAdmissionRequest, ColdBuildPermit,
+    };
+    use crate::config::Config;
+    use crate::parser::SymbolCache;
+    use std::sync::RwLock;
+
+    struct QueuedFlight {
+        _dir: tempfile::TempDir,
+        manager: Arc<InspectManager>,
+        snapshot: InspectSnapshot,
+        held_slot: ColdBuildPermit,
+        starter_cancellation: crate::executor::JobCancellation,
+        starter_rx: std::sync::mpsc::Receiver<JobOutcome>,
+    }
+
+    /// A duplicates flight started by a caller with its own request
+    /// cancellation, waiting at cold-build admission (the only slot is held).
+    fn queued_flight() -> QueuedFlight {
+        let dir = tempfile::tempdir().unwrap();
+        let root = crate::path_identity::canonicalize_normalized(dir.path());
+        std::fs::write(root.join("lib.rs"), "fn alpha() {}\nfn beta() {}\n").unwrap();
+        let snapshot = InspectSnapshot::new(
+            root.clone(),
+            root.join(".aft-cache").join("inspect"),
+            Arc::new(Config {
+                project_root: Some(root.clone()),
+                ..Config::default()
+            }),
+            Arc::new(RwLock::new(SymbolCache::new())),
+        );
+        let manager = Arc::new(InspectManager::new());
+        let limiter = test_limiter(1);
+        manager.set_cold_build_limiter(limiter.clone());
+        let held_slot = try_acquire_classified_with_limiter(
+            &limiter,
+            &ColdBuildAdmissionRequest::new("held-test-slot", ColdBuildAdmissionClass::Maintenance),
+        )
+        .unwrap();
+        let starter_cancellation = crate::executor::JobCancellation::new().with_root(&root);
+        let (starter_tx, starter_rx) = std::sync::mpsc::channel();
+        let (starter_manager, starter_snapshot, starter_token) = (
+            Arc::clone(&manager),
+            snapshot.clone(),
+            starter_cancellation.clone(),
+        );
+        std::thread::spawn(move || {
+            let _cancellation = crate::executor::install_job_cancellation(starter_token);
+            let scope = JobScope::for_project(starter_snapshot.project_root.clone());
+            let outcome = starter_manager.tier2_run_with_reuse_blocking(
+                starter_snapshot,
+                InspectCategory::Duplicates,
+                scope,
+            );
+            let _ = starter_tx.send(outcome);
+        });
+        // The bound only stops a broken build from hanging the suite.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while manager.tier2_builder_state(InspectCategory::Duplicates)
+            != InspectBuilderState::QueuedBehindColdBuilds
+        {
+            assert!(
+                Instant::now() < deadline,
+                "the flight never queued for admission"
+            );
+            std::thread::yield_now();
+        }
+        QueuedFlight {
+            _dir: dir,
+            manager,
+            snapshot,
+            held_slot,
+            starter_cancellation,
+            starter_rx,
+        }
+    }
+
+    /// Two callers share one Tier-2 flight. Cancelling the caller that started
+    /// it must not fail the flight for the other, nor record a builder failure.
+    #[test]
+    fn a_cancelled_caller_does_not_fail_the_shared_tier2_flight() {
+        let flight = queued_flight();
+        let key = flight
+            .manager
+            .tier2_reuse_job(flight.snapshot.clone(), InspectCategory::Duplicates, None)
+            .key;
+        let (joined_tx, joined_rx) = bounded(1);
+        assert!(
+            !flight
+                .manager
+                .register_tier2_reuse_waiter(&key, joined_tx)
+                .unwrap(),
+            "the second caller joins the running flight"
+        );
+        flight.starter_cancellation.request_cancel();
+        drop(flight.held_slot);
+
+        let joined = joined_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the shared flight completes");
+        assert!(matches!(joined, JobOutcome::Fresh { .. }), "{joined:?}");
+        let detail = flight
+            .manager
+            .tier2_builder_state_detail(InspectCategory::Duplicates);
+        assert!(!detail.contains("failed"), "{detail}");
+        let _ = flight.starter_rx.recv_timeout(Duration::from_secs(60));
+    }
+
+    /// When every caller of a flight is cancelled the flight stops, and the
+    /// stop is not recorded as a failed build.
+    #[test]
+    fn a_flight_whose_callers_all_cancelled_stops_without_a_builder_failure() {
+        let flight = queued_flight();
+        flight.starter_cancellation.request_cancel();
+        let outcome = flight
+            .starter_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the cancelled flight ends");
+        assert!(matches!(outcome, JobOutcome::Failed { .. }), "{outcome:?}");
+        let detail = flight
+            .manager
+            .tier2_builder_state_detail(InspectCategory::Duplicates);
+        assert!(!detail.contains("failed"), "{detail}");
+        drop(flight.held_slot);
     }
 }
