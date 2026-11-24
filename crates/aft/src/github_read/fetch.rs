@@ -12,7 +12,11 @@ use super::resource::{GithubResource, GithubResourceKind};
 
 const ISSUE_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,url";
 const PR_JSON_FIELDS: &str = "number,title,state,author,createdAt,updatedAt,labels,assignees,milestone,body,reactionGroups,comments,files,reviews,baseRefName,headRefName,reviewDecision,url";
-const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100) { nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { id author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
+const PR_REVIEW_COMMENTS_QUERY: &str = "query AftReadPullRequestReviewComments($owner: String!, $name: String!, $number: Int!, $cursor: String) { repository(owner: $owner, name: $name) { nameWithOwner pullRequest(number: $number) { number reviews(first: 100, after: $cursor) { pageInfo { hasNextPage endCursor } nodes { author { login } body state submittedAt comments(first: 100) { totalCount nodes { id author { login } body createdAt updatedAt isMinimized path line originalLine } } } } } } }";
+/// Review pages (100 reviews each) fetched for inline comments. Past this the
+/// rendered document says later reviews' inline comments are missing.
+const MAX_REVIEW_PAGES: usize = 10;
+const REVIEWS_PER_PAGE: usize = 100;
 
 /// Request context passed to a structured GitHub fetcher.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,13 +303,10 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
         )?;
         let mut document = normalize_document(&request.resource, &json)?;
         if request.resource.kind == GithubResourceKind::PullRequest {
-            let review_json = self.structured_json(
-                &request.working_directory,
-                &gh_pr_review_comments_args(&request.resource, &document.repository)?,
-                "review comment",
-            )?;
-            let review_document = normalize_document(&request.resource, &review_json)?;
-            document.review_comment_sections = review_document.review_comment_sections;
+            let (sections, reviews_fetched) =
+                self.fetch_review_comment_sections(request, &document.repository)?;
+            document.review_comment_sections = sections;
+            document.review_pages_cut_after = reviews_fetched;
             // Thread lookup is independent: a failed lookup must not hide comments.
             document.review_threads = self
                 .fetch_review_threads(request, &document.repository)
@@ -337,6 +338,40 @@ impl<R: GhCommandRunner> GithubFetcher for GhCliFetcher<R> {
 }
 
 impl<R: GhCommandRunner> GhCliFetcher<R> {
+    /// Inline review comments, one section per review, following the review
+    /// connection's pages up to [`MAX_REVIEW_PAGES`]. The second value is the
+    /// number of reviews fetched when more pages were left unfetched.
+    fn fetch_review_comment_sections(
+        &self,
+        request: &GithubFetchRequest,
+        repository: &str,
+    ) -> Result<(Vec<super::model::GithubReviewCommentSection>, Option<usize>), GithubReadError>
+    {
+        let mut sections = Vec::new();
+        let mut cursor: Option<String> = None;
+        for page in 0..MAX_REVIEW_PAGES {
+            let mut args = gh_pr_review_comments_args(&request.resource, repository)?;
+            if let Some(cursor) = &cursor {
+                args.extend(["-f".to_string(), format!("cursor={cursor}")]);
+            }
+            let json = self.structured_json(&request.working_directory, &args, "review comment")?;
+            sections.extend(normalize_document(&request.resource, &json)?.review_comment_sections);
+            let next = json
+                .pointer("/data/repository/pullRequest/reviews/pageInfo")
+                .filter(|info| info.get("hasNextPage").and_then(Value::as_bool) == Some(true))
+                .and_then(|info| info.get("endCursor").and_then(Value::as_str))
+                .filter(|next| !next.is_empty() && cursor.as_deref() != Some(*next));
+            match next {
+                None => break,
+                Some(_) if page + 1 == MAX_REVIEW_PAGES => {
+                    return Ok((sections, Some(MAX_REVIEW_PAGES * REVIEWS_PER_PAGE)));
+                }
+                Some(next) => cursor = Some(next.to_string()),
+            }
+        }
+        Ok((sections, None))
+    }
+
     /// Run one structured `gh` command, reading at most
     /// [`MAX_STRUCTURED_BYTES`] of its output. Returns the output and whether
     /// it reached that ceiling.
@@ -820,6 +855,105 @@ mod tests {
         );
         assert!(complete_leading_array_elements(b"[12").is_empty());
         assert!(complete_leading_array_elements(b"{}").is_empty());
+    }
+
+    fn pr_request() -> GithubFetchRequest {
+        GithubFetchRequest {
+            resource: GithubResource {
+                kind: GithubResourceKind::PullRequest,
+                ..issue_request().resource
+            },
+            working_directory: PathBuf::from("/fixture"),
+        }
+    }
+
+    /// One page of the review-comment query: one review by `author` holding
+    /// one inline comment `comment`.
+    fn review_page(author: &str, comment: &str, next: Option<&str>) -> Vec<u8> {
+        serde_json::to_vec(&json!({"data": {"repository": {
+            "nameWithOwner": "owner/repo",
+            "pullRequest": {"number": 1, "reviews": {
+                "pageInfo": {"hasNextPage": next.is_some(), "endCursor": next},
+                "nodes": [{
+                    "author": {"login": author},
+                    "body": "",
+                    "state": "COMMENTED",
+                    "submittedAt": "2026-09-03T05:05:00Z",
+                    "comments": {"totalCount": 1, "nodes": [{
+                        "id": comment,
+                        "author": {"login": author},
+                        "body": comment,
+                        "createdAt": "2026-09-03T05:05:00Z",
+                        "isMinimized": false,
+                        "path": "src/lib.rs",
+                        "line": 1
+                    }]}
+                }]
+            }}
+        }}}))
+        .unwrap()
+    }
+
+    fn pr_outputs(review_pages: Vec<Vec<u8>>) -> FixtureRunner {
+        let runner = FixtureRunner::default();
+        let mut outputs = vec![ok_output(
+            serde_json::to_vec(&json!({
+                "number": 1,
+                "title": "fixture",
+                "url": "https://github.com/owner/repo/pull/1"
+            }))
+            .unwrap(),
+        )];
+        outputs.extend(review_pages.into_iter().map(ok_output));
+        // Thread state is optional; a failed lookup is ignored.
+        outputs.push(Err(GhCommandError::Other("no thread state".to_string())));
+        outputs.push(ok_output(b"[]".to_vec()));
+        *runner.output.lock().unwrap() = outputs;
+        runner
+    }
+
+    #[test]
+    fn inline_comments_on_later_review_pages_are_fetched() {
+        let runner = pr_outputs(vec![
+            review_page("first-reviewer", "on page one", Some("cursor-1")),
+            review_page("second-reviewer", "on page two", None),
+        ]);
+        let fetcher = GhCliFetcher::new(runner);
+        let document = fetcher.fetch(&pr_request()).unwrap();
+        let comments: Vec<_> = document
+            .review_comment_sections
+            .iter()
+            .flat_map(|section| section.comments.iter().map(|comment| comment.body.as_str()))
+            .collect();
+        assert_eq!(comments, ["on page one", "on page two"]);
+        assert_eq!(document.review_pages_cut_after, None);
+        assert!(!document.has_fetch_gap());
+        let calls = fetcher.runner.calls.lock().unwrap();
+        assert!(calls[2]
+            .iter()
+            .any(|argument| argument == "cursor=cursor-1"));
+    }
+
+    #[test]
+    fn review_pages_past_the_page_budget_are_named_as_missing() {
+        let pages = (0..MAX_REVIEW_PAGES)
+            .map(|page| {
+                review_page(
+                    &format!("reviewer-{page}"),
+                    &format!("comment {page}"),
+                    Some(&format!("cursor-{page}")),
+                )
+            })
+            .collect();
+        let document = GhCliFetcher::new(pr_outputs(pages))
+            .fetch(&pr_request())
+            .unwrap();
+        assert_eq!(document.review_comment_sections.len(), MAX_REVIEW_PAGES);
+        assert_eq!(document.review_pages_cut_after, Some(1000));
+        assert!(document.has_fetch_gap());
+        assert!(crate::github_read::render_document(&document).contains(
+            "Review comments incomplete: only the first 1000 reviews were fetched; inline comments on later reviews are not shown."
+        ));
     }
 
     #[test]

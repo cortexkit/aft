@@ -215,14 +215,21 @@ fn render_review_comment_sections(
     resource: &GithubResource,
 ) {
     let sections = &document.review_comment_sections;
-    if !sections.iter().any(|section| {
-        section.comments.iter().any(comment_is_visible)
-            || section.comments_total_count.unwrap_or(0) > section.comments.len()
-            || section.minimized_comments_count.unwrap_or(0) > 0
-    }) {
+    if document.review_pages_cut_after.is_none()
+        && !sections.iter().any(|section| {
+            section.comments.iter().any(comment_is_visible)
+                || section.comments_total_count.unwrap_or(0) > section.comments.len()
+                || section.minimized_comments_count.unwrap_or(0) > 0
+        })
+    {
         return;
     }
     output.push_str("\n## Review comments\n\n");
+    if let Some(fetched) = document.review_pages_cut_after {
+        output.push_str(&format!(
+            "Review comments incomplete: only the first {fetched} reviews were fetched; inline comments on later reviews are not shown.\n\n"
+        ));
+    }
     for section in sections {
         let displayed = newest_comments(&section.comments);
         let total_count = section
