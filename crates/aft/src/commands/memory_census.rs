@@ -73,6 +73,7 @@ pub(crate) fn render_memory_census_with_roots(
         (None, None) => None,
     };
     let process_io = crate::process_io::ProcessIoSnapshot::capture().to_value();
+    let relief = crate::memory::last_allocator_relief();
     let mut result = json!({
         "process": {
             "phys_footprint_bytes": process.phys_footprint_bytes,
@@ -87,14 +88,15 @@ pub(crate) fn render_memory_census_with_roots(
             "shared_semantic_base_bytes": snapshot.shared_semantic_bases.estimated_bytes.unwrap_or(0),
             "total_attributed_bytes": process.total_attributed_bytes,
             "unattributed_bytes": unattributed_bytes,
-            "last_relief_at_ms": crate::memory::last_allocator_relief_at_ms(),
+            "last_relief_at_ms": relief.at_ms,
+            "last_relief_source": relief.source,
             // Two figures, not one "freed" number: what the allocator's own
             // accounting says it returned (source names what that measures on
             // this platform) and what the process was seen to give up.
-            "last_relief_allocator_accounting_bytes": crate::memory::last_allocator_relief_accounting_bytes(),
-            "last_relief_allocator_accounting_source": crate::memory::allocator_relief_accounting_source(),
-            "last_relief_rss_drop_bytes": crate::memory::last_allocator_relief_rss_drop_bytes(),
-            "last_relief_phys_footprint_drop_bytes": crate::memory::last_allocator_relief_phys_footprint_drop_bytes(),
+            "last_relief_allocator_accounting_bytes": relief.accounting_bytes,
+            "last_relief_allocator_accounting_source": relief.accounting_source,
+            "last_relief_rss_drop_bytes": relief.rss_drop_bytes,
+            "last_relief_phys_footprint_drop_bytes": relief.phys_footprint_drop_bytes,
             "dead_code_snapshots": {
                 "roots": dead_code_snapshots.roots,
                 "bytes": dead_code_snapshots.bytes,

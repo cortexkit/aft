@@ -3992,6 +3992,7 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         })
         .collect::<serde_json::Map<String, Value>>()
         .into();
+    let relief = crate::memory::last_allocator_relief();
     let result = json!({
         "status": snapshot.roots_status,
         "roots": per_root,
@@ -4005,10 +4006,9 @@ fn memory_rollup_metrics(snapshot: Option<crate::memory::MemoryRollupSnapshot>) 
         "allocator_slack_kind": ALLOCATOR_SLACK_KIND,
         "allocator_slack_measured": snapshot.process.allocator_slack_measured,
         "allocator_observation_age_ms": snapshot.process.allocator_observation_age_ms,
-        // The latest periodic relief pass, as two labelled figures: the
-        // allocator's own accounting and the RSS drop the process showed.
-        "last_relief_allocator_accounting_bytes": crate::memory::last_allocator_relief_accounting_bytes(),
-        "last_relief_rss_drop_bytes": crate::memory::last_allocator_relief_rss_drop_bytes(),
+        // Allocator accounting is separate from the observed RSS drop.
+        "last_relief_allocator_accounting_bytes": relief.accounting_bytes,
+        "last_relief_rss_drop_bytes": relief.rss_drop_bytes,
         // Headline number: excludes reclaimable pages RSS still counts.
         "phys_footprint_bytes": snapshot.process.phys_footprint_bytes,
         "total_attributed_bytes": snapshot.process.total_attributed_bytes,

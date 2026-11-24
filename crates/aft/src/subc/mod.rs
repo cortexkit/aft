@@ -2245,7 +2245,7 @@ fn allocator_pressure_relief_after_idle_sweep(
 
     #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu")))]
     {
-        Some(crate::memory::relieve_allocator_pressure())
+        Some(crate::memory::relieve_allocator_pressure_after_idle_sweep())
     }
     #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu"))))]
     {

@@ -271,7 +271,9 @@ impl Pool {
                         // after a run, rather than holding them until the
                         // daemon's periodic relief comes round.
                         #[cfg(any(target_os = "linux", target_os = "macos"))]
-                        crate::memory::return_free_pages();
+                        crate::memory::return_free_pages(
+                            crate::memory::AllocatorReliefSource::BuildPoolJob,
+                        );
                     }
                     let mut state = self.state().lock();
                     state.running -= 1;
