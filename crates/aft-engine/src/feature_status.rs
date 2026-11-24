@@ -163,12 +163,14 @@ impl IndexObservation {
         self.effective == IndexEffective::Ready
     }
 
-    pub(crate) fn disk_paused(&self) -> bool {
+    #[doc(hidden)]
+    pub fn disk_paused(&self) -> bool {
         self.unavailable_reason.as_deref()
             == Some(crate::data_layer::surfaces::reason::DISK_RESERVE)
     }
 
-    pub(crate) fn readiness_label(&self) -> String {
+    #[doc(hidden)]
+    pub fn readiness_label(&self) -> String {
         match self.effective {
             IndexEffective::Unavailable if self.disk_paused() => "paused (low disk space)".into(),
             IndexEffective::Unavailable
@@ -383,7 +385,8 @@ fn observe_semantic(ctx: &dyn IndexHost) -> IndexObservation {
     }
 }
 
-pub(crate) fn disk_pause_detail(ctx: &dyn IndexHost) -> Option<String> {
+#[doc(hidden)]
+pub fn disk_pause_detail(ctx: &dyn IndexHost) -> Option<String> {
     let failure = crate::data_layer::surfaces::report(ctx)?.failure?;
     crate::view_storage_reserve::is_message(&failure.error).then_some(failure.error)
 }

@@ -746,7 +746,8 @@ impl BgTaskRegistry {
         }
     }
 
-    pub(crate) fn mask_notice_text(&self, metadata: &PersistedTask, text: &str) -> String {
+    #[doc(hidden)]
+    pub fn mask_notice_text(&self, metadata: &PersistedTask, text: &str) -> String {
         if text.is_empty() {
             return String::new();
         }
