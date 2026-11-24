@@ -1029,6 +1029,54 @@ fn scoped_close_rejected_before_queue_keeps_the_open_document() {
 }
 
 #[test]
+fn failed_first_server_does_not_leave_later_server_on_pre_edit_content() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = canonicalize_for_lsp(tmp.path()).unwrap();
+    let file = root.join("index.ts");
+    std::fs::write(&file, "export const n = 1;\n").unwrap();
+    let first = ServerKey {
+        kind: ServerKind::TypeScript(None),
+        root: root.clone(),
+    };
+    let second = ServerKey {
+        kind: ServerKind::Biome,
+        root,
+    };
+    let keys = vec![first.clone(), second.clone()];
+    let mut manager = LspManager::new();
+    for key in &keys {
+        let client = lifecycle_fake_client(&manager, key);
+        manager.clients.insert(key.clone(), client);
+    }
+    assert_eq!(
+        manager.open_document_for_servers(&file, &keys).unwrap(),
+        keys
+    );
+    manager
+        .diagnostics
+        .publish(second.clone(), file.clone(), Vec::new());
+    assert!(manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&second, &file));
+    let old_version = manager.documents[&second].version(&file).unwrap();
+    reject_fixture_writes(manager.clients.get_mut(&first).unwrap(), &file);
+    let edited = "export const n = 2;\n";
+    std::fs::write(&file, edited).unwrap();
+
+    assert!(matches!(
+        manager.notify_file_changed_for_server_keys(file.clone(), edited, keys),
+        Err(LspError::ServerNotReady(_))
+    ));
+    assert_eq!(
+        manager.documents[&second].version(&file),
+        Some(old_version + 1)
+    );
+    assert!(!manager
+        .diagnostics
+        .has_fresh_report_for_server_file(&second, &file));
+}
+
+#[test]
 fn per_file_pulls_close_temporary_documents_at_each_open_version() {
     let tmp = tempfile::tempdir().unwrap();
     let root = canonicalize_for_lsp(tmp.path()).unwrap();
