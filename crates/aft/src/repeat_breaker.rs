@@ -74,7 +74,10 @@ pub fn semantic_key(tool: &str, input: &Value) -> String {
             ],
         ),
         "glob" => select_fields(input, &["pattern", "path", "topK", "offset"]),
-        "aft_search" => select_fields(input, &["query", "path", "topK", "offset", "includeTests"]),
+        "aft_search" => select_fields(
+            input,
+            &["query", "pattern", "path", "topK", "offset", "includeTests"],
+        ),
         _ => {
             let mut value = input.clone();
             if let Some(object) = value.as_object_mut() {
@@ -119,6 +122,39 @@ fn canonicalize(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn search_patterns_have_distinct_repeat_histories() {
+        let breaker = RepeatBreaker::default();
+        let start = Instant::now();
+        for (step, pattern) in ["alpha", "beta", "gamma"].into_iter().enumerate() {
+            let call = RepeatCall::new("search", &serde_json::json!({ "pattern": pattern }));
+            assert!(
+                breaker
+                    .observe_at(
+                        "agent",
+                        &call,
+                        0,
+                        start + Duration::from_secs(15 * step as u64)
+                    )
+                    .is_none(),
+                "the pattern changed to {pattern}"
+            );
+        }
+
+        let call = RepeatCall::new("search", &serde_json::json!({ "pattern": "gamma" }));
+        assert!(breaker
+            .observe_at("agent", &call, 0, start + Duration::from_secs(45))
+            .is_none());
+        assert_eq!(
+            breaker
+                .observe_at("agent", &call, 0, start + Duration::from_secs(60))
+                .unwrap()
+                .count,
+            3
+        );
+    }
 
     #[test]
     fn output_hash_ignores_the_task_line_of_a_finished_bash_call() {
