@@ -13,7 +13,7 @@ pub struct IdleLspFixture {
 }
 
 impl IdleLspFixture {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn new() -> Self {
         Self::with_server_binary(crate::fake_lsp_test_helper::fake_server_binary)
     }

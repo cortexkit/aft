@@ -123,7 +123,7 @@ pub use aft_base::environment;
 mod engine_source_guard_tests;
 pub use aft_base::error;
 pub mod exec_remote;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use aft_base::executable_cache;
 pub mod executor;
 pub use aft_base::feature_config;
@@ -149,7 +149,7 @@ pub mod gh_shim_worker_broker;
 #[doc(hidden)]
 pub mod gh_shim_worker_endpoints;
 pub use aft_base::git_head;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use aft_base::git_probe;
 pub(crate) use aft_base::git_revision;
 pub use aft_index::git_index_reader;
@@ -315,7 +315,7 @@ pub mod windows_shell;
 pub use aft_base::worker_jail_canary;
 #[cfg(test)]
 mod gate_hermeticity_tests;
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use aft_base::test_allocations;
 #[cfg(any(test, feature = "test-support"))]
 #[path = "base_tests/test_env.rs"]
