@@ -513,7 +513,7 @@ fn prepare_project_watcher_runtime<W, E, F, S>(
 where
     W: Send + 'static,
     E: std::fmt::Display + Send + 'static,
-    F: FnOnce(PathBuf, Vec<PathBuf>, mpsc::Sender<notify::Result<notify::Event>>) -> Result<W, E>
+    F: FnOnce(PathBuf, Vec<PathBuf>, crate::watcher_filter::RawEventSender) -> Result<W, E>
         + Send
         + 'static,
     S: FnOnce(thread::Builder, Box<dyn FnOnce() + Send>) -> std::io::Result<thread::JoinHandle<()>>,

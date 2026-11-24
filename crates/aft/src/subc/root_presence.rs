@@ -70,7 +70,7 @@ impl RootPresence {
 pub(super) struct RootPresenceProbe {
     latest: Arc<parking_lot::Mutex<Arc<RootPresence>>>,
     in_flight: Arc<AtomicBool>,
-    next_generation: u64,
+    pub(super) next_generation: u64,
     seen_generation: u64,
     next_at: tokio::time::Instant,
 }
