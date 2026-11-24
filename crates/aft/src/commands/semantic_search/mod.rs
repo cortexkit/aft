@@ -6636,7 +6636,7 @@ fn handle_semantic_or_hybrid_search(
                 gap.semantic_status,
                 gap.status,
                 gap.detail,
-                gap.footer_reason,
+                gap.footer_reason.as_ref(),
                 false,
                 warnings,
                 project_root,
@@ -6748,7 +6748,7 @@ fn handle_semantic_or_hybrid_search(
             gap.semantic_status,
             gap.status,
             gap.detail,
-            gap.footer_reason,
+            gap.footer_reason.as_ref(),
             false,
             warnings,
             project_root,
@@ -6770,7 +6770,7 @@ fn handle_semantic_or_hybrid_search(
                 return cancelled_search_response(req);
             }
             let gap = semantic_embed_gap(&error);
-            let reason = query_embedding_failure_reason(&error, gap.footer_reason);
+            let reason = query_embedding_failure_reason(&error, gap.footer_reason.as_ref());
             let response = semantic_unavailable_or_fallback_response(
                 req,
                 ctx,
@@ -6780,7 +6780,7 @@ fn handle_semantic_or_hybrid_search(
                 gap.semantic_status,
                 gap.status,
                 gap.detail,
-                gap.footer_reason,
+                gap.footer_reason.as_ref(),
                 true,
                 warnings,
                 project_root,
@@ -6833,7 +6833,7 @@ fn handle_semantic_or_hybrid_search(
                     gap.semantic_status,
                     gap.status,
                     gap.detail,
-                    gap.footer_reason,
+                    gap.footer_reason.as_ref(),
                     true,
                     warnings,
                     project_root,
@@ -8792,7 +8792,7 @@ fn check_query_dimension(
 /// substring-matching reqwest's rendered text, which varies by backend/locale.
 struct ClassifiedEmbedQueryError {
     detail: String,
-    footer_reason: &'static str,
+    footer_reason: std::borrow::Cow<'static, str>,
 }
 
 const PAUSED_EMBEDDING_DETAIL: &str =
@@ -8845,12 +8845,12 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
         if pause.cause == crate::synapse_embed::PauseCause::WarmingUp {
             return ClassifiedEmbedQueryError {
                 detail: warming_up_embedding_detail(pause.retry_after_ms),
-                footer_reason: WARMING_UP_FOOTER_REASON,
+                footer_reason: WARMING_UP_FOOTER_REASON.into(),
             };
         }
         ClassifiedEmbedQueryError {
             detail: PAUSED_EMBEDDING_DETAIL.to_string(),
-            footer_reason: "unavailable",
+            footer_reason: "unavailable".into(),
         }
     } else if let Some(timeout_ms) = query_embedding_timeout_budget(error) {
         let clean = strip_query_embedding_timeout_marker(error);
@@ -8859,8 +8859,7 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
         let detail = format!(
             "Semantic search unavailable: query embedding timed out after {timeout_ms}ms (semantic.query_timeout_ms; raise it for slow providers). {clean}"
         );
-        let footer_reason =
-            Box::leak(format!("query embed timeout ({timeout_ms}ms)").into_boxed_str());
+        let footer_reason = format!("query embed timeout ({timeout_ms}ms)").into();
         ClassifiedEmbedQueryError {
             detail,
             footer_reason,
@@ -8871,12 +8870,12 @@ fn classify_embed_query_error(error: &str) -> ClassifiedEmbedQueryError {
             detail: format!(
                 "Semantic search unavailable: local query embedder is busy finishing an earlier inference; using lexical search only. {clean}"
             ),
-            footer_reason: "query embed busy",
+            footer_reason: "query embed busy".into(),
         }
     } else {
         ClassifiedEmbedQueryError {
             detail: format!("Semantic search unavailable: {error}"),
-            footer_reason: "unavailable",
+            footer_reason: "unavailable".into(),
         }
     }
 }
@@ -9168,7 +9167,7 @@ struct SemanticLaneGap {
     /// The line that opens the reply text.
     detail: String,
     /// Reason shown in the reply footer's `[semantic: ...]` tag.
-    footer_reason: &'static str,
+    footer_reason: std::borrow::Cow<'static, str>,
 }
 
 /// The gap for an index configured off or failed; `None` for a ready or
@@ -9180,7 +9179,7 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
             semantic_status: "disabled",
             status: "disabled",
             detail: "Semantic search is not enabled.".to_string(),
-            footer_reason: "disabled",
+            footer_reason: "disabled".into(),
         }),
         SemanticIndexStatus::Failed(error) => {
             // A read-only root can lose its snapshot to idle eviction and get
@@ -9198,14 +9197,14 @@ fn semantic_status_gap(ctx: &AppContext, status: &SemanticIndexStatus) -> Option
                     semantic_status: "building",
                     status: "reloading",
                     detail: "Semantic index is reloading from the shared read-only snapshot; retry shortly.".to_string(),
-                    footer_reason: "reloading",
+                    footer_reason: "reloading".into(),
                 }
             } else {
                 SemanticLaneGap {
                     semantic_status: "unavailable",
                     status: "unavailable",
                     detail: format!("Semantic search unavailable: {error}"),
-                    footer_reason: "unavailable",
+                    footer_reason: "unavailable".into(),
                 }
             })
         }
@@ -9226,7 +9225,7 @@ fn semantic_not_loaded_gap(_ctx: &AppContext) -> SemanticLaneGap {
             "Semantic index is not ready yet."
         }
         .to_string(),
-        footer_reason: "not_ready",
+        footer_reason: "not_ready".into(),
     }
 }
 
@@ -9299,7 +9298,7 @@ fn semantic_artifacts_busy_gap() -> SemanticLaneGap {
             "Semantic search artifacts remained busy beyond {}ms.",
             INTERACTIVE_ARTIFACT_READ_BUDGET.as_millis()
         ),
-        footer_reason: "artifact contention",
+        footer_reason: "artifact contention".into(),
     }
 }
 
@@ -12422,6 +12421,10 @@ mod tests {
             classified.detail
         );
         assert_eq!(classified.footer_reason, "query embed timeout (3000ms)");
+        assert!(matches!(
+            classified.footer_reason,
+            std::borrow::Cow::Owned(_)
+        ));
     }
 
     #[test]
