@@ -17,7 +17,7 @@ use crate::harness::Harness;
 use crate::log_ctx;
 use crate::lsp::registry::{
     resolve_lsp_binary, resolve_server_binary, servers_for_file_in_pass, BiomeSelectionMemo,
-    ServerKind,
+    ServerDef, ServerKind,
 };
 use crate::parser::{detect_language, LangId};
 use crate::protocol::{RawRequest, Response};
@@ -888,32 +888,6 @@ fn is_custom_server(kind: &ServerKind) -> bool {
     matches!(kind, ServerKind::Custom(_))
 }
 
-fn configured_lsp_binary_resolves(
-    configured: &crate::config::UserServerDef,
-    files: &[PathBuf],
-    config: &crate::config::Config,
-    memo: &mut BiomeSelectionMemo,
-) -> bool {
-    let project_root = config.project_root.as_deref();
-    for file in files {
-        if let Some(server) = servers_for_file_in_pass(file, config, memo)
-            .into_iter()
-            .find(|server| {
-                server.kind.id_str() == configured.id && server.binary == configured.binary
-            })
-        {
-            let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
-                server.workspace_root_for_file_with_project_root(file, project_root)
-            } else {
-                project_root.map(Path::to_path_buf)
-            };
-            return resolve_server_binary(&server, workspace_root.as_deref(), config).is_some();
-        }
-    }
-
-    resolve_lsp_binary(&configured.binary, project_root, &config.lsp_paths_extra).is_some()
-}
-
 fn lsp_missing_hint(binary: &str) -> String {
     crate::format::install_hint(binary)
 }
@@ -1398,38 +1372,81 @@ fn audit01_python_warning_collection_uses_one_snapshot() {
     );
 }
 
-fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config) -> Vec<Value> {
-    let mut warnings = Vec::new();
-    let mut seen_resolutions = HashSet::new();
-    let mut file_driven_servers = HashSet::new();
-    let mut seen_explicit_servers = HashSet::new();
-    let mut warned_binaries = HashSet::new();
+type LspWarningIdentity = (String, String);
+type LspWarningWorkspace = Option<PathBuf>;
 
-    let project_root = config.project_root.as_deref();
-    // One memo for the whole pass: files that share folders share their Biome
-    // root and configuration lookups. A fresh one each pass sees config edits.
-    let mut biome_memo = BiomeSelectionMemo::default();
+#[derive(Default)]
+struct LspWarningCandidates {
+    builtins: HashMap<LspWarningIdentity, HashMap<LspWarningWorkspace, ServerDef>>,
+    custom: HashMap<LspWarningIdentity, (ServerDef, LspWarningWorkspace)>,
+    biome_memo: BiomeSelectionMemo,
+}
 
-    for file in files {
-        for server in servers_for_file_in_pass(file, config, &mut biome_memo) {
+impl LspWarningCandidates {
+    fn observe(&mut self, file: &Path, config: &Config) {
+        let project_root = config.project_root.as_deref();
+        for server in servers_for_file_in_pass(file, config, &mut self.biome_memo) {
             let workspace_root = if matches!(server.kind, ServerKind::Python | ServerKind::Ty) {
                 server.workspace_root_for_file_with_project_root(file, project_root)
             } else {
                 project_root.map(Path::to_path_buf)
             };
             let identity = (server.kind.id_str().to_string(), server.binary.clone());
-            if is_custom_server(&server.kind)
-                || !seen_resolutions.insert((
-                    server.kind.id_str().to_string(),
-                    server.binary.clone(),
-                    workspace_root.clone(),
-                ))
+            if is_custom_server(&server.kind) {
+                // Explicit servers use their first matching configuration.
+                self.custom
+                    .entry(identity)
+                    .or_insert((server, workspace_root));
+            } else {
+                self.builtins
+                    .entry(identity)
+                    .or_default()
+                    .entry(workspace_root)
+                    .or_insert(server);
+            }
+        }
+    }
+
+    fn warnings(&self, config: &Config) -> Vec<Value> {
+        let mut warnings = Vec::new();
+        let mut seen_explicit_servers = HashSet::new();
+        let mut warned_binaries = HashSet::new();
+        let project_root = config.project_root.as_deref();
+
+        for ((_, binary), workspaces) in &self.builtins {
+            if !config.lsp_auto_install_binaries.contains(binary)
+                || config.lsp_inflight_installs.contains(binary)
+                || warned_binaries.contains(binary)
             {
                 continue;
             }
-            file_driven_servers.insert(identity);
 
-            if !config.lsp_auto_install_binaries.contains(&server.binary) {
+            if workspaces.iter().any(|(workspace, server)| {
+                resolve_server_binary(server, workspace.as_deref(), config).is_none()
+            }) {
+                warned_binaries.insert(binary.clone());
+                warnings.push(json!({
+                    "kind": "lsp_binary_missing",
+                    "server": binary,
+                    "binary": binary,
+                    "hint": lsp_missing_hint(binary),
+                }));
+            }
+        }
+        for server in &config.lsp_servers {
+            // A blank binary means "partial built-in override, inherit the built-in
+            // binary" — the resolvable binary is already covered by the built-in
+            // pass above, so skip the missing-binary probe here (probing "" never
+            // resolves and would emit a bogus warning).
+            if server.binary.is_empty() {
+                continue;
+            }
+
+            let identity = (server.id.clone(), server.binary.clone());
+            if server.disabled
+                || self.builtins.contains_key(&identity)
+                || !seen_explicit_servers.insert(identity.clone())
+            {
                 continue;
             }
 
@@ -1437,54 +1454,33 @@ fn detect_missing_lsp_binaries(files: &[PathBuf], config: &crate::config::Config
                 continue;
             }
 
-            if resolve_server_binary(&server, workspace_root.as_deref(), config).is_none()
-                && warned_binaries.insert(server.binary.clone())
-            {
+            let resolves = if let Some((selected, workspace)) = self.custom.get(&identity) {
+                resolve_server_binary(selected, workspace.as_deref(), config).is_some()
+            } else {
+                resolve_lsp_binary(&server.binary, project_root, &config.lsp_paths_extra).is_some()
+            };
+            if !resolves && warned_binaries.insert(server.binary.clone()) {
                 warnings.push(json!({
                     "kind": "lsp_binary_missing",
-                    "server": server.binary,
+                    "server": server.id,
                     "binary": server.binary,
                     "hint": lsp_missing_hint(&server.binary),
                 }));
             }
         }
+
+        warnings.sort_by_key(|warning| warning.to_string());
+        warnings
     }
+}
 
-    for server in &config.lsp_servers {
-        // A blank binary means "partial built-in override, inherit the built-in
-        // binary" — the resolvable binary is already covered by the built-in
-        // pass above, so skip the missing-binary probe here (probing "" never
-        // resolves and would emit a bogus warning).
-        if server.binary.is_empty() {
-            continue;
-        }
-
-        let identity = (server.id.clone(), server.binary.clone());
-        if server.disabled
-            || file_driven_servers.contains(&identity)
-            || !seen_explicit_servers.insert(identity)
-        {
-            continue;
-        }
-
-        if config.lsp_inflight_installs.contains(&server.binary) {
-            continue;
-        }
-
-        if !configured_lsp_binary_resolves(server, files, config, &mut biome_memo)
-            && warned_binaries.insert(server.binary.clone())
-        {
-            warnings.push(json!({
-                "kind": "lsp_binary_missing",
-                "server": server.id,
-                "binary": server.binary,
-                "hint": lsp_missing_hint(&server.binary),
-            }));
-        }
+#[cfg(test)]
+fn detect_missing_lsp_binaries(files: &[PathBuf], config: &Config) -> Vec<Value> {
+    let mut lsp = LspWarningCandidates::default();
+    for file in files {
+        lsp.observe(file, config);
     }
-
-    warnings.sort_by_key(|warning| warning.to_string());
-    warnings
+    lsp.warnings(config)
 }
 
 #[cfg(test)]
@@ -1547,7 +1543,7 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
     ConfigureWarningWork {
         root: root.clone(),
         config: Arc::new(Config {
-            project_root: Some(root),
+            project_root: Some(root.clone()),
             ..Default::default()
         }),
         generation_flag: Arc::new(AtomicU64::new(1)),
@@ -1557,23 +1553,22 @@ fn configure_warnings_canonicalize_biome_directories_not_each_file() {
     }
     .run(|boundary| {
         crate::path_identity::CANONICALIZE_CALLS.with(|counter| match boundary {
-            WarningBoundary::ResolvingLsp => *counter.borrow_mut() = Some(Vec::new()),
+            WarningBoundary::Walking => *counter.borrow_mut() = Some(Vec::new()),
             WarningBoundary::Publication => calls = counter.borrow_mut().take().unwrap(),
             _ => {}
         });
     });
     assert!(rx.try_recv().is_ok(), "the warning pass must publish");
-    assert!(
-        calls.len() <= DIRECTORIES + 1,
-        "{} files should resolve at most {} directories, not {} paths: {:?}",
-        DIRECTORIES * FILES_PER_DIRECTORY,
-        DIRECTORIES + 1,
-        calls.len(),
-        &calls[..calls.len().min(12)]
-    );
-    assert!(
-        calls.len() >= DIRECTORIES,
-        "each source directory was visited"
+    // The streaming pass interleaves Biome discovery with the walk. Root
+    // lookups also include walk setup, which is independent of file count.
+    calls.retain(|path| path != &root);
+    calls.sort();
+    assert_eq!(
+        calls,
+        (0..DIRECTORIES)
+            .map(|directory| root.join(format!("src/nested{directory}")))
+            .collect::<Vec<_>>(),
+        "Biome discovery should canonicalize each source directory once, not each file"
     );
 }
 
@@ -1633,6 +1628,8 @@ fn configure_warnings_cpu_measurement() {
 enum WarningBoundary {
     Discovery,
     Walking,
+    #[cfg(test)]
+    BufferedSourcePaths(usize),
     Tools,
     ParsingTools,
     Lsp,
@@ -1660,16 +1657,23 @@ impl ConfigureWarningWork {
         }
         boundary(WarningBoundary::Walking);
         signal_configure_deferred_walk_start_for_test();
-        let source_files = self.source_files();
+        let mut languages = HashSet::new();
+        let mut lsp = LspWarningCandidates::default();
+        self.visit_source_paths(
+            |path| {
+                if let Some(language) = detect_language(path) {
+                    languages.insert(language);
+                }
+                lsp.observe(path, &self.config);
+            },
+            #[cfg(test)]
+            &mut boundary,
+        );
         boundary(WarningBoundary::Tools);
         if !current() {
             return;
         }
         boundary(WarningBoundary::ParsingTools);
-        let languages: HashSet<LangId> = source_files
-            .iter()
-            .filter_map(|path| detect_language(path))
-            .collect();
         let mut warnings = detect_missing_tools_for_languages(&languages, &self.config)
             .into_iter()
             .map(|warning| json!(warning))
@@ -1679,7 +1683,7 @@ impl ConfigureWarningWork {
             return;
         }
         boundary(WarningBoundary::ResolvingLsp);
-        warnings.extend(detect_missing_lsp_binaries(&source_files, &self.config));
+        warnings.extend(lsp.warnings(&self.config));
         boundary(WarningBoundary::Publication);
         // The consumer still filters the check/send race; obsolete discovery
         // must not knowingly queue a frame.
@@ -1700,15 +1704,29 @@ impl ConfigureWarningWork {
     /// otherwise the root is walked, until a newer configure supersedes this
     /// one. Configure can run before the checkout publishes, so the first
     /// configure of a new root usually walks.
-    fn source_files(&self) -> Vec<PathBuf> {
+    fn visit_source_paths(
+        &self,
+        mut visit: impl FnMut(&Path),
+        #[cfg(test)] boundary: &mut impl FnMut(WarningBoundary),
+    ) {
         let miss = match crate::inspect::data_sources::bound_inventory(&self.root) {
-            Ok(inventory) => return inventory.sources,
+            Ok(inventory) => {
+                #[cfg(test)]
+                boundary(WarningBoundary::BufferedSourcePaths(
+                    inventory.sources.len(),
+                ));
+                for path in inventory.sources {
+                    visit(&path);
+                }
+                return;
+            }
             Err(miss) => miss,
         };
         let started = Instant::now();
         let flag = self.generation_flag.clone();
         let generation = self.generation;
-        let files: Vec<PathBuf> = crate::callgraph::walk_project_files_while(
+        let mut files = 0;
+        for path in crate::callgraph::walk_project_files_while(
             &self.root,
             if crate::data_layer::read_fence::active() {
                 crate::project_walk::IgnoreFileAccess::Fenced
@@ -1716,16 +1734,19 @@ impl ConfigureWarningWork {
                 crate::project_walk::IgnoreFileAccess::Allowed
             },
             move || flag.load(Ordering::SeqCst) == generation,
-        )
-        .collect();
+        ) {
+            files += 1;
+            visit(&path);
+        }
+        #[cfg(test)]
+        boundary(WarningBoundary::BufferedSourcePaths(0));
         slog_info!(
             "configure warning files walked: reason={} files={} ms={} root={}",
             miss.as_str(),
-            files.len(),
+            files,
             started.elapsed().as_millis(),
             crate::logging::normalize_index_root(&self.root)
         );
-        files
     }
 }
 
@@ -1809,6 +1830,32 @@ fn audit01_warning_current_generation_publishes() {
     }
     .run(|_| {});
     assert_eq!(rx.try_recv().unwrap().0, 2);
+}
+
+#[cfg(test)]
+#[test]
+fn configure_warning_walk_does_not_buffer_source_paths() {
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..100 {
+        std::fs::write(root.path().join(format!("unit-{index}.rs")), "fn f() {}\n").unwrap();
+    }
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let mut retained = None;
+    ConfigureWarningWork {
+        root: root.path().to_path_buf(),
+        config: Arc::new(Config::default()),
+        generation_flag: Arc::new(AtomicU64::new(1)),
+        generation: 1,
+        tx,
+        session_id: None,
+    }
+    .run(|at| {
+        if let WarningBoundary::BufferedSourcePaths(paths) = at {
+            retained = Some(paths);
+        }
+    });
+    assert!(rx.try_recv().is_ok());
+    assert_eq!(retained, Some(0));
 }
 
 /// Once the root's index-store checkout has published, the warning pass
