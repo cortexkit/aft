@@ -321,8 +321,6 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         }
         Err(message) => return Response::error(&req.id, "powershell_not_installed", message),
     };
-    let execution_command = params.shell.command_text(&params.command);
-
     // NOTE (v0.30.1 prep, unblock-only): the previous two rejections
     // ("PTY mode requires background: true" and "ptyRows/ptyCols require
     // pty: true") have been removed so that:
@@ -374,7 +372,27 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     }
 
     crate::bash_background::enter_runon_phase("workdir_return_paths");
-    let workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    let requested_workdir = resolve_workdir(params.workdir.as_deref(), ctx);
+    // Keep the received arguments and the routing decision intact. The inferred
+    // cwd goes through the same scanner, sandbox and spawn path as an explicit cwd.
+    let (command, workdir) = if cfg!(unix)
+        && !params.shell.is_powershell()
+        && params.workdir.is_none()
+        && !remote_requested
+        && remote.is_none()
+    {
+        let may_use_cdpath = params
+            .env
+            .get("CDPATH")
+            .is_some_and(|value| !value.is_empty())
+            || std::env::var_os("CDPATH").is_some_and(|value| !value.is_empty())
+            || ctx.config().shell.env_provider.is_some();
+        infer_cd_workdir(&params.command, &requested_workdir, may_use_cdpath)
+            .unwrap_or((&params.command, requested_workdir))
+    } else {
+        (params.command.as_str(), requested_workdir)
+    };
+    let execution_command = params.shell.command_text(command);
     let mut remote = remote;
     if let Err(response) = attach_return_paths(&req.id, ctx, &params, &workdir, &mut remote) {
         return response;
@@ -554,7 +572,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
     } else if defer_permission_asks || params.permissions_requested || ctx.config().bash_permissions
     {
         crate::bash_permissions::scan::scan_with_cwd_for_session(
-            &params.command,
+            command,
             ctx,
             &workdir,
             req.session(),
@@ -590,7 +608,7 @@ pub fn handle(req: &RawRequest, ctx: &AppContext) -> Response {
         && workdir_matches_project_root(&workdir, ctx)
     {
         if let Some(response) = crate::bash_rewrite::try_rewrite_for_request(
-            &params.command,
+            command,
             &req.id,
             req.session_id.as_deref(),
             &req.host_tool_names(),
@@ -975,6 +993,37 @@ fn resolve_workdir(workdir: Option<&Path>, ctx: &AppContext) -> PathBuf {
         Some(path) => root.join(path),
         None => root,
     }
+}
+
+fn infer_cd_workdir<'a>(
+    line: &'a str,
+    cwd: &Path,
+    may_use_cdpath: bool,
+) -> Option<(&'a str, PathBuf)> {
+    let (prefix, rest) = line.trim_start_matches([' ', '\t']).split_once("&&")?;
+    let dir = prefix.strip_prefix("cd ")?.trim_matches([' ', '\t']);
+    let rest = rest.trim_start_matches([' ', '\t', '\n']);
+    // A literal directory is one word, not an option, expansion, or redirect.
+    if dir.is_empty()
+        || dir.starts_with(['-', '~'])
+        || dir.chars().any(char::is_whitespace)
+        || dir.contains([
+            '\'', '"', '$', '\\', '`', '*', '?', '[', '{', '|', '&', ';', '<', '>', '(', ')', '#',
+        ])
+        || rest.is_empty()
+        || rest.starts_with(['#', ';', '&', '|'])
+    {
+        return None;
+    }
+    let dir = Path::new(dir);
+    // Bash can search CDPATH instead of using cwd for an ordinary relative word.
+    if may_use_cdpath && !dir.is_absolute() && !dir.starts_with(".") && !dir.starts_with("..") {
+        return None;
+    }
+    let workdir = cwd.join(dir);
+    // Looking through the directory also checks search permission; statting
+    // just its entry can succeed even when the shell could not enter it.
+    workdir.join(".").is_dir().then_some((rest, workdir))
 }
 
 /// Inject spawn outcomes into the same piped retry policy used on Windows.
@@ -3671,4 +3720,8 @@ exec "$@"
     #[cfg(unix)]
     #[path = "bash_env_tests.rs"]
     mod bash_env_tests;
+
+    #[cfg(unix)]
+    #[path = "bash_cd_tests.rs"]
+    mod bash_cd_tests;
 }
