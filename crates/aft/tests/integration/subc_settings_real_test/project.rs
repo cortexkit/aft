@@ -192,24 +192,48 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
         );
     }
     let mut operator = desktop(&daemon).await;
-    approve(&mut operator, "config.stamp").await;
-    let route = consumer
-        .open_route_scoped(
-            RouteTarget::ToolProvider {
-                module_id: "aft".into(),
-            },
-            BindIdentity::new("runner", "settings-project-test"),
-            ScopeSelector::new(
-                Principal::Reserved {
-                    module_id: "entorhinal".into(),
+    let stamped = approve(&mut operator, "config.stamp").await;
+    eventually(&daemon, "stamped user settings active", || async {
+        consumer
+            .config_modules()
+            .await
+            .ok()?
+            .modules
+            .iter()
+            .any(|module| module.module_id == "aft" && module.active_generation == Some(stamped))
+            .then_some(())
+    })
+    .await;
+    let route = eventually(&daemon, "scoped project route ready", || async {
+        match consumer
+            .open_route_scoped(
+                RouteTarget::ToolProvider {
+                    module_id: "aft".into(),
                 },
-                SCOPE,
-                Some(1),
-            ),
-            CallOptions::default(),
-        )
-        .await
-        .unwrap();
+                BindIdentity::new("runner", "settings-project-test"),
+                ScopeSelector::new(
+                    Principal::Reserved {
+                        module_id: "entorhinal".into(),
+                    },
+                    SCOPE,
+                    Some(1),
+                ),
+                CallOptions::default(),
+            )
+            .await
+        {
+            Ok(route) => Some(route),
+            Err(error)
+                if error
+                    .route_open_refusal()
+                    .is_some_and(|refusal| refusal.code == "actor_not_ready") =>
+            {
+                None
+            }
+            Err(error) => panic!("project route refused: {error:?}"),
+        }
+    })
+    .await;
     let project_file = daemon.home.path().join("project/.cortexkit/aft.jsonc");
     for (candidate, path) in [
         (
