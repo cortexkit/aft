@@ -301,6 +301,43 @@ describe("bindToolRegistrationFunnel helper", () => {
     const registered = tools.get("aft_sample") as unknown as { loadMode?: string };
     expect(registered?.loadMode).toBe("essential");
   });
+
+  test("OMP rows use the host theme and pass call arguments and error state to AFT renderers", () => {
+    const { tools } = registerWithHarness("omp", { disabled_tools: [], bash: true });
+    const tool = tools.get("bash") as unknown as {
+      renderCall(
+        args: unknown,
+        options: unknown,
+        theme: unknown,
+      ): { render(width: number): string[] };
+      renderResult(
+        result: unknown,
+        options: unknown,
+        theme: unknown,
+        args?: unknown,
+      ): {
+        render(width: number): string[];
+      };
+    };
+    const args = { command: "echo fixture" };
+    const options = {
+      argsComplete: true,
+      expanded: true,
+      isPartial: false,
+      executionStarted: true,
+    };
+    const theme = { fg: (tone: string, text: string) => `<${tone}>${text}`, bold: String };
+    expect(tool.renderCall(args, options, theme).render(80).join("\n")).toContain(
+      "<toolTitle>bash <accent>echo fixture",
+    );
+    const error = { isError: true, content: [{ type: "text", text: "bash fixture failed" }] };
+    expect(tool.renderResult(error, options, theme, args).render(80).join("\n")).toContain(
+      "<error>bash fixture failed",
+    );
+    expect(tool.renderResult(error, options, theme).render(80).join("\n")).toContain(
+      "<error>bash fixture failed",
+    );
+  });
 });
 
 describe("Upstream Pi ExtensionAPI runtime tolerance", () => {
