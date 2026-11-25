@@ -3,11 +3,20 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 
-const WASM: &[u8] = include_bytes!("../../../../aft/tests/fixtures/grammars/56b2a562244e6f35f7b320bce59099126185389df1277a93e450ba4156c0e039.wasm");
+/// Publication checks only the artifact's size and hash against its manifest,
+/// so a synthetic artifact keeps this published crate free of workspace
+/// fixtures from other crates.
+fn artifact() -> (GrammarManifest, Vec<u8>) {
+    let bytes = b"\0asm synthetic grammar artifact".to_vec();
+    let mut manifest = super::super::manifest("luau").unwrap().clone();
+    manifest.size = bytes.len() as u64;
+    manifest.sha256 = format!("{:x}", Sha256::digest(&bytes));
+    (manifest, bytes)
+}
 
 #[test]
 fn review_gpt10_opus9_grammar_publication_writes_one_staged_file() {
-    let manifest = super::super::manifest("luau").unwrap();
+    let (manifest, wasm) = artifact();
     let root = tempfile::tempdir().unwrap();
     let storage = Storage {
         root: root.path().into(),
@@ -23,7 +32,7 @@ fn review_gpt10_opus9_grammar_publication_writes_one_staged_file() {
         libc::inotify_add_watch(events.as_raw_fd(), folder.as_ptr(), libc::IN_MODIFY | libc::IN_MOVED_FROM)
     };
     assert!(watch >= 0, "{}", io::Error::last_os_error());
-    assert_eq!(storage.publish(manifest, WASM).unwrap(), WASM);
+    assert_eq!(storage.publish(&manifest, &wasm).unwrap(), wasm);
     let mut modified = std::collections::BTreeSet::new();
     let mut renamed = Vec::new();
     let mut buffer = [0u8; 4096];
@@ -58,14 +67,14 @@ fn review_gpt10_opus9_grammar_publication_writes_one_staged_file() {
 
 #[test]
 fn review_gpt10_opus9_grammar_publication_discards_faulted_staging_file() {
-    let manifest = super::super::manifest("luau").unwrap();
+    let (manifest, wasm) = artifact();
     for fault in [StorageFault::Write, StorageFault::Publish] {
         let root = tempfile::tempdir().unwrap();
         let storage = Storage {
             root: root.path().into(),
             fault,
         };
-        assert!(storage.publish(manifest, WASM).is_err(), "{fault:?}");
+        assert!(storage.publish(&manifest, &wasm).is_err(), "{fault:?}");
         assert!(std::fs::read_dir(storage.folder()).unwrap().next().is_none());
     }
 }
