@@ -248,7 +248,7 @@ async fn subc_settings_real_daemon_reviews_and_delivers_project_settings() {
         shown.effective["bash"]["env"],
         json!({"SETTINGS_USER":"from_user","SETTINGS_WORKSPACE":"from_workspace","SETTINGS_PROJECT":"from_project"})
     );
-    let body = json!({"name":"bash","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}});
+    let body = json!({"name":"bash","preset":"head","arguments":{"command":"printf '%s:%s:%s' \"$SETTINGS_USER\" \"$SETTINGS_WORKSPACE\" \"$SETTINGS_PROJECT\""}});
     let output = consumer
         .request(
             &route,
