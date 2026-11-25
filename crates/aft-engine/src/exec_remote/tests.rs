@@ -33,7 +33,33 @@ fn accepted_021_vector_and_single_locked_contract_are_pinned() {
         .filter(|p| p["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .collect();
     assert_eq!(packages.len(), 1);
-    assert_eq!(packages[0]["version"].as_str(), Some("0.2.22"));
+    assert_eq!(packages[0]["version"].as_str(), Some("0.2.23"));
+}
+
+#[test]
+fn plain_return_result_round_trips_optional_executable_flags() {
+    let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let wire = serde_json::json!({
+        "type": "return_result",
+        "job_id": job_id(),
+        "seq": 1,
+        "returned_files": [
+            {"path": "tool", "sha256": empty_sha, "data": "", "executable": true},
+            {"path": "notes", "sha256": empty_sha, "data": "", "executable": false},
+            {"path": "legacy", "sha256": empty_sha, "data": ""}
+        ]
+    });
+    let record: StreamRecord = serde_json::from_value(wire.clone()).unwrap();
+    let StreamRecord::ReturnResult(result) = &record else {
+        panic!("expected a plain return result")
+    };
+    let [tool, notes, legacy] = result.returned_files().unwrap() else {
+        panic!("expected three returned files")
+    };
+    assert_eq!(tool.executable(), Some(true));
+    assert_eq!(notes.executable(), Some(false));
+    assert_eq!(legacy.executable(), None);
+    assert_eq!(serde_json::to_value(record).unwrap(), wire);
 }
 
 fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
@@ -54,7 +80,7 @@ fn vector_cases(directory: &str) -> Vec<(String, serde_json::Value)> {
         .filter(|package| package["name"].as_str() == Some("cortexkit-exec-remote-types"))
         .map(|package| package["version"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(versions, ["0.2.22"], "exactly one caller contract version");
+    assert_eq!(versions, ["0.2.23"], "exactly one caller contract version");
     let vectors: serde_json::Value = serde_json::from_str(include_str!(
         "../../../aft/tests/fixtures/exec-remote/published-v0.2.0.json"
     ))

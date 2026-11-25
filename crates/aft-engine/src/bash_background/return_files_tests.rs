@@ -488,6 +488,120 @@ mod receiving {
     }
 
     #[test]
+    fn returned_file_modes_follow_manifest_and_umask() {
+        const CHILD: &str = "AFT_TEST_RETURN_FILES_UMASK";
+        if std::env::var_os(CHILD).is_none() {
+            let module = module_path!().split_once("::").unwrap().1;
+            let test = format!("{module}::returned_file_modes_follow_manifest_and_umask");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "umask child failed: stdout={stdout} stderr={}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Only the isolated child changes umask, not the parallel test harness.
+        unsafe { libc::umask(0o027) };
+        check_returned_file_modes();
+        with_copy_for_test(check_returned_file_modes);
+    }
+
+    fn check_returned_file_modes() {
+        use crate::exec_remote::types::{ReturnManifest, ReturnManifestEntry, Uuid};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let (_private_dir, private) = private_folder();
+        fs::create_dir(root.join("dist")).unwrap();
+        let mode = |path| fs::metadata(root.join(path)).unwrap().permissions().mode() & 0o7777;
+
+        let legacy = "two-files-one-empty";
+        let existing = root.join("dist/hello.txt");
+        fs::write(&existing, b"old").unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o711)).unwrap();
+        let (_, recorded) = feed(&mut receiver(legacy, &root, &private), legacy);
+        let probe = private.path().join(staging_name("task-1", 2));
+        assert!(!recorded.files.contains(&probe));
+        assert_eq!(mode("dist/hello.txt"), 0o711);
+        assert_eq!(mode("dist/empty.txt"), 0o644);
+
+        let flagged = "two-files-executable-and-non-executable";
+        fs::set_permissions(
+            root.join("dist/empty.txt"),
+            fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let (report, recorded) = feed(&mut receiver(flagged, &root, &private), flagged);
+        assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 5 });
+        assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
+        assert_eq!(mode("dist/tool"), 0o750);
+        assert_eq!(mode("dist/empty.txt"), 0o640);
+        assert_eq!(
+            recorded.files.iter().filter(|path| **path == probe).count(),
+            1
+        );
+        assert_eq!(fs::read_dir(private.path()).unwrap().count(), 0);
+
+        fs::create_dir_all(root.join(".git/hooks")).unwrap();
+        std::os::unix::fs::symlink(".git/hooks", root.join("hooks-alias")).unwrap();
+        let paths = [".git/hooks/x", "hooks-alias/y"];
+        let mut receiver = ReturnReceiver::new(
+            paths.map(str::to_owned).into(),
+            1,
+            &root,
+            &root,
+            None,
+            private.clone(),
+            "task-git",
+        )
+        .unwrap();
+        let empty_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let manifest = ReturnManifest::new(
+            Uuid::parse_str("0192a64a-1234-7000-8000-000000000001").unwrap(),
+            1,
+            paths
+                .map(|path| ReturnManifestEntry::returned(path, 0, empty_sha).with_executable(true))
+                .into(),
+            0,
+            1,
+        );
+        let report = receiver.manifest(&manifest, None, &mut |_| Ok(()));
+        assert!(report
+            .iter()
+            .all(|entry| entry.outcome == ReturnOutcome::Returned { bytes: 0 }));
+        assert_eq!(mode(".git/hooks/x"), 0o640);
+        assert_eq!(mode(".git/hooks/y"), 0o640);
+    }
+
+    #[test]
+    fn unavailable_mode_probe_keeps_legacy_permissions_and_is_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(dir.path()).unwrap();
+        let (_private_dir, private) = private_folder();
+        let probe = private.path().join(staging_name("task-1", 2));
+        fs::write(&probe, b"already exists").unwrap();
+        let name = "two-files-executable-and-non-executable";
+        let (report, recorded) = feed(&mut receiver(name, &root, &private), name);
+        assert_eq!(report[0].outcome, ReturnOutcome::Returned { bytes: 5 });
+        assert_eq!(report[1].outcome, ReturnOutcome::Returned { bytes: 0 });
+        for path in ["dist/tool", "dist/empty.txt"] {
+            let mode = fs::metadata(root.join(path)).unwrap().permissions().mode();
+            assert_eq!(mode & 0o7777, 0o644, "{path}");
+        }
+        assert_eq!(
+            recorded.files.iter().filter(|path| **path == probe).count(),
+            1
+        );
+        assert_eq!(fs::read(&probe).unwrap(), b"already exists");
+    }
+
+    #[test]
     fn a_stop_before_publishing_leaves_the_destination_alone_and_replay_places_it() {
         // AFT stops after writing the temp files and before renaming them.
         let dir = tempfile::tempdir().unwrap();

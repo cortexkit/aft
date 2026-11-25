@@ -71,3 +71,9 @@ byte-for-byte from `cortexkit-exec-remote-types` 0.2.22,
 `b092e07997eb492305acb0f3a069391591e4dff0f8dda929bbbdcd859b5b8ca9`,
 as locked in `Cargo.lock`. The bash status tests verify the published digests
 and send these bytes unchanged through the daemon's stream and AFT's decoder.
+
+`return-chunked/two-files-executable-and-non-executable.{jcs,sha256}` were
+copied byte-for-byte from `cortexkit-exec-remote-types` 0.2.23,
+`test-vectors/exec-remote-v1/return-chunked/` (crate archive SHA-256
+`5440c96eacd9800616f64c767487fcea31e9d8d055b9c7a489fc85bb997c2fed`). The
+manifest marks a chunked file executable and an empty file non-executable.
