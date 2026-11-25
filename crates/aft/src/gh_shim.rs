@@ -9156,15 +9156,18 @@ mod tests {
         // must not turn that shim into operator pass-through. The marker lives
         // in the process environment, so the check runs in a fresh process.
         const CHILD: &str = "AFT_TEST_GH_SHIM_LAUNCH_MARKER_CHILD";
-        let doc = serde_json::json!({
-            "github": { "shim": false },
-            "harnesses": { "opencode": { "github": { "shim": true } } },
-            "subc": { "connection_file": "/nonexistent/connection.json" }
-        })
-        .to_string();
         if std::env::var_os(CHILD).is_some() {
             let directory = tempfile::tempdir().unwrap();
             let paths = StatePaths::from_root(directory.path().to_path_buf());
+            // An absolute path on every OS: "/nonexistent/..." has no drive on
+            // Windows, so it would read as unparseable instead of unreachable.
+            let connection_file = directory.path().join("missing-connection.json");
+            let doc = serde_json::json!({
+                "github": { "shim": false },
+                "harnesses": { "opencode": { "github": { "shim": true } } },
+                "subc": { "connection_file": connection_file }
+            })
+            .to_string();
             let record = determine_rung_from_doc(
                 &paths,
                 Path::new("/cwd"),
