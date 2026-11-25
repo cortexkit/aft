@@ -1473,7 +1473,9 @@ fn unversioned_closed_push_masks_status_until_a_certified_pull() {
     let dir = tempfile::tempdir().unwrap();
     let root = canonicalize_for_lsp(dir.path()).unwrap();
     let file = root.join("broken.go");
+    let clean = root.join("clean.go");
     std::fs::write(&file, "package main\nvar n int = \"error\"\n").unwrap();
+    std::fs::write(&clean, "package main\n").unwrap();
     let key = ServerKey {
         kind: ServerKind::Go,
         root: root.clone(),
@@ -1484,34 +1486,36 @@ fn unversioned_closed_push_masks_status_until_a_certified_pull() {
     );
     ctx.set_canonical_cache_root(root);
     ctx.lsp().store_project_applicability(Default::default());
-    let pull = || {
+    let pull = |file: &Path, items: serde_json::Value, count| {
         let mut manager = ctx.lsp();
         let version = manager
             .documents
             .entry(key.clone())
             .or_default()
-            .open(file.clone());
-        let report = decode_document_diagnostic_report(json!({"kind":"full", "items":[{
-            "range": {"start":{"line":1,"character":12},"end":{"line":1,"character":19}},
-            "severity": 1, "message": "type error"
-        }]}))
-        .unwrap();
+            .open(file.to_path_buf());
+        let report =
+            decode_document_diagnostic_report(json!({"kind":"full", "items":items})).unwrap();
         assert!(matches!(
-            manager.ingest_document_report(&key, &file, Some(version), None, report),
-            PullFileOutcome::Full {
-                diagnostic_count: 1
-            }
+            manager.ingest_document_report(&key, file, Some(version), None, report),
+            PullFileOutcome::Full { diagnostic_count } if diagnostic_count == count
         ));
         manager
-            .close_inspect_documents(&file, std::slice::from_ref(&key))
+            .close_inspect_documents(file, std::slice::from_ref(&key))
             .unwrap();
-        assert!(!manager.documents[&key].is_open(&file));
+        assert!(!manager.documents[&key].is_open(file));
     };
     let status = || {
         let values = ctx.status_bar_count_values();
         (values.errors, values.warnings, values.diagnostics_reason)
     };
-    pull();
+    let error = json!([{
+        "range": {"start":{"line":1,"character":12},"end":{"line":1,"character":19}},
+        "severity": 1, "message": "type error"
+    }]);
+    // The clean row would keep the counts numeric if the unverified error
+    // were merely omitted.
+    pull(&clean, json!([]), 0);
+    pull(&file, error.clone(), 1);
     assert_eq!(status(), (Some(1), Some(0), None));
 
     for message in ["first unverified error", "new unverified error"] {
@@ -1541,7 +1545,7 @@ fn unversioned_closed_push_masks_status_until_a_certified_pull() {
         );
     }
 
-    pull();
+    pull(&file, error, 1);
     assert_eq!(status(), (Some(1), Some(0), None));
 }
 
