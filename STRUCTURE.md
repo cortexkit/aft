@@ -18,7 +18,7 @@ crates/aft-fake-lsp/   Fake language server used by LSP tests
 packages/              TypeScript workspace (plugins, bridge, CLI, platform binary packages)
 tests/                 Cross-platform end-to-end suites (docker, macos-e2e, windows-e2e, pi-rpc)
 test-vectors/          Shared contract vectors read by Rust and TypeScript tests
-grammars/              Pinned tree-sitter grammar builds (Luau) and their provenance
+grammars/              Pinned tree-sitter grammar builds (Luau, SystemVerilog) and their provenance
 benchmarks/            Search, retrieval, and compression benchmarks
 scripts/               Release, card staging, validation, governed-doc alignment, telemetry
 docs/                  User and design documentation (tools, config, CLI, design notes, investigations)
