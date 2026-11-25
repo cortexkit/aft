@@ -3,6 +3,47 @@ use crate::lsp::client::ServerExitReason;
 use crate::lsp::registry::builtin_servers;
 use serde_json::json;
 
+impl LspManager {
+    pub(crate) fn enqueue_maintenance_backlog_for_test(&mut self, root: &Path) -> impl Drop {
+        let event = LspEvent::Notification {
+            server_kind: ServerKind::Rust,
+            root: root.to_path_buf(),
+            method: "custom/pending".into(),
+            params: None,
+        };
+        // One maintenance batch fits both queues, but a reader can also
+        // leave a final exit in its priority slot when ingress is full.
+        for _ in 0..EVENT_CAP {
+            self.enqueue_event_for_test(event.clone());
+            self.ready_startup_events.push_back(StartupEventDelivery {
+                event: event.clone().into(),
+                published: None,
+            });
+        }
+        let instance = ServerInstanceId::next();
+        let root = root.to_path_buf();
+        let key = ServerKey {
+            kind: ServerKind::Rust,
+            root: root.clone(),
+        };
+        let lease = self.event_tx.register(instance, key);
+        self.event_tx
+            .send(ReceivedLspEvent {
+                event: LspEvent::ServerExited {
+                    server_kind: ServerKind::Rust,
+                    root,
+                    pid: 0,
+                    reason: ServerExitReason::Eof,
+                },
+                instance: Some(instance),
+                receive_order: None,
+            })
+            .unwrap();
+        assert!(self.event_tx.exit_pending_for_test(instance));
+        lease
+    }
+}
+
 pub(crate) struct IdleLspFixture {
     pub(crate) ctx: std::sync::Arc<crate::context::AppContext>,
     pub(crate) config: Config,

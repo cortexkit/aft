@@ -17978,20 +17978,12 @@ mod tests {
         quiesce_unbound_root(&root, &mut live_roots, &executor);
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, mut rx) = mpsc::channel(4);
-        let batch = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP;
-
         // Detached readers can still send final receipts during shutdown.
         // Repeated bursts must be consumed rather than retained until rebind.
         for _ in 0..4 {
-            for _ in 0..=batch {
-                ctx.lsp()
-                    .enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
-                        server_kind: crate::lsp::registry::ServerKind::Rust,
-                        root: root.as_path().to_path_buf(),
-                        method: "custom/final".into(),
-                        params: None,
-                    });
-            }
+            let _reader = ctx
+                .lsp()
+                .enqueue_maintenance_backlog_for_test(root.as_path());
             for remaining in [1, 0] {
                 let (due, _) = due_maintenance_jobs(
                     &mut live_roots,
@@ -18075,16 +18067,9 @@ mod tests {
         assert!(executor.register_actor(root.clone(), Arc::clone(&ctx)));
         let metrics = Arc::new(DispatchPathMetrics::new());
         let (tx, mut rx) = mpsc::channel(4);
-        let held = ctx.lsp();
-        let total = runtime_drain::LSP_EVENT_DRAIN_BATCH_CAP + 1;
-        for _ in 0..total {
-            held.enqueue_event_for_test(crate::lsp::client::LspEvent::Notification {
-                server_kind: crate::lsp::registry::ServerKind::Rust,
-                root: root.as_path().to_path_buf(),
-                method: "custom/pending".into(),
-                params: None,
-            });
-        }
+        let mut held = ctx.lsp();
+        let _reader = held.enqueue_maintenance_backlog_for_test(root.as_path());
+        let total = held.pending_event_count_for_test();
         submit_maintenance_job(
             &executor,
             root.clone(),
